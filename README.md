@@ -97,6 +97,38 @@ orchestration/
 6. **Complete** - Extracts PR URL, triggers merge, runs survey
 7. **Record** - Creates `agent-run` note with session summary
 
+## Session Persistence
+
+Ralph persists OpenCode session IDs to survive daemon restarts. This prevents losing agent progress when Ralph crashes or is manually stopped.
+
+### How it works
+
+When a task starts, Ralph saves the OpenCode session ID to the task's frontmatter:
+
+```yaml
+---
+status: in-progress
+session-id: ses_abc123
+---
+```
+
+On daemon startup, Ralph checks for orphaned in-progress tasks:
+
+1. **Tasks with session-id** - Resumed using `continueSession()`. The agent picks up where it left off.
+2. **Tasks without session-id** - Reset to `queued` status. They'll be reprocessed from scratch.
+
+### Graceful handling
+
+- If session resume fails (expired session, OpenCode error), the task is escalated
+- Session IDs are cleared when tasks complete or escalate
+- Only one task per repo can be in-progress at a time; duplicates are reset to queued
+
+### Benefits
+
+- **Crash recovery** - No lost progress on unexpected restarts
+- **Easier debugging** - Stop daemon, inspect state, resume
+- **Token efficiency** - Avoid re-running completed work
+
 ## License
 
 Private

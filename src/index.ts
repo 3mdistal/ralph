@@ -8,13 +8,15 @@
  */
 
 import { loadConfig } from "./config";
-import { 
-  initialPoll, 
-  startWatching, 
-  stopWatching, 
+import {
+  initialPoll,
+  startWatching,
+  stopWatching,
   groupByRepo,
   getQueuedTasks,
-  type AgentTask 
+  getTasksByStatus,
+  updateTaskStatus,
+  type AgentTask,
 } from "./queue";
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
@@ -25,6 +27,10 @@ import { getRepoPath } from "./config";
 const workers = new Map<string, RepoWorker>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
+
+function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
+  return task._path || task.name;
+}
 
 // Track in-flight tasks to avoid double-processing
 const inFlightTasks = new Set<string>();
@@ -38,7 +44,7 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
   }
   
   // Filter out tasks already being processed
-  const newTasks = tasks.filter(t => !inFlightTasks.has(t.name));
+  const newTasks = tasks.filter(t => !inFlightTasks.has(getTaskKey(t)));
   if (newTasks.length === 0) {
     console.log("[ralph] All queued tasks already in flight");
     return;
@@ -68,7 +74,7 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
     
     // Process first task (highest priority due to sorting)
     const task = repoTasks[0];
-    inFlightTasks.add(task.name);
+    inFlightTasks.add(getTaskKey(task));
     
     promises.push(
       worker.processTask(task)
@@ -92,12 +98,74 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
           console.error(`[ralph] Error processing task ${task.name}:`, e);
         })
         .finally(() => {
-          inFlightTasks.delete(task.name);
+          inFlightTasks.delete(getTaskKey(task));
         })
     );
   }
   
   // Wait for all tasks to start (not complete - they run in background)
+  await Promise.allSettled(promises);
+}
+
+async function resumeTasksOnStartup(): Promise<void> {
+  const inProgress = await getTasksByStatus("in-progress");
+  if (inProgress.length === 0) return;
+
+  console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
+
+  const withoutSession = inProgress.filter((t) => !(t["session-id"]?.trim()));
+  for (const task of withoutSession) {
+    console.warn(`[ralph] In-progress task has no session ID, resetting to queued: ${task.name}`);
+    await updateTaskStatus(task, "queued", { "session-id": "" });
+  }
+
+  const withSession = inProgress.filter((t) => t["session-id"]?.trim());
+  if (withSession.length === 0) return;
+
+  const byRepo = groupByRepo(withSession);
+  const promises: Promise<void>[] = [];
+
+  for (const [repo, repoTasks] of byRepo) {
+    const task = repoTasks[0];
+
+    // If multiple tasks are marked in-progress for the same repo, only resume one.
+    for (const extra of repoTasks.slice(1)) {
+      console.warn(`[ralph] Multiple in-progress tasks for ${repo}; resetting to queued: ${extra.name}`);
+      await updateTaskStatus(extra, "queued", { "session-id": "" });
+    }
+
+
+    let worker = workers.get(repo);
+    if (!worker) {
+      const repoPath = getRepoPath(repo);
+      worker = new RepoWorker(repo, repoPath);
+      workers.set(repo, worker);
+      console.log(`[ralph] Created worker for ${repo} -> ${repoPath}`);
+    }
+
+    if (worker.busy) {
+      console.log(`[ralph] Worker for ${repo} is busy, skipping resume`);
+      continue;
+    }
+
+    inFlightTasks.add(getTaskKey(task));
+
+    promises.push(
+      worker
+        .resumeTask(task)
+        .then(() => {
+          // resumeTask returns an AgentRun; ignore it here
+        })
+        .catch((e: any) => {
+          console.error(`[ralph] Error resuming task ${task.name}:`, e);
+        })
+        .finally(() => {
+          inFlightTasks.delete(getTaskKey(task));
+        })
+    );
+
+  }
+
   await Promise.allSettled(promises);
 }
 
@@ -107,7 +175,7 @@ async function main(): Promise<void> {
   console.log("║     Autonomous Coding Task Processor       ║");
   console.log("╚════════════════════════════════════════════╝");
   console.log("");
-  
+
   // Load config
   const config = loadConfig();
   console.log("[ralph] Configuration:");
@@ -115,19 +183,22 @@ async function main(): Promise<void> {
   console.log(`        Batch size: ${config.batchSize} PRs before rollup`);
   console.log(`        Dev directory: ${config.devDir}`);
   console.log("");
-  
+
   // Initialize rollup monitor
   rollupMonitor = new RollupMonitor(config.batchSize);
-  
+
+  // Resume orphaned tasks from previous daemon runs
+  await resumeTasksOnStartup();
+
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
   const initialTasks = await initialPoll();
   console.log(`[ralph] Found ${initialTasks.length} queued task(s)`);
-  
+
   if (initialTasks.length > 0) {
     await processNewTasks(initialTasks);
   }
-  
+
   // Start file watching (no polling - watcher is reliable)
   console.log("[ralph] Starting queue watcher...");
   startWatching(async (tasks) => {
@@ -187,6 +258,12 @@ async function main(): Promise<void> {
 
 const args = process.argv.slice(2);
 
+if (args[0] === "resume") {
+  // Resume any orphaned in-progress tasks and exit
+  await resumeTasksOnStartup();
+  process.exit(0);
+}
+
 if (args[0] === "status") {
   // Quick status check
   const tasks = await getQueuedTasks();
@@ -204,7 +281,7 @@ if (args[0] === "rollup") {
     console.error("Usage: ralph rollup <repo>");
     process.exit(1);
   }
-  
+
   const monitor = new RollupMonitor();
   // Note: This won't work well since we don't persist merge counts
   // For now, just create a PR from current bot/integration state
@@ -217,3 +294,4 @@ main().catch((e) => {
   console.error("[ralph] Fatal error:", e);
   process.exit(1);
 });
+

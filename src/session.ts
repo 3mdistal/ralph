@@ -141,8 +141,13 @@ export async function runCommand(repoPath: string, command: string, args: string
 /**
  * Continue an existing session with a normal message.
  */
-export async function continueSession(repoPath: string, sessionId: string, message: string): Promise<SessionResult> {
-  return runSession(repoPath, message, { continueSession: sessionId });
+export async function continueSession(
+  repoPath: string,
+  sessionId: string,
+  message: string,
+  options?: { agent?: string }
+): Promise<SessionResult> {
+  return runSession(repoPath, message, { continueSession: sessionId, agent: options?.agent });
 }
 
 /**

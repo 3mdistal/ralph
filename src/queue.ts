@@ -17,6 +17,8 @@ export interface AgentTask {
   run?: string;
   "assigned-at"?: string;
   "completed-at"?: string;
+  /** OpenCode session ID used to resume after restarts */
+  "session-id"?: string;
 }
 
 export type QueueChangeHandler = (tasks: AgentTask[]) => void;
