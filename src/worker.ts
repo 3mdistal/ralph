@@ -8,7 +8,7 @@ import { type AgentTask, updateTaskStatus } from "./queue";
 import { loadConfig, getRepoBotBranch } from "./config";
 import { runCommand, continueSession, continueCommand } from "./session";
 import { parseRoutingDecision, hasProductGap, extractPrUrl, type RoutingDecision } from "./routing";
-import { notifyEscalation, notifyError, type EscalationContext } from "./notify";
+import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 
 // Ralph introspection logs location
 const RALPH_SESSIONS_DIR = join(homedir(), ".ralph", "sessions");
@@ -414,6 +414,9 @@ export class RepoWorker {
       await updateTaskStatus(task, "done", {
         "completed-at": endTime.toISOString().split("T")[0],
       });
+
+      // 12. Send desktop notification for completion
+      await notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
 
       console.log(`[ralph:worker:${this.repo}] Task completed: ${task.name}`);
 
