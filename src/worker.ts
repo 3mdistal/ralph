@@ -8,6 +8,7 @@ import { type AgentTask, updateTaskStatus } from "./queue";
 import { loadConfig, getRepoBotBranch } from "./config";
 import { runCommand, continueSession, continueCommand } from "./session";
 import { parseRoutingDecision, hasProductGap, extractPrUrl, type RoutingDecision } from "./routing";
+import { isImplementationTaskFromIssue, shouldConsultDevex, shouldEscalateAfterRouting, type IssueMetadata } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 
 // Ralph introspection logs location
@@ -113,6 +114,13 @@ function safeNoteName(name: string): string {
     .trim();
 }
 
+function summarizeForNote(text: string, maxChars = 900): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  if (trimmed.length <= maxChars) return trimmed;
+  return trimmed.slice(0, maxChars).trimEnd() + "…";
+}
+
 function resolveVaultPath(p: string): string {
   const vault = loadConfig().bwrbVault;
   return isAbsolute(p) ? p : join(vault, p);
@@ -124,20 +132,23 @@ export class RepoWorker {
   constructor(public readonly repo: string, public readonly repoPath: string) {}
 
   /**
-   * Fetch labels for a GitHub issue
+   * Fetch metadata for a GitHub issue.
    */
-  private async getIssueLabels(issue: string): Promise<string[]> {
+  private async getIssueMetadata(issue: string): Promise<IssueMetadata> {
     // issue format: "owner/repo#123"
     const match = issue.match(/^([^#]+)#(\d+)$/);
-    if (!match) return [];
-    
+    if (!match) return { labels: [], title: "" };
+
     const [, repo, number] = match;
     try {
-      const result = await $`gh issue view ${number} --repo ${repo} --json labels`.quiet();
+      const result = await $`gh issue view ${number} --repo ${repo} --json labels,title`.quiet();
       const data = JSON.parse(result.stdout.toString());
-      return data.labels?.map((l: any) => l.name) ?? [];
+      return {
+        labels: data.labels?.map((l: any) => l.name) ?? [],
+        title: data.title ?? "",
+      };
     } catch {
-      return [];
+      return { labels: [], title: "" };
     }
   }
 
@@ -150,40 +161,14 @@ export class RepoWorker {
     hasGap: boolean,
     isImplementationTask: boolean
   ): boolean {
-    // No routing decision parsed - don't escalate, let it proceed
-    if (!routing) return false;
+    const shouldEscalate = shouldEscalateAfterRouting({ routing, hasGap, isImplementationTask });
 
-    // Explicit escalate decision with high confidence - always escalate
-    if (routing.decision === "escalate" && routing.confidence === "high") {
-      return true;
+    // Preserve the existing audit log when ignoring product gaps for implementation tasks.
+    if (isImplementationTask && hasGap && routing && routing.decision !== "escalate") {
+      console.log(`[ralph:worker:${this.repo}] Ignoring product gap for implementation task`);
     }
 
-    // For implementation tasks, only escalate on explicit "escalate" + NOT low-level details
-    if (isImplementationTask) {
-      // Check if the escalation reason is about low-level implementation details
-      const reason = routing.escalation_reason?.toLowerCase() ?? "";
-      const isLowLevelQuestion = 
-        reason.includes("error message") ||
-        reason.includes("error format") ||
-        reason.includes("warning") ||
-        reason.includes("json output") ||
-        reason.includes("json mode") ||
-        reason.includes("wording");
-      
-      if (isLowLevelQuestion) {
-        console.log(`[ralph:worker:${this.repo}] Skipping escalation for low-level implementation question`);
-        return false;
-      }
-      
-      // For implementation tasks, ignore "product gap" signals unless explicit escalate
-      if (hasGap && routing.decision !== "escalate") {
-        console.log(`[ralph:worker:${this.repo}] Ignoring product gap for implementation task`);
-        return false;
-      }
-    }
-
-    // Default logic for non-implementation tasks
-    return routing.decision === "escalate" || hasGap || routing.confidence === "low";
+    return shouldEscalate;
   }
 
   async resumeTask(task: AgentTask): Promise<AgentRun> {
@@ -409,12 +394,10 @@ export class RepoWorker {
       if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
       const issueNumber = issueMatch[1];
 
-      // 3. Fetch issue labels to adjust escalation sensitivity
-      const issueLabels = await this.getIssueLabels(task.issue);
-      const isImplementationTask = issueLabels.some(l => 
-        ["dx", "refactor", "bug", "chore", "test"].includes(l.toLowerCase())
-      );
-      
+      // 3. Fetch issue metadata to adjust escalation sensitivity
+      const issueMeta = await this.getIssueMetadata(task.issue);
+      const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
+
       // 4. Run configured command: next-task
       console.log(`[ralph:worker:${this.repo}] Running /next-task ${issueNumber}`);
       const planResult = await runCommand(this.repoPath, "next-task", [issueNumber]);
@@ -426,11 +409,73 @@ export class RepoWorker {
       }
 
       // 5. Parse routing decision
-      const routing = parseRoutingDecision(planResult.output);
-      const hasGap = hasProductGap(planResult.output);
+      let routing = parseRoutingDecision(planResult.output);
+      let hasGap = hasProductGap(planResult.output);
 
-      // 6. Decide whether to escalate
-      // For implementation tasks (dx, refactor, bug), be more lenient
+      // 6. Consult devex once before escalating implementation tasks
+      let devexContext: EscalationContext["devex"] | undefined;
+      if (shouldConsultDevex({ routing, hasGap, isImplementationTask })) {
+        const baseSessionId = planResult.sessionId;
+        console.log(
+          `[ralph:worker:${this.repo}] Consulting @devex before escalation (task: ${task.name}, session: ${baseSessionId})`
+        );
+
+        const devexPrompt = [
+          "You are @devex.",
+          "Resolve low-level implementation ambiguity (style, error message patterns, validation scope that does not change public behavior).",
+          "IMPORTANT: This runs in a non-interactive daemon. Do NOT ask questions; make reasonable default choices and proceed.",
+          "Return a short, actionable summary.",
+        ].join("\n");
+
+        const devexResult = await continueSession(this.repoPath, baseSessionId, devexPrompt, { agent: "devex" });
+        if (!devexResult.success) {
+          console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
+          devexContext = {
+            consulted: true,
+            sessionId: devexResult.sessionId || baseSessionId,
+            summary: `Devex consult failed: ${summarizeForNote(devexResult.output, 400)}`,
+          };
+        } else {
+          const devexSummary = summarizeForNote(devexResult.output);
+          devexContext = {
+            consulted: true,
+            sessionId: devexResult.sessionId || baseSessionId,
+            summary: devexSummary,
+          };
+
+          console.log(
+            `[ralph:worker:${this.repo}] Devex consulted (task: ${task.name}, session: ${devexContext.sessionId})`
+          );
+
+          const reroutePrompt = [
+            "Incorporate the devex guidance below into your plan.",
+            "Then output ONLY the routing decision JSON code block.",
+            "Do not ask questions.",
+            "If an open question touches contract surfaces (CLI flags, exit codes, stdout/stderr formats, public error strings, config/schema, machine-readable JSON), set decision=escalate.",
+            "",
+            "Devex guidance:",
+            devexSummary || devexResult.output,
+          ].join("\n");
+
+          const rerouteResult = await continueSession(this.repoPath, baseSessionId, reroutePrompt);
+          if (!rerouteResult.success) {
+            console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
+          } else {
+            if (rerouteResult.sessionId) {
+              await updateTaskStatus(task, "in-progress", { "session-id": rerouteResult.sessionId });
+            }
+
+            const updatedRouting = parseRoutingDecision(rerouteResult.output);
+            if (updatedRouting) routing = updatedRouting;
+
+            // Allow product-gap detection to trigger if the reroute output explicitly flags it.
+            hasGap = hasGap || hasProductGap(rerouteResult.output);
+          }
+        }
+
+      }
+
+      // 7. Decide whether to escalate
       const shouldEscalate = this.shouldEscalate(routing, hasGap, isImplementationTask);
       
       if (shouldEscalate) {
@@ -469,6 +514,7 @@ export class RepoWorker {
                 plan_summary: routing.plan_summary ?? undefined,
               }
             : undefined,
+          devex: devexContext,
         });
 
         return {
@@ -621,6 +667,7 @@ export class RepoWorker {
         started: startTime,
         completed: endTime,
         surveyResults: surveyResult.output,
+        devex: devexContext,
       });
 
       // 11. Mark task done
@@ -667,6 +714,7 @@ export class RepoWorker {
       started: Date;
       completed: Date;
       surveyResults?: string;
+      devex?: EscalationContext["devex"];
     }
   ): Promise<void> {
     const vault = loadConfig().bwrbVault;
@@ -704,6 +752,17 @@ export class RepoWorker {
             `- **Tool calls:** ${introspection.totalToolCalls}`,
             `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
             `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
+            ""
+          );
+        }
+
+        // Add devex consult summary (if we used devex-before-escalate)
+        if (data.devex?.consulted) {
+          bodySections.push(
+            "## Devex Consult",
+            "",
+            data.devex.sessionId ? `- **Session:** ${data.devex.sessionId}` : "",
+            data.devex.summary ?? "",
             ""
           );
         }
