@@ -5,6 +5,71 @@ import { loadConfig } from "./config";
 
 export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
 
+// Cache for terminal-notifier availability check
+let terminalNotifierAvailable: boolean | null = null;
+
+/**
+ * Check if terminal-notifier is installed on the system.
+ * Result is cached for the lifetime of the process.
+ */
+async function isTerminalNotifierAvailable(): Promise<boolean> {
+  if (terminalNotifierAvailable !== null) {
+    return terminalNotifierAvailable;
+  }
+
+  try {
+    await $`which terminal-notifier`.quiet();
+    terminalNotifierAvailable = true;
+    console.log("[ralph:notify] terminal-notifier is available");
+  } catch {
+    terminalNotifierAvailable = false;
+    console.log("[ralph:notify] terminal-notifier not found, desktop notifications disabled");
+  }
+
+  return terminalNotifierAvailable;
+}
+
+/**
+ * Send a desktop notification using terminal-notifier (macOS).
+ * Falls back silently if terminal-notifier is not installed.
+ */
+export async function sendDesktopNotification(opts: {
+  title: string;
+  subtitle?: string;
+  message: string;
+  openUrl?: string;
+  sound?: string;
+}): Promise<boolean> {
+  if (!(await isTerminalNotifierAvailable())) {
+    return false;
+  }
+
+  try {
+    const args: string[] = [
+      "-title", opts.title,
+      "-message", opts.message,
+    ];
+
+    if (opts.subtitle) {
+      args.push("-subtitle", opts.subtitle);
+    }
+
+    if (opts.openUrl) {
+      args.push("-open", opts.openUrl);
+    }
+
+    if (opts.sound) {
+      args.push("-sound", opts.sound);
+    }
+
+    await $`terminal-notifier ${args}`.quiet();
+    return true;
+  } catch (e) {
+    console.warn("[ralph:notify] Failed to send desktop notification:", e);
+    return false;
+  }
+}
+
 function sanitizeNoteTitle(title: string): string {
   return title
     .replace(/[\\/]/g, " - ")
@@ -291,6 +356,20 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     const notePath = resolveVaultPath(output.path);
     await appendFile(notePath, noteBody, "utf8");
     console.log(`[ralph:notify] Created escalation: ${noteName}`);
+
+    // Send desktop notification
+    const issueUrl = ctx.issue.includes("github.com")
+      ? ctx.issue
+      : `https://github.com/${ctx.issue.replace("#", "/issues/")}`;
+
+    await sendDesktopNotification({
+      title: "Ralph: Escalation",
+      subtitle: ctx.escalationType,
+      message: `${shortIssue} needs attention: ${ctx.reason.slice(0, 100)}`,
+      openUrl: issueUrl,
+      sound: "Ping",
+    });
+
     return true;
   }
 
@@ -327,4 +406,26 @@ export async function notifyError(context: string, error: string, taskName?: str
     .join("\n");
 
   await createNotification("error", `Error: ${context}`, body, taskName);
+
+  // Send desktop notification
+  await sendDesktopNotification({
+    title: "Ralph: Error",
+    subtitle: taskName ?? "Task Error",
+    message: `${context}: ${error.slice(0, 80)}`,
+    sound: "Basso",
+  });
+}
+
+export async function notifyTaskComplete(
+  taskName: string,
+  repo: string,
+  prUrl?: string
+): Promise<void> {
+  await sendDesktopNotification({
+    title: "Ralph: Task Complete",
+    subtitle: repo,
+    message: `${taskName.slice(0, 60)}${prUrl ? " - PR created" : ""}`,
+    openUrl: prUrl,
+    sound: "Glass",
+  });
 }
