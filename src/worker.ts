@@ -1,0 +1,440 @@
+import { $ } from "bun";
+import { appendFile, readFile, rm } from "fs/promises";
+import { existsSync } from "fs";
+import { isAbsolute, join } from "path";
+import { homedir } from "os";
+
+import { type AgentTask, updateTaskStatus } from "./queue";
+import { loadConfig, getRepoBotBranch } from "./config";
+import { runCommand, continueSession, continueCommand } from "./session";
+import { parseRoutingDecision, hasProductGap, extractPrUrl } from "./routing";
+import { notifyEscalation, notifyError, type EscalationContext } from "./notify";
+
+// Ralph introspection logs location
+const RALPH_SESSIONS_DIR = join(homedir(), ".ralph", "sessions");
+
+// Anomaly detection thresholds
+const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
+const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
+
+interface IntrospectionSummary {
+  sessionId: string;
+  endTime: number;
+  toolResultAsTextCount: number;
+  totalToolCalls: number;
+  stepCount: number;
+  hasAnomalies: boolean;
+  recentTools: string[];
+}
+
+interface LiveAnomalyCount {
+  total: number;
+  recentBurst: boolean;
+}
+
+async function readIntrospectionSummary(sessionId: string): Promise<IntrospectionSummary | null> {
+  const summaryPath = join(RALPH_SESSIONS_DIR, sessionId, "summary.json");
+  if (!existsSync(summaryPath)) return null;
+  
+  try {
+    const content = await readFile(summaryPath, "utf8");
+    return JSON.parse(content);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read live anomaly count from the session's events.jsonl.
+ * Returns total count and whether there's been a recent burst.
+ */
+async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount> {
+  const eventsPath = join(RALPH_SESSIONS_DIR, sessionId, "events.jsonl");
+  if (!existsSync(eventsPath)) return { total: 0, recentBurst: false };
+
+  try {
+    const content = await readFile(eventsPath, "utf8");
+    const lines = content.trim().split("\n").filter(Boolean);
+    
+    let total = 0;
+    const recentAnomalies: number[] = [];
+    const now = Date.now();
+    const BURST_WINDOW_MS = 10000; // 10 seconds
+    
+    for (const line of lines) {
+      try {
+        const event = JSON.parse(line);
+        if (event.type === "anomaly") {
+          total++;
+          if (event.ts && (now - event.ts) < BURST_WINDOW_MS) {
+            recentAnomalies.push(event.ts);
+          }
+        }
+      } catch {
+        // ignore malformed lines
+      }
+    }
+    
+    // A burst is 20+ anomalies in the last 10 seconds
+    const recentBurst = recentAnomalies.length >= 20;
+    
+    return { total, recentBurst };
+  } catch {
+    return { total: 0, recentBurst: false };
+  }
+}
+
+async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
+  const sessionDir = join(RALPH_SESSIONS_DIR, sessionId);
+  if (existsSync(sessionDir)) {
+    try {
+      await rm(sessionDir, { recursive: true });
+    } catch (e) {
+      console.warn(`[ralph:worker] Failed to cleanup introspection logs: ${e}`);
+    }
+  }
+}
+
+export interface AgentRun {
+  taskName: string;
+  repo: string;
+  outcome: "success" | "escalated" | "failed";
+  pr?: string;
+  sessionId?: string;
+  escalationReason?: string;
+  surveyResults?: string;
+}
+
+function safeNoteName(name: string): string {
+  return name
+    .replace(/[\\/]/g, " - ")
+    .replace(/[:*?"<>|]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function resolveVaultPath(p: string): string {
+  const vault = loadConfig().bwrbVault;
+  return isAbsolute(p) ? p : join(vault, p);
+}
+
+export class RepoWorker {
+  public busy = false;
+
+  constructor(public readonly repo: string, public readonly repoPath: string) {}
+
+  async processTask(task: AgentTask): Promise<AgentRun> {
+    const startTime = new Date();
+    console.log(`[ralph:worker:${this.repo}] Starting task: ${task.name}`);
+
+    this.busy = true;
+
+    try {
+      // 1. Mark task in-progress (use _path to avoid ambiguous names)
+      const markedInProgress = await updateTaskStatus(task, "in-progress", {
+        "assigned-at": startTime.toISOString().split("T")[0],
+      });
+      if (!markedInProgress) {
+        throw new Error("Failed to mark task in-progress (bwrb edit failed)");
+      }
+
+      // 2. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
+      const issueMatch = task.issue.match(/#(\d+)$/);
+      if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
+      const issueNumber = issueMatch[1];
+
+      // 3. Run configured command: next-task
+      console.log(`[ralph:worker:${this.repo}] Running /next-task ${issueNumber}`);
+      const planResult = await runCommand(this.repoPath, "next-task", [issueNumber]);
+      if (!planResult.success) throw new Error(`/next-task failed: ${planResult.output}`);
+
+      // 4. Parse routing decision
+      const routing = parseRoutingDecision(planResult.output);
+      const hasGap = hasProductGap(planResult.output);
+
+      // 5. Escalate if needed
+      if (routing?.decision === "escalate" || hasGap || routing?.confidence === "low") {
+        const reason =
+          routing?.escalation_reason || (hasGap ? "Product documentation gap identified" : "Low confidence in plan");
+
+        // Determine escalation type
+        let escalationType: EscalationContext["escalationType"] = "other";
+        if (hasGap) {
+          escalationType = "product-gap";
+        } else if (routing?.confidence === "low") {
+          escalationType = "low-confidence";
+        } else if (routing?.escalation_reason?.toLowerCase().includes("ambiguous")) {
+          escalationType = "ambiguous-requirements";
+        } else if (routing?.escalation_reason?.toLowerCase().includes("blocked")) {
+          escalationType = "blocked";
+        }
+
+        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+
+        await updateTaskStatus(task, "escalated");
+        await notifyEscalation({
+          taskName: task.name,
+          taskFileName: task._name,
+          taskPath: task._path,
+          issue: task.issue,
+          repo: this.repo,
+          reason,
+          escalationType,
+          planOutput: planResult.output,
+          routing: routing
+            ? {
+                decision: routing.decision,
+                confidence: routing.confidence,
+                escalation_reason: routing.escalation_reason,
+                plan_summary: routing.plan_summary,
+              }
+            : undefined,
+        });
+
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "escalated",
+          sessionId: planResult.sessionId,
+          escalationReason: reason,
+        };
+      }
+
+      // 6. Proceed with build
+      console.log(`[ralph:worker:${this.repo}] Proceeding with build...`);
+      const botBranch = getRepoBotBranch(this.repo);
+      const proceedMessage = `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
+
+      let buildResult = await continueSession(this.repoPath, planResult.sessionId, proceedMessage);
+      if (!buildResult.success) throw new Error(`Build failed: ${buildResult.output}`);
+
+      // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
+      // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
+      const MAX_CONTINUE_RETRIES = 5;
+      let prUrl = extractPrUrl(buildResult.output);
+      let continueAttempts = 0;
+      let anomalyAborts = 0;
+      let lastAnomalyCount = 0;
+
+      while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
+        // Check for anomaly burst before continuing
+        const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
+        const newAnomalies = anomalyStatus.total - lastAnomalyCount;
+        lastAnomalyCount = anomalyStatus.total;
+
+        if (anomalyStatus.total >= ANOMALY_BURST_THRESHOLD || anomalyStatus.recentBurst) {
+          anomalyAborts++;
+          console.warn(
+            `[ralph:worker:${this.repo}] Anomaly burst detected (${anomalyStatus.total} total, ${newAnomalies} new). ` +
+            `Abort #${anomalyAborts}/${MAX_ANOMALY_ABORTS}`
+          );
+
+          if (anomalyAborts >= MAX_ANOMALY_ABORTS) {
+            // Too many anomaly aborts - escalate
+            const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
+            console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
+
+            await updateTaskStatus(task, "escalated");
+            await notifyEscalation({
+              taskName: task.name,
+              taskFileName: task._name,
+              taskPath: task._path,
+              issue: task.issue,
+              repo: this.repo,
+              reason,
+              escalationType: "other",
+              planOutput: buildResult.output,
+            });
+
+            return {
+              taskName: task.name,
+              repo: this.repo,
+              outcome: "escalated",
+              sessionId: buildResult.sessionId,
+              escalationReason: reason,
+            };
+          }
+
+          // Send a specific nudge to break the loop
+          console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
+          buildResult = await continueSession(
+            this.repoPath,
+            buildResult.sessionId,
+            "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step."
+          );
+          
+          // Reset anomaly tracking for fresh window
+          lastAnomalyCount = anomalyStatus.total;
+          
+          if (buildResult.success) {
+            prUrl = extractPrUrl(buildResult.output);
+          }
+          continue;
+        }
+
+        continueAttempts++;
+        console.log(`[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`);
+        
+        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.");
+        if (!buildResult.success) {
+          console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
+          break;
+        }
+        
+        prUrl = extractPrUrl(buildResult.output);
+      }
+
+      if (!prUrl) {
+        // Escalate if we still don't have a PR after retries
+        const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
+        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+
+        await updateTaskStatus(task, "escalated");
+        await notifyEscalation({
+          taskName: task.name,
+          taskFileName: task._name,
+          taskPath: task._path,
+          issue: task.issue,
+          repo: this.repo,
+          reason,
+          escalationType: "other",
+          planOutput: buildResult.output,
+        });
+
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "escalated",
+          sessionId: buildResult.sessionId,
+          escalationReason: reason,
+        };
+      }
+
+      // 8. Ask agent to merge
+      if (prUrl) {
+        console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
+        const mergeResult = await continueSession(
+          this.repoPath,
+          buildResult.sessionId,
+          "Looks good. Merge the PR and clean up the worktree."
+        );
+        if (!mergeResult.success) {
+          console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
+        }
+      }
+
+      // 9. Run survey (configured command)
+      console.log(`[ralph:worker:${this.repo}] Running survey...`);
+      const surveyResult = await continueCommand(this.repoPath, buildResult.sessionId, "survey");
+
+      // 10. Create agent-run note
+      const endTime = new Date();
+      await this.createAgentRun(task, {
+        sessionId: buildResult.sessionId,
+        pr: prUrl,
+        outcome: "success",
+        started: startTime,
+        completed: endTime,
+        surveyResults: surveyResult.output,
+      });
+
+      // 11. Mark task done
+      await updateTaskStatus(task, "done", {
+        "completed-at": endTime.toISOString().split("T")[0],
+      });
+
+      console.log(`[ralph:worker:${this.repo}] Task completed: ${task.name}`);
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "success",
+        pr: prUrl ?? undefined,
+        sessionId: buildResult.sessionId,
+      };
+    } catch (error: any) {
+      console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
+
+      await updateTaskStatus(task, "blocked");
+      await notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        escalationReason: error?.message ?? String(error),
+      };
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  private async createAgentRun(
+    task: AgentTask,
+    data: {
+      sessionId: string;
+      pr?: string | null;
+      outcome: "success" | "escalated" | "failed";
+      started: Date;
+      completed: Date;
+      surveyResults?: string;
+    }
+  ): Promise<void> {
+    const vault = loadConfig().bwrbVault;
+    const today = data.completed.toISOString().split("T")[0];
+    const shortIssue = task.issue.split("/").pop() || task.issue;
+
+    const runName = safeNoteName(`Run for ${shortIssue} - ${task.name.slice(0, 40)}`);
+
+    const json = JSON.stringify({
+      name: runName,
+      task: `[[${task._name}]]`,  // Use _name (filename) not name (display) for wikilinks
+      started: data.started.toISOString().split("T")[0],
+      completed: today,
+      outcome: data.outcome,
+      pr: data.pr || "",
+      "creation-date": today,
+      scope: "builder",
+    });
+
+    try {
+      const result = await $`bwrb new agent-run --json ${json}`.cwd(vault).quiet();
+      const output = JSON.parse(result.stdout.toString());
+
+      if (output.success && output.path) {
+        const notePath = resolveVaultPath(output.path);
+        const bodySections: string[] = [];
+
+        // Add introspection summary if available
+        const introspection = await readIntrospectionSummary(data.sessionId);
+        if (introspection) {
+          bodySections.push(
+            "## Session Summary",
+            "",
+            `- **Steps:** ${introspection.stepCount}`,
+            `- **Tool calls:** ${introspection.totalToolCalls}`,
+            `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
+            `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
+            ""
+          );
+        }
+
+        // Add survey results
+        if (data.surveyResults) {
+          bodySections.push("## Survey Results", "", data.surveyResults, "");
+        }
+
+        if (bodySections.length > 0) {
+          await appendFile(notePath, "\n" + bodySections.join("\n"), "utf8");
+        }
+
+        // Clean up introspection logs
+        await cleanupIntrospectionLogs(data.sessionId);
+      }
+
+      console.log(`[ralph:worker:${this.repo}] Created agent-run note`);
+    } catch (e) {
+      console.error(`[ralph:worker:${this.repo}] Failed to create agent-run:`, e);
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "ralph-loop",
+  "version": "0.1.0",
+  "description": "Ralph Loop - Autonomous coding task orchestrator for OpenCode",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "ralph": "src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun run --watch src/index.ts",
+    "status": "bun run src/index.ts status",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
