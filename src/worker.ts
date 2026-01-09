@@ -7,7 +7,7 @@ import { homedir } from "os";
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { loadConfig, getRepoBotBranch } from "./config";
 import { runCommand, continueSession, continueCommand } from "./session";
-import { parseRoutingDecision, hasProductGap, extractPrUrl } from "./routing";
+import { parseRoutingDecision, hasProductGap, extractPrUrl, type RoutingDecision } from "./routing";
 import { notifyEscalation, notifyError, type EscalationContext } from "./notify";
 
 // Ralph introspection logs location
@@ -123,6 +123,69 @@ export class RepoWorker {
 
   constructor(public readonly repo: string, public readonly repoPath: string) {}
 
+  /**
+   * Fetch labels for a GitHub issue
+   */
+  private async getIssueLabels(issue: string): Promise<string[]> {
+    // issue format: "owner/repo#123"
+    const match = issue.match(/^([^#]+)#(\d+)$/);
+    if (!match) return [];
+    
+    const [, repo, number] = match;
+    try {
+      const result = await $`gh issue view ${number} --repo ${repo} --json labels`.quiet();
+      const data = JSON.parse(result.stdout.toString());
+      return data.labels?.map((l: any) => l.name) ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Determine if we should escalate based on routing decision and task type.
+   * Implementation tasks (dx, refactor, bug) get more lenient treatment.
+   */
+  private shouldEscalate(
+    routing: RoutingDecision | null,
+    hasGap: boolean,
+    isImplementationTask: boolean
+  ): boolean {
+    // No routing decision parsed - don't escalate, let it proceed
+    if (!routing) return false;
+
+    // Explicit escalate decision with high confidence - always escalate
+    if (routing.decision === "escalate" && routing.confidence === "high") {
+      return true;
+    }
+
+    // For implementation tasks, only escalate on explicit "escalate" + NOT low-level details
+    if (isImplementationTask) {
+      // Check if the escalation reason is about low-level implementation details
+      const reason = routing.escalation_reason?.toLowerCase() ?? "";
+      const isLowLevelQuestion = 
+        reason.includes("error message") ||
+        reason.includes("error format") ||
+        reason.includes("warning") ||
+        reason.includes("json output") ||
+        reason.includes("json mode") ||
+        reason.includes("wording");
+      
+      if (isLowLevelQuestion) {
+        console.log(`[ralph:worker:${this.repo}] Skipping escalation for low-level implementation question`);
+        return false;
+      }
+      
+      // For implementation tasks, ignore "product gap" signals unless explicit escalate
+      if (hasGap && routing.decision !== "escalate") {
+        console.log(`[ralph:worker:${this.repo}] Ignoring product gap for implementation task`);
+        return false;
+      }
+    }
+
+    // Default logic for non-implementation tasks
+    return routing.decision === "escalate" || hasGap || routing.confidence === "low";
+  }
+
   async processTask(task: AgentTask): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Starting task: ${task.name}`);
@@ -143,17 +206,26 @@ export class RepoWorker {
       if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
       const issueNumber = issueMatch[1];
 
-      // 3. Run configured command: next-task
+      // 3. Fetch issue labels to adjust escalation sensitivity
+      const issueLabels = await this.getIssueLabels(task.issue);
+      const isImplementationTask = issueLabels.some(l => 
+        ["dx", "refactor", "bug", "chore", "test"].includes(l.toLowerCase())
+      );
+      
+      // 4. Run configured command: next-task
       console.log(`[ralph:worker:${this.repo}] Running /next-task ${issueNumber}`);
       const planResult = await runCommand(this.repoPath, "next-task", [issueNumber]);
       if (!planResult.success) throw new Error(`/next-task failed: ${planResult.output}`);
 
-      // 4. Parse routing decision
+      // 5. Parse routing decision
       const routing = parseRoutingDecision(planResult.output);
       const hasGap = hasProductGap(planResult.output);
 
-      // 5. Escalate if needed
-      if (routing?.decision === "escalate" || hasGap || routing?.confidence === "low") {
+      // 6. Decide whether to escalate
+      // For implementation tasks (dx, refactor, bug), be more lenient
+      const shouldEscalate = this.shouldEscalate(routing, hasGap, isImplementationTask);
+      
+      if (shouldEscalate) {
         const reason =
           routing?.escalation_reason || (hasGap ? "Product documentation gap identified" : "Low confidence in plan");
 
