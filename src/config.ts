@@ -32,19 +32,20 @@ export function loadConfig(): RalphConfig {
   if (config) return config;
 
   // Start with defaults
-  config = { ...DEFAULT_CONFIG };
+  let loaded: RalphConfig = { ...DEFAULT_CONFIG };
 
   // Try to load from file
   const configPath = join(homedir(), ".config/opencode/ralph/ralph.json");
   if (existsSync(configPath)) {
     try {
       const fileConfig = require(configPath);
-      config = { ...config, ...fileConfig };
+      loaded = { ...loaded, ...fileConfig };
     } catch (e) {
       console.error(`[ralph] Failed to load config from ${configPath}:`, e);
     }
   }
 
+  config = loaded;
   return config;
 }
 

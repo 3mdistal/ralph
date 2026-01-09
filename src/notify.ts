@@ -200,9 +200,9 @@ export interface EscalationContext {
   planOutput?: string;
   routing?: {
     decision: string;
-    confidence?: string;
-    escalation_reason?: string;
-    plan_summary?: string;
+    confidence?: string | null;
+    escalation_reason?: string | null;
+    plan_summary?: string | null;
   };
 }
 
