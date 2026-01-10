@@ -1,4 +1,5 @@
 import { $ } from "bun";
+import { existsSync } from "fs";
 import { readFile } from "fs/promises";
 import { join } from "path";
 import { loadConfig } from "./config";
@@ -19,8 +20,48 @@ export interface AgentEscalationNote {
   "resume-error"?: string;
 }
 
+export type EditEscalationResult =
+  | { ok: true }
+  | {
+      ok: false;
+      kind: "vault-missing" | "bwrb-error";
+      error: string;
+    };
+
+let warnedMissingVault = false;
+
+function ensureVaultExists(vault: string): boolean {
+  if (vault && existsSync(vault)) return true;
+
+  if (!warnedMissingVault) {
+    warnedMissingVault = true;
+    console.error(
+      `[ralph:escalations] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
+        `Set it in ~/.config/opencode/ralph/ralph.json (key: bwrbVault).`
+    );
+  }
+
+  return false;
+}
+
+function formatBwrbShellError(e: unknown): string {
+  const err = e as any;
+  const parts: string[] = [];
+
+  if (err?.message) parts.push(String(err.message));
+
+  const stdout = err?.stdout?.toString?.() ?? err?.stdout;
+  const stderr = err?.stderr?.toString?.() ?? err?.stderr;
+
+  if (typeof stdout === "string" && stdout.trim()) parts.push(`stdout: ${stdout.trim()}`);
+  if (typeof stderr === "string" && stderr.trim()) parts.push(`stderr: ${stderr.trim()}`);
+
+  return parts.join("\n").trim() || String(e);
+}
+
 export async function getEscalationsByStatus(status: string): Promise<AgentEscalationNote[]> {
   const config = loadConfig();
+  if (!ensureVaultExists(config.bwrbVault)) return [];
 
   try {
     const result = await $`bwrb list agent-escalation --where "status == '${status}'" --output json`
@@ -36,16 +77,25 @@ export async function getEscalationsByStatus(status: string): Promise<AgentEscal
 export async function editEscalation(
   escalationPath: string,
   fields: Record<string, string>
-): Promise<boolean> {
+): Promise<EditEscalationResult> {
   const config = loadConfig();
+  if (!ensureVaultExists(config.bwrbVault)) {
+    return {
+      ok: false,
+      kind: "vault-missing",
+      error: `bwrbVault is missing or invalid: ${JSON.stringify(config.bwrbVault)}`,
+    };
+  }
+
   const json = JSON.stringify(fields);
 
   try {
     await $`bwrb edit --path ${escalationPath} --json ${json}`.cwd(config.bwrbVault).quiet();
-    return true;
+    return { ok: true };
   } catch (e) {
-    console.error(`[ralph:escalations] Failed to edit escalation ${escalationPath}:`, e);
-    return false;
+    const error = formatBwrbShellError(e);
+    const kind = /no notes found in vault/i.test(error) ? "vault-missing" : "bwrb-error";
+    return { ok: false, kind, error };
   }
 }
 
