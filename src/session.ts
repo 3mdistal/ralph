@@ -586,9 +586,11 @@ export async function continueSession(
       recentEventLimit?: number;
       context?: string;
     };
+    agent?: string;
   }
 ): Promise<SessionResult> {
-  return runSession(repoPath, message, { continueSession: sessionId, ...options });
+  const { agent, ...rest } = options ?? {};
+  return runSession(repoPath, message, { continueSession: sessionId, agent, ...rest });
 }
 
 /**

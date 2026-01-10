@@ -205,6 +205,11 @@ export interface EscalationContext {
     escalation_reason?: string | null;
     plan_summary?: string | null;
   };
+  devex?: {
+    consulted: boolean;
+    sessionId?: string;
+    summary?: string;
+  };
 }
 
 /**
@@ -301,6 +306,17 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
       `- **Decision:** ${ctx.routing.decision}`,
       ctx.routing.confidence ? `- **Confidence:** ${ctx.routing.confidence}` : "",
       ctx.routing.plan_summary ? `- **Plan Summary:** ${ctx.routing.plan_summary}` : "",
+      ""
+    );
+  }
+
+  // Add devex consultation if provided
+  if (ctx.devex?.consulted) {
+    bodyParts.push(
+      `## Devex Consult`,
+      "",
+      ctx.devex.sessionId ? `- **Session:** ${ctx.devex.sessionId}` : "",
+      ctx.devex.summary ? ctx.devex.summary : "(Devex consulted; no summary captured)",
       ""
     );
   }
