@@ -51,10 +51,22 @@ Or for development with auto-reload:
 bun dev
 ```
 
-### Check queue status
+### Check daemon status
 
 ```bash
 bun run status
+```
+
+Machine-readable output:
+
+```bash
+bun run status --json
+```
+
+Live updates (prints when status changes):
+
+```bash
+bun run watch
 ```
 
 ### Queue a task

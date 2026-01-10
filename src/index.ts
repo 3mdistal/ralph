@@ -22,6 +22,8 @@ import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { getRepoPath } from "./config";
 import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
+import { shouldLog } from "./logging";
+import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 
 // --- State ---
 
@@ -50,14 +52,18 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
   }
 
   if (tasks.length === 0) {
-    console.log("[ralph] No queued tasks");
+    if (shouldLog("daemon:no-queued", 30_000)) {
+      console.log("[ralph] No queued tasks");
+    }
     return;
   }
   
   // Filter out tasks already being processed
   const newTasks = tasks.filter(t => !inFlightTasks.has(getTaskKey(t)));
   if (newTasks.length === 0) {
-    console.log("[ralph] All queued tasks already in flight");
+    if (shouldLog("daemon:all-in-flight", 30_000)) {
+      console.log("[ralph] All queued tasks already in flight");
+    }
     return;
   }
   
@@ -118,6 +124,35 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
   
   // Wait for all tasks to start (not complete - they run in background)
   await Promise.allSettled(promises);
+}
+
+function formatTaskLabel(task: Pick<AgentTask, "name" | "issue" | "repo">): string {
+  const issueMatch = task.issue.match(/#(\d+)$/);
+  const issueNumber = issueMatch?.[1] ?? "?";
+  const repoShort = task.repo.includes("/") ? task.repo.split("/")[1] : task.repo;
+  return `${repoShort}#${issueNumber} ${task.name}`;
+}
+
+async function getTaskNowDoingLine(task: AgentTask): Promise<string> {
+  const sessionId = task["session-id"]?.trim();
+  const label = formatTaskLabel(task);
+
+  if (!sessionId) return `${label} — starting session…`;
+
+  const nowDoing = await getSessionNowDoing(sessionId);
+  if (!nowDoing) return `${label} — waiting (no events yet)`;
+
+  return formatNowDoingLine(nowDoing, label);
+}
+
+async function printHeartbeatTick(): Promise<void> {
+  const inProgress = await getTasksByStatus("in-progress");
+  if (inProgress.length === 0) return;
+
+  for (const task of inProgress) {
+    const line = await getTaskNowDoingLine(task);
+    console.log(`[ralph:hb] ${line}`);
+  }
 }
 
 async function resumeTasksOnStartup(): Promise<void> {
@@ -232,6 +267,29 @@ async function main(): Promise<void> {
       await processNewTasks(tasks);
     }
   });
+
+  const heartbeatIntervalMs = 5_000;
+  let heartbeatInFlight = false;
+
+  const heartbeatTimer = setInterval(() => {
+    if (isShuttingDown) return;
+
+    // Avoid hitting bwrb repeatedly when the daemon is idle.
+    const anyBusy = Array.from(workers.values()).some((w) => w.busy);
+    if (!anyBusy) return;
+
+    // Avoid overlapping ticks if bwrb/filesystem are slow.
+    if (heartbeatInFlight) return;
+    heartbeatInFlight = true;
+
+    printHeartbeatTick()
+      .catch(() => {
+        // ignore
+      })
+      .finally(() => {
+        heartbeatInFlight = false;
+      });
+  }, heartbeatIntervalMs);
   
   console.log("");
   console.log("[ralph] Daemon running. Watching for queue changes...");
@@ -249,6 +307,7 @@ async function main(): Promise<void> {
     // Stop accepting new tasks
     stopWatching();
     drainMonitor?.stop();
+    clearInterval(heartbeatTimer);
     
     // Wait for in-flight tasks
     if (inFlightTasks.size > 0) {
@@ -292,16 +351,114 @@ if (args[0] === "resume") {
 }
 
 if (args[0] === "status") {
-  // Quick status check
+  const json = args.includes("--json");
   const mode: DaemonMode = isDraining() ? "draining" : "running";
+
+  const [inProgress, queued] = await Promise.all([
+    getTasksByStatus("in-progress"),
+    getQueuedTasks(),
+  ]);
+
+  if (json) {
+    const inProgressWithStatus = await Promise.all(
+      inProgress.map(async (task) => {
+        const sessionId = task["session-id"]?.trim() || null;
+        const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
+        return {
+          name: task.name,
+          repo: task.repo,
+          issue: task.issue,
+          priority: task.priority ?? "p2-medium",
+          sessionId,
+          nowDoing,
+          line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
+        };
+      })
+    );
+
+    console.log(
+      JSON.stringify(
+        {
+          mode,
+          inProgress: inProgressWithStatus,
+          queued: queued.map((t) => ({
+            name: t.name,
+            repo: t.repo,
+            issue: t.issue,
+            priority: t.priority ?? "p2-medium",
+          })),
+        },
+        null,
+        2
+      )
+    );
+    process.exit(0);
+  }
+
   console.log(`Mode: ${mode}`);
 
-  const tasks = await getQueuedTasks();
-  console.log(`Queued tasks: ${tasks.length}`);
-  for (const task of tasks) {
+  console.log(`In-progress tasks: ${inProgress.length}`);
+  for (const task of inProgress) {
+    console.log(`  - ${await getTaskNowDoingLine(task)}`);
+  }
+
+  console.log(`Queued tasks: ${queued.length}`);
+  for (const task of queued) {
     console.log(`  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}]`);
   }
+
   process.exit(0);
+}
+
+if (args[0] === "watch") {
+  console.log("[ralph] Watching in-progress task status (Ctrl+C to stop)...");
+
+  const lastLines = new Map<string, string>();
+
+  const tick = async () => {
+    const tasks = await getTasksByStatus("in-progress");
+    const seen = new Set<string>();
+
+    for (const task of tasks) {
+      const key = getTaskKey(task);
+      seen.add(key);
+
+      const line = await getTaskNowDoingLine(task);
+      const prev = lastLines.get(key);
+      if (prev !== line) {
+        console.log(line);
+        lastLines.set(key, line);
+      }
+    }
+
+    for (const key of Array.from(lastLines.keys())) {
+      if (!seen.has(key)) {
+        console.log(`${key} — no longer in-progress`);
+        lastLines.delete(key);
+      }
+    }
+  };
+
+  await tick();
+
+  const timer = setInterval(() => {
+    tick().catch(() => {
+      // ignore
+    });
+  }, 1000);
+
+  const shutdown = () => {
+    clearInterval(timer);
+    process.exit(0);
+  };
+
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  // Keep process alive.
+  await new Promise(() => {
+    // intentional
+  });
 }
 
 if (args[0] === "rollup") {
