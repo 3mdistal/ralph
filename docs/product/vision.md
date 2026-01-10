@@ -24,6 +24,12 @@ When a model identifies a documentation gap, it must output an explicit, machine
 
 This keeps escalation detection deterministic and prevents accidental escalations from quoted text or fuzzy phrasing (e.g. “not documented”).
 
+## Related Product Docs
+
+- `docs/product/dashboard-mvp-control-plane-tui.md`
+- `docs/product/graceful-drain-rolling-restart.md`
+- `docs/product/opencode-usage-throttling.md`
+
 ## The Problem We're Solving
 
 The manual workflow is effective but repetitive:
