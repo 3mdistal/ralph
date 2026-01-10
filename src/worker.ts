@@ -6,7 +6,7 @@ import { homedir } from "os";
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { loadConfig, getRepoBotBranch } from "./config";
-import { runCommand, continueSession, continueCommand } from "./session";
+import { runCommand, continueSession, continueCommand, getRalphXdgCacheHome } from "./session";
 import { parseRoutingDecision, hasProductGap, extractPrUrl, type RoutingDecision } from "./routing";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 
@@ -190,6 +190,9 @@ export class RepoWorker {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
 
+    const issueMatch = task.issue.match(/#(\d+)$/);
+    const cacheKey = issueMatch?.[1] ?? task._name;
+
     const existingSessionId = task["session-id"]?.trim();
     if (!existingSessionId) {
       const reason = "In-progress task has no session-id; cannot resume";
@@ -207,7 +210,10 @@ export class RepoWorker {
         "Resume from where you left off. " +
         `If you already created a PR, paste the PR URL. Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
 
-      let buildResult = await continueSession(this.repoPath, existingSessionId, resumeMessage);
+      let buildResult = await continueSession(this.repoPath, existingSessionId, resumeMessage, {
+        repo: this.repo,
+        cacheKey,
+      });
       if (!buildResult.success) {
         const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
@@ -284,7 +290,8 @@ export class RepoWorker {
           buildResult = await continueSession(
             this.repoPath,
             buildResult.sessionId,
-            "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step."
+            "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
+            { repo: this.repo, cacheKey }
           );
 
           lastAnomalyCount = anomalyStatus.total;
@@ -301,7 +308,7 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
         );
 
-        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.");
+        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.", { repo: this.repo, cacheKey });
         if (!buildResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
           break;
@@ -339,14 +346,18 @@ export class RepoWorker {
       const mergeResult = await continueSession(
         this.repoPath,
         buildResult.sessionId,
-        "Looks good. Merge the PR and clean up the worktree."
+        "Looks good. Merge the PR and clean up the worktree.",
+        { repo: this.repo, cacheKey }
       );
       if (!mergeResult.success) {
         console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
       }
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(this.repoPath, buildResult.sessionId, "survey");
+      const surveyResult = await continueCommand(this.repoPath, buildResult.sessionId, "survey", [], {
+        repo: this.repo,
+        cacheKey,
+      });
 
       const endTime = new Date();
       await this.createAgentRun(task, {
@@ -362,6 +373,9 @@ export class RepoWorker {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
       });
+
+      // Cleanup per-task OpenCode cache on success
+      await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
 
       console.log(`[ralph:worker:${this.repo}] Task resumed to completion: ${task.name}`);
 
@@ -408,6 +422,7 @@ export class RepoWorker {
       const issueMatch = task.issue.match(/#(\d+)$/);
       if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
       const issueNumber = issueMatch[1];
+      const cacheKey = issueNumber;
 
       // 3. Fetch issue labels to adjust escalation sensitivity
       const issueLabels = await this.getIssueLabels(task.issue);
@@ -417,8 +432,30 @@ export class RepoWorker {
       
       // 4. Run configured command: next-task
       console.log(`[ralph:worker:${this.repo}] Running /next-task ${issueNumber}`);
-      const planResult = await runCommand(this.repoPath, "next-task", [issueNumber]);
-      if (!planResult.success) throw new Error(`/next-task failed: ${planResult.output}`);
+
+      // Transient OpenCode cache races can cause ENOENT during module imports (e.g. zod locales).
+      // With per-run cache isolation this should be rare, but we still retry once for robustness.
+      const isTransientCacheENOENT = (output: string) =>
+        /ENOENT\s+reading\s+"[^"]*\/opencode\/node_modules\//.test(output) ||
+        /ENOENT\s+reading\s+"[^"]*zod\/v4\/locales\//.test(output);
+
+      let planResult = await runCommand(this.repoPath, "next-task", [issueNumber], {
+        repo: this.repo,
+        cacheKey,
+      });
+
+      if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
+        console.warn(`[ralph:worker:${this.repo}] /next-task hit transient cache ENOENT; retrying once...`);
+        await new Promise((r) => setTimeout(r, 750));
+        planResult = await runCommand(this.repoPath, "next-task", [issueNumber], {
+          repo: this.repo,
+          cacheKey,
+        });
+      }
+
+      if (!planResult.success) {
+        throw new Error(`/next-task failed: ${planResult.output}`);
+      }
 
       // Persist OpenCode session ID for crash recovery
       if (planResult.sessionId) {
@@ -485,7 +522,10 @@ export class RepoWorker {
       const botBranch = getRepoBotBranch(this.repo);
       const proceedMessage = `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
 
-      let buildResult = await continueSession(this.repoPath, planResult.sessionId, proceedMessage);
+      let buildResult = await continueSession(this.repoPath, planResult.sessionId, proceedMessage, {
+        repo: this.repo,
+        cacheKey,
+      });
       if (!buildResult.success) throw new Error(`Build failed: ${buildResult.output}`);
 
       // Keep the latest session ID persisted
@@ -545,7 +585,8 @@ export class RepoWorker {
           buildResult = await continueSession(
             this.repoPath,
             buildResult.sessionId,
-            "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step."
+            "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
+            { repo: this.repo, cacheKey }
           );
           
           // Reset anomaly tracking for fresh window
@@ -560,7 +601,7 @@ export class RepoWorker {
         continueAttempts++;
         console.log(`[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`);
         
-        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.");
+        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.", { repo: this.repo, cacheKey });
         if (!buildResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
           break;
@@ -601,7 +642,8 @@ export class RepoWorker {
         const mergeResult = await continueSession(
           this.repoPath,
           buildResult.sessionId,
-          "Looks good. Merge the PR and clean up the worktree."
+          "Looks good. Merge the PR and clean up the worktree.",
+          { repo: this.repo, cacheKey }
         );
         if (!mergeResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
@@ -610,7 +652,10 @@ export class RepoWorker {
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(this.repoPath, buildResult.sessionId, "survey");
+      const surveyResult = await continueCommand(this.repoPath, buildResult.sessionId, "survey", [], {
+        repo: this.repo,
+        cacheKey,
+      });
 
       // 10. Create agent-run note
       const endTime = new Date();
@@ -629,7 +674,10 @@ export class RepoWorker {
         "session-id": "",
       });
 
-      // 12. Send desktop notification for completion
+      // 12. Cleanup per-task OpenCode cache on success
+      await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+
+      // 13. Send desktop notification for completion
       await notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
 
       console.log(`[ralph:worker:${this.repo}] Task completed: ${task.name}`);
