@@ -14,6 +14,16 @@ Ralph Loop is an autonomous orchestration layer that manages a queue of coding t
 
 Everything else should proceed autonomously.
 
+## Escalation Markers
+
+When a model identifies a documentation gap, it must output an explicit, machine-parseable marker.
+
+- **Product gap (positive):** a line starting with `PRODUCT GAP:` (case-insensitive), optionally bullet-prefixed (`- ` or `* `).
+- **Product gap (negative):** a line starting with `NO PRODUCT GAP:` (case-insensitive), optionally bullet-prefixed.
+- **Not a marker:** `PRODUCT GAP` without a trailing `:` or mentions mid-line (e.g. `Here is the marker: PRODUCT GAP: ...`).
+
+This keeps escalation detection deterministic and prevents accidental escalations from quoted text or fuzzy phrasing (e.g. “not documented”).
+
 ## The Problem We're Solving
 
 The manual workflow is effective but repetitive:

@@ -271,11 +271,19 @@ export class RepoWorker {
       const resumeMessage =
         "Ralph restarted while this task was in progress. " +
         "Resume from where you left off. " +
-        `If you already created a PR, paste the PR URL. Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
+        "If you already created a PR, paste the PR URL. " +
+        `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
 
       let buildResult = await continueSession(this.repoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
         cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 4,
+          stepTitle: "resume",
+        },
         ...this.buildWatchdogOptions(task, "resume"),
       });
       if (!buildResult.success) {
@@ -359,7 +367,18 @@ export class RepoWorker {
             this.repoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
-            { repo: this.repo, cacheKey, ...this.buildWatchdogOptions(task, "resume-loop-break") }
+            {
+              repo: this.repo,
+              cacheKey,
+              introspection: {
+                repo: this.repo,
+                issue: task.issue,
+                taskName: task.name,
+                step: 4,
+                stepTitle: "resume loop-break",
+              },
+              ...this.buildWatchdogOptions(task, "resume-loop-break"),
+            }
           );
 
           if (!buildResult.success) {
@@ -381,7 +400,17 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
         );
 
-        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.", { repo: this.repo, cacheKey });
+        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.", {
+          repo: this.repo,
+          cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 4,
+            stepTitle: "continue",
+          },
+        });
         if (!buildResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
           break;
@@ -420,7 +449,18 @@ export class RepoWorker {
         this.repoPath,
         buildResult.sessionId,
         "Looks good. Merge the PR and clean up the worktree.",
-        { repo: this.repo, cacheKey, ...this.buildWatchdogOptions(task, "resume-merge") }
+        {
+          repo: this.repo,
+          cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 5,
+            stepTitle: "merge",
+          },
+          ...this.buildWatchdogOptions(task, "resume-merge"),
+        }
       );
       if (!mergeResult.success) {
         if (mergeResult.watchdogTimeout) {
@@ -525,6 +565,13 @@ export class RepoWorker {
       let planResult = await runCommand(this.repoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 1,
+          stepTitle: "next-task",
+        },
         ...this.buildWatchdogOptions(task, "next-task"),
       });
 
@@ -538,6 +585,13 @@ export class RepoWorker {
         planResult = await runCommand(this.repoPath, "next-task", [issueNumber], {
           repo: this.repo,
           cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 1,
+            stepTitle: "next-task (retry)",
+          },
           ...this.buildWatchdogOptions(task, "next-task-retry"),
         });
       }
@@ -573,7 +627,18 @@ export class RepoWorker {
           "Return a short, actionable summary.",
         ].join("\n");
 
-        const devexResult = await continueSession(this.repoPath, baseSessionId, devexPrompt, { agent: "devex" });
+        const devexResult = await continueSession(this.repoPath, baseSessionId, devexPrompt, {
+          agent: "devex",
+          repo: this.repo,
+          cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 2,
+            stepTitle: "consult devex",
+          },
+        });
         if (!devexResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
           devexContext = {
@@ -603,7 +668,17 @@ export class RepoWorker {
             devexSummary || devexResult.output,
           ].join("\n");
 
-          const rerouteResult = await continueSession(this.repoPath, baseSessionId, reroutePrompt);
+          const rerouteResult = await continueSession(this.repoPath, baseSessionId, reroutePrompt, {
+            repo: this.repo,
+            cacheKey,
+            introspection: {
+              repo: this.repo,
+              issue: task.issue,
+              taskName: task.name,
+              step: 3,
+              stepTitle: "reroute after devex",
+            },
+          });
           if (!rerouteResult.success) {
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
@@ -684,6 +759,13 @@ export class RepoWorker {
       let buildResult = await continueSession(this.repoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 4,
+          stepTitle: "build",
+        },
         ...this.buildWatchdogOptions(task, "build"),
       });
       if (!buildResult.success) {
@@ -751,7 +833,18 @@ export class RepoWorker {
             this.repoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
-            { repo: this.repo, cacheKey, ...this.buildWatchdogOptions(task, "build-loop-break") }
+            {
+              repo: this.repo,
+              cacheKey,
+              introspection: {
+                repo: this.repo,
+                issue: task.issue,
+                taskName: task.name,
+                step: 4,
+                stepTitle: "build loop-break",
+              },
+              ...this.buildWatchdogOptions(task, "build-loop-break"),
+            }
           );
 
           if (!buildResult.success) {
@@ -773,6 +866,13 @@ export class RepoWorker {
         buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.", {
           repo: this.repo,
           cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 4,
+            stepTitle: "build continue",
+          },
           ...this.buildWatchdogOptions(task, "build-continue"),
         });
         if (!buildResult.success) {
@@ -820,7 +920,18 @@ export class RepoWorker {
           this.repoPath,
           buildResult.sessionId,
           "Looks good. Merge the PR and clean up the worktree.",
-          { repo: this.repo, cacheKey, ...this.buildWatchdogOptions(task, "merge") }
+          {
+            repo: this.repo,
+            cacheKey,
+            introspection: {
+              repo: this.repo,
+              issue: task.issue,
+              taskName: task.name,
+              step: 5,
+              stepTitle: "merge",
+            },
+            ...this.buildWatchdogOptions(task, "merge"),
+          }
         );
         if (!mergeResult.success) {
           if (mergeResult.watchdogTimeout) {
@@ -835,6 +946,13 @@ export class RepoWorker {
       const surveyResult = await continueCommand(this.repoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 6,
+          stepTitle: "survey",
+        },
         ...this.buildWatchdogOptions(task, "survey"),
       });
 
