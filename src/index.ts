@@ -243,6 +243,8 @@ async function main(): Promise<void> {
   });
 
   const heartbeatIntervalMs = 5_000;
+  let heartbeatInFlight = false;
+
   const heartbeatTimer = setInterval(() => {
     if (isShuttingDown) return;
 
@@ -250,9 +252,17 @@ async function main(): Promise<void> {
     const anyBusy = Array.from(workers.values()).some((w) => w.busy);
     if (!anyBusy) return;
 
-    printHeartbeatTick().catch(() => {
-      // ignore
-    });
+    // Avoid overlapping ticks if bwrb/filesystem are slow.
+    if (heartbeatInFlight) return;
+    heartbeatInFlight = true;
+
+    printHeartbeatTick()
+      .catch(() => {
+        // ignore
+      })
+      .finally(() => {
+        heartbeatInFlight = false;
+      });
   }, heartbeatIntervalMs);
   
   console.log("");
