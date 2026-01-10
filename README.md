@@ -12,6 +12,16 @@ Ralph watches for `agent-task` notes in a bwrb vault and dispatches them to Open
 - **Anomaly detection** catches agents stuck in loops
 - **Introspection logging** for debugging agent behavior
 
+## Operator dashboard (planned)
+
+Ralph’s control plane (operator dashboard) is **operator tooling** (not a user-facing UI): a local, token-authenticated API that publishes structured events, with a TUI as the first client.
+
+- Local-only by default (binds `127.0.0.1`) and requires `Authorization: Bearer <token>` on all endpoints; no built-in TLS.
+- Single-user, local-machine threat model; not hardened for hostile networks.
+- Remote access is via SSH port-forwarding or your own proxy.
+- Canonical spec: `docs/product/dashboard-mvp-control-plane-tui.md`
+- Issue map: https://github.com/3mdistal/ralph/issues/22 (MVP epic) and https://github.com/3mdistal/ralph/issues/23 (docs/scope)
+
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.0.0
