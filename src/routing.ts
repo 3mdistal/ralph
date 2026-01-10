@@ -100,15 +100,11 @@ function normalizeDecision(obj: Record<string, any>): RoutingDecision | null {
  */
 export function hasProductGap(output: string): boolean {
   // IMPORTANT: Keep this conservative.
-  // The planner often quotes product docs that mention "documentation gaps" as a general concept.
-  // We only want to treat *explicit* statements of a missing policy/spec as a product gap.
-  const gapIndicators = [
-    /\bPRODUCT\s*GAP\b/i,
-    /product\s*docs?\s*(don't|do\s*not|doesn't|cannot)\s*(address|specify|define)/i,
-    /\bnot\s*documented\b/i,
-  ];
+  // Only treat an explicit marker as a product gap (no fuzzy heuristics).
+  // This must never match "NO PRODUCT GAP:".
+  const productGapMarker = /^\s*(?:[-*]\s+)?PRODUCT\s+GAP\s*:/im;
 
-  return gapIndicators.some((regex) => regex.test(output));
+  return productGapMarker.test(output);
 }
 
 /**
