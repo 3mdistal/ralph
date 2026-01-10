@@ -533,9 +533,24 @@ export async function runSession(
   }
 
   if (exitCode !== 0) {
-    const combined = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n\n");
-    const enriched = await appendOpencodeLogTail(combined || `Failed with exit code ${exitCode}`);
-    return { sessionId: "", output: enriched, success: false, exitCode };
+    // Avoid dumping full stdout on failures: in JSON mode it can be extremely verbose.
+    // Prefer stderr + bounded recent events (and preserve sessionId for debugging).
+    const combinedRaw = [stderr, stdout].filter(Boolean).join("\n");
+    const logPath = extractOpencodeLogPath(combinedRaw);
+
+    const header = `Failed with exit code ${exitCode}`;
+    const err = stderr.trim() ? sanitizeOpencodeLog(stderr.trim()) : "";
+    const text = textOutput.trim() ? sanitizeOpencodeLog(textOutput.trim()) : "";
+
+    const recent = recentEvents.length
+      ? ["Recent OpenCode events (bounded):", ...recentEvents.map((l) => `- ${l}`)].join("\n")
+      : "";
+
+    const logHint = logPath ? `check log file at ${logPath}` : "";
+
+    const combined = [header, err, logHint, text, recent].filter(Boolean).join("\n\n");
+    const enriched = await appendOpencodeLogTail(combined);
+    return { sessionId, output: enriched, success: false, exitCode };
   }
 
   const raw = stdout.toString();
