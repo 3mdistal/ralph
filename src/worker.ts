@@ -8,7 +8,13 @@ import { type AgentTask, updateTaskStatus } from "./queue";
 import { loadConfig, getRepoBotBranch } from "./config";
 import { runCommand, continueSession, continueCommand, getRalphXdgCacheHome, type SessionResult } from "./session";
 import { parseRoutingDecision, hasProductGap, extractPrUrl, type RoutingDecision } from "./routing";
-import { isImplementationTaskFromIssue, shouldConsultDevex, shouldEscalateAfterRouting, type IssueMetadata } from "./escalation";
+import {
+  isExplicitBlockerReason,
+  isImplementationTaskFromIssue,
+  shouldConsultDevex,
+  shouldEscalateAfterRouting,
+  type IssueMetadata,
+} from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 
 // Ralph introspection logs location
@@ -153,22 +159,14 @@ export class RepoWorker {
   }
 
   /**
-   * Determine if we should escalate based on routing decision and task type.
-   * Implementation tasks (dx, refactor, bug) get more lenient treatment.
+   * Determine if we should escalate based on routing decision.
    */
   private shouldEscalate(
     routing: RoutingDecision | null,
     hasGap: boolean,
     isImplementationTask: boolean
   ): boolean {
-    const shouldEscalate = shouldEscalateAfterRouting({ routing, hasGap, isImplementationTask });
-
-    // Preserve the existing audit log when ignoring product gaps for implementation tasks.
-    if (isImplementationTask && hasGap && routing && routing.decision !== "escalate") {
-      console.log(`[ralph:worker:${this.repo}] Ignoring product gap for implementation task`);
-    }
-
-    return shouldEscalate;
+    return shouldEscalateAfterRouting({ routing, hasGap });
   }
 
   private getWatchdogRetryCount(task: AgentTask): number {
@@ -628,19 +626,23 @@ export class RepoWorker {
       
       if (shouldEscalate) {
         const reason =
-          routing?.escalation_reason || (hasGap ? "Product documentation gap identified" : "Low confidence in plan");
+          routing?.escalation_reason ||
+          (hasGap
+            ? "Product documentation gap identified"
+            : routing?.decision === "escalate" && routing?.confidence === "high"
+              ? "High-confidence escalation requested"
+              : "Escalation requested");
 
         // Determine escalation type
         let escalationType: EscalationContext["escalationType"] = "other";
         if (hasGap) {
           escalationType = "product-gap";
-        } else if (routing?.confidence === "low") {
-          escalationType = "low-confidence";
+        } else if (isExplicitBlockerReason(routing?.escalation_reason)) {
+          escalationType = "blocked";
         } else if (routing?.escalation_reason?.toLowerCase().includes("ambiguous")) {
           escalationType = "ambiguous-requirements";
-        } else if (routing?.escalation_reason?.toLowerCase().includes("blocked")) {
-          escalationType = "blocked";
         }
+
 
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 

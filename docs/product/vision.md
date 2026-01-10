@@ -52,7 +52,9 @@ The system should bias toward proceeding, not asking. Escalate only when:
 - Requirements are ambiguous and can't be resolved from context
 - External blockers prevent progress
 
-Implementation tasks (dx, refactor, bug) should almost never escalate on low-level details like error message wording.
+Most tasks should be treated as "implementation-ish" and proceed autonomously unless explicitly labeled `product`, `ux`, or `breaking-change` (labels increase escalation sensitivity; absence should not).
+
+Implementation-ish tasks (including `dx`, `refactor`, `bug`) should almost never escalate on low-level details like error message wording.
 
 ### 4. Session Persistence
 
