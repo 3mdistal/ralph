@@ -132,6 +132,10 @@ function sanitizeOpencodeLog(text: string): string {
     out = out.replace(re, replacement);
   }
 
+  // Avoid leaking local usernames in diagnostics.
+  const home = homedir();
+  if (home) out = out.split(home).join("~");
+
   return out;
 }
 
