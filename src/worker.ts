@@ -6,7 +6,7 @@ import { homedir } from "os";
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { loadConfig, getRepoBotBranch } from "./config";
-import { runCommand, continueSession, continueCommand } from "./session";
+import { runCommand, continueSession, continueCommand, getRalphXdgCacheHome } from "./session";
 import { parseRoutingDecision, hasProductGap, extractPrUrl, type RoutingDecision } from "./routing";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 
@@ -374,6 +374,9 @@ export class RepoWorker {
         "session-id": "",
       });
 
+      // Cleanup per-task OpenCode cache on success
+      await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+
       console.log(`[ralph:worker:${this.repo}] Task resumed to completion: ${task.name}`);
 
       return {
@@ -671,7 +674,10 @@ export class RepoWorker {
         "session-id": "",
       });
 
-      // 12. Send desktop notification for completion
+      // 12. Cleanup per-task OpenCode cache on success
+      await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+
+      // 13. Send desktop notification for completion
       await notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
 
       console.log(`[ralph:worker:${this.repo}] Task completed: ${task.name}`);

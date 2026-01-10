@@ -89,6 +89,32 @@ function extractOpencodeLogPath(text: string): string | null {
   return match?.[1] ?? null;
 }
 
+function sanitizeOpencodeLog(text: string): string {
+  // Strip ANSI escape codes.
+  let out = text.replace(/\x1b\[[0-9;]*m/g, "");
+
+  // Best-effort redaction. This is intentionally conservative and may miss some secrets,
+  // but it helps reduce accidental leakage in error notes.
+  const patterns: Array<{ re: RegExp; replacement: string }> = [
+    { re: /ghp_[A-Za-z0-9]{20,}/g, replacement: "ghp_[REDACTED]" },
+    { re: /github_pat_[A-Za-z0-9_]{20,}/g, replacement: "github_pat_[REDACTED]" },
+    { re: /sk-[A-Za-z0-9]{20,}/g, replacement: "sk-[REDACTED]" },
+    { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "xox-[REDACTED]" },
+    { re: /(Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
+    { re: /(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
+  ];
+
+  for (const { re, replacement } of patterns) {
+    out = out.replace(re, replacement);
+  }
+
+  return out;
+}
+
+export function getRalphXdgCacheHome(repo: string, cacheKey: string): string {
+  return getIsolatedXdgCacheHome({ repo, cacheKey });
+}
+
 async function appendOpencodeLogTail(output: string): Promise<string> {
   const logPath = extractOpencodeLogPath(output);
   if (!logPath) return output;
@@ -96,7 +122,9 @@ async function appendOpencodeLogTail(output: string): Promise<string> {
   try {
     const raw = await readFile(logPath, "utf8");
     const lines = raw.split("\n");
-    const tail = lines.slice(Math.max(0, lines.length - 200)).join("\n");
+    const tailLines = lines.slice(Math.max(0, lines.length - 200));
+    const tail = sanitizeOpencodeLog(tailLines.join("\n")).slice(0, 20000);
+
     return [
       output.trimEnd(),
       "",
@@ -108,7 +136,7 @@ async function appendOpencodeLogTail(output: string): Promise<string> {
       "",
     ].join("\n");
   } catch (e: any) {
-    const message = e?.message ?? String(e);
+    const message = sanitizeOpencodeLog(e?.message ?? String(e));
     return [
       output.trimEnd(),
       "",
