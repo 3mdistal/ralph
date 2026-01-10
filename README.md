@@ -63,8 +63,8 @@ bun run status
 ralph nudge <taskRef> "Just implement it, stop asking questions"
 ```
 
-- Best-effort queued delivery: if the session is currently running, Ralph queues the message and delivers it at the next safe checkpoint.
-- Success means delivery attempt succeeded (session found + `continueSession(...)` call succeeded), not guaranteed agent compliance.
+- Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
+- Success means the delivery attempt succeeded, not guaranteed agent compliance.
 
 ### Queue a task
 

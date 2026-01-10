@@ -2,7 +2,6 @@ import { $ } from "bun";
 import { appendFile, readFile, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { isAbsolute, join } from "path";
-import { homedir } from "os";
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { loadConfig, getRepoBotBranch } from "./config";
@@ -17,9 +16,10 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
+import { getRalphSessionsDir } from "./paths";
 
 // Ralph introspection logs location
-const RALPH_SESSIONS_DIR = join(homedir(), ".ralph", "sessions");
+const RALPH_SESSIONS_DIR = getRalphSessionsDir();
 
 // Anomaly detection thresholds
 const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected

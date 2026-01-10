@@ -1,9 +1,9 @@
-import { appendFile, mkdir, readFile } from "fs/promises";
+import { appendFile, mkdir, open, readFile, rm, stat } from "fs/promises";
 import { existsSync } from "fs";
 import { randomUUID } from "crypto";
-import { dirname } from "path";
+import { dirname, join } from "path";
 
-import { getRalphSessionNudgesPath } from "./paths";
+import { getRalphSessionDir, getRalphSessionNudgesPath } from "./paths";
 
 export interface PendingNudge {
   id: string;
@@ -43,6 +43,54 @@ function safeJsonParse(line: string): any | null {
 function truncate(value: string, max = 800): string {
   const trimmed = value.trim();
   return trimmed.length > max ? trimmed.slice(0, max) + "…" : trimmed;
+}
+
+const DRAIN_LOCK_TTL_MS = 10 * 60_000;
+
+async function acquireDrainLock(sessionId: string): Promise<(() => Promise<void>) | null> {
+  const lockPath = join(getRalphSessionDir(sessionId), "nudges.drain.lock");
+  await mkdir(dirname(lockPath), { recursive: true });
+
+  const tryCreate = async (): Promise<(() => Promise<void>) | null> => {
+    try {
+      const handle = await open(lockPath, "wx");
+      try {
+        await handle.writeFile(
+          JSON.stringify({ ts: Date.now(), pid: process.pid, sessionId }) + "\n",
+          "utf8"
+        );
+      } finally {
+        await handle.close();
+      }
+
+      return async () => {
+        try {
+          await rm(lockPath, { force: true });
+        } catch {
+          // ignore
+        }
+      };
+    } catch (e: any) {
+      if (e?.code !== "EEXIST") return null;
+      return null;
+    }
+  };
+
+  const created = await tryCreate();
+  if (created) return created;
+
+  // Best-effort stale lock cleanup.
+  try {
+    const st = await stat(lockPath);
+    if (Date.now() - st.mtimeMs > DRAIN_LOCK_TTL_MS) {
+      await rm(lockPath, { force: true });
+      return await tryCreate();
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
 }
 
 async function appendEvent(sessionId: string, event: NudgeEvent): Promise<void> {
@@ -154,23 +202,30 @@ export async function drainQueuedNudges(
   deliver: (message: string) => Promise<{ success: boolean; error?: string }>,
   opts?: { maxAttempts?: number }
 ): Promise<DrainResult> {
-  const maxAttempts = opts?.maxAttempts ?? 3;
-  const pending = await getPendingNudges(sessionId, maxAttempts);
+  const release = await acquireDrainLock(sessionId);
+  if (!release) return { attempted: 0, delivered: 0, stoppedOnError: false };
 
-  let attempted = 0;
-  let delivered = 0;
+  try {
+    const maxAttempts = opts?.maxAttempts ?? 3;
+    const pending = await getPendingNudges(sessionId, maxAttempts);
 
-  for (const nudge of pending) {
-    attempted++;
-    const result = await deliver(nudge.message);
-    await recordDeliveryAttempt(sessionId, nudge.id, result);
+    let attempted = 0;
+    let delivered = 0;
 
-    if (!result.success) {
-      return { attempted, delivered, stoppedOnError: true };
+    for (const nudge of pending) {
+      attempted++;
+      const result = await deliver(nudge.message);
+      await recordDeliveryAttempt(sessionId, nudge.id, result);
+
+      if (!result.success) {
+        return { attempted, delivered, stoppedOnError: true };
+      }
+
+      delivered++;
     }
 
-    delivered++;
+    return { attempted, delivered, stoppedOnError: false };
+  } finally {
+    await release();
   }
-
-  return { attempted, delivered, stoppedOnError: false };
 }
