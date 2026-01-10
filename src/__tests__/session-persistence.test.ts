@@ -51,6 +51,14 @@ describe("Session Persistence", () => {
       const taskWithWorktree = createMockTask({ "worktree-path": "/tmp/worktree-1" });
       expect(taskWithWorktree["worktree-path"]).toBe("/tmp/worktree-1");
     });
+
+    test("watchdog-retries field is optional", () => {
+      const taskWithoutRetries = createMockTask();
+      expect(taskWithoutRetries["watchdog-retries"]).toBeUndefined();
+
+      const taskWithRetries = createMockTask({ "watchdog-retries": "1" });
+      expect(taskWithRetries["watchdog-retries"]).toBe("1");
+    });
   });
 
   describe("Task categorization logic", () => {
@@ -123,19 +131,19 @@ describe("Session Persistence", () => {
       expect(completedTask["session-id"]).toBe("");
     });
 
-    test("session-id should be cleared on task escalation", () => {
+    test("session-id should be preserved on task escalation", () => {
       const task = createMockTask({
         status: "in-progress",
         "session-id": "ses_abc123"
       });
 
-      // Simulate escalation - session-id implicitly cleared via status change
       const escalatedTask = {
         ...task,
         status: "escalated" as const,
       };
 
       expect(escalatedTask.status).toBe("escalated");
+      expect(escalatedTask["session-id"]).toBe("ses_abc123");
     });
   });
 

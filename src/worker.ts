@@ -2,20 +2,27 @@ import { $ } from "bun";
 import { appendFile, mkdir, readFile, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { dirname, isAbsolute, join } from "path";
-import { homedir } from "os";
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
-import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand } from "./session";
+import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { extractPrUrl, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
-import { isImplementationTaskFromIssue, shouldConsultDevex, shouldEscalateAfterRouting, type IssueMetadata } from "./escalation";
+import {
+  isExplicitBlockerReason,
+  isImplementationTaskFromIssue,
+  shouldConsultDevex,
+  shouldEscalateAfterRouting,
+  type IssueMetadata,
+} from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
+import { drainQueuedNudges } from "./nudge";
+import { getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
 
 // Ralph introspection logs location
-const RALPH_SESSIONS_DIR = join(homedir(), ".ralph", "sessions");
+const RALPH_SESSIONS_DIR = getRalphSessionsDir();
 
 // Git worktrees for per-task repo isolation
-const RALPH_WORKTREES_DIR = join(homedir(), ".ralph", "worktrees");
+const RALPH_WORKTREES_DIR = getRalphWorktreesDir();
 
 // Anomaly detection thresholds
 const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
@@ -237,25 +244,125 @@ export class RepoWorker {
   }
 
   /**
-   * Determine if we should escalate based on routing decision and task type.
-   * Implementation tasks (dx, refactor, bug) get more lenient treatment.
+   * Determine if we should escalate based on routing decision.
    */
   private shouldEscalate(
     routing: RoutingDecision | null,
     hasGap: boolean,
     isImplementationTask: boolean
   ): boolean {
-    const shouldEscalate = shouldEscalateAfterRouting({ routing, hasGap, isImplementationTask });
-
-    // Preserve the existing audit log when ignoring product gaps for implementation tasks.
-    if (isImplementationTask && hasGap && routing && routing.decision !== "escalate") {
-      console.log(`[ralph:worker:${this.repo}] Ignoring product gap for implementation task`);
-    }
-
-    return shouldEscalate;
+    return shouldEscalateAfterRouting({ routing, hasGap });
   }
 
-  async resumeTask(task: AgentTask): Promise<AgentRun> {
+  private getWatchdogRetryCount(task: AgentTask): number {
+    const raw = task["watchdog-retries"];
+    const parsed = Number.parseInt(String(raw ?? "0"), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
+  private buildWatchdogOptions(task: AgentTask, stage: string) {
+    const cfg = loadConfig().watchdog;
+    const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
+
+    return {
+      watchdog: {
+        enabled: cfg?.enabled ?? true,
+        thresholdsMs: cfg?.thresholdsMs,
+        softLogIntervalMs: cfg?.softLogIntervalMs,
+        recentEventLimit: cfg?.recentEventLimit,
+        context,
+      },
+    };
+  }
+
+  private async drainNudges(task: AgentTask, repoPath: string, sessionId: string, cacheKey: string, stage: string): Promise<void> {
+    const sid = sessionId?.trim();
+    if (!sid) return;
+
+    try {
+      const result = await drainQueuedNudges(sid, async (message) => {
+        const res = await continueSession(repoPath, sid, message, {
+          repo: this.repo,
+          cacheKey,
+          ...this.buildWatchdogOptions(task, `nudge-${stage}`),
+        });
+        return { success: res.success, error: res.success ? undefined : res.output };
+      });
+
+      if (result.attempted > 0) {
+        const suffix = result.stoppedOnError ? " (stopped on error)" : "";
+        console.log(
+          `[ralph:worker:${this.repo}] Delivered ${result.delivered}/${result.attempted} queued nudge(s)${suffix}`
+        );
+      }
+    } catch (e: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to drain nudges: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  private async handleWatchdogTimeout(task: AgentTask, cacheKey: string, stage: string, result: SessionResult): Promise<AgentRun> {
+    const timeout = result.watchdogTimeout;
+    const retryCount = this.getWatchdogRetryCount(task);
+    const nextRetryCount = retryCount + 1;
+
+    const reason = timeout
+      ? `Tool call timed out: ${timeout.toolName} ${timeout.callId} after ${Math.round(timeout.elapsedMs / 1000)}s (${stage})`
+      : `Tool call timed out (${stage})`;
+
+    // Cleanup per-task OpenCode cache on watchdog timeouts (best-effort)
+    try {
+      await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+
+    if (retryCount === 0) {
+      console.warn(`[ralph:worker:${this.repo}] Watchdog hard timeout; re-queuing once for recovery: ${reason}`);
+      await updateTaskStatus(task, "queued", {
+        "session-id": "",
+        "watchdog-retries": String(nextRetryCount),
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: result.sessionId || undefined,
+        escalationReason: reason,
+      };
+    }
+
+    console.log(`[ralph:worker:${this.repo}] Watchdog hard timeout repeated; escalating: ${reason}`);
+
+    const escalationFields: Record<string, string> = {
+      "watchdog-retries": String(nextRetryCount),
+    };
+    if (result.sessionId) escalationFields["session-id"] = result.sessionId;
+
+    await updateTaskStatus(task, "escalated", escalationFields);
+
+    await notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
+      reason,
+      escalationType: "other",
+      planOutput: result.output,
+    });
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: result.sessionId || undefined,
+      escalationReason: reason,
+    };
+  }
+
+  async resumeTask(task: AgentTask, opts?: { resumeMessage?: string }): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
 
@@ -276,34 +383,41 @@ export class RepoWorker {
 
     try {
       const botBranch = getRepoBotBranch(this.repo);
-      const resumeMessage =
+      const defaultResumeMessage =
         "Ralph restarted while this task was in progress. " +
         "Resume from where you left off. " +
-        `If you already created a PR, paste the PR URL. Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
+        "If you already created a PR, paste the PR URL. " +
+        `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
+
+      const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
 
       let buildResult = await continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
         cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 4,
+          stepTitle: "resume",
+        },
+        ...this.buildWatchdogOptions(task, "resume"),
       });
       if (!buildResult.success) {
-        const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
-        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+        if (buildResult.watchdogTimeout) {
+          return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult);
+        }
 
-        await updateTaskStatus(task, "escalated");
-        await notifyEscalation({
-          taskName: task.name,
-          taskFileName: task._name,
-          taskPath: task._path,
-          issue: task.issue,
-          repo: this.repo,
-          reason,
-          escalationType: "other",
-        });
+        const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
+        console.warn(`[ralph:worker:${this.repo}] Resume failed; falling back to fresh run: ${reason}`);
+
+        // Fall back to a fresh run by clearing session-id and re-queueing.
+        await updateTaskStatus(task, "queued", { "session-id": "" });
 
         return {
           taskName: task.name,
           repo: this.repo,
-          outcome: "escalated",
+          outcome: "failed",
           sessionId: existingSessionId,
           escalationReason: reason,
         };
@@ -313,6 +427,8 @@ export class RepoWorker {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
+        await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
       let prUrl = extractPrUrl(buildResult.output);
@@ -321,6 +437,8 @@ export class RepoWorker {
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
+      await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
         const newAnomalies = anomalyStatus.total - lastAnomalyCount;
         lastAnomalyCount = anomalyStatus.total;
@@ -343,6 +461,7 @@ export class RepoWorker {
               taskPath: task._path,
               issue: task.issue,
               repo: this.repo,
+              sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
               planOutput: buildResult.output,
@@ -362,14 +481,30 @@ export class RepoWorker {
             taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
-            { repo: this.repo, cacheKey }
+            {
+              repo: this.repo,
+              cacheKey,
+              introspection: {
+                repo: this.repo,
+                issue: task.issue,
+                taskName: task.name,
+                step: 4,
+                stepTitle: "resume loop-break",
+              },
+              ...this.buildWatchdogOptions(task, "resume-loop-break"),
+            }
           );
 
-          lastAnomalyCount = anomalyStatus.total;
-
-          if (buildResult.success) {
-            prUrl = extractPrUrl(buildResult.output);
+          if (!buildResult.success) {
+            if (buildResult.watchdogTimeout) {
+              return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult);
+            }
+            console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
+            break;
           }
+
+          lastAnomalyCount = anomalyStatus.total;
+          prUrl = extractPrUrl(buildResult.output);
 
           continue;
         }
@@ -379,7 +514,18 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
         );
 
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", { repo: this.repo, cacheKey });
+        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
+          repo: this.repo,
+          cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 4,
+            stepTitle: "continue",
+          },
+          ...this.buildWatchdogOptions(task, "resume-continue"),
+        });
         if (!buildResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
           break;
@@ -399,6 +545,7 @@ export class RepoWorker {
           taskPath: task._path,
           issue: task.issue,
           repo: this.repo,
+          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
           planOutput: buildResult.output,
@@ -418,9 +565,23 @@ export class RepoWorker {
         taskRepoPath,
         buildResult.sessionId,
         "Looks good. Merge the PR and clean up the worktree.",
-        { repo: this.repo, cacheKey }
+        {
+          repo: this.repo,
+          cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 5,
+            stepTitle: "merge",
+          },
+          ...this.buildWatchdogOptions(task, "resume-merge"),
+        }
       );
       if (!mergeResult.success) {
+        if (mergeResult.watchdogTimeout) {
+          return await this.handleWatchdogTimeout(task, cacheKey, "resume-merge", mergeResult);
+        }
         console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
       }
 
@@ -428,7 +589,15 @@ export class RepoWorker {
       const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
+        ...this.buildWatchdogOptions(task, "resume-survey"),
       });
+
+      if (!surveyResult.success) {
+        if (surveyResult.watchdogTimeout) {
+          return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult);
+        }
+        console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
+      }
 
       const endTime = new Date();
       await this.createAgentRun(task, {
@@ -443,6 +612,7 @@ export class RepoWorker {
       await updateTaskStatus(task, "done", {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
+        "watchdog-retries": "",
         ...(worktreePath ? { "worktree-path": "" } : {}),
       });
 
@@ -516,7 +686,19 @@ export class RepoWorker {
       let planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 1,
+          stepTitle: "next-task",
+        },
+        ...this.buildWatchdogOptions(task, "next-task"),
       });
+
+      if (!planResult.success && planResult.watchdogTimeout) {
+        return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult);
+      }
 
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
         console.warn(`[ralph:worker:${this.repo}] /next-task hit transient cache ENOENT; retrying once...`);
@@ -524,10 +706,21 @@ export class RepoWorker {
         planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
           repo: this.repo,
           cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 1,
+            stepTitle: "next-task (retry)",
+          },
+          ...this.buildWatchdogOptions(task, "next-task-retry"),
         });
       }
 
       if (!planResult.success) {
+        if (planResult.watchdogTimeout) {
+          return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult);
+        }
         throw new Error(`/next-task failed: ${planResult.output}`);
       }
 
@@ -555,7 +748,18 @@ export class RepoWorker {
           "Return a short, actionable summary.",
         ].join("\n");
 
-        const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, { agent: "devex" });
+        const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, {
+          agent: "devex",
+          repo: this.repo,
+          cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 2,
+            stepTitle: "consult devex",
+          },
+        });
         if (!devexResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
           devexContext = {
@@ -585,7 +789,17 @@ export class RepoWorker {
             devexSummary || devexResult.output,
           ].join("\n");
 
-          const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt);
+          const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
+            repo: this.repo,
+            cacheKey,
+            introspection: {
+              repo: this.repo,
+              issue: task.issue,
+              taskName: task.name,
+              step: 3,
+              stepTitle: "reroute after devex",
+            },
+          });
           if (!rerouteResult.success) {
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
@@ -608,19 +822,23 @@ export class RepoWorker {
       
       if (shouldEscalate) {
         const reason =
-          routing?.escalation_reason || (hasGap ? "Product documentation gap identified" : "Low confidence in plan");
+          routing?.escalation_reason ||
+          (hasGap
+            ? "Product documentation gap identified"
+            : routing?.decision === "escalate" && routing?.confidence === "high"
+              ? "High-confidence escalation requested"
+              : "Escalation requested");
 
         // Determine escalation type
         let escalationType: EscalationContext["escalationType"] = "other";
         if (hasGap) {
           escalationType = "product-gap";
-        } else if (routing?.confidence === "low") {
-          escalationType = "low-confidence";
+        } else if (isExplicitBlockerReason(routing?.escalation_reason)) {
+          escalationType = "blocked";
         } else if (routing?.escalation_reason?.toLowerCase().includes("ambiguous")) {
           escalationType = "ambiguous-requirements";
-        } else if (routing?.escalation_reason?.toLowerCase().includes("blocked")) {
-          escalationType = "blocked";
         }
+
 
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
@@ -631,6 +849,7 @@ export class RepoWorker {
           taskPath: task._path,
           issue: task.issue,
           repo: this.repo,
+          sessionId: planResult.sessionId,
           reason,
           escalationType,
           planOutput: planResult.output,
@@ -662,13 +881,28 @@ export class RepoWorker {
       let buildResult = await continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 4,
+          stepTitle: "build",
+        },
+        ...this.buildWatchdogOptions(task, "build"),
       });
-      if (!buildResult.success) throw new Error(`Build failed: ${buildResult.output}`);
+      if (!buildResult.success) {
+        if (buildResult.watchdogTimeout) {
+          return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult);
+        }
+        throw new Error(`Build failed: ${buildResult.output}`);
+      }
 
       // Keep the latest session ID persisted
       if (buildResult.sessionId) {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
+
+      await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build");
 
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
@@ -679,6 +913,8 @@ export class RepoWorker {
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
+        await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build");
+
         // Check for anomaly burst before continuing
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
         const newAnomalies = anomalyStatus.total - lastAnomalyCount;
@@ -703,6 +939,7 @@ export class RepoWorker {
               taskPath: task._path,
               issue: task.issue,
               repo: this.repo,
+              sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
               planOutput: buildResult.output,
@@ -723,26 +960,56 @@ export class RepoWorker {
             taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
-            { repo: this.repo, cacheKey }
+            {
+              repo: this.repo,
+              cacheKey,
+              introspection: {
+                repo: this.repo,
+                issue: task.issue,
+                taskName: task.name,
+                step: 4,
+                stepTitle: "build loop-break",
+              },
+              ...this.buildWatchdogOptions(task, "build-loop-break"),
+            }
           );
-          
+
+          if (!buildResult.success) {
+            if (buildResult.watchdogTimeout) {
+              return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult);
+            }
+            console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
+            break;
+          }
+
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
-          
-          if (buildResult.success) {
-            prUrl = extractPrUrl(buildResult.output);
-          }
+          prUrl = extractPrUrl(buildResult.output);
           continue;
         }
 
         continueAttempts++;
         console.log(`[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`);
-        
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", { repo: this.repo, cacheKey });
+        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
+          repo: this.repo,
+          cacheKey,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 4,
+            stepTitle: "build continue",
+          },
+          ...this.buildWatchdogOptions(task, "build-continue"),
+        });
         if (!buildResult.success) {
+          if (buildResult.watchdogTimeout) {
+            return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult);
+          }
           console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
           break;
         }
+
         
         prUrl = extractPrUrl(buildResult.output);
       }
@@ -759,6 +1026,7 @@ export class RepoWorker {
           taskPath: task._path,
           issue: task.issue,
           repo: this.repo,
+          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
           planOutput: buildResult.output,
@@ -780,9 +1048,23 @@ export class RepoWorker {
           taskRepoPath,
           buildResult.sessionId,
           "Looks good. Merge the PR and clean up the worktree.",
-          { repo: this.repo, cacheKey }
+          {
+            repo: this.repo,
+            cacheKey,
+            introspection: {
+              repo: this.repo,
+              issue: task.issue,
+              taskName: task.name,
+              step: 5,
+              stepTitle: "merge",
+            },
+            ...this.buildWatchdogOptions(task, "merge"),
+          }
         );
         if (!mergeResult.success) {
+          if (mergeResult.watchdogTimeout) {
+            return await this.handleWatchdogTimeout(task, cacheKey, "merge", mergeResult);
+          }
           console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
         }
       }
@@ -792,7 +1074,22 @@ export class RepoWorker {
       const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 6,
+          stepTitle: "survey",
+        },
+        ...this.buildWatchdogOptions(task, "survey"),
       });
+
+      if (!surveyResult.success) {
+        if (surveyResult.watchdogTimeout) {
+          return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult);
+        }
+        console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
+      }
 
       // 10. Create agent-run note
       const endTime = new Date();
@@ -810,6 +1107,7 @@ export class RepoWorker {
       await updateTaskStatus(task, "done", {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
+        "watchdog-retries": "",
         ...(worktreePath ? { "worktree-path": "" } : {}),
       });
 

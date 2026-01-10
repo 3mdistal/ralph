@@ -2,6 +2,7 @@ import { watch } from "fs";
 import { join } from "path";
 import { $ } from "bun";
 import { loadConfig } from "./config";
+import { shouldLog } from "./logging";
 
 export interface AgentTask {
   _path: string;
@@ -21,6 +22,8 @@ export interface AgentTask {
   "session-id"?: string;
   /** Git worktree path for this task (for per-repo concurrency + resume) */
   "worktree-path"?: string;
+  /** Watchdog recovery attempts (string in frontmatter) */
+  "watchdog-retries"?: string;
 }
 
 export type QueueChangeHandler = (tasks: AgentTask[]) => void;
@@ -65,6 +68,24 @@ export async function getTasksByStatus(status: AgentTask["status"]): Promise<Age
   } catch (e) {
     console.error(`[ralph:queue] Failed to get ${status} tasks:`, e);
     return [];
+  }
+}
+
+/**
+ * Fetch a task by its exact bwrb `_path`.
+ */
+export async function getTaskByPath(taskPath: string): Promise<AgentTask | null> {
+  const config = loadConfig();
+
+  try {
+    const result = await $`bwrb list agent-task --where "_path == '${taskPath}'" --output json`
+      .cwd(config.bwrbVault)
+      .quiet();
+    const parsed = JSON.parse(result.stdout.toString());
+    return Array.isArray(parsed) && parsed.length > 0 ? (parsed[0] as AgentTask) : null;
+  } catch (e) {
+    console.error(`[ralph:queue] Failed to get task by path ${taskPath}:`, e);
+    return null;
   }
 }
 
@@ -146,11 +167,13 @@ export function startWatching(onChange: QueueChangeHandler): void {
   console.log(`[ralph:queue] Watching ${tasksDir} for changes`);
 
   watcher = watch(tasksDir, { recursive: true }, async (eventType: string, filename: string | null) => {
-    if (!filename?.endsWith(".md")) return;
+    if (!filename || !filename.endsWith(".md")) return;
 
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(async () => {
-      console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
+      if (shouldLog("queue:change", 2_000)) {
+        console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
+      }
       const tasks = await getQueuedTasks();
       for (const handler of changeHandlers) handler(tasks);
     }, 500);

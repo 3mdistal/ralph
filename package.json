@@ -5,18 +5,20 @@
   "type": "module",
   "main": "src/index.ts",
   "bin": {
-    "ralph": "src/index.ts"
+    "ralph": "src/cli.ts"
   },
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
     "status": "bun run src/index.ts status",
+    "watch": "bun run src/index.ts watch",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {},
   "devDependencies": {
     "@types/bun": "latest",
+    "@types/node": "^20.11.0",
     "typescript": "^5.0.0"
   },
   "engines": {

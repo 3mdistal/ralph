@@ -14,6 +14,22 @@ Ralph Loop is an autonomous orchestration layer that manages a queue of coding t
 
 Everything else should proceed autonomously.
 
+## Escalation Markers
+
+When a model identifies a documentation gap, it must output an explicit, machine-parseable marker.
+
+- **Product gap (positive):** a line starting with `PRODUCT GAP:` (case-insensitive), optionally bullet-prefixed (`- ` or `* `).
+- **Product gap (negative):** a line starting with `NO PRODUCT GAP:` (case-insensitive), optionally bullet-prefixed.
+- **Not a marker:** `PRODUCT GAP` without a trailing `:` or mentions mid-line (e.g. `Here is the marker: PRODUCT GAP: ...`).
+
+This keeps escalation detection deterministic and prevents accidental escalations from quoted text or fuzzy phrasing (e.g. “not documented”).
+
+## Related Product Docs
+
+- `docs/product/dashboard-mvp-control-plane-tui.md`
+- `docs/product/graceful-drain-rolling-restart.md`
+- `docs/product/usage-throttling.md`
+
 ## The Problem We're Solving
 
 The manual workflow is effective but repetitive:
@@ -52,7 +68,9 @@ The system should bias toward proceeding, not asking. Escalate only when:
 - Requirements are ambiguous and can't be resolved from context
 - External blockers prevent progress
 
-Implementation tasks (dx, refactor, bug) should almost never escalate on low-level details like error message wording.
+Most tasks should be treated as "implementation-ish" and proceed autonomously unless explicitly labeled `product`, `ux`, or `breaking-change` (labels increase escalation sensitivity; absence should not).
+
+Implementation-ish tasks (including `dx`, `refactor`, `bug`) should almost never escalate on low-level details like error message wording.
 
 ### 4. Session Persistence
 
@@ -62,7 +80,11 @@ Tasks should survive daemon restarts. Store session IDs with tasks so work can r
 
 Log tool calls and detect when agents get stuck (tool-result-as-text loops). Auto-recover from loops by nudging the agent.
 
-**Diagnostics policy:** When OpenCode crashes and prints a log file path, Ralph may attach a redacted tail of that log to the error note to preserve debugging context before logs rotate. Redact obvious tokens (GitHub tokens, Bearer tokens, etc.) and keep the attachment bounded (e.g. ~200 lines / 20k chars). These logs are local diagnostics artifacts and should not be posted externally (issues/PRs) without manual review.
+**Watchdog policy:** In daemon mode, the system must never silently stall on a hung tool call.
+- Soft timeout: log-only heartbeat (no interruption)
+- Hard timeout: kill the in-flight run, re-queue once with a cleared `session-id`, then escalate if it repeats
+
+**Diagnostics policy:** When OpenCode crashes and prints a log file path, Ralph may attach a redacted tail of that log to the error note to preserve debugging context before logs rotate. Redact obvious tokens (GitHub tokens, Bearer tokens, etc.), redact the local home directory in paths and attached excerpts (replace with `~`), and keep the attachment bounded (e.g. ~200 lines / 20k chars). These logs are local diagnostics artifacts and should not be posted externally (issues/PRs) without manual review.
 
 **Stability policy:** To support safe parallelism, Ralph should avoid shared mutable tool caches between concurrent OpenCode runs (e.g. isolate `XDG_CACHE_HOME` per repo/task).
 
@@ -105,5 +127,5 @@ Every agent session dumps full chat history for:
 ## Non-Goals
 
 - **Real-time collaboration**: Ralph is async, queue-based
-- **User-facing UI**: Interaction is through bwrb notes and PRs
+- **User-facing UI**: No end-user UI; operator tooling (local dashboard/control plane and TUI) is in-scope, with interaction still centered on bwrb notes and PRs
 - **Multi-tenant**: Single-user orchestration for now
