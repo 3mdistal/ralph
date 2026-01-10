@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 
-import { DEFAULT_WATCHDOG_THRESHOLDS_MS } from "../session";
+import { DEFAULT_WATCHDOG_THRESHOLDS_MS } from "../watchdog";
 
 describe("Watchdog defaults", () => {
   test("match default soft/hard thresholds", () => {

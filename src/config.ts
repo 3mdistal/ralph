@@ -2,31 +2,15 @@ import { homedir } from "os";
 import { join } from "path";
 import { existsSync } from "fs";
 
+export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
+import type { WatchdogConfig } from "./watchdog";
+
 export interface RepoConfig {
   name: string;      // "3mdistal/bwrb"
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
 }
 
-export interface WatchdogThresholdMs {
-  softMs: number;
-  hardMs: number;
-}
-
-export interface WatchdogThresholdsMs {
-  read: WatchdogThresholdMs;
-  glob: WatchdogThresholdMs;
-  grep: WatchdogThresholdMs;
-  task: WatchdogThresholdMs;
-  bash: WatchdogThresholdMs;
-}
-
-export interface WatchdogConfig {
-  enabled?: boolean;
-  thresholdsMs?: Partial<WatchdogThresholdsMs>;
-  softLogIntervalMs?: number;
-  recentEventLimit?: number;
-}
 
 export interface RalphConfig {
   repos: RepoConfig[];

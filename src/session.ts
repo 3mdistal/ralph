@@ -4,32 +4,13 @@ import { readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 
+import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
+
 export interface ServerHandle {
   url: string;
   port: number;
   process: ChildProcess;
 }
-
-export interface WatchdogThresholdMs {
-  softMs: number;
-  hardMs: number;
-}
-
-export interface WatchdogThresholdsMs {
-  read: WatchdogThresholdMs;
-  glob: WatchdogThresholdMs;
-  grep: WatchdogThresholdMs;
-  task: WatchdogThresholdMs;
-  bash: WatchdogThresholdMs;
-}
-
-export const DEFAULT_WATCHDOG_THRESHOLDS_MS: WatchdogThresholdsMs = {
-  read: { softMs: 30_000, hardMs: 120_000 },
-  glob: { softMs: 30_000, hardMs: 120_000 },
-  grep: { softMs: 30_000, hardMs: 120_000 },
-  task: { softMs: 180_000, hardMs: 600_000 },
-  bash: { softMs: 300_000, hardMs: 1_800_000 },
-};
 
 export interface WatchdogTimeoutInfo {
   kind: "watchdog-timeout";
@@ -252,11 +233,21 @@ export async function runSession(
 
   const pickThreshold = (toolName: string, thresholds: WatchdogThresholdsMs): WatchdogThresholdMs => {
     const t = normalizeToolName(toolName);
-    if (t === "read" || t.includes("read")) return thresholds.read;
-    if (t === "glob" || t.includes("glob")) return thresholds.glob;
-    if (t === "grep" || t.includes("grep")) return thresholds.grep;
-    if (t === "task" || t.includes("task")) return thresholds.task;
-    if (t === "bash" || t.includes("bash") || t.includes("shell")) return thresholds.bash;
+
+    // Prefer exact matches first.
+    if (t === "read") return thresholds.read;
+    if (t === "glob") return thresholds.glob;
+    if (t === "grep") return thresholds.grep;
+    if (t === "task") return thresholds.task;
+    if (t === "bash" || t === "shell") return thresholds.bash;
+
+    // Fall back to word-boundary substring matches.
+    if (/\bread\b/.test(t)) return thresholds.read;
+    if (/\bglob\b/.test(t)) return thresholds.glob;
+    if (/\bgrep\b/.test(t)) return thresholds.grep;
+    if (/\btask\b/.test(t)) return thresholds.task;
+    if (/\bbash\b|\bshell\b/.test(t)) return thresholds.bash;
+
     return thresholds.bash;
   };
 
@@ -525,7 +516,9 @@ export async function runSession(
       ? ["Recent OpenCode events (bounded):", ...watchdogTimeout.recentEvents.map((l) => `- ${l}`)].join("\n")
       : "";
 
-    const combined = [header, recent, stderr.trim(), stdout.trim()].filter(Boolean).join("\n\n");
+    // Avoid attaching full stdout/stderr on watchdog timeouts to reduce the chance of leaking
+    // sensitive context. Prefer the bounded event lines + the OpenCode log tail.
+    const combined = [header, recent].filter(Boolean).join("\n\n");
     const enriched = await appendOpencodeLogTail(combined);
     return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout };
   }
