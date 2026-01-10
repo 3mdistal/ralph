@@ -19,6 +19,8 @@ export interface AgentTask {
   "completed-at"?: string;
   /** OpenCode session ID used to resume after restarts */
   "session-id"?: string;
+  /** Git worktree path for this task (for per-repo concurrency + resume) */
+  "worktree-path"?: string;
 }
 
 export type QueueChangeHandler = (tasks: AgentTask[]) => void;
@@ -143,7 +145,7 @@ export function startWatching(onChange: QueueChangeHandler): void {
 
   console.log(`[ralph:queue] Watching ${tasksDir} for changes`);
 
-  watcher = watch(tasksDir, { recursive: true }, async (eventType, filename) => {
+  watcher = watch(tasksDir, { recursive: true }, async (eventType: string, filename: string | null) => {
     if (!filename?.endsWith(".md")) return;
 
     if (debounceTimer) clearTimeout(debounceTimer);
