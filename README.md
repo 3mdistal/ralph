@@ -12,6 +12,16 @@ Ralph watches for `agent-task` notes in a bwrb vault and dispatches them to Open
 - **Anomaly detection** catches agents stuck in loops
 - **Introspection logging** for debugging agent behavior
 
+## Operator dashboard (planned)
+
+Ralph’s control plane (operator dashboard) is **operator tooling** (not a user-facing UI): a local, token-authenticated API that publishes structured events, with a TUI as the first client.
+
+- Local-only by default (binds `127.0.0.1`) and requires `Authorization: Bearer <token>` on all endpoints; no built-in TLS.
+- Single-user, local-machine threat model; not hardened for hostile networks.
+- Remote access is via SSH port-forwarding or your own proxy.
+- Canonical spec: `docs/product/dashboard-mvp-control-plane-tui.md`
+- Issue map: https://github.com/3mdistal/ralph/issues/22 (MVP epic) and https://github.com/3mdistal/ralph/issues/23 (docs/scope)
+
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.0.0
@@ -51,11 +61,33 @@ Or for development with auto-reload:
 bun dev
 ```
 
-### Check queue status
+### Check daemon status
 
 ```bash
 bun run status
 ```
+
+Machine-readable output:
+
+```bash
+bun run status --json
+```
+
+Live updates (prints when status changes):
+
+```bash
+bun run watch
+```
+
+### Nudge an in-progress task
+
+```bash
+ralph nudge <taskRef> "Just implement it, stop asking questions"
+```
+
+- Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
+- Success means the delivery attempt succeeded, not guaranteed agent compliance.
+
 
 ### Queue a task
 
@@ -128,6 +160,14 @@ On daemon startup, Ralph checks for orphaned in-progress tasks:
 - **Crash recovery** - No lost progress on unexpected restarts
 - **Easier debugging** - Stop daemon, inspect state, resume
 - **Token efficiency** - Avoid re-running completed work
+
+## Drain mode (pause new work)
+
+Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue.
+
+- Enable: create `~/.config/opencode/ralph/drain`
+- Disable: delete `~/.config/opencode/ralph/drain`
+- Observability: logs emit `Drain enabled` / `Drain disabled`, and `ralph status` shows `Mode: running|draining`
 
 ## Watchdog (Hung Tool Calls)
 

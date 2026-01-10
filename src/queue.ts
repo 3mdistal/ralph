@@ -2,6 +2,7 @@ import { watch } from "fs";
 import { join } from "path";
 import { $ } from "bun";
 import { loadConfig } from "./config";
+import { shouldLog } from "./logging";
 
 export interface AgentTask {
   _path: string;
@@ -150,7 +151,9 @@ export function startWatching(onChange: QueueChangeHandler): void {
 
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(async () => {
-      console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
+      if (shouldLog("queue:change", 2_000)) {
+        console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
+      }
       const tasks = await getQueuedTasks();
       for (const handler of changeHandlers) handler(tasks);
     }, 500);
