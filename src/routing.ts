@@ -102,7 +102,7 @@ export function hasProductGap(output: string): boolean {
   // IMPORTANT: Keep this conservative.
   // Only treat an explicit marker as a product gap (no fuzzy heuristics).
   // This must never match "NO PRODUCT GAP:".
-  const productGapMarker = /^\s*(?:[-*]\s+)?PRODUCT\s+GAP\s*:/im;
+  const productGapMarker = /^(?!\s*(?:[-*]\s+)?NO\s+PRODUCT\s+GAP\s*:)\s*(?:[-*]\s+)?PRODUCT\s+GAP\s*:/im;
 
   return productGapMarker.test(output);
 }
