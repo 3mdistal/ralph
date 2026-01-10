@@ -8,6 +8,26 @@ export interface RepoConfig {
   botBranch: string; // "bot/integration"
 }
 
+export interface WatchdogThresholdMs {
+  softMs: number;
+  hardMs: number;
+}
+
+export interface WatchdogThresholdsMs {
+  read: WatchdogThresholdMs;
+  glob: WatchdogThresholdMs;
+  grep: WatchdogThresholdMs;
+  task: WatchdogThresholdMs;
+  bash: WatchdogThresholdMs;
+}
+
+export interface WatchdogConfig {
+  enabled?: boolean;
+  thresholdsMs?: Partial<WatchdogThresholdsMs>;
+  softLogIntervalMs?: number;
+  recentEventLimit?: number;
+}
+
 export interface RalphConfig {
   repos: RepoConfig[];
   batchSize: number;       // PRs before rollup (default: 10)
@@ -15,6 +35,7 @@ export interface RalphConfig {
   bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // GitHub owner for repos (default: "3mdistal")
   devDir: string;          // base directory for repos (default: ~/Developer)
+  watchdog?: WatchdogConfig;
 }
 
 const DEFAULT_CONFIG: RalphConfig = {
