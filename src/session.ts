@@ -344,6 +344,23 @@ export async function runSession(
     env,
   });
 
+  const requestKill = () => {
+    try {
+      proc.kill();
+    } catch {
+      // ignore
+    }
+
+    // Some processes ignore SIGTERM. Follow up with SIGKILL.
+    setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+    }, 5000);
+  };
+
   const watchdogEnabled = options?.watchdog?.enabled ?? true;
   const thresholds = mergeThresholds(options?.watchdog?.thresholdsMs);
   const softLogIntervalMs = options?.watchdog?.softLogIntervalMs ?? 30_000;
@@ -464,11 +481,7 @@ export async function runSession(
           `[ralph:watchdog] Hard timeout${ctx}: ${inFlight.toolName} ${inFlight.callId} after ${Math.round(elapsedMs / 1000)}s; killing opencode process`
         );
 
-        try {
-          proc.kill();
-        } catch {
-          // ignore
-        }
+        requestKill();
       }
     }, 1000);
   }
@@ -479,11 +492,7 @@ export async function runSession(
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
     timeout = setTimeout(() => {
-      try {
-        proc.kill();
-      } catch {
-        // ignore
-      }
+      requestKill();
       resolve(124);
     }, fallbackTimeoutMs);
 

@@ -1,4 +1,5 @@
 import { $ } from "bun";
+import crypto from "crypto";
 import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import { loadConfig } from "./config";
