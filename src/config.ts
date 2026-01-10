@@ -72,7 +72,7 @@ export function getRepoBotBranch(repoName: string): string {
   return explicit?.botBranch ?? "bot/integration";
 }
 
-export function normalizeRepoName(repo: string): string {
+function normalizeRepoName(repo: string): string {
   const cfg = loadConfig();
   // If it's already full name, return as-is
   if (repo.includes("/")) return repo;
