@@ -51,10 +51,22 @@ Or for development with auto-reload:
 bun dev
 ```
 
-### Check queue status
+### Check daemon status
 
 ```bash
 bun run status
+```
+
+Machine-readable output:
+
+```bash
+bun run status --json
+```
+
+Live updates (prints when status changes):
+
+```bash
+bun run watch
 ```
 
 ### Nudge an in-progress task
@@ -65,6 +77,7 @@ ralph nudge <taskRef> "Just implement it, stop asking questions"
 
 - Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
 - Success means the delivery attempt succeeded, not guaranteed agent compliance.
+
 
 ### Queue a task
 
@@ -137,6 +150,14 @@ On daemon startup, Ralph checks for orphaned in-progress tasks:
 - **Crash recovery** - No lost progress on unexpected restarts
 - **Easier debugging** - Stop daemon, inspect state, resume
 - **Token efficiency** - Avoid re-running completed work
+
+## Drain mode (pause new work)
+
+Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue.
+
+- Enable: create `~/.config/opencode/ralph/drain`
+- Disable: delete `~/.config/opencode/ralph/drain`
+- Observability: logs emit `Drain enabled` / `Drain disabled`, and `ralph status` shows `Mode: running|draining`
 
 ## Watchdog (Hung Tool Calls)
 

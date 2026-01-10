@@ -7,8 +7,19 @@ export function getRalphSessionsDir(): string {
   return join(homedir(), ".ralph", "sessions");
 }
 
+export const RALPH_SESSIONS_DIR = getRalphSessionsDir();
+
 export function getRalphSessionDir(sessionId: string): string {
-  return join(getRalphSessionsDir(), sessionId);
+  return join(RALPH_SESSIONS_DIR, sessionId);
+}
+
+// Back-compat for bot/integration helpers
+export function getSessionDir(sessionId: string): string {
+  return getRalphSessionDir(sessionId);
+}
+
+export function getSessionEventsPath(sessionId: string): string {
+  return join(getRalphSessionDir(sessionId), "events.jsonl");
 }
 
 export function getRalphSessionLockPath(sessionId: string): string {

@@ -1,10 +1,11 @@
 import { spawn, type ChildProcess } from "child_process";
-import { mkdirSync, rmSync, writeFileSync } from "fs";
+import { createWriteStream, mkdirSync, rmSync, writeFileSync } from "fs";
 import { readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
+import type { Writable } from "stream";
 
-import { getRalphSessionDir, getRalphSessionLockPath } from "./paths";
+import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
 import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
 
 export interface ServerHandle {
@@ -194,6 +195,17 @@ export async function runSession(
     cacheKey?: string;
     /** Fallback hard timeout for the entire OpenCode process */
     timeoutMs?: number;
+    /**
+     * Optional introspection metadata written to ~/.ralph/sessions/<session>/events.jsonl
+     * so the daemon can render deterministic status without model calls.
+     */
+    introspection?: {
+      repo?: string;
+      issue?: string;
+      taskName?: string;
+      step?: number;
+      stepTitle?: string;
+    };
     watchdog?: {
       enabled?: boolean;
       thresholdsMs?: Partial<WatchdogThresholdsMs>;
@@ -359,7 +371,7 @@ export async function runSession(
 
   if (lockPath && continueSessionId) {
     try {
-      mkdirSync(getRalphSessionDir(continueSessionId), { recursive: true });
+      mkdirSync(getSessionDir(continueSessionId), { recursive: true });
       writeFileSync(
         lockPath,
         JSON.stringify({ ts: Date.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
@@ -400,6 +412,89 @@ export async function runSession(
   let sessionId = "";
   let textOutput = "";
 
+  const introspection = options?.introspection;
+
+  let eventStream: Writable | null = null;
+  let bufferedEventLines: string[] = [];
+
+  const writeEventLine = (line: string): void => {
+    if (eventStream) {
+      try {
+        eventStream.write(line + "\n");
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    bufferedEventLines.push(line);
+    if (bufferedEventLines.length > 500) bufferedEventLines = bufferedEventLines.slice(-500);
+  };
+
+  const writeEvent = (event: any): void => {
+    try {
+      writeEventLine(JSON.stringify(event));
+    } catch {
+      // ignore
+    }
+  };
+
+  const ensureEventStream = (id: string): void => {
+    if (eventStream) return;
+
+    try {
+      mkdirSync(getSessionDir(id), { recursive: true });
+      eventStream = createWriteStream(getSessionEventsPath(id), { flags: "a" });
+      for (const line of bufferedEventLines) {
+        try {
+          eventStream.write(line + "\n");
+        } catch {
+          // ignore
+        }
+      }
+      bufferedEventLines = [];
+    } catch {
+      // ignore
+    }
+  };
+
+  const closeEventStream = (): void => {
+    const stream: any = eventStream;
+    if (!stream || typeof stream.end !== "function") return;
+    try {
+      stream.end();
+    } catch {
+      // ignore
+    }
+  };
+
+  // Seed deterministic context before tool events begin.
+  if (introspection?.step != null || introspection?.repo || introspection?.issue || introspection?.taskName) {
+    if (typeof introspection?.step === "number") {
+      writeEvent({
+        type: "step-start",
+        ts: Date.now(),
+        step: introspection.step,
+        title: introspection.stepTitle,
+        repo: introspection.repo,
+        issue: introspection.issue,
+        taskName: introspection.taskName,
+      });
+    }
+
+    writeEvent({
+      type: "run-start",
+      ts: Date.now(),
+      command: command ?? undefined,
+      agent: options?.agent ?? undefined,
+      repo: introspection?.repo,
+      issue: introspection?.issue,
+      taskName: introspection?.taskName,
+      step: introspection?.step,
+      stepTitle: introspection?.stepTitle,
+    });
+  }
+
   let buffer = "";
   let recentEvents: string[] = [];
 
@@ -435,7 +530,19 @@ export async function runSession(
       try {
         const event = JSON.parse(trimmed);
         const eventSessionId = event.sessionID ?? event.sessionId;
-        if (eventSessionId && !sessionId) sessionId = eventSessionId;
+        if (eventSessionId && !sessionId) {
+          sessionId = String(eventSessionId);
+          ensureEventStream(sessionId);
+        } else if (eventSessionId && !eventStream) {
+          ensureEventStream(String(eventSessionId));
+        }
+
+        if (event.type === "anomaly") {
+          writeEvent({
+            type: "anomaly",
+            ts: typeof event.ts === "number" ? event.ts : Date.now(),
+          });
+        }
 
         if (event.type === "text" && event.part?.text) {
           textOutput += event.part.text;
@@ -453,7 +560,22 @@ export async function runSession(
               lastProgressTs: now,
               argsPreview: tool.argsPreview,
             };
+
+            writeEvent({
+              type: "tool-start",
+              ts: now,
+              toolName: tool.toolName,
+              callId: tool.callId,
+              argsPreview: tool.argsPreview,
+            });
           } else if (tool.phase === "end") {
+            writeEvent({
+              type: "tool-end",
+              ts: now,
+              toolName: tool.toolName,
+              callId: tool.callId,
+            });
+
             if (inFlight && (inFlight.callId === tool.callId || inFlight.callId === "unknown" || tool.callId === "unknown")) {
               inFlight = null;
             }
@@ -556,16 +678,49 @@ export async function runSession(
     // sensitive context. Prefer the bounded event lines + the OpenCode log tail.
     const combined = [header, recent].filter(Boolean).join("\n\n");
     const enriched = await appendOpencodeLogTail(combined);
+
+    if (sessionId) {
+      ensureEventStream(sessionId);
+      writeEvent({ type: "run-end", ts: Date.now(), success: false, exitCode, watchdogTimeout: true });
+      try {
+        closeEventStream();
+      } catch {
+        // ignore
+      }
+    }
+
     return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout };
   }
 
   if (exitCode !== 0) {
     const combined = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n\n");
     const enriched = await appendOpencodeLogTail(combined || `Failed with exit code ${exitCode}`);
+
+    if (sessionId) {
+      ensureEventStream(sessionId);
+      writeEvent({ type: "run-end", ts: Date.now(), success: false, exitCode });
+      try {
+        closeEventStream();
+      } catch {
+        // ignore
+      }
+    }
+
     return { sessionId: "", output: enriched, success: false, exitCode };
   }
 
   const raw = stdout.toString();
+
+  if (sessionId) {
+    ensureEventStream(sessionId);
+    writeEvent({ type: "run-end", ts: Date.now(), success: true, exitCode });
+    try {
+      closeEventStream();
+    } catch {
+      // ignore
+    }
+  }
+
   return { sessionId, output: textOutput || raw, success: true, exitCode };
 }
 
@@ -581,6 +736,13 @@ export async function runCommand(
     repo?: string;
     cacheKey?: string;
     timeoutMs?: number;
+    introspection?: {
+      repo?: string;
+      issue?: string;
+      taskName?: string;
+      step?: number;
+      stepTitle?: string;
+    };
     watchdog?: {
       enabled?: boolean;
       thresholdsMs?: Partial<WatchdogThresholdsMs>;
@@ -606,6 +768,13 @@ export async function continueSession(
     repo?: string;
     cacheKey?: string;
     timeoutMs?: number;
+    introspection?: {
+      repo?: string;
+      issue?: string;
+      taskName?: string;
+      step?: number;
+      stepTitle?: string;
+    };
     watchdog?: {
       enabled?: boolean;
       thresholdsMs?: Partial<WatchdogThresholdsMs>;
@@ -632,6 +801,13 @@ export async function continueCommand(
     repo?: string;
     cacheKey?: string;
     timeoutMs?: number;
+    introspection?: {
+      repo?: string;
+      issue?: string;
+      taskName?: string;
+      step?: number;
+      stepTitle?: string;
+    };
     watchdog?: {
       enabled?: boolean;
       thresholdsMs?: Partial<WatchdogThresholdsMs>;
