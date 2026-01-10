@@ -129,6 +129,14 @@ On daemon startup, Ralph checks for orphaned in-progress tasks:
 - **Easier debugging** - Stop daemon, inspect state, resume
 - **Token efficiency** - Avoid re-running completed work
 
+## Drain mode (pause new work)
+
+Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue.
+
+- Enable: create `~/.config/opencode/ralph/drain`
+- Disable: delete `~/.config/opencode/ralph/drain`
+- Observability: logs emit `Drain enabled` / `Drain disabled`, and `ralph status` shows `Mode: running|draining`
+
 ## Watchdog (Hung Tool Calls)
 
 In daemon mode, a single tool call can hang indefinitely. Ralph uses a watchdog to ensure runs never silently stall:

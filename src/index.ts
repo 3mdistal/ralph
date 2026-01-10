@@ -21,12 +21,19 @@ import {
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { getRepoPath } from "./config";
+import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
 
 // --- State ---
 
 const workers = new Map<string, RepoWorker>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
+let drainMonitor: DrainMonitor | null = null;
+
+function getDaemonMode(): DaemonMode {
+  if (drainMonitor) return drainMonitor.getMode();
+  return isDraining() ? "draining" : "running";
+}
 
 function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
   return task._path || task.name;
@@ -38,6 +45,10 @@ const inFlightTasks = new Set<string>();
 // --- Main Logic ---
 
 async function processNewTasks(tasks: AgentTask[]): Promise<void> {
+  if (getDaemonMode() === "draining") {
+    return;
+  }
+
   if (tasks.length === 0) {
     console.log("[ralph] No queued tasks");
     return;
@@ -184,6 +195,10 @@ async function main(): Promise<void> {
   console.log(`        Dev directory: ${config.devDir}`);
   console.log("");
 
+  // Start drain monitor (operator control file)
+  drainMonitor = new DrainMonitor({ log: (message) => console.log(message) });
+  drainMonitor.start();
+
   // Initialize rollup monitor
   rollupMonitor = new RollupMonitor(config.batchSize);
 
@@ -195,14 +210,14 @@ async function main(): Promise<void> {
   const initialTasks = await initialPoll();
   console.log(`[ralph] Found ${initialTasks.length} queued task(s)`);
 
-  if (initialTasks.length > 0) {
+  if (initialTasks.length > 0 && getDaemonMode() !== "draining") {
     await processNewTasks(initialTasks);
   }
 
   // Start file watching (no polling - watcher is reliable)
   console.log("[ralph] Starting queue watcher...");
   startWatching(async (tasks) => {
-    if (!isShuttingDown) {
+    if (!isShuttingDown && getDaemonMode() !== "draining") {
       await processNewTasks(tasks);
     }
   });
@@ -222,6 +237,7 @@ async function main(): Promise<void> {
     
     // Stop accepting new tasks
     stopWatching();
+    drainMonitor?.stop();
     
     // Wait for in-flight tasks
     if (inFlightTasks.size > 0) {
@@ -266,6 +282,9 @@ if (args[0] === "resume") {
 
 if (args[0] === "status") {
   // Quick status check
+  const mode: DaemonMode = isDraining() ? "draining" : "running";
+  console.log(`Mode: ${mode}`);
+
   const tasks = await getQueuedTasks();
   console.log(`Queued tasks: ${tasks.length}`);
   for (const task of tasks) {
