@@ -44,6 +44,14 @@ describe("Session Persistence", () => {
       expect(task["session-id"]?.trim()).toBeFalsy();
     });
 
+    test("worktree-path field is optional", () => {
+      const taskWithoutWorktree = createMockTask();
+      expect(taskWithoutWorktree["worktree-path"]).toBeUndefined();
+
+      const taskWithWorktree = createMockTask({ "worktree-path": "/tmp/worktree-1" });
+      expect(taskWithWorktree["worktree-path"]).toBe("/tmp/worktree-1");
+    });
+
     test("watchdog-retries field is optional", () => {
       const taskWithoutRetries = createMockTask();
       expect(taskWithoutRetries["watchdog-retries"]).toBeUndefined();
@@ -140,34 +148,33 @@ describe("Session Persistence", () => {
   });
 
   describe("Multiple in-progress tasks handling", () => {
-    test("only one task per repo should be resumed", () => {
+    test("resumes up to configured per-repo limit", () => {
+      const perRepoMaxWorkers = 2;
+
       const tasks = [
         createMockTask({
           name: "Task 1",
           status: "in-progress",
-          "session-id": "ses_1"
+          "session-id": "ses_1",
         }),
         createMockTask({
           name: "Task 2",
           status: "in-progress",
-          "session-id": "ses_2"
+          "session-id": "ses_2",
         }),
         createMockTask({
           name: "Task 3",
           status: "in-progress",
-          "session-id": "ses_3"
+          "session-id": "ses_3",
         }),
       ];
 
-      // Simulate the logic: first task resumes, others reset to queued
-      const [taskToResume, ...tasksToReset] = tasks;
+      // Simulate the logic: resume up to max, reset the rest to queued.
+      const tasksToResume = tasks.slice(0, perRepoMaxWorkers);
+      const tasksToReset = tasks.slice(perRepoMaxWorkers);
 
-      expect(taskToResume.name).toBe("Task 1");
-      expect(tasksToReset.length).toBe(2);
-
-      for (const task of tasksToReset) {
-        expect(["Task 2", "Task 3"]).toContain(task.name);
-      }
+      expect(tasksToResume.map((t) => t.name)).toEqual(["Task 1", "Task 2"]);
+      expect(tasksToReset.map((t) => t.name)).toEqual(["Task 3"]);
     });
   });
 

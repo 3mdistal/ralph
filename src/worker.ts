@@ -1,12 +1,12 @@
 import { $ } from "bun";
-import { appendFile, readFile, rm } from "fs/promises";
+import { appendFile, mkdir, readFile, rm } from "fs/promises";
 import { existsSync } from "fs";
-import { isAbsolute, join } from "path";
+import { dirname, isAbsolute, join } from "path";
 
 import { type AgentTask, updateTaskStatus } from "./queue";
-import { loadConfig, getRepoBotBranch } from "./config";
-import { runCommand, continueSession, continueCommand, getRalphXdgCacheHome, type SessionResult } from "./session";
-import { parseRoutingDecision, hasProductGap, extractPrUrl, type RoutingDecision } from "./routing";
+import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
+import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
+import { extractPrUrl, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
 import {
   isExplicitBlockerReason,
   isImplementationTaskFromIssue,
@@ -16,10 +16,13 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { getRalphSessionsDir } from "./paths";
+import { getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
 
 // Ralph introspection logs location
 const RALPH_SESSIONS_DIR = getRalphSessionsDir();
+
+// Git worktrees for per-task repo isolation
+const RALPH_WORKTREES_DIR = getRalphWorktreesDir();
 
 // Anomaly detection thresholds
 const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
@@ -134,9 +137,90 @@ function resolveVaultPath(p: string): string {
 }
 
 export class RepoWorker {
-  public busy = false;
-
   constructor(public readonly repo: string, public readonly repoPath: string) {}
+
+  private async resolveWorktreeRef(): Promise<string> {
+    const botBranch = getRepoBotBranch(this.repo);
+    try {
+      await $`git rev-parse --verify ${botBranch}`.cwd(this.repoPath).quiet();
+      return botBranch;
+    } catch {
+      return "HEAD";
+    }
+  }
+
+  private async ensureGitWorktree(worktreePath: string): Promise<void> {
+    try {
+      const list = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
+      const out = list.stdout.toString();
+      if (out.includes(`worktree ${worktreePath}\n`)) return;
+    } catch {
+      // ignore and attempt create
+    }
+
+    await mkdir(dirname(worktreePath), { recursive: true });
+
+    const ref = await this.resolveWorktreeRef();
+    try {
+      await $`git worktree add --detach ${worktreePath} ${ref}`.cwd(this.repoPath).quiet();
+    } catch (e: any) {
+      // If it already exists, treat as best-effort reuse.
+      if (existsSync(worktreePath)) {
+        console.warn(`[ralph:worker:${this.repo}] Failed to add worktree; reusing existing path: ${worktreePath}`);
+        return;
+      }
+      throw e;
+    }
+  }
+
+  private async cleanupGitWorktree(worktreePath: string): Promise<void> {
+    try {
+      await $`git worktree remove --force ${worktreePath}`.cwd(this.repoPath).quiet();
+    } catch (e: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to remove worktree ${worktreePath}: ${e?.message ?? String(e)}`);
+      try {
+        await rm(worktreePath, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private async resolveTaskRepoPath(
+    task: AgentTask,
+    issueNumber: string,
+    mode: "start" | "resume"
+  ): Promise<{ repoPath: string; worktreePath?: string }> {
+    const recorded = task["worktree-path"]?.trim();
+    if (recorded && existsSync(recorded)) {
+      return { repoPath: recorded, worktreePath: recorded };
+    }
+
+    if (recorded && !existsSync(recorded)) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Recorded worktree-path does not exist; falling back to main repo checkout: ${recorded}`
+      );
+    }
+
+    // Only create worktrees for new runs (not resume), and only when per-repo concurrency > 1.
+    if (mode === "resume") {
+      return { repoPath: this.repoPath };
+    }
+
+    const maxWorkers = getRepoMaxWorkers(this.repo);
+    if (maxWorkers <= 1) {
+      return { repoPath: this.repoPath };
+    }
+
+    const taskKey = safeNoteName(task._path || task._name || task.name);
+    const repoKey = safeNoteName(this.repo);
+    const worktreePath = join(RALPH_WORKTREES_DIR, repoKey, issueNumber, taskKey);
+
+    await this.ensureGitWorktree(worktreePath);
+    await updateTaskStatus(task, "in-progress", { "worktree-path": worktreePath });
+
+    return { repoPath: worktreePath, worktreePath };
+  }
 
   /**
    * Fetch metadata for a GitHub issue.
@@ -191,13 +275,13 @@ export class RepoWorker {
     };
   }
 
-  private async drainNudges(task: AgentTask, sessionId: string, cacheKey: string, stage: string): Promise<void> {
+  private async drainNudges(task: AgentTask, repoPath: string, sessionId: string, cacheKey: string, stage: string): Promise<void> {
     const sid = sessionId?.trim();
     if (!sid) return;
 
     try {
       const result = await drainQueuedNudges(sid, async (message) => {
-        const res = await continueSession(this.repoPath, sid, message, {
+        const res = await continueSession(repoPath, sid, message, {
           repo: this.repo,
           cacheKey,
           ...this.buildWatchdogOptions(task, `nudge-${stage}`),
@@ -283,7 +367,10 @@ export class RepoWorker {
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
 
     const issueMatch = task.issue.match(/#(\d+)$/);
-    const cacheKey = issueMatch?.[1] ?? task._name;
+    const issueNumber = issueMatch?.[1] ?? "";
+    const cacheKey = issueNumber || task._name;
+
+    const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber || cacheKey, "resume");
 
     const existingSessionId = task["session-id"]?.trim();
     if (!existingSessionId) {
@@ -293,7 +380,6 @@ export class RepoWorker {
       return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
     }
 
-    this.busy = true;
 
     try {
       const botBranch = getRepoBotBranch(this.repo);
@@ -305,7 +391,7 @@ export class RepoWorker {
 
       const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
 
-      let buildResult = await continueSession(this.repoPath, existingSessionId, resumeMessage, {
+      let buildResult = await continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
         cacheKey,
         introspection: {
@@ -341,7 +427,7 @@ export class RepoWorker {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
-      await this.drainNudges(task, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+        await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
 
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
@@ -351,7 +437,7 @@ export class RepoWorker {
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
-        await this.drainNudges(task, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+      await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
 
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
         const newAnomalies = anomalyStatus.total - lastAnomalyCount;
@@ -392,7 +478,7 @@ export class RepoWorker {
 
           console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
           buildResult = await continueSession(
-            this.repoPath,
+            taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
             {
@@ -428,7 +514,7 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
         );
 
-        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.", {
+        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
           repo: this.repo,
           cacheKey,
           introspection: {
@@ -438,6 +524,7 @@ export class RepoWorker {
             step: 4,
             stepTitle: "continue",
           },
+          ...this.buildWatchdogOptions(task, "resume-continue"),
         });
         if (!buildResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
@@ -475,7 +562,7 @@ export class RepoWorker {
 
       console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
       const mergeResult = await continueSession(
-        this.repoPath,
+        taskRepoPath,
         buildResult.sessionId,
         "Looks good. Merge the PR and clean up the worktree.",
         {
@@ -499,7 +586,7 @@ export class RepoWorker {
       }
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(this.repoPath, buildResult.sessionId, "survey", [], {
+      const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         ...this.buildWatchdogOptions(task, "resume-survey"),
@@ -526,10 +613,15 @@ export class RepoWorker {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
+        ...(worktreePath ? { "worktree-path": "" } : {}),
       });
 
       // Cleanup per-task OpenCode cache on success
       await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+
+      if (worktreePath) {
+        await this.cleanupGitWorktree(worktreePath);
+      }
 
       console.log(`[ralph:worker:${this.repo}] Task resumed to completion: ${task.name}`);
 
@@ -553,7 +645,6 @@ export class RepoWorker {
         escalationReason: error?.message ?? String(error),
       };
     } finally {
-      this.busy = false;
     }
   }
 
@@ -561,7 +652,6 @@ export class RepoWorker {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Starting task: ${task.name}`);
 
-    this.busy = true;
 
     try {
       // 1. Mark task in-progress (use _path to avoid ambiguous names)
@@ -578,6 +668,8 @@ export class RepoWorker {
       const issueNumber = issueMatch[1];
       const cacheKey = issueNumber;
 
+      const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber, "start");
+
       // 3. Fetch issue metadata to adjust escalation sensitivity
       const issueMeta = await this.getIssueMetadata(task.issue);
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
@@ -591,7 +683,7 @@ export class RepoWorker {
         /ENOENT\s+reading\s+"[^"]*\/opencode\/node_modules\//.test(output) ||
         /ENOENT\s+reading\s+"[^"]*zod\/v4\/locales\//.test(output);
 
-      let planResult = await runCommand(this.repoPath, "next-task", [issueNumber], {
+      let planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
         introspection: {
@@ -611,7 +703,7 @@ export class RepoWorker {
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
         console.warn(`[ralph:worker:${this.repo}] /next-task hit transient cache ENOENT; retrying once...`);
         await new Promise((r) => setTimeout(r, 750));
-        planResult = await runCommand(this.repoPath, "next-task", [issueNumber], {
+        planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
           repo: this.repo,
           cacheKey,
           introspection: {
@@ -656,7 +748,7 @@ export class RepoWorker {
           "Return a short, actionable summary.",
         ].join("\n");
 
-        const devexResult = await continueSession(this.repoPath, baseSessionId, devexPrompt, {
+        const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, {
           agent: "devex",
           repo: this.repo,
           cacheKey,
@@ -697,7 +789,7 @@ export class RepoWorker {
             devexSummary || devexResult.output,
           ].join("\n");
 
-          const rerouteResult = await continueSession(this.repoPath, baseSessionId, reroutePrompt, {
+          const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
             repo: this.repo,
             cacheKey,
             introspection: {
@@ -786,7 +878,7 @@ export class RepoWorker {
       const botBranch = getRepoBotBranch(this.repo);
       const proceedMessage = `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
 
-      let buildResult = await continueSession(this.repoPath, planResult.sessionId, proceedMessage, {
+      let buildResult = await continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
         introspection: {
@@ -810,7 +902,7 @@ export class RepoWorker {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
-      await this.drainNudges(task, buildResult.sessionId, cacheKey, "build");
+      await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build");
 
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
@@ -821,7 +913,7 @@ export class RepoWorker {
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
-        await this.drainNudges(task, buildResult.sessionId, cacheKey, "build");
+        await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build");
 
         // Check for anomaly burst before continuing
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
@@ -865,7 +957,7 @@ export class RepoWorker {
           // Send a specific nudge to break the loop
           console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
           buildResult = await continueSession(
-            this.repoPath,
+            taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
             {
@@ -898,7 +990,7 @@ export class RepoWorker {
 
         continueAttempts++;
         console.log(`[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`);
-        buildResult = await continueSession(this.repoPath, buildResult.sessionId, "Continue.", {
+        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
           repo: this.repo,
           cacheKey,
           introspection: {
@@ -953,7 +1045,7 @@ export class RepoWorker {
       if (prUrl) {
         console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
         const mergeResult = await continueSession(
-          this.repoPath,
+          taskRepoPath,
           buildResult.sessionId,
           "Looks good. Merge the PR and clean up the worktree.",
           {
@@ -979,7 +1071,7 @@ export class RepoWorker {
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(this.repoPath, buildResult.sessionId, "survey", [], {
+      const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         introspection: {
@@ -1016,10 +1108,15 @@ export class RepoWorker {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
+        ...(worktreePath ? { "worktree-path": "" } : {}),
       });
 
       // 12. Cleanup per-task OpenCode cache on success
       await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+
+      if (worktreePath) {
+        await this.cleanupGitWorktree(worktreePath);
+      }
 
       // 13. Send desktop notification for completion
       await notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
@@ -1046,7 +1143,6 @@ export class RepoWorker {
         escalationReason: error?.message ?? String(error),
       };
     } finally {
-      this.busy = false;
     }
   }
 
