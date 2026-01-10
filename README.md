@@ -57,6 +57,15 @@ bun dev
 bun run status
 ```
 
+### Nudge an in-progress task
+
+```bash
+ralph nudge <taskRef> "Just implement it, stop asking questions"
+```
+
+- Best-effort queued delivery: if the session is currently running, Ralph queues the message and delivers it at the next safe checkpoint.
+- Success means delivery attempt succeeded (session found + `continueSession(...)` call succeeded), not guaranteed agent compliance.
+
 ### Queue a task
 
 Create an `agent-task` note in your bwrb vault:

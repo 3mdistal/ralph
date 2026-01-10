@@ -7,6 +7,8 @@
  * Creates rollup PRs after N successful merges for batch review.
  */
 
+import { existsSync } from "fs";
+
 import { loadConfig } from "./config";
 import {
   initialPoll,
@@ -21,6 +23,9 @@ import {
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { getRepoPath } from "./config";
+import { continueSession } from "./session";
+import { getRalphSessionLockPath } from "./paths";
+import { queueNudge, recordDeliveryAttempt } from "./nudge";
 
 // --- State ---
 
@@ -272,6 +277,83 @@ if (args[0] === "status") {
     console.log(`  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}]`);
   }
   process.exit(0);
+}
+
+if (args[0] === "nudge") {
+  const taskRefRaw = args[1];
+  const messageRaw = args.slice(2).join(" ").trim();
+
+  if (!taskRefRaw || !messageRaw) {
+    console.error("Usage: ralph nudge <taskRef> \"<message>\"");
+    process.exit(1);
+  }
+
+  const taskRef = taskRefRaw;
+  const message = messageRaw;
+
+  const tasks = await getTasksByStatus("in-progress");
+  if (tasks.length === 0) {
+    console.error("No in-progress tasks found.");
+    process.exit(1);
+  }
+
+  const exactMatches = tasks.filter((t) => t._path === taskRef || t._name === taskRef || t.name === taskRef);
+  const matches =
+    exactMatches.length > 0
+      ? exactMatches
+      : tasks.filter((t) => t.name.toLowerCase().includes(taskRef.toLowerCase()));
+
+  if (matches.length === 0) {
+    console.error(`No in-progress task matched '${taskRef}'.`);
+    console.error("In-progress tasks:");
+    for (const t of tasks) {
+      console.error(`  - ${t._path} (${t.name})`);
+    }
+    process.exit(1);
+  }
+
+  if (matches.length > 1) {
+    console.error(`Ambiguous task ref '${taskRef}' (${matches.length} matches).`);
+    console.error("Matches:");
+    for (const t of matches) {
+      console.error(`  - ${t._path} (${t.name})`);
+    }
+    process.exit(1);
+  }
+
+  const task = matches[0]!;
+  const sessionId = task["session-id"]?.trim() ?? "";
+  if (!sessionId) {
+    console.error(`Task has no session-id recorded; cannot nudge: ${task._path}`);
+    process.exit(1);
+  }
+
+  const nudgeId = await queueNudge(sessionId, message, {
+    taskRef,
+    taskPath: task._path,
+    repo: task.repo,
+  });
+
+  const lockPath = getRalphSessionLockPath(sessionId);
+  if (existsSync(lockPath)) {
+    console.log(`Queued nudge ${nudgeId} for session ${sessionId}; will deliver at next checkpoint.`);
+    process.exit(0);
+  }
+
+  const issueMatch = task.issue.match(/#(\d+)$/);
+  const cacheKey = issueMatch?.[1] ?? task._name;
+  const repoPath = getRepoPath(task.repo);
+
+  const result = await continueSession(repoPath, sessionId, message, { repo: task.repo, cacheKey });
+  if (result.success) {
+    await recordDeliveryAttempt(sessionId, nudgeId, { success: true });
+    console.log(`Delivered nudge ${nudgeId} to session ${sessionId}.`);
+    process.exit(0);
+  }
+
+  await recordDeliveryAttempt(sessionId, nudgeId, { success: false, error: result.output });
+  console.error(`Failed to deliver nudge to session ${sessionId}: ${result.output}`);
+  process.exit(1);
 }
 
 if (args[0] === "rollup") {
