@@ -7,6 +7,8 @@
  * Creates rollup PRs after N successful merges for batch review.
  */
 
+import { existsSync } from "fs";
+
 import { loadConfig } from "./config";
 import {
   initialPoll,
@@ -24,6 +26,8 @@ import { getRepoPath } from "./config";
 import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
+import { getRalphSessionLockPath } from "./paths";
+import { queueNudge } from "./nudge";
 
 // --- State ---
 
@@ -410,6 +414,73 @@ if (args[0] === "status") {
   process.exit(0);
 }
 
+if (args[0] === "nudge") {
+  const taskRefRaw = args[1];
+  const messageRaw = args.slice(2).join(" ").trim();
+
+  if (!taskRefRaw || !messageRaw) {
+    console.error("Usage: ralph nudge <taskRef> \"<message>\"");
+    process.exit(1);
+  }
+
+  const taskRef = taskRefRaw;
+  const message = messageRaw;
+
+  const tasks = await getTasksByStatus("in-progress");
+  if (tasks.length === 0) {
+    console.error("No in-progress tasks found.");
+    process.exit(1);
+  }
+
+  const exactMatches = tasks.filter((t) => t._path === taskRef || t._name === taskRef || t.name === taskRef);
+  const matches =
+    exactMatches.length > 0
+      ? exactMatches
+      : tasks.filter((t) => t.name.toLowerCase().includes(taskRef.toLowerCase()));
+
+  if (matches.length === 0) {
+    console.error(`No in-progress task matched '${taskRef}'.`);
+    console.error("In-progress tasks:");
+    for (const t of tasks) {
+      console.error(`  - ${t._path} (${t.name})`);
+    }
+    process.exit(1);
+  }
+
+  if (matches.length > 1) {
+    console.error(`Ambiguous task ref '${taskRef}' (${matches.length} matches).`);
+    console.error("Matches:");
+    for (const t of matches) {
+      console.error(`  - ${t._path} (${t.name})`);
+    }
+    process.exit(1);
+  }
+
+  const task = matches[0]!;
+  const sessionId = task["session-id"]?.trim() ?? "";
+  if (!sessionId) {
+    console.error(`Task has no session-id recorded; cannot nudge: ${task._path}`);
+    process.exit(1);
+  }
+
+  const nudgeId = await queueNudge(sessionId, message, {
+    taskRef,
+    taskPath: task._path,
+    repo: task.repo,
+  });
+
+  const lockPath = getRalphSessionLockPath(sessionId);
+  if (existsSync(lockPath)) {
+    console.log(
+      `Queued nudge ${nudgeId} for session ${sessionId}; session is in-flight; will deliver at next checkpoint.`
+    );
+  } else {
+    console.log(`Queued nudge ${nudgeId} for session ${sessionId}; will deliver at next checkpoint.`);
+  }
+
+  process.exit(0);
+}
+
 if (args[0] === "watch") {
   console.log("[ralph] Watching in-progress task status (Ctrl+C to stop)...");
 
@@ -460,6 +531,7 @@ if (args[0] === "watch") {
     // intentional
   });
 }
+
 
 if (args[0] === "rollup") {
   // Force rollup for a repo

@@ -1,11 +1,11 @@
 import { spawn, type ChildProcess } from "child_process";
-import { createWriteStream, mkdirSync } from "fs";
+import { createWriteStream, mkdirSync, rmSync, writeFileSync } from "fs";
 import { readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 import type { Writable } from "stream";
 
-import { getSessionDir, getSessionEventsPath } from "./paths";
+import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
 import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
 
 export interface ServerHandle {
@@ -356,6 +356,32 @@ export async function runSession(
     stdio: ["ignore", "pipe", "pipe"],
     env,
   });
+
+  // If continuing an existing session, mark it as active for `ralph nudge`.
+  const continueSessionId = options?.continueSession;
+  const lockPath = continueSessionId ? getRalphSessionLockPath(continueSessionId) : null;
+  const cleanupLock = () => {
+    if (!lockPath) return;
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      // ignore
+    }
+  };
+
+  if (lockPath && continueSessionId) {
+    try {
+      mkdirSync(getSessionDir(continueSessionId), { recursive: true });
+      writeFileSync(
+        lockPath,
+        JSON.stringify({ ts: Date.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
+      );
+      proc.on("close", cleanupLock);
+      proc.on("error", cleanupLock);
+    } catch {
+      // If we can't write the lock file, proceed anyway.
+    }
+  }
 
   const requestKill = () => {
     try {

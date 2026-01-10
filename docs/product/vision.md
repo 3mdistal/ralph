@@ -24,6 +24,12 @@ When a model identifies a documentation gap, it must output an explicit, machine
 
 This keeps escalation detection deterministic and prevents accidental escalations from quoted text or fuzzy phrasing (e.g. “not documented”).
 
+## Related Product Docs
+
+- `docs/product/dashboard-mvp-control-plane-tui.md`
+- `docs/product/graceful-drain-rolling-restart.md`
+- `docs/product/usage-throttling.md`
+
 ## The Problem We're Solving
 
 The manual workflow is effective but repetitive:
@@ -121,5 +127,5 @@ Every agent session dumps full chat history for:
 ## Non-Goals
 
 - **Real-time collaboration**: Ralph is async, queue-based
-- **User-facing UI**: Interaction is through bwrb notes and PRs
+- **User-facing UI**: No end-user UI; operator tooling (local dashboard/control plane and TUI) is in-scope, with interaction still centered on bwrb notes and PRs
 - **Multi-tenant**: Single-user orchestration for now

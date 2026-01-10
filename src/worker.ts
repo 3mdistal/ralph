@@ -2,7 +2,6 @@ import { $ } from "bun";
 import { appendFile, readFile, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { isAbsolute, join } from "path";
-import { homedir } from "os";
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { loadConfig, getRepoBotBranch } from "./config";
@@ -16,9 +15,11 @@ import {
   type IssueMetadata,
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
+import { drainQueuedNudges } from "./nudge";
+import { getRalphSessionsDir } from "./paths";
 
 // Ralph introspection logs location
-const RALPH_SESSIONS_DIR = join(homedir(), ".ralph", "sessions");
+const RALPH_SESSIONS_DIR = getRalphSessionsDir();
 
 // Anomaly detection thresholds
 const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
@@ -190,6 +191,31 @@ export class RepoWorker {
     };
   }
 
+  private async drainNudges(task: AgentTask, sessionId: string, cacheKey: string, stage: string): Promise<void> {
+    const sid = sessionId?.trim();
+    if (!sid) return;
+
+    try {
+      const result = await drainQueuedNudges(sid, async (message) => {
+        const res = await continueSession(this.repoPath, sid, message, {
+          repo: this.repo,
+          cacheKey,
+          ...this.buildWatchdogOptions(task, `nudge-${stage}`),
+        });
+        return { success: res.success, error: res.success ? undefined : res.output };
+      });
+
+      if (result.attempted > 0) {
+        const suffix = result.stoppedOnError ? " (stopped on error)" : "";
+        console.log(
+          `[ralph:worker:${this.repo}] Delivered ${result.delivered}/${result.attempted} queued nudge(s)${suffix}`
+        );
+      }
+    } catch (e: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to drain nudges: ${e?.message ?? String(e)}`);
+    }
+  }
+
   private async handleWatchdogTimeout(task: AgentTask, cacheKey: string, stage: string, result: SessionResult): Promise<AgentRun> {
     const timeout = result.watchdogTimeout;
     const retryCount = this.getWatchdogRetryCount(task);
@@ -318,6 +344,8 @@ export class RepoWorker {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
+      await this.drainNudges(task, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
       let prUrl = extractPrUrl(buildResult.output);
@@ -326,6 +354,8 @@ export class RepoWorker {
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
+        await this.drainNudges(task, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
         const newAnomalies = anomalyStatus.total - lastAnomalyCount;
         lastAnomalyCount = anomalyStatus.total;
@@ -780,6 +810,8 @@ export class RepoWorker {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
+      await this.drainNudges(task, buildResult.sessionId, cacheKey, "build");
+
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
       const MAX_CONTINUE_RETRIES = 5;
@@ -789,6 +821,8 @@ export class RepoWorker {
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
+        await this.drainNudges(task, buildResult.sessionId, cacheKey, "build");
+
         // Check for anomaly burst before continuing
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
         const newAnomalies = anomalyStatus.total - lastAnomalyCount;
