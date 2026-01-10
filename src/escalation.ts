@@ -5,16 +5,14 @@ export interface IssueMetadata {
   title: string;
 }
 
-const IMPLEMENTATION_KEYWORDS = ["dx", "refactor", "bug"] as const;
+const ESCALATION_SENSITIVE_LABELS = ["product", "ux", "breaking-change"] as const;
 
 export function isImplementationTaskFromIssue(meta: IssueMetadata): boolean {
   const labels = meta.labels.map((l) => l.toLowerCase());
-  const title = meta.title.toLowerCase();
 
-  const hasLabel = labels.some((l) => IMPLEMENTATION_KEYWORDS.some((k) => k === l));
-  const titleHasKeyword = new RegExp(`\\b(${IMPLEMENTATION_KEYWORDS.join("|")})\\b`, "i").test(title);
-
-  return hasLabel || titleHasKeyword;
+  // Owner policy: default to "implementation-ish" unless explicitly labeled otherwise.
+  const isEscalationSensitive = labels.some((l) => ESCALATION_SENSITIVE_LABELS.some((k) => k === l));
+  return !isEscalationSensitive;
 }
 
 export function isContractSurfaceReason(reason?: string | null): boolean {
@@ -42,6 +40,25 @@ export function isContractSurfaceReason(reason?: string | null): boolean {
   return indicators.some((s) => r.includes(s));
 }
 
+export function isExplicitBlockerReason(reason?: string | null): boolean {
+  const r = (reason ?? "").toLowerCase();
+  if (!r) return false;
+
+  // Keep this conservative: only detect clear "cannot proceed" / "blocked" signals.
+  const indicators = [
+    "blocked",
+    "cannot proceed",
+    "can't proceed",
+    "needs human decision",
+    "need human decision",
+    "requires human decision",
+    "requires human",
+    "external blocker",
+  ];
+
+  return indicators.some((s) => r.includes(s));
+}
+
 export function shouldConsultDevex(opts: {
   routing: RoutingDecision | null;
   hasGap: boolean;
@@ -52,6 +69,8 @@ export function shouldConsultDevex(opts: {
   if (!isImplementationTask) return false;
   if (hasGap) return false;
   if (!routing) return false;
+
+  if (routing.decision === "escalate" && routing.confidence === "high") return false;
 
   const needsHelp = routing.decision === "escalate" || routing.confidence === "low";
   if (!needsHelp) return false;
@@ -64,20 +83,24 @@ export function shouldEscalateAfterRouting(opts: {
   hasGap: boolean;
   isImplementationTask: boolean;
 }): boolean {
-  const { routing, hasGap, isImplementationTask } = opts;
+  const { routing, hasGap } = opts;
 
   // No routing decision parsed - don't escalate, let it proceed.
   if (!routing) return false;
 
-  // Explicit escalate decision with high confidence - always escalate.
+  // Product gap and explicit blockers always escalate.
+  if (hasGap) return true;
+  if (isExplicitBlockerReason(routing.escalation_reason)) return true;
+
+  // Contract surfaces should escalate even if the agent isn't confident.
+  if (isContractSurfaceReason(routing.escalation_reason)) return true;
+
+  // Escalate immediately only on explicit high-confidence escalation.
   if (routing.decision === "escalate" && routing.confidence === "high") {
     return true;
   }
 
-  // For implementation tasks, ignore "product gap" signals unless explicit escalate.
-  if (isImplementationTask && hasGap && routing.decision !== "escalate") {
-    return false;
-  }
-
-  return routing.decision === "escalate" || hasGap || routing.confidence === "low";
+  // Low confidence alone must not trigger escalation.
+  // Low/medium-confidence "escalate" decisions should be treated as non-blocking.
+  return false;
 }
