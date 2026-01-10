@@ -42,10 +42,12 @@ describe("Drain mode", () => {
     tmpDirs.push(homeDir);
 
     const logs: string[] = [];
+    const modeChanges: string[] = [];
     const monitor = new DrainMonitor({
       homeDir,
       pollIntervalMs: 10,
       log: (message) => logs.push(message),
+      onModeChange: (mode) => modeChanges.push(mode),
     });
 
     monitor.start();
@@ -62,5 +64,7 @@ describe("Drain mode", () => {
 
     expect(logs.some((l) => l.includes("Drain enabled"))).toBe(true);
     expect(logs.some((l) => l.includes("Drain disabled"))).toBe(true);
+    expect(modeChanges).toContain("draining");
+    expect(modeChanges).toContain("running");
   });
 });

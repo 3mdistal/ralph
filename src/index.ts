@@ -196,7 +196,16 @@ async function main(): Promise<void> {
   console.log("");
 
   // Start drain monitor (operator control file)
-  drainMonitor = new DrainMonitor({ log: (message) => console.log(message) });
+  drainMonitor = new DrainMonitor({
+    log: (message) => console.log(message),
+    onModeChange: (mode) => {
+      if (mode !== "running" || isShuttingDown) return;
+      void (async () => {
+        const tasks = await getQueuedTasks();
+        await processNewTasks(tasks);
+      })();
+    },
+  });
   drainMonitor.start();
 
   // Initialize rollup monitor

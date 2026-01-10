@@ -26,6 +26,7 @@ export class DrainMonitor {
       pollIntervalMs?: number;
       homeDir?: string;
       log?: (message: string) => void;
+      onModeChange?: (mode: DaemonMode) => void;
     } = {}
   ) {}
 
@@ -66,5 +67,6 @@ export class DrainMonitor {
     this.mode = nextMode;
     if (draining) this.options.log?.("[ralph] Drain enabled");
     else this.options.log?.("[ralph] Drain disabled");
+    this.options.onModeChange?.(this.mode);
   }
 }
