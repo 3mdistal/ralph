@@ -285,7 +285,7 @@ export async function continueSession(
   repoPath: string,
   sessionId: string,
   message: string,
-  options?: { repo?: string; cacheKey?: string; timeoutMs?: number }
+  options?: { agent?: string; repo?: string; cacheKey?: string; timeoutMs?: number }
 ): Promise<SessionResult> {
   return runSession(repoPath, message, { continueSession: sessionId, ...options });
 }
