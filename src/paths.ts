@@ -7,6 +7,12 @@ export function getRalphSessionsDir(): string {
   return join(homedir(), ".ralph", "sessions");
 }
 
+export function getRalphWorktreesDir(): string {
+  const raw = process.env.RALPH_WORKTREES_DIR?.trim();
+  if (raw) return isAbsolute(raw) ? raw : join(process.cwd(), raw);
+  return join(homedir(), ".ralph", "worktrees");
+}
+
 export function getRalphSessionDir(sessionId: string): string {
   return join(getRalphSessionsDir(), sessionId);
 }

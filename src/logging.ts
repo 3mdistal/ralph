@@ -23,7 +23,7 @@ function wantsColor(): boolean {
 
 export type LogLevel = "info" | "warn" | "error";
 
-export function color(level: LogLevel, text: string): string {
+function color(level: LogLevel, text: string): string {
   if (!wantsColor()) return text;
   const reset = "\x1b[0m";
   const code =
