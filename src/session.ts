@@ -4,17 +4,35 @@ import { readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 
+import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
+
 export interface ServerHandle {
   url: string;
   port: number;
   process: ChildProcess;
 }
 
+export interface WatchdogTimeoutInfo {
+  kind: "watchdog-timeout";
+  toolName: string;
+  callId: string;
+  elapsedMs: number;
+  softMs: number;
+  hardMs: number;
+  lastProgressMsAgo: number;
+  argsPreview?: string;
+  context?: string;
+  recentEvents?: string[];
+}
+
 export interface SessionResult {
   sessionId: string;
   output: string;
   success: boolean;
+  exitCode?: number;
+  watchdogTimeout?: WatchdogTimeoutInfo;
 }
+
 
 /**
  * Spawn an OpenCode server for a specific repo directory.
@@ -173,9 +191,130 @@ export async function runSession(
     repo?: string;
     /** Used for per-run cache isolation */
     cacheKey?: string;
+    /** Fallback hard timeout for the entire OpenCode process */
     timeoutMs?: number;
+    watchdog?: {
+      enabled?: boolean;
+      thresholdsMs?: Partial<WatchdogThresholdsMs>;
+      /** Throttle for soft-timeout logs (default: 30s) */
+      softLogIntervalMs?: number;
+      /** Max number of recent JSON lines to attach (default: 50) */
+      recentEventLimit?: number;
+      /** Included in soft/hard timeout logs */
+      context?: string;
+    };
   }
 ): Promise<SessionResult> {
+  const truncate = (value: string, max: number) => (value.length > max ? value.slice(0, max) + "…" : value);
+
+  const mergeThresholds = (overrides?: Partial<WatchdogThresholdsMs>): WatchdogThresholdsMs => {
+    if (!overrides) return DEFAULT_WATCHDOG_THRESHOLDS_MS;
+    const base = DEFAULT_WATCHDOG_THRESHOLDS_MS;
+
+    const merge = (k: keyof WatchdogThresholdsMs): WatchdogThresholdMs => {
+      const override = overrides[k];
+      if (!override) return base[k];
+      return {
+        softMs: typeof override.softMs === "number" ? override.softMs : base[k].softMs,
+        hardMs: typeof override.hardMs === "number" ? override.hardMs : base[k].hardMs,
+      };
+    };
+
+    return {
+      read: merge("read"),
+      glob: merge("glob"),
+      grep: merge("grep"),
+      task: merge("task"),
+      bash: merge("bash"),
+    };
+  };
+
+  const normalizeToolName = (name: string): string => name.trim().toLowerCase();
+
+  const pickThreshold = (toolName: string, thresholds: WatchdogThresholdsMs): WatchdogThresholdMs => {
+    const t = normalizeToolName(toolName);
+
+    // Prefer exact matches first.
+    if (t === "read") return thresholds.read;
+    if (t === "glob") return thresholds.glob;
+    if (t === "grep") return thresholds.grep;
+    if (t === "task") return thresholds.task;
+    if (t === "bash" || t === "shell") return thresholds.bash;
+
+    // Fall back to word-boundary substring matches.
+    if (/\bread\b/.test(t)) return thresholds.read;
+    if (/\bglob\b/.test(t)) return thresholds.glob;
+    if (/\bgrep\b/.test(t)) return thresholds.grep;
+    if (/\btask\b/.test(t)) return thresholds.task;
+    if (/\bbash\b|\bshell\b/.test(t)) return thresholds.bash;
+
+    return thresholds.bash;
+  };
+
+  const argsPreviewFromEvent = (event: any): string | undefined => {
+    const candidate =
+      event?.tool?.input ??
+      event?.tool?.args ??
+      event?.tool?.arguments ??
+      event?.part?.tool?.input ??
+      event?.part?.tool?.args ??
+      event?.part?.toolCall?.input ??
+      event?.part?.toolCall?.args ??
+      event?.part?.tool_call?.input ??
+      event?.part?.tool_call?.args ??
+      undefined;
+
+    if (candidate === undefined) return undefined;
+
+    try {
+      const str = typeof candidate === "string" ? candidate : JSON.stringify(candidate);
+      return sanitizeOpencodeLog(truncate(str, 500));
+    } catch {
+      return undefined;
+    }
+  };
+
+  const extractToolInfo = (event: any): { phase: "start" | "end" | "progress"; toolName: string; callId: string; argsPreview?: string } | null => {
+    const type = String(event?.type ?? event?.event ?? "").toLowerCase();
+
+    const toolName =
+      event?.tool?.name ??
+      event?.toolName ??
+      event?.name ??
+      event?.part?.tool?.name ??
+      event?.part?.toolCall?.name ??
+      event?.part?.tool_call?.name ??
+      undefined;
+
+    const callId =
+      event?.tool?.callId ??
+      event?.tool?.id ??
+      event?.callId ??
+      event?.toolCallId ??
+      event?.id ??
+      event?.part?.tool?.callId ??
+      event?.part?.toolCall?.callId ??
+      event?.part?.tool_call?.callId ??
+      undefined;
+
+    const hasToolHints = Boolean(toolName || callId || type.includes("tool"));
+    if (!hasToolHints) return null;
+
+    const phase: "start" | "end" | "progress" =
+      /tool[_-]?start|tool[_-]?call/.test(type)
+        ? "start"
+        : /tool[_-]?end|tool[_-]?result/.test(type) || event?.tool?.result != null || event?.part?.toolResult != null
+          ? "end"
+          : "progress";
+
+    return {
+      phase,
+      toolName: String(toolName ?? "unknown"),
+      callId: String(callId ?? "unknown"),
+      argsPreview: argsPreviewFromEvent(event),
+    };
+  };
+
   const args: string[] = ["run"];
 
   const command = normalizeCommand(options?.command);
@@ -205,62 +344,202 @@ export async function runSession(
     env,
   });
 
+  const requestKill = () => {
+    try {
+      proc.kill();
+    } catch {
+      // ignore
+    }
+
+    // Some processes ignore SIGTERM. Follow up with SIGKILL.
+    setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+    }, 5000);
+  };
+
+  const watchdogEnabled = options?.watchdog?.enabled ?? true;
+  const thresholds = mergeThresholds(options?.watchdog?.thresholdsMs);
+  const softLogIntervalMs = options?.watchdog?.softLogIntervalMs ?? 30_000;
+  const recentEventLimit = options?.watchdog?.recentEventLimit ?? 50;
+  const context = options?.watchdog?.context;
+
   let stdout = "";
   let stderr = "";
 
+  let sessionId = "";
+  let textOutput = "";
+
+  let buffer = "";
+  let recentEvents: string[] = [];
+
+  let lastSoftLogTs = 0;
+
+  let inFlight:
+    | {
+        toolName: string;
+        callId: string;
+        startTs: number;
+        lastProgressTs: number;
+        argsPreview?: string;
+      }
+    | null = null;
+
+  let watchdogTimeout: WatchdogTimeoutInfo | undefined;
+
   proc.stdout?.on("data", (data: Buffer) => {
-    stdout += data.toString();
+    const chunk = data.toString();
+    stdout += chunk;
+    buffer += chunk;
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      recentEvents.push(sanitizeOpencodeLog(truncate(trimmed, 800)));
+      if (recentEvents.length > recentEventLimit) recentEvents = recentEvents.slice(-recentEventLimit);
+
+      try {
+        const event = JSON.parse(trimmed);
+        const eventSessionId = event.sessionID ?? event.sessionId;
+        if (eventSessionId && !sessionId) sessionId = eventSessionId;
+
+        if (event.type === "text" && event.part?.text) {
+          textOutput += event.part.text;
+        }
+
+        const tool = extractToolInfo(event);
+        if (tool) {
+          const now = Date.now();
+
+          if (tool.phase === "start") {
+            inFlight = {
+              toolName: tool.toolName,
+              callId: tool.callId,
+              startTs: now,
+              lastProgressTs: now,
+              argsPreview: tool.argsPreview,
+            };
+          } else if (tool.phase === "end") {
+            if (inFlight && (inFlight.callId === tool.callId || inFlight.callId === "unknown" || tool.callId === "unknown")) {
+              inFlight = null;
+            }
+          } else if (inFlight && (inFlight.callId === tool.callId || tool.callId === "unknown")) {
+            inFlight.lastProgressTs = now;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
   });
 
   proc.stderr?.on("data", (data: Buffer) => {
     stderr += data.toString();
   });
 
+  let watchdogInterval: ReturnType<typeof setInterval> | undefined;
+  if (watchdogEnabled) {
+    watchdogInterval = setInterval(() => {
+      if (watchdogTimeout || !inFlight) return;
+
+      const now = Date.now();
+      const elapsedMs = now - inFlight.startTs;
+      const threshold = pickThreshold(inFlight.toolName, thresholds);
+
+      if (elapsedMs >= threshold.softMs && now - lastSoftLogTs >= softLogIntervalMs) {
+        lastSoftLogTs = now;
+        const ctx = context ? ` ${context}` : "";
+        console.warn(
+          `[ralph:watchdog] Soft timeout${ctx}: ${inFlight.toolName} ${inFlight.callId} ` +
+            `elapsed=${Math.round(elapsedMs / 1000)}s soft=${Math.round(threshold.softMs / 1000)}s hard=${Math.round(threshold.hardMs / 1000)}s`
+        );
+      }
+
+      if (elapsedMs >= threshold.hardMs) {
+        watchdogTimeout = {
+          kind: "watchdog-timeout",
+          toolName: inFlight.toolName,
+          callId: inFlight.callId,
+          elapsedMs,
+          softMs: threshold.softMs,
+          hardMs: threshold.hardMs,
+          lastProgressMsAgo: now - inFlight.lastProgressTs,
+          argsPreview: inFlight.argsPreview,
+          context,
+          recentEvents,
+        };
+
+        const ctx = context ? ` ${context}` : "";
+        console.warn(
+          `[ralph:watchdog] Hard timeout${ctx}: ${inFlight.toolName} ${inFlight.callId} after ${Math.round(elapsedMs / 1000)}s; killing opencode process`
+        );
+
+        requestKill();
+      }
+    }, 1000);
+  }
+
+  const fallbackTimeoutMs = options?.timeoutMs ?? thresholds.bash.hardMs + 60_000;
+
   const exitCode = await new Promise<number>((resolve, reject) => {
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
-    if (options?.timeoutMs) {
-      timeout = setTimeout(() => {
-        proc.kill();
-        resolve(124);
-      }, options.timeoutMs);
-    }
+    timeout = setTimeout(() => {
+      requestKill();
+      resolve(124);
+    }, fallbackTimeoutMs);
 
     proc.on("error", (err) => {
       if (timeout) clearTimeout(timeout);
+      if (watchdogInterval) clearInterval(watchdogInterval);
       reject(err);
     });
 
     proc.on("close", (code) => {
       if (timeout) clearTimeout(timeout);
+      if (watchdogInterval) clearInterval(watchdogInterval);
       resolve(code ?? 0);
     });
   });
 
+  if (watchdogTimeout) {
+    const header = [
+      `Tool call timed out: ${watchdogTimeout.toolName} ${watchdogTimeout.callId} after ${Math.round(watchdogTimeout.elapsedMs / 1000)}s`,
+      watchdogTimeout.context ? `Context: ${watchdogTimeout.context}` : null,
+      watchdogTimeout.argsPreview ? `Args preview: ${watchdogTimeout.argsPreview}` : null,
+      `Soft threshold: ${Math.round(watchdogTimeout.softMs / 1000)}s`,
+      `Hard threshold: ${Math.round(watchdogTimeout.hardMs / 1000)}s`,
+      `Last progress: ${Math.round(watchdogTimeout.lastProgressMsAgo / 1000)}s ago`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const recent = watchdogTimeout.recentEvents?.length
+      ? ["Recent OpenCode events (bounded):", ...watchdogTimeout.recentEvents.map((l) => `- ${l}`)].join("\n")
+      : "";
+
+    // Avoid attaching full stdout/stderr on watchdog timeouts to reduce the chance of leaking
+    // sensitive context. Prefer the bounded event lines + the OpenCode log tail.
+    const combined = [header, recent].filter(Boolean).join("\n\n");
+    const enriched = await appendOpencodeLogTail(combined);
+    return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout };
+  }
+
   if (exitCode !== 0) {
     const combined = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n\n");
     const enriched = await appendOpencodeLogTail(combined || `Failed with exit code ${exitCode}`);
-    return { sessionId: "", output: enriched, success: false };
+    return { sessionId: "", output: enriched, success: false, exitCode };
   }
 
   const raw = stdout.toString();
-
-  const lines = raw.trim().split("\n").filter(Boolean);
-  let sessionId = "";
-  let textOutput = "";
-
-  for (const line of lines) {
-    try {
-      const event = JSON.parse(line);
-      const eventSessionId = event.sessionID ?? event.sessionId;
-      if (eventSessionId && !sessionId) sessionId = eventSessionId;
-      if (event.type === "text" && event.part?.text) textOutput += event.part.text;
-    } catch {
-      // ignore
-    }
-  }
-
-  return { sessionId, output: textOutput || raw, success: true };
+  return { sessionId, output: textOutput || raw, success: true, exitCode };
 }
 
 /**
@@ -271,7 +550,18 @@ export async function runCommand(
   repoPath: string,
   command: string,
   args: string[] = [],
-  options?: { repo?: string; cacheKey?: string; timeoutMs?: number }
+  options?: {
+    repo?: string;
+    cacheKey?: string;
+    timeoutMs?: number;
+    watchdog?: {
+      enabled?: boolean;
+      thresholdsMs?: Partial<WatchdogThresholdsMs>;
+      softLogIntervalMs?: number;
+      recentEventLimit?: number;
+      context?: string;
+    };
+  }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");
@@ -285,9 +575,22 @@ export async function continueSession(
   repoPath: string,
   sessionId: string,
   message: string,
-  options?: { agent?: string; repo?: string; cacheKey?: string; timeoutMs?: number }
+  options?: {
+    repo?: string;
+    cacheKey?: string;
+    timeoutMs?: number;
+    watchdog?: {
+      enabled?: boolean;
+      thresholdsMs?: Partial<WatchdogThresholdsMs>;
+      softLogIntervalMs?: number;
+      recentEventLimit?: number;
+      context?: string;
+    };
+    agent?: string;
+  }
 ): Promise<SessionResult> {
-  return runSession(repoPath, message, { continueSession: sessionId, ...options });
+  const { agent, ...rest } = options ?? {};
+  return runSession(repoPath, message, { continueSession: sessionId, agent, ...rest });
 }
 
 /**
@@ -298,7 +601,18 @@ export async function continueCommand(
   sessionId: string,
   command: string,
   args: string[] = [],
-  options?: { repo?: string; cacheKey?: string; timeoutMs?: number }
+  options?: {
+    repo?: string;
+    cacheKey?: string;
+    timeoutMs?: number;
+    watchdog?: {
+      enabled?: boolean;
+      thresholdsMs?: Partial<WatchdogThresholdsMs>;
+      softLogIntervalMs?: number;
+      recentEventLimit?: number;
+      context?: string;
+    };
+  }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");

@@ -1,4 +1,5 @@
 import { $ } from "bun";
+import crypto from "crypto";
 import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import { loadConfig } from "./config";
@@ -257,6 +258,27 @@ function extractPlanSummary(output: string): string | null {
   return null;
 }
 
+function sanitizeDiagnostics(text: string): string {
+  // Strip ANSI escape codes.
+  let out = text.replace(/\x1b\[[0-9;]*m/g, "");
+
+  // Best-effort redaction (keep conservative, avoid overfitting).
+  const patterns: Array<{ re: RegExp; replacement: string }> = [
+    { re: /ghp_[A-Za-z0-9]{20,}/g, replacement: "ghp_[REDACTED]" },
+    { re: /github_pat_[A-Za-z0-9_]{20,}/g, replacement: "github_pat_[REDACTED]" },
+    { re: /sk-[A-Za-z0-9]{20,}/g, replacement: "sk-[REDACTED]" },
+    { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "xox-[REDACTED]" },
+    { re: /(Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
+    { re: /(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
+  ];
+
+  for (const { re, replacement } of patterns) {
+    out = out.replace(re, replacement);
+  }
+
+  return out;
+}
+
 export async function notifyEscalation(ctx: EscalationContext): Promise<boolean> {
   const today = new Date().toISOString().split("T")[0];
   const shortIssue = ctx.issue.split("/").pop() || ctx.issue;
@@ -301,21 +323,28 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
 
   // Add product consultation if found in output
   if (ctx.planOutput) {
-    console.log(`[ralph:notify] planOutput length: ${ctx.planOutput.length} chars`);
-    
     const productSection = extractProductConsultation(ctx.planOutput);
-    console.log(`[ralph:notify] productSection extracted: ${productSection ? productSection.length + ' chars' : 'null'}`);
     if (productSection) {
       bodyParts.push(`## Product Review`, "", productSection, "");
     }
 
     const planSection = extractPlanSummary(ctx.planOutput);
-    console.log(`[ralph:notify] planSection extracted: ${planSection ? planSection.length + ' chars' : 'null'}`);
     if (planSection) {
       bodyParts.push(`## Implementation Plan`, "", planSection, "");
     }
-  } else {
-    console.log(`[ralph:notify] No planOutput provided`);
+
+    // Always include bounded diagnostics to make escalations actionable.
+    const diagnostics = sanitizeDiagnostics(ctx.planOutput).trim();
+    if (diagnostics) {
+      bodyParts.push(
+        `## Diagnostics`,
+        "",
+        "```",
+        diagnostics.slice(0, 20000).trimEnd(),
+        "```",
+        ""
+      );
+    }
   }
 
   // Add action items
