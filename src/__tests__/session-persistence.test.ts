@@ -123,19 +123,19 @@ describe("Session Persistence", () => {
       expect(completedTask["session-id"]).toBe("");
     });
 
-    test("session-id should be cleared on task escalation", () => {
+    test("session-id should be preserved on task escalation", () => {
       const task = createMockTask({
         status: "in-progress",
         "session-id": "ses_abc123"
       });
 
-      // Simulate escalation - session-id implicitly cleared via status change
       const escalatedTask = {
         ...task,
         status: "escalated" as const,
       };
 
       expect(escalatedTask.status).toBe("escalated");
+      expect(escalatedTask["session-id"]).toBe("ses_abc123");
     });
   });
 

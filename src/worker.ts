@@ -250,10 +250,12 @@ export class RepoWorker {
 
     console.log(`[ralph:worker:${this.repo}] Watchdog hard timeout repeated; escalating: ${reason}`);
 
-    await updateTaskStatus(task, "escalated", {
-      "session-id": "",
+    const escalationFields: Record<string, string> = {
       "watchdog-retries": String(nextRetryCount),
-    });
+    };
+    if (result.sessionId) escalationFields["session-id"] = result.sessionId;
+
+    await updateTaskStatus(task, "escalated", escalationFields);
 
     await notifyEscalation({
       taskName: task.name,
@@ -261,6 +263,7 @@ export class RepoWorker {
       taskPath: task._path,
       issue: task.issue,
       repo: this.repo,
+      sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
       reason,
       escalationType: "other",
       planOutput: result.output,
@@ -275,7 +278,7 @@ export class RepoWorker {
     };
   }
 
-  async resumeTask(task: AgentTask): Promise<AgentRun> {
+  async resumeTask(task: AgentTask, opts?: { resumeMessage?: string }): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
 
@@ -294,11 +297,13 @@ export class RepoWorker {
 
     try {
       const botBranch = getRepoBotBranch(this.repo);
-      const resumeMessage =
+      const defaultResumeMessage =
         "Ralph restarted while this task was in progress. " +
         "Resume from where you left off. " +
         "If you already created a PR, paste the PR URL. " +
         `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
+
+      const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
 
       let buildResult = await continueSession(this.repoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
@@ -318,23 +323,15 @@ export class RepoWorker {
         }
 
         const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
-        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+        console.warn(`[ralph:worker:${this.repo}] Resume failed; falling back to fresh run: ${reason}`);
 
-        await updateTaskStatus(task, "escalated");
-        await notifyEscalation({
-          taskName: task.name,
-          taskFileName: task._name,
-          taskPath: task._path,
-          issue: task.issue,
-          repo: this.repo,
-          reason,
-          escalationType: "other",
-        });
+        // Fall back to a fresh run by clearing session-id and re-queueing.
+        await updateTaskStatus(task, "queued", { "session-id": "" });
 
         return {
           taskName: task.name,
           repo: this.repo,
-          outcome: "escalated",
+          outcome: "failed",
           sessionId: existingSessionId,
           escalationReason: reason,
         };
@@ -378,6 +375,7 @@ export class RepoWorker {
               taskPath: task._path,
               issue: task.issue,
               repo: this.repo,
+              sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
               planOutput: buildResult.output,
@@ -460,6 +458,7 @@ export class RepoWorker {
           taskPath: task._path,
           issue: task.issue,
           repo: this.repo,
+          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
           planOutput: buildResult.output,
@@ -758,6 +757,7 @@ export class RepoWorker {
           taskPath: task._path,
           issue: task.issue,
           repo: this.repo,
+          sessionId: planResult.sessionId,
           reason,
           escalationType,
           planOutput: planResult.output,
@@ -847,6 +847,7 @@ export class RepoWorker {
               taskPath: task._path,
               issue: task.issue,
               repo: this.repo,
+              sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
               planOutput: buildResult.output,
@@ -933,6 +934,7 @@ export class RepoWorker {
           taskPath: task._path,
           issue: task.issue,
           repo: this.repo,
+          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
           planOutput: buildResult.output,

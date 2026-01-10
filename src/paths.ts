@@ -7,10 +7,8 @@ export function getRalphSessionsDir(): string {
   return join(homedir(), ".ralph", "sessions");
 }
 
-export const RALPH_SESSIONS_DIR = getRalphSessionsDir();
-
 export function getRalphSessionDir(sessionId: string): string {
-  return join(RALPH_SESSIONS_DIR, sessionId);
+  return join(getRalphSessionsDir(), sessionId);
 }
 
 // Back-compat for bot/integration helpers

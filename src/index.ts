@@ -7,7 +7,8 @@
  * Creates rollup PRs after N successful merges for batch review.
  */
 
-import { existsSync } from "fs";
+import { existsSync, watch } from "fs";
+import { join } from "path";
 
 import { loadConfig } from "./config";
 import {
@@ -17,6 +18,7 @@ import {
   groupByRepo,
   getQueuedTasks,
   getTasksByStatus,
+  getTaskByPath,
   updateTaskStatus,
   type AgentTask,
 } from "./queue";
@@ -28,6 +30,7 @@ import { shouldLog } from "./logging";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { queueNudge } from "./nudge";
+import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
 
 // --- State ---
 
@@ -47,6 +50,144 @@ function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
 
 // Track in-flight tasks to avoid double-processing
 const inFlightTasks = new Set<string>();
+
+let escalationWatcher: ReturnType<typeof watch> | null = null;
+let escalationDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function attemptResumeResolvedEscalations(): Promise<void> {
+  if (getDaemonMode() === "draining" || isShuttingDown) return;
+
+  const resolved = await getEscalationsByStatus("resolved");
+  if (resolved.length === 0) return;
+
+  const pending = resolved.filter((e) => !(e["resume-attempted-at"]?.trim()));
+  if (pending.length === 0) return;
+
+  for (const escalation of pending) {
+    if (getDaemonMode() === "draining" || isShuttingDown) return;
+
+    const taskPath = escalation["task-path"]?.trim() ?? "";
+    const sessionId = escalation["session-id"]?.trim() ?? "";
+    const repo = escalation.repo?.trim() ?? "";
+
+    if (!taskPath || !sessionId || !repo) {
+      const reason = `Missing required fields (task-path='${taskPath}', session-id='${sessionId}', repo='${repo}')`;
+      console.warn(`[ralph:escalations] Resolved escalation invalid; ${reason}: ${escalation._path}`);
+
+      await editEscalation(escalation._path, {
+        "resume-status": "failed",
+        "resume-attempted-at": new Date().toISOString(),
+        "resume-error": reason,
+      });
+
+      continue;
+    }
+
+    const worker = workers.get(repo) ?? (() => {
+      const repoPath = getRepoPath(repo);
+      const created = new RepoWorker(repo, repoPath);
+      workers.set(repo, created);
+      console.log(`[ralph] Created worker for ${repo} -> ${repoPath}`);
+      return created;
+    })();
+
+    if (worker.busy) {
+      // Avoid silent stalling: record a durable deferred state and retry later.
+      if (escalation["resume-status"]?.trim() !== "deferred") {
+        await editEscalation(escalation._path, {
+          "resume-status": "deferred",
+          "resume-deferred-at": new Date().toISOString(),
+          "resume-error": "Worker busy; will retry",
+        });
+      }
+      continue;
+    }
+
+    const task = await getTaskByPath(taskPath);
+    if (!task) {
+      console.warn(`[ralph:escalations] Resolved escalation references missing task; skipping: ${taskPath}`);
+      await editEscalation(escalation._path, {
+        "resume-status": "failed",
+        "resume-attempted-at": new Date().toISOString(),
+        "resume-error": `Task not found: ${taskPath}`,
+      });
+      continue;
+    }
+
+    const resolution = await readResolutionMessage(escalation._path);
+    if (!resolution) {
+      const reason = "Resolved escalation has empty/missing ## Resolution text";
+      console.warn(`[ralph:escalations] ${reason}; skipping: ${escalation._path}`);
+      await editEscalation(escalation._path, {
+        "resume-status": "failed",
+        "resume-attempted-at": new Date().toISOString(),
+        "resume-error": reason,
+      });
+      continue;
+    }
+
+    const taskKey = getTaskKey(task);
+    if (inFlightTasks.has(taskKey)) continue;
+
+    // Ensure the task is resumable and marked in-progress.
+    await updateTaskStatus(task, "in-progress", {
+      "assigned-at": new Date().toISOString().split("T")[0],
+      "session-id": sessionId,
+    });
+
+    const resumeMessage = [
+      "Escalation resolved. Resume the existing OpenCode session from where you left off.",
+      "Apply the human guidance below. Do NOT restart from scratch unless strictly necessary.",
+      "",
+      "Human guidance:",
+      resolution,
+    ].join("\n");
+
+    // Mark as attempted before resuming to avoid duplicate resumes.
+    await editEscalation(escalation._path, {
+      "resume-status": "attempting",
+      "resume-attempted-at": new Date().toISOString(),
+      "resume-error": "",
+    });
+
+    inFlightTasks.add(taskKey);
+
+    worker
+      .resumeTask(task, { resumeMessage })
+      .then(async (run) => {
+        if (run.outcome === "success") {
+          if (run.pr) {
+            await rollupMonitor.recordMerge(repo, run.pr);
+          }
+
+          await editEscalation(escalation._path, {
+            "resume-status": "succeeded",
+            "resume-error": "",
+          });
+
+          return;
+        }
+
+        const reason =
+          run.escalationReason ??
+          (run.outcome === "escalated" ? "Resumed session escalated" : "Resume failed");
+
+        await editEscalation(escalation._path, {
+          "resume-status": "failed",
+          "resume-error": reason,
+        });
+      })
+      .catch(async (e: any) => {
+        await editEscalation(escalation._path, {
+          "resume-status": "failed",
+          "resume-error": e?.message ?? String(e),
+        });
+      })
+      .finally(() => {
+        inFlightTasks.delete(taskKey);
+      });
+  }
+}
 
 // --- Main Logic ---
 
@@ -255,6 +396,9 @@ async function main(): Promise<void> {
   // Resume orphaned tasks from previous daemon runs
   await resumeTasksOnStartup();
 
+  // Resume any resolved escalations (HITL checkpoint) from the same session.
+  await attemptResumeResolvedEscalations();
+
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
   const initialTasks = await initialPoll();
@@ -271,6 +415,25 @@ async function main(): Promise<void> {
       await processNewTasks(tasks);
     }
   });
+
+  // Watch escalations for resolution and resume the same OpenCode session.
+  const escalationsDir = join(config.bwrbVault, "orchestration/escalations");
+  if (existsSync(escalationsDir)) {
+    console.log(`[ralph:escalations] Watching ${escalationsDir} for changes`);
+
+    escalationWatcher = watch(escalationsDir, { recursive: true }, async (_eventType: string, filename: string | null) => {
+      if (!filename || !filename.endsWith(".md")) return;
+
+      if (escalationDebounceTimer) clearTimeout(escalationDebounceTimer);
+      escalationDebounceTimer = setTimeout(() => {
+        attemptResumeResolvedEscalations().catch(() => {
+          // ignore
+        });
+      }, 750);
+    });
+  } else {
+    console.log(`[ralph:escalations] Escalations dir not found: ${escalationsDir}`);
+  }
 
   const heartbeatIntervalMs = 5_000;
   let heartbeatInFlight = false;
@@ -310,6 +473,14 @@ async function main(): Promise<void> {
     
     // Stop accepting new tasks
     stopWatching();
+    if (escalationWatcher) {
+      escalationWatcher.close();
+      escalationWatcher = null;
+    }
+    if (escalationDebounceTimer) {
+      clearTimeout(escalationDebounceTimer);
+      escalationDebounceTimer = null;
+    }
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
     

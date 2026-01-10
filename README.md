@@ -151,8 +151,8 @@ On daemon startup, Ralph checks for orphaned in-progress tasks:
 
 ### Graceful handling
 
-- If session resume fails (expired session, OpenCode error), the task is escalated
-- Session IDs are cleared when tasks complete or escalate
+- If session resume fails (expired session, OpenCode error), Ralph clears `session-id` and re-queues the task for a fresh run
+- Session IDs are cleared when tasks complete; preserved on escalation so the same session can be resumed after HITL resolution
 - Only one task per repo can be in-progress at a time; duplicates are reset to queued
 
 ### Benefits
