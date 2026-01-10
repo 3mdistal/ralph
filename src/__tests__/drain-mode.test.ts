@@ -55,10 +55,10 @@ describe("Drain mode", () => {
     const drainPath = resolveDrainFilePath(homeDir);
     mkdirSync(dirname(drainPath), { recursive: true });
     writeFileSync(drainPath, "");
-    await sleep(40);
+    await sleep(100);
 
     rmSync(drainPath, { force: true });
-    await sleep(40);
+    await sleep(100);
 
     monitor.stop();
 

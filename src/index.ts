@@ -68,6 +68,8 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
   
   // Process in parallel across repos
   for (const [repo, repoTasks] of byRepo) {
+    if (getDaemonMode() === "draining") return;
+
     // Get or create worker for this repo
     let worker = workers.get(repo);
     if (!worker) {
