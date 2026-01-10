@@ -109,8 +109,8 @@ function extractOpencodeLogPath(text: string): string | null {
 
 function redactHomePath(path: string): string {
   const home = homedir();
-  if (home && path.startsWith(home)) return `~${path.slice(home.length)}`;
-  return path;
+  if (!home) return path;
+  return path.split(home).join("~");
 }
 
 function sanitizeOpencodeLog(text: string): string {
