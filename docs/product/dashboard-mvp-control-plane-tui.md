@@ -16,6 +16,14 @@ Build an **observability + control plane** that the Ralph daemon exposes over a 
 
 The key design choice is **API-first**: the daemon publishes structured events; UIs subscribe and render.
 
+## Operator posture
+
+This dashboard/control plane is **operator tooling**, not a user-facing UI.
+
+- Intended user: the maintainer/operator running Ralph (single-user posture).
+- API-first: frontends are interchangeable (TUI first; other UIs later).
+- Local-first: token-authenticated and bound to `127.0.0.1` by default; remote access is via SSH port-forwarding or your own proxy.
+
 ## Goals
 
 - **State visibility:** see every worker, what it’s doing, and how long.
@@ -301,6 +309,34 @@ Constraints:
 Implementation preference:
 - use OpenCode (keeps dependencies/costs consolidated)
 - dedicate a summarizer session or small model
+
+## Issue map
+
+Epics:
+- https://github.com/3mdistal/ralph/issues/22 — Dashboard MVP (Control plane + TUI)
+- https://github.com/3mdistal/ralph/issues/23 — Dashboard docs + scope
+- https://github.com/3mdistal/ralph/issues/24 — Control plane backend
+- https://github.com/3mdistal/ralph/issues/25 — Control commands + checkpoints
+- https://github.com/3mdistal/ralph/issues/26 — Terminal UI client
+- https://github.com/3mdistal/ralph/issues/27 — OpenCode server integration
+- https://github.com/3mdistal/ralph/issues/28 — Observability upgrades
+
+Implementation issues:
+- https://github.com/3mdistal/ralph/issues/30 — Event bus + typed event schema
+- https://github.com/3mdistal/ralph/issues/31 — Worker IDs + per-repo concurrency slots
+- https://github.com/3mdistal/ralph/issues/32 — Emit timestamped log and state events
+- https://github.com/3mdistal/ralph/issues/33 — Persist events (JSONL) + retention cleanup
+- https://github.com/3mdistal/ralph/issues/34 — Control plane server (state + events + auth)
+- https://github.com/3mdistal/ralph/issues/35 — Checkpoints + stepwise pause/resume
+- https://github.com/3mdistal/ralph/issues/36 — Message queue + deliver at checkpoint
+- https://github.com/3mdistal/ralph/issues/37 — bwrb edit endpoints (priority/status)
+- https://github.com/3mdistal/ralph/issues/38 — TUI client MVP (workers list + logs tabs)
+- https://github.com/3mdistal/ralph/issues/39 — TUI controls (pause/resume + enqueue message)
+- https://github.com/3mdistal/ralph/issues/40 — TUI task controls (reprioritize via bwrb)
+- https://github.com/3mdistal/ralph/issues/41 — Activity classifier (heuristics)
+- https://github.com/3mdistal/ralph/issues/42 — OpenCode server client (SSE + prompt_async)
+- https://github.com/3mdistal/ralph/issues/43 — Interrupt messaging (abort + prompt_async)
+- https://github.com/3mdistal/ralph/issues/44 — Tiny summaries (minute-level, cost-capped)
 
 ## Proposed issue breakdown (after this idea)
 
