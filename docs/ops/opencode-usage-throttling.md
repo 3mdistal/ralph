@@ -1,7 +1,12 @@
 # Ralph: OpenCode usage throttling (Codex 5h + weekly)
 
+**Status:** draft (ops notes)
+**Owner:** @3mdistal
+**Last updated:** 2026-01-10
+**Canonical policy:** `docs/product/usage-throttling.md` (this doc is implementation notes + calibration)
+
 ## Goal
-Ensure Ralph never consumes more than a configurable fraction of my OpenAI Codex plan usage, while preserving predictable availability for my own OpenCode usage.
+Ensure Ralph never consumes more than a configurable fraction of the operator's available plan usage, while preserving predictable availability for interactive use.
 
 - Track usage from OpenCode local logs (covers Ralph + any OpenCode chats).
 - Enforce soft/hard thresholds (e.g., 65% / 75%).

@@ -1,5 +1,10 @@
 # Ralph Dashboard MVP: Control Plane + TUI
 
+**Status:** draft (copied from bwrb idea)
+**Owner:** @3mdistal
+**Last updated:** 2026-01-10
+**Related:** `docs/product/vision.md`, `docs/product/graceful-drain-rolling-restart.md`
+
 ## Summary
 
 Build an **observability + control plane** that the Ralph daemon exposes over a local API.

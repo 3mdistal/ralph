@@ -1,5 +1,10 @@
 # Ralph: Graceful drain + rolling restart (checkpoint-based)
 
+**Status:** draft (copied from bwrb idea)
+**Owner:** @3mdistal
+**Last updated:** 2026-01-10
+**Related:** `docs/product/vision.md`, `docs/product/dashboard-mvp-control-plane-tui.md`
+
 ## Summary
 
 Make Ralph restarts/upgrades low-disruption and platform-agnostic by introducing a **drain mode**, **checkpoint-based pausing**, and a **deterministic handoff/resume protocol**.

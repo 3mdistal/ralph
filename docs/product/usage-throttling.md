@@ -1,5 +1,10 @@
 # Ralph: Usage throttling policy
 
+**Status:** draft (policy)
+**Owner:** @3mdistal
+**Last updated:** 2026-01-10
+**Related:** `docs/product/vision.md`, `docs/ops/opencode-usage-throttling.md`
+
 ## Summary
 
 Ralph must protect operator reliability by preventing runaway background agent usage from consuming all available model budget.
