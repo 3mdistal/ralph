@@ -107,6 +107,12 @@ function extractOpencodeLogPath(text: string): string | null {
   return match?.[1] ?? null;
 }
 
+function redactHomePath(path: string): string {
+  const home = homedir();
+  if (home && path.startsWith(home)) return `~${path.slice(home.length)}`;
+  return path;
+}
+
 function sanitizeOpencodeLog(text: string): string {
   // Strip ANSI escape codes.
   let out = text.replace(/\x1b\[[0-9;]*m/g, "");
@@ -137,6 +143,8 @@ async function appendOpencodeLogTail(output: string): Promise<string> {
   const logPath = extractOpencodeLogPath(output);
   if (!logPath) return output;
 
+  const displayPath = redactHomePath(logPath);
+
   try {
     const raw = await readFile(logPath, "utf8");
     const lines = raw.split("\n");
@@ -147,7 +155,7 @@ async function appendOpencodeLogTail(output: string): Promise<string> {
       output.trimEnd(),
       "",
       "---",
-      `OpenCode log tail (${logPath})`,
+      `OpenCode log tail (${displayPath})`,
       "```",
       tail.trimEnd(),
       "```",
@@ -159,7 +167,7 @@ async function appendOpencodeLogTail(output: string): Promise<string> {
       output.trimEnd(),
       "",
       "---",
-      `OpenCode log tail unavailable (${logPath})`,
+      `OpenCode log tail unavailable (${displayPath})`,
       "```",
       message.trimEnd(),
       "```",
@@ -542,7 +550,7 @@ export async function runSession(
     const logPath = extractOpencodeLogPath(combinedRaw);
 
     const header = `Failed with exit code ${exitCode}${sessionId ? ` (session ${sessionId})` : ""}`;
-    const logHint = logPath ? `OpenCode log: \`${logPath}\`` : "";
+    const logHint = logPath ? `OpenCode log: \`${redactHomePath(logPath)}\`` : "";
 
     const err = stderr.trim() ? sanitizeOpencodeLog(truncateTail(stderr.trim(), 8000)) : "";
     const text = textOutput.trim() ? sanitizeOpencodeLog(truncateTail(textOutput.trim(), 8000)) : "";
