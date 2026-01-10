@@ -40,7 +40,7 @@ export interface SessionResult {
  * Spawn an OpenCode server for a specific repo directory.
  * Not required for `opencode run`, but useful for interactive/attached modes.
  */
-export async function spawnServer(repoPath: string): Promise<ServerHandle> {
+async function spawnServer(repoPath: string): Promise<ServerHandle> {
   return new Promise((resolve, reject) => {
     const port = 4000 + Math.floor(Math.random() * 1000);
 
@@ -78,7 +78,7 @@ export async function spawnServer(repoPath: string): Promise<ServerHandle> {
   });
 }
 
-export function killServer(handle: ServerHandle): void {
+function killServer(handle: ServerHandle): void {
   if (handle.process && !handle.process.killed) handle.process.kill();
 }
 
@@ -194,7 +194,7 @@ function argsFromMessage(message: string): string[] {
 /**
  * Run an OpenCode session with optional configured command.
  */
-export async function runSession(
+async function runSession(
   repoPath: string,
   message: string,
   options?: {
@@ -860,7 +860,7 @@ export async function continueCommand(
 /**
  * Stream JSON events for a run.
  */
-export async function* streamSession(
+async function* streamSession(
   repoPath: string,
   message: string,
   options?: {
