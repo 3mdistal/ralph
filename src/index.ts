@@ -346,15 +346,132 @@ async function main(): Promise<void> {
 
 // --- CLI Commands ---
 
+function printGlobalHelp(): void {
+  console.log(
+    [
+      "Ralph Loop (ralph)",
+      "",
+      "Usage:",
+      "  ralph                              Run daemon (default)",
+      "  ralph resume                       Resume orphaned in-progress tasks, then exit",
+      "  ralph status [--json]              Show daemon/task status",
+      "  ralph watch                        Stream status updates (Ctrl+C to stop)",
+      "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph rollup <repo>                (stub) Rollup helpers",
+      "",
+      "Options:",
+      "  -h, --help                         Show help (also: ralph help [command])",
+      "",
+      "Notes:",
+      "  Drain mode: create/remove ~/.config/opencode/ralph/drain to pause scheduling new tasks.",
+    ].join("\n")
+  );
+}
+
+function printCommandHelp(command: string): void {
+  switch (command) {
+    case "resume":
+      console.log(
+        [
+          "Usage:",
+          "  ralph resume",
+          "",
+          "Resumes any orphaned in-progress tasks (after a daemon restart) and exits.",
+        ].join("\n")
+      );
+      return;
+
+    case "status":
+      console.log(
+        [
+          "Usage:",
+          "  ralph status [--json]",
+          "",
+          "Shows daemon mode plus queued and in-progress tasks.",
+          "",
+          "Options:",
+          "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "watch":
+      console.log(
+        [
+          "Usage:",
+          "  ralph watch",
+          "",
+          "Prints a line whenever an in-progress task's status changes.",
+        ].join("\n")
+      );
+      return;
+
+    case "nudge":
+      console.log(
+        [
+          "Usage:",
+          "  ralph nudge <taskRef> \"<message>\"",
+          "",
+          "Queues an operator message and delivers it at the next safe checkpoint (between continueSession runs).",
+          "taskRef can be a task path, name, or a substring (must match exactly one in-progress task).",
+        ].join("\n")
+      );
+      return;
+
+    case "rollup":
+      console.log(
+        [
+          "Usage:",
+          "  ralph rollup <repo>",
+          "",
+          "Rollup helpers. (Currently prints guidance; rollup is typically done via gh.)",
+        ].join("\n")
+      );
+      return;
+
+    default:
+      printGlobalHelp();
+      return;
+  }
+}
+
 const args = process.argv.slice(2);
+const cmd = args[0];
+
+const hasHelpFlag = args.includes("-h") || args.includes("--help");
+
+// Global help: `ralph --help` / `ralph -h` / `ralph help [command]`
+if (cmd === "help") {
+  const target = args[1];
+  if (!target || target.startsWith("-")) printGlobalHelp();
+  else printCommandHelp(target);
+  process.exit(0);
+}
+
+if (!cmd || cmd.startsWith("-")) {
+  if (hasHelpFlag) {
+    printGlobalHelp();
+    process.exit(0);
+  }
+}
 
 if (args[0] === "resume") {
+  if (hasHelpFlag) {
+    printCommandHelp("resume");
+    process.exit(0);
+  }
+
   // Resume any orphaned in-progress tasks and exit
   await resumeTasksOnStartup();
   process.exit(0);
 }
 
 if (args[0] === "status") {
+  if (hasHelpFlag) {
+    printCommandHelp("status");
+    process.exit(0);
+  }
+
   const json = args.includes("--json");
   const mode: DaemonMode = isDraining() ? "draining" : "running";
 
@@ -415,6 +532,11 @@ if (args[0] === "status") {
 }
 
 if (args[0] === "nudge") {
+  if (hasHelpFlag) {
+    printCommandHelp("nudge");
+    process.exit(0);
+  }
+
   const taskRefRaw = args[1];
   const messageRaw = args.slice(2).join(" ").trim();
 
@@ -482,6 +604,11 @@ if (args[0] === "nudge") {
 }
 
 if (args[0] === "watch") {
+  if (hasHelpFlag) {
+    printCommandHelp("watch");
+    process.exit(0);
+  }
+
   console.log("[ralph] Watching in-progress task status (Ctrl+C to stop)...");
 
   const lastLines = new Map<string, string>();
@@ -534,6 +661,11 @@ if (args[0] === "watch") {
 
 
 if (args[0] === "rollup") {
+  if (hasHelpFlag) {
+    printCommandHelp("rollup");
+    process.exit(0);
+  }
+
   // Force rollup for a repo
   const repo = args[1];
   if (!repo) {
