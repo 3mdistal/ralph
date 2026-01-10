@@ -436,7 +436,7 @@ export class RepoWorker {
       // Transient OpenCode cache races can cause ENOENT during module imports (e.g. zod locales).
       // With per-run cache isolation this should be rare, but we still retry once for robustness.
       const isTransientCacheENOENT = (output: string) =>
-        /ENOENT\s+reading\s+"[^"]*\/\.cache\/opencode\/node_modules\//.test(output) ||
+        /ENOENT\s+reading\s+"[^"]*\/opencode\/node_modules\//.test(output) ||
         /ENOENT\s+reading\s+"[^"]*zod\/v4\/locales\//.test(output);
 
       let planResult = await runCommand(this.repoPath, "next-task", [issueNumber], {
