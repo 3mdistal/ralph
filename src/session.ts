@@ -268,7 +268,7 @@ export async function runSession(
 
     try {
       const str = typeof candidate === "string" ? candidate : JSON.stringify(candidate);
-      return truncate(str, 500);
+      return sanitizeOpencodeLog(truncate(str, 500));
     } catch {
       return undefined;
     }
@@ -385,7 +385,7 @@ export async function runSession(
       const trimmed = line.trim();
       if (!trimmed) continue;
 
-      recentEvents.push(truncate(trimmed, 800));
+      recentEvents.push(sanitizeOpencodeLog(truncate(trimmed, 800)));
       if (recentEvents.length > recentEventLimit) recentEvents = recentEvents.slice(-recentEventLimit);
 
       try {
