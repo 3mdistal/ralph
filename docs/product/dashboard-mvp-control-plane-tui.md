@@ -18,11 +18,12 @@ The key design choice is **API-first**: the daemon publishes structured events; 
 
 ## Operator posture
 
-This dashboard/control plane is **operator tooling**, not a user-facing UI.
+This control plane (operator dashboard) is **operator tooling**, not a user-facing UI.
 
 - Intended user: the maintainer/operator running Ralph (single-user posture).
 - API-first: frontends are interchangeable (TUI first; other UIs later).
 - Local-first: token-authenticated and bound to `127.0.0.1` by default; remote access is via SSH port-forwarding or your own proxy.
+- Threat model: single-user, local-machine; not hardened for hostile networks.
 
 ## Goals
 
@@ -311,6 +312,8 @@ Implementation preference:
 - dedicate a summarizer session or small model
 
 ## Issue map
+
+This list is for navigation and may drift; treat the epics as canonical.
 
 Epics:
 - https://github.com/3mdistal/ralph/issues/22 — Dashboard MVP (Control plane + TUI)
