@@ -17,6 +17,11 @@
   // Ignore build output and intentionally-unused modules.
   "ignore": ["dist/**", "src/transcript.ts"],
 
+  // Some config exports are intentionally public API.
+  "ignoreIssues": {
+    "src/config.ts": ["exports"]
+  },
+
   // Avoid noisy reports for intentional type-only public API.
   "ignoreExportsUsedInFile": {
     "interface": true,
