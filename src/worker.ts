@@ -9,7 +9,6 @@ import { loadConfig, getRepoBotBranch } from "./config";
 import { runCommand, continueSession, continueCommand, getRalphXdgCacheHome } from "./session";
 import { parseRoutingDecision, hasProductGap, extractPrUrl, type RoutingDecision } from "./routing";
 import {
-  isContractSurfaceReason,
   isExplicitBlockerReason,
   isImplementationTaskFromIssue,
   shouldConsultDevex,
@@ -167,7 +166,7 @@ export class RepoWorker {
     hasGap: boolean,
     isImplementationTask: boolean
   ): boolean {
-    return shouldEscalateAfterRouting({ routing, hasGap, isImplementationTask });
+    return shouldEscalateAfterRouting({ routing, hasGap });
   }
 
   async resumeTask(task: AgentTask): Promise<AgentRun> {
@@ -533,9 +532,6 @@ export class RepoWorker {
           escalationType = "ambiguous-requirements";
         }
 
-        if (isContractSurfaceReason(routing?.escalation_reason)) {
-          escalationType = "other";
-        }
 
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 

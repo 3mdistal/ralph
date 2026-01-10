@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  isAmbiguousRequirementsReason,
   isContractSurfaceReason,
   isExplicitBlockerReason,
   isImplementationTaskFromIssue,
@@ -86,39 +87,63 @@ describe("escalation helpers", () => {
       expect(isExplicitBlockerReason(null)).toBe(false);
       expect(isExplicitBlockerReason("style")).toBe(false);
     });
+
+    test("does not match common negations", () => {
+      expect(isExplicitBlockerReason("unblocked")).toBe(false);
+      expect(isExplicitBlockerReason("not blocked anymore")).toBe(false);
+    });
+  });
+ 
+  describe("isAmbiguousRequirementsReason", () => {
+    test("detects explicit ambiguity", () => {
+      expect(isAmbiguousRequirementsReason("ambiguous requirements")).toBe(true);
+      expect(isAmbiguousRequirementsReason("unclear spec")).toBe(true);
+      expect(isAmbiguousRequirementsReason("needs clarification")).toBe(true);
+      expect(isAmbiguousRequirementsReason("requires clarification")).toBe(true);
+    });
+
+    test("false for empty/unrelated reasons", () => {
+      expect(isAmbiguousRequirementsReason(null)).toBe(false);
+      expect(isAmbiguousRequirementsReason("ambiguous")).toBe(false);
+    });
   });
 
   describe("shouldEscalateAfterRouting", () => {
     test("always escalates on product gap", () => {
       const routing = { decision: "proceed" as const, confidence: "low" as const, escalation_reason: "" };
-      expect(shouldEscalateAfterRouting({ routing, hasGap: true, isImplementationTask: true })).toBe(true);
+      expect(shouldEscalateAfterRouting({ routing, hasGap: true })).toBe(true);
     });
 
     test("always escalates on explicit blocker", () => {
       const routing = { decision: "proceed" as const, confidence: "low" as const, escalation_reason: "blocked" };
-      expect(shouldEscalateAfterRouting({ routing, hasGap: false, isImplementationTask: true })).toBe(true);
+      expect(shouldEscalateAfterRouting({ routing, hasGap: false })).toBe(true);
+    });
+
+    test("always escalates on ambiguous requirements", () => {
+      const routing = { decision: "proceed" as const, confidence: "low" as const, escalation_reason: "ambiguous requirements" };
+      expect(shouldEscalateAfterRouting({ routing, hasGap: false })).toBe(true);
     });
 
     test("always escalates on contract-surface reasons", () => {
       const routing = { decision: "proceed" as const, confidence: "low" as const, escalation_reason: "exit code" };
-      expect(shouldEscalateAfterRouting({ routing, hasGap: false, isImplementationTask: true })).toBe(true);
+      expect(shouldEscalateAfterRouting({ routing, hasGap: false })).toBe(true);
     });
 
     test("escalates only on high-confidence explicit escalate", () => {
       const routing = { decision: "escalate" as const, confidence: "high" as const, escalation_reason: "" };
-      expect(shouldEscalateAfterRouting({ routing, hasGap: false, isImplementationTask: true })).toBe(true);
+      expect(shouldEscalateAfterRouting({ routing, hasGap: false })).toBe(true);
     });
 
     test("does not escalate on low confidence alone", () => {
       const routing = { decision: "proceed" as const, confidence: "low" as const, escalation_reason: "" };
-      expect(shouldEscalateAfterRouting({ routing, hasGap: false, isImplementationTask: true })).toBe(false);
+      expect(shouldEscalateAfterRouting({ routing, hasGap: false })).toBe(false);
     });
 
     test("does not escalate on low/medium-confidence escalate decisions", () => {
       const routingLow = { decision: "escalate" as const, confidence: "low" as const, escalation_reason: "" };
       const routingMedium = { decision: "escalate" as const, confidence: "medium" as const, escalation_reason: "" };
-      expect(shouldEscalateAfterRouting({ routing: routingLow, hasGap: false, isImplementationTask: true })).toBe(false);
-      expect(shouldEscalateAfterRouting({ routing: routingMedium, hasGap: false, isImplementationTask: true })).toBe(false);
+      expect(shouldEscalateAfterRouting({ routing: routingLow, hasGap: false })).toBe(false);
+      expect(shouldEscalateAfterRouting({ routing: routingMedium, hasGap: false })).toBe(false);
     });
   });
 });

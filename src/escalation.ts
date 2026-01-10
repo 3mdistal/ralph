@@ -44,19 +44,36 @@ export function isExplicitBlockerReason(reason?: string | null): boolean {
   const r = (reason ?? "").toLowerCase();
   if (!r) return false;
 
+  // Avoid common negations.
+  if (/\bunblocked\b/.test(r)) return false;
+  if (/\bnot\s+blocked\b/.test(r)) return false;
+
   // Keep this conservative: only detect clear "cannot proceed" / "blocked" signals.
-  const indicators = [
-    "blocked",
-    "cannot proceed",
-    "can't proceed",
-    "needs human decision",
-    "need human decision",
-    "requires human decision",
-    "requires human",
-    "external blocker",
+  const indicators: RegExp[] = [
+    /\bblocked\b/, 
+    /\bcannot\s+proceed\b/,
+    /\bcan'?t\s+proceed\b/,
+    /\bneeds?\s+human\s+decision\b/,
+    /\brequires?\s+human(\s+decision)?\b/,
+    /\bexternal\s+blocker\b/,
   ];
 
-  return indicators.some((s) => r.includes(s));
+  return indicators.some((re) => re.test(r));
+}
+
+export function isAmbiguousRequirementsReason(reason?: string | null): boolean {
+  const r = (reason ?? "").toLowerCase();
+  if (!r) return false;
+
+  // Conservative: only treat as ambiguity when it explicitly asks for clarification.
+  if (/\bneeds?\s+clarification\b/.test(r)) return true;
+  if (/\brequires?\s+clarification\b/.test(r)) return true;
+
+  const ambiguityWord = /\b(ambiguous|unclear)\b/.test(r);
+  if (!ambiguityWord) return false;
+
+  // Reduce false positives by requiring a requirements/spec context.
+  return /\b(requirements?|spec|behavior|expected|acceptance criteria)\b/.test(r);
 }
 
 export function shouldConsultDevex(opts: {
@@ -78,11 +95,7 @@ export function shouldConsultDevex(opts: {
   return !isContractSurfaceReason(routing.escalation_reason);
 }
 
-export function shouldEscalateAfterRouting(opts: {
-  routing: RoutingDecision | null;
-  hasGap: boolean;
-  isImplementationTask: boolean;
-}): boolean {
+export function shouldEscalateAfterRouting(opts: { routing: RoutingDecision | null; hasGap: boolean }): boolean {
   const { routing, hasGap } = opts;
 
   // No routing decision parsed - don't escalate, let it proceed.
@@ -91,6 +104,7 @@ export function shouldEscalateAfterRouting(opts: {
   // Product gap and explicit blockers always escalate.
   if (hasGap) return true;
   if (isExplicitBlockerReason(routing.escalation_reason)) return true;
+  if (isAmbiguousRequirementsReason(routing.escalation_reason)) return true;
 
   // Contract surfaces should escalate even if the agent isn't confident.
   if (isContractSurfaceReason(routing.escalation_reason)) return true;
