@@ -23,9 +23,8 @@ import {
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { getRepoPath } from "./config";
-import { continueSession } from "./session";
 import { getRalphSessionLockPath } from "./paths";
-import { queueNudge, recordDeliveryAttempt } from "./nudge";
+import { queueNudge } from "./nudge";
 
 // --- State ---
 
@@ -336,24 +335,14 @@ if (args[0] === "nudge") {
 
   const lockPath = getRalphSessionLockPath(sessionId);
   if (existsSync(lockPath)) {
+    console.log(
+      `Queued nudge ${nudgeId} for session ${sessionId}; session is in-flight; will deliver at next checkpoint.`
+    );
+  } else {
     console.log(`Queued nudge ${nudgeId} for session ${sessionId}; will deliver at next checkpoint.`);
-    process.exit(0);
   }
 
-  const issueMatch = task.issue.match(/#(\d+)$/);
-  const cacheKey = issueMatch?.[1] ?? task._name;
-  const repoPath = getRepoPath(task.repo);
-
-  const result = await continueSession(repoPath, sessionId, message, { repo: task.repo, cacheKey });
-  if (result.success) {
-    await recordDeliveryAttempt(sessionId, nudgeId, { success: true });
-    console.log(`Delivered nudge ${nudgeId} to session ${sessionId}.`);
-    process.exit(0);
-  }
-
-  await recordDeliveryAttempt(sessionId, nudgeId, { success: false, error: result.output });
-  console.error(`Failed to deliver nudge to session ${sessionId}: ${result.output}`);
-  process.exit(1);
+  process.exit(0);
 }
 
 if (args[0] === "rollup") {
