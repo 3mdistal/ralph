@@ -189,6 +189,12 @@ export class RepoWorker {
       return { repoPath: recorded, worktreePath: recorded };
     }
 
+    if (recorded && !existsSync(recorded)) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Recorded worktree-path does not exist; falling back to main repo checkout: ${recorded}`
+      );
+    }
+
     // Only create worktrees for new runs (not resume), and only when per-repo concurrency > 1.
     if (mode === "resume") {
       return { repoPath: this.repoPath };

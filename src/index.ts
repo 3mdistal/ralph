@@ -130,14 +130,16 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
       const repoTasks = byRepo.get(repo);
       if (!repoTasks || repoTasks.length === 0) continue;
 
-      const repoSemaphore = getRepoSemaphore(repo);
-      const releaseRepo = repoSemaphore.tryAcquire();
-      if (!releaseRepo) continue;
-
       const releaseGlobal = globalSemaphore.tryAcquire();
       if (!releaseGlobal) {
-        releaseRepo();
         return;
+      }
+
+      const repoSemaphore = getRepoSemaphore(repo);
+      const releaseRepo = repoSemaphore.tryAcquire();
+      if (!releaseRepo) {
+        releaseGlobal();
+        continue;
       }
 
       const task = repoTasks.shift()!;
@@ -228,17 +230,18 @@ async function resumeTasksOnStartup(opts: { awaitCompletion: boolean }): Promise
 
   for (const task of toResume) {
     const repo = task.repo;
-    const repoSemaphore = getRepoSemaphore(repo);
-    const releaseRepo = repoSemaphore.tryAcquire();
-    if (!releaseRepo) {
-      console.warn(`[ralph] Repo concurrency limit reached unexpectedly; skipping resume: ${task.name}`);
-      continue;
-    }
 
     const releaseGlobal = globalSemaphore.tryAcquire();
     if (!releaseGlobal) {
-      releaseRepo();
       console.warn(`[ralph] Global concurrency limit reached unexpectedly; skipping resume: ${task.name}`);
+      continue;
+    }
+
+    const repoSemaphore = getRepoSemaphore(repo);
+    const releaseRepo = repoSemaphore.tryAcquire();
+    if (!releaseRepo) {
+      releaseGlobal();
+      console.warn(`[ralph] Repo concurrency limit reached unexpectedly; skipping resume: ${task.name}`);
       continue;
     }
 
