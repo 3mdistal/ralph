@@ -71,9 +71,15 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     const repo = escalation.repo?.trim() ?? "";
 
     if (!taskPath || !sessionId || !repo) {
-      console.warn(
-        `[ralph:escalations] Resolved escalation missing required fields; skipping: ${escalation._path} (task-path='${taskPath}', session-id='${sessionId}', repo='${repo}')`
-      );
+      const reason = `Missing required fields (task-path='${taskPath}', session-id='${sessionId}', repo='${repo}')`;
+      console.warn(`[ralph:escalations] Resolved escalation invalid; ${reason}: ${escalation._path}`);
+
+      await editEscalation(escalation._path, {
+        "resume-status": "failed",
+        "resume-attempted-at": new Date().toISOString(),
+        "resume-error": reason,
+      });
+
       continue;
     }
 
@@ -85,12 +91,23 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
       return created;
     })();
 
-    if (worker.busy) continue;
+    if (worker.busy) {
+      // Avoid silent stalling: record a durable deferred state and retry later.
+      if (escalation["resume-status"]?.trim() !== "deferred") {
+        await editEscalation(escalation._path, {
+          "resume-status": "deferred",
+          "resume-deferred-at": new Date().toISOString(),
+          "resume-error": "Worker busy; will retry",
+        });
+      }
+      continue;
+    }
 
     const task = await getTaskByPath(taskPath);
     if (!task) {
       console.warn(`[ralph:escalations] Resolved escalation references missing task; skipping: ${taskPath}`);
       await editEscalation(escalation._path, {
+        "resume-status": "failed",
         "resume-attempted-at": new Date().toISOString(),
         "resume-error": `Task not found: ${taskPath}`,
       });
@@ -99,7 +116,13 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
 
     const resolution = await readResolutionMessage(escalation._path);
     if (!resolution) {
-      console.warn(`[ralph:escalations] Resolved escalation has no ## Resolution text; skipping: ${escalation._path}`);
+      const reason = "Resolved escalation has empty/missing ## Resolution text";
+      console.warn(`[ralph:escalations] ${reason}; skipping: ${escalation._path}`);
+      await editEscalation(escalation._path, {
+        "resume-status": "failed",
+        "resume-attempted-at": new Date().toISOString(),
+        "resume-error": reason,
+      });
       continue;
     }
 
@@ -122,6 +145,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
 
     // Mark as attempted before resuming to avoid duplicate resumes.
     await editEscalation(escalation._path, {
+      "resume-status": "attempting",
       "resume-attempted-at": new Date().toISOString(),
       "resume-error": "",
     });
@@ -131,18 +155,31 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     worker
       .resumeTask(task, { resumeMessage })
       .then(async (run) => {
-        if (run.outcome === "success" && run.pr) {
-          await rollupMonitor.recordMerge(repo, run.pr);
+        if (run.outcome === "success") {
+          if (run.pr) {
+            await rollupMonitor.recordMerge(repo, run.pr);
+          }
+
+          await editEscalation(escalation._path, {
+            "resume-status": "succeeded",
+            "resume-error": "",
+          });
+
+          return;
         }
 
-        if (run.outcome === "failed") {
-          await editEscalation(escalation._path, {
-            "resume-error": run.escalationReason ?? "Resume failed",
-          });
-        }
+        const reason =
+          run.escalationReason ??
+          (run.outcome === "escalated" ? "Resumed session escalated" : "Resume failed");
+
+        await editEscalation(escalation._path, {
+          "resume-status": "failed",
+          "resume-error": reason,
+        });
       })
       .catch(async (e: any) => {
         await editEscalation(escalation._path, {
+          "resume-status": "failed",
           "resume-error": e?.message ?? String(e),
         });
       })

@@ -29,6 +29,27 @@ Conclusion:
 - “Pause at next acceptable stopping point” is the main blocker for *clean* pauses.
 - OpenCode server integration is the main blocker for *zero-disruption* handoff while a run is actively streaming.
 
+## HITL escalation resolution protocol
+
+Escalations are HITL checkpoints and should behave like paused/resumable runs.
+
+**Contract (MVP)**
+- The created `agent-escalation` note must include frontmatter fields:
+  - `task-path`: the exact bwrb `_path` of the `agent-task` note to resume
+  - `session-id`: the OpenCode `ses_*` identifier to continue
+- The escalation note body must include a section headed exactly `## Resolution`.
+  - Operators write the human guidance under this heading.
+  - Ralph treats that text as the next user turn when resuming.
+
+**Resolution semantics**
+- Operator marks the escalation note `status: resolved`.
+- Ralph attempts to resume the existing OpenCode session by calling `continueSession(session-id, <resolution text>)`.
+- Ralph records durable resume state on the escalation note via frontmatter:
+  - `resume-status`: `deferred` | `attempting` | `succeeded` | `failed`
+  - `resume-attempted-at`: timestamp when an attempt starts
+  - `resume-error`: empty on success; error message on failure
+- If resuming fails (expired session / OpenCode error), Ralph clears the task’s `session-id` and re-queues the task for a fresh run.
+
 ## Terms and concepts
 
 ### Daemon modes

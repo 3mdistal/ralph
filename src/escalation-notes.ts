@@ -13,7 +13,9 @@ export interface AgentEscalationNote {
   issue?: string;
   "task-path"?: string;
   "session-id"?: string;
+  "resume-status"?: string;
   "resume-attempted-at"?: string;
+  "resume-deferred-at"?: string;
   "resume-error"?: string;
 }
 
