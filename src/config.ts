@@ -2,11 +2,15 @@ import { homedir } from "os";
 import { join } from "path";
 import { existsSync } from "fs";
 
+export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
+import type { WatchdogConfig } from "./watchdog";
+
 export interface RepoConfig {
   name: string;      // "3mdistal/bwrb"
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
 }
+
 
 export interface RalphConfig {
   repos: RepoConfig[];
@@ -15,6 +19,7 @@ export interface RalphConfig {
   bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // GitHub owner for repos (default: "3mdistal")
   devDir: string;          // base directory for repos (default: ~/Developer)
+  watchdog?: WatchdogConfig;
 }
 
 const DEFAULT_CONFIG: RalphConfig = {

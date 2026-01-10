@@ -64,6 +64,10 @@ Tasks should survive daemon restarts. Store session IDs with tasks so work can r
 
 Log tool calls and detect when agents get stuck (tool-result-as-text loops). Auto-recover from loops by nudging the agent.
 
+**Watchdog policy:** In daemon mode, the system must never silently stall on a hung tool call.
+- Soft timeout: log-only heartbeat (no interruption)
+- Hard timeout: kill the in-flight run, re-queue once with a cleared `session-id`, then escalate if it repeats
+
 **Diagnostics policy:** When OpenCode crashes and prints a log file path, Ralph may attach a redacted tail of that log to the error note to preserve debugging context before logs rotate. Redact obvious tokens (GitHub tokens, Bearer tokens, etc.) and keep the attachment bounded (e.g. ~200 lines / 20k chars). These logs are local diagnostics artifacts and should not be posted externally (issues/PRs) without manual review.
 
 **Stability policy:** To support safe parallelism, Ralph should avoid shared mutable tool caches between concurrent OpenCode runs (e.g. isolate `XDG_CACHE_HOME` per repo/task).

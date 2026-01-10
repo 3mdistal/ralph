@@ -19,6 +19,8 @@ export interface AgentTask {
   "completed-at"?: string;
   /** OpenCode session ID used to resume after restarts */
   "session-id"?: string;
+  /** Watchdog recovery attempts (string in frontmatter) */
+  "watchdog-retries"?: string;
 }
 
 export type QueueChangeHandler = (tasks: AgentTask[]) => void;

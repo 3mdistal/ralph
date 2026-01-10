@@ -43,6 +43,14 @@ describe("Session Persistence", () => {
       // Empty string should be treated as "no session"
       expect(task["session-id"]?.trim()).toBeFalsy();
     });
+
+    test("watchdog-retries field is optional", () => {
+      const taskWithoutRetries = createMockTask();
+      expect(taskWithoutRetries["watchdog-retries"]).toBeUndefined();
+
+      const taskWithRetries = createMockTask({ "watchdog-retries": "1" });
+      expect(taskWithRetries["watchdog-retries"]).toBe("1");
+    });
   });
 
   describe("Task categorization logic", () => {

@@ -129,6 +129,34 @@ On daemon startup, Ralph checks for orphaned in-progress tasks:
 - **Easier debugging** - Stop daemon, inspect state, resume
 - **Token efficiency** - Avoid re-running completed work
 
+## Watchdog (Hung Tool Calls)
+
+In daemon mode, a single tool call can hang indefinitely. Ralph uses a watchdog to ensure runs never silently stall:
+
+- **Soft timeout**: log-only heartbeat warning (no interruption)
+- **Hard timeout**: kill the in-flight `opencode` run, re-queue the task once with a cleared `session-id`, then escalate if it repeats
+
+### Configuration
+
+Configure via `~/.config/opencode/ralph/ralph.json` under `watchdog`:
+
+```json
+{
+  "watchdog": {
+    "enabled": true,
+    "softLogIntervalMs": 30000,
+    "recentEventLimit": 50,
+    "thresholdsMs": {
+      "read": { "softMs": 30000, "hardMs": 120000 },
+      "glob": { "softMs": 30000, "hardMs": 120000 },
+      "grep": { "softMs": 30000, "hardMs": 120000 },
+      "task": { "softMs": 180000, "hardMs": 600000 },
+      "bash": { "softMs": 300000, "hardMs": 1800000 }
+    }
+  }
+}
+```
+
 ## License
 
 Private
