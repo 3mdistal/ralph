@@ -43,11 +43,23 @@ bun install
 
 ## Configuration
 
-Ralph loads config from `~/.config/opencode/ralph/ralph.json` (hardcoded; does not currently honor `XDG_CONFIG_HOME`) and merges it over built-in defaults. This is a shallow merge (arrays/objects are replaced, not deep-merged).
+Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
 Config is loaded once at startup, so restart the daemon after editing.
 
 ### Minimal example
+
+`~/.ralph/config.toml`:
+
+```toml
+bwrbVault = "/absolute/path/to/your/bwrb-vault"
+devDir = "/absolute/path/to/your/dev-directory"
+repos = [
+  { name = "3mdistal/ralph", path = "/absolute/path/to/your/ralph", botBranch = "bot/integration" }
+]
+```
+
+Or JSON (`~/.ralph/config.json`):
 
 ```json
 {
@@ -57,24 +69,33 @@ Config is loaded once at startup, so restart the daemon after editing.
     {
       "name": "3mdistal/ralph",
       "path": "/absolute/path/to/your/ralph",
-      "botBranch": "bot/integration"
+      "botBranch": "bot/integration",
+      "requiredChecks": ["CI"]
     }
   ]
 }
 ```
 
-Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comments/trailing commas are not supported.
+Note: Config values are read as plain TOML/JSON. `~` is not expanded, and comments/trailing commas are not supported.
 
 ### Supported settings
 
 - `bwrbVault` (string): bwrb vault path for the task queue
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `maxWorkers`)
+- `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
+- `githubApp` (object, optional): GitHub App installation auth for `gh` + REST
+  - `appId` (number|string)
+  - `installationId` (number|string)
+  - `privateKeyPath` (string): path to a PEM file; key material is never logged
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
+- `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
+
+Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
 ### Environment variables
 
@@ -84,16 +105,20 @@ Only these env vars are currently supported:
 |---------|---------|---------|
 | Sessions dir | `RALPH_SESSIONS_DIR` | `~/.ralph/sessions` |
 | Worktrees dir | `RALPH_WORKTREES_DIR` | `~/.ralph/worktrees` |
+| Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
+| Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
+
+Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
 Note: If `RALPH_SESSIONS_DIR` / `RALPH_WORKTREES_DIR` are relative paths, they resolve relative to the current working directory.
 
-Older README versions mentioned `RALPH_VAULT`, `RALPH_DEV_DIR`, and `RALPH_BATCH_SIZE`; these are not supported by current releases. Use `ralph.json` instead.
+Older README versions mentioned `RALPH_VAULT`, `RALPH_DEV_DIR`, and `RALPH_BATCH_SIZE`; these are not supported by current releases. Use `~/.ralph/config.toml` or `~/.ralph/config.json` instead.
 
 ### Troubleshooting
 
 - **Config changes not taking effect**: Ralph caches config after the first `loadConfig()`; restart the daemon.
-- **Config file ignored**: Ralph only reads `~/.config/opencode/ralph/ralph.json` today (no `XDG_CONFIG_HOME` support yet).
-- **JSON parse errors**: Ralph logs `[ralph] Failed to load config from ...` and continues with defaults.
+- **Config file not picked up**: Ralph reads `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json`.
+- **Config parse errors**: Ralph logs `[ralph] Failed to load TOML/JSON config from ...` and continues with defaults.
 - **Invalid maxWorkers values**: Non-positive/non-integer values fall back to defaults and emit a warning.
 
 ## Usage
@@ -126,6 +151,18 @@ Live updates (prints when status changes):
 
 ```bash
 bun run watch
+```
+
+### List accessible repos
+
+```bash
+ralph repos
+```
+
+Machine-readable output:
+
+```bash
+ralph repos --json
 ```
 
 ### Nudge an in-progress task
@@ -165,12 +202,15 @@ orchestration/
   escalations/    # agent-escalation notes (needs human)
 
 ~/.ralph/
+  config.toml     # preferred config (if present)
+  config.json     # fallback config
+  state.sqlite    # durable metadata for idempotency + recovery
   sessions/       # introspection logs per session
 ```
 
 ## How it works
 
-1. **Watch** - Ralph watches `orchestration/tasks/**` for queued tasks
+1. **Watch** - Ralph watches `orchestration/tasks/**` for queued (and restart-orphaned starting) tasks
 2. **Dispatch** - Runs `/next-task <issue>` to plan the work
 3. **Route** - Parses agent's decision (policy: `docs/escalation-policy.md`): proceed or escalate
 4. **Build** - If proceeding, tells agent to implement
@@ -193,10 +233,10 @@ session-id: ses_abc123
 ---
 ```
 
-On daemon startup, Ralph checks for orphaned in-progress tasks:
+On daemon startup, Ralph checks for orphaned starting/in-progress tasks:
 
 1. **Tasks with session-id** - Resumed using `continueSession()`. The agent picks up where it left off.
-2. **Tasks without session-id** - Reset to `queued` status. They'll be reprocessed from scratch.
+2. **Tasks without session-id** - Reset to `starting` status (restart-safe pre-session state), then retried from scratch.
 
 ### Graceful handling
 
@@ -214,9 +254,23 @@ On daemon startup, Ralph checks for orphaned in-progress tasks:
 
 Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue.
 
-- Enable: create `~/.config/opencode/ralph/drain`
-- Disable: delete `~/.config/opencode/ralph/drain`
-- Observability: logs emit `Drain enabled` / `Drain disabled`, and `ralph status` shows `Mode: running|draining`
+Control file:
+
+- `$XDG_STATE_HOME/ralph/control.json`
+- Fallback: `~/.local/state/ralph/control.json`
+
+Example:
+
+```json
+{ "mode": "draining" }
+```
+
+Schema: `{ "mode": "running"|"draining", "pause_requested"?: boolean }` (unknown fields ignored)
+
+- Enable drain: set `mode` to `draining`
+- Disable drain: set `mode` to `running`
+- Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
+- Observability: logs emit `Control mode: draining|running`, and `ralph status` shows `Mode: ...`
 
 ## Watchdog (Hung Tool Calls)
 

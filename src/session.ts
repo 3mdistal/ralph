@@ -12,10 +12,36 @@ export function __resetSpawnForTests(): void {
   spawnFn = nodeSpawn;
 }
 
-import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
+type Scheduler = {
+  now: () => number;
+  setTimeout: typeof setTimeout;
+  clearTimeout: typeof clearTimeout;
+  setInterval: typeof setInterval;
+  clearInterval: typeof clearInterval;
+};
+
+const defaultScheduler: Scheduler = {
+  now: () => Date.now(),
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+};
+
+let schedulerForTests: Scheduler | null = null;
+
+export function __setSchedulerForTests(scheduler: Scheduler): void {
+  schedulerForTests = scheduler;
+}
+
+export function __resetSchedulerForTests(): void {
+  schedulerForTests = null;
+}
+
+import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
@@ -46,6 +72,8 @@ export interface SessionResult {
   success: boolean;
   exitCode?: number;
   watchdogTimeout?: WatchdogTimeoutInfo;
+  /** Best-effort PR URL discovered from structured JSON events. */
+  prUrl?: string;
 }
 
 
@@ -346,6 +374,8 @@ async function runSession(
     repo?: string;
     /** Used for per-run cache isolation */
     cacheKey?: string;
+    /** Restart-survivable run output log file path (stdout+stderr). */
+    runLogPath?: string;
     /** Fallback hard timeout for the entire OpenCode process */
     timeoutMs?: number;
     /**
@@ -369,8 +399,13 @@ async function runSession(
       /** Included in soft/hard timeout logs */
       context?: string;
     };
+    __testOverrides?: {
+      spawn?: SpawnFn;
+      scheduler?: Scheduler;
+    };
   }
 ): Promise<SessionResult> {
+  const scheduler = options?.__testOverrides?.scheduler ?? schedulerForTests ?? defaultScheduler;
   const truncate = (value: string, max: number) => (value.length > max ? value.slice(0, max) + "…" : value);
 
   const mergeThresholds = (overrides?: Partial<WatchdogThresholdsMs>): WatchdogThresholdsMs => {
@@ -396,6 +431,29 @@ async function runSession(
   };
 
   const normalizeToolName = (name: string): string => name.trim().toLowerCase();
+
+  const PR_URL_RE = /https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/;
+
+  const extractPrUrlFromEvent = (event: any): string | null => {
+    const candidates = [
+      event?.prUrl,
+      event?.pr_url,
+      event?.pullRequestUrl,
+      event?.pull_request_url,
+      event?.pullRequest?.url,
+      event?.pull_request?.url,
+      event?.part?.prUrl,
+      event?.part?.pr_url,
+    ];
+
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") continue;
+      const match = candidate.match(PR_URL_RE);
+      if (match) return match[0];
+    }
+
+    return null;
+  };
 
   const pickThreshold = (toolName: string, thresholds: WatchdogThresholdsMs): WatchdogThresholdMs => {
     const t = normalizeToolName(toolName);
@@ -503,12 +561,179 @@ async function runSession(
   mkdirSync(xdgCacheHome, { recursive: true });
 
   const env = { ...process.env, XDG_CACHE_HOME: xdgCacheHome };
- 
-  const proc = spawnFn("opencode", args, {
+  const spawn = options?.__testOverrides?.spawn ?? spawnFn;
+
+  const proc = spawn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env,
   });
+
+  const runLogPath = options?.runLogPath?.trim();
+
+  const parsePositiveInt = (value: string | undefined): number | null => {
+    const v = (value ?? "").trim();
+    if (!v) return null;
+    const num = Number.parseInt(v, 10);
+    return Number.isFinite(num) && num > 0 ? num : null;
+  };
+
+  const maxRunLogBytes =
+    parsePositiveInt(process.env.RALPH_RUN_LOG_MAX_BYTES) ??
+    10 * 1024 * 1024; // 10MB
+
+  const maxRunLogBackups =
+    parsePositiveInt(process.env.RALPH_RUN_LOG_MAX_BACKUPS) ??
+    3;
+
+  let runLogStream: Writable | null = null;
+  let runLogBytes = 0;
+  let runLogRotating = false;
+  let rotateScheduled = false;
+
+  const openRunLogStream = (): void => {
+    if (!runLogPath) return;
+
+    try {
+      mkdirSync(dirname(runLogPath), { recursive: true });
+    } catch {
+      return;
+    }
+
+    try {
+      runLogBytes = existsSync(runLogPath) ? statSync(runLogPath).size : 0;
+    } catch {
+      runLogBytes = 0;
+    }
+
+    try {
+      runLogStream = createWriteStream(runLogPath, { flags: "a" });
+    } catch {
+      runLogStream = null;
+    }
+  };
+
+  const rotateRunLog = (): void => {
+    if (!runLogPath) return;
+    if (!runLogStream) return;
+    if (runLogRotating) return;
+
+    runLogRotating = true;
+
+    try {
+      proc.stdout?.pause();
+      proc.stderr?.pause();
+    } catch {
+      // ignore
+    }
+
+    const stream: any = runLogStream;
+    runLogStream = null;
+
+    const finish = () => {
+      try {
+        if (maxRunLogBackups <= 0) {
+          rmSync(runLogPath, { force: true });
+        } else {
+          const oldest = `${runLogPath}.${maxRunLogBackups}`;
+          try {
+            rmSync(oldest, { force: true });
+          } catch {
+            // ignore
+          }
+
+          for (let i = maxRunLogBackups - 1; i >= 1; i--) {
+            const from = `${runLogPath}.${i}`;
+            const to = `${runLogPath}.${i + 1}`;
+            if (!existsSync(from)) continue;
+            try {
+              renameSync(from, to);
+            } catch {
+              // ignore
+            }
+          }
+
+          if (existsSync(runLogPath)) {
+            try {
+              renameSync(runLogPath, `${runLogPath}.1`);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      runLogBytes = 0;
+      openRunLogStream();
+      runLogRotating = false;
+
+      try {
+        proc.stdout?.resume();
+        proc.stderr?.resume();
+      } catch {
+        // ignore
+      }
+    };
+
+    try {
+      if (typeof stream?.end === "function") {
+        stream.end(() => finish());
+      } else {
+        finish();
+      }
+    } catch {
+      finish();
+    }
+  };
+
+  const scheduleRotateRunLog = (): void => {
+    if (rotateScheduled) return;
+    rotateScheduled = true;
+    scheduler.setTimeout(() => {
+      rotateScheduled = false;
+      rotateRunLog();
+    }, 0);
+  };
+
+  const writeRunLog = (data: Buffer): void => {
+    if (!runLogPath) return;
+    if (!runLogStream) return;
+
+    try {
+      runLogStream.write(data);
+      runLogBytes += data.length;
+      if (runLogBytes >= maxRunLogBytes) {
+        scheduleRotateRunLog();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const closeRunLogStream = async (): Promise<void> => {
+    const stream: any = runLogStream;
+    if (!stream || typeof stream.end !== "function") return;
+
+    runLogStream = null;
+
+    try {
+      await new Promise<void>((resolve) => {
+        try {
+          stream.end(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  if (runLogPath) {
+    openRunLogStream();
+  }
 
   // If continuing an existing session, mark it as active for `ralph nudge`.
   const continueSessionId = options?.continueSession;
@@ -527,7 +752,7 @@ async function runSession(
       mkdirSync(getSessionDir(continueSessionId), { recursive: true });
       writeFileSync(
         lockPath,
-        JSON.stringify({ ts: Date.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
+        JSON.stringify({ ts: scheduler.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
       );
       proc.on("close", cleanupLock);
       proc.on("error", cleanupLock);
@@ -544,7 +769,7 @@ async function runSession(
     }
 
     // Some processes ignore SIGTERM. Follow up with SIGKILL.
-    setTimeout(() => {
+    scheduler.setTimeout(() => {
       try {
         proc.kill("SIGKILL");
       } catch {
@@ -564,6 +789,7 @@ async function runSession(
 
   let sessionId = "";
   let textOutput = "";
+  let prUrlFromEvents: string | null = null;
 
   const introspection = options?.introspection;
 
@@ -611,11 +837,18 @@ async function runSession(
     }
   };
 
-  const closeEventStream = (): void => {
+  const closeEventStream = async (): Promise<void> => {
     const stream: any = eventStream;
     if (!stream || typeof stream.end !== "function") return;
+
     try {
-      stream.end();
+      await new Promise<void>((resolve) => {
+        try {
+          stream.end(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
     } catch {
       // ignore
     }
@@ -626,7 +859,7 @@ async function runSession(
     if (typeof introspection?.step === "number") {
       writeEvent({
         type: "step-start",
-        ts: Date.now(),
+        ts: scheduler.now(),
         step: introspection.step,
         title: introspection.stepTitle,
         repo: introspection.repo,
@@ -637,7 +870,7 @@ async function runSession(
 
     writeEvent({
       type: "run-start",
-      ts: Date.now(),
+      ts: scheduler.now(),
       command: command ?? undefined,
       agent: options?.agent ?? undefined,
       repo: introspection?.repo,
@@ -666,6 +899,8 @@ async function runSession(
   let watchdogTimeout: WatchdogTimeoutInfo | undefined;
 
   proc.stdout?.on("data", (data: Buffer) => {
+    writeRunLog(data);
+
     const chunk = data.toString();
     stdout += chunk;
     buffer += chunk;
@@ -690,10 +925,15 @@ async function runSession(
           ensureEventStream(String(eventSessionId));
         }
 
+        if (!prUrlFromEvents) {
+          const extracted = extractPrUrlFromEvent(event);
+          if (extracted) prUrlFromEvents = extracted;
+        }
+
         if (event.type === "anomaly") {
           writeEvent({
             type: "anomaly",
-            ts: typeof event.ts === "number" ? event.ts : Date.now(),
+            ts: typeof event.ts === "number" ? event.ts : scheduler.now(),
           });
         }
 
@@ -703,7 +943,7 @@ async function runSession(
 
         const tool = extractToolInfo(event);
         if (tool) {
-          const now = Date.now();
+          const now = scheduler.now();
 
           if (tool.phase === "start") {
             inFlight = {
@@ -743,15 +983,16 @@ async function runSession(
   });
 
   proc.stderr?.on("data", (data: Buffer) => {
+    writeRunLog(data);
     stderr += data.toString();
   });
 
   let watchdogInterval: ReturnType<typeof setInterval> | undefined;
   if (watchdogEnabled) {
-    watchdogInterval = setInterval(() => {
+    watchdogInterval = scheduler.setInterval(() => {
       if (watchdogTimeout || !inFlight) return;
 
-      const now = Date.now();
+      const now = scheduler.now();
       const elapsedMs = now - inFlight.startTs;
       const threshold = pickThreshold(inFlight.toolName, thresholds);
 
@@ -793,23 +1034,25 @@ async function runSession(
   const exitCode = await new Promise<number>((resolve, reject) => {
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
-    timeout = setTimeout(() => {
+    timeout = scheduler.setTimeout(() => {
       requestKill();
       resolve(124);
     }, fallbackTimeoutMs);
 
     proc.on("error", (err) => {
-      if (timeout) clearTimeout(timeout);
-      if (watchdogInterval) clearInterval(watchdogInterval);
+      if (timeout) scheduler.clearTimeout(timeout);
+      if (watchdogInterval) scheduler.clearInterval(watchdogInterval);
       reject(err);
     });
 
     proc.on("close", (code) => {
-      if (timeout) clearTimeout(timeout);
-      if (watchdogInterval) clearInterval(watchdogInterval);
+      if (timeout) scheduler.clearTimeout(timeout);
+      if (watchdogInterval) scheduler.clearInterval(watchdogInterval);
       resolve(code ?? 0);
     });
   });
+
+  await closeRunLogStream();
 
   if (watchdogTimeout) {
     const header = [
@@ -834,9 +1077,9 @@ async function runSession(
 
     if (sessionId) {
       ensureEventStream(sessionId);
-      writeEvent({ type: "run-end", ts: Date.now(), success: false, exitCode, watchdogTimeout: true });
+      writeEvent({ type: "run-end", ts: scheduler.now(), success: false, exitCode, watchdogTimeout: true });
       try {
-        closeEventStream();
+        await closeEventStream();
       } catch {
         // ignore
       }
@@ -846,7 +1089,7 @@ async function runSession(
       await enforceToolOutputBudgetInStorage(sessionId);
     }
 
-    return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout };
+    return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout, prUrl: prUrlFromEvents ?? undefined };
   }
 
   if (exitCode !== 0) {
@@ -878,9 +1121,9 @@ async function runSession(
 
     if (sessionId) {
       ensureEventStream(sessionId);
-      writeEvent({ type: "run-end", ts: Date.now(), success: false, exitCode });
+      writeEvent({ type: "run-end", ts: scheduler.now(), success: false, exitCode });
       try {
-        closeEventStream();
+        await closeEventStream();
       } catch {
         // ignore
       }
@@ -890,16 +1133,16 @@ async function runSession(
       await enforceToolOutputBudgetInStorage(sessionId);
     }
 
-    return { sessionId, output: enriched, success: false, exitCode };
+    return { sessionId, output: enriched, success: false, exitCode, prUrl: prUrlFromEvents ?? undefined };
   }
 
   const raw = stdout.toString();
 
   if (sessionId) {
     ensureEventStream(sessionId);
-    writeEvent({ type: "run-end", ts: Date.now(), success: true, exitCode });
+    writeEvent({ type: "run-end", ts: scheduler.now(), success: true, exitCode });
     try {
-      closeEventStream();
+      await closeEventStream();
     } catch {
       // ignore
     }
@@ -909,7 +1152,7 @@ async function runSession(
     await enforceToolOutputBudgetInStorage(sessionId);
   }
 
-  return { sessionId, output: textOutput || raw, success: true, exitCode };
+  return { sessionId, output: textOutput || raw, success: true, exitCode, prUrl: prUrlFromEvents ?? undefined };
 }
 
 /**
@@ -923,6 +1166,7 @@ export async function runCommand(
   options?: {
     repo?: string;
     cacheKey?: string;
+    runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
       repo?: string;
@@ -938,11 +1182,19 @@ export async function runCommand(
       recentEventLimit?: number;
       context?: string;
     };
+  },
+  testOverrides?: {
+    spawn?: SpawnFn;
+    scheduler?: Scheduler;
   }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");
-  return runSession(repoPath, message, { command: normalized, ...options });
+
+  const merged: any = { command: normalized, ...(options ?? {}) };
+  if (testOverrides) merged.__testOverrides = testOverrides;
+
+  return runSession(repoPath, message, merged);
 }
 
 /**
@@ -955,6 +1207,7 @@ export async function continueSession(
   options?: {
     repo?: string;
     cacheKey?: string;
+    runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
       repo?: string;
@@ -988,6 +1241,7 @@ export async function continueCommand(
   options?: {
     repo?: string;
     cacheKey?: string;
+    runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
       repo?: string;
@@ -1022,6 +1276,9 @@ async function* streamSession(
     continueSession?: string;
     repo?: string;
     cacheKey?: string;
+    __testOverrides?: {
+      spawn?: SpawnFn;
+    };
   }
 ): AsyncGenerator<any, void, unknown> {
   const args: string[] = ["run"];
@@ -1041,7 +1298,9 @@ async function* streamSession(
   const xdgCacheHome = getIsolatedXdgCacheHome({ repo: options?.repo, cacheKey: options?.cacheKey });
   mkdirSync(xdgCacheHome, { recursive: true });
 
-  const proc = spawnFn("opencode", args, {
+  const spawn = options?.__testOverrides?.spawn ?? spawnFn;
+
+  const proc = spawn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, XDG_CACHE_HOME: xdgCacheHome },
@@ -1083,6 +1342,9 @@ export async function* __streamSessionForTests(
     continueSession?: string;
     repo?: string;
     cacheKey?: string;
+    __testOverrides?: {
+      spawn?: SpawnFn;
+    };
   }
 ): AsyncGenerator<any, void, unknown> {
   yield* streamSession(repoPath, message, options);

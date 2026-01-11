@@ -11,6 +11,7 @@ import { existsSync, watch } from "fs";
 import { join } from "path";
 
 import { getRepoMaxWorkers, getRepoPath, loadConfig } from "./config";
+import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
   initialPoll,
   startWatching,
@@ -25,11 +26,14 @@ import {
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
+import { startQueuedTasks } from "./scheduler";
 
-import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
+import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
+import { getThrottleDecision, isHardThrottled } from "./throttle";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
+import { initStateDb, recordPrSnapshot } from "./state";
 import { queueNudge } from "./nudge";
 import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
 import {
@@ -37,6 +41,7 @@ import {
   DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
   shouldDeferWaitingResolutionCheck,
 } from "./escalation-resume";
+import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 
 // --- State ---
 
@@ -60,7 +65,7 @@ const inFlightTasks = new Set<string>();
 let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
-let rrCursor = 0;
+const rrCursor = { value: 0 };
 
 function ensureSemaphores(): void {
   if (globalSemaphore) return;
@@ -88,6 +93,11 @@ function getOrCreateWorker(repo: string): RepoWorker {
   return created;
 }
 
+async function getRunnableTasks(): Promise<AgentTask[]> {
+  const [starting, queued] = await Promise.all([getTasksByStatus("starting"), getQueuedTasks()]);
+  return [...starting, ...queued];
+}
+
 let scheduleQueuedTimer: ReturnType<typeof setTimeout> | null = null;
 function scheduleQueuedTasksSoon(): void {
   if (scheduleQueuedTimer) return;
@@ -95,7 +105,7 @@ function scheduleQueuedTasksSoon(): void {
     scheduleQueuedTimer = null;
     if (isShuttingDown) return;
     if (getDaemonMode() === "draining") return;
-    void getQueuedTasks().then((tasks) => processNewTasks(tasks));
+    void getRunnableTasks().then((tasks) => processNewTasks(tasks));
   }, 250);
 }
 
@@ -107,95 +117,87 @@ let resumeDisabledUntil = 0;
 
 const RESUME_DISABLE_MS = 60_000;
 
-async function safeEditEscalation(escalationPath: string, fields: Record<string, string>): Promise<boolean> {
-  const result = await editEscalation(escalationPath, fields);
-  if (result.ok) return true;
+async function attemptResumeResolvedEscalations(): Promise<void> {
+  return await attemptResumeResolvedEscalationsImpl({
+    isShuttingDown: () => isShuttingDown,
+    now: () => Date.now(),
 
-  resumeAttemptedThisRun.add(escalationPath);
+    resumeAttemptedThisRun,
+    getResumeDisabledUntil: () => resumeDisabledUntil,
+    setResumeDisabledUntil: (ts) => {
+      resumeDisabledUntil = ts;
+    },
+    resumeDisableMs: RESUME_DISABLE_MS,
+    getVaultPathForLogs: () => loadConfig().bwrbVault,
 
-  if (result.kind === "vault-missing") {
-    const now = Date.now();
-    if (now >= resumeDisabledUntil) {
-      resumeDisabledUntil = now + RESUME_DISABLE_MS;
-      const vault = loadConfig().bwrbVault;
-      console.error(
-        `[ralph:escalations] Cannot edit escalation notes; pausing auto-resume for ${Math.round(RESUME_DISABLE_MS / 1000)}s. ` +
-          `Check bwrbVault in ~/.config/opencode/ralph/ralph.json (current: ${JSON.stringify(vault)}). ` +
-          `Last error: ${result.error}`
-      );
-    }
-    return false;
-  }
+    ensureSemaphores,
+    getGlobalSemaphore: () => globalSemaphore,
+    getRepoSemaphore,
 
-  console.warn(`[ralph:escalations] Failed to edit escalation ${escalationPath}: ${result.error}`);
-  return false;
+    getTaskKey,
+    inFlightTasks,
+
+    getEscalationsByStatus,
+    editEscalation,
+    readResolutionMessage,
+
+    getTaskByPath,
+    updateTaskStatus,
+
+    shouldDeferWaitingResolutionCheck,
+    buildWaitingResolutionUpdate,
+    resolutionRecheckIntervalMs: DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
+
+    getOrCreateWorker,
+    recordMerge: async (repo, prUrl) => {
+      try {
+        recordPrSnapshot({ repo, issue: "", prUrl, state: "merged" });
+      } catch {
+        // best-effort
+      }
+
+      await rollupMonitor.recordMerge(repo, prUrl);
+    },
+    scheduleQueuedTasksSoon,
+  });
 }
 
-async function attemptResumeResolvedEscalations(): Promise<void> {
+async function attemptResumeThrottledTasks(): Promise<void> {
   if (getDaemonMode() === "draining" || isShuttingDown) return;
-  if (Date.now() < resumeDisabledUntil) return;
 
   ensureSemaphores();
   if (!globalSemaphore) return;
 
-  const resolved = await getEscalationsByStatus("resolved");
-  if (resolved.length === 0) return;
+  const throttled = await getTasksByStatus("throttled");
+  if (throttled.length === 0) return;
 
-  const pending = resolved.filter((e) => {
-    const attempted = e["resume-attempted-at"]?.trim();
-    const resumeStatus = e["resume-status"]?.trim();
+  const throttle = await isHardThrottled();
+  if (throttle.hard) {
+    if (shouldLog("daemon:hard-throttle-resume", 60_000)) {
+      console.warn(
+        `[ralph] Hard throttle active; deferring resume of throttled tasks until ${throttle.decision.snapshot.resumeAt ?? "unknown"}`
+      );
+    }
+    return;
+  }
 
-    return (!attempted || resumeStatus === "waiting-resolution") && !resumeAttemptedThisRun.has(e._path);
-  });
-  if (pending.length === 0) return;
+  const now = Date.now();
 
-  for (const escalation of pending) {
+  for (const task of throttled) {
     if (getDaemonMode() === "draining" || isShuttingDown) return;
-    if (Date.now() < resumeDisabledUntil) return;
 
-    const taskPath = escalation["task-path"]?.trim() ?? "";
-    const sessionId = escalation["session-id"]?.trim() ?? "";
-    const repo = escalation.repo?.trim() ?? "";
+    const resumeAtRaw = task["resume-at"]?.trim() ?? "";
+    const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;
+    if (Number.isFinite(resumeAtTs) && resumeAtTs > now) continue;
 
-    if (!taskPath || !sessionId || !repo) {
-      const reason = `Missing required fields (task-path='${taskPath}', session-id='${sessionId}', repo='${repo}')`;
-      console.warn(`[ralph:escalations] Resolved escalation invalid; ${reason}: ${escalation._path}`);
 
-      await safeEditEscalation(escalation._path, {
-        "resume-status": "failed",
-        "resume-attempted-at": new Date().toISOString(),
-        "resume-error": reason,
+    const sessionId = task["session-id"]?.trim() ?? "";
+    if (!sessionId) {
+      await updateTaskStatus(task, "queued", {
+        "throttled-at": "",
+        "resume-at": "",
+        "usage-snapshot": "",
       });
-
-      continue;
-    }
-
-    const worker = getOrCreateWorker(repo);
-
-
-    const task = await getTaskByPath(taskPath);
-    if (!task) {
-      console.warn(`[ralph:escalations] Resolved escalation references missing task; skipping: ${taskPath}`);
-      await safeEditEscalation(escalation._path, {
-        "resume-status": "failed",
-        "resume-attempted-at": new Date().toISOString(),
-        "resume-error": `Task not found: ${taskPath}`,
-      });
-      continue;
-    }
-
-    const nowIso = new Date().toISOString();
-    if (shouldDeferWaitingResolutionCheck(escalation, Date.now(), DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS)) {
-      continue;
-    }
-
-    const resolution = await readResolutionMessage(escalation._path);
-    if (!resolution) {
-      const reason = "Resolved escalation has empty/missing ## Resolution text";
-      console.warn(`[ralph:escalations] ${reason}; skipping: ${escalation._path}`);
-
-      await editEscalation(escalation._path, buildWaitingResolutionUpdate(nowIso, reason));
-
       continue;
     }
 
@@ -203,89 +205,39 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     if (inFlightTasks.has(taskKey)) continue;
 
     const releaseGlobal = globalSemaphore.tryAcquire();
-    if (!releaseGlobal) {
-      if (escalation["resume-status"]?.trim() !== "deferred") {
-        await safeEditEscalation(escalation._path, {
-          "resume-status": "deferred",
-          "resume-deferred-at": new Date().toISOString(),
-          "resume-error": "Global concurrency limit reached; will retry",
-        });
-      }
-      continue;
-    }
+    if (!releaseGlobal) return;
 
-    const releaseRepo = getRepoSemaphore(repo).tryAcquire();
+    const releaseRepo = getRepoSemaphore(task.repo).tryAcquire();
     if (!releaseRepo) {
       releaseGlobal();
-      if (escalation["resume-status"]?.trim() !== "deferred") {
-        await safeEditEscalation(escalation._path, {
-          "resume-status": "deferred",
-          "resume-deferred-at": new Date().toISOString(),
-          "resume-error": "Repo concurrency limit reached; will retry",
-        });
-      }
       continue;
     }
 
-    const resumeMessage = [
-      "Escalation resolved. Resume the existing OpenCode session from where you left off.",
-      "Apply the human guidance below. Do NOT restart from scratch unless strictly necessary.",
-      "",
-      "Human guidance:",
-      resolution,
-    ].join("\n");
-
-    // Mark as attempted before resuming to avoid duplicate resumes.
-    const markedAttempt = await safeEditEscalation(escalation._path, {
-      "resume-status": "attempting",
-      "resume-attempted-at": new Date().toISOString(),
-      "resume-error": "",
-    });
-
-    if (!markedAttempt) {
-      releaseGlobal();
-      releaseRepo();
-      continue;
-    }
-
-    // Ensure the task is resumable and marked in-progress.
     await updateTaskStatus(task, "in-progress", {
       "assigned-at": new Date().toISOString().split("T")[0],
       "session-id": sessionId,
+      "throttled-at": "",
+      "resume-at": "",
+      "usage-snapshot": "",
     });
 
     inFlightTasks.add(taskKey);
 
-    worker
-      .resumeTask(task, { resumeMessage })
-      .then(async (run) => {
-        if (run.outcome === "success") {
-          if (run.pr) {
-            await rollupMonitor.recordMerge(repo, run.pr);
-          }
+    getOrCreateWorker(task.repo)
+      .resumeTask(task, { resumeMessage: "Continue." })
+       .then(async (run) => {
+         if (run.outcome === "success" && run.pr) {
+           try {
+             recordPrSnapshot({ repo: task.repo, issue: task.issue, prUrl: run.pr, state: "merged" });
+           } catch {
+             // best-effort
+           }
 
-          await safeEditEscalation(escalation._path, {
-            "resume-status": "succeeded",
-            "resume-error": "",
-          });
-
-          return;
-        }
-
-        const reason =
-          run.escalationReason ??
-          (run.outcome === "escalated" ? "Resumed session escalated" : "Resume failed");
-
-        await safeEditEscalation(escalation._path, {
-          "resume-status": "failed",
-          "resume-error": reason,
-        });
-      })
-      .catch(async (e: any) => {
-        await safeEditEscalation(escalation._path, {
-          "resume-status": "failed",
-          "resume-error": e?.message ?? String(e),
-        });
+           await rollupMonitor.recordMerge(task.repo, run.pr);
+         }
+       })
+      .catch((e: any) => {
+        console.error(`[ralph] Error resuming throttled task ${task.name}:`, e);
       })
       .finally(() => {
         inFlightTasks.delete(taskKey);
@@ -309,11 +261,17 @@ function startTask(opts: {
 
   void getOrCreateWorker(repo)
     .processTask(task)
-    .then(async (run: AgentRun) => {
-      if (run.outcome === "success" && run.pr) {
-        await rollupMonitor.recordMerge(repo, run.pr);
-      }
-    })
+      .then(async (run: AgentRun) => {
+        if (run.outcome === "success" && run.pr) {
+          try {
+            recordPrSnapshot({ repo, issue: task.issue, prUrl: run.pr, state: "merged" });
+          } catch {
+            // best-effort
+          }
+
+          await rollupMonitor.recordMerge(repo, run.pr);
+        }
+      })
     .catch((e) => {
       console.error(`[ralph] Error processing task ${task.name}:`, e);
     })
@@ -333,56 +291,31 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
 
   if (getDaemonMode() === "draining") return;
 
-  if (tasks.length === 0) {
-    if (shouldLog("daemon:no-queued", 30_000)) {
-      console.log("[ralph] No queued tasks");
+  const throttle = await getThrottleDecision();
+  if (throttle.state === "hard") {
+    if (shouldLog("daemon:hard-throttle", 30_000)) {
+      console.warn(
+        `[ralph] Hard throttle active; skipping task scheduling until ${throttle.snapshot.resumeAt ?? "unknown"}`
+      );
     }
     return;
   }
 
-  const newTasks = tasks.filter((t) => !inFlightTasks.has(getTaskKey(t)));
-  if (newTasks.length === 0) {
-    if (shouldLog("daemon:all-in-flight", 30_000)) {
-      console.log("[ralph] All queued tasks already in flight");
-    }
-    return;
-  }
+  if (throttle.state === "soft") return;
 
-  const byRepo = groupByRepo(newTasks);
-  const repos = Array.from(byRepo.keys());
-  if (repos.length === 0) return;
-
-  let startedCount = 0;
-
-  while (globalSemaphore.available() > 0) {
-    let startedThisRound = false;
-
-    for (let i = 0; i < repos.length; i++) {
-      const idx = (rrCursor + i) % repos.length;
-      const repo = repos[idx];
-      const repoTasks = byRepo.get(repo);
-      if (!repoTasks || repoTasks.length === 0) continue;
-
-      const releaseGlobal = globalSemaphore.tryAcquire();
-      if (!releaseGlobal) return;
-
-      const releaseRepo = getRepoSemaphore(repo).tryAcquire();
-      if (!releaseRepo) {
-        releaseGlobal();
-        continue;
-      }
-
-      const task = repoTasks.shift()!;
-      rrCursor = (idx + 1) % repos.length;
-
-      startedCount++;
-      startedThisRound = true;
-      startTask({ repo, task, releaseGlobal, releaseRepo });
-      break;
-    }
-
-    if (!startedThisRound) break;
-  }
+  const startedCount = startQueuedTasks({
+    gate: "running",
+    tasks,
+    inFlightTasks,
+    getTaskKey: (t) => getTaskKey(t),
+    groupByRepo,
+    globalSemaphore,
+    getRepoSemaphore,
+    rrCursor,
+    shouldLog,
+    log: (message) => console.log(message),
+    startTask,
+  });
 
   if (startedCount > 0) {
     console.log(`[ralph] Started ${startedCount} task(s)`);
@@ -409,10 +342,11 @@ async function getTaskNowDoingLine(task: AgentTask): Promise<string> {
 }
 
 async function printHeartbeatTick(): Promise<void> {
-  const inProgress = await getTasksByStatus("in-progress");
-  if (inProgress.length === 0) return;
+  const [starting, inProgress] = await Promise.all([getTasksByStatus("starting"), getTasksByStatus("in-progress")]);
+  const tasks = [...starting, ...inProgress];
+  if (tasks.length === 0) return;
 
-  for (const task of inProgress) {
+  for (const task of tasks) {
     const line = await getTaskNowDoingLine(task);
     console.log(`[ralph:hb] ${line}`);
   }
@@ -431,8 +365,8 @@ async function resumeTasksOnStartup(opts?: { awaitCompletion?: boolean }): Promi
 
   const withoutSession = inProgress.filter((t) => !(t["session-id"]?.trim()));
   for (const task of withoutSession) {
-    console.warn(`[ralph] In-progress task has no session ID, resetting to queued: ${task.name}`);
-    await updateTaskStatus(task, "queued", { "session-id": "" });
+    console.warn(`[ralph] In-progress task has no session ID, resetting to starting: ${task.name}`);
+    await updateTaskStatus(task, "starting", { "session-id": "" });
   }
 
   const withSession = inProgress.filter((t) => t["session-id"]?.trim());
@@ -539,6 +473,10 @@ async function main(): Promise<void> {
 
   // Load config
   const config = loadConfig();
+
+  // Initialize durable local state (SQLite)
+  initStateDb();
+
   console.log("[ralph] Configuration:");
   console.log(`        Vault: ${config.bwrbVault}`);
   console.log(`        Max workers: ${config.maxWorkers}`);
@@ -550,9 +488,11 @@ async function main(): Promise<void> {
   drainMonitor = new DrainMonitor({
     log: (message) => console.log(message),
     onModeChange: (mode) => {
-      if (mode !== "running" || isShuttingDown) return;
+      if (isShuttingDown) return;
+      if (mode !== "running") return;
+
       void (async () => {
-        const tasks = await getQueuedTasks();
+        const tasks = await getRunnableTasks();
         await processNewTasks(tasks);
       })();
     },
@@ -568,10 +508,13 @@ async function main(): Promise<void> {
   // Resume any resolved escalations (HITL checkpoint) from the same session.
   await attemptResumeResolvedEscalations();
 
+  // Resume any tasks paused by hard throttle.
+  await attemptResumeThrottledTasks();
+
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
   const initialTasks = await initialPoll();
-  console.log(`[ralph] Found ${initialTasks.length} queued task(s)`);
+  console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
 
   if (initialTasks.length > 0 && getDaemonMode() !== "draining") {
     await processNewTasks(initialTasks);
@@ -625,7 +568,25 @@ async function main(): Promise<void> {
         heartbeatInFlight = false;
       });
   }, heartbeatIntervalMs);
-  
+
+  const throttleResumeIntervalMs = 15_000;
+  let throttleResumeInFlight = false;
+
+  const throttleResumeTimer = setInterval(() => {
+    if (isShuttingDown) return;
+    if (getDaemonMode() === "draining") return;
+    if (throttleResumeInFlight) return;
+    throttleResumeInFlight = true;
+
+    attemptResumeThrottledTasks()
+      .catch(() => {
+        // ignore
+      })
+      .finally(() => {
+        throttleResumeInFlight = false;
+      });
+  }, throttleResumeIntervalMs);
+
   console.log("");
   console.log("[ralph] Daemon running. Watching for queue changes...");
   console.log("[ralph] Press Ctrl+C to stop.");
@@ -651,6 +612,7 @@ async function main(): Promise<void> {
     }
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
+    clearInterval(throttleResumeTimer);
     
     // Wait for in-flight tasks
     if (inFlightTasks.size > 0) {
@@ -694,6 +656,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph rollup <repo>                (stub) Rollup helpers",
@@ -702,7 +665,8 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Drain mode: create/remove ~/.config/opencode/ralph/drain to pause scheduling new tasks.",
+      "  Drain mode: set mode=draining|running in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json).",
+      "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
   );
 }
@@ -726,7 +690,22 @@ function printCommandHelp(command: string): void {
           "Usage:",
           "  ralph status [--json]",
           "",
-          "Shows daemon mode plus queued and in-progress tasks.",
+          "Shows daemon mode plus starting, queued, in-progress, and throttled tasks.",
+          "",
+          "Options:",
+          "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "repos":
+      console.log(
+        [
+          "Usage:",
+          "  ralph repos [--json]",
+          "",
+          "Lists repositories accessible to the configured GitHub App installation.",
+          "Output is filtered to allowed owners (guardrail).",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -812,11 +791,23 @@ if (args[0] === "status") {
   }
 
   const json = args.includes("--json");
-  const mode: DaemonMode = isDraining() ? "draining" : "running";
 
-  const [inProgress, queued] = await Promise.all([
+  const throttle = await getThrottleDecision();
+  const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+
+  const mode = control.mode === "draining"
+    ? "draining"
+    : throttle.state === "hard"
+      ? "hard-throttled"
+      : throttle.state === "soft"
+        ? "soft-throttled"
+        : "running";
+
+  const [starting, inProgress, queued, throttled] = await Promise.all([
+    getTasksByStatus("starting"),
     getTasksByStatus("in-progress"),
     getQueuedTasks(),
+    getTasksByStatus("throttled"),
   ]);
 
   if (json) {
@@ -840,12 +831,27 @@ if (args[0] === "status") {
       JSON.stringify(
         {
           mode,
+          throttle: throttle.snapshot,
           inProgress: inProgressWithStatus,
+          starting: starting.map((t) => ({
+            name: t.name,
+            repo: t.repo,
+            issue: t.issue,
+            priority: t.priority ?? "p2-medium",
+          })),
           queued: queued.map((t) => ({
             name: t.name,
             repo: t.repo,
             issue: t.issue,
             priority: t.priority ?? "p2-medium",
+          })),
+          throttled: throttled.map((t) => ({
+            name: t.name,
+            repo: t.repo,
+            issue: t.issue,
+            priority: t.priority ?? "p2-medium",
+            sessionId: t["session-id"]?.trim() || null,
+            resumeAt: t["resume-at"]?.trim() || null,
           })),
         },
         null,
@@ -857,6 +863,11 @@ if (args[0] === "status") {
 
   console.log(`Mode: ${mode}`);
 
+  console.log(`Starting tasks: ${starting.length}`);
+  for (const task of starting) {
+    console.log(`  - ${await getTaskNowDoingLine(task)}`);
+  }
+
   console.log(`In-progress tasks: ${inProgress.length}`);
   for (const task of inProgress) {
     console.log(`  - ${await getTaskNowDoingLine(task)}`);
@@ -867,7 +878,40 @@ if (args[0] === "status") {
     console.log(`  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}]`);
   }
 
+  console.log(`Throttled tasks: ${throttled.length}`);
+  for (const task of throttled) {
+    const resumeAt = task["resume-at"]?.trim() || "unknown";
+    console.log(`  - ${task.name} (${task.repo}) resumeAt=${resumeAt} [${task.priority || "p2-medium"}]`);
+  }
+
   process.exit(0);
+}
+
+if (args[0] === "repos") {
+  if (hasHelpFlag) {
+    printCommandHelp("repos");
+    process.exit(0);
+  }
+
+  const json = args.includes("--json");
+
+  try {
+    const repos = filterReposToAllowedOwners(await listAccessibleRepos());
+
+    if (json) {
+      console.log(JSON.stringify(repos, null, 2));
+      process.exit(0);
+    }
+
+    for (const repo of repos) {
+      console.log(repo.fullName);
+    }
+
+    process.exit(0);
+  } catch (e: any) {
+    console.error(`[ralph] Failed to list accessible repos: ${e?.message ?? String(e)}`);
+    process.exit(1);
+  }
 }
 
 if (args[0] === "nudge") {

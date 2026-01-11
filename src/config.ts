@@ -1,6 +1,8 @@
 import { homedir } from "os";
 import { join } from "path";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
+
+import { getRalphConfigJsonPath, getRalphConfigTomlPath, getRalphLegacyConfigPath } from "./paths";
 
 export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
 import type { WatchdogConfig } from "./watchdog";
@@ -9,10 +11,58 @@ export interface RepoConfig {
   name: string;      // "3mdistal/bwrb"
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
+  /**
+   * Required status checks for merge gating (default: ["ci"]).
+   *
+   * Values must match the check context name shown by GitHub.
+   * Set to [] to disable merge gating for a repo.
+   */
+  requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
 }
 
+
+export interface ThrottleWindowConfig {
+  budgetTokens?: number;
+}
+
+export interface ThrottleResetRolling5hConfig {
+  /** Reset hours in local time (default: [1, 6, 11, 16, 21]). */
+  hours?: number[];
+  /** Minute within the hour (default: 50). */
+  minute?: number;
+}
+
+export interface ThrottleResetWeeklyConfig {
+  /** Day of week in local time (0=Sun ... 6=Sat). Default: 4 (Thu). */
+  dayOfWeek?: number;
+  /** Hour in local time (0-23). Default: 19. */
+  hour?: number;
+  /** Minute within the hour. Default: 9. */
+  minute?: number;
+}
+
+export interface ThrottleConfig {
+  /** Enable usage-based throttling (default: true). */
+  enabled?: boolean;
+  /** Provider ID to count toward usage (default: "openai"). */
+  providerID?: string;
+  /** Soft throttle threshold as fraction of budget (default: 0.65). */
+  softPct?: number;
+  /** Hard throttle threshold (reserved for #72; default: 0.75). */
+  hardPct?: number;
+  /** Minimum interval between expensive usage scans (default: 15000ms). */
+  minCheckIntervalMs?: number;
+  windows?: {
+    rolling5h?: ThrottleWindowConfig;
+    weekly?: ThrottleWindowConfig;
+  };
+  reset?: {
+    rolling5h?: ThrottleResetRolling5hConfig;
+    weekly?: ThrottleResetWeeklyConfig;
+  };
+}
 
 export interface RalphConfig {
   repos: RepoConfig[];
@@ -21,9 +71,25 @@ export interface RalphConfig {
   batchSize: number;       // PRs before rollup (default: 10)
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
   bwrbVault: string;       // path to bwrb vault for queue
-  owner: string;           // GitHub owner for repos (default: "3mdistal")
+  owner: string;           // default GitHub owner (default: "3mdistal")
+
+  /**
+   * Guardrail: only touch repos whose owner is in this allowlist.
+   * Default: [owner].
+   */
+  allowedOwners?: string[];
+
+  /** GitHub App auth (installation token) used for gh + REST calls. */
+  githubApp?: {
+    appId: number | string;
+    installationId: number | string;
+    /** PEM file path (read at runtime; never log key material). */
+    privateKeyPath: string;
+  };
+
   devDir: string;          // base directory for repos (default: ~/Developer)
   watchdog?: WatchdogConfig;
+  throttle?: ThrottleConfig;
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
@@ -47,6 +113,20 @@ function toPositiveIntOrNull(value: unknown): number | null {
   if (!Number.isInteger(value)) return null;
   if (value <= 0) return null;
   return value;
+}
+
+function toStringArrayOrNull(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  if (value.length === 0) return [];
+
+  const items: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") return null;
+    const trimmed = entry.trim();
+    if (!trimmed) return null;
+    items.push(trimmed);
+  }
+  return items;
 }
 
 function validateConfig(loaded: RalphConfig): RalphConfig {
@@ -74,6 +154,30 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     return repo;
   });
 
+  // Guardrail allowlist. Default to [owner].
+  const rawOwners = (loaded as any).allowedOwners;
+  if (Array.isArray(rawOwners)) {
+    const cleaned = rawOwners.map((v) => String(v ?? "").trim()).filter(Boolean);
+    if (cleaned.length === 0) {
+      console.warn(`[ralph] Invalid config allowedOwners=[]; defaulting to [${JSON.stringify(loaded.owner)}]`);
+      loaded.allowedOwners = [loaded.owner];
+    } else {
+      loaded.allowedOwners = cleaned;
+    }
+  } else if (rawOwners !== undefined) {
+    console.warn(`[ralph] Invalid config allowedOwners=${JSON.stringify(rawOwners)}; defaulting to [${JSON.stringify(loaded.owner)}]`);
+    loaded.allowedOwners = [loaded.owner];
+  } else {
+    loaded.allowedOwners = [loaded.owner];
+  }
+
+  // Best-effort validation for GitHub App auth config.
+  const rawGithubApp = (loaded as any).githubApp;
+  if (rawGithubApp !== undefined && rawGithubApp !== null && typeof rawGithubApp !== "object") {
+    console.warn(`[ralph] Invalid config githubApp=${JSON.stringify(rawGithubApp)}; ignoring`);
+    (loaded as any).githubApp = undefined;
+  }
+
   return loaded;
 }
 
@@ -83,20 +187,57 @@ export function loadConfig(): RalphConfig {
   // Start with defaults
   let loaded: RalphConfig = { ...DEFAULT_CONFIG };
 
-  // Try to load from file
-  const configPath = join(homedir(), ".config/opencode/ralph/ralph.json");
-  if (existsSync(configPath)) {
+  // Try to load from file (precedence: ~/.ralph/config.toml > ~/.ralph/config.json > legacy ~/.config/opencode/ralph/ralph.json)
+  const configTomlPath = getRalphConfigTomlPath();
+  const configJsonPath = getRalphConfigJsonPath();
+  const legacyConfigPath = getRalphLegacyConfigPath();
+
+  const tryLoadJson = (path: string): any | null => {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const fileConfig = require(configPath);
-      loaded = { ...loaded, ...fileConfig };
+      const text = readFileSync(path, "utf8");
+      return JSON.parse(text);
     } catch (e) {
-      console.error(`[ralph] Failed to load config from ${configPath}:`, e);
+      console.error(`[ralph] Failed to load JSON config from ${path}:`, e);
+      return null;
     }
+  };
+
+  const tryLoadToml = (path: string): any | null => {
+    try {
+      const text = readFileSync(path, "utf8");
+      const toml = (Bun as any)?.TOML;
+      if (!toml || typeof toml.parse !== "function") {
+        throw new Error("Bun.TOML.parse is not available in this runtime");
+      }
+      return toml.parse(text);
+    } catch (e) {
+      console.error(`[ralph] Failed to load TOML config from ${path}:`, e);
+      return null;
+    }
+  };
+
+  if (existsSync(configTomlPath)) {
+    const fileConfig = tryLoadToml(configTomlPath);
+    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+  } else if (existsSync(configJsonPath)) {
+    const fileConfig = tryLoadJson(configJsonPath);
+    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+  } else if (existsSync(legacyConfigPath)) {
+    console.warn(
+      `[ralph] Using legacy config path ${legacyConfigPath}. ` +
+        `Migrate to ${configTomlPath} or ${configJsonPath} (preferred).`
+    );
+
+    const fileConfig = tryLoadJson(legacyConfigPath);
+    if (fileConfig) loaded = { ...loaded, ...fileConfig };
   }
 
   config = validateConfig(loaded);
   return config;
+}
+
+export function __resetConfigForTests(): void {
+  config = null;
 }
 
 export function getRepoPath(repoName: string): string {
@@ -115,6 +256,13 @@ export function getRepoBotBranch(repoName: string): string {
   const cfg = loadConfig();
   const explicit = cfg.repos.find(r => r.name === repoName);
   return explicit?.botBranch ?? "bot/integration";
+}
+
+export function getRepoRequiredChecks(repoName: string): string[] {
+  const cfg = loadConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const checks = toStringArrayOrNull(explicit?.requiredChecks);
+  return checks ?? ["ci"];
 }
 
 export function getGlobalMaxWorkers(): number {

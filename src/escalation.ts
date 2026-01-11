@@ -23,7 +23,7 @@ export function isContractSurfaceReason(reason?: string | null): boolean {
   const r = (reason ?? "").toLowerCase();
   if (!r) return false;
 
-  // Owner policy: user-facing contract surfaces.
+  // Owner policy: user-facing contract surfaces (see docs/escalation-policy.md).
   const indicators = [
     "cli",
     "flag",
