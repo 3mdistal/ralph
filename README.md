@@ -47,7 +47,7 @@ bun install
 
 Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
-By default, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
+By default, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
 
 Config is loaded once at startup, so restart the daemon after editing.
 

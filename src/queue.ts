@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, watch } from "fs";
+import { watch } from "fs";
 import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
-import { getRepoBotBranch, getRepoPath, loadConfig } from "./config";
+import { ensureBwrbVaultLayout, getRepoBotBranch, getRepoPath, loadConfig } from "./config";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 
@@ -453,22 +453,10 @@ export function startWatching(onChange: QueueChangeHandler): void {
 
   const config = loadConfig();
   const vault = config.bwrbVault;
+
+  if (!ensureBwrbVaultLayout(vault)) return;
+
   const tasksDir = join(vault, "orchestration/tasks");
-
-  if (!vault || !existsSync(vault)) {
-    console.error(
-      `[ralph:queue] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
-        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`
-    );
-    return;
-  }
-
-  try {
-    mkdirSync(tasksDir, { recursive: true });
-  } catch (e) {
-    console.error(`[ralph:queue] Failed to create tasks dir: ${tasksDir}`, e);
-    return;
-  }
 
   console.log(`[ralph:queue] Watching ${tasksDir} for changes`);
 
