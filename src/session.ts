@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "child_process";
-import { createWriteStream, mkdirSync, rmSync, writeFileSync } from "fs";
+import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
@@ -44,11 +44,17 @@ async function spawnServer(repoPath: string): Promise<ServerHandle> {
   return new Promise((resolve, reject) => {
     const port = 4000 + Math.floor(Math.random() * 1000);
 
-    const proc = spawn("opencode", ["serve", "--port", String(port)], {
-      cwd: repoPath,
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env },
-    });
+    let proc: ChildProcess;
+    try {
+      proc = spawn(resolveOpencodeBin(), ["serve", "--port", String(port)], {
+        cwd: repoPath,
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env },
+      });
+    } catch (e: any) {
+      reject(new Error(`Failed to spawn OpenCode server: ${e?.message ?? String(e)}`));
+      return;
+    }
 
     let started = false;
 
@@ -95,6 +101,23 @@ function normalizeCacheSegment(value: string): string {
     .replace(/-+/g, "-")
     .replace(/^[-_.]+|[-_.]+$/g, "")
     .slice(0, 80);
+}
+
+function resolveOpencodeBin(): string {
+  const override = process.env.OPENCODE_BIN?.trim();
+  if (override) return override;
+
+  const candidates = [
+    "/opt/homebrew/bin/opencode",
+    "/usr/local/bin/opencode",
+    join(homedir(), ".local", "bin", "opencode"),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  return "opencode";
 }
 
 function getIsolatedXdgCacheHome(opts?: { repo?: string; cacheKey?: string }): string {
@@ -363,11 +386,26 @@ async function runSession(
 
   const env = { ...process.env, XDG_CACHE_HOME: xdgCacheHome };
 
-  const proc = spawn("opencode", args, {
-    cwd: repoPath,
-    stdio: ["ignore", "pipe", "pipe"],
-    env,
-  });
+  const opencodeBin = resolveOpencodeBin();
+  let proc: ChildProcess;
+  try {
+    proc = spawn(opencodeBin, args, {
+      cwd: repoPath,
+      stdio: ["ignore", "pipe", "pipe"],
+      env,
+    });
+  } catch (e: any) {
+    const message = e?.message ?? String(e);
+    const path = truncate(process.env.PATH ?? "", 300);
+    return {
+      sessionId: options?.continueSession ?? "",
+      success: false,
+      output:
+        `Failed to spawn OpenCode CLI (${opencodeBin}): ${message}\n` +
+        `PATH: ${path}\n` +
+        `Set OPENCODE_BIN to the full path of the opencode executable.`,
+    };
+  }
 
   // If continuing an existing session, mark it as active for `ralph nudge`.
   const continueSessionId = options?.continueSession;
