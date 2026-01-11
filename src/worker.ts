@@ -16,6 +16,7 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
+import { computeMissingBaselineLabels } from "./github-labels";
 import { getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
 
 // Ralph introspection logs location
@@ -138,6 +139,45 @@ function resolveVaultPath(p: string): string {
 
 export class RepoWorker {
   constructor(public readonly repo: string, public readonly repoPath: string) {}
+
+  private ensureLabelsPromise: Promise<void> | null = null;
+
+  private async ensureBaselineLabelsOnce(): Promise<void> {
+    if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
+
+    this.ensureLabelsPromise = (async () => {
+      try {
+        const result = await $`gh label list --repo ${this.repo} --json name`.quiet();
+        const raw = JSON.parse(result.stdout.toString());
+        const existing = Array.isArray(raw) ? raw.map((l: any) => String(l?.name ?? "")) : [];
+
+        const missing = computeMissingBaselineLabels(existing);
+        if (missing.length === 0) return;
+
+        const created: string[] = [];
+        for (const label of missing) {
+          try {
+            await $`gh label create ${label.name} --repo ${this.repo} --color ${label.color} --description ${label.description}`.quiet();
+            created.push(label.name);
+          } catch (e: any) {
+            const msg = e?.message ?? String(e);
+            if (/already exists/i.test(msg)) continue;
+            throw e;
+          }
+        }
+
+        if (created.length > 0) {
+          console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
+        }
+      } catch (e: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to ensure baseline GitHub labels (continuing): ${e?.message ?? String(e)}`
+        );
+      }
+    })();
+
+    return this.ensureLabelsPromise;
+  }
 
   private async resolveWorktreeRef(): Promise<string> {
     const botBranch = getRepoBotBranch(this.repo);
@@ -365,6 +405,8 @@ export class RepoWorker {
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string }): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
+
+    await this.ensureBaselineLabelsOnce();
 
     const issueMatch = task.issue.match(/#(\d+)$/);
     const issueNumber = issueMatch?.[1] ?? "";
@@ -667,6 +709,8 @@ export class RepoWorker {
       if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
       const issueNumber = issueMatch[1];
       const cacheKey = issueNumber;
+
+      await this.ensureBaselineLabelsOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber, "start");
 
