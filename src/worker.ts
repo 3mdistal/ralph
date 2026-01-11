@@ -17,7 +17,7 @@ const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 const gh: GhRunner = DEFAULT_GH_RUNNER;
 
 import { type AgentTask, updateTaskStatus } from "./queue";
-import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
+import { getRepoBotBranch, getRepoMaxWorkers, getRepoRequiredChecks, loadConfig } from "./config";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { getThrottleDecision } from "./throttle";
@@ -33,7 +33,7 @@ import {
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
-import { getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
+import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
 import {
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
@@ -135,6 +135,80 @@ function resolveVaultPath(p: string): string {
   return isAbsolute(p) ? p : join(vault, p);
 }
 
+type RequiredCheckState = "SUCCESS" | "PENDING" | "FAILURE" | "UNKNOWN";
+
+type PrCheck = {
+  name: string;
+  state: RequiredCheckState;
+  rawState: string;
+};
+
+type RequiredChecksSummary = {
+  status: "success" | "pending" | "failure";
+  required: Array<{ name: string; state: RequiredCheckState; rawState: string }>;
+  available: string[];
+};
+
+function splitRepoFullName(full: string): { owner: string; name: string } {
+  const [owner, name] = full.split("/");
+  if (!owner || !name) {
+    throw new Error(`Invalid repo name (expected owner/name): ${full}`);
+  }
+  return { owner, name };
+}
+
+function extractPullRequestNumber(url: string): number | null {
+  const match = url.match(/\/pull\/(\d+)(?:$|\b|\/)/);
+  if (!match) return null;
+  return Number.parseInt(match[1], 10);
+}
+
+function normalizeRequiredCheckState(raw: string | null | undefined): RequiredCheckState {
+  const val = String(raw ?? "").toUpperCase();
+  if (!val) return "UNKNOWN";
+  if (val === "SUCCESS") return "SUCCESS";
+
+  // Common non-success terminal states.
+  if (["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE"].includes(val)) {
+    return "FAILURE";
+  }
+
+  // Treat everything else (including IN_PROGRESS, QUEUED, PENDING) as pending.
+  return "PENDING";
+}
+
+function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: string[]): RequiredChecksSummary {
+  const available = Array.from(new Set(allChecks.map((c) => c.name))).sort();
+
+  const required = requiredChecks.map((name) => {
+    const match = allChecks.find((c) => c.name === name);
+    if (!match) return { name, state: "UNKNOWN" as const, rawState: "missing" };
+    return { name, state: match.state, rawState: match.rawState };
+  });
+
+  const hasFailure = required.some((c) => c.state === "FAILURE");
+  if (hasFailure) return { status: "failure", required, available };
+
+  const allSuccess = required.length > 0 && required.every((c) => c.state === "SUCCESS");
+  if (allSuccess) return { status: "success", required, available };
+
+  return { status: "pending", required, available };
+}
+
+function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
+  const lines: string[] = [];
+  lines.push(`Required checks: ${summary.required.map((c) => c.name).join(", ") || "(none)"}`);
+  for (const chk of summary.required) {
+    lines.push(`- ${chk.name}: ${chk.rawState}`);
+  }
+
+  if (summary.available.length > 0) {
+    lines.push("", "Available check contexts:", ...summary.available.map((c) => `- ${c}`));
+  }
+
+  return lines.join("\n");
+}
+
 export class RepoWorker {
   constructor(public readonly repo: string, public readonly repoPath: string) {}
 
@@ -145,8 +219,7 @@ export class RepoWorker {
     const completedAt = completed.toISOString().split("T")[0];
     const owners = getAllowedOwners();
 
-    const reason =
-      `Repo owner is not in allowlist (repo=${task.repo}, allowedOwners=${owners.join(", ") || "none"})`;
+    const reason = `Repo owner is not in allowlist (repo=${task.repo}, allowedOwners=${owners.join(", ") || "none"})`;
 
     console.warn(`[ralph:worker:${this.repo}] RALPH_BLOCKED_ALLOWLIST ${reason}`);
 
@@ -178,8 +251,18 @@ export class RepoWorker {
       escalationReason: reason,
     };
   }
- 
+
+  private async recordRunLogPath(task: AgentTask, issueNumber: string, stepTitle: string): Promise<string | undefined> {
+    const runLogPath = getRalphRunLogPath({ repo: this.repo, issueNumber, stepTitle, ts: Date.now() });
+    const updated = await updateTaskStatus(task, "in-progress", { "run-log-path": runLogPath });
+    if (!updated) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
+    }
+    return runLogPath;
+  }
+
   private async ensureBaselineLabelsOnce(): Promise<void> {
+
 
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
 
@@ -228,26 +311,59 @@ export class RepoWorker {
   }
 
   private async ensureGitWorktree(worktreePath: string): Promise<void> {
+    const worktreeGitMarker = join(worktreePath, ".git");
+
+    const hasHealthyWorktree = () => existsSync(worktreePath) && existsSync(worktreeGitMarker);
+
+    const cleanupBrokenWorktree = async (): Promise<void> => {
+      try {
+        await $`git worktree remove --force ${worktreePath}`.cwd(this.repoPath).quiet();
+      } catch {
+        // ignore
+      }
+
+      try {
+        await rm(worktreePath, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    };
+
+    // If git knows about the worktree but the path is broken, clean it up.
     try {
       const list = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
       const out = list.stdout.toString();
-      if (out.includes(`worktree ${worktreePath}\n`)) return;
+      if (out.includes(`worktree ${worktreePath}\n`)) {
+        if (hasHealthyWorktree()) return;
+        console.warn(`[ralph:worker:${this.repo}] Worktree registered but unhealthy; recreating: ${worktreePath}`);
+        await cleanupBrokenWorktree();
+      }
     } catch {
       // ignore and attempt create
+    }
+
+    // If the directory exists but is not a valid git worktree, remove it.
+    if (existsSync(worktreePath) && !hasHealthyWorktree()) {
+      console.warn(`[ralph:worker:${this.repo}] Worktree path exists but is not a worktree; recreating: ${worktreePath}`);
+      await cleanupBrokenWorktree();
     }
 
     await mkdir(dirname(worktreePath), { recursive: true });
 
     const ref = await this.resolveWorktreeRef();
-    try {
+    const create = async () => {
       await $`git worktree add --detach ${worktreePath} ${ref}`.cwd(this.repoPath).quiet();
-    } catch (e: any) {
-      // If it already exists, treat as best-effort reuse.
-      if (existsSync(worktreePath)) {
-        console.warn(`[ralph:worker:${this.repo}] Failed to add worktree; reusing existing path: ${worktreePath}`);
-        return;
+      if (!hasHealthyWorktree()) {
+        throw new Error(`Worktree created but missing .git marker: ${worktreePath}`);
       }
-      throw e;
+    };
+
+    try {
+      await create();
+    } catch (e: any) {
+      // Retry once after forcing cleanup. This handles half-created directories or stale git metadata.
+      await cleanupBrokenWorktree();
+      await create();
     }
   }
 
@@ -295,7 +411,7 @@ export class RepoWorker {
     const worktreePath = join(RALPH_WORKTREES_DIR, repoKey, issueNumber, taskKey);
 
     await this.ensureGitWorktree(worktreePath);
-    await updateTaskStatus(task, "in-progress", { "worktree-path": worktreePath });
+    await updateTaskStatus(task, "starting", { "worktree-path": worktreePath });
 
     return { repoPath: worktreePath, worktreePath };
   }
@@ -472,6 +588,234 @@ export class RepoWorker {
     return { prUrl: null, diagnostics: diagnostics.join("\n") };
   }
 
+  private async getPullRequestChecks(prUrl: string): Promise<{ headSha: string; checks: PrCheck[] }> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+
+    const query = [
+      "query($owner:String!,$name:String!,$number:Int!){",
+      "repository(owner:$owner,name:$name){",
+      "pullRequest(number:$number){",
+      "headRefOid",
+      "statusCheckRollup{",
+      "contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}",
+      "}",
+      "}",
+      "}",
+      "}",
+    ].join(" ");
+
+    const result = await gh`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
+    const parsed = JSON.parse(result.stdout.toString());
+
+    const pr = parsed?.data?.repository?.pullRequest;
+    const headSha = pr?.headRefOid as string | undefined;
+    if (!headSha) {
+      throw new Error(`Failed to read pull request head SHA for ${prUrl}`);
+    }
+
+    const nodes = pr?.statusCheckRollup?.contexts?.nodes;
+    const checksRaw = Array.isArray(nodes) ? nodes : [];
+
+    const checks: PrCheck[] = [];
+
+    for (const node of checksRaw) {
+      const type = String(node?.__typename ?? "");
+
+      if (type === "CheckRun") {
+        const name = String(node?.name ?? "").trim();
+        if (!name) continue;
+
+        const status = String(node?.status ?? "");
+        const conclusion = String(node?.conclusion ?? "");
+
+        // If it's not completed yet, treat status as the state.
+        const rawState = status && status !== "COMPLETED" ? status : conclusion || status || "UNKNOWN";
+        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState) });
+        continue;
+      }
+
+      if (type === "StatusContext") {
+        const name = String(node?.context ?? "").trim();
+        if (!name) continue;
+
+        const rawState = String(node?.state ?? "UNKNOWN");
+        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState) });
+        continue;
+      }
+    }
+
+    return { headSha, checks };
+  }
+
+  private async waitForRequiredChecks(
+    prUrl: string,
+    requiredChecks: string[],
+    opts: { timeoutMs: number; pollIntervalMs: number }
+  ): Promise<{ headSha: string; summary: RequiredChecksSummary; timedOut: boolean }> {
+    const startedAt = Date.now();
+    let last: { headSha: string; summary: RequiredChecksSummary } | null = null;
+
+    while (Date.now() - startedAt < opts.timeoutMs) {
+      const { headSha, checks } = await this.getPullRequestChecks(prUrl);
+      const summary = summarizeRequiredChecks(checks, requiredChecks);
+      last = { headSha, summary };
+
+      if (summary.status === "success" || summary.status === "failure") {
+        return { headSha, summary, timedOut: false };
+      }
+
+      await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
+    }
+
+    if (last) {
+      return { headSha: last.headSha, summary: last.summary, timedOut: true };
+    }
+
+    // Should be unreachable, but keep types happy.
+    const fallback = await this.getPullRequestChecks(prUrl);
+    return {
+      headSha: fallback.headSha,
+      summary: summarizeRequiredChecks(fallback.checks, requiredChecks),
+      timedOut: true,
+    };
+  }
+
+  private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
+    // Never pass --admin or -d (delete branch). The orchestrator should not bypass checks or clean up git branches.
+    await gh`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
+  }
+
+  private async mergePrWithRequiredChecks(params: {
+    task: AgentTask;
+    repoPath: string;
+    cacheKey: string;
+    botBranch: string;
+    prUrl: string;
+    sessionId: string;
+    watchdogStagePrefix: string;
+    notifyTitle: string;
+  }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
+    const REQUIRED_CHECKS = getRepoRequiredChecks(this.repo);
+    const MAX_CI_FIX_ATTEMPTS = 3;
+
+    let prUrl = params.prUrl;
+    let sessionId = params.sessionId;
+    let lastSummary: RequiredChecksSummary | null = null;
+
+    for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
+      const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
+        timeoutMs: 45 * 60_000,
+        pollIntervalMs: 30_000,
+      });
+
+      lastSummary = checkResult.summary;
+
+      if (checkResult.summary.status === "success") {
+        console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+        await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+        return { ok: true, prUrl, sessionId };
+      }
+
+      if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
+
+      const fixMessage = [
+        `CI is required before merging to '${params.botBranch}'.`,
+        `PR: ${prUrl}`,
+        "",
+        checkResult.timedOut
+          ? "Timed out waiting for required checks to complete."
+          : "One or more required checks failed.",
+        "",
+        formatRequiredChecksForHumans(checkResult.summary),
+        "",
+        "Do NOT merge yet.",
+        "Fix the CI failure (or rerun CI), push updates to the PR branch, and reply when CI is green.",
+        "",
+        "Commands:",
+        "```bash",
+        `gh pr checks ${prUrl} --repo ${this.repo}`,
+        "```",
+      ].join("\n");
+
+      const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
+      const runLogPath = await this.recordRunLogPath(params.task, issueNumber, `${params.watchdogStagePrefix}-fix-ci`);
+
+      const fixResult = await continueSession(params.repoPath, sessionId, fixMessage, {
+        repo: this.repo,
+        cacheKey: params.cacheKey,
+        runLogPath,
+        introspection: {
+          repo: this.repo,
+          issue: params.task.issue,
+          taskName: params.task.name,
+          step: 5,
+          stepTitle: "fix CI",
+        },
+        ...this.buildWatchdogOptions(params.task, `${params.watchdogStagePrefix}-ci-fix`),
+      });
+
+      sessionId = fixResult.sessionId || sessionId;
+
+      if (!fixResult.success) {
+        if (fixResult.watchdogTimeout) {
+          const run = await this.handleWatchdogTimeout(
+            params.task,
+            params.cacheKey,
+            `${params.watchdogStagePrefix}-ci-fix`,
+            fixResult
+          );
+          return { ok: false, run };
+        }
+
+        const reason = `Failed while fixing CI before merge: ${fixResult.output}`;
+        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+        await updateTaskStatus(params.task, "blocked");
+        await notifyError(params.notifyTitle, reason, params.task.name);
+
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: reason,
+          },
+        };
+      }
+
+      if (fixResult.sessionId) {
+        await updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
+      }
+
+      const updatedPrUrl = extractPrUrl(fixResult.output);
+      if (updatedPrUrl) prUrl = updatedPrUrl;
+    }
+
+    const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
+    const reason = `Required checks not passing; refusing to merge ${prUrl}`;
+    console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+
+    await updateTaskStatus(params.task, "blocked");
+    await notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
+
+    return {
+      ok: false,
+      run: {
+        taskName: params.task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId,
+        escalationReason: reason,
+      },
+    };
+  }
+
   private async skipClosedIssue(task: AgentTask, issueMeta: IssueMetadata, started: Date): Promise<AgentRun> {
     const completed = new Date();
     const completedAt = completed.toISOString().split("T")[0];
@@ -582,15 +926,20 @@ export class RepoWorker {
     if (!sid) return;
 
     try {
+      const issueNumber = task.issue.match(/#(\d+)$/)?.[1] ?? cacheKey;
+
       const result = await drainQueuedNudges(sid, async (message) => {
         const paused = await this.pauseIfHardThrottled(task, `nudge-${stage}`, sid);
         if (paused) {
           return { success: false, error: "hard throttled" };
         }
 
+        const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`);
+
         const res = await continueSession(repoPath, sid, message, {
           repo: this.repo,
           cacheKey,
+          runLogPath,
           ...this.buildWatchdogOptions(task, `nudge-${stage}`),
         });
         return { success: res.success, error: res.success ? undefined : res.output };
@@ -694,13 +1043,13 @@ export class RepoWorker {
 
     const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber || cacheKey, "resume");
 
-    const existingSessionId = task["session-id"]?.trim();
-    if (!existingSessionId) {
-      const reason = "In-progress task has no session-id; cannot resume";
-      console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
-      await updateTaskStatus(task, "queued", { "session-id": "" });
-      return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
-    }
+      const existingSessionId = task["session-id"]?.trim();
+      if (!existingSessionId) {
+        const reason = "In-progress task has no session-id; cannot resume";
+        console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
+        await updateTaskStatus(task, "starting", { "session-id": "" });
+        return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
+      }
 
 
     try {
@@ -718,9 +1067,12 @@ export class RepoWorker {
       const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
       if (pausedBefore) return pausedBefore;
 
+      const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume");
+
       let buildResult = await continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
         cacheKey,
+        runLogPath: resumeRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,
@@ -825,6 +1177,8 @@ export class RepoWorker {
           const pausedLoopBreak = await this.pauseIfHardThrottled(task, "resume loop-break", buildResult.sessionId || existingSessionId);
           if (pausedLoopBreak) return pausedLoopBreak;
 
+          const loopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume loop-break");
+
           buildResult = await continueSession(
             taskRepoPath,
             buildResult.sessionId,
@@ -832,6 +1186,7 @@ export class RepoWorker {
             {
               repo: this.repo,
               cacheKey,
+              runLogPath: loopBreakRunLogPath,
               introspection: {
                 repo: this.repo,
                 issue: task.issue,
@@ -873,9 +1228,12 @@ export class RepoWorker {
         if (pausedContinue) return pausedContinue;
 
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+        const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue");
+
         buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
+          runLogPath: resumeContinueRunLogPath,
           timeoutMs: 10 * 60_000,
           introspection: {
             repo: this.repo,
@@ -955,47 +1313,43 @@ export class RepoWorker {
         };
       }
 
-      console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
-
       const pausedMerge = await this.pauseIfHardThrottled(task, "resume merge", buildResult.sessionId || existingSessionId);
       if (pausedMerge) return pausedMerge;
 
-      const mergeResult = await continueSession(
-        taskRepoPath,
-        buildResult.sessionId,
-        "Looks good. Merge the PR. (Don’t delete branches/worktrees; Ralph will clean up.)",
-        {
-          repo: this.repo,
-          cacheKey,
-          introspection: {
-            repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 5,
-            stepTitle: "merge",
-          },
-          ...this.buildWatchdogOptions(task, "resume-merge"),
-        }
-      );
+      const mergeGate = await this.mergePrWithRequiredChecks({
+        task,
+        repoPath: taskRepoPath,
+        cacheKey,
+        botBranch,
+        prUrl,
+        sessionId: buildResult.sessionId,
+        watchdogStagePrefix: "resume-merge",
+        notifyTitle: `Resuming ${task.name}`,
+      });
 
-      const pausedMergeAfter = await this.pauseIfHardThrottled(task, "resume merge (post)", mergeResult.sessionId || buildResult.sessionId || existingSessionId);
+      if (!mergeGate.ok) return mergeGate.run;
+
+      const pausedMergeAfter = await this.pauseIfHardThrottled(
+        task,
+        "resume merge (post)",
+        mergeGate.sessionId || buildResult.sessionId || existingSessionId
+      );
       if (pausedMergeAfter) return pausedMergeAfter;
 
-      if (!mergeResult.success) {
-        if (mergeResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "resume-merge", mergeResult);
-        }
-        console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
-      }
+      prUrl = mergeGate.prUrl;
+      buildResult.sessionId = mergeGate.sessionId;
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
       const pausedSurvey = await this.pauseIfHardThrottled(task, "resume survey", buildResult.sessionId || existingSessionId);
       if (pausedSurvey) return pausedSurvey;
 
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey");
+
       const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
+        runLogPath: resumeSurveyRunLogPath,
         ...this.buildWatchdogOptions(task, "resume-survey"),
       });
 
@@ -1085,12 +1439,12 @@ export class RepoWorker {
       const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
       if (pausedPreStart) return pausedPreStart;
 
-      // 3. Mark task in-progress (use _path to avoid ambiguous names)
-      const markedInProgress = await updateTaskStatus(task, "in-progress", {
+      // 3. Mark task starting (restart-safe pre-session state)
+      const markedStarting = await updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
       });
-      if (!markedInProgress) {
-        throw new Error("Failed to mark task in-progress (bwrb edit failed)");
+      if (!markedStarting) {
+        throw new Error("Failed to mark task starting (bwrb edit failed)");
       }
 
       await this.ensureBaselineLabelsOnce();
@@ -1112,9 +1466,12 @@ export class RepoWorker {
       const pausedNextTask = await this.pauseIfHardThrottled(task, "next-task");
       if (pausedNextTask) return pausedNextTask;
 
+      const nextTaskRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task");
+
       let planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
+        runLogPath: nextTaskRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,
@@ -1135,9 +1492,12 @@ export class RepoWorker {
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
         console.warn(`[ralph:worker:${this.repo}] /next-task hit transient cache ENOENT; retrying once...`);
         await new Promise((r) => setTimeout(r, 750));
+        const nextTaskRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task-retry");
+
         planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
           repo: this.repo,
           cacheKey,
+          runLogPath: nextTaskRetryRunLogPath,
           introspection: {
             repo: this.repo,
             issue: task.issue,
@@ -1186,10 +1546,13 @@ export class RepoWorker {
         const pausedDevexConsult = await this.pauseIfHardThrottled(task, "consult devex", baseSessionId);
         if (pausedDevexConsult) return pausedDevexConsult;
 
+        const devexRunLogPath = await this.recordRunLogPath(task, issueNumber, "consult devex");
+
         const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, {
           agent: "devex",
           repo: this.repo,
           cacheKey,
+          runLogPath: devexRunLogPath,
           introspection: {
             repo: this.repo,
             issue: task.issue,
@@ -1238,9 +1601,12 @@ export class RepoWorker {
           const pausedReroute = await this.pauseIfHardThrottled(task, "reroute after devex", baseSessionId);
           if (pausedReroute) return pausedReroute;
 
+          const rerouteRunLogPath = await this.recordRunLogPath(task, issueNumber, "reroute after devex");
+
           const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
             repo: this.repo,
             cacheKey,
+            runLogPath: rerouteRunLogPath,
             introspection: {
               repo: this.repo,
               issue: task.issue,
@@ -1338,9 +1704,12 @@ export class RepoWorker {
       const pausedBuild = await this.pauseIfHardThrottled(task, "build", planResult.sessionId);
       if (pausedBuild) return pausedBuild;
 
+      const buildRunLogPath = await this.recordRunLogPath(task, issueNumber, "build");
+
       let buildResult = await continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
+        runLogPath: buildRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,
@@ -1437,6 +1806,8 @@ export class RepoWorker {
           const pausedBuildLoopBreak = await this.pauseIfHardThrottled(task, "build loop-break", buildResult.sessionId);
           if (pausedBuildLoopBreak) return pausedBuildLoopBreak;
 
+          const buildLoopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber, "build loop-break");
+
           buildResult = await continueSession(
             taskRepoPath,
             buildResult.sessionId,
@@ -1444,6 +1815,7 @@ export class RepoWorker {
             {
               repo: this.repo,
               cacheKey,
+              runLogPath: buildLoopBreakRunLogPath,
               introspection: {
                 repo: this.repo,
                 issue: task.issue,
@@ -1481,9 +1853,12 @@ export class RepoWorker {
         if (pausedBuildContinue) return pausedBuildContinue;
 
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+        const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue");
+
         buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
+          runLogPath: buildContinueRunLogPath,
           timeoutMs: 10 * 60_000,
           introspection: {
             repo: this.repo,
@@ -1560,41 +1935,27 @@ export class RepoWorker {
         };
       }
 
-      // 8. Ask agent to merge
-      if (prUrl) {
-        console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
+      const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);
+      if (pausedMerge) return pausedMerge;
 
-        const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);
-        if (pausedMerge) return pausedMerge;
+      const mergeGate = await this.mergePrWithRequiredChecks({
+        task,
+        repoPath: taskRepoPath,
+        cacheKey,
+        botBranch,
+        prUrl,
+        sessionId: buildResult.sessionId,
+        watchdogStagePrefix: "merge",
+        notifyTitle: `Merging ${task.name}`,
+      });
 
-        const mergeResult = await continueSession(
-          taskRepoPath,
-          buildResult.sessionId,
-          "Looks good. Merge the PR. (Don’t delete branches/worktrees; Ralph will clean up.)",
-          {
-            repo: this.repo,
-            cacheKey,
-            introspection: {
-              repo: this.repo,
-              issue: task.issue,
-              taskName: task.name,
-              step: 5,
-              stepTitle: "merge",
-            },
-            ...this.buildWatchdogOptions(task, "merge"),
-          }
-        );
+      if (!mergeGate.ok) return mergeGate.run;
 
-        const pausedMergeAfter = await this.pauseIfHardThrottled(task, "merge (post)", mergeResult.sessionId || buildResult.sessionId);
-        if (pausedMergeAfter) return pausedMergeAfter;
+      const pausedMergeAfter = await this.pauseIfHardThrottled(task, "merge (post)", mergeGate.sessionId || buildResult.sessionId);
+      if (pausedMergeAfter) return pausedMergeAfter;
 
-        if (!mergeResult.success) {
-          if (mergeResult.watchdogTimeout) {
-            return await this.handleWatchdogTimeout(task, cacheKey, "merge", mergeResult);
-          }
-          console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
-        }
-      }
+      prUrl = mergeGate.prUrl;
+      buildResult.sessionId = mergeGate.sessionId;
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
@@ -1602,9 +1963,12 @@ export class RepoWorker {
       if (pausedSurvey) return pausedSurvey;
 
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey");
+
       const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
+        runLogPath: surveyRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,

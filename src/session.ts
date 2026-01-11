@@ -38,10 +38,10 @@ export function __resetSchedulerForTests(): void {
   schedulerForTests = null;
 }
 
-import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
@@ -374,6 +374,8 @@ async function runSession(
     repo?: string;
     /** Used for per-run cache isolation */
     cacheKey?: string;
+    /** Restart-survivable run output log file path (stdout+stderr). */
+    runLogPath?: string;
     /** Fallback hard timeout for the entire OpenCode process */
     timeoutMs?: number;
     /**
@@ -562,6 +564,172 @@ async function runSession(
     env,
   });
 
+  const runLogPath = options?.runLogPath?.trim();
+
+  const parsePositiveInt = (value: string | undefined): number | null => {
+    const v = (value ?? "").trim();
+    if (!v) return null;
+    const num = Number.parseInt(v, 10);
+    return Number.isFinite(num) && num > 0 ? num : null;
+  };
+
+  const maxRunLogBytes =
+    parsePositiveInt(process.env.RALPH_RUN_LOG_MAX_BYTES) ??
+    10 * 1024 * 1024; // 10MB
+
+  const maxRunLogBackups =
+    parsePositiveInt(process.env.RALPH_RUN_LOG_MAX_BACKUPS) ??
+    3;
+
+  let runLogStream: Writable | null = null;
+  let runLogBytes = 0;
+  let runLogRotating = false;
+  let rotateScheduled = false;
+
+  const openRunLogStream = (): void => {
+    if (!runLogPath) return;
+
+    try {
+      mkdirSync(dirname(runLogPath), { recursive: true });
+    } catch {
+      return;
+    }
+
+    try {
+      runLogBytes = existsSync(runLogPath) ? statSync(runLogPath).size : 0;
+    } catch {
+      runLogBytes = 0;
+    }
+
+    try {
+      runLogStream = createWriteStream(runLogPath, { flags: "a" });
+    } catch {
+      runLogStream = null;
+    }
+  };
+
+  const rotateRunLog = (): void => {
+    if (!runLogPath) return;
+    if (!runLogStream) return;
+    if (runLogRotating) return;
+
+    runLogRotating = true;
+
+    try {
+      proc.stdout?.pause();
+      proc.stderr?.pause();
+    } catch {
+      // ignore
+    }
+
+    const stream: any = runLogStream;
+    runLogStream = null;
+
+    const finish = () => {
+      try {
+        if (maxRunLogBackups <= 0) {
+          rmSync(runLogPath, { force: true });
+        } else {
+          const oldest = `${runLogPath}.${maxRunLogBackups}`;
+          try {
+            rmSync(oldest, { force: true });
+          } catch {
+            // ignore
+          }
+
+          for (let i = maxRunLogBackups - 1; i >= 1; i--) {
+            const from = `${runLogPath}.${i}`;
+            const to = `${runLogPath}.${i + 1}`;
+            if (!existsSync(from)) continue;
+            try {
+              renameSync(from, to);
+            } catch {
+              // ignore
+            }
+          }
+
+          if (existsSync(runLogPath)) {
+            try {
+              renameSync(runLogPath, `${runLogPath}.1`);
+            } catch {
+              // ignore
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+
+      runLogBytes = 0;
+      openRunLogStream();
+      runLogRotating = false;
+
+      try {
+        proc.stdout?.resume();
+        proc.stderr?.resume();
+      } catch {
+        // ignore
+      }
+    };
+
+    try {
+      if (typeof stream?.end === "function") {
+        stream.end(() => finish());
+      } else {
+        finish();
+      }
+    } catch {
+      finish();
+    }
+  };
+
+  const scheduleRotateRunLog = (): void => {
+    if (rotateScheduled) return;
+    rotateScheduled = true;
+    scheduler.setTimeout(() => {
+      rotateScheduled = false;
+      rotateRunLog();
+    }, 0);
+  };
+
+  const writeRunLog = (data: Buffer): void => {
+    if (!runLogPath) return;
+    if (!runLogStream) return;
+
+    try {
+      runLogStream.write(data);
+      runLogBytes += data.length;
+      if (runLogBytes >= maxRunLogBytes) {
+        scheduleRotateRunLog();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const closeRunLogStream = async (): Promise<void> => {
+    const stream: any = runLogStream;
+    if (!stream || typeof stream.end !== "function") return;
+
+    runLogStream = null;
+
+    try {
+      await new Promise<void>((resolve) => {
+        try {
+          stream.end(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  if (runLogPath) {
+    openRunLogStream();
+  }
+
   // If continuing an existing session, mark it as active for `ralph nudge`.
   const continueSessionId = options?.continueSession;
   const lockPath = continueSessionId ? getRalphSessionLockPath(continueSessionId) : null;
@@ -726,6 +894,8 @@ async function runSession(
   let watchdogTimeout: WatchdogTimeoutInfo | undefined;
 
   proc.stdout?.on("data", (data: Buffer) => {
+    writeRunLog(data);
+
     const chunk = data.toString();
     stdout += chunk;
     buffer += chunk;
@@ -808,6 +978,7 @@ async function runSession(
   });
 
   proc.stderr?.on("data", (data: Buffer) => {
+    writeRunLog(data);
     stderr += data.toString();
   });
 
@@ -875,6 +1046,8 @@ async function runSession(
       resolve(code ?? 0);
     });
   });
+
+  await closeRunLogStream();
 
   if (watchdogTimeout) {
     const header = [
@@ -988,6 +1161,7 @@ export async function runCommand(
   options?: {
     repo?: string;
     cacheKey?: string;
+    runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
       repo?: string;
@@ -1020,6 +1194,7 @@ export async function continueSession(
   options?: {
     repo?: string;
     cacheKey?: string;
+    runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
       repo?: string;
@@ -1053,6 +1228,7 @@ export async function continueCommand(
   options?: {
     repo?: string;
     cacheKey?: string;
+    runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
       repo?: string;

@@ -57,7 +57,8 @@ Config is loaded once at startup, so restart the daemon after editing.
     {
       "name": "3mdistal/ralph",
       "path": "/absolute/path/to/your/ralph",
-      "botBranch": "bot/integration"
+      "botBranch": "bot/integration",
+      "requiredChecks": ["CI"]
     }
   ]
 }
@@ -75,12 +76,14 @@ Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comme
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `maxWorkers`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
+
+Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
 ### Environment variables
 
@@ -90,6 +93,10 @@ Only these env vars are currently supported:
 |---------|---------|---------|
 | Sessions dir | `RALPH_SESSIONS_DIR` | `~/.ralph/sessions` |
 | Worktrees dir | `RALPH_WORKTREES_DIR` | `~/.ralph/worktrees` |
+| Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
+| Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
+
+Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
 Note: If `RALPH_SESSIONS_DIR` / `RALPH_WORKTREES_DIR` are relative paths, they resolve relative to the current working directory.
 
@@ -188,7 +195,7 @@ orchestration/
 
 ## How it works
 
-1. **Watch** - Ralph watches `orchestration/tasks/**` for queued tasks
+1. **Watch** - Ralph watches `orchestration/tasks/**` for queued (and restart-orphaned starting) tasks
 2. **Dispatch** - Runs `/next-task <issue>` to plan the work
 3. **Route** - Parses agent's decision (policy: `docs/escalation-policy.md`): proceed or escalate
 4. **Build** - If proceeding, tells agent to implement
@@ -211,10 +218,10 @@ session-id: ses_abc123
 ---
 ```
 
-On daemon startup, Ralph checks for orphaned in-progress tasks:
+On daemon startup, Ralph checks for orphaned starting/in-progress tasks:
 
 1. **Tasks with session-id** - Resumed using `continueSession()`. The agent picks up where it left off.
-2. **Tasks without session-id** - Reset to `queued` status. They'll be reprocessed from scratch.
+2. **Tasks without session-id** - Reset to `starting` status (restart-safe pre-session state), then retried from scratch.
 
 ### Graceful handling
 
@@ -232,9 +239,23 @@ On daemon startup, Ralph checks for orphaned in-progress tasks:
 
 Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue.
 
-- Enable: create `~/.config/opencode/ralph/drain`
-- Disable: delete `~/.config/opencode/ralph/drain`
-- Observability: logs emit `Drain enabled` / `Drain disabled`, and `ralph status` shows `Mode: running|draining`
+Control file:
+
+- `$XDG_STATE_HOME/ralph/control.json`
+- Fallback: `~/.local/state/ralph/control.json`
+
+Example:
+
+```json
+{ "mode": "draining" }
+```
+
+Schema: `{ "mode": "running"|"draining", "pause_requested"?: boolean }` (unknown fields ignored)
+
+- Enable drain: set `mode` to `draining`
+- Disable drain: set `mode` to `running`
+- Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
+- Observability: logs emit `Control mode: draining|running`, and `ralph status` shows `Mode: ...`
 
 ## Watchdog (Hung Tool Calls)
 
