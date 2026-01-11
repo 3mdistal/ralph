@@ -12,6 +12,32 @@ export function __resetSpawnForTests(): void {
   spawnFn = nodeSpawn;
 }
 
+type Scheduler = {
+  now: () => number;
+  setTimeout: typeof setTimeout;
+  clearTimeout: typeof clearTimeout;
+  setInterval: typeof setInterval;
+  clearInterval: typeof clearInterval;
+};
+
+const defaultScheduler: Scheduler = {
+  now: () => Date.now(),
+  setTimeout,
+  clearTimeout,
+  setInterval,
+  clearInterval,
+};
+
+let schedulerForTests: Scheduler | null = null;
+
+export function __setSchedulerForTests(scheduler: Scheduler): void {
+  schedulerForTests = scheduler;
+}
+
+export function __resetSchedulerForTests(): void {
+  schedulerForTests = null;
+}
+
 import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
@@ -46,6 +72,8 @@ export interface SessionResult {
   success: boolean;
   exitCode?: number;
   watchdogTimeout?: WatchdogTimeoutInfo;
+  /** Best-effort PR URL discovered from structured JSON events. */
+  prUrl?: string;
 }
 
 
@@ -371,6 +399,7 @@ async function runSession(
     };
   }
 ): Promise<SessionResult> {
+  const scheduler = schedulerForTests ?? defaultScheduler;
   const truncate = (value: string, max: number) => (value.length > max ? value.slice(0, max) + "…" : value);
 
   const mergeThresholds = (overrides?: Partial<WatchdogThresholdsMs>): WatchdogThresholdsMs => {
@@ -396,6 +425,29 @@ async function runSession(
   };
 
   const normalizeToolName = (name: string): string => name.trim().toLowerCase();
+
+  const PR_URL_RE = /https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/;
+
+  const extractPrUrlFromEvent = (event: any): string | null => {
+    const candidates = [
+      event?.prUrl,
+      event?.pr_url,
+      event?.pullRequestUrl,
+      event?.pull_request_url,
+      event?.pullRequest?.url,
+      event?.pull_request?.url,
+      event?.part?.prUrl,
+      event?.part?.pr_url,
+    ];
+
+    for (const candidate of candidates) {
+      if (typeof candidate !== "string") continue;
+      const match = candidate.match(PR_URL_RE);
+      if (match) return match[0];
+    }
+
+    return null;
+  };
 
   const pickThreshold = (toolName: string, thresholds: WatchdogThresholdsMs): WatchdogThresholdMs => {
     const t = normalizeToolName(toolName);
@@ -527,7 +579,7 @@ async function runSession(
       mkdirSync(getSessionDir(continueSessionId), { recursive: true });
       writeFileSync(
         lockPath,
-        JSON.stringify({ ts: Date.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
+        JSON.stringify({ ts: scheduler.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
       );
       proc.on("close", cleanupLock);
       proc.on("error", cleanupLock);
@@ -544,7 +596,7 @@ async function runSession(
     }
 
     // Some processes ignore SIGTERM. Follow up with SIGKILL.
-    setTimeout(() => {
+    scheduler.setTimeout(() => {
       try {
         proc.kill("SIGKILL");
       } catch {
@@ -564,6 +616,7 @@ async function runSession(
 
   let sessionId = "";
   let textOutput = "";
+  let prUrlFromEvents: string | null = null;
 
   const introspection = options?.introspection;
 
@@ -611,11 +664,18 @@ async function runSession(
     }
   };
 
-  const closeEventStream = (): void => {
+  const closeEventStream = async (): Promise<void> => {
     const stream: any = eventStream;
     if (!stream || typeof stream.end !== "function") return;
+
     try {
-      stream.end();
+      await new Promise<void>((resolve) => {
+        try {
+          stream.end(() => resolve());
+        } catch {
+          resolve();
+        }
+      });
     } catch {
       // ignore
     }
@@ -626,7 +686,7 @@ async function runSession(
     if (typeof introspection?.step === "number") {
       writeEvent({
         type: "step-start",
-        ts: Date.now(),
+        ts: scheduler.now(),
         step: introspection.step,
         title: introspection.stepTitle,
         repo: introspection.repo,
@@ -637,7 +697,7 @@ async function runSession(
 
     writeEvent({
       type: "run-start",
-      ts: Date.now(),
+      ts: scheduler.now(),
       command: command ?? undefined,
       agent: options?.agent ?? undefined,
       repo: introspection?.repo,
@@ -690,10 +750,15 @@ async function runSession(
           ensureEventStream(String(eventSessionId));
         }
 
+        if (!prUrlFromEvents) {
+          const extracted = extractPrUrlFromEvent(event);
+          if (extracted) prUrlFromEvents = extracted;
+        }
+
         if (event.type === "anomaly") {
           writeEvent({
             type: "anomaly",
-            ts: typeof event.ts === "number" ? event.ts : Date.now(),
+            ts: typeof event.ts === "number" ? event.ts : scheduler.now(),
           });
         }
 
@@ -703,7 +768,7 @@ async function runSession(
 
         const tool = extractToolInfo(event);
         if (tool) {
-          const now = Date.now();
+          const now = scheduler.now();
 
           if (tool.phase === "start") {
             inFlight = {
@@ -748,10 +813,10 @@ async function runSession(
 
   let watchdogInterval: ReturnType<typeof setInterval> | undefined;
   if (watchdogEnabled) {
-    watchdogInterval = setInterval(() => {
+    watchdogInterval = scheduler.setInterval(() => {
       if (watchdogTimeout || !inFlight) return;
 
-      const now = Date.now();
+      const now = scheduler.now();
       const elapsedMs = now - inFlight.startTs;
       const threshold = pickThreshold(inFlight.toolName, thresholds);
 
@@ -793,20 +858,20 @@ async function runSession(
   const exitCode = await new Promise<number>((resolve, reject) => {
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
-    timeout = setTimeout(() => {
+    timeout = scheduler.setTimeout(() => {
       requestKill();
       resolve(124);
     }, fallbackTimeoutMs);
 
     proc.on("error", (err) => {
-      if (timeout) clearTimeout(timeout);
-      if (watchdogInterval) clearInterval(watchdogInterval);
+      if (timeout) scheduler.clearTimeout(timeout);
+      if (watchdogInterval) scheduler.clearInterval(watchdogInterval);
       reject(err);
     });
 
     proc.on("close", (code) => {
-      if (timeout) clearTimeout(timeout);
-      if (watchdogInterval) clearInterval(watchdogInterval);
+      if (timeout) scheduler.clearTimeout(timeout);
+      if (watchdogInterval) scheduler.clearInterval(watchdogInterval);
       resolve(code ?? 0);
     });
   });
@@ -834,9 +899,9 @@ async function runSession(
 
     if (sessionId) {
       ensureEventStream(sessionId);
-      writeEvent({ type: "run-end", ts: Date.now(), success: false, exitCode, watchdogTimeout: true });
+      writeEvent({ type: "run-end", ts: scheduler.now(), success: false, exitCode, watchdogTimeout: true });
       try {
-        closeEventStream();
+        await closeEventStream();
       } catch {
         // ignore
       }
@@ -846,7 +911,7 @@ async function runSession(
       await enforceToolOutputBudgetInStorage(sessionId);
     }
 
-    return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout };
+    return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout, prUrl: prUrlFromEvents ?? undefined };
   }
 
   if (exitCode !== 0) {
@@ -878,9 +943,9 @@ async function runSession(
 
     if (sessionId) {
       ensureEventStream(sessionId);
-      writeEvent({ type: "run-end", ts: Date.now(), success: false, exitCode });
+      writeEvent({ type: "run-end", ts: scheduler.now(), success: false, exitCode });
       try {
-        closeEventStream();
+        await closeEventStream();
       } catch {
         // ignore
       }
@@ -890,16 +955,16 @@ async function runSession(
       await enforceToolOutputBudgetInStorage(sessionId);
     }
 
-    return { sessionId, output: enriched, success: false, exitCode };
+    return { sessionId, output: enriched, success: false, exitCode, prUrl: prUrlFromEvents ?? undefined };
   }
 
   const raw = stdout.toString();
 
   if (sessionId) {
     ensureEventStream(sessionId);
-    writeEvent({ type: "run-end", ts: Date.now(), success: true, exitCode });
+    writeEvent({ type: "run-end", ts: scheduler.now(), success: true, exitCode });
     try {
-      closeEventStream();
+      await closeEventStream();
     } catch {
       // ignore
     }
@@ -909,7 +974,7 @@ async function runSession(
     await enforceToolOutputBudgetInStorage(sessionId);
   }
 
-  return { sessionId, output: textOutput || raw, success: true, exitCode };
+  return { sessionId, output: textOutput || raw, success: true, exitCode, prUrl: prUrlFromEvents ?? undefined };
 }
 
 /**

@@ -115,3 +115,11 @@ export function extractPrUrl(output: string): string | null {
   const prMatch = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/);
   return prMatch ? prMatch[0] : null;
 }
+
+/**
+ * Prefer best-effort structured PR URL if available; otherwise parse from text output.
+ */
+export function extractPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
+  if (result.prUrl) return result.prUrl;
+  return extractPrUrl(result.output);
+}
