@@ -2,7 +2,7 @@ import { describe, test, expect, afterEach } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
-import { DrainMonitor, isDraining, resolveDrainFilePath } from "../drain";
+import { DrainMonitor, isDraining, resolveControlFilePath } from "../drain";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -22,18 +22,18 @@ describe("Drain mode", () => {
     tmpDirs.length = 0;
   });
 
-  test("isDraining reflects presence of drain file", () => {
+  test("isDraining reflects mode in control.json", () => {
     const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
     tmpDirs.push(homeDir);
 
-    const drainPath = resolveDrainFilePath(homeDir);
+    const controlPath = resolveControlFilePath(homeDir);
     expect(isDraining(homeDir)).toBe(false);
 
-    mkdirSync(dirname(drainPath), { recursive: true });
-    writeFileSync(drainPath, "");
+    mkdirSync(dirname(controlPath), { recursive: true });
+    writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
     expect(isDraining(homeDir)).toBe(true);
 
-    rmSync(drainPath, { force: true });
+    writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
     expect(isDraining(homeDir)).toBe(false);
   });
 
@@ -43,6 +43,7 @@ describe("Drain mode", () => {
 
     const logs: string[] = [];
     const modeChanges: string[] = [];
+
     const monitor = new DrainMonitor({
       homeDir,
       pollIntervalMs: 10,
@@ -52,18 +53,19 @@ describe("Drain mode", () => {
 
     monitor.start();
 
-    const drainPath = resolveDrainFilePath(homeDir);
-    mkdirSync(dirname(drainPath), { recursive: true });
-    writeFileSync(drainPath, "");
+    const controlPath = resolveControlFilePath(homeDir);
+    mkdirSync(dirname(controlPath), { recursive: true });
+
+    writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
     await sleep(100);
 
-    rmSync(drainPath, { force: true });
+    writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
     await sleep(100);
 
     monitor.stop();
 
-    expect(logs.some((l) => l.includes("Drain enabled"))).toBe(true);
-    expect(logs.some((l) => l.includes("Drain disabled"))).toBe(true);
+    expect(logs.some((l) => l.includes("Control mode: draining"))).toBe(true);
+    expect(logs.some((l) => l.includes("Control mode: running"))).toBe(true);
     expect(modeChanges).toContain("draining");
     expect(modeChanges).toContain("running");
   });
