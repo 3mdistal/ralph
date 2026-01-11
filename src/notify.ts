@@ -3,6 +3,7 @@ import crypto from "crypto";
 import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import { loadConfig } from "./config";
+import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue";
 
 export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
 
@@ -196,6 +197,10 @@ export interface EscalationContext {
   taskPath: string;
   issue: string;
   repo: string;
+  /** The original task scope (if known) */
+  scope?: string;
+  /** The original task priority (if known) */
+  priority?: string;
   /** OpenCode session ID (for resuming after resolution) */
   sessionId?: string;
   reason: string;
@@ -285,6 +290,61 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
   const today = new Date().toISOString().split("T")[0];
   const shortIssue = ctx.issue.split("/").pop() || ctx.issue;
 
+  // Defensive normalization: bwrb identifiers can include accidental newlines/whitespace.
+  const attemptedTaskPath = normalizeBwrbNoteRef(ctx.taskPath);
+  const attemptedTaskFileName = normalizeBwrbNoteRef(ctx.taskFileName);
+
+  let resolvedTaskPath = attemptedTaskPath;
+  let resolvedTaskFileName = attemptedTaskFileName;
+  let createdReplacementTask = false;
+
+  // Ensure the task exists before creating an escalation.
+  // If it can't be resolved (e.g. task note renamed/moved/deleted), create a replacement agent-task.
+  const resolved = await resolveAgentTaskByIssue(ctx.issue, ctx.repo);
+  if (resolved) {
+    resolvedTaskPath = resolved._path;
+    resolvedTaskFileName = resolved._name;
+
+    if (attemptedTaskPath && attemptedTaskPath !== resolvedTaskPath) {
+      console.warn(
+        `[ralph:notify] Escalation task path was stale; resolved by issue (${ctx.issue}): ${attemptedTaskPath} -> ${resolvedTaskPath}`
+      );
+    }
+  } else {
+    console.warn(`[ralph:notify] Task not found for escalation (issue=${ctx.issue}); creating replacement agent-task...`);
+
+    const replacement = await createAgentTask({
+      name: sanitizeNoteTitle(`Recovered Task - ${shortIssue} - ${ctx.taskName}`),
+      issue: ctx.issue,
+      repo: ctx.repo,
+      scope: ctx.scope ?? "builder",
+      status: "escalated",
+      ...(ctx.priority ? { priority: ctx.priority } : {}),
+    });
+
+    if (!replacement) {
+      const msg = `Failed to create replacement agent-task for ${ctx.issue}; cannot create required agent-escalation.task relation.`;
+      console.error(`[ralph:notify] ${msg}`);
+
+      // Last-resort operator-visible artifact (does not change bwrb schema).
+      await createNotification(
+        "error",
+        `Escalation creation failed for ${shortIssue}`,
+        `${msg}\n\nAttempted task path: ${attemptedTaskPath || "(none)"}\nAttempted task file: ${attemptedTaskFileName || "(none)"}\nSession: ${ctx.sessionId ?? ""}`
+      );
+
+      return false;
+    }
+
+    createdReplacementTask = true;
+    resolvedTaskPath = replacement.taskPath;
+    resolvedTaskFileName = replacement.taskFileName;
+
+    console.warn(
+      `[ralph:notify] Created replacement agent-task for ${ctx.issue}: ${resolvedTaskPath} (file=${resolvedTaskFileName})`
+    );
+  }
+
   // Build the note body with rich context
   const bodyParts: string[] = [
     `## Escalation Summary`,
@@ -299,6 +359,17 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     `| Reason | ${ctx.reason} |`,
     "",
   ];
+
+  bodyParts.push(
+    `## Task Note Resolution`,
+    "",
+    `- Attempted task path: ${attemptedTaskPath || "(none)"}`,
+    `- Resolved task path: ${resolvedTaskPath || "(none)"}`,
+    `- Attempted task file: ${attemptedTaskFileName || "(none)"}`,
+    `- Resolved task file: ${resolvedTaskFileName || "(none)"}`,
+    `- Replacement task created: ${createdReplacementTask ? "yes" : "no"}`,
+    ""
+  );
 
   // Add routing decision if available
   if (ctx.routing) {
@@ -379,8 +450,8 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
   let output = await bwrbNewEscalation(
     JSON.stringify({
       name: noteName,
-      task: `[[${ctx.taskFileName}]]`,
-      "task-path": ctx.taskPath,
+      task: `[[${resolvedTaskFileName}]]`,
+      "task-path": resolvedTaskPath,
       issue: ctx.issue,
       repo: ctx.repo,
       "session-id": ctx.sessionId ?? "",
@@ -397,8 +468,8 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     output = await bwrbNewEscalation(
       JSON.stringify({
         name: `${noteName} [${suffix}]`,
-        task: `[[${ctx.taskFileName}]]`,
-        "task-path": ctx.taskPath,
+        task: `[[${resolvedTaskFileName}]]`,
+        "task-path": resolvedTaskPath,
         issue: ctx.issue,
         repo: ctx.repo,
         "session-id": ctx.sessionId ?? "",

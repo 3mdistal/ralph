@@ -347,6 +347,8 @@ export class RepoWorker {
       taskPath: task._path,
       issue: task.issue,
       repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
       sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
       reason,
       escalationType: "other",
