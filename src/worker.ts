@@ -3,6 +3,27 @@ import { appendFile, mkdir, readFile, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { dirname, isAbsolute, join } from "path";
 
+type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
+
+type GhProcess = {
+  cwd: (path: string) => GhProcess;
+  quiet: () => Promise<GhCommandResult>;
+};
+
+type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProcess;
+
+const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
+
+let gh: GhRunner = DEFAULT_GH_RUNNER;
+
+export function __setGhRunnerForTests(runner: GhRunner): void {
+  gh = runner;
+}
+
+export function __resetGhRunnerForTests(): void {
+  gh = DEFAULT_GH_RUNNER;
+}
+
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
@@ -147,7 +168,7 @@ export class RepoWorker {
 
     this.ensureLabelsPromise = (async () => {
       try {
-        const result = await $`gh label list --repo ${this.repo} --json name`.quiet();
+        const result = await gh`gh label list --repo ${this.repo} --json name`.quiet();
         const raw = JSON.parse(result.stdout.toString());
         const existing = Array.isArray(raw) ? raw.map((l: any) => String(l?.name ?? "")) : [];
 
@@ -157,7 +178,7 @@ export class RepoWorker {
         const created: string[] = [];
         for (const label of missing) {
           try {
-            await $`gh label create ${label.name} --repo ${this.repo} --color ${label.color} --description ${label.description}`.quiet();
+            await gh`gh label create ${label.name} --repo ${this.repo} --color ${label.color} --description ${label.description}`.quiet();
             created.push(label.name);
           } catch (e: any) {
             const msg = e?.message ?? String(e);
@@ -272,7 +293,7 @@ export class RepoWorker {
 
     const [, repo, number] = match;
     try {
-      const result = await $`gh issue view ${number} --repo ${repo} --json state,stateReason,closedAt,url,labels,title`.quiet();
+      const result = await gh`gh issue view ${number} --repo ${repo} --json state,stateReason,closedAt,url,labels,title`.quiet();
       const data = JSON.parse(result.stdout.toString());
 
       return {

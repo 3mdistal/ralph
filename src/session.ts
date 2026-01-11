@@ -1,4 +1,17 @@
-import { spawn, type ChildProcess } from "child_process";
+import { spawn as nodeSpawn, type ChildProcess } from "child_process";
+
+type SpawnFn = typeof nodeSpawn;
+
+let spawnFn: SpawnFn = nodeSpawn;
+
+export function __setSpawnForTests(fn: SpawnFn): void {
+  spawnFn = fn;
+}
+
+export function __resetSpawnForTests(): void {
+  spawnFn = nodeSpawn;
+}
+
 import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
@@ -44,7 +57,7 @@ async function spawnServer(repoPath: string): Promise<ServerHandle> {
   return new Promise((resolve, reject) => {
     const port = 4000 + Math.floor(Math.random() * 1000);
 
-    const proc = spawn("opencode", ["serve", "--port", String(port)], {
+    const proc = spawnFn("opencode", ["serve", "--port", String(port)], {
       cwd: repoPath,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env },
@@ -473,8 +486,8 @@ async function runSession(
   mkdirSync(xdgCacheHome, { recursive: true });
 
   const env = { ...process.env, XDG_CACHE_HOME: xdgCacheHome };
-
-  const proc = spawn("opencode", args, {
+ 
+  const proc = spawnFn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env,
@@ -1011,7 +1024,7 @@ async function* streamSession(
   const xdgCacheHome = getIsolatedXdgCacheHome({ repo: options?.repo, cacheKey: options?.cacheKey });
   mkdirSync(xdgCacheHome, { recursive: true });
 
-  const proc = spawn("opencode", args, {
+  const proc = spawnFn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, XDG_CACHE_HOME: xdgCacheHome },
@@ -1042,4 +1055,18 @@ async function* streamSession(
       // ignore
     }
   }
+}
+
+export async function* __streamSessionForTests(
+  repoPath: string,
+  message: string,
+  options?: {
+    command?: string;
+    agent?: string;
+    continueSession?: string;
+    repo?: string;
+    cacheKey?: string;
+  }
+): AsyncGenerator<any, void, unknown> {
+  yield* streamSession(repoPath, message, options);
 }

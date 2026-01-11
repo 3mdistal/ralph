@@ -32,6 +32,11 @@ import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { queueNudge } from "./nudge";
 import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
+import {
+  buildWaitingResolutionUpdate,
+  DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
+  shouldDeferWaitingResolutionCheck,
+} from "./escalation-resume";
 
 // --- State ---
 
@@ -143,15 +148,18 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
       continue;
     }
 
+    const nowIso = new Date().toISOString();
+    if (shouldDeferWaitingResolutionCheck(escalation, Date.now(), DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS)) {
+      continue;
+    }
+
     const resolution = await readResolutionMessage(escalation._path);
     if (!resolution) {
       const reason = "Resolved escalation has empty/missing ## Resolution text";
       console.warn(`[ralph:escalations] ${reason}; skipping: ${escalation._path}`);
-      await editEscalation(escalation._path, {
-        "resume-status": "failed",
-        "resume-attempted-at": new Date().toISOString(),
-        "resume-error": reason,
-      });
+
+      await editEscalation(escalation._path, buildWaitingResolutionUpdate(nowIso, reason));
+
       continue;
     }
 
