@@ -203,29 +203,34 @@ export async function drainQueuedNudges(
   opts?: { maxAttempts?: number }
 ): Promise<DrainResult> {
   const release = await acquireDrainLock(sessionId);
-  if (!release) return { attempted: 0, delivered: 0, stoppedOnError: false };
+  if (!release) {
+    return { attempted: 0, delivered: 0, stoppedOnError: false };
+  }
+
+  let attempted = 0;
+  let delivered = 0;
+  let stoppedOnError = false;
 
   try {
     const maxAttempts = opts?.maxAttempts ?? 3;
     const pending = await getPendingNudges(sessionId, maxAttempts);
 
-    let attempted = 0;
-    let delivered = 0;
-
     for (const nudge of pending) {
-      attempted++;
-      const result = await deliver(nudge.message);
-      await recordDeliveryAttempt(sessionId, nudge.id, result);
+      attempted += 1;
 
-      if (!result.success) {
-        return { attempted, delivered, stoppedOnError: true };
+      const delivery = await deliver(nudge.message);
+      await recordDeliveryAttempt(sessionId, nudge.id, delivery);
+
+      if (!delivery.success) {
+        stoppedOnError = true;
+        break;
       }
 
-      delivered++;
+      delivered += 1;
     }
-
-    return { attempted, delivered, stoppedOnError: false };
   } finally {
     await release();
   }
+
+  return { attempted: attempted, delivered: delivered, stoppedOnError: stoppedOnError };
 }
