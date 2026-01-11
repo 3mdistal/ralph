@@ -9,6 +9,12 @@ export interface RepoConfig {
   name: string;      // "3mdistal/bwrb"
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
+  /**
+   * Required status checks for merge gating (default: ["ci"]).
+   *
+   * IMPORTANT: Values must match the check context name shown by GitHub.
+   */
+  requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
 }
@@ -47,6 +53,14 @@ function toPositiveIntOrNull(value: unknown): number | null {
   if (!Number.isInteger(value)) return null;
   if (value <= 0) return null;
   return value;
+}
+
+function toNonEmptyStringArrayOrNull(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const items = value
+    .map((v) => (typeof v === "string" ? v.trim() : ""))
+    .filter(Boolean);
+  return items.length > 0 ? items : null;
 }
 
 function validateConfig(loaded: RalphConfig): RalphConfig {
@@ -115,6 +129,13 @@ export function getRepoBotBranch(repoName: string): string {
   const cfg = loadConfig();
   const explicit = cfg.repos.find(r => r.name === repoName);
   return explicit?.botBranch ?? "bot/integration";
+}
+
+export function getRepoRequiredChecks(repoName: string): string[] {
+  const cfg = loadConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const checks = toNonEmptyStringArrayOrNull((explicit as any)?.requiredChecks);
+  return checks ?? ["ci"];
 }
 
 export function getGlobalMaxWorkers(): number {

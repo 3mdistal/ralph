@@ -57,7 +57,8 @@ Config is loaded once at startup, so restart the daemon after editing.
     {
       "name": "3mdistal/ralph",
       "path": "/absolute/path/to/your/ralph",
-      "botBranch": "bot/integration"
+      "botBranch": "bot/integration",
+      "requiredChecks": ["ci"]
     }
   ]
 }
@@ -70,7 +71,7 @@ Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comme
 - `bwrbVault` (string): bwrb vault path for the task queue
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `maxWorkers`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
