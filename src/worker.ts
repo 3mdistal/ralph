@@ -666,8 +666,6 @@ export class RepoWorker {
     botBranch: string;
     prUrl: string;
     sessionId: string;
-    throttleSessionId: string;
-    pauseStagePrefix: string;
     watchdogStagePrefix: string;
     notifyTitle: string;
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
@@ -676,7 +674,6 @@ export class RepoWorker {
 
     let prUrl = params.prUrl;
     let sessionId = params.sessionId;
-    let throttleSessionId = params.throttleSessionId;
     let lastSummary: RequiredChecksSummary | null = null;
 
     for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
@@ -694,9 +691,6 @@ export class RepoWorker {
       }
 
       if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
-
-      const pausedFix = await this.pauseIfHardThrottled(params.task, `${params.pauseStagePrefix} ci-fix`, throttleSessionId);
-      if (pausedFix) return { ok: false, run: pausedFix };
 
       const fixMessage = [
         `CI is required before merging to '${params.botBranch}'.`,
@@ -731,14 +725,6 @@ export class RepoWorker {
       });
 
       sessionId = fixResult.sessionId || sessionId;
-      throttleSessionId = sessionId;
-
-      const pausedFixAfter = await this.pauseIfHardThrottled(
-        params.task,
-        `${params.pauseStagePrefix} ci-fix (post)`,
-        throttleSessionId
-      );
-      if (pausedFixAfter) return { ok: false, run: pausedFixAfter };
 
       if (!fixResult.success) {
         if (fixResult.watchdogTimeout) {
@@ -1215,8 +1201,6 @@ export class RepoWorker {
         botBranch,
         prUrl,
         sessionId: buildResult.sessionId,
-        throttleSessionId: buildResult.sessionId || existingSessionId,
-        pauseStagePrefix: "resume merge",
         watchdogStagePrefix: "resume-merge",
         notifyTitle: `Resuming ${task.name}`,
       });
@@ -1738,8 +1722,6 @@ export class RepoWorker {
         botBranch,
         prUrl,
         sessionId: buildResult.sessionId,
-        throttleSessionId: buildResult.sessionId,
-        pauseStagePrefix: "merge",
         watchdogStagePrefix: "merge",
         notifyTitle: `Merging ${task.name}`,
       });
