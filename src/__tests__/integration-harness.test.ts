@@ -120,8 +120,8 @@ describe("integration-ish harness: full task lifecycle", () => {
       headSha: "deadbeef",
       summary: {
         status: "success",
-        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
-        available: ["ci"],
+        required: [{ name: "CI", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["CI"],
       },
       timedOut: false,
     }));
