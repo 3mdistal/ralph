@@ -1073,7 +1073,7 @@ export class RepoWorker {
       }
 
       // Merge PR (gate on required CI checks)
-      const REQUIRED_CHECKS = ["CI"];
+      const REQUIRED_CHECKS = ["ci"];
       const MAX_CI_FIX_ATTEMPTS = 3;
       let merged = false;
       let lastSummary: RequiredChecksSummary | null = null;
@@ -1677,7 +1677,7 @@ export class RepoWorker {
       }
 
       // 8. Merge PR (gate on required CI checks)
-      const REQUIRED_CHECKS = ["CI"];
+      const REQUIRED_CHECKS = ["ci"];
       const MAX_CI_FIX_ATTEMPTS = 3;
       let merged = false;
       let lastSummary: RequiredChecksSummary | null = null;
