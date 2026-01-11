@@ -659,6 +659,142 @@ export class RepoWorker {
     await gh`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
   }
 
+  private async mergePrWithRequiredChecks(params: {
+    task: AgentTask;
+    repoPath: string;
+    cacheKey: string;
+    botBranch: string;
+    prUrl: string;
+    sessionId: string;
+    throttleSessionId: string;
+    pauseStagePrefix: string;
+    watchdogStagePrefix: string;
+    notifyTitle: string;
+  }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
+    const REQUIRED_CHECKS = ["CI"];
+    const MAX_CI_FIX_ATTEMPTS = 3;
+
+    let prUrl = params.prUrl;
+    let sessionId = params.sessionId;
+    let throttleSessionId = params.throttleSessionId;
+    let lastSummary: RequiredChecksSummary | null = null;
+
+    for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
+      const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
+        timeoutMs: 45 * 60_000,
+        pollIntervalMs: 30_000,
+      });
+
+      lastSummary = checkResult.summary;
+
+      if (checkResult.summary.status === "success") {
+        console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+        await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+        return { ok: true, prUrl, sessionId };
+      }
+
+      if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
+
+      const pausedFix = await this.pauseIfHardThrottled(params.task, `${params.pauseStagePrefix} ci-fix`, throttleSessionId);
+      if (pausedFix) return { ok: false, run: pausedFix };
+
+      const fixMessage = [
+        `CI is required before merging to '${params.botBranch}'.`,
+        `PR: ${prUrl}`,
+        "",
+        checkResult.timedOut
+          ? "Timed out waiting for required checks to complete."
+          : "One or more required checks failed.",
+        "",
+        formatRequiredChecksForHumans(checkResult.summary),
+        "",
+        "Do NOT merge yet.",
+        "Fix the CI failure (or rerun CI), push updates to the PR branch, and reply when CI is green.",
+        "",
+        "Commands:",
+        "```bash",
+        `gh pr checks ${prUrl} --repo ${this.repo}`,
+        "```",
+      ].join("\n");
+
+      const fixResult = await continueSession(params.repoPath, sessionId, fixMessage, {
+        repo: this.repo,
+        cacheKey: params.cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: params.task.issue,
+          taskName: params.task.name,
+          step: 5,
+          stepTitle: "fix CI",
+        },
+        ...this.buildWatchdogOptions(params.task, `${params.watchdogStagePrefix}-ci-fix`),
+      });
+
+      sessionId = fixResult.sessionId || sessionId;
+      throttleSessionId = sessionId;
+
+      const pausedFixAfter = await this.pauseIfHardThrottled(
+        params.task,
+        `${params.pauseStagePrefix} ci-fix (post)`,
+        throttleSessionId
+      );
+      if (pausedFixAfter) return { ok: false, run: pausedFixAfter };
+
+      if (!fixResult.success) {
+        if (fixResult.watchdogTimeout) {
+          const run = await this.handleWatchdogTimeout(
+            params.task,
+            params.cacheKey,
+            `${params.watchdogStagePrefix}-ci-fix`,
+            fixResult
+          );
+          return { ok: false, run };
+        }
+
+        const reason = `Failed while fixing CI before merge: ${fixResult.output}`;
+        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+        await updateTaskStatus(params.task, "blocked");
+        await notifyError(params.notifyTitle, reason, params.task.name);
+
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: reason,
+          },
+        };
+      }
+
+      if (fixResult.sessionId) {
+        await updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
+      }
+
+      const updatedPrUrl = extractPrUrl(fixResult.output);
+      if (updatedPrUrl) prUrl = updatedPrUrl;
+    }
+
+    const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
+    const reason = `Required checks not passing; refusing to merge ${prUrl}`;
+    console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+
+    await updateTaskStatus(params.task, "blocked");
+    await notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
+
+    return {
+      ok: false,
+      run: {
+        taskName: params.task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId,
+        escalationReason: reason,
+      },
+    };
+  }
+
   private async skipClosedIssue(task: AgentTask, issueMeta: IssueMetadata, started: Date): Promise<AgentRun> {
     const completed = new Date();
     const completedAt = completed.toISOString().split("T")[0];
@@ -1072,104 +1208,23 @@ export class RepoWorker {
         };
       }
 
-      // Merge PR (gate on required CI checks)
-      const REQUIRED_CHECKS = ["ci"];
-      const MAX_CI_FIX_ATTEMPTS = 3;
-      let merged = false;
-      let lastSummary: RequiredChecksSummary | null = null;
+      const mergeGate = await this.mergePrWithRequiredChecks({
+        task,
+        repoPath: taskRepoPath,
+        cacheKey,
+        botBranch,
+        prUrl,
+        sessionId: buildResult.sessionId,
+        throttleSessionId: buildResult.sessionId || existingSessionId,
+        pauseStagePrefix: "resume merge",
+        watchdogStagePrefix: "resume-merge",
+        notifyTitle: `Resuming ${task.name}`,
+      });
 
-      for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
-        const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
-          timeoutMs: 45 * 60_000,
-          pollIntervalMs: 30_000,
-        });
+      if (!mergeGate.ok) return mergeGate.run;
 
-        lastSummary = checkResult.summary;
-
-        if (checkResult.summary.status === "success") {
-          console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
-          await this.mergePullRequest(prUrl, checkResult.headSha, taskRepoPath);
-          merged = true;
-          break;
-        }
-
-        if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
-
-        const fixMessage = [
-          `CI is required before merging to '${botBranch}'.`,
-          `PR: ${prUrl}`,
-          "",
-          checkResult.timedOut
-            ? "Timed out waiting for required checks to complete."
-            : "One or more required checks failed.",
-          "",
-          formatRequiredChecksForHumans(checkResult.summary),
-          "",
-          "Do NOT merge yet.",
-          "Fix the CI failure (or rerun CI), push updates to the PR branch, and reply when CI is green.",
-          "",
-          "Commands:",
-          "```bash",
-          `gh pr checks ${prUrl} --repo ${this.repo}`,
-          "```",
-        ].join("\n");
-
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, fixMessage, {
-          repo: this.repo,
-          cacheKey,
-          introspection: {
-            repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 5,
-            stepTitle: "fix CI",
-          },
-          ...this.buildWatchdogOptions(task, "resume-merge-ci-fix"),
-        });
-
-        if (!buildResult.success) {
-          if (buildResult.watchdogTimeout) {
-            return await this.handleWatchdogTimeout(task, cacheKey, "resume-merge-ci-fix", buildResult);
-          }
-
-          const reason = `Failed while fixing CI before merge: ${buildResult.output}`;
-          console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-          await updateTaskStatus(task, "blocked");
-          await notifyError(`Resuming ${task.name}`, reason, task.name);
-
-          return {
-            taskName: task.name,
-            repo: this.repo,
-            outcome: "failed",
-            sessionId: buildResult.sessionId,
-            escalationReason: reason,
-          };
-        }
-
-        if (buildResult.sessionId) {
-          await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
-        }
-
-        const updatedPrUrl = extractPrUrl(buildResult.output);
-        if (updatedPrUrl) prUrl = updatedPrUrl;
-      }
-
-      if (!merged) {
-        const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
-        const reason = `Required checks not passing; refusing to merge ${prUrl}`;
-        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-
-        await updateTaskStatus(task, "blocked");
-        await notifyError(`Resuming ${task.name}`, [reason, summaryText].filter(Boolean).join("\n\n"), task.name);
-
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "failed",
-          sessionId: buildResult.sessionId,
-          escalationReason: reason,
-        };
-      }
+      prUrl = mergeGate.prUrl;
+      buildResult.sessionId = mergeGate.sessionId;
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
@@ -1676,104 +1731,23 @@ export class RepoWorker {
         };
       }
 
-      // 8. Merge PR (gate on required CI checks)
-      const REQUIRED_CHECKS = ["ci"];
-      const MAX_CI_FIX_ATTEMPTS = 3;
-      let merged = false;
-      let lastSummary: RequiredChecksSummary | null = null;
+      const mergeGate = await this.mergePrWithRequiredChecks({
+        task,
+        repoPath: taskRepoPath,
+        cacheKey,
+        botBranch,
+        prUrl,
+        sessionId: buildResult.sessionId,
+        throttleSessionId: buildResult.sessionId,
+        pauseStagePrefix: "merge",
+        watchdogStagePrefix: "merge",
+        notifyTitle: `Merging ${task.name}`,
+      });
 
-      for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
-        const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
-          timeoutMs: 45 * 60_000,
-          pollIntervalMs: 30_000,
-        });
+      if (!mergeGate.ok) return mergeGate.run;
 
-        lastSummary = checkResult.summary;
-
-        if (checkResult.summary.status === "success") {
-          console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
-          await this.mergePullRequest(prUrl, checkResult.headSha, taskRepoPath);
-          merged = true;
-          break;
-        }
-
-        if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
-
-        const fixMessage = [
-          `CI is required before merging to '${botBranch}'.`,
-          `PR: ${prUrl}`,
-          "",
-          checkResult.timedOut
-            ? "Timed out waiting for required checks to complete."
-            : "One or more required checks failed.",
-          "",
-          formatRequiredChecksForHumans(checkResult.summary),
-          "",
-          "Do NOT merge yet.",
-          "Fix the CI failure (or rerun CI), push updates to the PR branch, and reply when CI is green.",
-          "",
-          "Commands:",
-          "```bash",
-          `gh pr checks ${prUrl} --repo ${this.repo}`,
-          "```",
-        ].join("\n");
-
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, fixMessage, {
-          repo: this.repo,
-          cacheKey,
-          introspection: {
-            repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 5,
-            stepTitle: "fix CI",
-          },
-          ...this.buildWatchdogOptions(task, "merge-ci-fix"),
-        });
-
-        if (!buildResult.success) {
-          if (buildResult.watchdogTimeout) {
-            return await this.handleWatchdogTimeout(task, cacheKey, "merge-ci-fix", buildResult);
-          }
-
-          const reason = `Failed while fixing CI before merge: ${buildResult.output}`;
-          console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-          await updateTaskStatus(task, "blocked");
-          await notifyError(`Merging ${task.name}`, reason, task.name);
-
-          return {
-            taskName: task.name,
-            repo: this.repo,
-            outcome: "failed",
-            sessionId: buildResult.sessionId,
-            escalationReason: reason,
-          };
-        }
-
-        if (buildResult.sessionId) {
-          await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
-        }
-
-        const updatedPrUrl = extractPrUrl(buildResult.output);
-        if (updatedPrUrl) prUrl = updatedPrUrl;
-      }
-
-      if (!merged) {
-        const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
-        const reason = `Required checks not passing; refusing to merge ${prUrl}`;
-        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-
-        await updateTaskStatus(task, "blocked");
-        await notifyError(`Merging ${task.name}`, [reason, summaryText].filter(Boolean).join("\n\n"), task.name);
-
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "failed",
-          sessionId: buildResult.sessionId,
-          escalationReason: reason,
-        };
-      }
+      prUrl = mergeGate.prUrl;
+      buildResult.sessionId = mergeGate.sessionId;
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
