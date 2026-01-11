@@ -90,6 +90,11 @@ function getOrCreateWorker(repo: string): RepoWorker {
   return created;
 }
 
+async function getRunnableTasks(): Promise<AgentTask[]> {
+  const [starting, queued] = await Promise.all([getTasksByStatus("starting"), getQueuedTasks()]);
+  return [...starting, ...queued];
+}
+
 let scheduleQueuedTimer: ReturnType<typeof setTimeout> | null = null;
 function scheduleQueuedTasksSoon(): void {
   if (scheduleQueuedTimer) return;
@@ -97,7 +102,7 @@ function scheduleQueuedTasksSoon(): void {
     scheduleQueuedTimer = null;
     if (isShuttingDown) return;
     if (getDaemonMode() === "draining") return;
-    void getQueuedTasks().then((tasks) => processNewTasks(tasks));
+    void getRunnableTasks().then((tasks) => processNewTasks(tasks));
   }, 250);
 }
 
@@ -471,10 +476,11 @@ async function getTaskNowDoingLine(task: AgentTask): Promise<string> {
 }
 
 async function printHeartbeatTick(): Promise<void> {
-  const inProgress = await getTasksByStatus("in-progress");
-  if (inProgress.length === 0) return;
+  const [starting, inProgress] = await Promise.all([getTasksByStatus("starting"), getTasksByStatus("in-progress")]);
+  const tasks = [...starting, ...inProgress];
+  if (tasks.length === 0) return;
 
-  for (const task of inProgress) {
+  for (const task of tasks) {
     const line = await getTaskNowDoingLine(task);
     console.log(`[ralph:hb] ${line}`);
   }
@@ -493,8 +499,8 @@ async function resumeTasksOnStartup(opts?: { awaitCompletion?: boolean }): Promi
 
   const withoutSession = inProgress.filter((t) => !(t["session-id"]?.trim()));
   for (const task of withoutSession) {
-    console.warn(`[ralph] In-progress task has no session ID, resetting to queued: ${task.name}`);
-    await updateTaskStatus(task, "queued", { "session-id": "" });
+    console.warn(`[ralph] In-progress task has no session ID, resetting to starting: ${task.name}`);
+    await updateTaskStatus(task, "starting", { "session-id": "" });
   }
 
   const withSession = inProgress.filter((t) => t["session-id"]?.trim());
@@ -616,7 +622,7 @@ async function main(): Promise<void> {
       if (mode !== "running") return;
 
       void (async () => {
-        const tasks = await getQueuedTasks();
+        const tasks = await getRunnableTasks();
         await processNewTasks(tasks);
       })();
     },
@@ -638,7 +644,7 @@ async function main(): Promise<void> {
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
   const initialTasks = await initialPoll();
-  console.log(`[ralph] Found ${initialTasks.length} queued task(s)`);
+  console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
 
   if (initialTasks.length > 0 && getDaemonMode() !== "draining") {
     await processNewTasks(initialTasks);
@@ -812,7 +818,7 @@ function printCommandHelp(command: string): void {
           "Usage:",
           "  ralph status [--json]",
           "",
-          "Shows daemon mode plus queued, in-progress, and throttled tasks.",
+          "Shows daemon mode plus starting, queued, in-progress, and throttled tasks.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -908,7 +914,8 @@ if (args[0] === "status") {
         ? "soft-throttled"
         : "running";
 
-  const [inProgress, queued, throttled] = await Promise.all([
+  const [starting, inProgress, queued, throttled] = await Promise.all([
+    getTasksByStatus("starting"),
     getTasksByStatus("in-progress"),
     getQueuedTasks(),
     getTasksByStatus("throttled"),
@@ -937,6 +944,12 @@ if (args[0] === "status") {
           mode,
           throttle: throttle.snapshot,
           inProgress: inProgressWithStatus,
+          starting: starting.map((t) => ({
+            name: t.name,
+            repo: t.repo,
+            issue: t.issue,
+            priority: t.priority ?? "p2-medium",
+          })),
           queued: queued.map((t) => ({
             name: t.name,
             repo: t.repo,
@@ -960,6 +973,11 @@ if (args[0] === "status") {
   }
 
   console.log(`Mode: ${mode}`);
+
+  console.log(`Starting tasks: ${starting.length}`);
+  for (const task of starting) {
+    console.log(`  - ${await getTaskNowDoingLine(task)}`);
+  }
 
   console.log(`In-progress tasks: ${inProgress.length}`);
   for (const task of inProgress) {

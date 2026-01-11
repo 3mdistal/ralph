@@ -7,7 +7,7 @@ import type { AgentTask } from "../queue";
  * Session persistence ensures that:
  * 1. Session IDs are saved when tasks start
  * 2. On startup, in-progress tasks with session IDs are resumed
- * 3. In-progress tasks without session IDs are reset to queued
+ * 3. In-progress tasks without session IDs are reset to starting
  * 4. Failed session resumes are escalated gracefully
  */
 
@@ -89,14 +89,14 @@ describe("Session Persistence", () => {
   });
 
   describe("Status transitions", () => {
-    test("in-progress task without session should transition to queued", () => {
+    test("in-progress task without session should transition to starting", () => {
       const task = createMockTask({ status: "in-progress" });
 
       // Simulate the logic from resumeTasksOnStartup
       const hasSession = task["session-id"]?.trim();
-      const newStatus = hasSession ? "in-progress" : "queued";
+      const newStatus = hasSession ? "in-progress" : "starting";
 
-      expect(newStatus).toBe("queued");
+      expect(newStatus).toBe("starting");
     });
 
     test("in-progress task with session should stay in-progress", () => {
@@ -106,7 +106,7 @@ describe("Session Persistence", () => {
       });
 
       const hasSession = task["session-id"]?.trim();
-      const newStatus = hasSession ? "in-progress" : "queued";
+      const newStatus = hasSession ? "in-progress" : "starting";
 
       expect(newStatus).toBe("in-progress");
     });
@@ -300,12 +300,17 @@ describe("Queue discovery", () => {
     dataset = [
       createMockTask({ _path: "orchestration/tasks/a.md", _name: "a", status: "in-progress" }),
       createMockTask({ _path: "orchestration/tasks/b.md", _name: "b", status: "queued" }),
+      createMockTask({ _path: "orchestration/tasks/c.md", _name: "c", status: "starting" }),
     ];
 
     const { getTasksByStatus } = await loadQueue();
-    const tasks = await getTasksByStatus("in-progress");
 
+    const inProgressTasks = await getTasksByStatus("in-progress");
     expect(lastCommand).toContain("status == 'in-progress'");
-    expect(tasks.map((t) => t._path)).toEqual(["orchestration/tasks/a.md"]);
+    expect(inProgressTasks.map((t) => t._path)).toEqual(["orchestration/tasks/a.md"]);
+
+    const startingTasks = await getTasksByStatus("starting");
+    expect(lastCommand).toContain("status == 'starting'");
+    expect(startingTasks.map((t) => t._path)).toEqual(["orchestration/tasks/c.md"]);
   });
 });
