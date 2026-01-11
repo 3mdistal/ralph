@@ -90,7 +90,7 @@ export async function editEscalation(
   const json = JSON.stringify(fields);
 
   try {
-    await $`bwrb edit --path ${escalationPath} --json ${json}`.cwd(config.bwrbVault).quiet();
+    await $`bwrb edit --picker none --json ${json} ${escalationPath}`.cwd(config.bwrbVault).quiet();
     return { ok: true };
   } catch (e) {
     const error = formatBwrbShellError(e);

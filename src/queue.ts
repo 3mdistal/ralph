@@ -108,14 +108,14 @@ export async function updateTaskStatus(
 
   try {
     if (exactPath) {
-      // Use --path for exact file match - no ambiguity
-      await $`bwrb edit --path ${exactPath} --json ${json}`
+      // Use full path query to avoid glob escaping issues.
+      await $`bwrb edit --picker none --json ${json} ${exactPath}`
         .cwd(config.bwrbVault)
         .quiet();
     } else {
       // Fallback to name search (less reliable)
       const query = typeof task === "string" ? task : task.name;
-      await $`bwrb edit --picker none -t agent-task --path "orchestration/tasks/**" ${query} --json ${json}`
+      await $`bwrb edit --picker none -t agent-task --path "orchestration/tasks/**" --json ${json} ${query}`
         .cwd(config.bwrbVault)
         .quiet();
     }
