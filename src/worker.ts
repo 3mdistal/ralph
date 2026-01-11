@@ -676,13 +676,6 @@ export class RepoWorker {
     let sessionId = params.sessionId;
     let lastSummary: RequiredChecksSummary | null = null;
 
-    // Allow opting out of merge gating for a repo via config.
-    if (REQUIRED_CHECKS.length === 0) {
-      const { headSha } = await this.getPullRequestChecks(prUrl);
-      await this.mergePullRequest(prUrl, headSha, params.repoPath);
-      return { ok: true, prUrl, sessionId };
-    }
-
     for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
       const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
         timeoutMs: 45 * 60_000,

@@ -9,11 +9,11 @@ export interface RepoConfig {
   name: string;      // "3mdistal/bwrb"
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
-  /**
-   * Required status checks for merge gating (default: ["ci"]).
-   *
-   * IMPORTANT: Values must match the check context name shown by GitHub.
-   */
+   /**
+    * Required status checks for merge gating (default: ["CI"]).
+    *
+    * IMPORTANT: Values must match the check context name shown by GitHub (case-sensitive).
+    */
   requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
@@ -55,12 +55,18 @@ function toPositiveIntOrNull(value: unknown): number | null {
   return value;
 }
 
-function toNonEmptyStringArrayOrNull(value: unknown): string[] | null {
+function toStringArrayOrNull(value: unknown): string[] | null {
   if (!Array.isArray(value)) return null;
-  const items = value
-    .map((v) => (typeof v === "string" ? v.trim() : ""))
-    .filter(Boolean);
-  return items.length > 0 ? items : null;
+  if (value.length === 0) return [];
+
+  const items: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") return null;
+    const trimmed = entry.trim();
+    if (!trimmed) return null;
+    items.push(trimmed);
+  }
+  return items;
 }
 
 function validateConfig(loaded: RalphConfig): RalphConfig {
@@ -134,7 +140,7 @@ export function getRepoBotBranch(repoName: string): string {
 export function getRepoRequiredChecks(repoName: string): string[] {
   const cfg = loadConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
-  const checks = toNonEmptyStringArrayOrNull((explicit as any)?.requiredChecks);
+  const checks = toStringArrayOrNull(explicit?.requiredChecks);
   return checks ?? ["ci"];
 }
 

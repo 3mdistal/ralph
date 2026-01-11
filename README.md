@@ -58,7 +58,7 @@ Config is loaded once at startup, so restart the daemon after editing.
       "name": "3mdistal/ralph",
       "path": "/absolute/path/to/your/ralph",
       "botBranch": "bot/integration",
-      "requiredChecks": ["ci"]
+      "requiredChecks": ["CI"]
     }
   ]
 }
