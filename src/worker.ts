@@ -156,26 +156,59 @@ export class RepoWorker {
   }
 
   private async ensureGitWorktree(worktreePath: string): Promise<void> {
+    const worktreeGitMarker = join(worktreePath, ".git");
+
+    const hasHealthyWorktree = () => existsSync(worktreePath) && existsSync(worktreeGitMarker);
+
+    const cleanupBrokenWorktree = async (): Promise<void> => {
+      try {
+        await $`git worktree remove --force ${worktreePath}`.cwd(this.repoPath).quiet();
+      } catch {
+        // ignore
+      }
+
+      try {
+        await rm(worktreePath, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    };
+
+    // If git knows about the worktree but the path is broken, clean it up.
     try {
       const list = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
       const out = list.stdout.toString();
-      if (out.includes(`worktree ${worktreePath}\n`)) return;
+      if (out.includes(`worktree ${worktreePath}\n`)) {
+        if (hasHealthyWorktree()) return;
+        console.warn(`[ralph:worker:${this.repo}] Worktree registered but unhealthy; recreating: ${worktreePath}`);
+        await cleanupBrokenWorktree();
+      }
     } catch {
       // ignore and attempt create
+    }
+
+    // If the directory exists but is not a valid git worktree, remove it.
+    if (existsSync(worktreePath) && !hasHealthyWorktree()) {
+      console.warn(`[ralph:worker:${this.repo}] Worktree path exists but is not a worktree; recreating: ${worktreePath}`);
+      await cleanupBrokenWorktree();
     }
 
     await mkdir(dirname(worktreePath), { recursive: true });
 
     const ref = await this.resolveWorktreeRef();
-    try {
+    const create = async () => {
       await $`git worktree add --detach ${worktreePath} ${ref}`.cwd(this.repoPath).quiet();
-    } catch (e: any) {
-      // If it already exists, treat as best-effort reuse.
-      if (existsSync(worktreePath)) {
-        console.warn(`[ralph:worker:${this.repo}] Failed to add worktree; reusing existing path: ${worktreePath}`);
-        return;
+      if (!hasHealthyWorktree()) {
+        throw new Error(`Worktree created but missing .git marker: ${worktreePath}`);
       }
-      throw e;
+    };
+
+    try {
+      await create();
+    } catch (e: any) {
+      // Retry once after forcing cleanup. This handles half-created directories or stale git metadata.
+      await cleanupBrokenWorktree();
+      await create();
     }
   }
 
