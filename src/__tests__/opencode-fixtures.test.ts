@@ -5,13 +5,7 @@ import { dirname, join } from "path";
 import { EventEmitter } from "events";
 import { fileURLToPath } from "url";
 
-import {
-  __resetSchedulerForTests,
-  __resetSpawnForTests,
-  __setSchedulerForTests,
-  __setSpawnForTests,
-  runCommand,
-} from "../session";
+import { __withSchedulerForTests, __withSpawnForTests, runCommand } from "../session";
 import { extractPrUrlFromSession } from "../routing";
 import { computeLiveAnomalyCountFromJsonl } from "../anomaly";
 
@@ -169,33 +163,32 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
   afterEach(async () => {
     delete process.env.RALPH_SESSIONS_DIR;
-    __resetSpawnForTests();
-    __resetSchedulerForTests();
     await rm(sessionsDir, { recursive: true, force: true });
   });
 
   test("watchdog-timeout.jsonl: hard timeout sets SessionResult.watchdogTimeout", async () => {
     const scheduler = new FakeScheduler(0);
-    __setSchedulerForTests(scheduler as any);
-
     const lines = await loadFixtureLines("watchdog-timeout.jsonl");
-    __setSpawnForTests(spawnFromFixture({ lines, scheduler }) as any);
 
-    const promise = runCommand("/tmp", "next-task", [], {
-      watchdog: {
-        thresholdsMs: {
-          bash: { softMs: 1000, hardMs: 2000 },
-        },
-      },
+    const result = await __withSchedulerForTests(scheduler as any, async () => {
+      return await __withSpawnForTests(spawnFromFixture({ lines, scheduler }) as any, async () => {
+        const promise = runCommand("/tmp", "next-task", [], {
+          watchdog: {
+            thresholdsMs: {
+              bash: { softMs: 1000, hardMs: 2000 },
+            },
+          },
+        });
+
+        // Flush initial tool-start event.
+        scheduler.advanceBy(0);
+
+        // Trip the watchdog hard timeout without sleeping.
+        scheduler.advanceBy(2000);
+
+        return await promise;
+      });
     });
-
-    // Flush initial tool-start event.
-    scheduler.advanceBy(0);
-
-    // Trip the watchdog hard timeout without sleeping.
-    scheduler.advanceBy(2000);
-
-    const result = await promise;
 
     expect(result.success).toBe(false);
     expect(Boolean(result.watchdogTimeout)).toBe(true);
@@ -205,14 +198,15 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
   test("pr-url-structured.jsonl: structured PR URL beats text output", async () => {
     const scheduler = new FakeScheduler(0);
-    __setSchedulerForTests(scheduler as any);
-
     const lines = await loadFixtureLines("pr-url-structured.jsonl");
-    __setSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any);
 
-    const promise = runCommand("/tmp", "next-task", [], {});
-    scheduler.advanceBy(0);
-    const result = await promise;
+    const result = await __withSchedulerForTests(scheduler as any, async () => {
+      return await __withSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any, async () => {
+        const promise = runCommand("/tmp", "next-task", [], {});
+        scheduler.advanceBy(0);
+        return await promise;
+      });
+    });
 
     expect(result.success).toBe(true);
     expect(result.prUrl).toBe("https://github.com/owner/repo/pull/123");
@@ -221,14 +215,15 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
   test("anomaly-burst-recent.jsonl: 20 anomalies in 10s triggers recentBurst", async () => {
     const scheduler = new FakeScheduler(100000);
-    __setSchedulerForTests(scheduler as any);
-
     const lines = await loadFixtureLines("anomaly-burst-recent.jsonl");
-    __setSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any);
 
-    const promise = runCommand("/tmp", "next-task", [], {});
-    scheduler.advanceBy(0);
-    await promise;
+    await __withSchedulerForTests(scheduler as any, async () => {
+      return await __withSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any, async () => {
+        const promise = runCommand("/tmp", "next-task", [], {});
+        scheduler.advanceBy(0);
+        await promise;
+      });
+    });
 
     const eventsPath = join(sessionsDir, "ses_anomaly_recent", "events.jsonl");
     const eventsJsonl = await readFile(eventsPath, "utf8");
@@ -240,14 +235,15 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
   test("anomaly-burst-total.jsonl: total>=50 triggers regardless of recency", async () => {
     const scheduler = new FakeScheduler(100000);
-    __setSchedulerForTests(scheduler as any);
-
     const lines = await loadFixtureLines("anomaly-burst-total.jsonl");
-    __setSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any);
 
-    const promise = runCommand("/tmp", "next-task", [], {});
-    scheduler.advanceBy(0);
-    await promise;
+    await __withSchedulerForTests(scheduler as any, async () => {
+      return await __withSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any, async () => {
+        const promise = runCommand("/tmp", "next-task", [], {});
+        scheduler.advanceBy(0);
+        await promise;
+      });
+    });
 
     const eventsPath = join(sessionsDir, "ses_anomaly_total", "events.jsonl");
     const eventsJsonl = await readFile(eventsPath, "utf8");
