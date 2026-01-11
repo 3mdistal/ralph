@@ -12,6 +12,10 @@ Ralph watches for `agent-task` notes in a bwrb vault and dispatches them to Open
 - **Anomaly detection** catches agents stuck in loops
 - **Introspection logging** for debugging agent behavior
 
+## Escalation policy
+
+Canonical routing/escalation rules live in `docs/escalation-policy.md`.
+
 ## Operator dashboard (planned)
 
 Ralph’s control plane (operator dashboard) is **operator tooling** (not a user-facing UI): a local, token-authenticated API that publishes structured events, with a TUI as the first client.
