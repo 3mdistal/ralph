@@ -17,7 +17,7 @@ const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 const gh: GhRunner = DEFAULT_GH_RUNNER;
 
 import { type AgentTask, updateTaskStatus } from "./queue";
-import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
+import { getRepoBotBranch, getRepoMaxWorkers, getRepoRequiredChecks, loadConfig } from "./config";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { extractPrUrl, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
 import {
