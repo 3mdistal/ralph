@@ -5,7 +5,7 @@ import { dirname, join } from "path";
 import { EventEmitter } from "events";
 import { fileURLToPath } from "url";
 
-import { __withSchedulerForTests, __withSpawnForTests, runCommand } from "../session";
+import { runCommand } from "../session";
 import { extractPrUrlFromSession } from "../routing";
 import { computeLiveAnomalyCountFromJsonl } from "../anomaly";
 
@@ -170,25 +170,25 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const scheduler = new FakeScheduler(0);
     const lines = await loadFixtureLines("watchdog-timeout.jsonl");
 
-    const result = await __withSchedulerForTests(scheduler as any, async () => {
-      return await __withSpawnForTests(spawnFromFixture({ lines, scheduler }) as any, async () => {
-        const promise = runCommand("/tmp", "next-task", [], {
-          watchdog: {
-            thresholdsMs: {
-              bash: { softMs: 1000, hardMs: 2000 },
-            },
-          },
-        });
-
-        // Flush initial tool-start event.
-        scheduler.advanceBy(0);
-
-        // Trip the watchdog hard timeout without sleeping.
-        scheduler.advanceBy(2000);
-
-        return await promise;
-      });
+    const promise = runCommand("/tmp", "next-task", [], {
+      watchdog: {
+        thresholdsMs: {
+          bash: { softMs: 1000, hardMs: 2000 },
+        },
+      },
+      __testOverrides: {
+        spawn: spawnFromFixture({ lines, scheduler }) as any,
+        scheduler: scheduler as any,
+      },
     });
+
+    // Flush initial tool-start event.
+    scheduler.advanceBy(0);
+
+    // Trip the watchdog hard timeout without sleeping.
+    scheduler.advanceBy(2000);
+
+    const result = await promise;
 
     expect(result.success).toBe(false);
     expect(Boolean(result.watchdogTimeout)).toBe(true);
@@ -200,13 +200,15 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const scheduler = new FakeScheduler(0);
     const lines = await loadFixtureLines("pr-url-structured.jsonl");
 
-    const result = await __withSchedulerForTests(scheduler as any, async () => {
-      return await __withSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any, async () => {
-        const promise = runCommand("/tmp", "next-task", [], {});
-        scheduler.advanceBy(0);
-        return await promise;
-      });
+    const promise = runCommand("/tmp", "next-task", [], {
+      __testOverrides: {
+        spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
+        scheduler: scheduler as any,
+      },
     });
+
+    scheduler.advanceBy(0);
+    const result = await promise;
 
     expect(result.success).toBe(true);
     expect(result.prUrl).toBe("https://github.com/owner/repo/pull/123");
@@ -217,13 +219,15 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const scheduler = new FakeScheduler(100000);
     const lines = await loadFixtureLines("anomaly-burst-recent.jsonl");
 
-    await __withSchedulerForTests(scheduler as any, async () => {
-      return await __withSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any, async () => {
-        const promise = runCommand("/tmp", "next-task", [], {});
-        scheduler.advanceBy(0);
-        await promise;
-      });
+    const promise = runCommand("/tmp", "next-task", [], {
+      __testOverrides: {
+        spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
+        scheduler: scheduler as any,
+      },
     });
+
+    scheduler.advanceBy(0);
+    await promise;
 
     const eventsPath = join(sessionsDir, "ses_anomaly_recent", "events.jsonl");
     const eventsJsonl = await readFile(eventsPath, "utf8");
@@ -237,13 +241,15 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const scheduler = new FakeScheduler(100000);
     const lines = await loadFixtureLines("anomaly-burst-total.jsonl");
 
-    await __withSchedulerForTests(scheduler as any, async () => {
-      return await __withSpawnForTests(spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any, async () => {
-        const promise = runCommand("/tmp", "next-task", [], {});
-        scheduler.advanceBy(0);
-        await promise;
-      });
+    const promise = runCommand("/tmp", "next-task", [], {
+      __testOverrides: {
+        spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
+        scheduler: scheduler as any,
+      },
     });
+
+    scheduler.advanceBy(0);
+    await promise;
 
     const eventsPath = join(sessionsDir, "ses_anomaly_total", "events.jsonl");
     const eventsJsonl = await readFile(eventsPath, "utf8");

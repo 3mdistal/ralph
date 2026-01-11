@@ -1,15 +1,8 @@
-import { AsyncLocalStorage } from "async_hooks";
 import { spawn as nodeSpawn, type ChildProcess } from "child_process";
 
 type SpawnFn = typeof nodeSpawn;
 
 let spawnFn: SpawnFn = nodeSpawn;
-
-const spawnOverrideForTests = new AsyncLocalStorage<SpawnFn>();
-
-export async function __withSpawnForTests<T>(fn: SpawnFn, cb: () => Promise<T> | T): Promise<T> {
-  return await spawnOverrideForTests.run(fn, cb);
-}
 
 export function __setSpawnForTests(fn: SpawnFn): void {
   spawnFn = fn;
@@ -36,12 +29,6 @@ const defaultScheduler: Scheduler = {
 };
 
 let schedulerForTests: Scheduler | null = null;
-
-const schedulerOverrideForTests = new AsyncLocalStorage<Scheduler>();
-
-export async function __withSchedulerForTests<T>(scheduler: Scheduler, cb: () => Promise<T> | T): Promise<T> {
-  return await schedulerOverrideForTests.run(scheduler, cb);
-}
 
 export function __setSchedulerForTests(scheduler: Scheduler): void {
   schedulerForTests = scheduler;
@@ -98,9 +85,7 @@ async function spawnServer(repoPath: string): Promise<ServerHandle> {
   return new Promise((resolve, reject) => {
     const port = 4000 + Math.floor(Math.random() * 1000);
 
-    const spawn = spawnOverrideForTests.getStore() ?? spawnFn;
-
-    const proc = spawn("opencode", ["serve", "--port", String(port)], {
+    const proc = spawnFn("opencode", ["serve", "--port", String(port)], {
       cwd: repoPath,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env },
@@ -414,9 +399,13 @@ async function runSession(
       /** Included in soft/hard timeout logs */
       context?: string;
     };
+    __testOverrides?: {
+      spawn?: SpawnFn;
+      scheduler?: Scheduler;
+    };
   }
 ): Promise<SessionResult> {
-  const scheduler = schedulerOverrideForTests.getStore() ?? schedulerForTests ?? defaultScheduler;
+  const scheduler = options?.__testOverrides?.scheduler ?? schedulerForTests ?? defaultScheduler;
   const truncate = (value: string, max: number) => (value.length > max ? value.slice(0, max) + "…" : value);
 
   const mergeThresholds = (overrides?: Partial<WatchdogThresholdsMs>): WatchdogThresholdsMs => {
@@ -572,10 +561,9 @@ async function runSession(
   mkdirSync(xdgCacheHome, { recursive: true });
 
   const env = { ...process.env, XDG_CACHE_HOME: xdgCacheHome };
-  const spawn = spawnOverrideForTests.getStore() ?? spawnFn;
+  const spawn = options?.__testOverrides?.spawn ?? spawnFn;
 
   const proc = spawn("opencode", args, {
-
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env,
@@ -1194,6 +1182,10 @@ export async function runCommand(
       recentEventLimit?: number;
       context?: string;
     };
+    __testOverrides?: {
+      spawn?: SpawnFn;
+      scheduler?: Scheduler;
+    };
   }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
@@ -1280,6 +1272,9 @@ async function* streamSession(
     continueSession?: string;
     repo?: string;
     cacheKey?: string;
+    __testOverrides?: {
+      spawn?: SpawnFn;
+    };
   }
 ): AsyncGenerator<any, void, unknown> {
   const args: string[] = ["run"];
@@ -1299,7 +1294,7 @@ async function* streamSession(
   const xdgCacheHome = getIsolatedXdgCacheHome({ repo: options?.repo, cacheKey: options?.cacheKey });
   mkdirSync(xdgCacheHome, { recursive: true });
 
-  const spawn = spawnOverrideForTests.getStore() ?? spawnFn;
+  const spawn = options?.__testOverrides?.spawn ?? spawnFn;
 
   const proc = spawn("opencode", args, {
     cwd: repoPath,
@@ -1343,6 +1338,9 @@ export async function* __streamSessionForTests(
     continueSession?: string;
     repo?: string;
     cacheKey?: string;
+    __testOverrides?: {
+      spawn?: SpawnFn;
+    };
   }
 ): AsyncGenerator<any, void, unknown> {
   yield* streamSession(repoPath, message, options);
