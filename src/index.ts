@@ -7,7 +7,7 @@
  * Creates rollup PRs after N successful merges for batch review.
  */
 
-import { existsSync, watch } from "fs";
+import { existsSync, mkdirSync, watch } from "fs";
 import { join } from "path";
 
 import { getRepoMaxWorkers, getRepoPath, loadConfig } from "./config";
@@ -473,6 +473,29 @@ async function main(): Promise<void> {
 
   // Load config
   const config = loadConfig();
+
+  // Ensure expected bwrb vault layout exists (avoid fs.watch startup errors).
+  if (!config.bwrbVault || !existsSync(config.bwrbVault)) {
+    console.error(
+      `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(config.bwrbVault)}. ` +
+        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`
+    );
+  } else {
+    const dirs = [
+      "orchestration/tasks",
+      "orchestration/runs",
+      "orchestration/escalations",
+      "orchestration/notifications",
+    ];
+
+    for (const rel of dirs) {
+      try {
+        mkdirSync(join(config.bwrbVault, rel), { recursive: true });
+      } catch (e) {
+        console.error(`[ralph] Failed to create dir: ${join(config.bwrbVault, rel)}`, e);
+      }
+    }
+  }
 
   // Initialize durable local state (SQLite)
   initStateDb();

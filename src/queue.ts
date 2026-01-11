@@ -1,4 +1,4 @@
-import { watch } from "fs";
+import { existsSync, mkdirSync, watch } from "fs";
 import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
@@ -452,7 +452,23 @@ export function startWatching(onChange: QueueChangeHandler): void {
   if (watcher) return;
 
   const config = loadConfig();
-  const tasksDir = join(config.bwrbVault, "orchestration/tasks");
+  const vault = config.bwrbVault;
+  const tasksDir = join(vault, "orchestration/tasks");
+
+  if (!vault || !existsSync(vault)) {
+    console.error(
+      `[ralph:queue] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
+        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`
+    );
+    return;
+  }
+
+  try {
+    mkdirSync(tasksDir, { recursive: true });
+  } catch (e) {
+    console.error(`[ralph:queue] Failed to create tasks dir: ${tasksDir}`, e);
+    return;
+  }
 
   console.log(`[ralph:queue] Watching ${tasksDir} for changes`);
 
