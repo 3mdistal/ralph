@@ -669,12 +669,19 @@ export class RepoWorker {
     watchdogStagePrefix: string;
     notifyTitle: string;
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
-    const REQUIRED_CHECKS = ["CI"];
+    const REQUIRED_CHECKS = getRepoRequiredChecks(this.repo);
     const MAX_CI_FIX_ATTEMPTS = 3;
 
     let prUrl = params.prUrl;
     let sessionId = params.sessionId;
     let lastSummary: RequiredChecksSummary | null = null;
+
+    // Allow opting out of merge gating for a repo via config.
+    if (REQUIRED_CHECKS.length === 0) {
+      const { headSha } = await this.getPullRequestChecks(prUrl);
+      await this.mergePullRequest(prUrl, headSha, params.repoPath);
+      return { ok: true, prUrl, sessionId };
+    }
 
     for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
       const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
