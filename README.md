@@ -77,6 +77,8 @@ Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comme
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 
+Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Set it to `[]` to disable merge gating for a repo.
+
 ### Environment variables
 
 Only these env vars are currently supported:
