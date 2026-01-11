@@ -88,6 +88,10 @@ Only these env vars are currently supported:
 |---------|---------|---------|
 | Sessions dir | `RALPH_SESSIONS_DIR` | `~/.ralph/sessions` |
 | Worktrees dir | `RALPH_WORKTREES_DIR` | `~/.ralph/worktrees` |
+| Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
+| Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
+
+Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
 Note: If `RALPH_SESSIONS_DIR` / `RALPH_WORKTREES_DIR` are relative paths, they resolve relative to the current working directory.
 

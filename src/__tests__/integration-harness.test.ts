@@ -173,6 +173,13 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(statuses).toContain("in-progress");
     expect(statuses[statuses.length - 1]).toBe("done");
 
+    // Per-run log path is persisted for restart survivability.
+    const hasRunLogPath = updateTaskStatusMock.mock.calls.some((call: any[]) => {
+      const extra = call?.[2];
+      return extra && typeof extra === "object" && typeof extra["run-log-path"] === "string" && extra["run-log-path"].length > 0;
+    });
+    expect(hasRunLogPath).toBe(true);
+
     // Agent-run captures PR + survey output.
     expect(agentRunData?.outcome).toBe("success");
     expect(agentRunData?.pr).toBe("https://github.com/3mdistal/ralph/pull/999");

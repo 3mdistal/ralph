@@ -32,7 +32,7 @@ import {
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
-import { getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
+import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
 import {
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
@@ -212,6 +212,15 @@ export class RepoWorker {
   constructor(public readonly repo: string, public readonly repoPath: string) {}
 
   private ensureLabelsPromise: Promise<void> | null = null;
+
+  private async recordRunLogPath(task: AgentTask, issueNumber: string, stepTitle: string): Promise<string | undefined> {
+    const runLogPath = getRalphRunLogPath({ repo: this.repo, issueNumber, stepTitle, ts: Date.now() });
+    const updated = await updateTaskStatus(task, "in-progress", { "run-log-path": runLogPath });
+    if (!updated) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
+    }
+    return runLogPath;
+  }
 
   private async ensureBaselineLabelsOnce(): Promise<void> {
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
@@ -689,9 +698,13 @@ export class RepoWorker {
         "```",
       ].join("\n");
 
+      const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
+      const runLogPath = await this.recordRunLogPath(params.task, issueNumber, `${params.watchdogStagePrefix}-fix-ci`);
+
       const fixResult = await continueSession(params.repoPath, sessionId, fixMessage, {
         repo: this.repo,
         cacheKey: params.cacheKey,
+        runLogPath,
         introspection: {
           repo: this.repo,
           issue: params.task.issue,
@@ -869,15 +882,20 @@ export class RepoWorker {
     if (!sid) return;
 
     try {
+      const issueNumber = task.issue.match(/#(\d+)$/)?.[1] ?? cacheKey;
+
       const result = await drainQueuedNudges(sid, async (message) => {
         const paused = await this.pauseIfHardThrottled(task, `nudge-${stage}`, sid);
         if (paused) {
           return { success: false, error: "hard throttled" };
         }
 
+        const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`);
+
         const res = await continueSession(repoPath, sid, message, {
           repo: this.repo,
           cacheKey,
+          runLogPath,
           ...this.buildWatchdogOptions(task, `nudge-${stage}`),
         });
         return { success: res.success, error: res.success ? undefined : res.output };
@@ -999,9 +1017,12 @@ export class RepoWorker {
       const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
       if (pausedBefore) return pausedBefore;
 
+      const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume");
+
       let buildResult = await continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
         cacheKey,
+        runLogPath: resumeRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,
@@ -1106,6 +1127,8 @@ export class RepoWorker {
           const pausedLoopBreak = await this.pauseIfHardThrottled(task, "resume loop-break", buildResult.sessionId || existingSessionId);
           if (pausedLoopBreak) return pausedLoopBreak;
 
+          const loopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume loop-break");
+
           buildResult = await continueSession(
             taskRepoPath,
             buildResult.sessionId,
@@ -1113,6 +1136,7 @@ export class RepoWorker {
             {
               repo: this.repo,
               cacheKey,
+              runLogPath: loopBreakRunLogPath,
               introspection: {
                 repo: this.repo,
                 issue: task.issue,
@@ -1154,9 +1178,12 @@ export class RepoWorker {
         if (pausedContinue) return pausedContinue;
 
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+        const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue");
+
         buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
+          runLogPath: resumeContinueRunLogPath,
           timeoutMs: 10 * 60_000,
           introspection: {
             repo: this.repo,
@@ -1267,9 +1294,12 @@ export class RepoWorker {
       if (pausedSurvey) return pausedSurvey;
 
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey");
+
       const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
+        runLogPath: resumeSurveyRunLogPath,
         ...this.buildWatchdogOptions(task, "resume-survey"),
       });
 
@@ -1380,9 +1410,12 @@ export class RepoWorker {
       const pausedNextTask = await this.pauseIfHardThrottled(task, "next-task");
       if (pausedNextTask) return pausedNextTask;
 
+      const nextTaskRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task");
+
       let planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
+        runLogPath: nextTaskRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,
@@ -1403,9 +1436,12 @@ export class RepoWorker {
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
         console.warn(`[ralph:worker:${this.repo}] /next-task hit transient cache ENOENT; retrying once...`);
         await new Promise((r) => setTimeout(r, 750));
+        const nextTaskRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task-retry");
+
         planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
           repo: this.repo,
           cacheKey,
+          runLogPath: nextTaskRetryRunLogPath,
           introspection: {
             repo: this.repo,
             issue: task.issue,
@@ -1454,10 +1490,13 @@ export class RepoWorker {
         const pausedDevexConsult = await this.pauseIfHardThrottled(task, "consult devex", baseSessionId);
         if (pausedDevexConsult) return pausedDevexConsult;
 
+        const devexRunLogPath = await this.recordRunLogPath(task, issueNumber, "consult devex");
+
         const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, {
           agent: "devex",
           repo: this.repo,
           cacheKey,
+          runLogPath: devexRunLogPath,
           introspection: {
             repo: this.repo,
             issue: task.issue,
@@ -1506,9 +1545,12 @@ export class RepoWorker {
           const pausedReroute = await this.pauseIfHardThrottled(task, "reroute after devex", baseSessionId);
           if (pausedReroute) return pausedReroute;
 
+          const rerouteRunLogPath = await this.recordRunLogPath(task, issueNumber, "reroute after devex");
+
           const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
             repo: this.repo,
             cacheKey,
+            runLogPath: rerouteRunLogPath,
             introspection: {
               repo: this.repo,
               issue: task.issue,
@@ -1606,9 +1648,12 @@ export class RepoWorker {
       const pausedBuild = await this.pauseIfHardThrottled(task, "build", planResult.sessionId);
       if (pausedBuild) return pausedBuild;
 
+      const buildRunLogPath = await this.recordRunLogPath(task, issueNumber, "build");
+
       let buildResult = await continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
+        runLogPath: buildRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,
@@ -1705,6 +1750,8 @@ export class RepoWorker {
           const pausedBuildLoopBreak = await this.pauseIfHardThrottled(task, "build loop-break", buildResult.sessionId);
           if (pausedBuildLoopBreak) return pausedBuildLoopBreak;
 
+          const buildLoopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber, "build loop-break");
+
           buildResult = await continueSession(
             taskRepoPath,
             buildResult.sessionId,
@@ -1712,6 +1759,7 @@ export class RepoWorker {
             {
               repo: this.repo,
               cacheKey,
+              runLogPath: buildLoopBreakRunLogPath,
               introspection: {
                 repo: this.repo,
                 issue: task.issue,
@@ -1749,9 +1797,12 @@ export class RepoWorker {
         if (pausedBuildContinue) return pausedBuildContinue;
 
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+        const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue");
+
         buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
+          runLogPath: buildContinueRunLogPath,
           timeoutMs: 10 * 60_000,
           introspection: {
             repo: this.repo,
@@ -1856,9 +1907,12 @@ export class RepoWorker {
       if (pausedSurvey) return pausedSurvey;
 
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey");
+
       const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
+        runLogPath: surveyRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,

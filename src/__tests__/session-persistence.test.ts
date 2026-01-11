@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import type { AgentTask } from "../queue";
+import { getRalphRunLogPath } from "../paths";
 
 /**
  * Tests for session persistence (crash recovery) functionality.
@@ -42,6 +43,14 @@ describe("Session Persistence", () => {
       expect(task["session-id"]).toBe("");
       // Empty string should be treated as "no session"
       expect(task["session-id"]?.trim()).toBeFalsy();
+    });
+
+    test("run-log-path field is optional", () => {
+      const taskWithoutLog = createMockTask();
+      expect(taskWithoutLog["run-log-path"]).toBeUndefined();
+
+      const taskWithLog = createMockTask({ "run-log-path": "/tmp/ralph/run.log" });
+      expect(taskWithLog["run-log-path"]).toBe("/tmp/ralph/run.log");
     });
 
     test("worktree-path field is optional", () => {
@@ -192,6 +201,24 @@ describe("Session Persistence", () => {
         expect(task["session-id"]?.trim()).toBeTruthy();
       }
     });
+  });
+});
+
+describe("run-log-path (XDG state)", () => {
+  const original = process.env.XDG_STATE_HOME;
+
+  afterEach(() => {
+    if (original === undefined) {
+      delete process.env.XDG_STATE_HOME;
+    } else {
+      process.env.XDG_STATE_HOME = original;
+    }
+  });
+
+  test("uses XDG_STATE_HOME when set", () => {
+    process.env.XDG_STATE_HOME = "/tmp/xdg-state";
+    const path = getRalphRunLogPath({ repo: "3mdistal/ralph", issueNumber: "51", stepTitle: "next-task", ts: 123 });
+    expect(path.startsWith("/tmp/xdg-state/ralph/run-logs/")).toBe(true);
   });
 });
 
