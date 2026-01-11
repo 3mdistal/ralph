@@ -34,12 +34,16 @@ export interface AgentTask {
   scope: string;
   issue: string;
   repo: string;
-  status: "queued" | "in-progress" | "blocked" | "escalated" | "done";
+  status: "queued" | "in-progress" | "throttled" | "blocked" | "escalated" | "done";
   priority?: string;
   name: string;
   run?: string;
   "assigned-at"?: string;
   "completed-at"?: string;
+  /** Hard throttle metadata (best-effort) */
+  "throttled-at"?: string;
+  "resume-at"?: string;
+  "usage-snapshot"?: string;
   /** OpenCode session ID used to resume after restarts */
   "session-id"?: string;
   /** Git worktree path for this task (for per-repo concurrency + resume) */
@@ -115,6 +119,7 @@ function warnIfNestedTaskPaths(tasks: AgentTask[]): void {
 const VALID_TASK_STATUSES = new Set<AgentTask["status"]>([
   "queued",
   "in-progress",
+  "throttled",
   "blocked",
   "escalated",
   "done",

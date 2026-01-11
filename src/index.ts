@@ -28,6 +28,7 @@ import { Semaphore } from "./semaphore";
 
 import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
+import { isHardThrottled } from "./throttle";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { queueNudge } from "./nudge";
@@ -296,6 +297,86 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
   }
 }
 
+async function attemptResumeThrottledTasks(): Promise<void> {
+  if (getDaemonMode() === "draining" || isShuttingDown) return;
+
+  ensureSemaphores();
+  if (!globalSemaphore) return;
+
+  const throttled = await getTasksByStatus("throttled");
+  if (throttled.length === 0) return;
+
+  const throttle = await isHardThrottled();
+  if (throttle.hard) {
+    if (shouldLog("daemon:hard-throttle-resume", 60_000)) {
+      console.warn(
+        `[ralph] Hard throttle active; deferring resume of throttled tasks until ${throttle.decision.snapshot.resumeAt ?? "unknown"}`
+      );
+    }
+    return;
+  }
+
+  const now = Date.now();
+
+  for (const task of throttled) {
+    if (getDaemonMode() === "draining" || isShuttingDown) return;
+
+    const resumeAtRaw = task["resume-at"]?.trim() ?? "";
+    const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;
+    if (Number.isFinite(resumeAtTs) && resumeAtTs > now) continue;
+
+
+    const sessionId = task["session-id"]?.trim() ?? "";
+    if (!sessionId) {
+      await updateTaskStatus(task, "queued", {
+        "throttled-at": "",
+        "resume-at": "",
+        "usage-snapshot": "",
+      });
+      continue;
+    }
+
+    const taskKey = getTaskKey(task);
+    if (inFlightTasks.has(taskKey)) continue;
+
+    const releaseGlobal = globalSemaphore.tryAcquire();
+    if (!releaseGlobal) return;
+
+    const releaseRepo = getRepoSemaphore(task.repo).tryAcquire();
+    if (!releaseRepo) {
+      releaseGlobal();
+      continue;
+    }
+
+    await updateTaskStatus(task, "in-progress", {
+      "assigned-at": new Date().toISOString().split("T")[0],
+      "session-id": sessionId,
+      "throttled-at": "",
+      "resume-at": "",
+      "usage-snapshot": "",
+    });
+
+    inFlightTasks.add(taskKey);
+
+    getOrCreateWorker(task.repo)
+      .resumeTask(task, { resumeMessage: "Continue." })
+      .then(async (run) => {
+        if (run.outcome === "success" && run.pr) {
+          await rollupMonitor.recordMerge(task.repo, run.pr);
+        }
+      })
+      .catch((e: any) => {
+        console.error(`[ralph] Error resuming throttled task ${task.name}:`, e);
+      })
+      .finally(() => {
+        inFlightTasks.delete(taskKey);
+        releaseGlobal();
+        releaseRepo();
+        if (!isShuttingDown) scheduleQueuedTasksSoon();
+      });
+  }
+}
+
 function startTask(opts: {
   repo: string;
   task: AgentTask;
@@ -332,6 +413,14 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
   if (!globalSemaphore) return;
 
   if (getDaemonMode() === "draining") return;
+
+  const throttle = await isHardThrottled();
+  if (throttle.hard) {
+    if (shouldLog("daemon:hard-throttle", 30_000)) {
+      console.warn(`[ralph] Hard throttle active; skipping task scheduling until ${throttle.decision.snapshot.resumeAt ?? "unknown"}`);
+    }
+    return;
+  }
 
   if (tasks.length === 0) {
     if (shouldLog("daemon:no-queued", 30_000)) {
@@ -568,6 +657,9 @@ async function main(): Promise<void> {
   // Resume any resolved escalations (HITL checkpoint) from the same session.
   await attemptResumeResolvedEscalations();
 
+  // Resume any tasks paused by hard throttle.
+  await attemptResumeThrottledTasks();
+
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
   const initialTasks = await initialPoll();
@@ -625,7 +717,25 @@ async function main(): Promise<void> {
         heartbeatInFlight = false;
       });
   }, heartbeatIntervalMs);
-  
+
+  const throttleResumeIntervalMs = 15_000;
+  let throttleResumeInFlight = false;
+
+  const throttleResumeTimer = setInterval(() => {
+    if (isShuttingDown) return;
+    if (getDaemonMode() === "draining") return;
+    if (throttleResumeInFlight) return;
+    throttleResumeInFlight = true;
+
+    attemptResumeThrottledTasks()
+      .catch(() => {
+        // ignore
+      })
+      .finally(() => {
+        throttleResumeInFlight = false;
+      });
+  }, throttleResumeIntervalMs);
+
   console.log("");
   console.log("[ralph] Daemon running. Watching for queue changes...");
   console.log("[ralph] Press Ctrl+C to stop.");
@@ -651,6 +761,7 @@ async function main(): Promise<void> {
     }
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
+    clearInterval(throttleResumeTimer);
     
     // Wait for in-flight tasks
     if (inFlightTasks.size > 0) {
@@ -726,7 +837,7 @@ function printCommandHelp(command: string): void {
           "Usage:",
           "  ralph status [--json]",
           "",
-          "Shows daemon mode plus queued and in-progress tasks.",
+          "Shows daemon mode plus queued, in-progress, and throttled tasks.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -814,9 +925,10 @@ if (args[0] === "status") {
   const json = args.includes("--json");
   const mode: DaemonMode = isDraining() ? "draining" : "running";
 
-  const [inProgress, queued] = await Promise.all([
+  const [inProgress, queued, throttled] = await Promise.all([
     getTasksByStatus("in-progress"),
     getQueuedTasks(),
+    getTasksByStatus("throttled"),
   ]);
 
   if (json) {
@@ -847,6 +959,14 @@ if (args[0] === "status") {
             issue: t.issue,
             priority: t.priority ?? "p2-medium",
           })),
+          throttled: throttled.map((t) => ({
+            name: t.name,
+            repo: t.repo,
+            issue: t.issue,
+            priority: t.priority ?? "p2-medium",
+            sessionId: t["session-id"]?.trim() || null,
+            resumeAt: t["resume-at"]?.trim() || null,
+          })),
         },
         null,
         2
@@ -865,6 +985,12 @@ if (args[0] === "status") {
   console.log(`Queued tasks: ${queued.length}`);
   for (const task of queued) {
     console.log(`  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}]`);
+  }
+
+  console.log(`Throttled tasks: ${throttled.length}`);
+  for (const task of throttled) {
+    const resumeAt = task["resume-at"]?.trim() || "unknown";
+    console.log(`  - ${task.name} (${task.repo}) resumeAt=${resumeAt} [${task.priority || "p2-medium"}]`);
   }
 
   process.exit(0);
