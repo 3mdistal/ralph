@@ -3,6 +3,27 @@ import { readFile } from "fs/promises";
 import { join } from "path";
 import { loadConfig } from "./config";
 
+type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
+
+type BwrbProcess = {
+  cwd: (path: string) => BwrbProcess;
+  quiet: () => Promise<BwrbCommandResult>;
+};
+
+type BwrbRunner = (strings: TemplateStringsArray, ...values: unknown[]) => BwrbProcess;
+
+const DEFAULT_BWRB_RUNNER: BwrbRunner = $ as unknown as BwrbRunner;
+
+let bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
+
+export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
+  bwrb = runner;
+}
+
+export function __resetBwrbRunnerForTests(): void {
+  bwrb = DEFAULT_BWRB_RUNNER;
+}
+
 export interface AgentEscalationNote {
   _path: string;
   _name: string;
@@ -23,7 +44,7 @@ export async function getEscalationsByStatus(status: string): Promise<AgentEscal
   const config = loadConfig();
 
   try {
-    const result = await $`bwrb list agent-escalation --where "status == '${status}'" --output json`
+    const result = await bwrb`bwrb list agent-escalation --where "status == '${status}'" --output json`
       .cwd(config.bwrbVault)
       .quiet();
     return JSON.parse(result.stdout.toString());
@@ -41,7 +62,7 @@ export async function editEscalation(
   const json = JSON.stringify(fields);
 
   try {
-    await $`bwrb edit --path ${escalationPath} --json ${json}`.cwd(config.bwrbVault).quiet();
+    await bwrb`bwrb edit --path ${escalationPath} --json ${json}`.cwd(config.bwrbVault).quiet();
     return true;
   } catch (e) {
     console.error(`[ralph:escalations] Failed to edit escalation ${escalationPath}:`, e);
