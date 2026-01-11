@@ -272,21 +272,69 @@ export class RepoWorker {
 
     const [, repo, number] = match;
     try {
-      const result = await $`gh issue view ${number} --repo ${repo} --json labels,title`.quiet();
+      const result = await $`gh issue view ${number} --repo ${repo} --json state,stateReason,closedAt,url,labels,title`.quiet();
       const data = JSON.parse(result.stdout.toString());
+
       return {
         labels: data.labels?.map((l: any) => l.name) ?? [],
         title: data.title ?? "",
+        state: typeof data.state === "string" ? data.state : undefined,
+        stateReason: typeof data.stateReason === "string" ? data.stateReason : undefined,
+        closedAt: typeof data.closedAt === "string" ? data.closedAt : undefined,
+        url: typeof data.url === "string" ? data.url : undefined,
       };
     } catch {
       return { labels: [], title: "" };
     }
   }
 
+  private async skipClosedIssue(task: AgentTask, issueMeta: IssueMetadata, started: Date): Promise<AgentRun> {
+    const completed = new Date();
+    const completedAt = completed.toISOString().split("T")[0];
+
+    const issueUrl = issueMeta.url ?? task.issue;
+    const closedAt = issueMeta.closedAt ?? "";
+    const stateReason = issueMeta.stateReason ?? "";
+
+    console.log(
+      `[ralph:worker:${this.repo}] RALPH_SKIP_CLOSED issue=${issueUrl} closedAt=${closedAt || "unknown"} task=${task.name}`
+    );
+
+    await this.createAgentRun(task, {
+      outcome: "success",
+      started,
+      completed,
+      sessionId: task["session-id"]?.trim() || undefined,
+      bodyPrefix: [
+        "Skipped: issue already closed upstream",
+        "",
+        `Issue: ${issueUrl}`,
+        `closedAt: ${closedAt || "unknown"}`,
+        stateReason ? `stateReason: ${stateReason}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
+    });
+
+    await updateTaskStatus(task, "done", {
+      "completed-at": completedAt,
+      "session-id": "",
+      "watchdog-retries": "",
+      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+    });
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+    };
+  }
+
   /**
    * Determine if we should escalate based on routing decision.
    */
   private shouldEscalate(
+
     routing: RoutingDecision | null,
     hasGap: boolean,
     isImplementationTask: boolean
@@ -407,6 +455,11 @@ export class RepoWorker {
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string }): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
+
+    const issueMeta = await this.getIssueMetadata(task.issue);
+    if (issueMeta.state === "CLOSED") {
+      return await this.skipClosedIssue(task, issueMeta, startTime);
+    }
 
     await this.ensureBaselineLabelsOnce();
 
@@ -698,7 +751,19 @@ export class RepoWorker {
 
 
     try {
-      // 1. Mark task in-progress (use _path to avoid ambiguous names)
+      // 1. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
+      const issueMatch = task.issue.match(/#(\d+)$/);
+      if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
+      const issueNumber = issueMatch[1];
+      const cacheKey = issueNumber;
+
+      // 2. Preflight: skip work if the upstream issue is already CLOSED
+      const issueMeta = await this.getIssueMetadata(task.issue);
+      if (issueMeta.state === "CLOSED") {
+        return await this.skipClosedIssue(task, issueMeta, startTime);
+      }
+
+      // 3. Mark task in-progress (use _path to avoid ambiguous names)
       const markedInProgress = await updateTaskStatus(task, "in-progress", {
         "assigned-at": startTime.toISOString().split("T")[0],
       });
@@ -706,18 +771,11 @@ export class RepoWorker {
         throw new Error("Failed to mark task in-progress (bwrb edit failed)");
       }
 
-      // 2. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
-      const issueMatch = task.issue.match(/#(\d+)$/);
-      if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
-      const issueNumber = issueMatch[1];
-      const cacheKey = issueNumber;
-
       await this.ensureBaselineLabelsOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber, "start");
 
-      // 3. Fetch issue metadata to adjust escalation sensitivity
-      const issueMeta = await this.getIssueMetadata(task.issue);
+      // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
 
       // 4. Run configured command: next-task
@@ -1195,13 +1253,14 @@ export class RepoWorker {
   private async createAgentRun(
     task: AgentTask,
     data: {
-      sessionId: string;
+      sessionId?: string;
       pr?: string | null;
       outcome: "success" | "escalated" | "failed";
       started: Date;
       completed: Date;
       surveyResults?: string;
       devex?: EscalationContext["devex"];
+      bodyPrefix?: string;
     }
   ): Promise<void> {
     const vault = loadConfig().bwrbVault;
@@ -1225,23 +1284,30 @@ export class RepoWorker {
       const result = await $`bwrb new agent-run --json ${json}`.cwd(vault).quiet();
       const output = JSON.parse(result.stdout.toString());
 
-      if (output.success && output.path) {
-        const notePath = resolveVaultPath(output.path);
-        const bodySections: string[] = [];
+        if (output.success && output.path) {
+          const notePath = resolveVaultPath(output.path);
+          const bodySections: string[] = [];
 
-        // Add introspection summary if available
-        const introspection = await readIntrospectionSummary(data.sessionId);
-        if (introspection) {
-          bodySections.push(
-            "## Session Summary",
-            "",
-            `- **Steps:** ${introspection.stepCount}`,
-            `- **Tool calls:** ${introspection.totalToolCalls}`,
-            `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
-            `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
-            ""
-          );
-        }
+          if (data.bodyPrefix?.trim()) {
+            bodySections.push(data.bodyPrefix.trim(), "");
+          }
+
+          // Add introspection summary if available
+          if (data.sessionId) {
+            const introspection = await readIntrospectionSummary(data.sessionId);
+            if (introspection) {
+              bodySections.push(
+                "## Session Summary",
+                "",
+                `- **Steps:** ${introspection.stepCount}`,
+                `- **Tool calls:** ${introspection.totalToolCalls}`,
+                `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
+                `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
+                ""
+              );
+            }
+          }
+
 
         // Add devex consult summary (if we used devex-before-escalate)
         if (data.devex?.consulted) {
@@ -1264,7 +1330,9 @@ export class RepoWorker {
         }
 
         // Clean up introspection logs
-        await cleanupIntrospectionLogs(data.sessionId);
+        if (data.sessionId) {
+          await cleanupIntrospectionLogs(data.sessionId);
+        }
       }
 
       console.log(`[ralph:worker:${this.repo}] Created agent-run note`);

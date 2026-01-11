@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "child_process";
-import { createWriteStream, mkdirSync, rmSync, writeFileSync } from "fs";
-import { readFile } from "fs/promises";
+import { createWriteStream, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { readdir, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 import type { Writable } from "stream";
@@ -139,6 +139,117 @@ function sanitizeOpencodeLog(text: string): string {
   if (home) out = out.split(home).join("~");
 
   return out;
+}
+
+const TOOL_OUTPUT_BUDGET = {
+  maxLines: 200,
+  maxChars: 20000,
+} as const;
+
+export function applyToolOutputBudget(text: string): { text: string; truncated: boolean } {
+  const original = text ?? "";
+  const lines = original.split("\n");
+  const originalLines = lines.length;
+  const originalChars = original.length;
+
+  const withinLineBudget = originalLines <= TOOL_OUTPUT_BUDGET.maxLines;
+  const withinCharBudget = originalChars <= TOOL_OUTPUT_BUDGET.maxChars;
+  if (withinLineBudget && withinCharBudget) return { text: original, truncated: false };
+
+  const headLines = lines.slice(0, TOOL_OUTPUT_BUDGET.maxLines);
+  let truncated = headLines.join("\n");
+  if (truncated.length > TOOL_OUTPUT_BUDGET.maxChars) {
+    truncated = truncated.slice(0, TOOL_OUTPUT_BUDGET.maxChars);
+  }
+
+  const marker =
+    `\n\n[output truncated: original_lines=${originalLines} max_lines=${TOOL_OUTPUT_BUDGET.maxLines} ` +
+    `original_chars=${originalChars} max_chars=${TOOL_OUTPUT_BUDGET.maxChars}]\n`;
+
+  return { text: truncated.trimEnd() + marker, truncated: true };
+}
+
+export async function enforceToolOutputBudgetInStorage(sessionId: string): Promise<void> {
+  const storageDir = join(homedir(), ".local/share/opencode/storage");
+  const messagesDir = join(storageDir, "message", sessionId);
+  if (!existsSync(messagesDir)) return;
+
+  let truncatedParts = 0;
+
+  try {
+    const messageFiles = (await readdir(messagesDir)).filter((f) => f.endsWith(".json"));
+
+    for (const file of messageFiles) {
+      try {
+        const msgRaw = await readFile(join(messagesDir, file), "utf8");
+        const msg = JSON.parse(msgRaw);
+        const messageId = msg?.id;
+        if (!messageId || typeof messageId !== "string") continue;
+
+        const partsDir = join(storageDir, "part", messageId);
+        if (!existsSync(partsDir)) continue;
+
+        const partFiles = (await readdir(partsDir)).filter((f) => f.endsWith(".json"));
+        for (const partFile of partFiles) {
+          const partPath = join(partsDir, partFile);
+          try {
+            const partRaw = await readFile(partPath, "utf8");
+            const part = JSON.parse(partRaw);
+
+            const type = typeof part?.type === "string" ? part.type.toLowerCase() : "";
+            const isToolPart = type.includes("tool") && type !== "text";
+            if (!isToolPart) continue;
+
+            let changed = false;
+
+            const TOOL_STRING_KEYS = new Set(["output", "stdout", "stderr", "result", "content", "text"]);
+
+            const visit = (node: any, key?: string): any => {
+              if (typeof node === "string") {
+                if (key && TOOL_STRING_KEYS.has(key)) {
+                  const capped = applyToolOutputBudget(node);
+                  if (capped.truncated) changed = true;
+                  return capped.text;
+                }
+                return node;
+              }
+
+              if (Array.isArray(node)) {
+                for (let i = 0; i < node.length; i++) node[i] = visit(node[i]);
+                return node;
+              }
+
+              if (node && typeof node === "object") {
+                for (const [k, v] of Object.entries(node)) {
+                  (node as any)[k] = visit(v, k);
+                }
+                return node;
+              }
+
+              return node;
+            };
+
+            visit(part);
+
+            if (changed) {
+              truncatedParts++;
+              await writeFile(partPath, JSON.stringify(part), "utf8");
+            }
+          } catch {
+            // ignore malformed part files
+          }
+        }
+      } catch {
+        // ignore malformed message files
+      }
+    }
+  } catch {
+    // ignore storage IO errors
+  }
+
+  if (truncatedParts > 0) {
+    console.log(`[ralph:session] Applied tool output budget to session ${sessionId} (${truncatedParts} part(s) truncated)`);
+  }
 }
 
 export function getRalphXdgCacheHome(repo: string, cacheKey: string): string {
@@ -701,6 +812,10 @@ async function runSession(
       }
     }
 
+    if (sessionId) {
+      await enforceToolOutputBudgetInStorage(sessionId);
+    }
+
     return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout };
   }
 
@@ -741,6 +856,10 @@ async function runSession(
       }
     }
 
+    if (sessionId) {
+      await enforceToolOutputBudgetInStorage(sessionId);
+    }
+
     return { sessionId, output: enriched, success: false, exitCode };
   }
 
@@ -754,6 +873,10 @@ async function runSession(
     } catch {
       // ignore
     }
+  }
+
+  if (sessionId) {
+    await enforceToolOutputBudgetInStorage(sessionId);
   }
 
   return { sessionId, output: textOutput || raw, success: true, exitCode };
