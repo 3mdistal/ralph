@@ -1182,15 +1182,19 @@ export async function runCommand(
       recentEventLimit?: number;
       context?: string;
     };
-    __testOverrides?: {
-      spawn?: SpawnFn;
-      scheduler?: Scheduler;
-    };
+  },
+  testOverrides?: {
+    spawn?: SpawnFn;
+    scheduler?: Scheduler;
   }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");
-  return runSession(repoPath, message, { command: normalized, ...options });
+
+  const merged: any = { command: normalized, ...(options ?? {}) };
+  if (testOverrides) merged.__testOverrides = testOverrides;
+
+  return runSession(repoPath, message, merged);
 }
 
 /**

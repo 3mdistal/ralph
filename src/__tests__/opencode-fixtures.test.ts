@@ -170,17 +170,22 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const scheduler = new FakeScheduler(0);
     const lines = await loadFixtureLines("watchdog-timeout.jsonl");
 
-    const promise = runCommand("/tmp", "next-task", [], {
-      watchdog: {
-        thresholdsMs: {
-          bash: { softMs: 1000, hardMs: 2000 },
+    const promise = runCommand(
+      "/tmp",
+      "next-task",
+      [],
+      {
+        watchdog: {
+          thresholdsMs: {
+            bash: { softMs: 1000, hardMs: 2000 },
+          },
         },
       },
-      __testOverrides: {
+      {
         spawn: spawnFromFixture({ lines, scheduler }) as any,
         scheduler: scheduler as any,
-      },
-    });
+      }
+    );
 
     // Flush initial tool-start event.
     scheduler.advanceBy(0);
@@ -189,14 +194,6 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     scheduler.advanceBy(2000);
 
     const result = await promise;
-
-    if (result.success) {
-      console.log("[opencode-fixtures] unexpected success", {
-        sessionId: result.sessionId,
-        prUrl: result.prUrl,
-        output: String(result.output ?? "").slice(0, 500),
-      });
-    }
 
     expect(result.success).toBe(false);
     expect(Boolean(result.watchdogTimeout)).toBe(true);
@@ -208,23 +205,19 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const scheduler = new FakeScheduler(0);
     const lines = await loadFixtureLines("pr-url-structured.jsonl");
 
-    const promise = runCommand("/tmp", "next-task", [], {
-      __testOverrides: {
+    const promise = runCommand(
+      "/tmp",
+      "next-task",
+      [],
+      {},
+      {
         spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
         scheduler: scheduler as any,
-      },
-    });
+      }
+    );
 
     scheduler.advanceBy(0);
     const result = await promise;
-
-    if (!result.prUrl) {
-      console.log("[opencode-fixtures] missing prUrl", {
-        sessionId: result.sessionId,
-        prUrl: result.prUrl,
-        output: String(result.output ?? "").slice(0, 500),
-      });
-    }
 
     expect(result.success).toBe(true);
     expect(result.prUrl).toBe("https://github.com/owner/repo/pull/123");
@@ -235,12 +228,16 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const scheduler = new FakeScheduler(100000);
     const lines = await loadFixtureLines("anomaly-burst-recent.jsonl");
 
-    const promise = runCommand("/tmp", "next-task", [], {
-      __testOverrides: {
+    const promise = runCommand(
+      "/tmp",
+      "next-task",
+      [],
+      {},
+      {
         spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
         scheduler: scheduler as any,
-      },
-    });
+      }
+    );
 
     scheduler.advanceBy(0);
     await promise;
@@ -257,12 +254,16 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const scheduler = new FakeScheduler(100000);
     const lines = await loadFixtureLines("anomaly-burst-total.jsonl");
 
-    const promise = runCommand("/tmp", "next-task", [], {
-      __testOverrides: {
+    const promise = runCommand(
+      "/tmp",
+      "next-task",
+      [],
+      {},
+      {
         spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
         scheduler: scheduler as any,
-      },
-    });
+      }
+    );
 
     scheduler.advanceBy(0);
     await promise;
