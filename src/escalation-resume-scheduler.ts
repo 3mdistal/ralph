@@ -64,7 +64,7 @@ async function safeEditEscalation(
       const vault = deps.getVaultPathForLogs();
       console.error(
         `[ralph:escalations] Cannot edit escalation notes; pausing auto-resume for ${Math.round(deps.resumeDisableMs / 1000)}s. ` +
-          `Check bwrbVault in ~/.config/opencode/ralph/ralph.json (current: ${JSON.stringify(vault)}). ` +
+          `Check bwrbVault in ~/.ralph/config.toml or ~/.ralph/config.json (current: ${JSON.stringify(vault)}). ` +
           `Last error: ${result.error}`
       );
     }

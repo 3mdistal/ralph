@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
 mock.module("../config", () => ({
   loadConfig: () => ({
@@ -24,6 +24,10 @@ import {
   getInstallationToken,
   listAccessibleRepos,
 } from "../github-app-auth";
+
+afterAll(() => {
+  mock.restore();
+});
 
 describe("github app auth", () => {
   beforeEach(() => {

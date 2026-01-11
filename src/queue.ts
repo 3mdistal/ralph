@@ -2,8 +2,9 @@ import { watch } from "fs";
 import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
-import { loadConfig } from "./config";
+import { getRepoBotBranch, getRepoPath, loadConfig } from "./config";
 import { shouldLog } from "./logging";
+import { recordRepoSync, recordTaskSnapshot } from "./state";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -118,6 +119,38 @@ function warnIfNestedTaskPaths(tasks: AgentTask[]): void {
   }
 }
 
+function recordQueueStateSnapshot(tasks: AgentTask[]): void {
+  const at = new Date().toISOString();
+  const seenRepos = new Set<string>();
+
+  for (const task of tasks) {
+    try {
+      if (!seenRepos.has(task.repo)) {
+        seenRepos.add(task.repo);
+        recordRepoSync({
+          repo: task.repo,
+          repoPath: getRepoPath(task.repo),
+          botBranch: getRepoBotBranch(task.repo),
+          lastSyncAt: at,
+        });
+      }
+
+      recordTaskSnapshot({
+        repo: task.repo,
+        issue: task.issue,
+        taskPath: task._path,
+        taskName: task.name,
+        status: task.status,
+        sessionId: task["session-id"],
+        worktreePath: task["worktree-path"],
+        at,
+      });
+    } catch {
+      // State persistence is best-effort here; the daemon initializes state.sqlite at startup.
+    }
+  }
+}
+
 const VALID_TASK_STATUSES = new Set<AgentTask["status"]>([
   "queued",
   "starting",
@@ -155,6 +188,7 @@ async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentT
 
     const normalized = tasks.map((t) => normalizeAgentTaskIdentity(t));
     warnIfNestedTaskPaths(normalized);
+    recordQueueStateSnapshot(normalized);
     return normalized;
   } catch (e) {
     console.error(`[ralph:queue] Failed to list tasks under ${TASKS_GLOB_PATH}:`, e);
@@ -304,12 +338,33 @@ export async function updateTaskStatus(
   };
 
   try {
+    const recordAfterUpdate = (path: string | null) => {
+      try {
+        if (!taskObj) return;
+        if (typeof taskObj.repo !== "string" || typeof taskObj.issue !== "string") return;
+
+        recordTaskSnapshot({
+          repo: taskObj.repo,
+          issue: taskObj.issue,
+          taskPath: path ?? taskObj._path ?? "",
+          taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
+          status,
+          sessionId: extraFields?.["session-id"] ?? taskObj["session-id"],
+          worktreePath: extraFields?.["worktree-path"] ?? taskObj["worktree-path"],
+        });
+      } catch {
+        // best-effort
+      }
+    };
+
     if (exactPath) {
       await editByPath(exactPath);
+      recordAfterUpdate(exactPath);
       return true;
     }
 
     await editByQuery();
+    recordAfterUpdate(taskObj?._path ?? null);
     return true;
   } catch (e: any) {
     const identifier = exactPath || (typeof task === "string" ? task : (task as any).name);

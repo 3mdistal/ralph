@@ -33,6 +33,7 @@ import { shouldLog } from "./logging";
 import { getThrottleDecision, isHardThrottled } from "./throttle";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
+import { initStateDb, recordPrSnapshot } from "./state";
 import { queueNudge } from "./nudge";
 import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
 import {
@@ -149,6 +150,12 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
 
     getOrCreateWorker,
     recordMerge: async (repo, prUrl) => {
+      try {
+        recordPrSnapshot({ repo, issue: "", prUrl, state: "merged" });
+      } catch {
+        // best-effort
+      }
+
       await rollupMonitor.recordMerge(repo, prUrl);
     },
     scheduleQueuedTasksSoon,
@@ -218,11 +225,17 @@ async function attemptResumeThrottledTasks(): Promise<void> {
 
     getOrCreateWorker(task.repo)
       .resumeTask(task, { resumeMessage: "Continue." })
-      .then(async (run) => {
-        if (run.outcome === "success" && run.pr) {
-          await rollupMonitor.recordMerge(task.repo, run.pr);
-        }
-      })
+       .then(async (run) => {
+         if (run.outcome === "success" && run.pr) {
+           try {
+             recordPrSnapshot({ repo: task.repo, issue: task.issue, prUrl: run.pr, state: "merged" });
+           } catch {
+             // best-effort
+           }
+
+           await rollupMonitor.recordMerge(task.repo, run.pr);
+         }
+       })
       .catch((e: any) => {
         console.error(`[ralph] Error resuming throttled task ${task.name}:`, e);
       })
@@ -248,11 +261,17 @@ function startTask(opts: {
 
   void getOrCreateWorker(repo)
     .processTask(task)
-    .then(async (run: AgentRun) => {
-      if (run.outcome === "success" && run.pr) {
-        await rollupMonitor.recordMerge(repo, run.pr);
-      }
-    })
+      .then(async (run: AgentRun) => {
+        if (run.outcome === "success" && run.pr) {
+          try {
+            recordPrSnapshot({ repo, issue: task.issue, prUrl: run.pr, state: "merged" });
+          } catch {
+            // best-effort
+          }
+
+          await rollupMonitor.recordMerge(repo, run.pr);
+        }
+      })
     .catch((e) => {
       console.error(`[ralph] Error processing task ${task.name}:`, e);
     })
@@ -454,6 +473,10 @@ async function main(): Promise<void> {
 
   // Load config
   const config = loadConfig();
+
+  // Initialize durable local state (SQLite)
+  initStateDb();
+
   console.log("[ralph] Configuration:");
   console.log(`        Vault: ${config.bwrbVault}`);
   console.log(`        Max workers: ${config.maxWorkers}`);

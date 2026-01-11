@@ -43,11 +43,23 @@ bun install
 
 ## Configuration
 
-Ralph loads config from `~/.config/opencode/ralph/ralph.json` (hardcoded; does not currently honor `XDG_CONFIG_HOME`) and merges it over built-in defaults. This is a shallow merge (arrays/objects are replaced, not deep-merged).
+Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
 Config is loaded once at startup, so restart the daemon after editing.
 
 ### Minimal example
+
+`~/.ralph/config.toml`:
+
+```toml
+bwrbVault = "/absolute/path/to/your/bwrb-vault"
+devDir = "/absolute/path/to/your/dev-directory"
+repos = [
+  { name = "3mdistal/ralph", path = "/absolute/path/to/your/ralph", botBranch = "bot/integration" }
+]
+```
+
+Or JSON (`~/.ralph/config.json`):
 
 ```json
 {
@@ -64,7 +76,7 @@ Config is loaded once at startup, so restart the daemon after editing.
 }
 ```
 
-Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comments/trailing commas are not supported.
+Note: Config values are read as plain TOML/JSON. `~` is not expanded, and comments/trailing commas are not supported.
 
 ### Supported settings
 
@@ -100,13 +112,13 @@ Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local
 
 Note: If `RALPH_SESSIONS_DIR` / `RALPH_WORKTREES_DIR` are relative paths, they resolve relative to the current working directory.
 
-Older README versions mentioned `RALPH_VAULT`, `RALPH_DEV_DIR`, and `RALPH_BATCH_SIZE`; these are not supported by current releases. Use `ralph.json` instead.
+Older README versions mentioned `RALPH_VAULT`, `RALPH_DEV_DIR`, and `RALPH_BATCH_SIZE`; these are not supported by current releases. Use `~/.ralph/config.toml` or `~/.ralph/config.json` instead.
 
 ### Troubleshooting
 
 - **Config changes not taking effect**: Ralph caches config after the first `loadConfig()`; restart the daemon.
-- **Config file ignored**: Ralph only reads `~/.config/opencode/ralph/ralph.json` today (no `XDG_CONFIG_HOME` support yet).
-- **JSON parse errors**: Ralph logs `[ralph] Failed to load config from ...` and continues with defaults.
+- **Config file not picked up**: Ralph reads `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json`.
+- **Config parse errors**: Ralph logs `[ralph] Failed to load TOML/JSON config from ...` and continues with defaults.
 - **Invalid maxWorkers values**: Non-positive/non-integer values fall back to defaults and emit a warning.
 
 ## Usage
@@ -190,6 +202,9 @@ orchestration/
   escalations/    # agent-escalation notes (needs human)
 
 ~/.ralph/
+  config.toml     # preferred config (if present)
+  config.json     # fallback config
+  state.sqlite    # durable metadata for idempotency + recovery
   sessions/       # introspection logs per session
 ```
 
