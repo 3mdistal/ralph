@@ -27,7 +27,8 @@ export function __resetGhRunnerForTests(): void {
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
-import { extractPrUrl, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
+import { extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
+import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
 import {
   isExplicitBlockerReason,
   isImplementationTaskFromIssue,
@@ -87,31 +88,7 @@ async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount
 
   try {
     const content = await readFile(eventsPath, "utf8");
-    const lines = content.trim().split("\n").filter(Boolean);
-    
-    let total = 0;
-    const recentAnomalies: number[] = [];
-    const now = Date.now();
-    const BURST_WINDOW_MS = 10000; // 10 seconds
-    
-    for (const line of lines) {
-      try {
-        const event = JSON.parse(line);
-        if (event.type === "anomaly") {
-          total++;
-          if (event.ts && (now - event.ts) < BURST_WINDOW_MS) {
-            recentAnomalies.push(event.ts);
-          }
-        }
-      } catch {
-        // ignore malformed lines
-      }
-    }
-    
-    // A burst is 20+ anomalies in the last 10 seconds
-    const recentBurst = recentAnomalies.length >= 20;
-    
-    return { total, recentBurst };
+    return computeLiveAnomalyCountFromJsonl(content, Date.now());
   } catch {
     return { total: 0, recentBurst: false };
   }
@@ -549,7 +526,7 @@ export class RepoWorker {
 
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = extractPrUrl(buildResult.output);
+      let prUrl = extractPrUrlFromSession(buildResult);
       let continueAttempts = 0;
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
@@ -622,7 +599,7 @@ export class RepoWorker {
           }
 
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = extractPrUrl(buildResult.output);
+          prUrl = extractPrUrlFromSession(buildResult);
 
           continue;
         }
@@ -649,7 +626,7 @@ export class RepoWorker {
           break;
         }
 
-        prUrl = extractPrUrl(buildResult.output);
+        prUrl = extractPrUrlFromSession(buildResult);
       }
 
       if (!prUrl) {
@@ -1032,7 +1009,7 @@ export class RepoWorker {
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = extractPrUrl(buildResult.output);
+      let prUrl = extractPrUrlFromSession(buildResult);
       let continueAttempts = 0;
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
@@ -1109,7 +1086,7 @@ export class RepoWorker {
 
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = extractPrUrl(buildResult.output);
+          prUrl = extractPrUrlFromSession(buildResult);
           continue;
         }
 
@@ -1136,7 +1113,7 @@ export class RepoWorker {
         }
 
         
-        prUrl = extractPrUrl(buildResult.output);
+        prUrl = extractPrUrlFromSession(buildResult);
       }
 
       if (!prUrl) {
