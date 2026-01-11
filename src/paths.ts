@@ -1,6 +1,11 @@
 import { homedir } from "os";
 import { isAbsolute, join } from "path";
 
+function resolveHomeDir(): string {
+  const raw = process.env.HOME?.trim();
+  return raw ? raw : homedir();
+}
+
 function normalizePathSegment(value: string): string {
   return String(value ?? "")
     .trim()
@@ -12,7 +17,7 @@ function normalizePathSegment(value: string): string {
 }
 
 export function getRalphHomeDir(): string {
-  return join(homedir(), ".ralph");
+  return join(resolveHomeDir(), ".ralph");
 }
 
 export function getRalphConfigTomlPath(): string {
@@ -24,7 +29,7 @@ export function getRalphConfigJsonPath(): string {
 }
 
 export function getRalphLegacyConfigPath(): string {
-  return join(homedir(), ".config", "opencode", "ralph", "ralph.json");
+  return join(resolveHomeDir(), ".config", "opencode", "ralph", "ralph.json");
 }
 
 export function getRalphStateDbPath(): string {
@@ -45,7 +50,7 @@ export function getRalphWorktreesDir(): string {
 
 export function getRalphStateDir(): string {
   const raw = process.env.XDG_STATE_HOME?.trim();
-  const stateHome = raw ? raw : join(homedir(), ".local", "state");
+  const stateHome = raw ? raw : join(resolveHomeDir(), ".local", "state");
   return join(stateHome, "ralph");
 }
 

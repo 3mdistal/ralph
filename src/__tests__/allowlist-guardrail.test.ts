@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
 const updateTaskStatusMock = mock(async () => true);
 
@@ -38,6 +38,10 @@ function createMockTask(overrides: Record<string, unknown> = {}) {
     ...overrides,
   } as any;
 }
+
+afterAll(() => {
+  mock.restore();
+});
 
 describe("allowlist guardrail", () => {
   beforeEach(() => {
