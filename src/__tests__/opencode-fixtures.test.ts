@@ -190,6 +190,14 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     const result = await promise;
 
+    if (result.success) {
+      console.log("[opencode-fixtures] unexpected success", {
+        sessionId: result.sessionId,
+        prUrl: result.prUrl,
+        output: String(result.output ?? "").slice(0, 500),
+      });
+    }
+
     expect(result.success).toBe(false);
     expect(Boolean(result.watchdogTimeout)).toBe(true);
     expect(result.watchdogTimeout?.toolName).toBe("bash");
@@ -209,6 +217,14 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     scheduler.advanceBy(0);
     const result = await promise;
+
+    if (!result.prUrl) {
+      console.log("[opencode-fixtures] missing prUrl", {
+        sessionId: result.sessionId,
+        prUrl: result.prUrl,
+        output: String(result.output ?? "").slice(0, 500),
+      });
+    }
 
     expect(result.success).toBe(true);
     expect(result.prUrl).toBe("https://github.com/owner/repo/pull/123");
