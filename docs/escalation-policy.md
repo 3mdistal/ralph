@@ -6,13 +6,20 @@ Goal: **minimize human interrupt surface**. Most tasks should proceed autonomous
 
 ## Routing decision format
 
-Agents must output a routing decision as machine-parseable JSON:
+Agents must output a routing decision as machine-parseable JSON.
+
+Allowed values:
+- `decision`: `"proceed"` or `"escalate"`
+- `confidence`: `"high"`, `"medium"`, or `"low"`
+- `escalation_reason`: `null` or a short string
+
+Example:
 
 ```json
 {
-  "decision": "proceed" | "escalate",
-  "confidence": "high" | "medium" | "low",
-  "escalation_reason": null | "<reason>"
+  "decision": "proceed",
+  "confidence": "low",
+  "escalation_reason": null
 }
 ```
 
@@ -26,16 +33,25 @@ Recognized markers (case-insensitive):
 
 The marker may be prefixed by optional whitespace and/or a single list marker (`- ` or `* `).
 
-Recommended detection regex (guidance only; not normative):
+Canonical detection rule (normative):
+- Only match markers at the start of a line (after optional whitespace and an optional single list prefix `- ` or `* `).
+- Do not treat mid-line or quoted mentions as markers.
+
+One acceptable regex implementation:
 - `^\s*(?:[-*]\s+)?(NO\s+)?PRODUCT\s+GAP:\s+` (case-insensitive)
-- The match must be anchored at line start; do not match mid-line mentions.
 
 Not markers:
 - Mid-line mentions (example: `Here is the marker: PRODUCT GAP: ...`)
 - Quoted mentions copied from earlier text
 - `PRODUCT GAP` without a trailing `:`
 
-**Override rule:** if a response contains any `NO PRODUCT GAP:` marker, treat the response as **not** asserting a product gap even if `PRODUCT GAP:` appears elsewhere.
+Authoring guidance:
+- Emit **at most one** marker per response.
+
+Precedence rule:
+- If a response contains any `NO PRODUCT GAP:` marker, treat it as **not** asserting a product gap even if `PRODUCT GAP:` appears elsewhere.
+
+**Routing precedence:** if a product gap marker is present (and not negated by `NO PRODUCT GAP:`), it should be treated as an escalation signal even if the routing decision JSON says `"decision": "proceed"`.
 
 ## When to escalate
 
@@ -64,6 +80,7 @@ Contract surface indicators include:
 
 Notes:
 - “Contract surface” is about **compatibility promises** (especially anything scripts or downstream tooling might rely on).
+- Public error strings are contract surface only when they are explicitly stable (documented) and/or used by downstream tooling for machine parsing.
 - Purely internal refactors, implementation details, and incidental wording changes are usually not contract-surface concerns.
 
 ## Low confidence handling

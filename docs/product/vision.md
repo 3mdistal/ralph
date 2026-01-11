@@ -20,7 +20,7 @@ Escalation marker parsing must be deterministic and machine-parseable.
 
 Canonical spec: `docs/escalation-policy.md`.
 
-(Keep this doc focused on product intent; update routing/escalation policy in one place.)
+Keep this doc focused on product intent; update routing/escalation policy in one place.
 
 ## Related Product Docs
 
