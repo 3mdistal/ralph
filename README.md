@@ -8,7 +8,7 @@ Ralph watches for `agent-task` notes in a bwrb vault and dispatches them to Open
 
 - **Queue-based task management** via bwrb notes
 - **Parallel processing** across repos, sequential within each repo
-- **Smart escalation** when agents need human guidance
+- **Smart escalation** when agents need human guidance (policy: `docs/escalation-policy.md`)
 - **Anomaly detection** catches agents stuck in loops
 - **Introspection logging** for debugging agent behavior
 
@@ -168,7 +168,7 @@ orchestration/
 
 1. **Watch** - Ralph watches `orchestration/tasks/**` for queued tasks
 2. **Dispatch** - Runs `/next-task <issue>` to plan the work
-3. **Route** - Parses agent's decision: proceed or escalate
+3. **Route** - Parses agent's decision (policy: `docs/escalation-policy.md`): proceed or escalate
 4. **Build** - If proceeding, tells agent to implement
 5. **Monitor** - Watches for anomalies (stuck loops)
 6. **Complete** - Extracts PR URL, triggers merge, runs survey
