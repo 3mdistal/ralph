@@ -1,14 +1,13 @@
-# Agent Guidance (Ralph)
+# Agent Notes
 
-This repo is designed for autonomous, non-interactive daemon runs.
+This repo is designed to be worked on by autonomous coding agents.
 
-## Escalation policy
+## Canonical policy docs
 
-Canonical policy lives in `docs/escalation-policy.md`.
+- Escalation & routing policy (single source of truth): `docs/escalation-policy.md`
+- Product vision and operating principles: `docs/product/vision.md`
 
-In short:
+## PR / branch strategy
 
-- Use deterministic, line-start markers: `PRODUCT GAP:` and `NO PRODUCT GAP:`.
-- Escalate immediately for contract-surface uncertainty (CLI flags/args, exit codes, output formats, public error strings, config/schema, machine-readable outputs).
-- Do not escalate on low confidence alone for implementation-ish tasks; default is proceed.
-- For implementation-ish tasks, consult `@devex` before escalating when routing is low confidence (unless product-gap marker or contract-surface reasons apply).
+- Prefer targeting `bot/integration` for agent PRs.
+- Keep policy text centralized: link to canonical docs instead of duplicating rules across files.

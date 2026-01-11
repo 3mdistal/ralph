@@ -3,6 +3,10 @@ import type { RoutingDecision } from "./routing";
 export interface IssueMetadata {
   labels: string[];
   title: string;
+  state?: string;
+  stateReason?: string;
+  closedAt?: string;
+  url?: string;
 }
 
 const ESCALATION_SENSITIVE_LABELS = ["product", "ux", "breaking-change"] as const;

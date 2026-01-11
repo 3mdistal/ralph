@@ -3,6 +3,27 @@ import { appendFile, mkdir, readFile, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { dirname, isAbsolute, join } from "path";
 
+type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
+
+type GhProcess = {
+  cwd: (path: string) => GhProcess;
+  quiet: () => Promise<GhCommandResult>;
+};
+
+type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProcess;
+
+const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
+
+let gh: GhRunner = DEFAULT_GH_RUNNER;
+
+export function __setGhRunnerForTests(runner: GhRunner): void {
+  gh = runner;
+}
+
+export function __resetGhRunnerForTests(): void {
+  gh = DEFAULT_GH_RUNNER;
+}
+
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
@@ -16,6 +37,7 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
+import { computeMissingBaselineLabels } from "./github-labels";
 import { getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
 import {
   parseGitWorktreeListPorcelain,
@@ -145,6 +167,45 @@ function resolveVaultPath(p: string): string {
 export class RepoWorker {
   constructor(public readonly repo: string, public readonly repoPath: string) {}
 
+  private ensureLabelsPromise: Promise<void> | null = null;
+
+  private async ensureBaselineLabelsOnce(): Promise<void> {
+    if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
+
+    this.ensureLabelsPromise = (async () => {
+      try {
+        const result = await gh`gh label list --repo ${this.repo} --json name`.quiet();
+        const raw = JSON.parse(result.stdout.toString());
+        const existing = Array.isArray(raw) ? raw.map((l: any) => String(l?.name ?? "")) : [];
+
+        const missing = computeMissingBaselineLabels(existing);
+        if (missing.length === 0) return;
+
+        const created: string[] = [];
+        for (const label of missing) {
+          try {
+            await gh`gh label create ${label.name} --repo ${this.repo} --color ${label.color} --description ${label.description}`.quiet();
+            created.push(label.name);
+          } catch (e: any) {
+            const msg = e?.message ?? String(e);
+            if (/already exists/i.test(msg)) continue;
+            throw e;
+          }
+        }
+
+        if (created.length > 0) {
+          console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
+        }
+      } catch (e: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to ensure baseline GitHub labels (continuing): ${e?.message ?? String(e)}`
+        );
+      }
+    })();
+
+    return this.ensureLabelsPromise;
+  }
+
   private async resolveWorktreeRef(): Promise<string> {
     const botBranch = getRepoBotBranch(this.repo);
     try {
@@ -238,167 +299,69 @@ export class RepoWorker {
 
     const [, repo, number] = match;
     try {
-      const result = await $`gh issue view ${number} --repo ${repo} --json labels,title`.quiet();
+      const result = await gh`gh issue view ${number} --repo ${repo} --json state,stateReason,closedAt,url,labels,title`.quiet();
       const data = JSON.parse(result.stdout.toString());
+
       return {
         labels: data.labels?.map((l: any) => l.name) ?? [],
         title: data.title ?? "",
+        state: typeof data.state === "string" ? data.state : undefined,
+        stateReason: typeof data.stateReason === "string" ? data.stateReason : undefined,
+        closedAt: typeof data.closedAt === "string" ? data.closedAt : undefined,
+        url: typeof data.url === "string" ? data.url : undefined,
       };
     } catch {
       return { labels: [], title: "" };
     }
   }
 
-  private buildPrCreationNudge(botBranch: string, issueNumber: string, issueRef: string): string {
-    const fixes = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${issueRef}`;
+  private async skipClosedIssue(task: AgentTask, issueMeta: IssueMetadata, started: Date): Promise<AgentRun> {
+    const completed = new Date();
+    const completedAt = completed.toISOString().split("T")[0];
 
-    return [
-      `No PR URL found. Create a PR targeting '${botBranch}' and paste the PR URL.`,
-      "",
-      "Commands (run in the task worktree):",
-      "```bash",
-      "git status",
-      "git push -u origin HEAD",
-      `gh pr create --base ${botBranch} --fill --body \"${fixes}\"`,
-      "```",
-      "",
-      "If a PR already exists:",
-      "```bash",
-      "gh pr list --head $(git branch --show-current) --json url --limit 1",
-      "```",
-    ].join("\n");
-  }
+    const issueUrl = issueMeta.url ?? task.issue;
+    const closedAt = issueMeta.closedAt ?? "";
+    const stateReason = issueMeta.stateReason ?? "";
 
-  private async getGitWorktrees(): Promise<GitWorktreeEntry[]> {
-    try {
-      const result = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
-      return parseGitWorktreeListPorcelain(result.stdout.toString());
-    } catch {
-      return [];
-    }
-  }
+    console.log(
+      `[ralph:worker:${this.repo}] RALPH_SKIP_CLOSED issue=${issueUrl} closedAt=${closedAt || "unknown"} task=${task.name}`
+    );
 
-  private async tryEnsurePrFromWorktree(params: {
-    task: AgentTask;
-    issueNumber: string;
-    issueTitle: string;
-    botBranch: string;
-  }): Promise<{ prUrl: string | null; diagnostics: string }> {
-    const { task, issueNumber, issueTitle, botBranch } = params;
-
-    const diagnostics: string[] = [
-      "Ralph PR recovery:",
-      `- Repo: ${this.repo}`,
-      `- Issue: ${task.issue}`,
-      `- Base: ${botBranch}`,
-    ];
-
-    if (!issueNumber) {
-      diagnostics.push("- No issue number detected; skipping auto PR recovery");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
-    }
-
-    const entries = await this.getGitWorktrees();
-    const candidate = pickWorktreeForIssue(entries, issueNumber, {
-      deprioritizeBranches: ["main", botBranch],
+    await this.createAgentRun(task, {
+      outcome: "success",
+      started,
+      completed,
+      sessionId: task["session-id"]?.trim() || undefined,
+      bodyPrefix: [
+        "Skipped: issue already closed upstream",
+        "",
+        `Issue: ${issueUrl}`,
+        `closedAt: ${closedAt || "unknown"}`,
+        stateReason ? `stateReason: ${stateReason}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n"),
     });
 
-    if (!candidate) {
-      diagnostics.push(`- No worktree matched issue ${issueNumber}`);
-      diagnostics.push("- Manual: run `git worktree list` in the repo root to locate the task worktree");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
-    }
+    await updateTaskStatus(task, "done", {
+      "completed-at": completedAt,
+      "session-id": "",
+      "watchdog-retries": "",
+      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+    });
 
-    const branch = stripHeadsRef(candidate.branch);
-    diagnostics.push(`- Worktree: ${candidate.worktreePath}`);
-    diagnostics.push(`- Branch: ${branch ?? "(unknown)"}`);
-
-    if (!branch || candidate.detached) {
-      diagnostics.push("- Cannot auto-create PR: detached HEAD or unknown branch");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
-    }
-
-    // If a PR already exists for this branch, use it.
-    try {
-      const list = await $`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
-      const data = JSON.parse(list.stdout.toString());
-      const existingUrl = data?.[0]?.url as string | undefined;
-      if (existingUrl) {
-        diagnostics.push(`- Found existing PR: ${existingUrl}`);
-        return { prUrl: existingUrl, diagnostics: diagnostics.join("\n") };
-      }
-    } catch (e: any) {
-      diagnostics.push(`- gh pr list failed: ${e?.message ?? String(e)}`);
-    }
-
-    // Only auto-push/create when clean (avoid pushing partial work).
-    try {
-      const status = await $`git status --porcelain`.cwd(candidate.worktreePath).quiet();
-      if (status.stdout.toString().trim()) {
-        diagnostics.push("- Worktree has uncommitted changes; skipping auto push/PR create");
-        diagnostics.push(`- Manual: cd ${candidate.worktreePath} && git status`);
-        return { prUrl: null, diagnostics: diagnostics.join("\n") };
-      }
-    } catch (e: any) {
-      diagnostics.push(`- git status failed: ${e?.message ?? String(e)}`);
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
-    }
-
-    // Push branch (ensures it exists on remote for PR creation).
-    try {
-      await $`git push -u origin HEAD`.cwd(candidate.worktreePath).quiet();
-      diagnostics.push("- Pushed branch to origin");
-    } catch (e: any) {
-      diagnostics.push(`- git push failed: ${e?.message ?? String(e)}`);
-      diagnostics.push(`- Manual: cd ${candidate.worktreePath} && git push -u origin ${branch}`);
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
-    }
-
-    const title = issueTitle?.trim() ? issueTitle.trim() : `Fixes #${issueNumber}`;
-    const body = [
-      `Fixes #${issueNumber}`,
-      "",
-      "## Summary",
-      "- (Auto-created by Ralph: agent completed without a PR URL)",
-      "",
-      "## Testing",
-      "- (Please fill in)",
-      "",
-    ].join("\n");
-
-    try {
-      const created = await $`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
-        .cwd(candidate.worktreePath)
-        .quiet();
-
-      const prUrl = extractPrUrl(created.stdout.toString()) ?? extractPrUrl(created.stderr.toString()) ?? null;
-      diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
-
-      if (prUrl) return { prUrl, diagnostics: diagnostics.join("\n") };
-    } catch (e: any) {
-      diagnostics.push(`- gh pr create failed: ${e?.message ?? String(e)}`);
-    }
-
-    // Final attempt: PR might exist now (e.g. if gh created it but failed to print URL).
-    try {
-      const list = await $`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
-      const data = JSON.parse(list.stdout.toString());
-      const url = data?.[0]?.url as string | undefined;
-      if (url) {
-        diagnostics.push(`- Found PR after create attempt: ${url}`);
-        return { prUrl: url, diagnostics: diagnostics.join("\n") };
-      }
-    } catch {
-      // ignore
-    }
-
-    return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+    };
   }
 
   /**
    * Determine if we should escalate based on routing decision.
    */
   private shouldEscalate(
+
     routing: RoutingDecision | null,
     hasGap: boolean,
     isImplementationTask: boolean
@@ -499,6 +462,8 @@ export class RepoWorker {
       taskPath: task._path,
       issue: task.issue,
       repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
       sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
       reason,
       escalationType: "other",
@@ -517,6 +482,13 @@ export class RepoWorker {
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string }): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
+
+    const issueMeta = await this.getIssueMetadata(task.issue);
+    if (issueMeta.state === "CLOSED") {
+      return await this.skipClosedIssue(task, issueMeta, startTime);
+    }
+
+    await this.ensureBaselineLabelsOnce();
 
     const issueMatch = task.issue.match(/#(\d+)$/);
     const issueNumber = issueMatch?.[1] ?? "";
@@ -851,7 +823,19 @@ export class RepoWorker {
 
 
     try {
-      // 1. Mark task in-progress (use _path to avoid ambiguous names)
+      // 1. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
+      const issueMatch = task.issue.match(/#(\d+)$/);
+      if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
+      const issueNumber = issueMatch[1];
+      const cacheKey = issueNumber;
+
+      // 2. Preflight: skip work if the upstream issue is already CLOSED
+      const issueMeta = await this.getIssueMetadata(task.issue);
+      if (issueMeta.state === "CLOSED") {
+        return await this.skipClosedIssue(task, issueMeta, startTime);
+      }
+
+      // 3. Mark task in-progress (use _path to avoid ambiguous names)
       const markedInProgress = await updateTaskStatus(task, "in-progress", {
         "assigned-at": startTime.toISOString().split("T")[0],
       });
@@ -859,16 +843,11 @@ export class RepoWorker {
         throw new Error("Failed to mark task in-progress (bwrb edit failed)");
       }
 
-      // 2. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
-      const issueMatch = task.issue.match(/#(\d+)$/);
-      if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
-      const issueNumber = issueMatch[1];
-      const cacheKey = issueNumber;
+      await this.ensureBaselineLabelsOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber, "start");
 
-      // 3. Fetch issue metadata to adjust escalation sensitivity
-      const issueMeta = await this.getIssueMetadata(task.issue);
+      // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
 
       // 4. Run configured command: next-task
@@ -1388,13 +1367,14 @@ export class RepoWorker {
   private async createAgentRun(
     task: AgentTask,
     data: {
-      sessionId: string;
+      sessionId?: string;
       pr?: string | null;
       outcome: "success" | "escalated" | "failed";
       started: Date;
       completed: Date;
       surveyResults?: string;
       devex?: EscalationContext["devex"];
+      bodyPrefix?: string;
     }
   ): Promise<void> {
     const vault = loadConfig().bwrbVault;
@@ -1418,23 +1398,30 @@ export class RepoWorker {
       const result = await $`bwrb new agent-run --json ${json}`.cwd(vault).quiet();
       const output = JSON.parse(result.stdout.toString());
 
-      if (output.success && output.path) {
-        const notePath = resolveVaultPath(output.path);
-        const bodySections: string[] = [];
+        if (output.success && output.path) {
+          const notePath = resolveVaultPath(output.path);
+          const bodySections: string[] = [];
 
-        // Add introspection summary if available
-        const introspection = await readIntrospectionSummary(data.sessionId);
-        if (introspection) {
-          bodySections.push(
-            "## Session Summary",
-            "",
-            `- **Steps:** ${introspection.stepCount}`,
-            `- **Tool calls:** ${introspection.totalToolCalls}`,
-            `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
-            `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
-            ""
-          );
-        }
+          if (data.bodyPrefix?.trim()) {
+            bodySections.push(data.bodyPrefix.trim(), "");
+          }
+
+          // Add introspection summary if available
+          if (data.sessionId) {
+            const introspection = await readIntrospectionSummary(data.sessionId);
+            if (introspection) {
+              bodySections.push(
+                "## Session Summary",
+                "",
+                `- **Steps:** ${introspection.stepCount}`,
+                `- **Tool calls:** ${introspection.totalToolCalls}`,
+                `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
+                `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
+                ""
+              );
+            }
+          }
+
 
         // Add devex consult summary (if we used devex-before-escalate)
         if (data.devex?.consulted) {
@@ -1457,7 +1444,9 @@ export class RepoWorker {
         }
 
         // Clean up introspection logs
-        await cleanupIntrospectionLogs(data.sessionId);
+        if (data.sessionId) {
+          await cleanupIntrospectionLogs(data.sessionId);
+        }
       }
 
       console.log(`[ralph:worker:${this.repo}] Created agent-run note`);
