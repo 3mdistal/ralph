@@ -72,13 +72,15 @@ export async function getTasksByStatus(status: AgentTask["status"]): Promise<Age
 }
 
 /**
- * Fetch a task by its exact bwrb `_path`.
+ * Fetch a task by its file path in the vault.
  */
 export async function getTaskByPath(taskPath: string): Promise<AgentTask | null> {
   const config = loadConfig();
 
   try {
-    const result = await $`bwrb list agent-task --where "_path == '${taskPath}'" --output json`
+    // bwrb does not expose system fields like `_path` in --where filters.
+    // Use --path instead (supports exact paths and globs).
+    const result = await $`bwrb list agent-task --path ${taskPath} --output json`
       .cwd(config.bwrbVault)
       .quiet();
     const parsed = JSON.parse(result.stdout.toString());
