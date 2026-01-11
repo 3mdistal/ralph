@@ -13,12 +13,14 @@
     "status": "bun run src/index.ts status",
     "watch": "bun run src/index.ts watch",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "knip": "knip"
   },
   "dependencies": {},
   "devDependencies": {
     "@types/bun": "latest",
     "@types/node": "^20.11.0",
+    "knip": "^5.80.2",
     "typescript": "^5.0.0"
   },
   "engines": {

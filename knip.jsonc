@@ -1,0 +1,30 @@
+{
+  "$schema": "https://unpkg.com/knip@5/schema.json",
+
+  // Mirror the intent of bwrb's Knip setup: keep CI signal stable
+  // and explicitly ignore environment-provided tooling.
+
+  // These binaries are expected to exist in the operator environment.
+  "ignoreBinaries": ["which", "terminal-notifier", "bwrb", "gh"],
+
+  // Bun's recommended TS config uses the virtual `bun-types` package name.
+  // Knip reports it as unresolved because it's not a real dependency.
+  "ignoreUnresolved": ["bun-types"],
+
+  // Project files to analyze.
+  "project": ["src/**/*.ts"],
+
+  // Ignore build output and intentionally-unused modules.
+  "ignore": ["dist/**", "src/transcript.ts"],
+
+  // Some config exports are intentionally public API.
+  "ignoreIssues": {
+    "src/config.ts": ["exports"]
+  },
+
+  // Avoid noisy reports for intentional type-only public API.
+  "ignoreExportsUsedInFile": {
+    "interface": true,
+    "type": true
+  }
+}

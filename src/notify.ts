@@ -35,7 +35,7 @@ async function isTerminalNotifierAvailable(): Promise<boolean> {
  * Send a desktop notification using terminal-notifier (macOS).
  * Falls back silently if terminal-notifier is not installed.
  */
-export async function sendDesktopNotification(opts: {
+async function sendDesktopNotification(opts: {
   title: string;
   subtitle?: string;
   message: string;
@@ -134,7 +134,7 @@ async function bwrbNewEscalation(json: string): Promise<{ success: boolean; path
 /**
  * Create a notification as a bwrb idea note.
  */
-export async function createNotification(
+async function createNotification(
   type: NotificationType,
   title: string,
   body: string,
