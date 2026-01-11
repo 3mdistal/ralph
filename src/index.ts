@@ -102,8 +102,38 @@ function scheduleQueuedTasksSoon(): void {
 let escalationWatcher: ReturnType<typeof watch> | null = null;
 let escalationDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+const resumeAttemptedThisRun = new Set<string>();
+let resumeDisabledUntil = 0;
+
+const RESUME_DISABLE_MS = 60_000;
+
+async function safeEditEscalation(escalationPath: string, fields: Record<string, string>): Promise<boolean> {
+  const result = await editEscalation(escalationPath, fields);
+  if (result.ok) return true;
+
+  resumeAttemptedThisRun.add(escalationPath);
+
+  if (result.kind === "vault-missing") {
+    const now = Date.now();
+    if (now >= resumeDisabledUntil) {
+      resumeDisabledUntil = now + RESUME_DISABLE_MS;
+      const vault = loadConfig().bwrbVault;
+      console.error(
+        `[ralph:escalations] Cannot edit escalation notes; pausing auto-resume for ${Math.round(RESUME_DISABLE_MS / 1000)}s. ` +
+          `Check bwrbVault in ~/.config/opencode/ralph/ralph.json (current: ${JSON.stringify(vault)}). ` +
+          `Last error: ${result.error}`
+      );
+    }
+    return false;
+  }
+
+  console.warn(`[ralph:escalations] Failed to edit escalation ${escalationPath}: ${result.error}`);
+  return false;
+}
+
 async function attemptResumeResolvedEscalations(): Promise<void> {
   if (getDaemonMode() === "draining" || isShuttingDown) return;
+  if (Date.now() < resumeDisabledUntil) return;
 
   ensureSemaphores();
   if (!globalSemaphore) return;
@@ -111,11 +141,17 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
   const resolved = await getEscalationsByStatus("resolved");
   if (resolved.length === 0) return;
 
-  const pending = resolved.filter((e) => !(e["resume-attempted-at"]?.trim()));
+  const pending = resolved.filter((e) => {
+    const attempted = e["resume-attempted-at"]?.trim();
+    const resumeStatus = e["resume-status"]?.trim();
+
+    return (!attempted || resumeStatus === "waiting-resolution") && !resumeAttemptedThisRun.has(e._path);
+  });
   if (pending.length === 0) return;
 
   for (const escalation of pending) {
     if (getDaemonMode() === "draining" || isShuttingDown) return;
+    if (Date.now() < resumeDisabledUntil) return;
 
     const taskPath = escalation["task-path"]?.trim() ?? "";
     const sessionId = escalation["session-id"]?.trim() ?? "";
@@ -125,7 +161,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
       const reason = `Missing required fields (task-path='${taskPath}', session-id='${sessionId}', repo='${repo}')`;
       console.warn(`[ralph:escalations] Resolved escalation invalid; ${reason}: ${escalation._path}`);
 
-      await editEscalation(escalation._path, {
+      await safeEditEscalation(escalation._path, {
         "resume-status": "failed",
         "resume-attempted-at": new Date().toISOString(),
         "resume-error": reason,
@@ -140,7 +176,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     const task = await getTaskByPath(taskPath);
     if (!task) {
       console.warn(`[ralph:escalations] Resolved escalation references missing task; skipping: ${taskPath}`);
-      await editEscalation(escalation._path, {
+      await safeEditEscalation(escalation._path, {
         "resume-status": "failed",
         "resume-attempted-at": new Date().toISOString(),
         "resume-error": `Task not found: ${taskPath}`,
@@ -169,7 +205,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     const releaseGlobal = globalSemaphore.tryAcquire();
     if (!releaseGlobal) {
       if (escalation["resume-status"]?.trim() !== "deferred") {
-        await editEscalation(escalation._path, {
+        await safeEditEscalation(escalation._path, {
           "resume-status": "deferred",
           "resume-deferred-at": new Date().toISOString(),
           "resume-error": "Global concurrency limit reached; will retry",
@@ -182,7 +218,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     if (!releaseRepo) {
       releaseGlobal();
       if (escalation["resume-status"]?.trim() !== "deferred") {
-        await editEscalation(escalation._path, {
+        await safeEditEscalation(escalation._path, {
           "resume-status": "deferred",
           "resume-deferred-at": new Date().toISOString(),
           "resume-error": "Repo concurrency limit reached; will retry",
@@ -190,12 +226,6 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
       }
       continue;
     }
-
-    // Ensure the task is resumable and marked in-progress.
-    await updateTaskStatus(task, "in-progress", {
-      "assigned-at": new Date().toISOString().split("T")[0],
-      "session-id": sessionId,
-    });
 
     const resumeMessage = [
       "Escalation resolved. Resume the existing OpenCode session from where you left off.",
@@ -206,10 +236,22 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     ].join("\n");
 
     // Mark as attempted before resuming to avoid duplicate resumes.
-    await editEscalation(escalation._path, {
+    const markedAttempt = await safeEditEscalation(escalation._path, {
       "resume-status": "attempting",
       "resume-attempted-at": new Date().toISOString(),
       "resume-error": "",
+    });
+
+    if (!markedAttempt) {
+      releaseGlobal();
+      releaseRepo();
+      continue;
+    }
+
+    // Ensure the task is resumable and marked in-progress.
+    await updateTaskStatus(task, "in-progress", {
+      "assigned-at": new Date().toISOString().split("T")[0],
+      "session-id": sessionId,
     });
 
     inFlightTasks.add(taskKey);
@@ -222,7 +264,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
             await rollupMonitor.recordMerge(repo, run.pr);
           }
 
-          await editEscalation(escalation._path, {
+          await safeEditEscalation(escalation._path, {
             "resume-status": "succeeded",
             "resume-error": "",
           });
@@ -234,13 +276,13 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
           run.escalationReason ??
           (run.outcome === "escalated" ? "Resumed session escalated" : "Resume failed");
 
-        await editEscalation(escalation._path, {
+        await safeEditEscalation(escalation._path, {
           "resume-status": "failed",
           "resume-error": reason,
         });
       })
       .catch(async (e: any) => {
-        await editEscalation(escalation._path, {
+        await safeEditEscalation(escalation._path, {
           "resume-status": "failed",
           "resume-error": e?.message ?? String(e),
         });

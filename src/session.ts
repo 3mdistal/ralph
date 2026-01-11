@@ -110,6 +110,23 @@ function normalizeCacheSegment(value: string): string {
     .slice(0, 80);
 }
 
+function resolveOpencodeBin(): string {
+  const override = process.env.OPENCODE_BIN?.trim();
+  if (override) return override;
+
+  const candidates = [
+    "/opt/homebrew/bin/opencode",
+    "/usr/local/bin/opencode",
+    join(homedir(), ".local", "bin", "opencode"),
+  ];
+
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  return "opencode";
+}
+
 function getIsolatedXdgCacheHome(opts?: { repo?: string; cacheKey?: string }): string {
   const repo = normalizeCacheSegment(opts?.repo ?? "unknown-repo");
   const key = normalizeCacheSegment(opts?.cacheKey ?? "default");

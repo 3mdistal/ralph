@@ -39,6 +39,12 @@ import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationConte
 import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
 import { getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
+import {
+  parseGitWorktreeListPorcelain,
+  pickWorktreeForIssue,
+  stripHeadsRef,
+  type GitWorktreeEntry,
+} from "./git-worktree";
 
 // Ralph introspection logs location
 const RALPH_SESSIONS_DIR = getRalphSessionsDir();
@@ -501,6 +507,8 @@ export class RepoWorker {
 
     try {
       const botBranch = getRepoBotBranch(this.repo);
+      const issueMeta = await this.getIssueMetadata(task.issue);
+
       const defaultResumeMessage =
         "Ralph restarted while this task was in progress. " +
         "Resume from where you left off. " +
@@ -550,6 +558,19 @@ export class RepoWorker {
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
       let prUrl = extractPrUrl(buildResult.output);
+      let prRecoveryDiagnostics = "";
+
+      if (!prUrl) {
+        const recovered = await this.tryEnsurePrFromWorktree({
+          task,
+          issueNumber,
+          issueTitle: issueMeta.title || task.name,
+          botBranch,
+        });
+        prRecoveryDiagnostics = recovered.diagnostics;
+        prUrl = recovered.prUrl ?? prUrl;
+      }
+
       let continueAttempts = 0;
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
@@ -582,7 +603,7 @@ export class RepoWorker {
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
-              planOutput: buildResult.output,
+              planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
             return {
@@ -629,12 +650,14 @@ export class RepoWorker {
 
         continueAttempts++;
         console.log(
-          `[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
+          `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
         );
 
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
+        const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
+          timeoutMs: 10 * 60_000,
           introspection: {
             repo: this.repo,
             issue: task.issue,
@@ -645,11 +668,38 @@ export class RepoWorker {
           ...this.buildWatchdogOptions(task, "resume-continue"),
         });
         if (!buildResult.success) {
-          console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
-          break;
-        }
+          if (buildResult.watchdogTimeout) {
+            return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult);
+          }
 
-        prUrl = extractPrUrl(buildResult.output);
+          // If the session timed out or ended without printing a URL, try to recover PR from git state.
+          const recovered = await this.tryEnsurePrFromWorktree({
+            task,
+            issueNumber,
+            issueTitle: issueMeta.title || task.name,
+            botBranch,
+          });
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+          prUrl = recovered.prUrl ?? prUrl;
+
+          if (!prUrl) {
+            console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
+            break;
+          }
+        } else {
+          prUrl = extractPrUrl(buildResult.output);
+        }
+      }
+
+      if (!prUrl) {
+        const recovered = await this.tryEnsurePrFromWorktree({
+          task,
+          issueNumber,
+          issueTitle: issueMeta.title || task.name,
+          botBranch,
+        });
+        prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+        prUrl = recovered.prUrl ?? prUrl;
       }
 
       if (!prUrl) {
@@ -666,7 +716,7 @@ export class RepoWorker {
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
-          planOutput: buildResult.output,
+          planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
         });
 
         return {
@@ -682,7 +732,7 @@ export class RepoWorker {
       const mergeResult = await continueSession(
         taskRepoPath,
         buildResult.sessionId,
-        "Looks good. Merge the PR and clean up the worktree.",
+        "Looks good. Merge the PR. (Don’t delete branches/worktrees; Ralph will clean up.)",
         {
           repo: this.repo,
           cacheKey,
@@ -704,7 +754,8 @@ export class RepoWorker {
       }
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
+      const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         ...this.buildWatchdogOptions(task, "resume-survey"),
@@ -1033,6 +1084,19 @@ export class RepoWorker {
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
       const MAX_CONTINUE_RETRIES = 5;
       let prUrl = extractPrUrl(buildResult.output);
+      let prRecoveryDiagnostics = "";
+
+      if (!prUrl) {
+        const recovered = await this.tryEnsurePrFromWorktree({
+          task,
+          issueNumber,
+          issueTitle: issueMeta.title || task.name,
+          botBranch,
+        });
+        prRecoveryDiagnostics = recovered.diagnostics;
+        prUrl = recovered.prUrl ?? prUrl;
+      }
+
       let continueAttempts = 0;
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
@@ -1067,7 +1131,7 @@ export class RepoWorker {
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
-              planOutput: buildResult.output,
+              planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
             return {
@@ -1114,10 +1178,15 @@ export class RepoWorker {
         }
 
         continueAttempts++;
-        console.log(`[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`);
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
+        console.log(
+          `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
+        );
+
+        const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
+          timeoutMs: 10 * 60_000,
           introspection: {
             repo: this.repo,
             issue: task.issue,
@@ -1131,12 +1200,35 @@ export class RepoWorker {
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult);
           }
-          console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
-          break;
-        }
 
-        
-        prUrl = extractPrUrl(buildResult.output);
+          // If the session timed out or ended without printing a URL, try to recover PR from git state.
+          const recovered = await this.tryEnsurePrFromWorktree({
+            task,
+            issueNumber,
+            issueTitle: issueMeta.title || task.name,
+            botBranch,
+          });
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+          prUrl = recovered.prUrl ?? prUrl;
+
+          if (!prUrl) {
+            console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
+            break;
+          }
+        } else {
+          prUrl = extractPrUrl(buildResult.output);
+        }
+      }
+
+      if (!prUrl) {
+        const recovered = await this.tryEnsurePrFromWorktree({
+          task,
+          issueNumber,
+          issueTitle: issueMeta.title || task.name,
+          botBranch,
+        });
+        prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+        prUrl = recovered.prUrl ?? prUrl;
       }
 
       if (!prUrl) {
@@ -1154,7 +1246,7 @@ export class RepoWorker {
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
-          planOutput: buildResult.output,
+          planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
         });
 
         return {
@@ -1172,7 +1264,7 @@ export class RepoWorker {
         const mergeResult = await continueSession(
           taskRepoPath,
           buildResult.sessionId,
-          "Looks good. Merge the PR and clean up the worktree.",
+          "Looks good. Merge the PR. (Don’t delete branches/worktrees; Ralph will clean up.)",
           {
             repo: this.repo,
             cacheKey,
@@ -1196,7 +1288,8 @@ export class RepoWorker {
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
+      const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         introspection: {
