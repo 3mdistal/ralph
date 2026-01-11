@@ -1592,7 +1592,7 @@ export class RepoWorker {
             "Incorporate the devex guidance below into your plan.",
             "Then output ONLY the routing decision JSON code block.",
             "Do not ask questions.",
-            "If an open question touches contract surfaces (CLI flags, exit codes, stdout/stderr formats, public error strings, config/schema, machine-readable JSON), set decision=escalate.",
+            "If an open question touches a user-facing contract surface, set decision=escalate (policy: docs/escalation-policy.md).",
             "",
             "Devex guidance:",
             devexSummary || devexResult.output,
