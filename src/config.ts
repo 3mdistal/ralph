@@ -1,6 +1,6 @@
 import { homedir } from "os";
-import { join } from "path";
-import { existsSync, readFileSync } from "fs";
+import { dirname, join } from "path";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 
 import { getRalphConfigJsonPath, getRalphConfigTomlPath, getRalphLegacyConfigPath } from "./paths";
 
@@ -95,12 +95,60 @@ export interface RalphConfig {
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
 
+function detectDefaultBwrbVault(): string {
+  const start = process.cwd();
+  let dir = start;
+
+  for (;;) {
+    if (existsSync(join(dir, ".bwrb", "schema.json"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return start;
+    dir = parent;
+  }
+}
+
+export function ensureBwrbVaultLayout(vault: string): boolean {
+  if (!vault || !existsSync(vault)) {
+    console.error(
+      `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
+        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`
+    );
+    return false;
+  }
+
+  const schemaPath = join(vault, ".bwrb", "schema.json");
+  if (!existsSync(schemaPath)) {
+    console.error(
+      `[ralph] bwrbVault does not contain a bwrb schema: ${JSON.stringify(vault)} (missing ${schemaPath}). ` +
+        `Point bwrbVault at a directory that contains .bwrb/schema.json.`
+    );
+    return false;
+  }
+
+  const dirs = [
+    "orchestration/tasks",
+    "orchestration/runs",
+    "orchestration/escalations",
+    "orchestration/notifications",
+  ];
+
+  try {
+    for (const rel of dirs) {
+      mkdirSync(join(vault, rel), { recursive: true });
+    }
+    return true;
+  } catch (e) {
+    console.error(`[ralph] Failed to create orchestration directories in ${vault}:`, e);
+    return false;
+  }
+}
+
 const DEFAULT_CONFIG: RalphConfig = {
   repos: [],
   maxWorkers: DEFAULT_GLOBAL_MAX_WORKERS,
   batchSize: 10,
   pollInterval: 30000,
-  bwrbVault: join(homedir(), "Developer/teenylilthoughts"),
+  bwrbVault: detectDefaultBwrbVault(),
   owner: "3mdistal",
   devDir: join(homedir(), "Developer"),
 };
