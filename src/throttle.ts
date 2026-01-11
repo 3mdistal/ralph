@@ -17,6 +17,8 @@ export interface ThrottleWindowSnapshot {
   usedPct: number;
   oldestTsInWindow: number | null;
   resumeAtTs: number | null;
+  softResumeAtTs?: number | null;
+  hardResumeAtTs?: number | null;
 }
 
 export interface ThrottleSnapshot {
@@ -254,20 +256,31 @@ export async function getThrottleDecision(now: number = Date.now()): Promise<Thr
 
   const prevState: ThrottleState = lastDecision?.state ?? "ok";
 
-  // Use per-threshold resume timestamps so the snapshot matches the effective state.
-  const windowsForSnapshot = state === "hard" ? hardWindows : softWindows;
+  const mergedWindows: ThrottleWindowSnapshot[] = hardWindows.map((hardWindow, idx) => {
+    const softWindow = softWindows[idx];
+    const softResumeAtTs = softWindow?.resumeAtTs ?? null;
+    const hardResumeAtTs = hardWindow.resumeAtTs;
+    const effectiveResumeAtTs = state === "hard" ? hardResumeAtTs : softResumeAtTs;
+
+    return {
+      ...hardWindow,
+      resumeAtTs: effectiveResumeAtTs,
+      softResumeAtTs,
+      hardResumeAtTs,
+    };
+  });
 
   const snapshot: ThrottleSnapshot = {
     computedAt: new Date(now).toISOString(),
     providerID,
     state,
     resumeAt: resumeAtTs ? new Date(resumeAtTs).toISOString() : null,
-    windows: windowsForSnapshot,
+    windows: mergedWindows,
   };
 
   if (prevState !== state) {
     const pct = (value: number) => `${(value * 100).toFixed(2)}%`;
-    const softParts = softWindows.map((w) => {
+    const softParts = snapshot.windows.map((w) => {
       const resetAt = w.resumeAtTs ? new Date(w.resumeAtTs).toISOString() : "unknown";
       return (
         `${w.name} used=${pct(w.usedPct)} usedTokens=${w.usedTokens} ` +
