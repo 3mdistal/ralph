@@ -16,13 +16,11 @@ Everything else should proceed autonomously.
 
 ## Escalation Markers
 
-When a model identifies a documentation gap, it must output an explicit, machine-parseable marker.
+Escalation marker parsing must be deterministic and machine-parseable.
 
-- **Product gap (positive):** a line starting with `PRODUCT GAP:` (case-insensitive), optionally bullet-prefixed (`- ` or `* `).
-- **Product gap (negative):** a line starting with `NO PRODUCT GAP:` (case-insensitive), optionally bullet-prefixed.
-- **Not a marker:** `PRODUCT GAP` without a trailing `:` or mentions mid-line (e.g. `Here is the marker: PRODUCT GAP: ...`).
+Canonical spec: `docs/escalation-policy.md`.
 
-This keeps escalation detection deterministic and prevents accidental escalations from quoted text or fuzzy phrasing (e.g. “not documented”).
+(Keep this doc focused on product intent; update routing/escalation policy in one place.)
 
 ## Related Product Docs
 
