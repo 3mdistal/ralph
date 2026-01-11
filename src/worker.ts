@@ -760,7 +760,7 @@ export class RepoWorker {
       const mergeResult = await continueSession(
         taskRepoPath,
         buildResult.sessionId,
-        "Looks good. Merge the PR and clean up the worktree.",
+        "Looks good. Merge the PR. (Don’t delete branches/worktrees; Ralph will clean up.)",
         {
           repo: this.repo,
           cacheKey,
@@ -782,7 +782,8 @@ export class RepoWorker {
       }
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
+      const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         ...this.buildWatchdogOptions(task, "resume-survey"),
@@ -1284,7 +1285,7 @@ export class RepoWorker {
         const mergeResult = await continueSession(
           taskRepoPath,
           buildResult.sessionId,
-          "Looks good. Merge the PR and clean up the worktree.",
+          "Looks good. Merge the PR. (Don’t delete branches/worktrees; Ralph will clean up.)",
           {
             repo: this.repo,
             cacheKey,
@@ -1308,7 +1309,8 @@ export class RepoWorker {
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
+      const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         introspection: {

@@ -387,6 +387,14 @@ async function runSession(
   const env = { ...process.env, XDG_CACHE_HOME: xdgCacheHome };
 
   const opencodeBin = resolveOpencodeBin();
+  if (!existsSync(repoPath)) {
+    return {
+      sessionId: options?.continueSession ?? "",
+      success: false,
+      output: `Repo path does not exist (likely cleaned up earlier): ${repoPath}`,
+    };
+  }
+
   let proc: ChildProcess;
   try {
     proc = spawn(opencodeBin, args, {
