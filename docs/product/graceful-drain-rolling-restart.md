@@ -83,7 +83,7 @@ Use the same list described in the existing idea note `reflections/ideas/Ralph D
 
 - Must work on macOS and Linux/NixOS.
 - Prefer XDG paths where possible (target state). Current implementation:
-  - Config: `~/.config/opencode/ralph/ralph.json` (does not honor `XDG_CONFIG_HOME` yet)
+  - Config: `~/.ralph/config.toml` > `~/.ralph/config.json` > legacy `~/.config/opencode/ralph/ralph.json`
   - State/logs: `~/.ralph/...` (overridable via `RALPH_SESSIONS_DIR` / `RALPH_WORKTREES_DIR`)
   - Caches: TBD
 - Avoid macOS-only supervisors (launchd) in the core protocol. Supervisors can exist, but they shouldn’t be required.

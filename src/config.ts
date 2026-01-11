@@ -1,6 +1,8 @@
 import { homedir } from "os";
 import { join } from "path";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
+
+import { getRalphConfigJsonPath, getRalphConfigTomlPath, getRalphLegacyConfigPath } from "./paths";
 
 export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
 import type { WatchdogConfig } from "./watchdog";
@@ -125,20 +127,57 @@ export function loadConfig(): RalphConfig {
   // Start with defaults
   let loaded: RalphConfig = { ...DEFAULT_CONFIG };
 
-  // Try to load from file
-  const configPath = join(homedir(), ".config/opencode/ralph/ralph.json");
-  if (existsSync(configPath)) {
+  // Try to load from file (precedence: ~/.ralph/config.toml > ~/.ralph/config.json > legacy ~/.config/opencode/ralph/ralph.json)
+  const configTomlPath = getRalphConfigTomlPath();
+  const configJsonPath = getRalphConfigJsonPath();
+  const legacyConfigPath = getRalphLegacyConfigPath();
+
+  const tryLoadJson = (path: string): any | null => {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const fileConfig = require(configPath);
-      loaded = { ...loaded, ...fileConfig };
+      const text = readFileSync(path, "utf8");
+      return JSON.parse(text);
     } catch (e) {
-      console.error(`[ralph] Failed to load config from ${configPath}:`, e);
+      console.error(`[ralph] Failed to load JSON config from ${path}:`, e);
+      return null;
     }
+  };
+
+  const tryLoadToml = (path: string): any | null => {
+    try {
+      const text = readFileSync(path, "utf8");
+      const toml = (Bun as any)?.TOML;
+      if (!toml || typeof toml.parse !== "function") {
+        throw new Error("Bun.TOML.parse is not available in this runtime");
+      }
+      return toml.parse(text);
+    } catch (e) {
+      console.error(`[ralph] Failed to load TOML config from ${path}:`, e);
+      return null;
+    }
+  };
+
+  if (existsSync(configTomlPath)) {
+    const fileConfig = tryLoadToml(configTomlPath);
+    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+  } else if (existsSync(configJsonPath)) {
+    const fileConfig = tryLoadJson(configJsonPath);
+    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+  } else if (existsSync(legacyConfigPath)) {
+    console.warn(
+      `[ralph] Using legacy config path ${legacyConfigPath}. ` +
+        `Migrate to ${configTomlPath} or ${configJsonPath} (preferred).`
+    );
+
+    const fileConfig = tryLoadJson(legacyConfigPath);
+    if (fileConfig) loaded = { ...loaded, ...fileConfig };
   }
 
   config = validateConfig(loaded);
   return config;
+}
+
+export function __resetConfigForTests(): void {
+  config = null;
 }
 
 export function getRepoPath(repoName: string): string {

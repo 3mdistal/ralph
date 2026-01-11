@@ -50,7 +50,7 @@ function ensureVaultExists(vault: string): boolean {
     warnedMissingVault = true;
     console.error(
       `[ralph:escalations] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
-        `Set it in ~/.config/opencode/ralph/ralph.json (key: bwrbVault).`
+        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`
     );
   }
 

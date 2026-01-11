@@ -4,6 +4,7 @@ import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import { loadConfig } from "./config";
 import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue";
+import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 
 export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
 
@@ -345,6 +346,23 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     );
   }
 
+  const idempotencyKey = [
+    "notifyEscalation",
+    ctx.issue,
+    resolvedTaskPath,
+    ctx.sessionId ?? "",
+    ctx.escalationType,
+  ].join(":");
+
+  try {
+    if (hasIdempotencyKey(idempotencyKey)) {
+      console.warn(`[ralph:notify] Escalation already recorded (idempotency); skipping duplicate: ${idempotencyKey}`);
+      return true;
+    }
+  } catch {
+    // best-effort
+  }
+
   // Build the note body with rich context
   const bodyParts: string[] = [
     `## Escalation Summary`,
@@ -485,6 +503,16 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     const notePath = resolveVaultPath(output.path);
     await appendFile(notePath, noteBody, "utf8");
     console.log(`[ralph:notify] Created escalation: ${noteName}`);
+
+    try {
+      recordIdempotencyKey({
+        key: idempotencyKey,
+        scope: "notifyEscalation",
+        payloadJson: JSON.stringify({ escalationPath: output.path, taskPath: resolvedTaskPath, sessionId: ctx.sessionId ?? "" }),
+      });
+    } catch {
+      // best-effort
+    }
 
     // Send desktop notification
     const issueUrl = ctx.issue.includes("github.com")
