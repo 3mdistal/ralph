@@ -39,7 +39,7 @@ bun install
 
 ## Configuration
 
-Ralph loads config from `~/.config/opencode/ralph/ralph.json` (hardcoded; does not currently honor `XDG_CONFIG_HOME`) and merges it over built-in defaults.
+Ralph loads config from `~/.config/opencode/ralph/ralph.json` (hardcoded; does not currently honor `XDG_CONFIG_HOME`) and merges it over built-in defaults. This is a shallow merge (arrays/objects are replaced, not deep-merged).
 
 Config is loaded once at startup, so restart the daemon after editing.
 
@@ -47,17 +47,19 @@ Config is loaded once at startup, so restart the daemon after editing.
 
 ```json
 {
-  "bwrbVault": "/Users/you/Developer/teenylilthoughts",
-  "devDir": "/Users/you/Developer",
+  "bwrbVault": "/absolute/path/to/your/bwrb-vault",
+  "devDir": "/absolute/path/to/your/dev-directory",
   "repos": [
     {
       "name": "3mdistal/ralph",
-      "path": "/Users/you/Developer/ralph",
+      "path": "/absolute/path/to/your/ralph",
       "botBranch": "bot/integration"
     }
   ]
 }
 ```
+
+Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comments/trailing commas are not supported.
 
 ### Supported settings
 
