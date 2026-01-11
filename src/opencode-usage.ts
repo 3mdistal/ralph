@@ -3,7 +3,7 @@ import { readFile, readdir } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 
-export interface UsageWindowConfig {
+interface UsageWindowConfig {
   name: string;
   /** Window size in milliseconds (e.g. 5h, 7d). */
   durationMs: number;
@@ -48,7 +48,7 @@ export interface OpencodeUsageSnapshot {
   windows: Record<string, UsageWindowSnapshot>;
 }
 
-export function getDefaultOpencodeMessagesRootDir(): string {
+function getDefaultOpencodeMessagesRootDir(): string {
   return join(homedir(), ".local/share/opencode/storage/message");
 }
 

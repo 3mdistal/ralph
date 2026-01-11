@@ -13,7 +13,7 @@ export interface GitHubRepoSummary {
   defaultBranch?: string;
 }
 
-export class GitHubAuthError extends Error {
+class GitHubAuthError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "GitHubAuthError";
