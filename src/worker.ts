@@ -14,15 +14,7 @@ type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProce
 
 const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 
-let gh: GhRunner = DEFAULT_GH_RUNNER;
-
-export function __setGhRunnerForTests(runner: GhRunner): void {
-  gh = runner;
-}
-
-export function __resetGhRunnerForTests(): void {
-  gh = DEFAULT_GH_RUNNER;
-}
+const gh: GhRunner = DEFAULT_GH_RUNNER;
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
@@ -313,6 +305,149 @@ export class RepoWorker {
     } catch {
       return { labels: [], title: "" };
     }
+  }
+
+  private buildPrCreationNudge(botBranch: string, issueNumber: string, issueRef: string): string {
+    const fixes = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${issueRef}`;
+
+    return [
+      `No PR URL found. Create a PR targeting '${botBranch}' and paste the PR URL.`,
+      "",
+      "Commands (run in the task worktree):",
+      "```bash",
+      "git status",
+      "git push -u origin HEAD",
+      `gh pr create --base ${botBranch} --fill --body \"${fixes}\"`,
+      "```",
+      "",
+      "If a PR already exists:",
+      "```bash",
+      "gh pr list --head $(git branch --show-current) --json url --limit 1",
+      "```",
+    ].join("\n");
+  }
+
+  private async getGitWorktrees(): Promise<GitWorktreeEntry[]> {
+    try {
+      const result = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
+      return parseGitWorktreeListPorcelain(result.stdout.toString());
+    } catch {
+      return [];
+    }
+  }
+
+  private async tryEnsurePrFromWorktree(params: {
+    task: AgentTask;
+    issueNumber: string;
+    issueTitle: string;
+    botBranch: string;
+  }): Promise<{ prUrl: string | null; diagnostics: string }> {
+    const { task, issueNumber, issueTitle, botBranch } = params;
+
+    const diagnostics: string[] = [
+      "Ralph PR recovery:",
+      `- Repo: ${this.repo}`,
+      `- Issue: ${task.issue}`,
+      `- Base: ${botBranch}`,
+    ];
+
+    if (!issueNumber) {
+      diagnostics.push("- No issue number detected; skipping auto PR recovery");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const entries = await this.getGitWorktrees();
+    const candidate = pickWorktreeForIssue(entries, issueNumber, {
+      deprioritizeBranches: ["main", botBranch],
+    });
+
+    if (!candidate) {
+      diagnostics.push(`- No worktree matched issue ${issueNumber}`);
+      diagnostics.push("- Manual: run `git worktree list` in the repo root to locate the task worktree");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const branch = stripHeadsRef(candidate.branch);
+    diagnostics.push(`- Worktree: ${candidate.worktreePath}`);
+    diagnostics.push(`- Branch: ${branch ?? "(unknown)"}`);
+
+    if (!branch || candidate.detached) {
+      diagnostics.push("- Cannot auto-create PR: detached HEAD or unknown branch");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    try {
+      const list = await gh`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
+      const data = JSON.parse(list.stdout.toString());
+      const existingUrl = data?.[0]?.url as string | undefined;
+      if (existingUrl) {
+        diagnostics.push(`- Found existing PR: ${existingUrl}`);
+        return { prUrl: existingUrl, diagnostics: diagnostics.join("\n") };
+      }
+    } catch (e: any) {
+      diagnostics.push(`- gh pr list failed: ${e?.message ?? String(e)}`);
+    }
+
+    try {
+      const status = await $`git status --porcelain`.cwd(candidate.worktreePath).quiet();
+      if (status.stdout.toString().trim()) {
+        diagnostics.push("- Worktree has uncommitted changes; skipping auto push/PR create");
+        diagnostics.push(`- Manual: cd ${candidate.worktreePath} && git status`);
+        return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      }
+    } catch (e: any) {
+      diagnostics.push(`- git status failed: ${e?.message ?? String(e)}`);
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    try {
+      await $`git push -u origin HEAD`.cwd(candidate.worktreePath).quiet();
+      diagnostics.push("- Pushed branch to origin");
+    } catch (e: any) {
+      diagnostics.push(`- git push failed: ${e?.message ?? String(e)}`);
+      diagnostics.push(`- Manual: cd ${candidate.worktreePath} && git push -u origin ${branch}`);
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const title = issueTitle?.trim() ? issueTitle.trim() : `Fixes #${issueNumber}`;
+    const body = [
+      `Fixes #${issueNumber}`,
+      "",
+      "## Summary",
+      "- (Auto-created by Ralph: agent completed without a PR URL)",
+      "",
+      "## Testing",
+      "- (Please fill in)",
+      "",
+    ].join("\n");
+
+    try {
+      const created = await gh`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
+        .cwd(candidate.worktreePath)
+        .quiet();
+
+      const prUrl = extractPrUrl(created.stdout.toString()) ?? null;
+      diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
+
+      if (prUrl) return { prUrl, diagnostics: diagnostics.join("\n") };
+    } catch (e: any) {
+      diagnostics.push(`- gh pr create failed: ${e?.message ?? String(e)}`);
+    }
+
+    try {
+      const list = await gh`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
+      const data = JSON.parse(list.stdout.toString());
+      const url = data?.[0]?.url as string | undefined;
+      if (url) {
+        diagnostics.push(`- Found PR after create attempt: ${url}`);
+        return { prUrl: url, diagnostics: diagnostics.join("\n") };
+      }
+    } catch (e: any) {
+      diagnostics.push(`- Final gh pr list failed: ${e?.message ?? String(e)}`);
+    }
+
+    diagnostics.push("- No PR URL recovered");
+    return { prUrl: null, diagnostics: diagnostics.join("\n") };
   }
 
   private async skipClosedIssue(task: AgentTask, issueMeta: IssueMetadata, started: Date): Promise<AgentRun> {

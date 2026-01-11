@@ -15,15 +15,7 @@ type BwrbRunner = (strings: TemplateStringsArray, ...values: unknown[]) => BwrbP
 
 const DEFAULT_BWRB_RUNNER: BwrbRunner = $ as unknown as BwrbRunner;
 
-let bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
-
-export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
-  bwrb = runner;
-}
-
-export function __resetBwrbRunnerForTests(): void {
-  bwrb = DEFAULT_BWRB_RUNNER;
-}
+const bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
 
 export interface AgentEscalationNote {
   _path: string;
@@ -112,7 +104,7 @@ export async function editEscalation(
 
   try {
     await bwrb`bwrb edit --path ${escalationPath} --json ${json}`.cwd(config.bwrbVault).quiet();
-    return true;
+    return { ok: true };
   } catch (e) {
     const error = formatBwrbShellError(e);
     const kind = /no notes found in vault/i.test(error) ? "vault-missing" : "bwrb-error";
