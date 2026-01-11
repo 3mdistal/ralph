@@ -76,8 +76,9 @@ Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comme
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
+- `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 
-Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Set it to `[]` to disable merge gating for a repo.
+Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
 ### Environment variables
 

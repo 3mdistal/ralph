@@ -9,16 +9,58 @@ export interface RepoConfig {
   name: string;      // "3mdistal/bwrb"
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
-   /**
-    * Required status checks for merge gating (default: ["CI"]).
-    *
-    * IMPORTANT: Values must match the check context name shown by GitHub (case-sensitive).
-    */
+  /**
+   * Required status checks for merge gating (default: ["ci"]).
+   *
+   * Values must match the check context name shown by GitHub.
+   * Set to [] to disable merge gating for a repo.
+   */
   requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
 }
 
+
+export interface ThrottleWindowConfig {
+  budgetTokens?: number;
+}
+
+export interface ThrottleResetRolling5hConfig {
+  /** Reset hours in local time (default: [1, 6, 11, 16, 21]). */
+  hours?: number[];
+  /** Minute within the hour (default: 50). */
+  minute?: number;
+}
+
+export interface ThrottleResetWeeklyConfig {
+  /** Day of week in local time (0=Sun ... 6=Sat). Default: 4 (Thu). */
+  dayOfWeek?: number;
+  /** Hour in local time (0-23). Default: 19. */
+  hour?: number;
+  /** Minute within the hour. Default: 9. */
+  minute?: number;
+}
+
+export interface ThrottleConfig {
+  /** Enable usage-based throttling (default: true). */
+  enabled?: boolean;
+  /** Provider ID to count toward usage (default: "openai"). */
+  providerID?: string;
+  /** Soft throttle threshold as fraction of budget (default: 0.65). */
+  softPct?: number;
+  /** Hard throttle threshold (reserved for #72; default: 0.75). */
+  hardPct?: number;
+  /** Minimum interval between expensive usage scans (default: 15000ms). */
+  minCheckIntervalMs?: number;
+  windows?: {
+    rolling5h?: ThrottleWindowConfig;
+    weekly?: ThrottleWindowConfig;
+  };
+  reset?: {
+    rolling5h?: ThrottleResetRolling5hConfig;
+    weekly?: ThrottleResetWeeklyConfig;
+  };
+}
 
 export interface RalphConfig {
   repos: RepoConfig[];
@@ -30,6 +72,7 @@ export interface RalphConfig {
   owner: string;           // GitHub owner for repos (default: "3mdistal")
   devDir: string;          // base directory for repos (default: ~/Developer)
   watchdog?: WatchdogConfig;
+  throttle?: ThrottleConfig;
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
