@@ -115,6 +115,22 @@ describe("integration-ish harness: full task lifecycle", () => {
       stateReason: null,
     });
 
+    // Avoid hitting GitHub APIs during merge gating.
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      timedOut: false,
+    }));
+
+    const mergePullRequestMock = mock(async () => {});
+
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+
     let agentRunData: any = null;
     (worker as any).createAgentRun = async (_task: any, data: any) => {
       agentRunData = data;
@@ -127,9 +143,10 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("success");
     expect(result.pr).toBe("https://github.com/3mdistal/ralph/pull/999");
 
-    // Next-task + build + merge + survey happened.
+    // Next-task + build + CI-gated merge + survey happened.
     expect(runCommandMock).toHaveBeenCalled();
-    expect(continueSessionMock).toHaveBeenCalled();
+    expect(continueSessionMock).toHaveBeenCalledTimes(1);
+    expect(mergePullRequestMock).toHaveBeenCalled();
     expect(continueCommandMock).toHaveBeenCalled();
 
     // Task status transitions are explicit and deterministic.
