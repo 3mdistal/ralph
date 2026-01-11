@@ -75,6 +75,7 @@ Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comme
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
+- `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 
 ### Environment variables
 

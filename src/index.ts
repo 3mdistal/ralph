@@ -25,10 +25,11 @@ import {
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
+import { startQueuedTasks } from "./scheduler";
 
 import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
-import { isHardThrottled } from "./throttle";
+import { getThrottleDecision, isHardThrottled } from "./throttle";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { queueNudge } from "./nudge";
@@ -61,7 +62,7 @@ const inFlightTasks = new Set<string>();
 let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
-let rrCursor = 0;
+const rrCursor = { value: 0 };
 
 function ensureSemaphores(): void {
   if (globalSemaphore) return;
@@ -414,64 +415,36 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
 
   if (getDaemonMode() === "draining") return;
 
-  const throttle = await isHardThrottled();
-  if (throttle.hard) {
+  const throttle = await getThrottleDecision();
+  if (throttle.state === "hard") {
     if (shouldLog("daemon:hard-throttle", 30_000)) {
-      console.warn(`[ralph] Hard throttle active; skipping task scheduling until ${throttle.decision.snapshot.resumeAt ?? "unknown"}`);
+      console.warn(
+        `[ralph] Hard throttle active; skipping task scheduling until ${throttle.snapshot.resumeAt ?? "unknown"}`
+      );
     }
     return;
   }
 
-  if (tasks.length === 0) {
-    if (shouldLog("daemon:no-queued", 30_000)) {
-      console.log("[ralph] No queued tasks");
+  if (throttle.state === "soft") {
+    if (shouldLog("daemon:soft-throttle", 30_000)) {
+      console.warn(`[ralph] Soft throttle active; skipping task scheduling until ${throttle.snapshot.resumeAt ?? "unknown"}`);
     }
     return;
   }
 
-  const newTasks = tasks.filter((t) => !inFlightTasks.has(getTaskKey(t)));
-  if (newTasks.length === 0) {
-    if (shouldLog("daemon:all-in-flight", 30_000)) {
-      console.log("[ralph] All queued tasks already in flight");
-    }
-    return;
-  }
-
-  const byRepo = groupByRepo(newTasks);
-  const repos = Array.from(byRepo.keys());
-  if (repos.length === 0) return;
-
-  let startedCount = 0;
-
-  while (globalSemaphore.available() > 0) {
-    let startedThisRound = false;
-
-    for (let i = 0; i < repos.length; i++) {
-      const idx = (rrCursor + i) % repos.length;
-      const repo = repos[idx];
-      const repoTasks = byRepo.get(repo);
-      if (!repoTasks || repoTasks.length === 0) continue;
-
-      const releaseGlobal = globalSemaphore.tryAcquire();
-      if (!releaseGlobal) return;
-
-      const releaseRepo = getRepoSemaphore(repo).tryAcquire();
-      if (!releaseRepo) {
-        releaseGlobal();
-        continue;
-      }
-
-      const task = repoTasks.shift()!;
-      rrCursor = (idx + 1) % repos.length;
-
-      startedCount++;
-      startedThisRound = true;
-      startTask({ repo, task, releaseGlobal, releaseRepo });
-      break;
-    }
-
-    if (!startedThisRound) break;
-  }
+  const startedCount = startQueuedTasks({
+    gate: "running",
+    tasks,
+    inFlightTasks,
+    getTaskKey: (t) => getTaskKey(t),
+    groupByRepo,
+    globalSemaphore,
+    getRepoSemaphore,
+    rrCursor,
+    shouldLog,
+    log: (message) => console.log(message),
+    startTask,
+  });
 
   if (startedCount > 0) {
     console.log(`[ralph] Started ${startedCount} task(s)`);
@@ -639,7 +612,9 @@ async function main(): Promise<void> {
   drainMonitor = new DrainMonitor({
     log: (message) => console.log(message),
     onModeChange: (mode) => {
-      if (mode !== "running" || isShuttingDown) return;
+      if (isShuttingDown) return;
+      if (mode !== "running") return;
+
       void (async () => {
         const tasks = await getQueuedTasks();
         await processNewTasks(tasks);
@@ -923,7 +898,15 @@ if (args[0] === "status") {
   }
 
   const json = args.includes("--json");
-  const mode: DaemonMode = isDraining() ? "draining" : "running";
+
+  const throttle = await getThrottleDecision();
+  const mode = isDraining()
+    ? "draining"
+    : throttle.state === "hard"
+      ? "hard-throttled"
+      : throttle.state === "soft"
+        ? "soft-throttled"
+        : "running";
 
   const [inProgress, queued, throttled] = await Promise.all([
     getTasksByStatus("in-progress"),
@@ -952,6 +935,7 @@ if (args[0] === "status") {
       JSON.stringify(
         {
           mode,
+          throttle: throttle.snapshot,
           inProgress: inProgressWithStatus,
           queued: queued.map((t) => ({
             name: t.name,
