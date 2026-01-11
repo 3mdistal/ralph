@@ -1095,9 +1095,6 @@ export class RepoWorker {
 
         if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
 
-        const pausedFix = await this.pauseIfHardThrottled(task, "resume merge ci-fix", buildResult.sessionId || existingSessionId);
-        if (pausedFix) return pausedFix;
-
         const fixMessage = [
           `CI is required before merging to '${botBranch}'.`,
           `PR: ${prUrl}`,
@@ -1129,13 +1126,6 @@ export class RepoWorker {
           },
           ...this.buildWatchdogOptions(task, "resume-merge-ci-fix"),
         });
-
-        const pausedFixAfter = await this.pauseIfHardThrottled(
-          task,
-          "resume merge ci-fix (post)",
-          buildResult.sessionId || existingSessionId
-        );
-        if (pausedFixAfter) return pausedFixAfter;
 
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
@@ -1709,9 +1699,6 @@ export class RepoWorker {
 
         if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
 
-        const pausedFix = await this.pauseIfHardThrottled(task, "merge ci-fix", buildResult.sessionId);
-        if (pausedFix) return pausedFix;
-
         const fixMessage = [
           `CI is required before merging to '${botBranch}'.`,
           `PR: ${prUrl}`,
@@ -1743,9 +1730,6 @@ export class RepoWorker {
           },
           ...this.buildWatchdogOptions(task, "merge-ci-fix"),
         });
-
-        const pausedFixAfter = await this.pauseIfHardThrottled(task, "merge ci-fix (post)", buildResult.sessionId);
-        if (pausedFixAfter) return pausedFixAfter;
 
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
