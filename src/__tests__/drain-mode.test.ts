@@ -69,4 +69,39 @@ describe("Drain mode", () => {
     expect(modeChanges).toContain("draining");
     expect(modeChanges).toContain("running");
   });
+
+  test("DrainMonitor keeps last-known-good when control.json is invalid", async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+    tmpDirs.push(homeDir);
+
+    const warnings: string[] = [];
+    const monitor = new DrainMonitor({
+      homeDir,
+      pollIntervalMs: 10,
+      warn: (message) => warnings.push(message),
+    });
+
+    const controlPath = resolveControlFilePath(homeDir);
+    mkdirSync(dirname(controlPath), { recursive: true });
+
+    writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
+    monitor.start();
+    await sleep(50);
+
+    writeFileSync(controlPath, "{\"mode\":\"draining\"");
+    await sleep(50);
+
+    expect(monitor.getMode()).toBe("draining");
+    expect(warnings.some((w) => w.toLowerCase().includes("invalid"))).toBe(true);
+
+    const warningCount = warnings.length;
+    await sleep(50);
+    expect(warnings.length).toBe(warningCount);
+
+    writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
+    await sleep(50);
+
+    monitor.stop();
+    expect(monitor.getMode()).toBe("running");
+  });
 });

@@ -50,6 +50,47 @@ function formatWarning(message: string): string {
   return `[ralph] ${message}`;
 }
 
+type Sigusr1Subscriber = () => void;
+
+let sigusr1Installed = false;
+const sigusr1Subscribers = new Set<Sigusr1Subscriber>();
+
+const sigusr1Dispatcher = () => {
+  for (const cb of Array.from(sigusr1Subscribers)) {
+    try {
+      cb();
+    } catch {
+      // ignore subscriber errors
+    }
+  }
+};
+
+function subscribeSigusr1(cb: Sigusr1Subscriber): () => void {
+  if (!sigusr1Installed) {
+    try {
+      process.on("SIGUSR1", sigusr1Dispatcher);
+      sigusr1Installed = true;
+    } catch {
+      // ignore
+    }
+  }
+
+  sigusr1Subscribers.add(cb);
+
+  return () => {
+    sigusr1Subscribers.delete(cb);
+
+    if (sigusr1Installed && sigusr1Subscribers.size === 0) {
+      try {
+        process.off("SIGUSR1", sigusr1Dispatcher);
+      } catch {
+        // ignore
+      }
+      sigusr1Installed = false;
+    }
+  };
+}
+
 export function readControlStateSnapshot(opts?: {
   homeDir?: string;
   xdgStateHome?: string;
@@ -85,9 +126,7 @@ export class DrainMonitor {
   private lastMissing = false;
   private lastWarnedInvalidMtimeMs: number | null = null;
 
-  private readonly sigusr1Handler = () => {
-    this.reloadNow("SIGUSR1");
-  };
+  private unsubscribeSigusr1: (() => void) | null = null;
 
   constructor(
     private readonly options: {
@@ -107,10 +146,10 @@ export class DrainMonitor {
 
     this.reloadNow("startup", { force: true });
 
-    try {
-      process.on("SIGUSR1", this.sigusr1Handler);
-    } catch {
-      // best-effort; signal support can vary
+    if (!this.unsubscribeSigusr1) {
+      this.unsubscribeSigusr1 = subscribeSigusr1(() => {
+        this.reloadNow("SIGUSR1");
+      });
     }
 
     this.pollTimer = setInterval(() => {
@@ -124,10 +163,9 @@ export class DrainMonitor {
       this.pollTimer = null;
     }
 
-    try {
-      process.off("SIGUSR1", this.sigusr1Handler);
-    } catch {
-      // ignore
+    if (this.unsubscribeSigusr1) {
+      this.unsubscribeSigusr1();
+      this.unsubscribeSigusr1 = null;
     }
   }
 
