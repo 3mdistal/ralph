@@ -1,6 +1,6 @@
 import { homedir } from "os";
 import { join } from "path";
-import { readdir, readFile } from "fs/promises";
+import { readdir, readFile, stat } from "fs/promises";
 
 export interface OpenCodeUsageTotals {
   rolling5hTokens: number;
@@ -89,6 +89,14 @@ export async function readOpenCodeUsageTotals(opts: {
 
   try {
     for await (const filePath of filePaths) {
+      try {
+        const st = await stat(filePath);
+        if (st.mtimeMs < earliestStartMs) continue;
+      } catch {
+        filesSkipped++;
+        continue;
+      }
+
       let raw: string;
       try {
         raw = await readFile(filePath, "utf8");
