@@ -13,10 +13,16 @@ type BwrbProcess = {
 
 type BwrbRunner = (strings: TemplateStringsArray, ...values: unknown[]) => BwrbProcess;
 
-let bwrb: BwrbRunner = $ as unknown as BwrbRunner;
+const DEFAULT_BWRB_RUNNER: BwrbRunner = $ as unknown as BwrbRunner;
+
+let bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
 
 export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
   bwrb = runner;
+}
+
+export function __resetBwrbRunnerForTests(): void {
+  bwrb = DEFAULT_BWRB_RUNNER;
 }
 
 export interface AgentTask {

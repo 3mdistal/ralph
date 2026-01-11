@@ -264,8 +264,16 @@ describe("Queue discovery", () => {
   }
 
   beforeEach(async () => {
+    dataset = [];
+    lastCommand = "";
+
     const queue = await loadQueue();
     queue.__setBwrbRunnerForTests(createMockBwrbRunner());
+  });
+
+  afterEach(async () => {
+    const queue = await loadQueue();
+    queue.__resetBwrbRunnerForTests();
   });
 
   test("discovers queued agent-task notes nested under orchestration/tasks/**", async () => {
