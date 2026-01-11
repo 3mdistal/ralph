@@ -18,6 +18,7 @@ const gh: GhRunner = DEFAULT_GH_RUNNER;
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { getRepoBotBranch, getRepoMaxWorkers, getRepoRequiredChecks, loadConfig } from "./config";
+import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { getThrottleDecision } from "./throttle";
 import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
@@ -213,6 +214,44 @@ export class RepoWorker {
 
   private ensureLabelsPromise: Promise<void> | null = null;
 
+  private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
+    const completed = new Date();
+    const completedAt = completed.toISOString().split("T")[0];
+    const owners = getAllowedOwners();
+
+    const reason = `Repo owner is not in allowlist (repo=${task.repo}, allowedOwners=${owners.join(", ") || "none"})`;
+
+    console.warn(`[ralph:worker:${this.repo}] RALPH_BLOCKED_ALLOWLIST ${reason}`);
+
+    await this.createAgentRun(task, {
+      outcome: "failed",
+      started,
+      completed,
+      sessionId: task["session-id"]?.trim() || undefined,
+      bodyPrefix: [
+        "Blocked: repo owner not in allowlist",
+        "",
+        `Phase: ${phase}`,
+        `Repo: ${task.repo}`,
+        `Allowed owners: ${owners.join(", ")}`,
+      ].join("\n"),
+    });
+
+    await updateTaskStatus(task, "blocked", {
+      "completed-at": completedAt,
+      "session-id": "",
+      "watchdog-retries": "",
+      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+    });
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "failed",
+      escalationReason: reason,
+    };
+  }
+
   private async recordRunLogPath(task: AgentTask, issueNumber: string, stepTitle: string): Promise<string | undefined> {
     const runLogPath = getRalphRunLogPath({ repo: this.repo, issueNumber, stepTitle, ts: Date.now() });
     const updated = await updateTaskStatus(task, "in-progress", { "run-log-path": runLogPath });
@@ -223,6 +262,8 @@ export class RepoWorker {
   }
 
   private async ensureBaselineLabelsOnce(): Promise<void> {
+
+
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
 
     this.ensureLabelsPromise = (async () => {
@@ -438,7 +479,10 @@ export class RepoWorker {
   }): Promise<{ prUrl: string | null; diagnostics: string }> {
     const { task, issueNumber, issueTitle, botBranch } = params;
 
+    await ensureGhTokenEnv();
+
     const diagnostics: string[] = [
+
       "Ralph PR recovery:",
       `- Repo: ${this.repo}`,
       `- Issue: ${task.issue}`,
@@ -980,6 +1024,12 @@ export class RepoWorker {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
 
+    if (!isRepoAllowed(task.repo)) {
+      return await this.blockDisallowedRepo(task, startTime, "resume");
+    }
+
+    await ensureGhTokenEnv();
+
     const issueMeta = await this.getIssueMetadata(task.issue);
     if (issueMeta.state === "CLOSED") {
       return await this.skipClosedIssue(task, issueMeta, startTime);
@@ -1373,6 +1423,12 @@ export class RepoWorker {
       if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
       const issueNumber = issueMatch[1];
       const cacheKey = issueNumber;
+
+      if (!isRepoAllowed(task.repo)) {
+        return await this.blockDisallowedRepo(task, startTime, "start");
+      }
+
+      await ensureGhTokenEnv();
 
       // 2. Preflight: skip work if the upstream issue is already CLOSED
       const issueMeta = await this.getIssueMetadata(task.issue);

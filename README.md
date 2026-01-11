@@ -71,6 +71,11 @@ Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comme
 - `bwrbVault` (string): bwrb vault path for the task queue
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
+- `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
+- `githubApp` (object, optional): GitHub App installation auth for `gh` + REST
+  - `appId` (number|string)
+  - `installationId` (number|string)
+  - `privateKeyPath` (string): path to a PEM file; key material is never logged
 - `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
@@ -134,6 +139,18 @@ Live updates (prints when status changes):
 
 ```bash
 bun run watch
+```
+
+### List accessible repos
+
+```bash
+ralph repos
+```
+
+Machine-readable output:
+
+```bash
+ralph repos --json
 ```
 
 ### Nudge an in-progress task

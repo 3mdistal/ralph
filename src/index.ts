@@ -11,6 +11,7 @@ import { existsSync, watch } from "fs";
 import { join } from "path";
 
 import { getRepoMaxWorkers, getRepoPath, loadConfig } from "./config";
+import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
   initialPoll,
   startWatching,
@@ -632,6 +633,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph rollup <repo>                (stub) Rollup helpers",
@@ -666,6 +668,21 @@ function printCommandHelp(command: string): void {
           "  ralph status [--json]",
           "",
           "Shows daemon mode plus starting, queued, in-progress, and throttled tasks.",
+          "",
+          "Options:",
+          "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "repos":
+      console.log(
+        [
+          "Usage:",
+          "  ralph repos [--json]",
+          "",
+          "Lists repositories accessible to the configured GitHub App installation.",
+          "Output is filtered to allowed owners (guardrail).",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -845,6 +862,33 @@ if (args[0] === "status") {
   }
 
   process.exit(0);
+}
+
+if (args[0] === "repos") {
+  if (hasHelpFlag) {
+    printCommandHelp("repos");
+    process.exit(0);
+  }
+
+  const json = args.includes("--json");
+
+  try {
+    const repos = filterReposToAllowedOwners(await listAccessibleRepos());
+
+    if (json) {
+      console.log(JSON.stringify(repos, null, 2));
+      process.exit(0);
+    }
+
+    for (const repo of repos) {
+      console.log(repo.fullName);
+    }
+
+    process.exit(0);
+  } catch (e: any) {
+    console.error(`[ralph] Failed to list accessible repos: ${e?.message ?? String(e)}`);
+    process.exit(1);
+  }
 }
 
 if (args[0] === "nudge") {

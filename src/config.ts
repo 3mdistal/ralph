@@ -69,7 +69,22 @@ export interface RalphConfig {
   batchSize: number;       // PRs before rollup (default: 10)
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
   bwrbVault: string;       // path to bwrb vault for queue
-  owner: string;           // GitHub owner for repos (default: "3mdistal")
+  owner: string;           // default GitHub owner (default: "3mdistal")
+
+  /**
+   * Guardrail: only touch repos whose owner is in this allowlist.
+   * Default: [owner].
+   */
+  allowedOwners?: string[];
+
+  /** GitHub App auth (installation token) used for gh + REST calls. */
+  githubApp?: {
+    appId: number | string;
+    installationId: number | string;
+    /** PEM file path (read at runtime; never log key material). */
+    privateKeyPath: string;
+  };
+
   devDir: string;          // base directory for repos (default: ~/Developer)
   watchdog?: WatchdogConfig;
   throttle?: ThrottleConfig;
@@ -136,6 +151,30 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     }
     return repo;
   });
+
+  // Guardrail allowlist. Default to [owner].
+  const rawOwners = (loaded as any).allowedOwners;
+  if (Array.isArray(rawOwners)) {
+    const cleaned = rawOwners.map((v) => String(v ?? "").trim()).filter(Boolean);
+    if (cleaned.length === 0) {
+      console.warn(`[ralph] Invalid config allowedOwners=[]; defaulting to [${JSON.stringify(loaded.owner)}]`);
+      loaded.allowedOwners = [loaded.owner];
+    } else {
+      loaded.allowedOwners = cleaned;
+    }
+  } else if (rawOwners !== undefined) {
+    console.warn(`[ralph] Invalid config allowedOwners=${JSON.stringify(rawOwners)}; defaulting to [${JSON.stringify(loaded.owner)}]`);
+    loaded.allowedOwners = [loaded.owner];
+  } else {
+    loaded.allowedOwners = [loaded.owner];
+  }
+
+  // Best-effort validation for GitHub App auth config.
+  const rawGithubApp = (loaded as any).githubApp;
+  if (rawGithubApp !== undefined && rawGithubApp !== null && typeof rawGithubApp !== "object") {
+    console.warn(`[ralph] Invalid config githubApp=${JSON.stringify(rawGithubApp)}; ignoring`);
+    (loaded as any).githubApp = undefined;
+  }
 
   return loaded;
 }

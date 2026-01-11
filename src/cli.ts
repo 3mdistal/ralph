@@ -23,6 +23,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph rollup <repo>                (stub) Rollup helpers",
@@ -58,6 +59,21 @@ function printCommandHelp(command: string): void {
           "  ralph status [--json]",
           "",
           "Shows daemon mode plus starting, queued, in-progress, and throttled tasks.",
+          "",
+          "Options:",
+          "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "repos":
+      console.log(
+        [
+          "Usage:",
+          "  ralph repos [--json]",
+          "",
+          "Lists repositories accessible to the configured GitHub App installation.",
+          "Output is filtered to allowed owners (guardrail).",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -131,7 +147,7 @@ if (!cmd || cmd.startsWith("-")) {
   }
 }
 
-if ((cmd === "resume" || cmd === "status" || cmd === "watch" || cmd === "nudge" || cmd === "rollup") && hasHelpFlag) {
+if ((cmd === "resume" || cmd === "status" || cmd === "repos" || cmd === "watch" || cmd === "nudge" || cmd === "rollup") && hasHelpFlag) {
   printCommandHelp(cmd);
   process.exit(0);
 }
