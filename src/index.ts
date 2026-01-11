@@ -27,7 +27,7 @@ import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { startQueuedTasks } from "./scheduler";
 
-import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
+import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
 import { getThrottleDecision, isHardThrottled } from "./throttle";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
@@ -640,7 +640,8 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Drain mode: create/remove ~/.config/opencode/ralph/drain to pause scheduling new tasks.",
+      "  Drain mode: set mode=draining|running in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json).",
+      "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
   );
 }
@@ -752,7 +753,9 @@ if (args[0] === "status") {
   const json = args.includes("--json");
 
   const throttle = await getThrottleDecision();
-  const mode = isDraining()
+  const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+
+  const mode = control.mode === "draining"
     ? "draining"
     : throttle.state === "hard"
       ? "hard-throttled"

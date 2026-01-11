@@ -32,7 +32,8 @@ function printGlobalHelp(): void {
       "  --version                          Print version and exit",
       "",
       "Notes:",
-      "  Drain mode: create/remove ~/.config/opencode/ralph/drain to pause scheduling new tasks.",
+      "  Drain mode: set mode=draining|running in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json).",
+      "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
   );
 }

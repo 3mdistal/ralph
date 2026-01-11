@@ -222,9 +222,23 @@ On daemon startup, Ralph checks for orphaned starting/in-progress tasks:
 
 Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue.
 
-- Enable: create `~/.config/opencode/ralph/drain`
-- Disable: delete `~/.config/opencode/ralph/drain`
-- Observability: logs emit `Drain enabled` / `Drain disabled`, and `ralph status` shows `Mode: running|draining`
+Control file:
+
+- `$XDG_STATE_HOME/ralph/control.json`
+- Fallback: `~/.local/state/ralph/control.json`
+
+Example:
+
+```json
+{ "mode": "draining" }
+```
+
+Schema: `{ "mode": "running"|"draining", "pause_requested"?: boolean }` (unknown fields ignored)
+
+- Enable drain: set `mode` to `draining`
+- Disable drain: set `mode` to `running`
+- Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
+- Observability: logs emit `Control mode: draining|running`, and `ralph status` shows `Mode: ...`
 
 ## Watchdog (Hung Tool Calls)
 
