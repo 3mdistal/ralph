@@ -48,13 +48,13 @@ export function getRalphWorktreesDir(): string {
   return join(getRalphHomeDir(), "worktrees");
 }
 
-export function getRalphStateDir(): string {
+function getRalphStateDir(): string {
   const raw = process.env.XDG_STATE_HOME?.trim();
   const stateHome = raw ? raw : join(resolveHomeDir(), ".local", "state");
   return join(stateHome, "ralph");
 }
 
-export function getRalphRunLogsDir(): string {
+function getRalphRunLogsDir(): string {
   return join(getRalphStateDir(), "run-logs");
 }
 

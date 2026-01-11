@@ -399,9 +399,13 @@ async function runSession(
       /** Included in soft/hard timeout logs */
       context?: string;
     };
+    __testOverrides?: {
+      spawn?: SpawnFn;
+      scheduler?: Scheduler;
+    };
   }
 ): Promise<SessionResult> {
-  const scheduler = schedulerForTests ?? defaultScheduler;
+  const scheduler = options?.__testOverrides?.scheduler ?? schedulerForTests ?? defaultScheduler;
   const truncate = (value: string, max: number) => (value.length > max ? value.slice(0, max) + "…" : value);
 
   const mergeThresholds = (overrides?: Partial<WatchdogThresholdsMs>): WatchdogThresholdsMs => {
@@ -557,8 +561,9 @@ async function runSession(
   mkdirSync(xdgCacheHome, { recursive: true });
 
   const env = { ...process.env, XDG_CACHE_HOME: xdgCacheHome };
- 
-  const proc = spawnFn("opencode", args, {
+  const spawn = options?.__testOverrides?.spawn ?? spawnFn;
+
+  const proc = spawn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env,
@@ -1177,11 +1182,19 @@ export async function runCommand(
       recentEventLimit?: number;
       context?: string;
     };
+  },
+  testOverrides?: {
+    spawn?: SpawnFn;
+    scheduler?: Scheduler;
   }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");
-  return runSession(repoPath, message, { command: normalized, ...options });
+
+  const merged: any = { command: normalized, ...(options ?? {}) };
+  if (testOverrides) merged.__testOverrides = testOverrides;
+
+  return runSession(repoPath, message, merged);
 }
 
 /**
@@ -1263,6 +1276,9 @@ async function* streamSession(
     continueSession?: string;
     repo?: string;
     cacheKey?: string;
+    __testOverrides?: {
+      spawn?: SpawnFn;
+    };
   }
 ): AsyncGenerator<any, void, unknown> {
   const args: string[] = ["run"];
@@ -1282,7 +1298,9 @@ async function* streamSession(
   const xdgCacheHome = getIsolatedXdgCacheHome({ repo: options?.repo, cacheKey: options?.cacheKey });
   mkdirSync(xdgCacheHome, { recursive: true });
 
-  const proc = spawnFn("opencode", args, {
+  const spawn = options?.__testOverrides?.spawn ?? spawnFn;
+
+  const proc = spawn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, XDG_CACHE_HOME: xdgCacheHome },
@@ -1324,6 +1342,9 @@ export async function* __streamSessionForTests(
     continueSession?: string;
     repo?: string;
     cacheKey?: string;
+    __testOverrides?: {
+      spawn?: SpawnFn;
+    };
   }
 ): AsyncGenerator<any, void, unknown> {
   yield* streamSession(repoPath, message, options);

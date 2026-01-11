@@ -13,7 +13,7 @@ export interface GitHubRepoSummary {
   defaultBranch?: string;
 }
 
-export class GitHubAuthError extends Error {
+class GitHubAuthError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "GitHubAuthError";
@@ -29,7 +29,7 @@ type GitHubAppConfig = {
 type GitHubAuthDeps = {
   readFile: (path: string, encoding: "utf8") => Promise<string>;
   createSign: typeof crypto.createSign;
-  fetch: typeof fetch;
+  fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 };
 
 const DEFAULT_DEPS: GitHubAuthDeps = {
