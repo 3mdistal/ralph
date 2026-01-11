@@ -174,7 +174,7 @@ orchestration/
 
 ## How it works
 
-1. **Watch** - Ralph watches `orchestration/tasks/**` for queued tasks
+1. **Watch** - Ralph watches `orchestration/tasks/**` for queued (and restart-orphaned starting) tasks
 2. **Dispatch** - Runs `/next-task <issue>` to plan the work
 3. **Route** - Parses agent's decision (policy: `docs/escalation-policy.md`): proceed or escalate
 4. **Build** - If proceeding, tells agent to implement
@@ -197,10 +197,10 @@ session-id: ses_abc123
 ---
 ```
 
-On daemon startup, Ralph checks for orphaned in-progress tasks:
+On daemon startup, Ralph checks for orphaned starting/in-progress tasks:
 
 1. **Tasks with session-id** - Resumed using `continueSession()`. The agent picks up where it left off.
-2. **Tasks without session-id** - Reset to `queued` status. They'll be reprocessed from scratch.
+2. **Tasks without session-id** - Reset to `starting` status (restart-safe pre-session state), then retried from scratch.
 
 ### Graceful handling
 

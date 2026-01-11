@@ -361,7 +361,7 @@ export class RepoWorker {
     const worktreePath = join(RALPH_WORKTREES_DIR, repoKey, issueNumber, taskKey);
 
     await this.ensureGitWorktree(worktreePath);
-    await updateTaskStatus(task, "in-progress", { "worktree-path": worktreePath });
+    await updateTaskStatus(task, "starting", { "worktree-path": worktreePath });
 
     return { repoPath: worktreePath, worktreePath };
   }
@@ -975,13 +975,13 @@ export class RepoWorker {
 
     const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber || cacheKey, "resume");
 
-    const existingSessionId = task["session-id"]?.trim();
-    if (!existingSessionId) {
-      const reason = "In-progress task has no session-id; cannot resume";
-      console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
-      await updateTaskStatus(task, "queued", { "session-id": "" });
-      return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
-    }
+      const existingSessionId = task["session-id"]?.trim();
+      if (!existingSessionId) {
+        const reason = "In-progress task has no session-id; cannot resume";
+        console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
+        await updateTaskStatus(task, "starting", { "session-id": "" });
+        return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
+      }
 
 
     try {
@@ -1353,12 +1353,12 @@ export class RepoWorker {
       const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
       if (pausedPreStart) return pausedPreStart;
 
-      // 3. Mark task in-progress (use _path to avoid ambiguous names)
-      const markedInProgress = await updateTaskStatus(task, "in-progress", {
+      // 3. Mark task starting (restart-safe pre-session state)
+      const markedStarting = await updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
       });
-      if (!markedInProgress) {
-        throw new Error("Failed to mark task in-progress (bwrb edit failed)");
+      if (!markedStarting) {
+        throw new Error("Failed to mark task starting (bwrb edit failed)");
       }
 
       await this.ensureBaselineLabelsOnce();

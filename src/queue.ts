@@ -34,7 +34,7 @@ export interface AgentTask {
   scope: string;
   issue: string;
   repo: string;
-  status: "queued" | "in-progress" | "throttled" | "blocked" | "escalated" | "done";
+  status: "queued" | "starting" | "in-progress" | "throttled" | "blocked" | "escalated" | "done";
   priority?: string;
   name: string;
   run?: string;
@@ -118,6 +118,7 @@ function warnIfNestedTaskPaths(tasks: AgentTask[]): void {
 
 const VALID_TASK_STATUSES = new Set<AgentTask["status"]>([
   "queued",
+  "starting",
   "in-progress",
   "throttled",
   "blocked",
@@ -406,7 +407,8 @@ export function startWatching(onChange: QueueChangeHandler): void {
       if (shouldLog("queue:change", 2_000)) {
         console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
       }
-      const tasks = await getQueuedTasks();
+      const [queued, starting] = await Promise.all([getQueuedTasks(), getTasksByStatus("starting")]);
+      const tasks = [...starting, ...queued];
       for (const handler of changeHandlers) handler(tasks);
     }, 500);
   });
@@ -434,5 +436,6 @@ export function stopWatching(): void {
  */
 export async function initialPoll(): Promise<AgentTask[]> {
   console.log("[ralph:queue] Initial poll...");
-  return await getQueuedTasks();
+  const [queued, starting] = await Promise.all([getQueuedTasks(), getTasksByStatus("starting")]);
+  return [...starting, ...queued];
 }
