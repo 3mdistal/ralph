@@ -22,12 +22,14 @@ import {
   updateTaskStatus,
   type AgentTask,
 } from "./queue";
-import { RepoWorker } from "./worker";
+import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
-import { Scheduler, getTaskKey } from "./scheduler";
+import { Semaphore } from "./semaphore";
+import { startQueuedTasks } from "./scheduler";
 
 import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
+import { getThrottleDecision, isHardThrottled } from "./throttle";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { queueNudge } from "./nudge";
@@ -37,11 +39,12 @@ import {
   DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
   shouldDeferWaitingResolutionCheck,
 } from "./escalation-resume";
+import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 
 // --- State ---
 
 const workers = new Map<string, RepoWorker>();
-let rollupMonitor: RollupMonitor | null = null;
+let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
 
@@ -50,42 +53,32 @@ function getDaemonMode(): DaemonMode {
   return isDraining() ? "draining" : "running";
 }
 
-const scheduler = new Scheduler({
-  timers: { setTimeout, clearTimeout },
-  getDaemonMode,
-  isShuttingDown: () => isShuttingDown,
-  concurrency: {
-    getGlobalLimit: () => loadConfig().maxWorkers,
-    getRepoLimit: (repo) => getRepoMaxWorkers(repo),
-  },
-  queue: {
-    getQueuedTasks,
-    getTasksByStatus,
-    getTaskByPath,
-    updateTaskStatus,
-    groupByRepo,
-  },
-  workers: {
-    getOrCreateWorker: (repo) => getOrCreateWorker(repo),
-  },
-  rollup: {
-    recordMerge: async (repo, prUrl) => {
-      if (!rollupMonitor) return;
-      await rollupMonitor.recordMerge(repo, prUrl);
-    },
-  },
-  escalations: {
-    getEscalationsByStatus,
-    editEscalation,
-    readResolutionMessage,
-    buildWaitingResolutionUpdate,
-    shouldDeferWaitingResolutionCheck,
-    resolutionRecheckIntervalMs: DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
-  },
-  logging: {
-    shouldLog,
-  },
-});
+function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
+  return task._path || task.name;
+}
+
+// Track in-flight tasks to avoid double-processing
+const inFlightTasks = new Set<string>();
+
+let globalSemaphore: Semaphore | null = null;
+const repoSemaphores = new Map<string, Semaphore>();
+
+const rrCursor = { value: 0 };
+
+function ensureSemaphores(): void {
+  if (globalSemaphore) return;
+  const config = loadConfig();
+  globalSemaphore = new Semaphore(config.maxWorkers);
+}
+
+function getRepoSemaphore(repo: string): Semaphore {
+  let sem = repoSemaphores.get(repo);
+  if (!sem) {
+    sem = new Semaphore(getRepoMaxWorkers(repo));
+    repoSemaphores.set(repo, sem);
+  }
+  return sem;
+}
 
 function getOrCreateWorker(repo: string): RepoWorker {
   let worker = workers.get(repo);
@@ -98,11 +91,211 @@ function getOrCreateWorker(repo: string): RepoWorker {
   return created;
 }
 
+let scheduleQueuedTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleQueuedTasksSoon(): void {
+  if (scheduleQueuedTimer) return;
+  scheduleQueuedTimer = setTimeout(() => {
+    scheduleQueuedTimer = null;
+    if (isShuttingDown) return;
+    if (getDaemonMode() === "draining") return;
+    void getQueuedTasks().then((tasks) => processNewTasks(tasks));
+  }, 250);
+}
 
 let escalationWatcher: ReturnType<typeof watch> | null = null;
 let escalationDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+const resumeAttemptedThisRun = new Set<string>();
+let resumeDisabledUntil = 0;
 
+const RESUME_DISABLE_MS = 60_000;
+
+async function attemptResumeResolvedEscalations(): Promise<void> {
+  return await attemptResumeResolvedEscalationsImpl({
+    isShuttingDown: () => isShuttingDown,
+    now: () => Date.now(),
+
+    resumeAttemptedThisRun,
+    getResumeDisabledUntil: () => resumeDisabledUntil,
+    setResumeDisabledUntil: (ts) => {
+      resumeDisabledUntil = ts;
+    },
+    resumeDisableMs: RESUME_DISABLE_MS,
+    getVaultPathForLogs: () => loadConfig().bwrbVault,
+
+    ensureSemaphores,
+    getGlobalSemaphore: () => globalSemaphore,
+    getRepoSemaphore,
+
+    getTaskKey,
+    inFlightTasks,
+
+    getEscalationsByStatus,
+    editEscalation,
+    readResolutionMessage,
+
+    getTaskByPath,
+    updateTaskStatus,
+
+    shouldDeferWaitingResolutionCheck,
+    buildWaitingResolutionUpdate,
+    resolutionRecheckIntervalMs: DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
+
+    getOrCreateWorker,
+    recordMerge: async (repo, prUrl) => {
+      await rollupMonitor.recordMerge(repo, prUrl);
+    },
+    scheduleQueuedTasksSoon,
+  });
+}
+
+async function attemptResumeThrottledTasks(): Promise<void> {
+  if (getDaemonMode() === "draining" || isShuttingDown) return;
+
+  ensureSemaphores();
+  if (!globalSemaphore) return;
+
+  const throttled = await getTasksByStatus("throttled");
+  if (throttled.length === 0) return;
+
+  const throttle = await isHardThrottled();
+  if (throttle.hard) {
+    if (shouldLog("daemon:hard-throttle-resume", 60_000)) {
+      console.warn(
+        `[ralph] Hard throttle active; deferring resume of throttled tasks until ${throttle.decision.snapshot.resumeAt ?? "unknown"}`
+      );
+    }
+    return;
+  }
+
+  const now = Date.now();
+
+  for (const task of throttled) {
+    if (getDaemonMode() === "draining" || isShuttingDown) return;
+
+    const resumeAtRaw = task["resume-at"]?.trim() ?? "";
+    const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;
+    if (Number.isFinite(resumeAtTs) && resumeAtTs > now) continue;
+
+
+    const sessionId = task["session-id"]?.trim() ?? "";
+    if (!sessionId) {
+      await updateTaskStatus(task, "queued", {
+        "throttled-at": "",
+        "resume-at": "",
+        "usage-snapshot": "",
+      });
+      continue;
+    }
+
+    const taskKey = getTaskKey(task);
+    if (inFlightTasks.has(taskKey)) continue;
+
+    const releaseGlobal = globalSemaphore.tryAcquire();
+    if (!releaseGlobal) return;
+
+    const releaseRepo = getRepoSemaphore(task.repo).tryAcquire();
+    if (!releaseRepo) {
+      releaseGlobal();
+      continue;
+    }
+
+    await updateTaskStatus(task, "in-progress", {
+      "assigned-at": new Date().toISOString().split("T")[0],
+      "session-id": sessionId,
+      "throttled-at": "",
+      "resume-at": "",
+      "usage-snapshot": "",
+    });
+
+    inFlightTasks.add(taskKey);
+
+    getOrCreateWorker(task.repo)
+      .resumeTask(task, { resumeMessage: "Continue." })
+      .then(async (run) => {
+        if (run.outcome === "success" && run.pr) {
+          await rollupMonitor.recordMerge(task.repo, run.pr);
+        }
+      })
+      .catch((e: any) => {
+        console.error(`[ralph] Error resuming throttled task ${task.name}:`, e);
+      })
+      .finally(() => {
+        inFlightTasks.delete(taskKey);
+        releaseGlobal();
+        releaseRepo();
+        if (!isShuttingDown) scheduleQueuedTasksSoon();
+      });
+  }
+}
+
+function startTask(opts: {
+  repo: string;
+  task: AgentTask;
+  releaseGlobal: () => void;
+  releaseRepo: () => void;
+}): void {
+  const { repo, task, releaseGlobal, releaseRepo } = opts;
+  const key = getTaskKey(task);
+
+  inFlightTasks.add(key);
+
+  void getOrCreateWorker(repo)
+    .processTask(task)
+    .then(async (run: AgentRun) => {
+      if (run.outcome === "success" && run.pr) {
+        await rollupMonitor.recordMerge(repo, run.pr);
+      }
+    })
+    .catch((e) => {
+      console.error(`[ralph] Error processing task ${task.name}:`, e);
+    })
+    .finally(() => {
+      inFlightTasks.delete(key);
+      releaseGlobal();
+      releaseRepo();
+      if (!isShuttingDown) scheduleQueuedTasksSoon();
+    });
+}
+
+// --- Main Logic ---
+
+async function processNewTasks(tasks: AgentTask[]): Promise<void> {
+  ensureSemaphores();
+  if (!globalSemaphore) return;
+
+  if (getDaemonMode() === "draining") return;
+
+  const throttle = await getThrottleDecision();
+  if (throttle.state === "hard") {
+    if (shouldLog("daemon:hard-throttle", 30_000)) {
+      console.warn(
+        `[ralph] Hard throttle active; skipping task scheduling until ${throttle.snapshot.resumeAt ?? "unknown"}`
+      );
+    }
+    return;
+  }
+
+  if (throttle.state === "soft") return;
+
+  const startedCount = startQueuedTasks({
+    gate: "running",
+    tasks,
+    inFlightTasks,
+    getTaskKey: (t) => getTaskKey(t),
+    groupByRepo,
+    globalSemaphore,
+    getRepoSemaphore,
+    rrCursor,
+    shouldLog,
+    log: (message) => console.log(message),
+    startTask,
+  });
+
+  if (startedCount > 0) {
+    console.log(`[ralph] Started ${startedCount} task(s)`);
+  }
+}
 
 function formatTaskLabel(task: Pick<AgentTask, "name" | "issue" | "repo">): string {
   const issueMatch = task.issue.match(/#(\d+)$/);
@@ -134,7 +327,115 @@ async function printHeartbeatTick(): Promise<void> {
 }
 
 async function resumeTasksOnStartup(opts?: { awaitCompletion?: boolean }): Promise<void> {
-  await scheduler.resumeTasksOnStartup(opts);
+  ensureSemaphores();
+  if (!globalSemaphore) return;
+
+  const awaitCompletion = opts?.awaitCompletion ?? true;
+
+  const inProgress = await getTasksByStatus("in-progress");
+  if (inProgress.length === 0) return;
+
+  console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
+
+  const withoutSession = inProgress.filter((t) => !(t["session-id"]?.trim()));
+  for (const task of withoutSession) {
+    console.warn(`[ralph] In-progress task has no session ID, resetting to queued: ${task.name}`);
+    await updateTaskStatus(task, "queued", { "session-id": "" });
+  }
+
+  const withSession = inProgress.filter((t) => t["session-id"]?.trim());
+  if (withSession.length === 0) return;
+
+  const globalLimit = loadConfig().maxWorkers;
+
+  const byRepo = groupByRepo(withSession);
+  const repos = Array.from(byRepo.keys());
+  const perRepoResumed = new Map<string, number>();
+
+  const toResume: AgentTask[] = [];
+  let cursor = 0;
+
+  while (toResume.length < globalLimit) {
+    let progressed = false;
+
+    for (let i = 0; i < repos.length; i++) {
+      const idx = (cursor + i) % repos.length;
+      const repo = repos[idx];
+      const repoTasks = byRepo.get(repo);
+      if (!repoTasks || repoTasks.length === 0) continue;
+
+      const limit = getRepoMaxWorkers(repo);
+      const already = perRepoResumed.get(repo) ?? 0;
+      if (already >= limit) continue;
+
+      const task = repoTasks.shift()!;
+      toResume.push(task);
+      perRepoResumed.set(repo, already + 1);
+      cursor = (idx + 1) % repos.length;
+      progressed = true;
+      break;
+    }
+
+    if (!progressed) break;
+  }
+
+  const toRequeue: AgentTask[] = [];
+  for (const repo of repos) {
+    const remaining = byRepo.get(repo) ?? [];
+    for (const task of remaining) toRequeue.push(task);
+  }
+
+  for (const task of toRequeue) {
+    console.warn(
+      `[ralph] Concurrency limits exceeded on startup; resetting in-progress task to queued: ${task.name} (${task.repo})`
+    );
+    await updateTaskStatus(task, "queued", { "session-id": "" });
+  }
+
+  if (toResume.length === 0) return;
+
+  const promises: Promise<void>[] = [];
+
+  for (const task of toResume) {
+    const repo = task.repo;
+
+    const releaseGlobal = globalSemaphore.tryAcquire();
+    if (!releaseGlobal) {
+      console.warn(`[ralph] Global concurrency limit reached unexpectedly; skipping resume: ${task.name}`);
+      continue;
+    }
+
+    const releaseRepo = getRepoSemaphore(repo).tryAcquire();
+    if (!releaseRepo) {
+      releaseGlobal();
+      console.warn(`[ralph] Repo concurrency limit reached unexpectedly; skipping resume: ${task.name}`);
+      continue;
+    }
+
+    const key = getTaskKey(task);
+    inFlightTasks.add(key);
+
+    const promise = getOrCreateWorker(repo)
+      .resumeTask(task)
+      .then(() => {
+        // ignore
+      })
+      .catch((e: any) => {
+        console.error(`[ralph] Error resuming task ${task.name}:`, e);
+      })
+      .finally(() => {
+        inFlightTasks.delete(key);
+        releaseGlobal();
+        releaseRepo();
+        if (!isShuttingDown) scheduleQueuedTasksSoon();
+      });
+
+    promises.push(promise);
+  }
+
+  if (awaitCompletion) {
+    await Promise.allSettled(promises);
+  }
 }
 
 async function main(): Promise<void> {
@@ -157,10 +458,12 @@ async function main(): Promise<void> {
   drainMonitor = new DrainMonitor({
     log: (message) => console.log(message),
     onModeChange: (mode) => {
-      if (mode !== "running" || isShuttingDown) return;
+      if (isShuttingDown) return;
+      if (mode !== "running") return;
+
       void (async () => {
         const tasks = await getQueuedTasks();
-        await scheduler.processNewTasks(tasks);
+        await processNewTasks(tasks);
       })();
     },
   });
@@ -173,7 +476,10 @@ async function main(): Promise<void> {
   await resumeTasksOnStartup();
 
   // Resume any resolved escalations (HITL checkpoint) from the same session.
-  await scheduler.attemptResumeResolvedEscalations();
+  await attemptResumeResolvedEscalations();
+
+  // Resume any tasks paused by hard throttle.
+  await attemptResumeThrottledTasks();
 
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
@@ -181,14 +487,14 @@ async function main(): Promise<void> {
   console.log(`[ralph] Found ${initialTasks.length} queued task(s)`);
 
   if (initialTasks.length > 0 && getDaemonMode() !== "draining") {
-    await scheduler.processNewTasks(initialTasks);
+    await processNewTasks(initialTasks);
   }
 
   // Start file watching (no polling - watcher is reliable)
   console.log("[ralph] Starting queue watcher...");
   startWatching(async (tasks) => {
     if (!isShuttingDown && getDaemonMode() !== "draining") {
-      await scheduler.processNewTasks(tasks);
+      await processNewTasks(tasks);
     }
   });
 
@@ -202,7 +508,7 @@ async function main(): Promise<void> {
 
       if (escalationDebounceTimer) clearTimeout(escalationDebounceTimer);
       escalationDebounceTimer = setTimeout(() => {
-        scheduler.attemptResumeResolvedEscalations().catch(() => {
+        attemptResumeResolvedEscalations().catch(() => {
           // ignore
         });
       }, 750);
@@ -218,7 +524,7 @@ async function main(): Promise<void> {
     if (isShuttingDown) return;
 
     // Avoid hitting bwrb repeatedly when the daemon is idle.
-    if (scheduler.getInFlightSize() === 0) return;
+    if (inFlightTasks.size === 0) return;
 
     // Avoid overlapping ticks if bwrb/filesystem are slow.
     if (heartbeatInFlight) return;
@@ -232,7 +538,25 @@ async function main(): Promise<void> {
         heartbeatInFlight = false;
       });
   }, heartbeatIntervalMs);
-  
+
+  const throttleResumeIntervalMs = 15_000;
+  let throttleResumeInFlight = false;
+
+  const throttleResumeTimer = setInterval(() => {
+    if (isShuttingDown) return;
+    if (getDaemonMode() === "draining") return;
+    if (throttleResumeInFlight) return;
+    throttleResumeInFlight = true;
+
+    attemptResumeThrottledTasks()
+      .catch(() => {
+        // ignore
+      })
+      .finally(() => {
+        throttleResumeInFlight = false;
+      });
+  }, throttleResumeIntervalMs);
+
   console.log("");
   console.log("[ralph] Daemon running. Watching for queue changes...");
   console.log("[ralph] Press Ctrl+C to stop.");
@@ -258,24 +582,25 @@ async function main(): Promise<void> {
     }
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
+    clearInterval(throttleResumeTimer);
     
     // Wait for in-flight tasks
-    if (scheduler.getInFlightSize() > 0) {
-      console.log(`[ralph] Waiting for ${scheduler.getInFlightSize()} in-flight task(s)...`);
-
+    if (inFlightTasks.size > 0) {
+      console.log(`[ralph] Waiting for ${inFlightTasks.size} in-flight task(s)...`);
+      
       // Give tasks up to 60 seconds to complete
       const deadline = Date.now() + 60000;
-      while (scheduler.getInFlightSize() > 0 && Date.now() < deadline) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
+      while (inFlightTasks.size > 0 && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
-
-      if (scheduler.getInFlightSize() > 0) {
-        console.log(`[ralph] ${scheduler.getInFlightSize()} task(s) still running after timeout`);
+      
+      if (inFlightTasks.size > 0) {
+        console.log(`[ralph] ${inFlightTasks.size} task(s) still running after timeout`);
       }
     }
     
     // Check if any repos need a forced rollup
-    const status = rollupMonitor?.getStatus() ?? new Map();
+    const status = rollupMonitor.getStatus();
     for (const [repo, { count }] of status) {
       if (count > 0) {
         console.log(`[ralph] ${count} unrolled PR(s) for ${repo}`);
@@ -333,7 +658,7 @@ function printCommandHelp(command: string): void {
           "Usage:",
           "  ralph status [--json]",
           "",
-          "Shows daemon mode plus queued and in-progress tasks.",
+          "Shows daemon mode plus queued, in-progress, and throttled tasks.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -419,11 +744,20 @@ if (args[0] === "status") {
   }
 
   const json = args.includes("--json");
-  const mode: DaemonMode = isDraining() ? "draining" : "running";
 
-  const [inProgress, queued] = await Promise.all([
+  const throttle = await getThrottleDecision();
+  const mode = isDraining()
+    ? "draining"
+    : throttle.state === "hard"
+      ? "hard-throttled"
+      : throttle.state === "soft"
+        ? "soft-throttled"
+        : "running";
+
+  const [inProgress, queued, throttled] = await Promise.all([
     getTasksByStatus("in-progress"),
     getQueuedTasks(),
+    getTasksByStatus("throttled"),
   ]);
 
   if (json) {
@@ -447,12 +781,21 @@ if (args[0] === "status") {
       JSON.stringify(
         {
           mode,
+          throttle: throttle.snapshot,
           inProgress: inProgressWithStatus,
           queued: queued.map((t) => ({
             name: t.name,
             repo: t.repo,
             issue: t.issue,
             priority: t.priority ?? "p2-medium",
+          })),
+          throttled: throttled.map((t) => ({
+            name: t.name,
+            repo: t.repo,
+            issue: t.issue,
+            priority: t.priority ?? "p2-medium",
+            sessionId: t["session-id"]?.trim() || null,
+            resumeAt: t["resume-at"]?.trim() || null,
           })),
         },
         null,
@@ -472,6 +815,12 @@ if (args[0] === "status") {
   console.log(`Queued tasks: ${queued.length}`);
   for (const task of queued) {
     console.log(`  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}]`);
+  }
+
+  console.log(`Throttled tasks: ${throttled.length}`);
+  for (const task of throttled) {
+    const resumeAt = task["resume-at"]?.trim() || "unknown";
+    console.log(`  - ${task.name} (${task.repo}) resumeAt=${resumeAt} [${task.priority || "p2-medium"}]`);
   }
 
   process.exit(0);

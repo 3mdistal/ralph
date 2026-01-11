@@ -1,272 +1,279 @@
 import { describe, expect, mock, test } from "bun:test";
 
-import { Scheduler, type Timers } from "../scheduler";
+import { Semaphore } from "../semaphore";
+import { startQueuedTasks } from "../scheduler";
+import { attemptResumeResolvedEscalations } from "../escalation-resume-scheduler";
 import type { AgentTask } from "../queue";
-import type { DaemonMode } from "../drain";
 
-function createMockTask(overrides: Partial<AgentTask> = {}): AgentTask {
-  return {
-    _path: "orchestration/tasks/test-task.md",
-    _name: "test-task",
-    type: "agent-task",
-    "creation-date": "2026-01-10",
-    scope: "builder",
-    issue: "3mdistal/ralph#91",
-    repo: "3mdistal/ralph",
-    status: "queued",
-    priority: "p1-high",
-    name: "Scheduler Test Task",
-    ...overrides,
-  };
+type TestTask = { repo: string; _path: string; name: string };
+
+function groupByRepo(tasks: TestTask[]): Map<string, TestTask[]> {
+  const by = new Map<string, TestTask[]>();
+  for (const t of tasks) {
+    const existing = by.get(t.repo);
+    if (existing) existing.push(t);
+    else by.set(t.repo, [t]);
+  }
+  return by;
 }
 
-function createManualTimers(): Timers & { runAll: () => void } {
-  let nextId = 1;
-  const pending = new Map<number, () => void>();
+describe("Scheduler invariants", () => {
+  test("drain gates new queued starts", () => {
+    const started: TestTask[] = [];
 
-  return {
-    setTimeout: ((fn: any) => {
-      const id = nextId++;
-      pending.set(id, () => fn());
-      return id as any;
-    }) as any,
-    clearTimeout: ((id: any) => {
-      pending.delete(Number(id));
-    }) as any,
-    runAll: () => {
-      const callbacks = Array.from(pending.values());
-      pending.clear();
-      for (const cb of callbacks) cb();
-    },
-  };
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (err: any) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
-}
-
-describe("Scheduler (DI boundary)", () => {
-  test("drain gates new dequeues (scheduleQueuedTasksSoon)", async () => {
-    const timers = createManualTimers();
-    let mode: DaemonMode = "draining";
-
-    const getQueuedTasks = mock(async () => [] as AgentTask[]);
-
-    const scheduler = new Scheduler({
-      timers,
-      getDaemonMode: () => mode,
-      isShuttingDown: () => false,
-      concurrency: { getGlobalLimit: () => 4, getRepoLimit: () => 4 },
-      queue: {
-        getQueuedTasks,
-        getTasksByStatus: async () => [],
-        getTaskByPath: async () => null,
-        updateTaskStatus: async () => true,
-        groupByRepo: () => new Map(),
-      },
-      workers: {
-        getOrCreateWorker: () => ({
-          processTask: async () => ({ taskName: "", repo: "", outcome: "success" } as any),
-          resumeTask: async () => ({ taskName: "", repo: "", outcome: "success" } as any),
-        }),
-      },
-      rollup: { recordMerge: async () => {} },
-      escalations: {
-        getEscalationsByStatus: async () => [],
-        editEscalation: async () => {},
-        readResolutionMessage: async () => null,
-        buildWaitingResolutionUpdate: () => ({}),
-        shouldDeferWaitingResolutionCheck: () => false,
-        resolutionRecheckIntervalMs: 1,
-      },
-      logging: { shouldLog: () => false },
+    const startedCount = startQueuedTasks<TestTask>({
+      gate: "draining",
+      tasks: [{ repo: "a", _path: "t1", name: "t1" }],
+      inFlightTasks: new Set<string>(),
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore: new Semaphore(10),
+      getRepoSemaphore: () => new Semaphore(10),
+      rrCursor: { value: 0 },
+      shouldLog: () => false,
+      log: () => {},
+      startTask: ({ task }) => started.push(task),
     });
 
-    scheduler.scheduleQueuedTasksSoon();
-    scheduler.scheduleQueuedTasksSoon();
-    timers.runAll();
+    expect(startedCount).toBe(0);
+    expect(started.length).toBe(0);
+  });
 
-    expect(getQueuedTasks).not.toHaveBeenCalled();
+  test("no duplicate scheduling when watcher double-fires", () => {
+    const inFlightTasks = new Set<string>();
+    const started: TestTask[] = [];
 
-    mode = "running";
-    scheduler.scheduleQueuedTasksSoon();
-    timers.runAll();
+    const globalSemaphore = new Semaphore(10);
 
-    expect(getQueuedTasks).toHaveBeenCalledTimes(1);
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(10);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const rrCursor = { value: 0 };
+
+    const startTask = ({ repo, task }: { repo: string; task: TestTask }) => {
+      inFlightTasks.add(task._path || task.name);
+      started.push({ ...task, repo });
+    };
+
+    const tasks = [{ repo: "a", _path: "orchestration/tasks/t1.md", name: "t1" }];
+
+    const first = startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks,
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor,
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+    });
+
+    const second = startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks,
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor,
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+    });
+
+    expect(first).toBe(1);
+    expect(second).toBe(0);
+    expect(started.length).toBe(1);
   });
 
   test("resume still runs under drain (resolved escalations)", async () => {
-    const timers = createManualTimers();
-    const mode: DaemonMode = "draining";
-
     const resumeTask = mock(async () => ({ taskName: "", repo: "", outcome: "success" } as any));
-    const processTask = mock(async () => ({ taskName: "", repo: "", outcome: "success" } as any));
+
+    const resumeAttemptedThisRun = new Set<string>();
+    let resumeDisabledUntil = 0;
+
+    const globalSemaphore = new Semaphore(10);
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(10);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const inFlightTasks = new Set<string>();
 
     const escalation = {
       _path: "orchestration/escalations/e1.md",
+      _name: "e1",
+      type: "agent-escalation",
+      status: "resolved",
       repo: "3mdistal/ralph",
       "task-path": "orchestration/tasks/test-task.md",
       "session-id": "ses_123",
       "resume-attempted-at": "",
-    };
+      "resume-status": "",
+    } as any;
 
-    const scheduler = new Scheduler({
-      timers,
-      getDaemonMode: () => mode,
+    const task = {
+      _path: "orchestration/tasks/test-task.md",
+      _name: "test-task",
+      type: "agent-task",
+      "creation-date": "2026-01-10",
+      scope: "builder",
+      issue: "3mdistal/ralph#91",
+      repo: "3mdistal/ralph",
+      status: "in-progress",
+      name: "Scheduler Test Task",
+    } as AgentTask;
+
+    const updateTaskStatus = mock(async () => true);
+
+    await attemptResumeResolvedEscalations({
       isShuttingDown: () => false,
-      concurrency: { getGlobalLimit: () => 4, getRepoLimit: () => 4 },
-      queue: {
-        getQueuedTasks: async () => [],
-        getTasksByStatus: async () => [],
-        getTaskByPath: async () => createMockTask({ status: "in-progress" }),
-        updateTaskStatus: async () => true,
-        groupByRepo: () => new Map(),
-      },
-      workers: {
-        getOrCreateWorker: () => ({ processTask, resumeTask }),
-      },
-      rollup: { recordMerge: async () => {} },
-      escalations: {
-        getEscalationsByStatus: async () => [escalation],
-        editEscalation: async () => {},
-        readResolutionMessage: async () => "Do the thing",
-        buildWaitingResolutionUpdate: () => ({}),
-        shouldDeferWaitingResolutionCheck: () => false,
-        resolutionRecheckIntervalMs: 1,
-      },
-      logging: { shouldLog: () => false },
-    });
+      now: () => Date.now(),
 
-    await scheduler.attemptResumeResolvedEscalations();
+      resumeAttemptedThisRun,
+      getResumeDisabledUntil: () => resumeDisabledUntil,
+      setResumeDisabledUntil: (ts) => {
+        resumeDisabledUntil = ts;
+      },
+      resumeDisableMs: 60_000,
+      getVaultPathForLogs: () => "/tmp/vault",
+
+      ensureSemaphores: () => {},
+      getGlobalSemaphore: () => globalSemaphore,
+      getRepoSemaphore,
+
+      getTaskKey: (t) => t._path || t.name,
+      inFlightTasks,
+
+      getEscalationsByStatus: async () => [escalation],
+      editEscalation: async () => ({ ok: true }),
+      readResolutionMessage: async () => "Do the thing",
+
+      getTaskByPath: async () => task,
+      updateTaskStatus,
+
+      shouldDeferWaitingResolutionCheck: () => false,
+      buildWaitingResolutionUpdate: () => ({}),
+      resolutionRecheckIntervalMs: 1,
+
+      getOrCreateWorker: () => ({ resumeTask } as any),
+      recordMerge: async () => {},
+      scheduleQueuedTasksSoon: () => {},
+    });
 
     expect(resumeTask).toHaveBeenCalledTimes(1);
-    expect(processTask).toHaveBeenCalledTimes(0);
-  });
-
-  test("no duplicate scheduling when watcher double-fires (processNewTasks)", async () => {
-    const timers = createManualTimers();
-    let mode: DaemonMode = "running";
-
-    const run = deferred<any>();
-    const processTask = mock(async () => run.promise);
-
-    const scheduler = new Scheduler({
-      timers,
-      getDaemonMode: () => mode,
-      isShuttingDown: () => false,
-      concurrency: { getGlobalLimit: () => 4, getRepoLimit: () => 4 },
-      queue: {
-        getQueuedTasks: async () => [],
-        getTasksByStatus: async () => [],
-        getTaskByPath: async () => null,
-        updateTaskStatus: async () => true,
-        groupByRepo: (tasks) => {
-          const map = new Map<string, AgentTask[]>();
-          for (const t of tasks) {
-            const arr = map.get(t.repo) ?? [];
-            arr.push(t);
-            map.set(t.repo, arr);
-          }
-          return map;
-        },
-      },
-      workers: {
-        getOrCreateWorker: () => ({
-          processTask,
-          resumeTask: async () => ({ taskName: "", repo: "", outcome: "success" } as any),
-        }),
-      },
-      rollup: { recordMerge: async () => {} },
-      escalations: {
-        getEscalationsByStatus: async () => [],
-        editEscalation: async () => {},
-        readResolutionMessage: async () => null,
-        buildWaitingResolutionUpdate: () => ({}),
-        shouldDeferWaitingResolutionCheck: () => false,
-        resolutionRecheckIntervalMs: 1,
-      },
-      logging: { shouldLog: () => false },
-    });
-
-    const task = createMockTask();
-
-    await scheduler.processNewTasks([task]);
-    await scheduler.processNewTasks([task]);
-
-    expect(processTask).toHaveBeenCalledTimes(1);
-
-    run.resolve({ taskName: "", repo: "", outcome: "success" });
-
-    mode = "draining";
-    await scheduler.processNewTasks([createMockTask({ _path: "orchestration/tasks/other.md" })]);
-    expect(processTask).toHaveBeenCalledTimes(1);
+    expect(updateTaskStatus).toHaveBeenCalledWith(task, "in-progress", expect.any(Object));
   });
 
   test("no duplicate resume per task key (resolved escalations)", async () => {
-    const timers = createManualTimers();
+    const resumeTask = mock(async () => ({ taskName: "", repo: "", outcome: "success" } as any));
 
-    const run = deferred<any>();
-    const resumeTask = mock(async () => run.promise);
+    const resumeAttemptedThisRun = new Set<string>();
+    let resumeDisabledUntil = 0;
 
-    const sharedTask = createMockTask({ status: "in-progress" });
+    const globalSemaphore = new Semaphore(10);
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(10);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const inFlightTasks = new Set<string>();
+
+    const taskPath = "orchestration/tasks/test-task.md";
 
     const escalations = [
       {
         _path: "orchestration/escalations/e1.md",
+        _name: "e1",
+        type: "agent-escalation",
+        status: "resolved",
         repo: "3mdistal/ralph",
-        "task-path": sharedTask._path,
+        "task-path": taskPath,
         "session-id": "ses_123",
         "resume-attempted-at": "",
+        "resume-status": "",
       },
       {
         _path: "orchestration/escalations/e2.md",
+        _name: "e2",
+        type: "agent-escalation",
+        status: "resolved",
         repo: "3mdistal/ralph",
-        "task-path": sharedTask._path,
+        "task-path": taskPath,
         "session-id": "ses_123",
         "resume-attempted-at": "",
+        "resume-status": "",
       },
-    ];
+    ] as any[];
 
-    const scheduler = new Scheduler({
-      timers,
-      getDaemonMode: () => "running",
+    const task = {
+      _path: taskPath,
+      _name: "test-task",
+      type: "agent-task",
+      "creation-date": "2026-01-10",
+      scope: "builder",
+      issue: "3mdistal/ralph#91",
+      repo: "3mdistal/ralph",
+      status: "in-progress",
+      name: "Scheduler Test Task",
+    } as AgentTask;
+
+    await attemptResumeResolvedEscalations({
       isShuttingDown: () => false,
-      concurrency: { getGlobalLimit: () => 4, getRepoLimit: () => 4 },
-      queue: {
-        getQueuedTasks: async () => [],
-        getTasksByStatus: async () => [],
-        getTaskByPath: async () => sharedTask,
-        updateTaskStatus: async () => true,
-        groupByRepo: () => new Map(),
+      now: () => Date.now(),
+
+      resumeAttemptedThisRun,
+      getResumeDisabledUntil: () => resumeDisabledUntil,
+      setResumeDisabledUntil: (ts) => {
+        resumeDisabledUntil = ts;
       },
-      workers: {
-        getOrCreateWorker: () => ({
-          processTask: async () => ({ taskName: "", repo: "", outcome: "success" } as any),
-          resumeTask,
-        }),
-      },
-      rollup: { recordMerge: async () => {} },
-      escalations: {
-        getEscalationsByStatus: async () => escalations,
-        editEscalation: async () => {},
-        readResolutionMessage: async () => "Proceed",
-        buildWaitingResolutionUpdate: () => ({}),
-        shouldDeferWaitingResolutionCheck: () => false,
-        resolutionRecheckIntervalMs: 1,
-      },
-      logging: { shouldLog: () => false },
+      resumeDisableMs: 60_000,
+      getVaultPathForLogs: () => "/tmp/vault",
+
+      ensureSemaphores: () => {},
+      getGlobalSemaphore: () => globalSemaphore,
+      getRepoSemaphore,
+
+      getTaskKey: (t) => t._path || t.name,
+      inFlightTasks,
+
+      getEscalationsByStatus: async () => escalations,
+      editEscalation: async () => ({ ok: true }),
+      readResolutionMessage: async () => "Proceed",
+
+      getTaskByPath: async () => task,
+      updateTaskStatus: async () => true,
+
+      shouldDeferWaitingResolutionCheck: () => false,
+      buildWaitingResolutionUpdate: () => ({}),
+      resolutionRecheckIntervalMs: 1,
+
+      getOrCreateWorker: () => ({ resumeTask } as any),
+      recordMerge: async () => {},
+      scheduleQueuedTasksSoon: () => {},
     });
 
-    await scheduler.attemptResumeResolvedEscalations();
-
     expect(resumeTask).toHaveBeenCalledTimes(1);
-
-    run.resolve({ taskName: "", repo: "", outcome: "success" });
   });
 });

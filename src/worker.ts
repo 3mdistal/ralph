@@ -14,20 +14,14 @@ type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProce
 
 const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 
-let gh: GhRunner = DEFAULT_GH_RUNNER;
-
-export function __setGhRunnerForTests(runner: GhRunner): void {
-  gh = runner;
-}
-
-export function __resetGhRunnerForTests(): void {
-  gh = DEFAULT_GH_RUNNER;
-}
+const gh: GhRunner = DEFAULT_GH_RUNNER;
 
 import { type AgentTask, updateTaskStatus } from "./queue";
-import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
+import { getRepoBotBranch, getRepoMaxWorkers, getRepoRequiredChecks, loadConfig } from "./config";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
-import { extractPrUrl, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
+import { getThrottleDecision } from "./throttle";
+import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
+import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
 import {
   isExplicitBlockerReason,
   isImplementationTaskFromIssue,
@@ -39,6 +33,12 @@ import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationConte
 import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
 import { getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
+import {
+  parseGitWorktreeListPorcelain,
+  pickWorktreeForIssue,
+  stripHeadsRef,
+  type GitWorktreeEntry,
+} from "./git-worktree";
 
 // Ralph introspection logs location
 const RALPH_SESSIONS_DIR = getRalphSessionsDir();
@@ -87,31 +87,7 @@ async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount
 
   try {
     const content = await readFile(eventsPath, "utf8");
-    const lines = content.trim().split("\n").filter(Boolean);
-    
-    let total = 0;
-    const recentAnomalies: number[] = [];
-    const now = Date.now();
-    const BURST_WINDOW_MS = 10000; // 10 seconds
-    
-    for (const line of lines) {
-      try {
-        const event = JSON.parse(line);
-        if (event.type === "anomaly") {
-          total++;
-          if (event.ts && (now - event.ts) < BURST_WINDOW_MS) {
-            recentAnomalies.push(event.ts);
-          }
-        }
-      } catch {
-        // ignore malformed lines
-      }
-    }
-    
-    // A burst is 20+ anomalies in the last 10 seconds
-    const recentBurst = recentAnomalies.length >= 20;
-    
-    return { total, recentBurst };
+    return computeLiveAnomalyCountFromJsonl(content, Date.now());
   } catch {
     return { total: 0, recentBurst: false };
   }
@@ -131,7 +107,7 @@ async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
 export interface AgentRun {
   taskName: string;
   repo: string;
-  outcome: "success" | "escalated" | "failed";
+  outcome: "success" | "throttled" | "escalated" | "failed";
   pr?: string;
   sessionId?: string;
   escalationReason?: string;
@@ -156,6 +132,80 @@ function summarizeForNote(text: string, maxChars = 900): string {
 function resolveVaultPath(p: string): string {
   const vault = loadConfig().bwrbVault;
   return isAbsolute(p) ? p : join(vault, p);
+}
+
+type RequiredCheckState = "SUCCESS" | "PENDING" | "FAILURE" | "UNKNOWN";
+
+type PrCheck = {
+  name: string;
+  state: RequiredCheckState;
+  rawState: string;
+};
+
+type RequiredChecksSummary = {
+  status: "success" | "pending" | "failure";
+  required: Array<{ name: string; state: RequiredCheckState; rawState: string }>;
+  available: string[];
+};
+
+function splitRepoFullName(full: string): { owner: string; name: string } {
+  const [owner, name] = full.split("/");
+  if (!owner || !name) {
+    throw new Error(`Invalid repo name (expected owner/name): ${full}`);
+  }
+  return { owner, name };
+}
+
+function extractPullRequestNumber(url: string): number | null {
+  const match = url.match(/\/pull\/(\d+)(?:$|\b|\/)/);
+  if (!match) return null;
+  return Number.parseInt(match[1], 10);
+}
+
+function normalizeRequiredCheckState(raw: string | null | undefined): RequiredCheckState {
+  const val = String(raw ?? "").toUpperCase();
+  if (!val) return "UNKNOWN";
+  if (val === "SUCCESS") return "SUCCESS";
+
+  // Common non-success terminal states.
+  if (["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE"].includes(val)) {
+    return "FAILURE";
+  }
+
+  // Treat everything else (including IN_PROGRESS, QUEUED, PENDING) as pending.
+  return "PENDING";
+}
+
+function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: string[]): RequiredChecksSummary {
+  const available = Array.from(new Set(allChecks.map((c) => c.name))).sort();
+
+  const required = requiredChecks.map((name) => {
+    const match = allChecks.find((c) => c.name === name);
+    if (!match) return { name, state: "UNKNOWN" as const, rawState: "missing" };
+    return { name, state: match.state, rawState: match.rawState };
+  });
+
+  const hasFailure = required.some((c) => c.state === "FAILURE");
+  if (hasFailure) return { status: "failure", required, available };
+
+  const allSuccess = required.length > 0 && required.every((c) => c.state === "SUCCESS");
+  if (allSuccess) return { status: "success", required, available };
+
+  return { status: "pending", required, available };
+}
+
+function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
+  const lines: string[] = [];
+  lines.push(`Required checks: ${summary.required.map((c) => c.name).join(", ") || "(none)"}`);
+  for (const chk of summary.required) {
+    lines.push(`- ${chk.name}: ${chk.rawState}`);
+  }
+
+  if (summary.available.length > 0) {
+    lines.push("", "Available check contexts:", ...summary.available.map((c) => `- ${c}`));
+  }
+
+  return lines.join("\n");
 }
 
 export class RepoWorker {
@@ -211,26 +261,59 @@ export class RepoWorker {
   }
 
   private async ensureGitWorktree(worktreePath: string): Promise<void> {
+    const worktreeGitMarker = join(worktreePath, ".git");
+
+    const hasHealthyWorktree = () => existsSync(worktreePath) && existsSync(worktreeGitMarker);
+
+    const cleanupBrokenWorktree = async (): Promise<void> => {
+      try {
+        await $`git worktree remove --force ${worktreePath}`.cwd(this.repoPath).quiet();
+      } catch {
+        // ignore
+      }
+
+      try {
+        await rm(worktreePath, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    };
+
+    // If git knows about the worktree but the path is broken, clean it up.
     try {
       const list = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
       const out = list.stdout.toString();
-      if (out.includes(`worktree ${worktreePath}\n`)) return;
+      if (out.includes(`worktree ${worktreePath}\n`)) {
+        if (hasHealthyWorktree()) return;
+        console.warn(`[ralph:worker:${this.repo}] Worktree registered but unhealthy; recreating: ${worktreePath}`);
+        await cleanupBrokenWorktree();
+      }
     } catch {
       // ignore and attempt create
+    }
+
+    // If the directory exists but is not a valid git worktree, remove it.
+    if (existsSync(worktreePath) && !hasHealthyWorktree()) {
+      console.warn(`[ralph:worker:${this.repo}] Worktree path exists but is not a worktree; recreating: ${worktreePath}`);
+      await cleanupBrokenWorktree();
     }
 
     await mkdir(dirname(worktreePath), { recursive: true });
 
     const ref = await this.resolveWorktreeRef();
-    try {
+    const create = async () => {
       await $`git worktree add --detach ${worktreePath} ${ref}`.cwd(this.repoPath).quiet();
-    } catch (e: any) {
-      // If it already exists, treat as best-effort reuse.
-      if (existsSync(worktreePath)) {
-        console.warn(`[ralph:worker:${this.repo}] Failed to add worktree; reusing existing path: ${worktreePath}`);
-        return;
+      if (!hasHealthyWorktree()) {
+        throw new Error(`Worktree created but missing .git marker: ${worktreePath}`);
       }
-      throw e;
+    };
+
+    try {
+      await create();
+    } catch (e: any) {
+      // Retry once after forcing cleanup. This handles half-created directories or stale git metadata.
+      await cleanupBrokenWorktree();
+      await create();
     }
   }
 
@@ -309,6 +392,373 @@ export class RepoWorker {
     }
   }
 
+  private buildPrCreationNudge(botBranch: string, issueNumber: string, issueRef: string): string {
+    const fixes = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${issueRef}`;
+
+    return [
+      `No PR URL found. Create a PR targeting '${botBranch}' and paste the PR URL.`,
+      "",
+      "Commands (run in the task worktree):",
+      "```bash",
+      "git status",
+      "git push -u origin HEAD",
+      `gh pr create --base ${botBranch} --fill --body \"${fixes}\"`,
+      "```",
+      "",
+      "If a PR already exists:",
+      "```bash",
+      "gh pr list --head $(git branch --show-current) --json url --limit 1",
+      "```",
+    ].join("\n");
+  }
+
+  private async getGitWorktrees(): Promise<GitWorktreeEntry[]> {
+    try {
+      const result = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
+      return parseGitWorktreeListPorcelain(result.stdout.toString());
+    } catch {
+      return [];
+    }
+  }
+
+  private async tryEnsurePrFromWorktree(params: {
+    task: AgentTask;
+    issueNumber: string;
+    issueTitle: string;
+    botBranch: string;
+  }): Promise<{ prUrl: string | null; diagnostics: string }> {
+    const { task, issueNumber, issueTitle, botBranch } = params;
+
+    const diagnostics: string[] = [
+      "Ralph PR recovery:",
+      `- Repo: ${this.repo}`,
+      `- Issue: ${task.issue}`,
+      `- Base: ${botBranch}`,
+    ];
+
+    if (!issueNumber) {
+      diagnostics.push("- No issue number detected; skipping auto PR recovery");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const entries = await this.getGitWorktrees();
+    const candidate = pickWorktreeForIssue(entries, issueNumber, {
+      deprioritizeBranches: ["main", botBranch],
+    });
+
+    if (!candidate) {
+      diagnostics.push(`- No worktree matched issue ${issueNumber}`);
+      diagnostics.push("- Manual: run `git worktree list` in the repo root to locate the task worktree");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const branch = stripHeadsRef(candidate.branch);
+    diagnostics.push(`- Worktree: ${candidate.worktreePath}`);
+    diagnostics.push(`- Branch: ${branch ?? "(unknown)"}`);
+
+    if (!branch || candidate.detached) {
+      diagnostics.push("- Cannot auto-create PR: detached HEAD or unknown branch");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    try {
+      const list = await gh`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
+      const data = JSON.parse(list.stdout.toString());
+      const existingUrl = data?.[0]?.url as string | undefined;
+      if (existingUrl) {
+        diagnostics.push(`- Found existing PR: ${existingUrl}`);
+        return { prUrl: existingUrl, diagnostics: diagnostics.join("\n") };
+      }
+    } catch (e: any) {
+      diagnostics.push(`- gh pr list failed: ${e?.message ?? String(e)}`);
+    }
+
+    try {
+      const status = await $`git status --porcelain`.cwd(candidate.worktreePath).quiet();
+      if (status.stdout.toString().trim()) {
+        diagnostics.push("- Worktree has uncommitted changes; skipping auto push/PR create");
+        diagnostics.push(`- Manual: cd ${candidate.worktreePath} && git status`);
+        return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      }
+    } catch (e: any) {
+      diagnostics.push(`- git status failed: ${e?.message ?? String(e)}`);
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    try {
+      await $`git push -u origin HEAD`.cwd(candidate.worktreePath).quiet();
+      diagnostics.push("- Pushed branch to origin");
+    } catch (e: any) {
+      diagnostics.push(`- git push failed: ${e?.message ?? String(e)}`);
+      diagnostics.push(`- Manual: cd ${candidate.worktreePath} && git push -u origin ${branch}`);
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const title = issueTitle?.trim() ? issueTitle.trim() : `Fixes #${issueNumber}`;
+    const body = [
+      `Fixes #${issueNumber}`,
+      "",
+      "## Summary",
+      "- (Auto-created by Ralph: agent completed without a PR URL)",
+      "",
+      "## Testing",
+      "- (Please fill in)",
+      "",
+    ].join("\n");
+
+    try {
+      const created = await gh`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
+        .cwd(candidate.worktreePath)
+        .quiet();
+
+      const prUrl = extractPrUrl(created.stdout.toString()) ?? null;
+      diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
+
+      if (prUrl) return { prUrl, diagnostics: diagnostics.join("\n") };
+    } catch (e: any) {
+      diagnostics.push(`- gh pr create failed: ${e?.message ?? String(e)}`);
+    }
+
+    try {
+      const list = await gh`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
+      const data = JSON.parse(list.stdout.toString());
+      const url = data?.[0]?.url as string | undefined;
+      if (url) {
+        diagnostics.push(`- Found PR after create attempt: ${url}`);
+        return { prUrl: url, diagnostics: diagnostics.join("\n") };
+      }
+    } catch (e: any) {
+      diagnostics.push(`- Final gh pr list failed: ${e?.message ?? String(e)}`);
+    }
+
+    diagnostics.push("- No PR URL recovered");
+    return { prUrl: null, diagnostics: diagnostics.join("\n") };
+  }
+
+  private async getPullRequestChecks(prUrl: string): Promise<{ headSha: string; checks: PrCheck[] }> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+
+    const query = [
+      "query($owner:String!,$name:String!,$number:Int!){",
+      "repository(owner:$owner,name:$name){",
+      "pullRequest(number:$number){",
+      "headRefOid",
+      "statusCheckRollup{",
+      "contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}",
+      "}",
+      "}",
+      "}",
+      "}",
+    ].join(" ");
+
+    const result = await gh`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
+    const parsed = JSON.parse(result.stdout.toString());
+
+    const pr = parsed?.data?.repository?.pullRequest;
+    const headSha = pr?.headRefOid as string | undefined;
+    if (!headSha) {
+      throw new Error(`Failed to read pull request head SHA for ${prUrl}`);
+    }
+
+    const nodes = pr?.statusCheckRollup?.contexts?.nodes;
+    const checksRaw = Array.isArray(nodes) ? nodes : [];
+
+    const checks: PrCheck[] = [];
+
+    for (const node of checksRaw) {
+      const type = String(node?.__typename ?? "");
+
+      if (type === "CheckRun") {
+        const name = String(node?.name ?? "").trim();
+        if (!name) continue;
+
+        const status = String(node?.status ?? "");
+        const conclusion = String(node?.conclusion ?? "");
+
+        // If it's not completed yet, treat status as the state.
+        const rawState = status && status !== "COMPLETED" ? status : conclusion || status || "UNKNOWN";
+        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState) });
+        continue;
+      }
+
+      if (type === "StatusContext") {
+        const name = String(node?.context ?? "").trim();
+        if (!name) continue;
+
+        const rawState = String(node?.state ?? "UNKNOWN");
+        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState) });
+        continue;
+      }
+    }
+
+    return { headSha, checks };
+  }
+
+  private async waitForRequiredChecks(
+    prUrl: string,
+    requiredChecks: string[],
+    opts: { timeoutMs: number; pollIntervalMs: number }
+  ): Promise<{ headSha: string; summary: RequiredChecksSummary; timedOut: boolean }> {
+    const startedAt = Date.now();
+    let last: { headSha: string; summary: RequiredChecksSummary } | null = null;
+
+    while (Date.now() - startedAt < opts.timeoutMs) {
+      const { headSha, checks } = await this.getPullRequestChecks(prUrl);
+      const summary = summarizeRequiredChecks(checks, requiredChecks);
+      last = { headSha, summary };
+
+      if (summary.status === "success" || summary.status === "failure") {
+        return { headSha, summary, timedOut: false };
+      }
+
+      await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
+    }
+
+    if (last) {
+      return { headSha: last.headSha, summary: last.summary, timedOut: true };
+    }
+
+    // Should be unreachable, but keep types happy.
+    const fallback = await this.getPullRequestChecks(prUrl);
+    return {
+      headSha: fallback.headSha,
+      summary: summarizeRequiredChecks(fallback.checks, requiredChecks),
+      timedOut: true,
+    };
+  }
+
+  private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
+    // Never pass --admin or -d (delete branch). The orchestrator should not bypass checks or clean up git branches.
+    await gh`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
+  }
+
+  private async mergePrWithRequiredChecks(params: {
+    task: AgentTask;
+    repoPath: string;
+    cacheKey: string;
+    botBranch: string;
+    prUrl: string;
+    sessionId: string;
+    watchdogStagePrefix: string;
+    notifyTitle: string;
+  }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
+    const REQUIRED_CHECKS = getRepoRequiredChecks(this.repo);
+    const MAX_CI_FIX_ATTEMPTS = 3;
+
+    let prUrl = params.prUrl;
+    let sessionId = params.sessionId;
+    let lastSummary: RequiredChecksSummary | null = null;
+
+    for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
+      const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
+        timeoutMs: 45 * 60_000,
+        pollIntervalMs: 30_000,
+      });
+
+      lastSummary = checkResult.summary;
+
+      if (checkResult.summary.status === "success") {
+        console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+        await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+        return { ok: true, prUrl, sessionId };
+      }
+
+      if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
+
+      const fixMessage = [
+        `CI is required before merging to '${params.botBranch}'.`,
+        `PR: ${prUrl}`,
+        "",
+        checkResult.timedOut
+          ? "Timed out waiting for required checks to complete."
+          : "One or more required checks failed.",
+        "",
+        formatRequiredChecksForHumans(checkResult.summary),
+        "",
+        "Do NOT merge yet.",
+        "Fix the CI failure (or rerun CI), push updates to the PR branch, and reply when CI is green.",
+        "",
+        "Commands:",
+        "```bash",
+        `gh pr checks ${prUrl} --repo ${this.repo}`,
+        "```",
+      ].join("\n");
+
+      const fixResult = await continueSession(params.repoPath, sessionId, fixMessage, {
+        repo: this.repo,
+        cacheKey: params.cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: params.task.issue,
+          taskName: params.task.name,
+          step: 5,
+          stepTitle: "fix CI",
+        },
+        ...this.buildWatchdogOptions(params.task, `${params.watchdogStagePrefix}-ci-fix`),
+      });
+
+      sessionId = fixResult.sessionId || sessionId;
+
+      if (!fixResult.success) {
+        if (fixResult.watchdogTimeout) {
+          const run = await this.handleWatchdogTimeout(
+            params.task,
+            params.cacheKey,
+            `${params.watchdogStagePrefix}-ci-fix`,
+            fixResult
+          );
+          return { ok: false, run };
+        }
+
+        const reason = `Failed while fixing CI before merge: ${fixResult.output}`;
+        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+        await updateTaskStatus(params.task, "blocked");
+        await notifyError(params.notifyTitle, reason, params.task.name);
+
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: reason,
+          },
+        };
+      }
+
+      if (fixResult.sessionId) {
+        await updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
+      }
+
+      const updatedPrUrl = extractPrUrl(fixResult.output);
+      if (updatedPrUrl) prUrl = updatedPrUrl;
+    }
+
+    const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
+    const reason = `Required checks not passing; refusing to merge ${prUrl}`;
+    console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+
+    await updateTaskStatus(params.task, "blocked");
+    await notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
+
+    return {
+      ok: false,
+      run: {
+        taskName: params.task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId,
+        escalationReason: reason,
+      },
+    };
+  }
+
   private async skipClosedIssue(task: AgentTask, issueMeta: IssueMetadata, started: Date): Promise<AgentRun> {
     const completed = new Date();
     const completedAt = completed.toISOString().split("T")[0];
@@ -384,12 +834,47 @@ export class RepoWorker {
     };
   }
 
+  private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
+    const decision = await getThrottleDecision();
+    if (decision.state !== "hard") return null;
+
+    const throttledAt = new Date().toISOString();
+    const resumeAt = decision.resumeAtTs ? new Date(decision.resumeAtTs).toISOString() : "";
+    const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
+
+    const extraFields: Record<string, string> = {
+      "throttled-at": throttledAt,
+      "resume-at": resumeAt,
+      "usage-snapshot": JSON.stringify(decision.snapshot),
+    };
+
+    if (sid) extraFields["session-id"] = sid;
+
+    await updateTaskStatus(task, "throttled", extraFields);
+
+    console.log(
+      `[ralph:worker:${this.repo}] Hard throttle active; pausing at checkpoint stage=${stage} resumeAt=${resumeAt || "unknown"}`
+    );
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "throttled",
+      sessionId: sid || undefined,
+    };
+  }
+
   private async drainNudges(task: AgentTask, repoPath: string, sessionId: string, cacheKey: string, stage: string): Promise<void> {
     const sid = sessionId?.trim();
     if (!sid) return;
 
     try {
       const result = await drainQueuedNudges(sid, async (message) => {
+        const paused = await this.pauseIfHardThrottled(task, `nudge-${stage}`, sid);
+        if (paused) {
+          return { success: false, error: "hard throttled" };
+        }
+
         const res = await continueSession(repoPath, sid, message, {
           repo: this.repo,
           cacheKey,
@@ -501,6 +986,8 @@ export class RepoWorker {
 
     try {
       const botBranch = getRepoBotBranch(this.repo);
+      const issueMeta = await this.getIssueMetadata(task.issue);
+
       const defaultResumeMessage =
         "Ralph restarted while this task was in progress. " +
         "Resume from where you left off. " +
@@ -508,6 +995,9 @@ export class RepoWorker {
         `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
 
       const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
+
+      const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
+      if (pausedBefore) return pausedBefore;
 
       let buildResult = await continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
@@ -521,6 +1011,10 @@ export class RepoWorker {
         },
         ...this.buildWatchdogOptions(task, "resume"),
       });
+
+      const pausedAfter = await this.pauseIfHardThrottled(task, "resume (post)", buildResult.sessionId || existingSessionId);
+      if (pausedAfter) return pausedAfter;
+
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult);
@@ -545,17 +1039,30 @@ export class RepoWorker {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
-        await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+      await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
 
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = extractPrUrl(buildResult.output);
+      let prUrl = extractPrUrlFromSession(buildResult);
+      let prRecoveryDiagnostics = "";
+
+      if (!prUrl) {
+        const recovered = await this.tryEnsurePrFromWorktree({
+          task,
+          issueNumber,
+          issueTitle: issueMeta.title || task.name,
+          botBranch,
+        });
+        prRecoveryDiagnostics = recovered.diagnostics;
+        prUrl = recovered.prUrl ?? prUrl;
+      }
+
       let continueAttempts = 0;
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
-      await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+        await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
 
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
         const newAnomalies = anomalyStatus.total - lastAnomalyCount;
@@ -582,7 +1089,7 @@ export class RepoWorker {
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
-              planOutput: buildResult.output,
+              planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
             return {
@@ -595,6 +1102,10 @@ export class RepoWorker {
           }
 
           console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
+
+          const pausedLoopBreak = await this.pauseIfHardThrottled(task, "resume loop-break", buildResult.sessionId || existingSessionId);
+          if (pausedLoopBreak) return pausedLoopBreak;
+
           buildResult = await continueSession(
             taskRepoPath,
             buildResult.sessionId,
@@ -613,6 +1124,13 @@ export class RepoWorker {
             }
           );
 
+          const pausedLoopBreakAfter = await this.pauseIfHardThrottled(
+            task,
+            "resume loop-break (post)",
+            buildResult.sessionId || existingSessionId
+          );
+          if (pausedLoopBreakAfter) return pausedLoopBreakAfter;
+
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult);
@@ -622,19 +1140,24 @@ export class RepoWorker {
           }
 
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = extractPrUrl(buildResult.output);
+          prUrl = extractPrUrlFromSession(buildResult);
 
           continue;
         }
 
         continueAttempts++;
         console.log(
-          `[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
+          `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
         );
 
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
+        const pausedContinue = await this.pauseIfHardThrottled(task, "resume continue", buildResult.sessionId || existingSessionId);
+        if (pausedContinue) return pausedContinue;
+
+        const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
+          timeoutMs: 10 * 60_000,
           introspection: {
             repo: this.repo,
             issue: task.issue,
@@ -644,12 +1167,47 @@ export class RepoWorker {
           },
           ...this.buildWatchdogOptions(task, "resume-continue"),
         });
-        if (!buildResult.success) {
-          console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
-          break;
-        }
 
-        prUrl = extractPrUrl(buildResult.output);
+        const pausedContinueAfter = await this.pauseIfHardThrottled(
+          task,
+          "resume continue (post)",
+          buildResult.sessionId || existingSessionId
+        );
+        if (pausedContinueAfter) return pausedContinueAfter;
+
+        if (!buildResult.success) {
+          if (buildResult.watchdogTimeout) {
+            return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult);
+          }
+
+          // If the session ended without printing a URL, try to recover PR from git state.
+          const recovered = await this.tryEnsurePrFromWorktree({
+            task,
+            issueNumber,
+            issueTitle: issueMeta.title || task.name,
+            botBranch,
+          });
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+          prUrl = recovered.prUrl ?? prUrl;
+
+          if (!prUrl) {
+            console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
+            break;
+          }
+        } else {
+          prUrl = extractPrUrlFromSession(buildResult);
+        }
+      }
+
+      if (!prUrl) {
+        const recovered = await this.tryEnsurePrFromWorktree({
+          task,
+          issueNumber,
+          issueTitle: issueMeta.title || task.name,
+          botBranch,
+        });
+        prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+        prUrl = recovered.prUrl ?? prUrl;
       }
 
       if (!prUrl) {
@@ -666,7 +1224,7 @@ export class RepoWorker {
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
-          planOutput: buildResult.output,
+          planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
         });
 
         return {
@@ -678,37 +1236,45 @@ export class RepoWorker {
         };
       }
 
-      console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
-      const mergeResult = await continueSession(
-        taskRepoPath,
-        buildResult.sessionId,
-        "Looks good. Merge the PR and clean up the worktree.",
-        {
-          repo: this.repo,
-          cacheKey,
-          introspection: {
-            repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 5,
-            stepTitle: "merge",
-          },
-          ...this.buildWatchdogOptions(task, "resume-merge"),
-        }
+      const pausedMerge = await this.pauseIfHardThrottled(task, "resume merge", buildResult.sessionId || existingSessionId);
+      if (pausedMerge) return pausedMerge;
+
+      const mergeGate = await this.mergePrWithRequiredChecks({
+        task,
+        repoPath: taskRepoPath,
+        cacheKey,
+        botBranch,
+        prUrl,
+        sessionId: buildResult.sessionId,
+        watchdogStagePrefix: "resume-merge",
+        notifyTitle: `Resuming ${task.name}`,
+      });
+
+      if (!mergeGate.ok) return mergeGate.run;
+
+      const pausedMergeAfter = await this.pauseIfHardThrottled(
+        task,
+        "resume merge (post)",
+        mergeGate.sessionId || buildResult.sessionId || existingSessionId
       );
-      if (!mergeResult.success) {
-        if (mergeResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "resume-merge", mergeResult);
-        }
-        console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
-      }
+      if (pausedMergeAfter) return pausedMergeAfter;
+
+      prUrl = mergeGate.prUrl;
+      buildResult.sessionId = mergeGate.sessionId;
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
+      const pausedSurvey = await this.pauseIfHardThrottled(task, "resume survey", buildResult.sessionId || existingSessionId);
+      if (pausedSurvey) return pausedSurvey;
+
+      const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         ...this.buildWatchdogOptions(task, "resume-survey"),
       });
+
+      const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "resume survey (post)", surveyResult.sessionId || buildResult.sessionId || existingSessionId);
+      if (pausedSurveyAfter) return pausedSurveyAfter;
 
       if (!surveyResult.success) {
         if (surveyResult.watchdogTimeout) {
@@ -784,6 +1350,9 @@ export class RepoWorker {
         return await this.skipClosedIssue(task, issueMeta, startTime);
       }
 
+      const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
+      if (pausedPreStart) return pausedPreStart;
+
       // 3. Mark task in-progress (use _path to avoid ambiguous names)
       const markedInProgress = await updateTaskStatus(task, "in-progress", {
         "assigned-at": startTime.toISOString().split("T")[0],
@@ -808,6 +1377,9 @@ export class RepoWorker {
         /ENOENT\s+reading\s+"[^"]*\/opencode\/node_modules\//.test(output) ||
         /ENOENT\s+reading\s+"[^"]*zod\/v4\/locales\//.test(output);
 
+      const pausedNextTask = await this.pauseIfHardThrottled(task, "next-task");
+      if (pausedNextTask) return pausedNextTask;
+
       let planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
@@ -820,6 +1392,9 @@ export class RepoWorker {
         },
         ...this.buildWatchdogOptions(task, "next-task"),
       });
+
+      const pausedAfterNextTask = await this.pauseIfHardThrottled(task, "next-task (post)", planResult.sessionId);
+      if (pausedAfterNextTask) return pausedAfterNextTask;
 
       if (!planResult.success && planResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult);
@@ -841,6 +1416,9 @@ export class RepoWorker {
           ...this.buildWatchdogOptions(task, "next-task-retry"),
         });
       }
+
+      const pausedAfterNextTaskRetry = await this.pauseIfHardThrottled(task, "next-task (post retry)", planResult.sessionId);
+      if (pausedAfterNextTaskRetry) return pausedAfterNextTaskRetry;
 
       if (!planResult.success) {
         if (planResult.watchdogTimeout) {
@@ -873,6 +1451,9 @@ export class RepoWorker {
           "Return a short, actionable summary.",
         ].join("\n");
 
+        const pausedDevexConsult = await this.pauseIfHardThrottled(task, "consult devex", baseSessionId);
+        if (pausedDevexConsult) return pausedDevexConsult;
+
         const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, {
           agent: "devex",
           repo: this.repo,
@@ -885,6 +1466,14 @@ export class RepoWorker {
             stepTitle: "consult devex",
           },
         });
+
+        const pausedAfterDevexConsult = await this.pauseIfHardThrottled(
+          task,
+          "consult devex (post)",
+          devexResult.sessionId || baseSessionId
+        );
+        if (pausedAfterDevexConsult) return pausedAfterDevexConsult;
+
         if (!devexResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
           devexContext = {
@@ -914,6 +1503,9 @@ export class RepoWorker {
             devexSummary || devexResult.output,
           ].join("\n");
 
+          const pausedReroute = await this.pauseIfHardThrottled(task, "reroute after devex", baseSessionId);
+          if (pausedReroute) return pausedReroute;
+
           const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
             repo: this.repo,
             cacheKey,
@@ -925,6 +1517,14 @@ export class RepoWorker {
               stepTitle: "reroute after devex",
             },
           });
+
+          const pausedAfterReroute = await this.pauseIfHardThrottled(
+            task,
+            "reroute after devex (post)",
+            rerouteResult.sessionId || baseSessionId
+          );
+          if (pausedAfterReroute) return pausedAfterReroute;
+
           if (!rerouteResult.success) {
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
@@ -1003,6 +1603,9 @@ export class RepoWorker {
       const botBranch = getRepoBotBranch(this.repo);
       const proceedMessage = `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
 
+      const pausedBuild = await this.pauseIfHardThrottled(task, "build", planResult.sessionId);
+      if (pausedBuild) return pausedBuild;
+
       let buildResult = await continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
@@ -1015,6 +1618,10 @@ export class RepoWorker {
         },
         ...this.buildWatchdogOptions(task, "build"),
       });
+
+      const pausedAfterBuild = await this.pauseIfHardThrottled(task, "build (post)", buildResult.sessionId || planResult.sessionId);
+      if (pausedAfterBuild) return pausedAfterBuild;
+
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult);
@@ -1032,7 +1639,20 @@ export class RepoWorker {
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = extractPrUrl(buildResult.output);
+      let prUrl = extractPrUrlFromSession(buildResult);
+      let prRecoveryDiagnostics = "";
+
+      if (!prUrl) {
+        const recovered = await this.tryEnsurePrFromWorktree({
+          task,
+          issueNumber,
+          issueTitle: issueMeta.title || task.name,
+          botBranch,
+        });
+        prRecoveryDiagnostics = recovered.diagnostics;
+        prUrl = recovered.prUrl ?? prUrl;
+      }
+
       let continueAttempts = 0;
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
@@ -1067,7 +1687,7 @@ export class RepoWorker {
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
-              planOutput: buildResult.output,
+              planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
             return {
@@ -1081,6 +1701,10 @@ export class RepoWorker {
 
           // Send a specific nudge to break the loop
           console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
+
+          const pausedBuildLoopBreak = await this.pauseIfHardThrottled(task, "build loop-break", buildResult.sessionId);
+          if (pausedBuildLoopBreak) return pausedBuildLoopBreak;
+
           buildResult = await continueSession(
             taskRepoPath,
             buildResult.sessionId,
@@ -1099,6 +1723,9 @@ export class RepoWorker {
             }
           );
 
+          const pausedBuildLoopBreakAfter = await this.pauseIfHardThrottled(task, "build loop-break (post)", buildResult.sessionId);
+          if (pausedBuildLoopBreakAfter) return pausedBuildLoopBreakAfter;
+
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult);
@@ -1109,15 +1736,23 @@ export class RepoWorker {
 
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = extractPrUrl(buildResult.output);
+          prUrl = extractPrUrlFromSession(buildResult);
           continue;
         }
 
         continueAttempts++;
-        console.log(`[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`);
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
+        console.log(
+          `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
+        );
+
+        const pausedBuildContinue = await this.pauseIfHardThrottled(task, "build continue", buildResult.sessionId);
+        if (pausedBuildContinue) return pausedBuildContinue;
+
+        const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
+          timeoutMs: 10 * 60_000,
           introspection: {
             repo: this.repo,
             issue: task.issue,
@@ -1127,16 +1762,43 @@ export class RepoWorker {
           },
           ...this.buildWatchdogOptions(task, "build-continue"),
         });
+
+        const pausedBuildContinueAfter = await this.pauseIfHardThrottled(task, "build continue (post)", buildResult.sessionId);
+        if (pausedBuildContinueAfter) return pausedBuildContinueAfter;
+
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult);
           }
-          console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
-          break;
-        }
 
-        
-        prUrl = extractPrUrl(buildResult.output);
+          // If the session ended without printing a URL, try to recover PR from git state.
+          const recovered = await this.tryEnsurePrFromWorktree({
+            task,
+            issueNumber,
+            issueTitle: issueMeta.title || task.name,
+            botBranch,
+          });
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+          prUrl = recovered.prUrl ?? prUrl;
+
+          if (!prUrl) {
+            console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
+            break;
+          }
+        } else {
+          prUrl = extractPrUrlFromSession(buildResult);
+        }
+      }
+
+      if (!prUrl) {
+        const recovered = await this.tryEnsurePrFromWorktree({
+          task,
+          issueNumber,
+          issueTitle: issueMeta.title || task.name,
+          botBranch,
+        });
+        prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+        prUrl = recovered.prUrl ?? prUrl;
       }
 
       if (!prUrl) {
@@ -1154,7 +1816,7 @@ export class RepoWorker {
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
-          planOutput: buildResult.output,
+          planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
         });
 
         return {
@@ -1166,37 +1828,35 @@ export class RepoWorker {
         };
       }
 
-      // 8. Ask agent to merge
-      if (prUrl) {
-        console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
-        const mergeResult = await continueSession(
-          taskRepoPath,
-          buildResult.sessionId,
-          "Looks good. Merge the PR and clean up the worktree.",
-          {
-            repo: this.repo,
-            cacheKey,
-            introspection: {
-              repo: this.repo,
-              issue: task.issue,
-              taskName: task.name,
-              step: 5,
-              stepTitle: "merge",
-            },
-            ...this.buildWatchdogOptions(task, "merge"),
-          }
-        );
-        if (!mergeResult.success) {
-          if (mergeResult.watchdogTimeout) {
-            return await this.handleWatchdogTimeout(task, cacheKey, "merge", mergeResult);
-          }
-          console.warn(`[ralph:worker:${this.repo}] Merge may have failed: ${mergeResult.output}`);
-        }
-      }
+      const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);
+      if (pausedMerge) return pausedMerge;
+
+      const mergeGate = await this.mergePrWithRequiredChecks({
+        task,
+        repoPath: taskRepoPath,
+        cacheKey,
+        botBranch,
+        prUrl,
+        sessionId: buildResult.sessionId,
+        watchdogStagePrefix: "merge",
+        notifyTitle: `Merging ${task.name}`,
+      });
+
+      if (!mergeGate.ok) return mergeGate.run;
+
+      const pausedMergeAfter = await this.pauseIfHardThrottled(task, "merge (post)", mergeGate.sessionId || buildResult.sessionId);
+      if (pausedMergeAfter) return pausedMergeAfter;
+
+      prUrl = mergeGate.prUrl;
+      buildResult.sessionId = mergeGate.sessionId;
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
+      const pausedSurvey = await this.pauseIfHardThrottled(task, "survey", buildResult.sessionId);
+      if (pausedSurvey) return pausedSurvey;
+
+      const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         introspection: {
@@ -1208,6 +1868,9 @@ export class RepoWorker {
         },
         ...this.buildWatchdogOptions(task, "survey"),
       });
+
+      const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "survey (post)", surveyResult.sessionId || buildResult.sessionId);
+      if (pausedSurveyAfter) return pausedSurveyAfter;
 
       if (!surveyResult.success) {
         if (surveyResult.watchdogTimeout) {
@@ -1276,7 +1939,7 @@ export class RepoWorker {
     data: {
       sessionId?: string;
       pr?: string | null;
-      outcome: "success" | "escalated" | "failed";
+      outcome: "success" | "throttled" | "escalated" | "failed";
       started: Date;
       completed: Date;
       surveyResults?: string;

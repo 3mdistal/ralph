@@ -12,6 +12,10 @@ Ralph watches for `agent-task` notes in a bwrb vault and dispatches them to Open
 - **Anomaly detection** catches agents stuck in loops
 - **Introspection logging** for debugging agent behavior
 
+## Escalation policy
+
+Canonical routing/escalation rules live in `docs/escalation-policy.md`.
+
 ## Operator dashboard (planned)
 
 Ralph’s control plane (operator dashboard) is **operator tooling** (not a user-facing UI): a local, token-authenticated API that publishes structured events, with a TUI as the first client.
@@ -53,7 +57,8 @@ Config is loaded once at startup, so restart the daemon after editing.
     {
       "name": "3mdistal/ralph",
       "path": "/absolute/path/to/your/ralph",
-      "botBranch": "bot/integration"
+      "botBranch": "bot/integration",
+      "requiredChecks": ["CI"]
     }
   ]
 }
@@ -66,11 +71,14 @@ Note: `ralph.json` values are read as plain JSON. `~` is not expanded, and comme
 - `bwrbVault` (string): bwrb vault path for the task queue
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `maxWorkers`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
+- `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
+
+Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
 ### Environment variables
 
