@@ -25,9 +25,11 @@ import {
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
+import { startQueuedTasks, type SchedulerGate } from "./scheduler";
 
 import { DrainMonitor, isDraining, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
+import { SoftThrottleMonitor, getSoftThrottleDecision, type SoftThrottleMode } from "./throttle/soft-throttle";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { queueNudge } from "./nudge";
@@ -44,10 +46,19 @@ const workers = new Map<string, RepoWorker>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
+let softThrottleMonitor: SoftThrottleMonitor | null = null;
+let softThrottleBootMode: SoftThrottleMode | null = null;
 
 function getDaemonMode(): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
   return isDraining() ? "draining" : "running";
+}
+
+function getSchedulerGate(): SchedulerGate {
+  if (getDaemonMode() === "draining") return "draining";
+  const throttleMode = softThrottleMonitor?.getMode() ?? softThrottleBootMode;
+  if (throttleMode === "soft-throttled") return "soft-throttled";
+  return "running";
 }
 
 function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
@@ -60,7 +71,7 @@ const inFlightTasks = new Set<string>();
 let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
-let rrCursor = 0;
+const rrCursor = { value: 0 };
 
 function ensureSemaphores(): void {
   if (globalSemaphore) return;
@@ -94,7 +105,7 @@ function scheduleQueuedTasksSoon(): void {
   scheduleQueuedTimer = setTimeout(() => {
     scheduleQueuedTimer = null;
     if (isShuttingDown) return;
-    if (getDaemonMode() === "draining") return;
+    if (getSchedulerGate() !== "running") return;
     void getQueuedTasks().then((tasks) => processNewTasks(tasks));
   }, 250);
 }
@@ -103,7 +114,7 @@ let escalationWatcher: ReturnType<typeof watch> | null = null;
 let escalationDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 async function attemptResumeResolvedEscalations(): Promise<void> {
-  if (getDaemonMode() === "draining" || isShuttingDown) return;
+  if (getSchedulerGate() !== "running" || isShuttingDown) return;
 
   ensureSemaphores();
   if (!globalSemaphore) return;
@@ -115,7 +126,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
   if (pending.length === 0) return;
 
   for (const escalation of pending) {
-    if (getDaemonMode() === "draining" || isShuttingDown) return;
+    if (getSchedulerGate() !== "running" || isShuttingDown) return;
 
     const taskPath = escalation["task-path"]?.trim() ?? "";
     const sessionId = escalation["session-id"]?.trim() ?? "";
@@ -289,58 +300,19 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
   ensureSemaphores();
   if (!globalSemaphore) return;
 
-  if (getDaemonMode() === "draining") return;
-
-  if (tasks.length === 0) {
-    if (shouldLog("daemon:no-queued", 30_000)) {
-      console.log("[ralph] No queued tasks");
-    }
-    return;
-  }
-
-  const newTasks = tasks.filter((t) => !inFlightTasks.has(getTaskKey(t)));
-  if (newTasks.length === 0) {
-    if (shouldLog("daemon:all-in-flight", 30_000)) {
-      console.log("[ralph] All queued tasks already in flight");
-    }
-    return;
-  }
-
-  const byRepo = groupByRepo(newTasks);
-  const repos = Array.from(byRepo.keys());
-  if (repos.length === 0) return;
-
-  let startedCount = 0;
-
-  while (globalSemaphore.available() > 0) {
-    let startedThisRound = false;
-
-    for (let i = 0; i < repos.length; i++) {
-      const idx = (rrCursor + i) % repos.length;
-      const repo = repos[idx];
-      const repoTasks = byRepo.get(repo);
-      if (!repoTasks || repoTasks.length === 0) continue;
-
-      const releaseGlobal = globalSemaphore.tryAcquire();
-      if (!releaseGlobal) return;
-
-      const releaseRepo = getRepoSemaphore(repo).tryAcquire();
-      if (!releaseRepo) {
-        releaseGlobal();
-        continue;
-      }
-
-      const task = repoTasks.shift()!;
-      rrCursor = (idx + 1) % repos.length;
-
-      startedCount++;
-      startedThisRound = true;
-      startTask({ repo, task, releaseGlobal, releaseRepo });
-      break;
-    }
-
-    if (!startedThisRound) break;
-  }
+  const startedCount = startQueuedTasks({
+    gate: getSchedulerGate(),
+    tasks,
+    inFlightTasks,
+    getTaskKey: (t) => getTaskKey(t),
+    groupByRepo,
+    globalSemaphore,
+    getRepoSemaphore,
+    rrCursor,
+    shouldLog,
+    log: (message) => console.log(message),
+    startTask,
+  });
 
   if (startedCount > 0) {
     console.log(`[ralph] Started ${startedCount} task(s)`);
@@ -508,7 +480,10 @@ async function main(): Promise<void> {
   drainMonitor = new DrainMonitor({
     log: (message) => console.log(message),
     onModeChange: (mode) => {
-      if (mode !== "running" || isShuttingDown) return;
+      if (isShuttingDown) return;
+      if (mode !== "running") return;
+      if (getSchedulerGate() !== "running") return;
+
       void (async () => {
         const tasks = await getQueuedTasks();
         await processNewTasks(tasks);
@@ -516,6 +491,26 @@ async function main(): Promise<void> {
     },
   });
   drainMonitor.start();
+
+  // Prime soft throttle once on startup so gating is correct immediately.
+  const bootDecision = await getSoftThrottleDecision();
+  softThrottleBootMode = bootDecision.enabled ? bootDecision.mode : "running";
+
+  // Start soft throttle monitor (usage-based scheduler gate)
+  softThrottleMonitor = new SoftThrottleMonitor({
+    log: (message) => console.log(message),
+    onModeChange: (mode) => {
+      if (isShuttingDown) return;
+      if (mode !== "running") return;
+      if (getSchedulerGate() !== "running") return;
+
+      void (async () => {
+        const tasks = await getQueuedTasks();
+        await processNewTasks(tasks);
+      })();
+    },
+  });
+  softThrottleMonitor.start();
 
   // Initialize rollup monitor
   rollupMonitor = new RollupMonitor(config.batchSize);
@@ -531,14 +526,14 @@ async function main(): Promise<void> {
   const initialTasks = await initialPoll();
   console.log(`[ralph] Found ${initialTasks.length} queued task(s)`);
 
-  if (initialTasks.length > 0 && getDaemonMode() !== "draining") {
+  if (initialTasks.length > 0 && getSchedulerGate() === "running") {
     await processNewTasks(initialTasks);
   }
 
   // Start file watching (no polling - watcher is reliable)
   console.log("[ralph] Starting queue watcher...");
   startWatching(async (tasks) => {
-    if (!isShuttingDown && getDaemonMode() !== "draining") {
+    if (!isShuttingDown && getSchedulerGate() === "running") {
       await processNewTasks(tasks);
     }
   });
@@ -608,6 +603,7 @@ async function main(): Promise<void> {
       escalationDebounceTimer = null;
     }
     drainMonitor?.stop();
+    softThrottleMonitor?.stop();
     clearInterval(heartbeatTimer);
     
     // Wait for in-flight tasks
@@ -770,7 +766,12 @@ if (args[0] === "status") {
   }
 
   const json = args.includes("--json");
-  const mode: DaemonMode = isDraining() ? "draining" : "running";
+
+  let mode: SchedulerGate = isDraining() ? "draining" : "running";
+  const softDecision = mode === "running" ? await getSoftThrottleDecision() : { enabled: false, mode: "running" as const, snapshot: null };
+  if (mode === "running" && softDecision.enabled && softDecision.mode === "soft-throttled") {
+    mode = "soft-throttled";
+  }
 
   const [inProgress, queued] = await Promise.all([
     getTasksByStatus("in-progress"),
@@ -798,6 +799,7 @@ if (args[0] === "status") {
       JSON.stringify(
         {
           mode,
+          softThrottle: softDecision.snapshot,
           inProgress: inProgressWithStatus,
           queued: queued.map((t) => ({
             name: t.name,
