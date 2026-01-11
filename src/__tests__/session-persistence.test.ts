@@ -1,5 +1,6 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
 import type { AgentTask } from "../queue";
+import { getRalphRunLogPath } from "../paths";
 
 /**
  * Tests for session persistence (crash recovery) functionality.
@@ -7,7 +8,7 @@ import type { AgentTask } from "../queue";
  * Session persistence ensures that:
  * 1. Session IDs are saved when tasks start
  * 2. On startup, in-progress tasks with session IDs are resumed
- * 3. In-progress tasks without session IDs are reset to queued
+ * 3. In-progress tasks without session IDs are reset to starting
  * 4. Failed session resumes are escalated gracefully
  */
 
@@ -42,6 +43,14 @@ describe("Session Persistence", () => {
       expect(task["session-id"]).toBe("");
       // Empty string should be treated as "no session"
       expect(task["session-id"]?.trim()).toBeFalsy();
+    });
+
+    test("run-log-path field is optional", () => {
+      const taskWithoutLog = createMockTask();
+      expect(taskWithoutLog["run-log-path"]).toBeUndefined();
+
+      const taskWithLog = createMockTask({ "run-log-path": "/tmp/ralph/run.log" });
+      expect(taskWithLog["run-log-path"]).toBe("/tmp/ralph/run.log");
     });
 
     test("worktree-path field is optional", () => {
@@ -89,14 +98,14 @@ describe("Session Persistence", () => {
   });
 
   describe("Status transitions", () => {
-    test("in-progress task without session should transition to queued", () => {
+    test("in-progress task without session should transition to starting", () => {
       const task = createMockTask({ status: "in-progress" });
 
       // Simulate the logic from resumeTasksOnStartup
       const hasSession = task["session-id"]?.trim();
-      const newStatus = hasSession ? "in-progress" : "queued";
+      const newStatus = hasSession ? "in-progress" : "starting";
 
-      expect(newStatus).toBe("queued");
+      expect(newStatus).toBe("starting");
     });
 
     test("in-progress task with session should stay in-progress", () => {
@@ -106,7 +115,7 @@ describe("Session Persistence", () => {
       });
 
       const hasSession = task["session-id"]?.trim();
-      const newStatus = hasSession ? "in-progress" : "queued";
+      const newStatus = hasSession ? "in-progress" : "starting";
 
       expect(newStatus).toBe("in-progress");
     });
@@ -192,6 +201,24 @@ describe("Session Persistence", () => {
         expect(task["session-id"]?.trim()).toBeTruthy();
       }
     });
+  });
+});
+
+describe("run-log-path (XDG state)", () => {
+  const original = process.env.XDG_STATE_HOME;
+
+  afterEach(() => {
+    if (original === undefined) {
+      delete process.env.XDG_STATE_HOME;
+    } else {
+      process.env.XDG_STATE_HOME = original;
+    }
+  });
+
+  test("uses XDG_STATE_HOME when set", () => {
+    process.env.XDG_STATE_HOME = "/tmp/xdg-state";
+    const path = getRalphRunLogPath({ repo: "3mdistal/ralph", issueNumber: "51", stepTitle: "next-task", ts: 123 });
+    expect(path.startsWith("/tmp/xdg-state/ralph/run-logs/")).toBe(true);
   });
 });
 
@@ -300,12 +327,17 @@ describe("Queue discovery", () => {
     dataset = [
       createMockTask({ _path: "orchestration/tasks/a.md", _name: "a", status: "in-progress" }),
       createMockTask({ _path: "orchestration/tasks/b.md", _name: "b", status: "queued" }),
+      createMockTask({ _path: "orchestration/tasks/c.md", _name: "c", status: "starting" }),
     ];
 
     const { getTasksByStatus } = await loadQueue();
-    const tasks = await getTasksByStatus("in-progress");
 
+    const inProgressTasks = await getTasksByStatus("in-progress");
     expect(lastCommand).toContain("status == 'in-progress'");
-    expect(tasks.map((t) => t._path)).toEqual(["orchestration/tasks/a.md"]);
+    expect(inProgressTasks.map((t) => t._path)).toEqual(["orchestration/tasks/a.md"]);
+
+    const startingTasks = await getTasksByStatus("starting");
+    expect(lastCommand).toContain("status == 'starting'");
+    expect(startingTasks.map((t) => t._path)).toEqual(["orchestration/tasks/c.md"]);
   });
 });

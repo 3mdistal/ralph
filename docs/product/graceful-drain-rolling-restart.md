@@ -55,7 +55,9 @@ Escalations are HITL checkpoints and should behave like paused/resumable runs.
 ### Daemon modes
 
 - `running`: normal scheduling
-- `draining`: stop scheduling new tasks; let in-flight work reach next acceptable checkpoint
+- `draining`: stop scheduling new queued tasks; let in-flight work reach the next acceptable checkpoint
+  - While `draining`, Ralph may resume already-owned work (e.g. orphaned `in-progress` tasks on startup, or resolved HITL escalations) as long as it does not dequeue/start new queued tasks.
+  - If hard-throttled, `draining` should also stop model sends (e.g. `continueSession(...)`).
 - `paused`: scheduler paused; no new work; workers may also be paused at checkpoint
 
 ### Worker modes
