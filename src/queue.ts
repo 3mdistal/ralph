@@ -49,17 +49,35 @@ function warnIfNestedTaskPaths(tasks: AgentTask[]): void {
   }
 }
 
-async function listAgentTasks(where: string): Promise<AgentTask[]> {
+const VALID_TASK_STATUSES = new Set<AgentTask["status"]>([
+  "queued",
+  "in-progress",
+  "blocked",
+  "escalated",
+  "done",
+]);
+
+async function listTasksInQueueDir(): Promise<AgentTask[]> {
   const config = loadConfig();
 
   try {
-    const result = await $`bwrb list --path ${TASKS_GLOB_PATH} --where ${where} --output json`.cwd(config.bwrbVault).quiet();
+    const result = await $`bwrb list --path ${TASKS_GLOB_PATH} --output json`.cwd(config.bwrbVault).quiet();
     const parsed = JSON.parse(result.stdout.toString());
-    const tasks = Array.isArray(parsed) ? (parsed as AgentTask[]) : [];
+    const rows = Array.isArray(parsed) ? parsed : [];
+
+    const tasks = rows.filter((row): row is AgentTask => {
+      return (
+        typeof row === "object" &&
+        row !== null &&
+        (row as { type?: unknown }).type === "agent-task" &&
+        typeof (row as { _path?: unknown })._path === "string"
+      );
+    });
+
     warnIfNestedTaskPaths(tasks);
     return tasks;
   } catch (e) {
-    console.error(`[ralph:queue] Failed to list agent tasks (${where}):`, e);
+    console.error(`[ralph:queue] Failed to list tasks under ${TASKS_GLOB_PATH}:`, e);
     return [];
   }
 }
@@ -73,23 +91,29 @@ function getTaskQuery(task: Pick<AgentTask, "_path" | "name"> | string): string 
  * Get all queued tasks from bwrb
  */
 export async function getQueuedTasks(): Promise<AgentTask[]> {
-  return await listAgentTasks("type == 'agent-task' && status == 'queued'");
+  const tasks = await listTasksInQueueDir();
+  return tasks.filter((t) => t.status === "queued");
 }
 
 /**
  * Get tasks by status
  */
 export async function getTasksByStatus(status: AgentTask["status"]): Promise<AgentTask[]> {
-  return await listAgentTasks(`type == 'agent-task' && status == '${status}'`);
+  if (!VALID_TASK_STATUSES.has(status)) {
+    console.error(`[ralph:queue] Invalid task status: ${String(status)}`);
+    return [];
+  }
+
+  const tasks = await listTasksInQueueDir();
+  return tasks.filter((t) => t.status === status);
 }
 
 /**
  * Fetch a task by its exact bwrb `_path`.
  */
 export async function getTaskByPath(taskPath: string): Promise<AgentTask | null> {
-  const escapedPath = taskPath.replaceAll("'", "\\'");
-  const tasks = await listAgentTasks(`type == 'agent-task' && _path == '${escapedPath}'`);
-  return tasks.length > 0 ? tasks[0] : null;
+  const tasks = await listTasksInQueueDir();
+  return tasks.find((t) => t._path === taskPath) ?? null;
 }
 
 /**
