@@ -179,7 +179,7 @@ export async function getTasksByStatus(status: AgentTask["status"]): Promise<Age
 }
 
 /**
- * Fetch a task by its exact bwrb `_path`.
+ * Fetch a task by its file path in the vault.
  */
 export async function getTaskByPath(taskPath: string): Promise<AgentTask | null> {
   const normalizedPath = normalizeBwrbNoteRef(taskPath);
