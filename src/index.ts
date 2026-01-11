@@ -136,7 +136,12 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
   const resolved = await getEscalationsByStatus("resolved");
   if (resolved.length === 0) return;
 
-  const pending = resolved.filter((e) => !(e["resume-attempted-at"]?.trim()) && !resumeAttemptedThisRun.has(e._path));
+  const pending = resolved.filter((e) => {
+    const attempted = e["resume-attempted-at"]?.trim();
+    const resumeStatus = e["resume-status"]?.trim();
+
+    return (!attempted || resumeStatus === "waiting-resolution") && !resumeAttemptedThisRun.has(e._path);
+  });
   if (pending.length === 0) return;
 
   for (const escalation of pending) {
@@ -177,12 +182,19 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     const resolution = await readResolutionMessage(escalation._path);
     if (!resolution) {
       const reason = "Resolved escalation has empty/missing ## Resolution text";
-      console.warn(`[ralph:escalations] ${reason}; skipping: ${escalation._path}`);
-      await safeEditEscalation(escalation._path, {
-        "resume-status": "failed",
-        "resume-attempted-at": new Date().toISOString(),
-        "resume-error": reason,
-      });
+
+      // Treat this as “not ready yet”: an operator may have marked the escalation as resolved
+      // without filling in guidance, or they may still be editing the note.
+      // Do NOT set resume-attempted-at here; allow a future edit to trigger a retry.
+      if (escalation["resume-status"]?.trim() !== "waiting-resolution") {
+        console.warn(`[ralph:escalations] ${reason}; waiting: ${escalation._path}`);
+        await safeEditEscalation(escalation._path, {
+          "resume-status": "waiting-resolution",
+          "resume-deferred-at": new Date().toISOString(),
+          "resume-error": reason,
+        });
+      }
+
       continue;
     }
 
@@ -228,6 +240,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
       "resume-attempted-at": new Date().toISOString(),
       "resume-error": "",
     });
+
     if (!markedAttempt) {
       releaseGlobal();
       releaseRepo();
