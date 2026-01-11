@@ -27,6 +27,7 @@ export function __resetGhRunnerForTests(): void {
 import { type AgentTask, updateTaskStatus } from "./queue";
 import { getRepoBotBranch, getRepoMaxWorkers, loadConfig } from "./config";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
+import { getThrottleDecision } from "./throttle";
 import { extractPrUrl, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
 import {
   isExplicitBlockerReason,
@@ -131,7 +132,7 @@ async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
 export interface AgentRun {
   taskName: string;
   repo: string;
-  outcome: "success" | "escalated" | "failed";
+  outcome: "success" | "throttled" | "escalated" | "failed";
   pr?: string;
   sessionId?: string;
   escalationReason?: string;
@@ -384,12 +385,47 @@ export class RepoWorker {
     };
   }
 
+  private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
+    const decision = await getThrottleDecision();
+    if (decision.state !== "hard") return null;
+
+    const throttledAt = new Date().toISOString();
+    const resumeAt = decision.resumeAtTs ? new Date(decision.resumeAtTs).toISOString() : "";
+    const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
+
+    const extraFields: Record<string, string> = {
+      "throttled-at": throttledAt,
+      "resume-at": resumeAt,
+      "usage-snapshot": JSON.stringify(decision.snapshot),
+    };
+
+    if (sid) extraFields["session-id"] = sid;
+
+    await updateTaskStatus(task, "throttled", extraFields);
+
+    console.log(
+      `[ralph:worker:${this.repo}] Hard throttle active; pausing at checkpoint stage=${stage} resumeAt=${resumeAt || "unknown"}`
+    );
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "throttled",
+      sessionId: sid || undefined,
+    };
+  }
+
   private async drainNudges(task: AgentTask, repoPath: string, sessionId: string, cacheKey: string, stage: string): Promise<void> {
     const sid = sessionId?.trim();
     if (!sid) return;
 
     try {
       const result = await drainQueuedNudges(sid, async (message) => {
+        const paused = await this.pauseIfHardThrottled(task, `nudge-${stage}`, sid);
+        if (paused) {
+          return { success: false, error: "hard throttled" };
+        }
+
         const res = await continueSession(repoPath, sid, message, {
           repo: this.repo,
           cacheKey,
@@ -509,6 +545,9 @@ export class RepoWorker {
 
       const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
 
+      const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
+      if (pausedBefore) return pausedBefore;
+
       let buildResult = await continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
         cacheKey,
@@ -521,6 +560,10 @@ export class RepoWorker {
         },
         ...this.buildWatchdogOptions(task, "resume"),
       });
+
+      const pausedAfter = await this.pauseIfHardThrottled(task, "resume (post)", buildResult.sessionId || existingSessionId);
+      if (pausedAfter) return pausedAfter;
+
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult);
@@ -595,6 +638,10 @@ export class RepoWorker {
           }
 
           console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
+
+          const pausedLoopBreak = await this.pauseIfHardThrottled(task, "resume loop-break", buildResult.sessionId || existingSessionId);
+          if (pausedLoopBreak) return pausedLoopBreak;
+
           buildResult = await continueSession(
             taskRepoPath,
             buildResult.sessionId,
@@ -612,6 +659,13 @@ export class RepoWorker {
               ...this.buildWatchdogOptions(task, "resume-loop-break"),
             }
           );
+
+          const pausedLoopBreakAfter = await this.pauseIfHardThrottled(
+            task,
+            "resume loop-break (post)",
+            buildResult.sessionId || existingSessionId
+          );
+          if (pausedLoopBreakAfter) return pausedLoopBreakAfter;
 
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
@@ -632,6 +686,9 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
         );
 
+        const pausedContinue = await this.pauseIfHardThrottled(task, "resume continue", buildResult.sessionId || existingSessionId);
+        if (pausedContinue) return pausedContinue;
+
         buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
           repo: this.repo,
           cacheKey,
@@ -644,6 +701,10 @@ export class RepoWorker {
           },
           ...this.buildWatchdogOptions(task, "resume-continue"),
         });
+
+        const pausedContinueAfter = await this.pauseIfHardThrottled(task, "resume continue (post)", buildResult.sessionId || existingSessionId);
+        if (pausedContinueAfter) return pausedContinueAfter;
+
         if (!buildResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
           break;
@@ -679,6 +740,10 @@ export class RepoWorker {
       }
 
       console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
+
+      const pausedMerge = await this.pauseIfHardThrottled(task, "resume merge", buildResult.sessionId || existingSessionId);
+      if (pausedMerge) return pausedMerge;
+
       const mergeResult = await continueSession(
         taskRepoPath,
         buildResult.sessionId,
@@ -696,6 +761,10 @@ export class RepoWorker {
           ...this.buildWatchdogOptions(task, "resume-merge"),
         }
       );
+
+      const pausedMergeAfter = await this.pauseIfHardThrottled(task, "resume merge (post)", mergeResult.sessionId || buildResult.sessionId || existingSessionId);
+      if (pausedMergeAfter) return pausedMergeAfter;
+
       if (!mergeResult.success) {
         if (mergeResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume-merge", mergeResult);
@@ -704,11 +773,18 @@ export class RepoWorker {
       }
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
+
+      const pausedSurvey = await this.pauseIfHardThrottled(task, "resume survey", buildResult.sessionId || existingSessionId);
+      if (pausedSurvey) return pausedSurvey;
+
       const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         ...this.buildWatchdogOptions(task, "resume-survey"),
       });
+
+      const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "resume survey (post)", surveyResult.sessionId || buildResult.sessionId || existingSessionId);
+      if (pausedSurveyAfter) return pausedSurveyAfter;
 
       if (!surveyResult.success) {
         if (surveyResult.watchdogTimeout) {
@@ -784,6 +860,9 @@ export class RepoWorker {
         return await this.skipClosedIssue(task, issueMeta, startTime);
       }
 
+      const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
+      if (pausedPreStart) return pausedPreStart;
+
       // 3. Mark task in-progress (use _path to avoid ambiguous names)
       const markedInProgress = await updateTaskStatus(task, "in-progress", {
         "assigned-at": startTime.toISOString().split("T")[0],
@@ -808,6 +887,9 @@ export class RepoWorker {
         /ENOENT\s+reading\s+"[^"]*\/opencode\/node_modules\//.test(output) ||
         /ENOENT\s+reading\s+"[^"]*zod\/v4\/locales\//.test(output);
 
+      const pausedNextTask = await this.pauseIfHardThrottled(task, "next-task");
+      if (pausedNextTask) return pausedNextTask;
+
       let planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
@@ -820,6 +902,9 @@ export class RepoWorker {
         },
         ...this.buildWatchdogOptions(task, "next-task"),
       });
+
+      const pausedAfterNextTask = await this.pauseIfHardThrottled(task, "next-task (post)", planResult.sessionId);
+      if (pausedAfterNextTask) return pausedAfterNextTask;
 
       if (!planResult.success && planResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult);
@@ -841,6 +926,9 @@ export class RepoWorker {
           ...this.buildWatchdogOptions(task, "next-task-retry"),
         });
       }
+
+      const pausedAfterNextTaskRetry = await this.pauseIfHardThrottled(task, "next-task (post retry)", planResult.sessionId);
+      if (pausedAfterNextTaskRetry) return pausedAfterNextTaskRetry;
 
       if (!planResult.success) {
         if (planResult.watchdogTimeout) {
@@ -873,6 +961,9 @@ export class RepoWorker {
           "Return a short, actionable summary.",
         ].join("\n");
 
+        const pausedDevexConsult = await this.pauseIfHardThrottled(task, "consult devex", baseSessionId);
+        if (pausedDevexConsult) return pausedDevexConsult;
+
         const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, {
           agent: "devex",
           repo: this.repo,
@@ -885,6 +976,14 @@ export class RepoWorker {
             stepTitle: "consult devex",
           },
         });
+
+        const pausedAfterDevexConsult = await this.pauseIfHardThrottled(
+          task,
+          "consult devex (post)",
+          devexResult.sessionId || baseSessionId
+        );
+        if (pausedAfterDevexConsult) return pausedAfterDevexConsult;
+
         if (!devexResult.success) {
           console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
           devexContext = {
@@ -914,6 +1013,9 @@ export class RepoWorker {
             devexSummary || devexResult.output,
           ].join("\n");
 
+          const pausedReroute = await this.pauseIfHardThrottled(task, "reroute after devex", baseSessionId);
+          if (pausedReroute) return pausedReroute;
+
           const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
             repo: this.repo,
             cacheKey,
@@ -925,6 +1027,14 @@ export class RepoWorker {
               stepTitle: "reroute after devex",
             },
           });
+
+          const pausedAfterReroute = await this.pauseIfHardThrottled(
+            task,
+            "reroute after devex (post)",
+            rerouteResult.sessionId || baseSessionId
+          );
+          if (pausedAfterReroute) return pausedAfterReroute;
+
           if (!rerouteResult.success) {
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
@@ -1003,6 +1113,9 @@ export class RepoWorker {
       const botBranch = getRepoBotBranch(this.repo);
       const proceedMessage = `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
 
+      const pausedBuild = await this.pauseIfHardThrottled(task, "build", planResult.sessionId);
+      if (pausedBuild) return pausedBuild;
+
       let buildResult = await continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
@@ -1015,6 +1128,10 @@ export class RepoWorker {
         },
         ...this.buildWatchdogOptions(task, "build"),
       });
+
+      const pausedAfterBuild = await this.pauseIfHardThrottled(task, "build (post)", buildResult.sessionId || planResult.sessionId);
+      if (pausedAfterBuild) return pausedAfterBuild;
+
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult);
@@ -1081,6 +1198,10 @@ export class RepoWorker {
 
           // Send a specific nudge to break the loop
           console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
+
+          const pausedBuildLoopBreak = await this.pauseIfHardThrottled(task, "build loop-break", buildResult.sessionId);
+          if (pausedBuildLoopBreak) return pausedBuildLoopBreak;
+
           buildResult = await continueSession(
             taskRepoPath,
             buildResult.sessionId,
@@ -1099,6 +1220,9 @@ export class RepoWorker {
             }
           );
 
+          const pausedBuildLoopBreakAfter = await this.pauseIfHardThrottled(task, "build loop-break (post)", buildResult.sessionId);
+          if (pausedBuildLoopBreakAfter) return pausedBuildLoopBreakAfter;
+
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult);
@@ -1115,6 +1239,10 @@ export class RepoWorker {
 
         continueAttempts++;
         console.log(`[ralph:worker:${this.repo}] No PR URL found, sending "Continue." (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`);
+
+        const pausedBuildContinue = await this.pauseIfHardThrottled(task, "build continue", buildResult.sessionId);
+        if (pausedBuildContinue) return pausedBuildContinue;
+
         buildResult = await continueSession(taskRepoPath, buildResult.sessionId, "Continue.", {
           repo: this.repo,
           cacheKey,
@@ -1127,6 +1255,10 @@ export class RepoWorker {
           },
           ...this.buildWatchdogOptions(task, "build-continue"),
         });
+
+        const pausedBuildContinueAfter = await this.pauseIfHardThrottled(task, "build continue (post)", buildResult.sessionId);
+        if (pausedBuildContinueAfter) return pausedBuildContinueAfter;
+
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult);
@@ -1169,6 +1301,10 @@ export class RepoWorker {
       // 8. Ask agent to merge
       if (prUrl) {
         console.log(`[ralph:worker:${this.repo}] Approving merge for ${prUrl}`);
+
+        const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);
+        if (pausedMerge) return pausedMerge;
+
         const mergeResult = await continueSession(
           taskRepoPath,
           buildResult.sessionId,
@@ -1186,6 +1322,10 @@ export class RepoWorker {
             ...this.buildWatchdogOptions(task, "merge"),
           }
         );
+
+        const pausedMergeAfter = await this.pauseIfHardThrottled(task, "merge (post)", mergeResult.sessionId || buildResult.sessionId);
+        if (pausedMergeAfter) return pausedMergeAfter;
+
         if (!mergeResult.success) {
           if (mergeResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "merge", mergeResult);
@@ -1196,6 +1336,10 @@ export class RepoWorker {
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
+
+      const pausedSurvey = await this.pauseIfHardThrottled(task, "survey", buildResult.sessionId);
+      if (pausedSurvey) return pausedSurvey;
+
       const surveyResult = await continueCommand(taskRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
@@ -1208,6 +1352,9 @@ export class RepoWorker {
         },
         ...this.buildWatchdogOptions(task, "survey"),
       });
+
+      const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "survey (post)", surveyResult.sessionId || buildResult.sessionId);
+      if (pausedSurveyAfter) return pausedSurveyAfter;
 
       if (!surveyResult.success) {
         if (surveyResult.watchdogTimeout) {
@@ -1276,7 +1423,7 @@ export class RepoWorker {
     data: {
       sessionId?: string;
       pr?: string | null;
-      outcome: "success" | "escalated" | "failed";
+      outcome: "success" | "throttled" | "escalated" | "failed";
       started: Date;
       completed: Date;
       surveyResults?: string;

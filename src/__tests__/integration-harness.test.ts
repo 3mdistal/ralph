@@ -69,6 +69,22 @@ mock.module("../session", () => ({
   getRalphXdgCacheHome: () => "/tmp/ralph-opencode-cache-test",
 }));
 
+const getThrottleDecisionMock = mock(async () => ({
+  state: "ok",
+  resumeAtTs: null,
+  snapshot: {
+    computedAt: new Date(0).toISOString(),
+    providerID: "openai",
+    state: "ok",
+    resumeAt: null,
+    windows: [],
+  },
+}));
+
+mock.module("../throttle", () => ({
+  getThrottleDecision: getThrottleDecisionMock,
+}));
+
 import { RepoWorker } from "../worker";
 
 function createMockTask(overrides: Record<string, unknown> = {}) {
@@ -96,6 +112,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     runCommandMock.mockClear();
     continueSessionMock.mockClear();
     continueCommandMock.mockClear();
+    getThrottleDecisionMock.mockClear();
   });
 
   test("queued → in-progress → build → PR → merge → survey → done", async () => {
@@ -148,6 +165,44 @@ describe("integration-ish harness: full task lifecycle", () => {
     // No escalation/error notification in the happy path.
     expect(notifyEscalationMock).not.toHaveBeenCalled();
     expect(notifyErrorMock).not.toHaveBeenCalled();
+  });
+
+  test("hard throttle pauses before any model send", async () => {
+    const resumeAtTs = Date.now() + 60_000;
+
+    getThrottleDecisionMock.mockImplementationOnce(async () => ({
+      state: "hard",
+      resumeAtTs,
+      snapshot: {
+        computedAt: new Date().toISOString(),
+        providerID: "openai",
+        state: "hard",
+        resumeAt: new Date(resumeAtTs).toISOString(),
+        windows: [],
+      },
+    }));
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    (worker as any).createAgentRun = async () => {};
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("throttled");
+    expect(runCommandMock).not.toHaveBeenCalled();
+    expect(continueSessionMock).not.toHaveBeenCalled();
+
+    const statuses = updateTaskStatusMock.mock.calls.map((call: any[]) => call[1]);
+    expect(statuses).toContain("throttled");
   });
 
   test("missing opencode/PATH mismatch fails without crashing", async () => {
