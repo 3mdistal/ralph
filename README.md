@@ -121,7 +121,7 @@ orchestration/
 
 ## How it works
 
-1. **Watch** - Ralph watches `orchestration/tasks/` for queued tasks
+1. **Watch** - Ralph watches `orchestration/tasks/**` for queued tasks
 2. **Dispatch** - Runs `/next-task <issue>` to plan the work
 3. **Route** - Parses agent's decision: proceed or escalate
 4. **Build** - If proceeding, tells agent to implement

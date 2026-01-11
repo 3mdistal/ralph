@@ -32,6 +32,56 @@ let watcher: ReturnType<typeof watch> | null = null;
 let changeHandlers: QueueChangeHandler[] = [];
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+const TASKS_GLOB_PATH = "orchestration/tasks/**";
+
+function warnIfNestedTaskPaths(tasks: AgentTask[]): void {
+  const nested = tasks
+    .map((t) => t._path)
+    .filter((p) => p.startsWith("orchestration/tasks/") && p.slice("orchestration/tasks/".length).includes("/"));
+
+  if (nested.length === 0) return;
+
+  if (shouldLog("queue:nested-tasks", 60_000)) {
+    const examples = nested.slice(0, 3).join(", ");
+    console.warn(
+      `[ralph:queue] Detected ${nested.length} nested agent-task path(s) under ${TASKS_GLOB_PATH} (likely due to '/' in the note name). These are supported. Examples: ${examples}`
+    );
+  }
+}
+
+const VALID_TASK_STATUSES = new Set<AgentTask["status"]>([
+  "queued",
+  "in-progress",
+  "blocked",
+  "escalated",
+  "done",
+]);
+
+async function listTasksInQueueDir(): Promise<AgentTask[]> {
+  const config = loadConfig();
+
+  try {
+    const result = await $`bwrb list --path ${TASKS_GLOB_PATH} --output json`.cwd(config.bwrbVault).quiet();
+    const parsed = JSON.parse(result.stdout.toString());
+    const rows = Array.isArray(parsed) ? parsed : [];
+
+    const tasks = rows.filter((row): row is AgentTask => {
+      return (
+        typeof row === "object" &&
+        row !== null &&
+        (row as { type?: unknown }).type === "agent-task" &&
+        typeof (row as { _path?: unknown })._path === "string"
+      );
+    });
+
+    warnIfNestedTaskPaths(tasks);
+    return tasks;
+  } catch (e) {
+    console.error(`[ralph:queue] Failed to list tasks under ${TASKS_GLOB_PATH}:`, e);
+    return [];
+  }
+}
+
 function getTaskQuery(task: Pick<AgentTask, "_path" | "name"> | string): string {
   if (typeof task === "string") return task;
   return task._path || task.name;
@@ -41,52 +91,29 @@ function getTaskQuery(task: Pick<AgentTask, "_path" | "name"> | string): string 
  * Get all queued tasks from bwrb
  */
 export async function getQueuedTasks(): Promise<AgentTask[]> {
-  const config = loadConfig();
-
-  try {
-    const result = await $`bwrb list agent-task --where "status == 'queued'" --output json`
-      .cwd(config.bwrbVault)
-      .quiet();
-    return JSON.parse(result.stdout.toString());
-  } catch (e) {
-    console.error("[ralph:queue] Failed to get queued tasks:", e);
-    return [];
-  }
+  const tasks = await listTasksInQueueDir();
+  return tasks.filter((t) => t.status === "queued");
 }
 
 /**
  * Get tasks by status
  */
 export async function getTasksByStatus(status: AgentTask["status"]): Promise<AgentTask[]> {
-  const config = loadConfig();
-
-  try {
-    const result = await $`bwrb list agent-task --where "status == '${status}'" --output json`
-      .cwd(config.bwrbVault)
-      .quiet();
-    return JSON.parse(result.stdout.toString());
-  } catch (e) {
-    console.error(`[ralph:queue] Failed to get ${status} tasks:`, e);
+  if (!VALID_TASK_STATUSES.has(status)) {
+    console.error(`[ralph:queue] Invalid task status: ${String(status)}`);
     return [];
   }
+
+  const tasks = await listTasksInQueueDir();
+  return tasks.filter((t) => t.status === status);
 }
 
 /**
  * Fetch a task by its exact bwrb `_path`.
  */
 export async function getTaskByPath(taskPath: string): Promise<AgentTask | null> {
-  const config = loadConfig();
-
-  try {
-    const result = await $`bwrb list agent-task --where "_path == '${taskPath}'" --output json`
-      .cwd(config.bwrbVault)
-      .quiet();
-    const parsed = JSON.parse(result.stdout.toString());
-    return Array.isArray(parsed) && parsed.length > 0 ? (parsed[0] as AgentTask) : null;
-  } catch (e) {
-    console.error(`[ralph:queue] Failed to get task by path ${taskPath}:`, e);
-    return null;
-  }
+  const tasks = await listTasksInQueueDir();
+  return tasks.find((t) => t._path === taskPath) ?? null;
 }
 
 /**
