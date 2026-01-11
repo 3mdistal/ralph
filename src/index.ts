@@ -425,12 +425,7 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
     return;
   }
 
-  if (throttle.state === "soft") {
-    if (shouldLog("daemon:soft-throttle", 30_000)) {
-      console.warn(`[ralph] Soft throttle active; skipping task scheduling until ${throttle.snapshot.resumeAt ?? "unknown"}`);
-    }
-    return;
-  }
+  if (throttle.state === "soft") return;
 
   const startedCount = startQueuedTasks({
     gate: "running",

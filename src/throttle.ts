@@ -43,7 +43,7 @@ const WINDOWS = [
 const DEFAULT_SOFT_PCT = 0.65;
 const DEFAULT_HARD_PCT = 0.75;
 
-const MIN_CHECK_INTERVAL_MS = 5_000;
+const MIN_CHECK_INTERVAL_MS = 1_000;
 
 let lastCheckedAt = 0;
 let lastDecision: ThrottleDecision | null = null;
@@ -252,15 +252,38 @@ export async function getThrottleDecision(now: number = Date.now()): Promise<Thr
     resumeAtTs = Math.max(...softResumeCandidates);
   }
 
+  const prevState: ThrottleState = lastDecision?.state ?? "ok";
+
+  // Use per-threshold resume timestamps so the snapshot matches the effective state.
+  const windowsForSnapshot = state === "hard" ? hardWindows : softWindows;
+
   const snapshot: ThrottleSnapshot = {
     computedAt: new Date(now).toISOString(),
     providerID,
     state,
     resumeAt: resumeAtTs ? new Date(resumeAtTs).toISOString() : null,
-    windows: hardWindows,
+    windows: windowsForSnapshot,
   };
 
-  if (state !== "ok" && shouldLog(`throttle:${state}`, 60_000)) {
+  if (prevState !== state) {
+    const pct = (value: number) => `${(value * 100).toFixed(2)}%`;
+    const softParts = softWindows.map((w) => {
+      const resetAt = w.resumeAtTs ? new Date(w.resumeAtTs).toISOString() : "unknown";
+      return (
+        `${w.name} used=${pct(w.usedPct)} usedTokens=${w.usedTokens} ` +
+        `softCapTokens=${w.softCapTokens} hardCapTokens=${w.hardCapTokens} budgetTokens=${w.budgetTokens} ` +
+        `resetAt=${resetAt}`
+      );
+    });
+
+    if (state === "soft") {
+      console.warn(`[ralph] Soft throttle enabled (${softParts.join("; ")}) resumeAt=${snapshot.resumeAt ?? "unknown"}`);
+    } else if (prevState === "soft" && state === "ok") {
+      console.warn(`[ralph] Soft throttle disabled (${softParts.join("; ")})`);
+    }
+  }
+
+  if (state === "hard" && shouldLog(`throttle:${state}`, 60_000)) {
     console.warn(
       `[ralph:throttle] ${state} throttle active; resumeAt=${snapshot.resumeAt ?? "unknown"} ` +
         `5h=${hardWindows[0]?.usedTokens ?? 0}/${hardWindows[0]?.hardCapTokens ?? 0} ` +
