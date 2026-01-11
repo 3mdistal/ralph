@@ -51,6 +51,31 @@ When throttled, the system should compute and surface a best-effort `resumeAt` t
 - Store a durable throttle snapshot when entering throttled states (reason, window(s), used %, caps, reset times).
 - Ensure “stop starting new tasks” composes with drain mode and does not interrupt in-flight work unless hard-throttled.
 
+## Throttle persistence
+
+When hard throttle triggers, Ralph persists throttling state at the task level so it is visible, explainable, and survives daemon restarts.
+
+### Task status + fields
+
+- Set task `status: throttled`.
+- Persist the following frontmatter fields (string-typed):
+  - `throttled-at`: ISO timestamp when Ralph paused the task.
+  - `resume-at`: ISO timestamp when Ralph expects it is safe to resume (best-effort).
+  - `usage-snapshot`: JSON string describing the throttle decision.
+
+### Snapshot schema (best-effort)
+
+`usage-snapshot` is a JSON object that SHOULD include:
+- `computedAt` (ISO timestamp)
+- `providerID` (e.g. `openai`)
+- `state` (`ok` | `soft` | `hard`)
+- `resumeAt` (ISO timestamp or null)
+- `windows`: array of per-window objects including:
+  - `name`, `windowMs`, `budgetTokens`, `softCapTokens`, `hardCapTokens`, `usedTokens`, `usedPct`
+  - `oldestTsInWindow`, `resumeAtTs`
+
+Ralph may include additional keys for observability, but should keep these core fields stable.
+
 ## Implementation notes
 
 See `docs/ops/opencode-usage-throttling.md` for current implementation details and calibration notes for the current provider/tooling.

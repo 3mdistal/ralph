@@ -264,6 +264,16 @@ async function attemptResumeThrottledTasks(): Promise<void> {
   const throttled = await getTasksByStatus("throttled");
   if (throttled.length === 0) return;
 
+  const throttle = await isHardThrottled();
+  if (throttle.hard) {
+    if (shouldLog("daemon:hard-throttle-resume", 60_000)) {
+      console.warn(
+        `[ralph] Hard throttle active; deferring resume of throttled tasks until ${throttle.decision.snapshot.resumeAt ?? "unknown"}`
+      );
+    }
+    return;
+  }
+
   const now = Date.now();
 
   for (const task of throttled) {
@@ -273,15 +283,6 @@ async function attemptResumeThrottledTasks(): Promise<void> {
     const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;
     if (Number.isFinite(resumeAtTs) && resumeAtTs > now) continue;
 
-    const throttle = await isHardThrottled();
-    if (throttle.hard) {
-      await updateTaskStatus(task, "throttled", {
-        "throttled-at": task["throttled-at"]?.trim() || new Date().toISOString(),
-        "resume-at": throttle.decision.snapshot.resumeAt ?? "",
-        "usage-snapshot": JSON.stringify(throttle.decision.snapshot),
-      });
-      continue;
-    }
 
     const sessionId = task["session-id"]?.trim() ?? "";
     if (!sessionId) {

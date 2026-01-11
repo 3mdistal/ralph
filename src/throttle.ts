@@ -178,7 +178,17 @@ function computeWindowSnapshot(opts: {
   const cap = opts.threshold === "hard" ? hardCapTokens : softCapTokens;
   const isThrottled = usedTokens >= cap;
 
-  const resumeAtTs = isThrottled && oldestTs !== null ? oldestTs + opts.windowMs : null;
+  let resumeAtTs: number | null = null;
+
+  if (isThrottled) {
+    const sorted = [...inWindow].sort((a, b) => a.ts - b.ts);
+    let remaining = usedTokens;
+    for (const e of sorted) {
+      if (remaining < cap) break;
+      remaining -= e.tokens;
+      resumeAtTs = e.ts + opts.windowMs;
+    }
+  }
 
   return {
     name: opts.name,
