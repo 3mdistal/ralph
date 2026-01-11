@@ -2,7 +2,7 @@ import { watch } from "fs";
 import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
-import { getRepoBotBranch, getRepoPath, loadConfig } from "./config";
+import { ensureBwrbVaultLayout, getRepoBotBranch, getRepoPath, loadConfig } from "./config";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 
@@ -452,7 +452,11 @@ export function startWatching(onChange: QueueChangeHandler): void {
   if (watcher) return;
 
   const config = loadConfig();
-  const tasksDir = join(config.bwrbVault, "orchestration/tasks");
+  const vault = config.bwrbVault;
+
+  if (!ensureBwrbVaultLayout(vault)) return;
+
+  const tasksDir = join(vault, "orchestration/tasks");
 
   console.log(`[ralph:queue] Watching ${tasksDir} for changes`);
 

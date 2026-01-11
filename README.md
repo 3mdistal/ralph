@@ -30,8 +30,10 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 
 - [Bun](https://bun.sh) >= 1.0.0
 - [OpenCode](https://opencode.ai) CLI
-- [bwrb](https://github.com/3mdistal/bwrb) CLI
+- [bwrb](https://github.com/3mdistal/bwrb) CLI (`npm install -g bwrb`)
 - [gh](https://cli.github.com) CLI
+
+If you previously installed bwrb via `pnpm link -g`, unlink it first so Ralph uses the published CLI on your PATH (Bun just shells out to the `bwrb` binary).
 
 ## Installation
 
@@ -45,6 +47,8 @@ bun install
 
 Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
+By default, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
+
 Config is loaded once at startup, so restart the daemon after editing.
 
 ### Minimal example
@@ -52,7 +56,7 @@ Config is loaded once at startup, so restart the daemon after editing.
 `~/.ralph/config.toml`:
 
 ```toml
-bwrbVault = "/absolute/path/to/your/bwrb-vault"
+bwrbVault = "/absolute/path/to/your/ralph"
 devDir = "/absolute/path/to/your/dev-directory"
 repos = [
   { name = "3mdistal/ralph", path = "/absolute/path/to/your/ralph", botBranch = "bot/integration" }
@@ -63,7 +67,7 @@ Or JSON (`~/.ralph/config.json`):
 
 ```json
 {
-  "bwrbVault": "/absolute/path/to/your/bwrb-vault",
+  "bwrbVault": "/absolute/path/to/your/ralph",
   "devDir": "/absolute/path/to/your/dev-directory",
   "repos": [
     {

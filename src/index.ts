@@ -10,7 +10,7 @@
 import { existsSync, watch } from "fs";
 import { join } from "path";
 
-import { getRepoMaxWorkers, getRepoPath, loadConfig } from "./config";
+import { ensureBwrbVaultLayout, getRepoMaxWorkers, getRepoPath, loadConfig } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
   initialPoll,
@@ -66,6 +66,11 @@ let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
 const rrCursor = { value: 0 };
+
+function requireBwrbVaultOrExit(): void {
+  const vault = loadConfig().bwrbVault;
+  if (!ensureBwrbVaultLayout(vault)) process.exit(1);
+}
 
 function ensureSemaphores(): void {
   if (globalSemaphore) return;
@@ -474,6 +479,11 @@ async function main(): Promise<void> {
   // Load config
   const config = loadConfig();
 
+  // Ensure the configured vault is valid and ready.
+  if (!ensureBwrbVaultLayout(config.bwrbVault)) {
+    throw new Error(`Invalid bwrbVault: ${JSON.stringify(config.bwrbVault)}`);
+  }
+
   // Initialize durable local state (SQLite)
   initStateDb();
 
@@ -779,6 +789,8 @@ if (args[0] === "resume") {
     process.exit(0);
   }
 
+  requireBwrbVaultOrExit();
+
   // Resume any orphaned in-progress tasks and exit
   await resumeTasksOnStartup();
   process.exit(0);
@@ -789,6 +801,8 @@ if (args[0] === "status") {
     printCommandHelp("status");
     process.exit(0);
   }
+
+  requireBwrbVaultOrExit();
 
   const json = args.includes("--json");
 
@@ -931,6 +945,8 @@ if (args[0] === "nudge") {
   const taskRef = taskRefRaw;
   const message = messageRaw;
 
+  requireBwrbVaultOrExit();
+
   const tasks = await getTasksByStatus("in-progress");
   if (tasks.length === 0) {
     console.error("No in-progress tasks found.");
@@ -991,6 +1007,8 @@ if (args[0] === "watch") {
     printCommandHelp("watch");
     process.exit(0);
   }
+
+  requireBwrbVaultOrExit();
 
   console.log("[ralph] Watching in-progress task status (Ctrl+C to stop)...");
 
