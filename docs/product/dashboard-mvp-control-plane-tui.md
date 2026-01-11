@@ -106,7 +106,7 @@ Recommended MVP `workerId`:
 ### Auth
 
 - Require `Authorization: Bearer <token>` for all endpoints.
-- Token is stored in `~/.config/opencode/ralph/ralph.json` (new field, e.g. `dashboardToken`).
+- Token is stored in `~/.config/opencode/ralph/ralph.json` (planned new field, e.g. `dashboardToken`; not currently read by the daemon config loader).
 - Default bind: `127.0.0.1`.
 
 ### Remote access strategy (BYO)

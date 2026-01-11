@@ -4,6 +4,27 @@ import { $ } from "bun";
 import { loadConfig } from "./config";
 import { shouldLog } from "./logging";
 
+type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
+
+type BwrbProcess = {
+  cwd: (path: string) => BwrbProcess;
+  quiet: () => Promise<BwrbCommandResult>;
+};
+
+type BwrbRunner = (strings: TemplateStringsArray, ...values: unknown[]) => BwrbProcess;
+
+const DEFAULT_BWRB_RUNNER: BwrbRunner = $ as unknown as BwrbRunner;
+
+let bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
+
+export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
+  bwrb = runner;
+}
+
+export function __resetBwrbRunnerForTests(): void {
+  bwrb = DEFAULT_BWRB_RUNNER;
+}
+
 export interface AgentTask {
   _path: string;
   _name: string;
@@ -57,11 +78,18 @@ const VALID_TASK_STATUSES = new Set<AgentTask["status"]>([
   "done",
 ]);
 
-async function listTasksInQueueDir(): Promise<AgentTask[]> {
+async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentTask[]> {
   const config = loadConfig();
 
+  const where = status
+    ? `type == 'agent-task' && status == '${status}'`
+    : "type == 'agent-task'";
+
   try {
-    const result = await $`bwrb list --path ${TASKS_GLOB_PATH} --output json`.cwd(config.bwrbVault).quiet();
+    const result = await bwrb`bwrb list --path ${TASKS_GLOB_PATH} --where ${where} --output json`
+      .cwd(config.bwrbVault)
+      .quiet();
+
     const parsed = JSON.parse(result.stdout.toString());
     const rows = Array.isArray(parsed) ? parsed : [];
 
@@ -91,8 +119,7 @@ function getTaskQuery(task: Pick<AgentTask, "_path" | "name"> | string): string 
  * Get all queued tasks from bwrb
  */
 export async function getQueuedTasks(): Promise<AgentTask[]> {
-  const tasks = await listTasksInQueueDir();
-  return tasks.filter((t) => t.status === "queued");
+  return await listTasksInQueueDir("queued");
 }
 
 /**
@@ -104,8 +131,7 @@ export async function getTasksByStatus(status: AgentTask["status"]): Promise<Age
     return [];
   }
 
-  const tasks = await listTasksInQueueDir();
-  return tasks.filter((t) => t.status === status);
+  return await listTasksInQueueDir(status);
 }
 
 /**
@@ -136,13 +162,13 @@ export async function updateTaskStatus(
   try {
     if (exactPath) {
       // Use --path for exact file match - no ambiguity
-      await $`bwrb edit --path ${exactPath} --json ${json}`
+      await bwrb`bwrb edit --path ${exactPath} --json ${json}`
         .cwd(config.bwrbVault)
         .quiet();
     } else {
       // Fallback to name search (less reliable)
       const query = typeof task === "string" ? task : task.name;
-      await $`bwrb edit --picker none -t agent-task --path "orchestration/tasks/**" ${query} --json ${json}`
+      await bwrb`bwrb edit --picker none -t agent-task --path "orchestration/tasks/**" ${query} --json ${json}`
         .cwd(config.bwrbVault)
         .quiet();
     }
