@@ -42,6 +42,14 @@ Throttle decisions should pace usage toward the next reset time, rather than dis
 
 When throttled, the system should compute and surface a best-effort `resumeAt` time based on reset schedules and current usage.
 
+### Enforcement timing
+
+Hard throttle is enforced at safe checkpoints (control boundaries), not by interrupting an in-flight model send.
+
+- If a model send is already in progress, it may complete.
+- Ralph must not initiate any *new* model sends once hard throttle is detected.
+- In practice, this means gating sends *before* they happen and pausing tasks at the next safe checkpoint (e.g., between `continueSession(...)` calls).
+
 ## Integration requirements
 
 - Gate model sends at all major send points:
