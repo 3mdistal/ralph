@@ -34,6 +34,12 @@ This is a product-level policy: the system should self-regulate to preserve pred
 
 Support multiple windows simultaneously (e.g., a short rolling window and a weekly window). The effective throttle state is the most restrictive state across windows.
 
+### Per-profile overrides
+
+When using multiple OpenCode profiles (multi-account), Ralph may apply throttle settings per profile (budgets/thresholds/provider). Overrides are selected based on the effective OpenCode profile used for the operation (i.e., the profile whose local OpenCode logs are scanned and whose account would be charged).
+
+When no effective profile is known, Ralph should fall back to global throttle settings.
+
 ### Pacing
 
 Throttle decisions should pace usage toward the next reset time, rather than distributing evenly from window start.
@@ -76,6 +82,8 @@ When hard throttle triggers, Ralph persists throttling state at the task level s
 `usage-snapshot` is a JSON object that SHOULD include:
 - `computedAt` (ISO timestamp)
 - `providerID` (e.g. `openai`)
+- `opencodeProfile` (string or null; best-effort)
+- `messagesRootDir` (string; best-effort)
 - `state` (`ok` | `soft` | `hard`)
 - `resumeAt` (ISO timestamp or null)
 - `windows`: array of per-window objects including:
