@@ -17,10 +17,19 @@ const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 const gh: GhRunner = DEFAULT_GH_RUNNER;
 
 import { type AgentTask, updateTaskStatus } from "./queue";
-import { getRepoBotBranch, getRepoMaxWorkers, getRepoRequiredChecks, loadConfig } from "./config";
+import {
+  getOpencodeDefaultProfileName,
+  getRepoBotBranch,
+  getRepoMaxWorkers,
+  getRepoRequiredChecks,
+  isOpencodeProfilesEnabled,
+  loadConfig,
+  resolveOpencodeProfile,
+} from "./config";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { getThrottleDecision } from "./throttle";
+import { readControlStateSnapshot } from "./drain";
 import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
 import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
 import {
@@ -699,6 +708,7 @@ export class RepoWorker {
     sessionId: string;
     watchdogStagePrefix: string;
     notifyTitle: string;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
     const REQUIRED_CHECKS = getRepoRequiredChecks(this.repo);
     const MAX_CI_FIX_ATTEMPTS = 3;
@@ -757,6 +767,7 @@ export class RepoWorker {
           stepTitle: "fix CI",
         },
         ...this.buildWatchdogOptions(params.task, `${params.watchdogStagePrefix}-ci-fix`),
+        ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
       });
 
       sessionId = fixResult.sessionId || sessionId;
@@ -767,7 +778,8 @@ export class RepoWorker {
             params.task,
             params.cacheKey,
             `${params.watchdogStagePrefix}-ci-fix`,
-            fixResult
+            fixResult,
+            params.opencodeXdg
           );
           return { ok: false, run };
         }
@@ -891,8 +903,81 @@ export class RepoWorker {
     };
   }
 
+  private getPinnedOpencodeProfileName(task: AgentTask): string | null {
+    const raw = task["opencode-profile"];
+    const trimmed = typeof raw === "string" ? raw.trim() : "";
+    return trimmed ? trimmed : null;
+  }
+
+  private resolveOpencodeXdgForTask(
+    task: AgentTask,
+    phase: "start" | "resume"
+  ): {
+    profileName: string | null;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+  } {
+    if (!isOpencodeProfilesEnabled()) return { profileName: null };
+
+    const pinned = this.getPinnedOpencodeProfileName(task);
+
+    if (pinned) {
+      const resolved = resolveOpencodeProfile(pinned);
+      if (!resolved) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Unknown opencode-profile=${JSON.stringify(pinned)} for task ${task.issue}; ` +
+            `configure it under [opencode.profiles.${pinned}] in ~/.ralph/config.toml. Continuing with ambient XDG dirs.`
+        );
+        return { profileName: pinned };
+      }
+
+      return {
+        profileName: resolved.name,
+        opencodeXdg: {
+          dataHome: resolved.xdgDataHome,
+          configHome: resolved.xdgConfigHome,
+          stateHome: resolved.xdgStateHome,
+          cacheHome: resolved.xdgCacheHome,
+        },
+      };
+    }
+
+    const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+    const requested = control.opencodeProfile?.trim() ?? "";
+
+    let resolved = requested ? resolveOpencodeProfile(requested) : null;
+
+    if (requested && !resolved) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Control opencode_profile=${JSON.stringify(requested)} does not match a configured profile; ` +
+          `falling back to defaultProfile=${JSON.stringify(getOpencodeDefaultProfileName() ?? "")}`
+      );
+      resolved = resolveOpencodeProfile(null);
+    }
+
+    if (!resolved) {
+      if (phase === "start" && requested) {
+        console.warn(`[ralph:worker:${this.repo}] Unable to resolve OpenCode profile for new task; running with ambient XDG dirs`);
+      }
+      return { profileName: null };
+    }
+
+    return {
+      profileName: resolved.name,
+      opencodeXdg: {
+        dataHome: resolved.xdgDataHome,
+        configHome: resolved.xdgConfigHome,
+        stateHome: resolved.xdgStateHome,
+        cacheHome: resolved.xdgCacheHome,
+      },
+    };
+  }
+
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
-    const decision = await getThrottleDecision();
+    const pinned = this.getPinnedOpencodeProfileName(task);
+    const controlProfile = pinned ? null : (readControlStateSnapshot({ log: (message) => console.warn(message) }).opencodeProfile?.trim() ?? null);
+    const opencodeProfile = pinned ?? controlProfile ?? getOpencodeDefaultProfileName();
+
+    const decision = await getThrottleDecision(Date.now(), { opencodeProfile });
     if (decision.state !== "hard") return null;
 
     const throttledAt = new Date().toISOString();
@@ -921,12 +1006,20 @@ export class RepoWorker {
     };
   }
 
-  private async drainNudges(task: AgentTask, repoPath: string, sessionId: string, cacheKey: string, stage: string): Promise<void> {
+  private async drainNudges(
+    task: AgentTask,
+    repoPath: string,
+    sessionId: string,
+    cacheKey: string,
+    stage: string,
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string }
+  ): Promise<void> {
     const sid = sessionId?.trim();
     if (!sid) return;
 
     try {
       const issueNumber = task.issue.match(/#(\d+)$/)?.[1] ?? cacheKey;
+      const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
       const result = await drainQueuedNudges(sid, async (message) => {
         const paused = await this.pauseIfHardThrottled(task, `nudge-${stage}`, sid);
@@ -941,6 +1034,7 @@ export class RepoWorker {
           cacheKey,
           runLogPath,
           ...this.buildWatchdogOptions(task, `nudge-${stage}`),
+          ...opencodeSessionOptions,
         });
         return { success: res.success, error: res.success ? undefined : res.output };
       });
@@ -956,7 +1050,13 @@ export class RepoWorker {
     }
   }
 
-  private async handleWatchdogTimeout(task: AgentTask, cacheKey: string, stage: string, result: SessionResult): Promise<AgentRun> {
+  private async handleWatchdogTimeout(
+    task: AgentTask,
+    cacheKey: string,
+    stage: string,
+    result: SessionResult,
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string }
+  ): Promise<AgentRun> {
     const timeout = result.watchdogTimeout;
     const retryCount = this.getWatchdogRetryCount(task);
     const nextRetryCount = retryCount + 1;
@@ -967,7 +1067,7 @@ export class RepoWorker {
 
     // Cleanup per-task OpenCode cache on watchdog timeouts (best-effort)
     try {
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
     } catch {
       // ignore
     }
@@ -1041,6 +1141,15 @@ export class RepoWorker {
     const issueNumber = issueMatch?.[1] ?? "";
     const cacheKey = issueNumber || task._name;
 
+    const resolvedOpencode = this.resolveOpencodeXdgForTask(task, "resume");
+    const opencodeProfileName = resolvedOpencode.profileName;
+    const opencodeXdg = resolvedOpencode.opencodeXdg;
+    const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
+
+    if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
+      await updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
+    }
+
     const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber || cacheKey, "resume");
 
       const existingSessionId = task["session-id"]?.trim();
@@ -1081,6 +1190,7 @@ export class RepoWorker {
           stepTitle: "resume",
         },
         ...this.buildWatchdogOptions(task, "resume"),
+        ...opencodeSessionOptions,
       });
 
       const pausedAfter = await this.pauseIfHardThrottled(task, "resume (post)", buildResult.sessionId || existingSessionId);
@@ -1088,7 +1198,7 @@ export class RepoWorker {
 
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult);
+          return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult, opencodeXdg);
         }
 
         const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
@@ -1110,7 +1220,7 @@ export class RepoWorker {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
-      await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+      await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
 
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
@@ -1133,7 +1243,7 @@ export class RepoWorker {
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
-        await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume");
+        await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
 
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
         const newAnomalies = anomalyStatus.total - lastAnomalyCount;
@@ -1195,6 +1305,7 @@ export class RepoWorker {
                 stepTitle: "resume loop-break",
               },
               ...this.buildWatchdogOptions(task, "resume-loop-break"),
+              ...opencodeSessionOptions,
             }
           );
 
@@ -1207,7 +1318,7 @@ export class RepoWorker {
 
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
-              return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult);
+              return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
             }
             console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
             break;
@@ -1243,6 +1354,7 @@ export class RepoWorker {
             stepTitle: "continue",
           },
           ...this.buildWatchdogOptions(task, "resume-continue"),
+          ...opencodeSessionOptions,
         });
 
         const pausedContinueAfter = await this.pauseIfHardThrottled(
@@ -1254,7 +1366,7 @@ export class RepoWorker {
 
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
-            return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult);
+            return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult, opencodeXdg);
           }
 
           // If the session ended without printing a URL, try to recover PR from git state.
@@ -1325,6 +1437,7 @@ export class RepoWorker {
         sessionId: buildResult.sessionId,
         watchdogStagePrefix: "resume-merge",
         notifyTitle: `Resuming ${task.name}`,
+        opencodeXdg,
       });
 
       if (!mergeGate.ok) return mergeGate.run;
@@ -1346,19 +1459,21 @@ export class RepoWorker {
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
       const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey");
 
-      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: resumeSurveyRunLogPath,
-        ...this.buildWatchdogOptions(task, "resume-survey"),
-      });
+        const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
+          repo: this.repo,
+          cacheKey,
+          runLogPath: resumeSurveyRunLogPath,
+          ...this.buildWatchdogOptions(task, "resume-survey"),
+          ...opencodeSessionOptions,
+        });
+
 
       const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "resume survey (post)", surveyResult.sessionId || buildResult.sessionId || existingSessionId);
       if (pausedSurveyAfter) return pausedSurveyAfter;
 
       if (!surveyResult.success) {
         if (surveyResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult);
+          return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult, opencodeXdg);
         }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
@@ -1381,7 +1496,7 @@ export class RepoWorker {
       });
 
       // Cleanup per-task OpenCode cache on success
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
 
       if (worktreePath) {
         await this.cleanupGitWorktree(worktreePath);
@@ -1439,9 +1554,15 @@ export class RepoWorker {
       const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
       if (pausedPreStart) return pausedPreStart;
 
+      const resolvedOpencode = this.resolveOpencodeXdgForTask(task, "start");
+      const opencodeProfileName = resolvedOpencode.profileName;
+      const opencodeXdg = resolvedOpencode.opencodeXdg;
+      const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
+
       // 3. Mark task starting (restart-safe pre-session state)
       const markedStarting = await updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
+        ...(!task["opencode-profile"]?.trim() && opencodeProfileName ? { "opencode-profile": opencodeProfileName } : {}),
       });
       if (!markedStarting) {
         throw new Error("Failed to mark task starting (bwrb edit failed)");
@@ -1480,13 +1601,14 @@ export class RepoWorker {
           stepTitle: "next-task",
         },
         ...this.buildWatchdogOptions(task, "next-task"),
+        ...opencodeSessionOptions,
       });
 
       const pausedAfterNextTask = await this.pauseIfHardThrottled(task, "next-task (post)", planResult.sessionId);
       if (pausedAfterNextTask) return pausedAfterNextTask;
 
       if (!planResult.success && planResult.watchdogTimeout) {
-        return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult);
+        return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult, opencodeXdg);
       }
 
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
@@ -1506,6 +1628,7 @@ export class RepoWorker {
             stepTitle: "next-task (retry)",
           },
           ...this.buildWatchdogOptions(task, "next-task-retry"),
+          ...opencodeSessionOptions,
         });
       }
 
@@ -1514,7 +1637,7 @@ export class RepoWorker {
 
       if (!planResult.success) {
         if (planResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult);
+          return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult, opencodeXdg);
         }
         throw new Error(`/next-task failed: ${planResult.output}`);
       }
@@ -1560,6 +1683,7 @@ export class RepoWorker {
             step: 2,
             stepTitle: "consult devex",
           },
+          ...opencodeSessionOptions,
         });
 
         const pausedAfterDevexConsult = await this.pauseIfHardThrottled(
@@ -1614,6 +1738,7 @@ export class RepoWorker {
               step: 3,
               stepTitle: "reroute after devex",
             },
+            ...opencodeSessionOptions,
           });
 
           const pausedAfterReroute = await this.pauseIfHardThrottled(
@@ -1718,6 +1843,7 @@ export class RepoWorker {
           stepTitle: "build",
         },
         ...this.buildWatchdogOptions(task, "build"),
+        ...opencodeSessionOptions,
       });
 
       const pausedAfterBuild = await this.pauseIfHardThrottled(task, "build (post)", buildResult.sessionId || planResult.sessionId);
@@ -1725,7 +1851,7 @@ export class RepoWorker {
 
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult);
+          return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult, opencodeXdg);
         }
         throw new Error(`Build failed: ${buildResult.output}`);
       }
@@ -1735,7 +1861,7 @@ export class RepoWorker {
         await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
-      await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build");
+      await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build", opencodeXdg);
 
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
@@ -1759,7 +1885,7 @@ export class RepoWorker {
       let lastAnomalyCount = 0;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
-        await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build");
+        await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build", opencodeXdg);
 
         // Check for anomaly burst before continuing
         const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
@@ -1824,6 +1950,7 @@ export class RepoWorker {
                 stepTitle: "build loop-break",
               },
               ...this.buildWatchdogOptions(task, "build-loop-break"),
+              ...opencodeSessionOptions,
             }
           );
 
@@ -1832,7 +1959,7 @@ export class RepoWorker {
 
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
-              return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult);
+              return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
             }
             console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
             break;
@@ -1868,6 +1995,7 @@ export class RepoWorker {
             stepTitle: "build continue",
           },
           ...this.buildWatchdogOptions(task, "build-continue"),
+          ...opencodeSessionOptions,
         });
 
         const pausedBuildContinueAfter = await this.pauseIfHardThrottled(task, "build continue (post)", buildResult.sessionId);
@@ -1875,7 +2003,7 @@ export class RepoWorker {
 
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
-            return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult);
+            return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult, opencodeXdg);
           }
 
           // If the session ended without printing a URL, try to recover PR from git state.
@@ -1947,6 +2075,7 @@ export class RepoWorker {
         sessionId: buildResult.sessionId,
         watchdogStagePrefix: "merge",
         notifyTitle: `Merging ${task.name}`,
+        opencodeXdg,
       });
 
       if (!mergeGate.ok) return mergeGate.run;
@@ -1977,6 +2106,7 @@ export class RepoWorker {
           stepTitle: "survey",
         },
         ...this.buildWatchdogOptions(task, "survey"),
+        ...opencodeSessionOptions,
       });
 
       const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "survey (post)", surveyResult.sessionId || buildResult.sessionId);
@@ -1984,7 +2114,7 @@ export class RepoWorker {
 
       if (!surveyResult.success) {
         if (surveyResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult);
+          return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
         }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
@@ -2010,7 +2140,7 @@ export class RepoWorker {
       });
 
       // 12. Cleanup per-task OpenCode cache on success
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
 
       if (worktreePath) {
         await this.cleanupGitWorktree(worktreePath);
