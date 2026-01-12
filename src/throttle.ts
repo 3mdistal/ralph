@@ -286,18 +286,24 @@ function getSystemTimeZone(): string {
   return typeof tz === "string" && tz.trim() ? tz.trim() : "UTC";
 }
 
+const zonedPartsFormatterCache = new Map<string, Intl.DateTimeFormat>();
+
 function getZonedParts(date: Date, timeZone: string): ZonedParts {
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    weekday: "short",
-    hourCycle: "h23",
-  });
+  let fmt = zonedPartsFormatterCache.get(timeZone);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      weekday: "short",
+      hourCycle: "h23",
+    });
+    zonedPartsFormatterCache.set(timeZone, fmt);
+  }
 
   const parts = fmt.formatToParts(date);
   const lookup: Record<string, string> = {};

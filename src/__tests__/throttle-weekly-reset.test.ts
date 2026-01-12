@@ -68,4 +68,43 @@ describe("weekly reset boundaries", () => {
     expect(next.hour).toBe(19);
     expect(next.minute).toBe(9);
   });
+
+  test("handles DST spring-forward week for a 19:05 reset", () => {
+    const timeZone = "America/Indiana/Indianapolis";
+    const schedule = { dayOfWeek: 1, hour: 19, minute: 5, timeZone };
+
+    // DST in 2026 starts Sun Mar 8. This is Mon Mar 9 18:00 local.
+    const nowMs = Date.parse("2026-03-09T22:00:00Z");
+
+    const { lastResetTs, nextResetTs } = __computeWeeklyResetBoundariesForTests(nowMs, schedule);
+
+    const next = zonedParts(nextResetTs, timeZone);
+    expect(next.weekday).toBe("Mon");
+    expect(next.hour).toBe(19);
+    expect(next.minute).toBe(5);
+
+    // DST can shift the UTC delta by an hour.
+    const delta = nextResetTs - lastResetTs;
+    expect(delta).toBeGreaterThan(6.8 * 24 * 60 * 60 * 1000);
+    expect(delta).toBeLessThan(7.2 * 24 * 60 * 60 * 1000);
+  });
+
+  test("handles DST fall-back week for a 19:05 reset", () => {
+    const timeZone = "America/Indiana/Indianapolis";
+    const schedule = { dayOfWeek: 1, hour: 19, minute: 5, timeZone };
+
+    // DST in 2026 ends Sun Nov 1. This is Mon Nov 2 18:00 local.
+    const nowMs = Date.parse("2026-11-02T23:00:00Z");
+
+    const { lastResetTs, nextResetTs } = __computeWeeklyResetBoundariesForTests(nowMs, schedule);
+
+    const next = zonedParts(nextResetTs, timeZone);
+    expect(next.weekday).toBe("Mon");
+    expect(next.hour).toBe(19);
+    expect(next.minute).toBe(5);
+
+    const delta = nextResetTs - lastResetTs;
+    expect(delta).toBeGreaterThan(6.8 * 24 * 60 * 60 * 1000);
+    expect(delta).toBeLessThan(7.2 * 24 * 60 * 60 * 1000);
+  });
 });
