@@ -60,7 +60,8 @@ describe("throttle config validation", () => {
       "",
     ]);
 
-    const cfgMod = await import("../config?throttle-config-validation");
+    const query: string = "throttle-config-validation";
+    const cfgMod = await import(`../config?${query}`);
     cfgMod.__resetConfigForTests();
     const cfg = cfgMod.loadConfig();
 
@@ -97,7 +98,8 @@ describe("throttle config validation", () => {
       "",
     ]);
 
-    const cfgMod = await import("../config?throttle-config-validation-invalid");
+    const query: string = "throttle-config-validation-invalid";
+    const cfgMod = await import(`../config?${query}`);
     cfgMod.__resetConfigForTests();
     const cfg = cfgMod.loadConfig();
 
