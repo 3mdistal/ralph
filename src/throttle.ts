@@ -11,6 +11,12 @@ export type ThrottleState = "ok" | "soft" | "hard";
 export interface ThrottleWindowSnapshot {
   name: string;
   windowMs: number;
+
+  /** Inclusive start timestamp used for counting in this window (best-effort). */
+  windowStartTs?: number | null;
+  /** Exclusive end timestamp used for counting in this window (best-effort). */
+  windowEndTs?: number | null;
+
   budgetTokens: number;
   softCapTokens: number;
   hardCapTokens: number;
@@ -18,6 +24,15 @@ export interface ThrottleWindowSnapshot {
   usedPct: number;
   oldestTsInWindow: number | null;
   resumeAtTs: number | null;
+
+  /** Weekly reset metadata (only set when weekly reset is configured). */
+  weeklyLastResetTs?: number | null;
+  weeklyNextResetTs?: number | null;
+  weeklyResetTimeZone?: string | null;
+  weeklyResetDayOfWeek?: number | null;
+  weeklyResetHour?: number | null;
+  weeklyResetMinute?: number | null;
+
   softResumeAtTs?: number | null;
   hardResumeAtTs?: number | null;
 }
@@ -237,6 +252,211 @@ export async function scanOpencodeUsageEvents(
   return { events, stats };
 }
 
+type WeeklyResetSchedule = {
+  dayOfWeek: number;
+  hour: number;
+  minute: number;
+  timeZone: string;
+};
+
+type Ymd = { year: number; month: number; day: number };
+
+type ZonedParts = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second: number;
+  dayOfWeek: number; // 0=Sun..6=Sat
+};
+
+const WEEKDAY_TO_IDX: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+function getSystemTimeZone(): string {
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return typeof tz === "string" && tz.trim() ? tz.trim() : "UTC";
+}
+
+function getZonedParts(date: Date, timeZone: string): ZonedParts {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    weekday: "short",
+    hourCycle: "h23",
+  });
+
+  const parts = fmt.formatToParts(date);
+  const lookup: Record<string, string> = {};
+  for (const p of parts) {
+    if (p.type !== "literal") lookup[p.type] = p.value;
+  }
+
+  const year = Number(lookup.year);
+  const month = Number(lookup.month);
+  const day = Number(lookup.day);
+  const hour = Number(lookup.hour);
+  const minute = Number(lookup.minute);
+  const second = Number(lookup.second);
+  const weekdayRaw = lookup.weekday;
+  const dayOfWeek = WEEKDAY_TO_IDX[weekdayRaw] ?? 0;
+
+  return { year, month, day, hour, minute, second, dayOfWeek };
+}
+
+function tzOffsetMs(at: Date, timeZone: string): number {
+  const p = getZonedParts(at, timeZone);
+  const asUTC = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  return asUTC - at.getTime();
+}
+
+function shiftYmd(ymd: Ymd, deltaDays: number): Ymd {
+  const base = Date.UTC(ymd.year, ymd.month - 1, ymd.day);
+  const shifted = new Date(base + deltaDays * 24 * 60 * 60 * 1000);
+  return {
+    year: shifted.getUTCFullYear(),
+    month: shifted.getUTCMonth() + 1,
+    day: shifted.getUTCDate(),
+  };
+}
+
+function zonedDateTimeToInstantMs(args: {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+  second?: number;
+  timeZone: string;
+}): number {
+  const guessUTC = Date.UTC(args.year, args.month - 1, args.day, args.hour, args.minute, args.second ?? 0);
+
+  let t = guessUTC;
+  for (let i = 0; i < 3; i++) {
+    const offset = tzOffsetMs(new Date(t), args.timeZone);
+    t = guessUTC - offset;
+  }
+  return t;
+}
+
+function resolveWeeklyResetSchedule(opts: { global?: any; perProfile?: any }): WeeklyResetSchedule {
+  const systemTz = getSystemTimeZone();
+  const raw = (opts.perProfile?.reset?.weekly ?? opts.global?.reset?.weekly ?? {}) as any;
+
+  const dayOfWeek =
+    typeof raw?.dayOfWeek === "number" && Number.isFinite(raw.dayOfWeek) ? Math.max(0, Math.min(6, Math.floor(raw.dayOfWeek))) : 4;
+  const hour = typeof raw?.hour === "number" && Number.isFinite(raw.hour) ? Math.max(0, Math.min(23, Math.floor(raw.hour))) : 19;
+  const minute = typeof raw?.minute === "number" && Number.isFinite(raw.minute) ? Math.max(0, Math.min(59, Math.floor(raw.minute))) : 9;
+
+  const tzRaw = typeof raw?.timeZone === "string" && raw.timeZone.trim() ? raw.timeZone.trim() : systemTz;
+
+  return { dayOfWeek, hour, minute, timeZone: tzRaw };
+}
+
+function computeWeeklyResetBoundaries(nowMs: number, schedule: WeeklyResetSchedule): { lastResetTs: number; nextResetTs: number } {
+  const now = new Date(nowMs);
+  const zonedNow = getZonedParts(now, schedule.timeZone);
+  const nowMinutes = zonedNow.hour * 60 + zonedNow.minute + zonedNow.second / 60;
+  const resetMinutes = schedule.hour * 60 + schedule.minute;
+
+  const deltaForward = (schedule.dayOfWeek - zonedNow.dayOfWeek + 7) % 7;
+
+  const todayYmd: Ymd = { year: zonedNow.year, month: zonedNow.month, day: zonedNow.day };
+  const nextResetYmd = shiftYmd(todayYmd, deltaForward);
+
+  const candidateNextResetTs = zonedDateTimeToInstantMs({
+    ...nextResetYmd,
+    hour: schedule.hour,
+    minute: schedule.minute,
+    second: 0,
+    timeZone: schedule.timeZone,
+  });
+
+  const isTodayResetDay = deltaForward === 0;
+  const beforeResetToday = isTodayResetDay && nowMinutes < resetMinutes;
+
+  if (beforeResetToday || deltaForward > 0) {
+    const lastYmd = shiftYmd(nextResetYmd, -7);
+    const lastResetTs = zonedDateTimeToInstantMs({
+      ...lastYmd,
+      hour: schedule.hour,
+      minute: schedule.minute,
+      second: 0,
+      timeZone: schedule.timeZone,
+    });
+    return { lastResetTs, nextResetTs: candidateNextResetTs };
+  }
+
+  const nextYmd = shiftYmd(nextResetYmd, 7);
+  const nextResetTs = zonedDateTimeToInstantMs({
+    ...nextYmd,
+    hour: schedule.hour,
+    minute: schedule.minute,
+    second: 0,
+    timeZone: schedule.timeZone,
+  });
+  return { lastResetTs: candidateNextResetTs, nextResetTs };
+}
+
+function computeFixedWeeklySnapshot(opts: {
+  now: number;
+  events: { ts: number; tokens: number }[];
+  budgetTokens: number;
+  softPct: number;
+  hardPct: number;
+  threshold: "soft" | "hard";
+  schedule: WeeklyResetSchedule;
+  boundaries: { lastResetTs: number; nextResetTs: number };
+}): ThrottleWindowSnapshot {
+  const inWindow = opts.events.filter((e) => e.ts >= opts.boundaries.lastResetTs);
+
+  let usedTokens = 0;
+  let oldestTs: number | null = null;
+  for (const e of inWindow) {
+    usedTokens += e.tokens;
+    if (oldestTs === null || e.ts < oldestTs) oldestTs = e.ts;
+  }
+
+  const softCapTokens = Math.floor(opts.budgetTokens * opts.softPct);
+  const hardCapTokens = Math.floor(opts.budgetTokens * opts.hardPct);
+  const cap = opts.threshold === "hard" ? hardCapTokens : softCapTokens;
+
+  const resumeAtTs = usedTokens >= cap ? opts.boundaries.nextResetTs : null;
+
+  return {
+    name: "weekly",
+    windowMs: ROLLING_WEEKLY_MS,
+    windowStartTs: opts.boundaries.lastResetTs,
+    windowEndTs: opts.boundaries.nextResetTs,
+    budgetTokens: opts.budgetTokens,
+    softCapTokens,
+    hardCapTokens,
+    usedTokens,
+    usedPct: opts.budgetTokens > 0 ? usedTokens / opts.budgetTokens : 0,
+    oldestTsInWindow: oldestTs,
+    resumeAtTs,
+    weeklyLastResetTs: opts.boundaries.lastResetTs,
+    weeklyNextResetTs: opts.boundaries.nextResetTs,
+    weeklyResetTimeZone: opts.schedule.timeZone,
+    weeklyResetDayOfWeek: opts.schedule.dayOfWeek,
+    weeklyResetHour: opts.schedule.hour,
+    weeklyResetMinute: opts.schedule.minute,
+  };
+}
+
 function computeWindowSnapshot(opts: {
   now: number;
   events: { ts: number; tokens: number }[];
@@ -278,6 +498,8 @@ function computeWindowSnapshot(opts: {
   return {
     name: opts.name,
     windowMs: opts.windowMs,
+    windowStartTs: start,
+    windowEndTs: opts.now,
     budgetTokens: opts.budgetTokens,
     softCapTokens,
     hardCapTokens,
@@ -377,6 +599,10 @@ export async function getThrottleDecision(
         ? cfg.windows.weekly.budgetTokens
         : DEFAULT_BUDGET_WEEKLY_TOKENS;
 
+  const hasWeeklyResetCfg = !!(perProfileCfg?.reset?.weekly || cfg?.reset?.weekly);
+  const weeklySchedule = hasWeeklyResetCfg ? resolveWeeklyResetSchedule({ global: cfg, perProfile: perProfileCfg }) : null;
+  const weeklyBoundaries = weeklySchedule ? computeWeeklyResetBoundaries(now, weeklySchedule) : null;
+
   const windows = [
     { name: "rolling5h", windowMs: ROLLING_5H_MS, budgetTokens: budget5hTokens },
     { name: "weekly", windowMs: ROLLING_WEEKLY_MS, budgetTokens: budgetWeeklyTokens },
@@ -391,7 +617,8 @@ export async function getThrottleDecision(
 
   const prevState: ThrottleState = cached?.lastDecision?.state ?? "ok";
 
-  const maxWindowMs = Math.max(...windows.map((w) => w.windowMs));
+  const weeklyLookbackMs = weeklyBoundaries ? Math.max(0, now - weeklyBoundaries.lastResetTs) : ROLLING_WEEKLY_MS;
+  const maxWindowMs = Math.max(ROLLING_5H_MS, ROLLING_WEEKLY_MS, weeklyLookbackMs) + 2 * 60 * 60 * 1000;
   const usage =
     enabled
       ? await scanOpencodeUsageEvents(now, providerID, messagesRootDir, maxWindowMs)
@@ -409,31 +636,74 @@ export async function getThrottleDecision(
   const events = usage.events;
 
   // First compute hard/soft separately so the snapshot includes both caps.
-  const hardWindows = windows.map((w) =>
-    computeWindowSnapshot({
-      now,
-      events,
-      name: w.name,
-      windowMs: w.windowMs,
-      budgetTokens: w.budgetTokens,
-      softPct,
-      hardPct,
-      threshold: "hard",
-    })
-  );
+  const hardRolling5h = computeWindowSnapshot({
+    now,
+    events,
+    name: "rolling5h",
+    windowMs: ROLLING_5H_MS,
+    budgetTokens: budget5hTokens,
+    softPct,
+    hardPct,
+    threshold: "hard",
+  });
 
-  const softWindows = windows.map((w) =>
-    computeWindowSnapshot({
-      now,
-      events,
-      name: w.name,
-      windowMs: w.windowMs,
-      budgetTokens: w.budgetTokens,
-      softPct,
-      hardPct,
-      threshold: "soft",
-    })
-  );
+  const softRolling5h = computeWindowSnapshot({
+    now,
+    events,
+    name: "rolling5h",
+    windowMs: ROLLING_5H_MS,
+    budgetTokens: budget5hTokens,
+    softPct,
+    hardPct,
+    threshold: "soft",
+  });
+
+  const hardWeekly = weeklySchedule && weeklyBoundaries
+    ? computeFixedWeeklySnapshot({
+        now,
+        events,
+        budgetTokens: budgetWeeklyTokens,
+        softPct,
+        hardPct,
+        threshold: "hard",
+        schedule: weeklySchedule,
+        boundaries: weeklyBoundaries,
+      })
+    : computeWindowSnapshot({
+        now,
+        events,
+        name: "weekly",
+        windowMs: ROLLING_WEEKLY_MS,
+        budgetTokens: budgetWeeklyTokens,
+        softPct,
+        hardPct,
+        threshold: "hard",
+      });
+
+  const softWeekly = weeklySchedule && weeklyBoundaries
+    ? computeFixedWeeklySnapshot({
+        now,
+        events,
+        budgetTokens: budgetWeeklyTokens,
+        softPct,
+        hardPct,
+        threshold: "soft",
+        schedule: weeklySchedule,
+        boundaries: weeklyBoundaries,
+      })
+    : computeWindowSnapshot({
+        now,
+        events,
+        name: "weekly",
+        windowMs: ROLLING_WEEKLY_MS,
+        budgetTokens: budgetWeeklyTokens,
+        softPct,
+        hardPct,
+        threshold: "soft",
+      });
+
+  const hardWindows = [hardRolling5h, hardWeekly];
+  const softWindows = [softRolling5h, softWeekly];
 
   const hardResumeCandidates = hardWindows.map((w) => w.resumeAtTs).filter((t): t is number => typeof t === "number");
   const softResumeCandidates = softWindows.map((w) => w.resumeAtTs).filter((t): t is number => typeof t === "number");
@@ -519,5 +789,12 @@ export async function getThrottleDecision(
   const decision: ThrottleDecision = { state, resumeAtTs, snapshot };
   decisionCache.set(cacheKey, { lastCheckedAt: now, lastDecision: decision });
   return decision;
+}
+
+export function __computeWeeklyResetBoundariesForTests(
+  nowMs: number,
+  schedule: { dayOfWeek: number; hour: number; minute: number; timeZone: string }
+): { lastResetTs: number; nextResetTs: number } {
+  return computeWeeklyResetBoundaries(nowMs, schedule);
 }
 

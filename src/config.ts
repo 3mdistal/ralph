@@ -41,6 +41,8 @@ export interface ThrottleResetWeeklyConfig {
   hour?: number;
   /** Minute within the hour. Default: 9. */
   minute?: number;
+  /** IANA time zone, e.g. "America/Indiana/Indianapolis" (default: system local time zone). */
+  timeZone?: string;
 }
 
 export interface ThrottlePerProfileConfig {
@@ -52,6 +54,10 @@ export interface ThrottlePerProfileConfig {
   windows?: {
     rolling5h?: ThrottleWindowConfig;
     weekly?: ThrottleWindowConfig;
+  };
+  reset?: {
+    rolling5h?: ThrottleResetRolling5hConfig;
+    weekly?: ThrottleResetWeeklyConfig;
   };
 }
 
@@ -471,11 +477,102 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       DEFAULT_THROTTLE_BUDGET_WEEKLY_TOKENS
     );
 
+    const isValidTimeZone = (tz: string): boolean => {
+      try {
+        // eslint-disable-next-line no-new
+        new Intl.DateTimeFormat("en-US", { timeZone: tz }).format(new Date());
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const parseResetRolling5h = (raw: any, label: string): ThrottleResetRolling5hConfig | undefined => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+      const obj = raw as Record<string, unknown>;
+
+      const out: ThrottleResetRolling5hConfig = {};
+
+      if (obj.hours !== undefined) {
+        if (Array.isArray(obj.hours)) {
+          const hours = obj.hours
+            .map((h) => toNonNegativeIntOrNull(h))
+            .filter((h): h is number => typeof h === "number" && h >= 0 && h <= 23);
+          if (hours.length > 0) out.hours = Array.from(new Set(hours)).sort((a, b) => a - b);
+          else console.warn(`[ralph] Invalid config ${label}.hours=${JSON.stringify(obj.hours)}; ignoring`);
+        } else {
+          console.warn(`[ralph] Invalid config ${label}.hours=${JSON.stringify(obj.hours)}; ignoring`);
+        }
+      }
+
+      if (obj.minute !== undefined) {
+        const minute = toNonNegativeIntOrNull(obj.minute);
+        if (minute == null || minute > 59) {
+          console.warn(`[ralph] Invalid config ${label}.minute=${JSON.stringify(obj.minute)}; ignoring`);
+        } else {
+          out.minute = minute;
+        }
+      }
+
+      return Object.keys(out).length > 0 ? out : undefined;
+    };
+
+    const parseResetWeekly = (raw: any, label: string): ThrottleResetWeeklyConfig | undefined => {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+      const obj = raw as Record<string, unknown>;
+
+      const out: ThrottleResetWeeklyConfig = {};
+
+      if (obj.dayOfWeek !== undefined) {
+        const day = toNonNegativeIntOrNull(obj.dayOfWeek);
+        if (day == null || day > 6) {
+          console.warn(`[ralph] Invalid config ${label}.dayOfWeek=${JSON.stringify(obj.dayOfWeek)}; ignoring`);
+        } else {
+          out.dayOfWeek = day;
+        }
+      }
+
+      if (obj.hour !== undefined) {
+        const hour = toNonNegativeIntOrNull(obj.hour);
+        if (hour == null || hour > 23) {
+          console.warn(`[ralph] Invalid config ${label}.hour=${JSON.stringify(obj.hour)}; ignoring`);
+        } else {
+          out.hour = hour;
+        }
+      }
+
+      if (obj.minute !== undefined) {
+        const minute = toNonNegativeIntOrNull(obj.minute);
+        if (minute == null || minute > 59) {
+          console.warn(`[ralph] Invalid config ${label}.minute=${JSON.stringify(obj.minute)}; ignoring`);
+        } else {
+          out.minute = minute;
+        }
+      }
+
+      if (obj.timeZone !== undefined) {
+        if (typeof obj.timeZone === "string" && obj.timeZone.trim()) {
+          const tz = obj.timeZone.trim();
+          if (isValidTimeZone(tz)) out.timeZone = tz;
+          else console.warn(`[ralph] Invalid config ${label}.timeZone=${JSON.stringify(obj.timeZone)}; ignoring`);
+        } else {
+          console.warn(`[ralph] Invalid config ${label}.timeZone=${JSON.stringify(obj.timeZone)}; ignoring`);
+        }
+      }
+
+      return Object.keys(out).length > 0 ? out : undefined;
+    };
+
     const rawReset = (throttleObj as any).reset;
-    const reset = rawReset && typeof rawReset === "object" && !Array.isArray(rawReset) ? (rawReset as any) : undefined;
-    if (rawReset !== undefined && reset === undefined) {
+    const resetObj = rawReset && typeof rawReset === "object" && !Array.isArray(rawReset) ? (rawReset as any) : undefined;
+    if (rawReset !== undefined && resetObj === undefined) {
       console.warn(`[ralph] Invalid config throttle.reset=${JSON.stringify(rawReset)}; ignoring`);
     }
+
+    const resetRolling5h = parseResetRolling5h(resetObj?.rolling5h, "throttle.reset.rolling5h");
+    const resetWeekly = parseResetWeekly(resetObj?.weekly, "throttle.reset.weekly");
+
+    const resetCfg = resetRolling5h || resetWeekly ? { ...(resetRolling5h ? { rolling5h: resetRolling5h } : {}), ...(resetWeekly ? { weekly: resetWeekly } : {}) } : undefined;
 
     const rawPerProfile = (throttleObj as any).perProfile;
     let perProfile: Record<string, ThrottlePerProfileConfig> | undefined;
@@ -569,6 +666,24 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           if (w.rolling5h || w.weekly) override.windows = w;
         }
 
+        const rawOverrideReset = (o as any).reset;
+        const overrideResetObj =
+          rawOverrideReset && typeof rawOverrideReset === "object" && !Array.isArray(rawOverrideReset) ? (rawOverrideReset as any) : undefined;
+
+        if (rawOverrideReset !== undefined && overrideResetObj === undefined) {
+          console.warn(`[ralph] Invalid config throttle.perProfile.${name}.reset=${JSON.stringify(rawOverrideReset)}; ignoring`);
+        }
+
+        const overrideResetRolling5h = parseResetRolling5h(overrideResetObj?.rolling5h, `throttle.perProfile.${name}.reset.rolling5h`);
+        const overrideResetWeekly = parseResetWeekly(overrideResetObj?.weekly, `throttle.perProfile.${name}.reset.weekly`);
+
+        if (overrideResetRolling5h || overrideResetWeekly) {
+          override.reset = {
+            ...(overrideResetRolling5h ? { rolling5h: overrideResetRolling5h } : {}),
+            ...(overrideResetWeekly ? { weekly: overrideResetWeekly } : {}),
+          };
+        }
+
         if (Object.keys(override).length > 0) out[name] = override;
       }
 
@@ -587,7 +702,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
         rolling5h: { budgetTokens: budget5h },
         weekly: { budgetTokens: budgetWeekly },
       },
-      ...(reset ? { reset } : {}),
+      ...(resetCfg ? { reset: resetCfg } : {}),
       ...(perProfile ? { perProfile } : {}),
     };
   }
