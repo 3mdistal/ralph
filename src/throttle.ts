@@ -414,7 +414,3 @@ export async function getThrottleDecision(
   return decision;
 }
 
-export function __resetThrottleCacheForTests(): void {
-  decisionCache.clear();
-}
-
