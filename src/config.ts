@@ -1,5 +1,5 @@
 import { homedir } from "os";
-import { dirname, join } from "path";
+import { dirname, isAbsolute, join } from "path";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 
 import { getRalphConfigJsonPath, getRalphConfigTomlPath, getRalphLegacyConfigPath } from "./paths";
@@ -64,6 +64,26 @@ export interface ThrottleConfig {
   };
 }
 
+export interface OpencodeProfileConfig {
+  /** Absolute path for $XDG_DATA_HOME */
+  xdgDataHome: string;
+  /** Absolute path for $XDG_CONFIG_HOME */
+  xdgConfigHome: string;
+  /** Absolute path for $XDG_STATE_HOME */
+  xdgStateHome: string;
+  /** Optional absolute path for $XDG_CACHE_HOME (Ralph still isolates per task). */
+  xdgCacheHome?: string;
+}
+
+export interface OpencodeConfig {
+  /** Enable named OpenCode XDG profiles (default: true if section present). */
+  enabled?: boolean;
+  /** Default profile name for new tasks when control override missing. */
+  defaultProfile?: string;
+  /** Named profiles keyed by their identifier (e.g. "apple", "google"). */
+  profiles?: Record<string, OpencodeProfileConfig>;
+}
+
 export interface RalphConfig {
   repos: RepoConfig[];
   /** Global max concurrent tasks across all repos (default: 6) */
@@ -90,6 +110,7 @@ export interface RalphConfig {
   devDir: string;          // base directory for repos (default: ~/Developer)
   watchdog?: WatchdogConfig;
   throttle?: ThrottleConfig;
+  opencode?: OpencodeConfig;
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
@@ -226,6 +247,102 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     (loaded as any).githubApp = undefined;
   }
 
+  // Best-effort validation for OpenCode profile config.
+  const rawOpencode = (loaded as any).opencode;
+  if (rawOpencode !== undefined && rawOpencode !== null && (typeof rawOpencode !== "object" || Array.isArray(rawOpencode))) {
+    console.warn(`[ralph] Invalid config opencode=${JSON.stringify(rawOpencode)}; ignoring`);
+    (loaded as any).opencode = undefined;
+  } else if (rawOpencode && typeof rawOpencode === "object") {
+    const enabledRaw = (rawOpencode as any).enabled;
+    let enabled = true;
+    if (enabledRaw !== undefined) {
+      if (typeof enabledRaw === "boolean") {
+        enabled = enabledRaw;
+      } else {
+        console.warn(`[ralph] Invalid config opencode.enabled=${JSON.stringify(enabledRaw)}; defaulting to true`);
+        enabled = true;
+      }
+    }
+
+    const rawProfiles = (rawOpencode as any).profiles;
+    const profiles: Record<string, OpencodeProfileConfig> = {};
+
+    if (rawProfiles && typeof rawProfiles === "object" && !Array.isArray(rawProfiles)) {
+      for (const [rawName, rawProfile] of Object.entries(rawProfiles as Record<string, unknown>)) {
+        const name = String(rawName ?? "").trim();
+        if (!name) continue;
+
+        if (!rawProfile || typeof rawProfile !== "object" || Array.isArray(rawProfile)) {
+          console.warn(`[ralph] Invalid config opencode.profiles.${name}=${JSON.stringify(rawProfile)}; skipping`);
+          continue;
+        }
+
+        const profileObj = rawProfile as Record<string, unknown>;
+
+        const readAbs = (key: string, required: boolean): string | null => {
+          const raw = profileObj[key];
+          if (typeof raw !== "string") {
+            if (required) console.warn(`[ralph] Invalid config opencode.profiles.${name}.${key}=${JSON.stringify(raw)}; skipping profile`);
+            return required ? null : null;
+          }
+          const trimmed = raw.trim();
+          if (!trimmed) {
+            if (required) console.warn(`[ralph] Invalid config opencode.profiles.${name}.${key}=""; skipping profile`);
+            return required ? null : null;
+          }
+          if (!isAbsolute(trimmed)) {
+            console.warn(
+              `[ralph] Invalid config opencode.profiles.${name}.${key}=${JSON.stringify(trimmed)}; must be an absolute path (no '~' expansion). Skipping profile.`
+            );
+            return null;
+          }
+          return trimmed;
+        };
+
+        const xdgDataHome = readAbs("xdgDataHome", true);
+        const xdgConfigHome = readAbs("xdgConfigHome", true);
+        const xdgStateHome = readAbs("xdgStateHome", true);
+        if (!xdgDataHome || !xdgConfigHome || !xdgStateHome) continue;
+
+        const xdgCacheHome = readAbs("xdgCacheHome", false);
+
+        profiles[name] = {
+          xdgDataHome,
+          xdgConfigHome,
+          xdgStateHome,
+          ...(xdgCacheHome ? { xdgCacheHome } : {}),
+        };
+      }
+    } else if (rawProfiles !== undefined) {
+      console.warn(`[ralph] Invalid config opencode.profiles=${JSON.stringify(rawProfiles)}; ignoring`);
+    }
+
+    const profileNames = Object.keys(profiles).sort();
+    const rawDefaultProfile = (rawOpencode as any).defaultProfile;
+    const defaultProfile = typeof rawDefaultProfile === "string" ? rawDefaultProfile.trim() : "";
+
+    if (enabled && profileNames.length === 0) {
+      console.warn("[ralph] OpenCode profiles enabled but no valid profiles were configured; falling back to ambient XDG dirs");
+      loaded.opencode = { enabled: false };
+    } else if (!enabled) {
+      loaded.opencode = { enabled: false };
+    } else if (defaultProfile && profiles[defaultProfile]) {
+      loaded.opencode = { enabled: true, defaultProfile, profiles };
+    } else {
+      const fallback = profileNames[0] ?? "";
+      if (fallback) {
+        if (defaultProfile) {
+          console.warn(
+            `[ralph] Invalid config opencode.defaultProfile=${JSON.stringify(defaultProfile)}; falling back to ${JSON.stringify(fallback)}`
+          );
+        }
+        loaded.opencode = { enabled: true, defaultProfile: fallback, profiles };
+      } else {
+        loaded.opencode = { enabled: false };
+      }
+    }
+  }
+
   return loaded;
 }
 
@@ -330,4 +447,48 @@ export function normalizeRepoName(repo: string): string {
   if (repo.includes("/")) return repo;
   // Otherwise, prepend owner
   return `${cfg.owner}/${repo}`;
+}
+
+export type ResolvedOpencodeProfile = {
+  name: string;
+  xdgDataHome: string;
+  xdgConfigHome: string;
+  xdgStateHome: string;
+  xdgCacheHome?: string;
+};
+
+export function isOpencodeProfilesEnabled(): boolean {
+  const cfg = loadConfig();
+  return cfg.opencode?.enabled ?? false;
+}
+
+export function listOpencodeProfileNames(): string[] {
+  const cfg = loadConfig();
+  const profiles = cfg.opencode?.profiles;
+  if (!profiles || typeof profiles !== "object") return [];
+  return Object.keys(profiles).sort();
+}
+
+export function getOpencodeDefaultProfileName(): string | null {
+  const cfg = loadConfig();
+  const raw = cfg.opencode?.defaultProfile;
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  return trimmed ? trimmed : null;
+}
+
+export function resolveOpencodeProfile(name?: string | null): ResolvedOpencodeProfile | null {
+  const cfg = loadConfig();
+  const opencode = cfg.opencode;
+  if (!opencode?.enabled) return null;
+
+  const profiles = opencode.profiles;
+  if (!profiles) return null;
+
+  const rawName = (name ?? opencode.defaultProfile ?? "").trim();
+  if (!rawName) return null;
+
+  const profile = profiles[rawName];
+  if (!profile) return null;
+
+  return { name: rawName, ...profile };
 }
