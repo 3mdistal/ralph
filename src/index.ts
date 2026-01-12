@@ -923,6 +923,9 @@ if (args[0] === "status") {
   }
 
   console.log(`Mode: ${mode}`);
+  if (activeProfile) {
+    console.log(`Active OpenCode profile: ${activeProfile}`);
+  }
 
   console.log(`Starting tasks: ${starting.length}`);
   for (const task of starting) {

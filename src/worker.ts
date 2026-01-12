@@ -915,6 +915,7 @@ export class RepoWorker {
   ): {
     profileName: string | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    error?: string;
   } {
     if (!isOpencodeProfilesEnabled()) return { profileName: null };
 
@@ -923,11 +924,12 @@ export class RepoWorker {
     if (pinned) {
       const resolved = resolveOpencodeProfile(pinned);
       if (!resolved) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Unknown opencode-profile=${JSON.stringify(pinned)} for task ${task.issue}; ` +
-            `configure it under [opencode.profiles.${pinned}] in ~/.ralph/config.toml. Continuing with ambient XDG dirs.`
-        );
-        return { profileName: pinned };
+        return {
+          profileName: pinned,
+          error:
+            `Task is pinned to an unknown OpenCode profile ${JSON.stringify(pinned)} (task ${task.issue}). ` +
+            `Configure it under [opencode.profiles.${pinned}] in ~/.ralph/config.toml (paths must be absolute; no '~' expansion).`,
+        };
       }
 
       return {
@@ -1141,15 +1143,6 @@ export class RepoWorker {
     const issueNumber = issueMatch?.[1] ?? "";
     const cacheKey = issueNumber || task._name;
 
-    const resolvedOpencode = this.resolveOpencodeXdgForTask(task, "resume");
-    const opencodeProfileName = resolvedOpencode.profileName;
-    const opencodeXdg = resolvedOpencode.opencodeXdg;
-    const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
-
-    if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
-      await updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
-    }
-
     const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber || cacheKey, "resume");
 
       const existingSessionId = task["session-id"]?.trim();
@@ -1162,6 +1155,17 @@ export class RepoWorker {
 
 
     try {
+      const resolvedOpencode = this.resolveOpencodeXdgForTask(task, "resume");
+      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
+
+      const opencodeProfileName = resolvedOpencode.profileName;
+      const opencodeXdg = resolvedOpencode.opencodeXdg;
+      const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
+
+      if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
+        await updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
+      }
+
       const botBranch = getRepoBotBranch(this.repo);
       const issueMeta = await this.getIssueMetadata(task.issue);
 
@@ -1555,6 +1559,8 @@ export class RepoWorker {
       if (pausedPreStart) return pausedPreStart;
 
       const resolvedOpencode = this.resolveOpencodeXdgForTask(task, "start");
+      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
+
       const opencodeProfileName = resolvedOpencode.profileName;
       const opencodeXdg = resolvedOpencode.opencodeXdg;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
