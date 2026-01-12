@@ -6,5 +6,5 @@ dist/
 # Local machine config
 src/ralph.json
 
-# bwrb vault content
+# bwrb vault content (gitignored; still traversed by bwrb via .bwrbignore)
 orchestration/
