@@ -110,6 +110,7 @@ Add a throttle config section to Ralph:
 - `throttle.hardPct` (default 0.75)
 - `throttle.reservePct5h` (optional, extra protection for personal usage)
 - `throttle.minCheckIntervalMs` (avoid scanning logs too frequently)
+- `throttle.perProfile.<profile>` (optional): override `enabled`, `providerID`, `softPct`, `hardPct`, `minCheckIntervalMs`, and window budgets for a specific OpenCode profile
 
 ## Implementation Plan (High-Level)
 1) Add usage reader

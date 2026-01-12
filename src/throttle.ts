@@ -42,15 +42,16 @@ export interface ThrottleDecision {
 
 const DEFAULT_PROVIDER_ID = "openai";
 
-const WINDOWS = [
-  { name: "rolling5h", windowMs: 5 * 60 * 60 * 1000, budgetTokens: 16_987_015 },
-  { name: "weekly", windowMs: 7 * 24 * 60 * 60 * 1000, budgetTokens: 55_769_305 },
-] as const;
+const ROLLING_5H_MS = 5 * 60 * 60 * 1000;
+const ROLLING_WEEKLY_MS = 7 * 24 * 60 * 60 * 1000;
+
+const DEFAULT_BUDGET_5H_TOKENS = 16_987_015;
+const DEFAULT_BUDGET_WEEKLY_TOKENS = 55_769_305;
 
 const DEFAULT_SOFT_PCT = 0.65;
 const DEFAULT_HARD_PCT = 0.75;
 
-const DEFAULT_MIN_CHECK_INTERVAL_MS = 1_000;
+const DEFAULT_MIN_CHECK_INTERVAL_MS = 15_000;
 
 type ThrottleCacheEntry = { lastCheckedAt: number; lastDecision: ThrottleDecision | null };
 const decisionCache = new Map<string, ThrottleCacheEntry>();
@@ -118,11 +119,11 @@ async function listJsonFiles(dir: string): Promise<string[]> {
 async function readUsageEvents(
   now: number,
   providerID: string,
-  messagesRoot: string
+  messagesRoot: string,
+  maxWindowMs: number
 ): Promise<{ ts: number; tokens: number }[]> {
   if (!existsSync(messagesRoot)) return [];
 
-  const maxWindowMs = Math.max(...WINDOWS.map((w) => w.windowMs));
   const oldestStart = now - maxWindowMs;
 
   const out: { ts: number; tokens: number }[] = [];
@@ -254,28 +255,69 @@ export async function getThrottleDecision(
   opts?: { opencodeProfile?: string | null }
 ): Promise<ThrottleDecision> {
   const cfg = loadConfig().throttle;
-  const enabled = cfg?.enabled ?? true;
-
-  const providerID = (cfg?.providerID?.trim() ?? "") || DEFAULT_PROVIDER_ID;
-  const softPct = typeof cfg?.softPct === "number" && Number.isFinite(cfg.softPct) ? cfg.softPct : DEFAULT_SOFT_PCT;
-  const hardPct = typeof cfg?.hardPct === "number" && Number.isFinite(cfg.hardPct) ? cfg.hardPct : DEFAULT_HARD_PCT;
-
-  const minCheckIntervalMs =
-    typeof cfg?.minCheckIntervalMs === "number" && Number.isFinite(cfg.minCheckIntervalMs)
-      ? Math.max(0, Math.floor(cfg.minCheckIntervalMs))
-      : DEFAULT_MIN_CHECK_INTERVAL_MS;
 
   const { effectiveProfile, messagesRootDir } = resolveOpencodeMessagesRootDir(opts?.opencodeProfile);
-  const cacheKey = `${providerID}|${messagesRootDir}|soft=${softPct}|hard=${hardPct}`;
+  const perProfileCfg = effectiveProfile ? cfg?.perProfile?.[effectiveProfile] : undefined;
+
+  const enabled = perProfileCfg?.enabled ?? cfg?.enabled ?? true;
+
+  const providerID =
+    String(perProfileCfg?.providerID ?? cfg?.providerID ?? DEFAULT_PROVIDER_ID).trim() || DEFAULT_PROVIDER_ID;
+
+  const softPct =
+    typeof perProfileCfg?.softPct === "number" && Number.isFinite(perProfileCfg.softPct)
+      ? perProfileCfg.softPct
+      : typeof cfg?.softPct === "number" && Number.isFinite(cfg.softPct)
+        ? cfg.softPct
+        : DEFAULT_SOFT_PCT;
+
+  const hardPct =
+    typeof perProfileCfg?.hardPct === "number" && Number.isFinite(perProfileCfg.hardPct)
+      ? perProfileCfg.hardPct
+      : typeof cfg?.hardPct === "number" && Number.isFinite(cfg.hardPct)
+        ? cfg.hardPct
+        : DEFAULT_HARD_PCT;
+
+  const minCheckIntervalMs =
+    typeof perProfileCfg?.minCheckIntervalMs === "number" && Number.isFinite(perProfileCfg.minCheckIntervalMs)
+      ? Math.max(0, Math.floor(perProfileCfg.minCheckIntervalMs))
+      : typeof cfg?.minCheckIntervalMs === "number" && Number.isFinite(cfg.minCheckIntervalMs)
+        ? Math.max(0, Math.floor(cfg.minCheckIntervalMs))
+        : DEFAULT_MIN_CHECK_INTERVAL_MS;
+
+  const budget5hTokens =
+    typeof perProfileCfg?.windows?.rolling5h?.budgetTokens === "number" && Number.isFinite(perProfileCfg.windows.rolling5h.budgetTokens)
+      ? perProfileCfg.windows.rolling5h.budgetTokens
+      : typeof cfg?.windows?.rolling5h?.budgetTokens === "number" && Number.isFinite(cfg.windows.rolling5h.budgetTokens)
+        ? cfg.windows.rolling5h.budgetTokens
+        : DEFAULT_BUDGET_5H_TOKENS;
+
+  const budgetWeeklyTokens =
+    typeof perProfileCfg?.windows?.weekly?.budgetTokens === "number" && Number.isFinite(perProfileCfg.windows.weekly.budgetTokens)
+      ? perProfileCfg.windows.weekly.budgetTokens
+      : typeof cfg?.windows?.weekly?.budgetTokens === "number" && Number.isFinite(cfg.windows.weekly.budgetTokens)
+        ? cfg.windows.weekly.budgetTokens
+        : DEFAULT_BUDGET_WEEKLY_TOKENS;
+
+  const windows = [
+    { name: "rolling5h", windowMs: ROLLING_5H_MS, budgetTokens: budget5hTokens },
+    { name: "weekly", windowMs: ROLLING_WEEKLY_MS, budgetTokens: budgetWeeklyTokens },
+  ];
+
+  const cacheKey =
+    `${providerID}|${messagesRootDir}|` +
+    `b5h=${budget5hTokens}|bw=${budgetWeeklyTokens}|soft=${softPct}|hard=${hardPct}|enabled=${enabled}`;
 
   const cached = decisionCache.get(cacheKey);
   if (cached?.lastDecision && now - cached.lastCheckedAt < minCheckIntervalMs) return cached.lastDecision;
 
   const prevState: ThrottleState = cached?.lastDecision?.state ?? "ok";
-  const events = enabled ? await readUsageEvents(now, providerID, messagesRootDir) : [];
+
+  const maxWindowMs = Math.max(...windows.map((w) => w.windowMs));
+  const events = enabled ? await readUsageEvents(now, providerID, messagesRootDir, maxWindowMs) : [];
 
   // First compute hard/soft separately so the snapshot includes both caps.
-  const hardWindows = WINDOWS.map((w) =>
+  const hardWindows = windows.map((w) =>
     computeWindowSnapshot({
       now,
       events,
@@ -288,7 +330,7 @@ export async function getThrottleDecision(
     })
   );
 
-  const softWindows = WINDOWS.map((w) =>
+  const softWindows = windows.map((w) =>
     computeWindowSnapshot({
       now,
       events,
@@ -370,5 +412,9 @@ export async function getThrottleDecision(
   const decision: ThrottleDecision = { state, resumeAtTs, snapshot };
   decisionCache.set(cacheKey, { lastCheckedAt: now, lastDecision: decision });
   return decision;
+}
+
+export function __resetThrottleCacheForTests(): void {
+  decisionCache.clear();
 }
 
