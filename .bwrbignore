@@ -1,0 +1,6 @@
+# bwrb traversal overrides for this vault.
+# bwrb reads vault-root .gitignore by default; keep orchestration notes visible.
+# Requires bwrb >= 0.1.3 for '!' negation support.
+
+!orchestration/
+!orchestration/**
