@@ -195,6 +195,10 @@ function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: string[])
     return { name, state: match.state, rawState: match.rawState };
   });
 
+  if (requiredChecks.length === 0) {
+    return { status: "success", required: [], available };
+  }
+
   const hasFailure = required.some((c) => c.state === "FAILURE");
   if (hasFailure) return { status: "failure", required, available };
 
@@ -202,6 +206,13 @@ function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: string[])
   if (allSuccess) return { status: "success", required, available };
 
   return { status: "pending", required, available };
+}
+
+export function __summarizeRequiredChecksForTests(
+  allChecks: PrCheck[],
+  requiredChecks: string[]
+): RequiredChecksSummary {
+  return summarizeRequiredChecks(allChecks, requiredChecks);
 }
 
 function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
