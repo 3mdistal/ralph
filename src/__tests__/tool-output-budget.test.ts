@@ -15,7 +15,9 @@ describe("tool output budget", () => {
 
   test("enforceToolOutputBudgetInStorage truncates tool parts", async () => {
     const sessionId = `ses_test_${Date.now()}_${Math.random().toString(16).slice(2)}`;
-    const storageDir = join(homedir(), ".local/share/opencode/storage");
+    const homeDir = homedir();
+    const xdgDataHome = join(homeDir, ".local", "share");
+    const storageDir = join(xdgDataHome, "opencode", "storage");
 
     const messageId = `msg_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
@@ -38,7 +40,7 @@ describe("tool output budget", () => {
     await writeFile(partPath, JSON.stringify({ type: "toolResult", output: toolOutput }), "utf8");
 
     try {
-      await enforceToolOutputBudgetInStorage(sessionId);
+      await enforceToolOutputBudgetInStorage(sessionId, { homeDir, xdgDataHome });
 
       const updated = JSON.parse(await readFile(partPath, "utf8"));
       expect(typeof updated.output).toBe("string");
