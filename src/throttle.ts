@@ -372,7 +372,3 @@ export async function getThrottleDecision(
   return decision;
 }
 
-export async function isHardThrottled(opts?: { opencodeProfile?: string | null }): Promise<{ hard: boolean; decision: ThrottleDecision }> {
-  const decision = await getThrottleDecision(Date.now(), opts);
-  return { hard: decision.state === "hard", decision };
-}
