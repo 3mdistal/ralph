@@ -25,10 +25,29 @@ export interface ThrottleWindowSnapshot {
 export interface ThrottleSnapshot {
   computedAt: string;
   providerID: string;
+
   /** Best-effort, config-selected profile name (for debugging). */
   opencodeProfile?: string | null;
+
+  /** Best-effort, XDG_DATA_HOME used to compute scan paths (for debugging). */
+  xdgDataHome?: string;
+
   /** Best-effort, messages root scanned for usage (for debugging). */
   messagesRootDir?: string;
+
+  /** Best-effort, OpenCode auth file path (for debugging). */
+  authFilePath?: string;
+  authFileExists?: boolean;
+
+  /** Best-effort scan diagnostics (helps validate profile usage is measured). */
+  messagesRootDirExists?: boolean;
+  scannedSessionDirs?: number;
+  scannedFiles?: number;
+  parsedFiles?: number;
+  newestMessageTs?: number | null;
+  newestMessageAt?: string | null;
+  newestCountedEventTs?: number | null;
+
   state: ThrottleState;
   resumeAt: string | null;
   windows: ThrottleWindowSnapshot[];
@@ -60,6 +79,33 @@ function num(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function parseTimestampMs(value: unknown): number | null {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    // Heuristic: treat small numbers as epoch seconds.
+    if (value > 0 && value < 1e12) return Math.floor(value * 1000);
+    return Math.floor(value);
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+
+    const asNumber = Number(trimmed);
+    if (Number.isFinite(asNumber)) return parseTimestampMs(asNumber);
+
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
 function extractProviderId(message: any): string | null {
   const direct = typeof message?.providerID === "string" ? message.providerID : null;
   if (direct) return direct;
@@ -74,14 +120,14 @@ function extractProviderId(message: any): string | null {
 }
 
 function extractCreatedTs(message: any): number | null {
-  const fromTime = num(message?.time?.created);
-  if (fromTime) return fromTime;
+  const fromTime = parseTimestampMs(message?.time?.created);
+  if (fromTime != null) return fromTime;
 
-  const fromCreated = num(message?.created);
-  if (fromCreated) return fromCreated;
+  const fromCreated = parseTimestampMs(message?.created);
+  if (fromCreated != null) return fromCreated;
 
-  const fromTs = num(message?.ts);
-  if (fromTs) return fromTs;
+  const fromTs = parseTimestampMs(message?.ts);
+  if (fromTs != null) return fromTs;
 
   return null;
 }
@@ -110,37 +156,65 @@ async function listSessionDirs(messagesRoot: string): Promise<string[]> {
 async function listJsonFiles(dir: string): Promise<string[]> {
   try {
     const entries = await readdir(dir, { withFileTypes: true });
-    return entries.filter((e) => e.isFile() && e.name.endsWith(".json")).map((e) => e.name);
+    return entries
+      .filter((e) => e.isFile() && e.name.startsWith("msg_") && e.name.endsWith(".json"))
+      .map((e) => e.name);
   } catch {
     return [];
   }
 }
 
-async function readUsageEvents(
+export type UsageScanStats = {
+  messagesRootDirExists: boolean;
+  scannedSessionDirs: number;
+  scannedFiles: number;
+  parsedFiles: number;
+  newestMessageTs: number | null;
+  newestCountedEventTs: number | null;
+};
+
+export async function scanOpencodeUsageEvents(
   now: number,
   providerID: string,
   messagesRoot: string,
   maxWindowMs: number
-): Promise<{ ts: number; tokens: number }[]> {
-  if (!existsSync(messagesRoot)) return [];
+): Promise<{ events: { ts: number; tokens: number }[]; stats: UsageScanStats }> {
+  const stats: UsageScanStats = {
+    messagesRootDirExists: false,
+    scannedSessionDirs: 0,
+    scannedFiles: 0,
+    parsedFiles: 0,
+    newestMessageTs: null,
+    newestCountedEventTs: null,
+  };
+
+  if (!existsSync(messagesRoot)) return { events: [], stats };
+  stats.messagesRootDirExists = true;
 
   const oldestStart = now - maxWindowMs;
 
-  const out: { ts: number; tokens: number }[] = [];
+  const events: { ts: number; tokens: number }[] = [];
 
   const sessionDirs = await listSessionDirs(messagesRoot);
+  stats.scannedSessionDirs = sessionDirs.length;
+
   for (const session of sessionDirs) {
     const sessionDir = join(messagesRoot, session);
     const files = await listJsonFiles(sessionDir);
 
     for (const file of files) {
       const path = join(sessionDir, file);
+      stats.scannedFiles++;
+
       try {
         const raw = await readFile(path, "utf8");
         const msg = JSON.parse(raw);
+        stats.parsedFiles++;
 
         const ts = extractCreatedTs(msg);
-        if (!ts) continue;
+        if (ts == null) continue;
+
+        if (stats.newestMessageTs == null || ts > stats.newestMessageTs) stats.newestMessageTs = ts;
         if (ts < oldestStart) continue;
 
         const role = extractRole(msg);
@@ -152,14 +226,15 @@ async function readUsageEvents(
         const tokens = extractTokenCount(msg);
         if (tokens <= 0) continue;
 
-        out.push({ ts, tokens });
+        events.push({ ts, tokens });
+        if (stats.newestCountedEventTs == null || ts > stats.newestCountedEventTs) stats.newestCountedEventTs = ts;
       } catch {
         // ignore malformed message files
       }
     }
   }
 
-  return out;
+  return { events, stats };
 }
 
 function computeWindowSnapshot(opts: {
@@ -220,6 +295,7 @@ function resolveDefaultXdgDataHome(homeDir: string = homedir()): string {
 
 function resolveOpencodeMessagesRootDir(opencodeProfile?: string | null): {
   effectiveProfile: string | null;
+  xdgDataHome: string;
   messagesRootDir: string;
 } {
   const requested = (opencodeProfile ?? "").trim();
@@ -228,13 +304,14 @@ function resolveOpencodeMessagesRootDir(opencodeProfile?: string | null): {
     if (resolved) {
       return {
         effectiveProfile: resolved.name,
+        xdgDataHome: resolved.xdgDataHome,
         messagesRootDir: join(resolved.xdgDataHome, "opencode", "storage", "message"),
       };
     }
 
     // Unknown profile: fall back to ambient XDG dirs.
     const xdgDataHome = resolveDefaultXdgDataHome();
-    return { effectiveProfile: null, messagesRootDir: join(xdgDataHome, "opencode", "storage", "message") };
+    return { effectiveProfile: null, xdgDataHome, messagesRootDir: join(xdgDataHome, "opencode", "storage", "message") };
   }
 
   // No explicit profile: prefer configured default profile if enabled.
@@ -242,12 +319,13 @@ function resolveOpencodeMessagesRootDir(opencodeProfile?: string | null): {
   if (resolvedDefault) {
     return {
       effectiveProfile: resolvedDefault.name,
+      xdgDataHome: resolvedDefault.xdgDataHome,
       messagesRootDir: join(resolvedDefault.xdgDataHome, "opencode", "storage", "message"),
     };
   }
 
   const xdgDataHome = resolveDefaultXdgDataHome();
-  return { effectiveProfile: null, messagesRootDir: join(xdgDataHome, "opencode", "storage", "message") };
+  return { effectiveProfile: null, xdgDataHome, messagesRootDir: join(xdgDataHome, "opencode", "storage", "message") };
 }
 
 export async function getThrottleDecision(
@@ -256,7 +334,7 @@ export async function getThrottleDecision(
 ): Promise<ThrottleDecision> {
   const cfg = loadConfig().throttle;
 
-  const { effectiveProfile, messagesRootDir } = resolveOpencodeMessagesRootDir(opts?.opencodeProfile);
+  const { effectiveProfile, xdgDataHome, messagesRootDir } = resolveOpencodeMessagesRootDir(opts?.opencodeProfile);
   const perProfileCfg = effectiveProfile ? cfg?.perProfile?.[effectiveProfile] : undefined;
 
   const enabled = perProfileCfg?.enabled ?? cfg?.enabled ?? true;
@@ -314,7 +392,21 @@ export async function getThrottleDecision(
   const prevState: ThrottleState = cached?.lastDecision?.state ?? "ok";
 
   const maxWindowMs = Math.max(...windows.map((w) => w.windowMs));
-  const events = enabled ? await readUsageEvents(now, providerID, messagesRootDir, maxWindowMs) : [];
+  const usage =
+    enabled
+      ? await scanOpencodeUsageEvents(now, providerID, messagesRootDir, maxWindowMs)
+      : {
+          events: [],
+          stats: {
+            messagesRootDirExists: existsSync(messagesRootDir),
+            scannedSessionDirs: 0,
+            scannedFiles: 0,
+            parsedFiles: 0,
+            newestMessageTs: null,
+            newestCountedEventTs: null,
+          },
+        };
+  const events = usage.events;
 
   // First compute hard/soft separately so the snapshot includes both caps.
   const hardWindows = windows.map((w) =>
@@ -371,11 +463,26 @@ export async function getThrottleDecision(
     };
   });
 
+  const authFilePath = join(xdgDataHome, "opencode", "auth.json");
+  const authFileExists = existsSync(authFilePath);
+
+  const newestMessageAt = usage.stats.newestMessageTs != null ? new Date(usage.stats.newestMessageTs).toISOString() : null;
+
   const snapshot: ThrottleSnapshot = {
     computedAt: new Date(now).toISOString(),
     providerID,
     opencodeProfile: effectiveProfile,
+    xdgDataHome,
     messagesRootDir,
+    authFilePath,
+    authFileExists,
+    messagesRootDirExists: usage.stats.messagesRootDirExists,
+    scannedSessionDirs: usage.stats.scannedSessionDirs,
+    scannedFiles: usage.stats.scannedFiles,
+    parsedFiles: usage.stats.parsedFiles,
+    newestMessageTs: usage.stats.newestMessageTs,
+    newestMessageAt,
+    newestCountedEventTs: usage.stats.newestCountedEventTs,
     state,
     resumeAt: resumeAtTs ? new Date(resumeAtTs).toISOString() : null,
     windows: mergedWindows,
