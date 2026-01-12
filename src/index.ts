@@ -37,6 +37,7 @@ import { startQueuedTasks } from "./scheduler";
 import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
+import { resolveAutoOpencodeProfileName } from "./opencode-auto-profile";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { initStateDb, recordPrSnapshot } from "./state";
@@ -70,6 +71,12 @@ function getActiveOpencodeProfileName(): string | null {
   if (fromControl) return fromControl;
 
   return getOpencodeDefaultProfileName();
+}
+
+async function resolveEffectiveOpencodeProfileNameForNewTasks(now: number): Promise<string | null> {
+  const requested = getActiveOpencodeProfileName();
+  if (requested === "auto") return await resolveAutoOpencodeProfileName(now);
+  return requested;
 }
 
 function getTaskOpencodeProfileName(task: Pick<AgentTask, "opencode-profile">): string | null {
@@ -199,7 +206,8 @@ async function attemptResumeThrottledTasks(): Promise<void> {
   const throttled = await getTasksByStatus("throttled");
   if (throttled.length === 0) return;
 
-  const activeProfile = getActiveOpencodeProfileName();
+  const controlProfile = getActiveOpencodeProfileName();
+  const activeProfile = controlProfile === "auto" ? await resolveAutoOpencodeProfileName(Date.now()) : controlProfile;
   const profileKeys = Array.from(
     new Set(throttled.map((t) => getTaskOpencodeProfileName(t) ?? activeProfile ?? ""))
   );
@@ -335,7 +343,8 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
 
   if (getDaemonMode() === "draining") return;
 
-  const throttle = await getThrottleDecision(Date.now(), { opencodeProfile: getActiveOpencodeProfileName() });
+  const effectiveProfile = await resolveEffectiveOpencodeProfileNameForNewTasks(Date.now());
+  const throttle = await getThrottleDecision(Date.now(), { opencodeProfile: effectiveProfile });
   if (throttle.state === "hard") {
     if (shouldLog("daemon:hard-throttle", 30_000)) {
       console.warn(
@@ -847,8 +856,14 @@ if (args[0] === "status") {
   const json = args.includes("--json");
 
   const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
-  const activeProfile = control.opencodeProfile?.trim() || getOpencodeDefaultProfileName();
-  const throttle = await getThrottleDecision(Date.now(), { opencodeProfile: activeProfile });
+  const controlProfile = control.opencodeProfile?.trim() || "";
+
+  let resolvedProfile: string | null = controlProfile || getOpencodeDefaultProfileName();
+  if (controlProfile === "auto") {
+    resolvedProfile = (await resolveAutoOpencodeProfileName(Date.now())) || getOpencodeDefaultProfileName();
+  }
+
+  const throttle = await getThrottleDecision(Date.now(), { opencodeProfile: resolvedProfile });
 
   const mode = control.mode === "draining"
     ? "draining"
@@ -888,7 +903,8 @@ if (args[0] === "status") {
       JSON.stringify(
         {
           mode,
-          activeProfile: activeProfile ?? null,
+          controlProfile: controlProfile || null,
+          activeProfile: resolvedProfile ?? null,
           throttle: throttle.snapshot,
           inProgress: inProgressWithStatus,
           starting: starting.map((t) => ({
@@ -923,8 +939,10 @@ if (args[0] === "status") {
   }
 
   console.log(`Mode: ${mode}`);
-  if (activeProfile) {
-    console.log(`Active OpenCode profile: ${activeProfile}`);
+  if (controlProfile === "auto") {
+    console.log(`Active OpenCode profile: auto (resolved: ${resolvedProfile ?? "ambient"})`);
+  } else if (resolvedProfile) {
+    console.log(`Active OpenCode profile: ${resolvedProfile}`);
   }
 
   console.log(`Starting tasks: ${starting.length}`);

@@ -29,6 +29,7 @@ import {
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { getThrottleDecision } from "./throttle";
+import { resolveAutoOpencodeProfileName } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
 import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
 import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
@@ -920,14 +921,14 @@ export class RepoWorker {
     return trimmed ? trimmed : null;
   }
 
-  private resolveOpencodeXdgForTask(
+  private async resolveOpencodeXdgForTask(
     task: AgentTask,
     phase: "start" | "resume"
-  ): {
+  ): Promise<{
     profileName: string | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     error?: string;
-  } {
+  }> {
     if (!isOpencodeProfilesEnabled()) return { profileName: null };
 
     const pinned = this.getPinnedOpencodeProfileName(task);
@@ -957,9 +958,19 @@ export class RepoWorker {
     const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
     const requested = control.opencodeProfile?.trim() ?? "";
 
-    let resolved = requested ? resolveOpencodeProfile(requested) : null;
+    let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
-    if (requested && !resolved) {
+    if (requested === "auto") {
+      const chosen = await resolveAutoOpencodeProfileName(Date.now());
+      if (phase === "start") {
+        console.log(`[ralph:worker:${this.repo}] Auto-selected OpenCode profile=${JSON.stringify(chosen ?? "")}`);
+      }
+      resolved = chosen ? resolveOpencodeProfile(chosen) : resolveOpencodeProfile(null);
+    } else {
+      resolved = requested ? resolveOpencodeProfile(requested) : null;
+    }
+
+    if (requested && requested !== "auto" && !resolved) {
       console.warn(
         `[ralph:worker:${this.repo}] Control opencode_profile=${JSON.stringify(requested)} does not match a configured profile; ` +
           `falling back to defaultProfile=${JSON.stringify(getOpencodeDefaultProfileName() ?? "")}`
@@ -988,7 +999,12 @@ export class RepoWorker {
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
     const pinned = this.getPinnedOpencodeProfileName(task);
     const controlProfile = pinned ? null : (readControlStateSnapshot({ log: (message) => console.warn(message) }).opencodeProfile?.trim() ?? null);
-    const opencodeProfile = pinned ?? controlProfile ?? getOpencodeDefaultProfileName();
+
+    let opencodeProfile = pinned ?? controlProfile ?? getOpencodeDefaultProfileName();
+
+    if (!pinned && controlProfile === "auto") {
+      opencodeProfile = (await resolveAutoOpencodeProfileName(Date.now())) ?? getOpencodeDefaultProfileName();
+    }
 
     const decision = await getThrottleDecision(Date.now(), { opencodeProfile });
     if (decision.state !== "hard") return null;
@@ -1166,7 +1182,7 @@ export class RepoWorker {
 
 
     try {
-      const resolvedOpencode = this.resolveOpencodeXdgForTask(task, "resume");
+      const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
 
       const opencodeProfileName = resolvedOpencode.profileName;
@@ -1569,7 +1585,7 @@ export class RepoWorker {
       const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
       if (pausedPreStart) return pausedPreStart;
 
-      const resolvedOpencode = this.resolveOpencodeXdgForTask(task, "start");
+      const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "start");
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
 
       const opencodeProfileName = resolvedOpencode.profileName;
