@@ -155,10 +155,20 @@ function resolveOpencodeBin(): string {
   return "opencode";
 }
 
-function getIsolatedXdgCacheHome(opts?: { repo?: string; cacheKey?: string }): string {
+function getIsolatedXdgCacheHome(opts?: {
+  repo?: string;
+  cacheKey?: string;
+  xdgCacheHome?: string;
+  homeDir?: string;
+}): string {
   const repo = normalizeCacheSegment(opts?.repo ?? "unknown-repo");
   const key = normalizeCacheSegment(opts?.cacheKey ?? "default");
-  return join(homedir(), ".cache", "ralph-opencode", repo, key);
+  const homeDir = opts?.homeDir ?? homedir();
+
+  const rawCacheHome = opts?.xdgCacheHome?.trim();
+  const cacheHome = rawCacheHome ? rawCacheHome : join(homeDir, ".cache");
+
+  return join(cacheHome, "ralph-opencode", repo, key);
 }
 
 function extractOpencodeLogPath(text: string): string | null {
@@ -227,8 +237,17 @@ export function applyToolOutputBudget(text: string): { text: string; truncated: 
   return { text: truncated.trimEnd() + marker, truncated: true };
 }
 
-export async function enforceToolOutputBudgetInStorage(sessionId: string): Promise<void> {
-  const storageDir = join(homedir(), ".local/share/opencode/storage");
+export async function enforceToolOutputBudgetInStorage(
+  sessionId: string,
+  opts?: { xdgDataHome?: string; homeDir?: string }
+): Promise<void> {
+  const homeDir = opts?.homeDir ?? homedir();
+
+  const rawFromOpts = opts?.xdgDataHome?.trim();
+  const rawFromEnv = process.env.XDG_DATA_HOME?.trim();
+  const xdgDataHome = rawFromOpts ? rawFromOpts : rawFromEnv ? rawFromEnv : join(homeDir, ".local", "share");
+
+  const storageDir = join(xdgDataHome, "opencode", "storage");
   const messagesDir = join(storageDir, "message", sessionId);
   if (!existsSync(messagesDir)) return;
 
@@ -310,8 +329,8 @@ export async function enforceToolOutputBudgetInStorage(sessionId: string): Promi
   }
 }
 
-export function getRalphXdgCacheHome(repo: string, cacheKey: string): string {
-  return getIsolatedXdgCacheHome({ repo, cacheKey });
+export function getRalphXdgCacheHome(repo: string, cacheKey: string, xdgCacheHome?: string): string {
+  return getIsolatedXdgCacheHome({ repo, cacheKey, xdgCacheHome });
 }
 
 async function appendOpencodeLogTail(output: string): Promise<string> {
@@ -374,6 +393,13 @@ async function runSession(
     repo?: string;
     /** Used for per-run cache isolation */
     cacheKey?: string;
+    /** OpenCode XDG roots for this run (multi-account profiles). */
+    opencodeXdg?: {
+      dataHome?: string;
+      configHome?: string;
+      stateHome?: string;
+      cacheHome?: string;
+    };
     /** Restart-survivable run output log file path (stdout+stderr). */
     runLogPath?: string;
     /** Fallback hard timeout for the entire OpenCode process */
@@ -553,14 +579,26 @@ async function runSession(
 
   args.push("--format", "json");
 
+  const opencodeXdg = options?.opencodeXdg;
+
   // IMPORTANT: OpenCode installs plugins/deps under its cache dir (XDG_CACHE_HOME/opencode).
   // If multiple OpenCode runs share the same cache concurrently, we can get transient ENOENTs
   // due to node_modules being mutated mid-import. To keep Ralph stable under concurrency,
   // isolate XDG_CACHE_HOME per repo/task key.
-  const xdgCacheHome = getIsolatedXdgCacheHome({ repo: options?.repo, cacheKey: options?.cacheKey });
+  const xdgCacheHome = getIsolatedXdgCacheHome({
+    repo: options?.repo,
+    cacheKey: options?.cacheKey,
+    xdgCacheHome: opencodeXdg?.cacheHome,
+  });
   mkdirSync(xdgCacheHome, { recursive: true });
 
-  const env = { ...process.env, XDG_CACHE_HOME: xdgCacheHome };
+  const env = {
+    ...process.env,
+    ...(opencodeXdg?.dataHome ? { XDG_DATA_HOME: opencodeXdg.dataHome } : {}),
+    ...(opencodeXdg?.configHome ? { XDG_CONFIG_HOME: opencodeXdg.configHome } : {}),
+    ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
+    XDG_CACHE_HOME: xdgCacheHome,
+  };
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
 
   const proc = spawn("opencode", args, {
@@ -1086,7 +1124,7 @@ async function runSession(
     }
 
     if (sessionId) {
-      await enforceToolOutputBudgetInStorage(sessionId);
+      await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
     }
 
     return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout, prUrl: prUrlFromEvents ?? undefined };
@@ -1130,7 +1168,7 @@ async function runSession(
     }
 
     if (sessionId) {
-      await enforceToolOutputBudgetInStorage(sessionId);
+      await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
     }
 
     return { sessionId, output: enriched, success: false, exitCode, prUrl: prUrlFromEvents ?? undefined };
@@ -1149,7 +1187,7 @@ async function runSession(
   }
 
   if (sessionId) {
-    await enforceToolOutputBudgetInStorage(sessionId);
+    await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
   }
 
   return { sessionId, output: textOutput || raw, success: true, exitCode, prUrl: prUrlFromEvents ?? undefined };
@@ -1166,6 +1204,12 @@ export async function runCommand(
   options?: {
     repo?: string;
     cacheKey?: string;
+    opencodeXdg?: {
+      dataHome?: string;
+      configHome?: string;
+      stateHome?: string;
+      cacheHome?: string;
+    };
     runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
@@ -1207,6 +1251,12 @@ export async function continueSession(
   options?: {
     repo?: string;
     cacheKey?: string;
+    opencodeXdg?: {
+      dataHome?: string;
+      configHome?: string;
+      stateHome?: string;
+      cacheHome?: string;
+    };
     runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
@@ -1241,6 +1291,12 @@ export async function continueCommand(
   options?: {
     repo?: string;
     cacheKey?: string;
+    opencodeXdg?: {
+      dataHome?: string;
+      configHome?: string;
+      stateHome?: string;
+      cacheHome?: string;
+    };
     runLogPath?: string;
     timeoutMs?: number;
     introspection?: {
@@ -1276,6 +1332,12 @@ async function* streamSession(
     continueSession?: string;
     repo?: string;
     cacheKey?: string;
+    opencodeXdg?: {
+      dataHome?: string;
+      configHome?: string;
+      stateHome?: string;
+      cacheHome?: string;
+    };
     __testOverrides?: {
       spawn?: SpawnFn;
     };
@@ -1295,7 +1357,13 @@ async function* streamSession(
 
   args.push("--format", "json");
 
-  const xdgCacheHome = getIsolatedXdgCacheHome({ repo: options?.repo, cacheKey: options?.cacheKey });
+  const opencodeXdg = options?.opencodeXdg;
+
+  const xdgCacheHome = getIsolatedXdgCacheHome({
+    repo: options?.repo,
+    cacheKey: options?.cacheKey,
+    xdgCacheHome: opencodeXdg?.cacheHome,
+  });
   mkdirSync(xdgCacheHome, { recursive: true });
 
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
@@ -1303,7 +1371,13 @@ async function* streamSession(
   const proc = spawn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, XDG_CACHE_HOME: xdgCacheHome },
+    env: {
+      ...process.env,
+      ...(opencodeXdg?.dataHome ? { XDG_DATA_HOME: opencodeXdg.dataHome } : {}),
+      ...(opencodeXdg?.configHome ? { XDG_CONFIG_HOME: opencodeXdg.configHome } : {}),
+      ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
+      XDG_CACHE_HOME: xdgCacheHome,
+    },
   });
 
   let buffer = "";

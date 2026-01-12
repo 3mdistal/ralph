@@ -98,6 +98,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
+- `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
 
 Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
@@ -269,12 +270,36 @@ Example:
 { "mode": "draining" }
 ```
 
-Schema: `{ "mode": "running"|"draining", "pause_requested"?: boolean }` (unknown fields ignored)
+Schema: `{ "mode": "running"|"draining", "pause_requested"?: boolean, "opencode_profile"?: string }` (unknown fields ignored)
 
 - Enable drain: set `mode` to `draining`
 - Disable drain: set `mode` to `running`
+- Active OpenCode profile: set `opencode_profile` (affects new tasks only; tasks pin their profile on start)
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running`, and `ralph status` shows `Mode: ...`
+
+## OpenCode profiles (multi-account)
+
+Ralph can run OpenCode under named XDG roots so each account keeps separate `auth.json`, storage, and usage logs.
+
+Example `~/.ralph/config.toml`:
+
+```toml
+[opencode]
+defaultProfile = "apple"
+
+[opencode.profiles.apple]
+xdgDataHome = "/absolute/path/to/opencode-apple/data"
+xdgConfigHome = "/absolute/path/to/opencode-apple/config"
+xdgStateHome = "/absolute/path/to/opencode-apple/state"
+xdgCacheHome = "/absolute/path/to/opencode-apple/cache"
+```
+
+Notes:
+
+- Paths must be absolute (no `~` expansion).
+- New tasks start under the active `opencode_profile` from the control file (or `defaultProfile` when unset).
+- Tasks persist `opencode-profile` in frontmatter and always resume under the same profile.
 
 ## Watchdog (Hung Tool Calls)
 

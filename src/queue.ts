@@ -47,6 +47,8 @@ export interface AgentTask {
   "usage-snapshot"?: string;
   /** OpenCode session ID used to resume after restarts */
   "session-id"?: string;
+  /** OpenCode profile name used for this task (persisted for resume). */
+  "opencode-profile"?: string;
   /** Path to restart-survivable OpenCode run output log */
   "run-log-path"?: string;
   /** Git worktree path for this task (for per-repo concurrency + resume) */

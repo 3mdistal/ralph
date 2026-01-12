@@ -7,6 +7,8 @@ export type DaemonMode = "running" | "draining";
 export type ControlState = {
   mode: DaemonMode;
   pauseRequested?: boolean;
+  /** Active OpenCode profile for starting new tasks (control file key: opencode_profile). */
+  opencodeProfile?: string;
 };
 
 export function resolveControlFilePath(
@@ -41,6 +43,12 @@ function parseControlStateJson(raw: string): ControlState {
 
   if (typeof pauseRequestedRaw === "boolean") {
     state.pauseRequested = pauseRequestedRaw;
+  }
+
+  const opencodeProfileRaw = obj.opencode_profile;
+  if (typeof opencodeProfileRaw === "string") {
+    const trimmed = opencodeProfileRaw.trim();
+    if (trimmed) state.opencodeProfile = trimmed;
   }
 
   return state;

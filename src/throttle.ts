@@ -3,6 +3,7 @@ import { readdir, readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 
+import { loadConfig, resolveOpencodeProfile } from "./config";
 import { shouldLog } from "./logging";
 
 export type ThrottleState = "ok" | "soft" | "hard";
@@ -24,6 +25,10 @@ export interface ThrottleWindowSnapshot {
 export interface ThrottleSnapshot {
   computedAt: string;
   providerID: string;
+  /** Best-effort, config-selected profile name (for debugging). */
+  opencodeProfile?: string | null;
+  /** Best-effort, messages root scanned for usage (for debugging). */
+  messagesRootDir?: string;
   state: ThrottleState;
   resumeAt: string | null;
   windows: ThrottleWindowSnapshot[];
@@ -37,18 +42,19 @@ export interface ThrottleDecision {
 
 const DEFAULT_PROVIDER_ID = "openai";
 
-const WINDOWS = [
-  { name: "rolling5h", windowMs: 5 * 60 * 60 * 1000, budgetTokens: 16_987_015 },
-  { name: "weekly", windowMs: 7 * 24 * 60 * 60 * 1000, budgetTokens: 55_769_305 },
-] as const;
+const ROLLING_5H_MS = 5 * 60 * 60 * 1000;
+const ROLLING_WEEKLY_MS = 7 * 24 * 60 * 60 * 1000;
+
+const DEFAULT_BUDGET_5H_TOKENS = 16_987_015;
+const DEFAULT_BUDGET_WEEKLY_TOKENS = 55_769_305;
 
 const DEFAULT_SOFT_PCT = 0.65;
 const DEFAULT_HARD_PCT = 0.75;
 
-const MIN_CHECK_INTERVAL_MS = 1_000;
+const DEFAULT_MIN_CHECK_INTERVAL_MS = 15_000;
 
-let lastCheckedAt = 0;
-let lastDecision: ThrottleDecision | null = null;
+type ThrottleCacheEntry = { lastCheckedAt: number; lastDecision: ThrottleDecision | null };
+const decisionCache = new Map<string, ThrottleCacheEntry>();
 
 function num(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -110,12 +116,14 @@ async function listJsonFiles(dir: string): Promise<string[]> {
   }
 }
 
-async function readUsageEvents(now: number, providerID: string): Promise<{ ts: number; tokens: number }[]> {
-  const storageDir = join(homedir(), ".local/share/opencode/storage");
-  const messagesRoot = join(storageDir, "message");
+async function readUsageEvents(
+  now: number,
+  providerID: string,
+  messagesRoot: string,
+  maxWindowMs: number
+): Promise<{ ts: number; tokens: number }[]> {
   if (!existsSync(messagesRoot)) return [];
 
-  const maxWindowMs = Math.max(...WINDOWS.map((w) => w.windowMs));
   const oldestStart = now - maxWindowMs;
 
   const out: { ts: number; tokens: number }[] = [];
@@ -205,37 +213,132 @@ function computeWindowSnapshot(opts: {
   };
 }
 
-export async function getThrottleDecision(now: number = Date.now()): Promise<ThrottleDecision> {
-  if (lastDecision && now - lastCheckedAt < MIN_CHECK_INTERVAL_MS) return lastDecision;
+function resolveDefaultXdgDataHome(homeDir: string = homedir()): string {
+  const raw = process.env.XDG_DATA_HOME?.trim();
+  return raw ? raw : join(homeDir, ".local", "share");
+}
 
-  lastCheckedAt = now;
+function resolveOpencodeMessagesRootDir(opencodeProfile?: string | null): {
+  effectiveProfile: string | null;
+  messagesRootDir: string;
+} {
+  const requested = (opencodeProfile ?? "").trim();
+  if (requested) {
+    const resolved = resolveOpencodeProfile(requested);
+    if (resolved) {
+      return {
+        effectiveProfile: resolved.name,
+        messagesRootDir: join(resolved.xdgDataHome, "opencode", "storage", "message"),
+      };
+    }
 
-  const providerID = DEFAULT_PROVIDER_ID;
-  const events = await readUsageEvents(now, providerID);
+    // Unknown profile: fall back to ambient XDG dirs.
+    const xdgDataHome = resolveDefaultXdgDataHome();
+    return { effectiveProfile: null, messagesRootDir: join(xdgDataHome, "opencode", "storage", "message") };
+  }
+
+  // No explicit profile: prefer configured default profile if enabled.
+  const resolvedDefault = resolveOpencodeProfile(null);
+  if (resolvedDefault) {
+    return {
+      effectiveProfile: resolvedDefault.name,
+      messagesRootDir: join(resolvedDefault.xdgDataHome, "opencode", "storage", "message"),
+    };
+  }
+
+  const xdgDataHome = resolveDefaultXdgDataHome();
+  return { effectiveProfile: null, messagesRootDir: join(xdgDataHome, "opencode", "storage", "message") };
+}
+
+export async function getThrottleDecision(
+  now: number = Date.now(),
+  opts?: { opencodeProfile?: string | null }
+): Promise<ThrottleDecision> {
+  const cfg = loadConfig().throttle;
+
+  const { effectiveProfile, messagesRootDir } = resolveOpencodeMessagesRootDir(opts?.opencodeProfile);
+  const perProfileCfg = effectiveProfile ? cfg?.perProfile?.[effectiveProfile] : undefined;
+
+  const enabled = perProfileCfg?.enabled ?? cfg?.enabled ?? true;
+
+  const providerID =
+    String(perProfileCfg?.providerID ?? cfg?.providerID ?? DEFAULT_PROVIDER_ID).trim() || DEFAULT_PROVIDER_ID;
+
+  const softPct =
+    typeof perProfileCfg?.softPct === "number" && Number.isFinite(perProfileCfg.softPct)
+      ? perProfileCfg.softPct
+      : typeof cfg?.softPct === "number" && Number.isFinite(cfg.softPct)
+        ? cfg.softPct
+        : DEFAULT_SOFT_PCT;
+
+  const hardPct =
+    typeof perProfileCfg?.hardPct === "number" && Number.isFinite(perProfileCfg.hardPct)
+      ? perProfileCfg.hardPct
+      : typeof cfg?.hardPct === "number" && Number.isFinite(cfg.hardPct)
+        ? cfg.hardPct
+        : DEFAULT_HARD_PCT;
+
+  const minCheckIntervalMs =
+    typeof perProfileCfg?.minCheckIntervalMs === "number" && Number.isFinite(perProfileCfg.minCheckIntervalMs)
+      ? Math.max(0, Math.floor(perProfileCfg.minCheckIntervalMs))
+      : typeof cfg?.minCheckIntervalMs === "number" && Number.isFinite(cfg.minCheckIntervalMs)
+        ? Math.max(0, Math.floor(cfg.minCheckIntervalMs))
+        : DEFAULT_MIN_CHECK_INTERVAL_MS;
+
+  const budget5hTokens =
+    typeof perProfileCfg?.windows?.rolling5h?.budgetTokens === "number" && Number.isFinite(perProfileCfg.windows.rolling5h.budgetTokens)
+      ? perProfileCfg.windows.rolling5h.budgetTokens
+      : typeof cfg?.windows?.rolling5h?.budgetTokens === "number" && Number.isFinite(cfg.windows.rolling5h.budgetTokens)
+        ? cfg.windows.rolling5h.budgetTokens
+        : DEFAULT_BUDGET_5H_TOKENS;
+
+  const budgetWeeklyTokens =
+    typeof perProfileCfg?.windows?.weekly?.budgetTokens === "number" && Number.isFinite(perProfileCfg.windows.weekly.budgetTokens)
+      ? perProfileCfg.windows.weekly.budgetTokens
+      : typeof cfg?.windows?.weekly?.budgetTokens === "number" && Number.isFinite(cfg.windows.weekly.budgetTokens)
+        ? cfg.windows.weekly.budgetTokens
+        : DEFAULT_BUDGET_WEEKLY_TOKENS;
+
+  const windows = [
+    { name: "rolling5h", windowMs: ROLLING_5H_MS, budgetTokens: budget5hTokens },
+    { name: "weekly", windowMs: ROLLING_WEEKLY_MS, budgetTokens: budgetWeeklyTokens },
+  ];
+
+  const cacheKey =
+    `${providerID}|${messagesRootDir}|` +
+    `b5h=${budget5hTokens}|bw=${budgetWeeklyTokens}|soft=${softPct}|hard=${hardPct}|enabled=${enabled}`;
+
+  const cached = decisionCache.get(cacheKey);
+  if (cached?.lastDecision && now - cached.lastCheckedAt < minCheckIntervalMs) return cached.lastDecision;
+
+  const prevState: ThrottleState = cached?.lastDecision?.state ?? "ok";
+
+  const maxWindowMs = Math.max(...windows.map((w) => w.windowMs));
+  const events = enabled ? await readUsageEvents(now, providerID, messagesRootDir, maxWindowMs) : [];
 
   // First compute hard/soft separately so the snapshot includes both caps.
-  const hardWindows = WINDOWS.map((w) =>
+  const hardWindows = windows.map((w) =>
     computeWindowSnapshot({
       now,
       events,
       name: w.name,
       windowMs: w.windowMs,
       budgetTokens: w.budgetTokens,
-      softPct: DEFAULT_SOFT_PCT,
-      hardPct: DEFAULT_HARD_PCT,
+      softPct,
+      hardPct,
       threshold: "hard",
     })
   );
 
-  const softWindows = WINDOWS.map((w) =>
+  const softWindows = windows.map((w) =>
     computeWindowSnapshot({
       now,
       events,
       name: w.name,
       windowMs: w.windowMs,
       budgetTokens: w.budgetTokens,
-      softPct: DEFAULT_SOFT_PCT,
-      hardPct: DEFAULT_HARD_PCT,
+      softPct,
+      hardPct,
       threshold: "soft",
     })
   );
@@ -254,8 +357,6 @@ export async function getThrottleDecision(now: number = Date.now()): Promise<Thr
     resumeAtTs = Math.max(...softResumeCandidates);
   }
 
-  const prevState: ThrottleState = lastDecision?.state ?? "ok";
-
   const mergedWindows: ThrottleWindowSnapshot[] = hardWindows.map((hardWindow, idx) => {
     const softWindow = softWindows[idx];
     const softResumeAtTs = softWindow?.resumeAtTs ?? null;
@@ -273,6 +374,8 @@ export async function getThrottleDecision(now: number = Date.now()): Promise<Thr
   const snapshot: ThrottleSnapshot = {
     computedAt: new Date(now).toISOString(),
     providerID,
+    opencodeProfile: effectiveProfile,
+    messagesRootDir,
     state,
     resumeAt: resumeAtTs ? new Date(resumeAtTs).toISOString() : null,
     windows: mergedWindows,
@@ -289,26 +392,25 @@ export async function getThrottleDecision(now: number = Date.now()): Promise<Thr
       );
     });
 
+    const label = effectiveProfile ? `profile=${effectiveProfile}` : "profile=ambient";
+
     if (state === "soft") {
-      console.warn(`[ralph] Soft throttle enabled (${softParts.join("; ")}) resumeAt=${snapshot.resumeAt ?? "unknown"}`);
+      console.warn(`[ralph] Soft throttle enabled (${label}; ${softParts.join("; ")}) resumeAt=${snapshot.resumeAt ?? "unknown"}`);
     } else if (prevState === "soft" && state === "ok") {
-      console.warn(`[ralph] Soft throttle disabled (${softParts.join("; ")})`);
+      console.warn(`[ralph] Soft throttle disabled (${label}; ${softParts.join("; ")})`);
     }
   }
 
-  if (state === "hard" && shouldLog(`throttle:${state}`, 60_000)) {
+  if (state === "hard" && shouldLog(`throttle:${state}:${effectiveProfile ?? "ambient"}`, 60_000)) {
     console.warn(
-      `[ralph:throttle] ${state} throttle active; resumeAt=${snapshot.resumeAt ?? "unknown"} ` +
+      `[ralph:throttle] ${state} throttle active; profile=${effectiveProfile ?? "ambient"} resumeAt=${snapshot.resumeAt ?? "unknown"} ` +
         `5h=${hardWindows[0]?.usedTokens ?? 0}/${hardWindows[0]?.hardCapTokens ?? 0} ` +
         `week=${hardWindows[1]?.usedTokens ?? 0}/${hardWindows[1]?.hardCapTokens ?? 0}`
     );
   }
 
-  lastDecision = { state, resumeAtTs, snapshot };
-  return lastDecision;
+  const decision: ThrottleDecision = { state, resumeAtTs, snapshot };
+  decisionCache.set(cacheKey, { lastCheckedAt: now, lastDecision: decision });
+  return decision;
 }
 
-export async function isHardThrottled(): Promise<{ hard: boolean; decision: ThrottleDecision }>{
-  const decision = await getThrottleDecision();
-  return { hard: decision.state === "hard", decision };
-}
