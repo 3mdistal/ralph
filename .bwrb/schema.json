@@ -107,6 +107,43 @@
       ],
       "output_dir": "orchestration/escalations"
     },
+    "dx-recommendation": {
+      "fields": {
+        "creation-date": { "prompt": "date", "required": true },
+        "scope": { "prompt": "text", "required": true },
+        "title": { "prompt": "text", "required": true },
+        "repo": { "prompt": "text", "required": true },
+        "recommendation-type": {
+          "prompt": "select",
+          "options": ["task", "docs", "refactor", "feature", "bug"],
+          "required": true
+        },
+        "priority": {
+          "prompt": "select",
+          "options": ["p0-critical", "p1-high", "p2-medium", "p3-low", "p4-backlog"],
+          "required": true
+        },
+        "status": {
+          "prompt": "select",
+          "options": ["pending", "filed", "rejected", "done"],
+          "required": true
+        },
+        "issue-url": { "prompt": "text", "required": false },
+        "name": { "prompt": "text", "required": true }
+      },
+      "field_order": [
+        "creation-date",
+        "scope",
+        "title",
+        "repo",
+        "recommendation-type",
+        "priority",
+        "status",
+        "issue-url",
+        "name"
+      ],
+      "output_dir": "orchestration/dx-recommendations"
+    },
     "idea": {
       "fields": {
         "creation-date": { "prompt": "date", "required": true },
