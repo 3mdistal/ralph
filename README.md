@@ -338,11 +338,19 @@ Edit the control file (`~/.local/state/ralph/control.json`):
 
 Or send `SIGUSR1` to the daemon for immediate reload after editing.
 
+You can also use automatic selection for new tasks:
+
+```json
+{ "mode": "running", "opencode_profile": "auto" }
+```
+
 New tasks will start under the active profile. In-flight tasks continue under their pinned profile.
 
 ### Per-profile throttle overrides
 
-You can set different throttle budgets per profile:
+You can set different throttle budgets per profile.
+
+If you configure a weekly reset schedule, the weekly throttle is computed as **tokens since the last reset boundary** (instead of a rolling 7-day window), and hard throttle resumes at the **next** reset time.
 
 ```toml
 [throttle]
@@ -356,6 +364,17 @@ budgetTokens = 16987015
 [throttle.windows.weekly]
 budgetTokens = 55769305
 
+# Weekly reset schedule (optional)
+[throttle.reset.weekly]
+# 0=Sun ... 6=Sat
+# (example below is Thu 7:09pm)
+dayOfWeek = 4
+hour = 19
+minute = 9
+# Use an explicit IANA timezone so it matches Codex reliably
+# (example: Indianapolis)
+timeZone = "America/Indiana/Indianapolis"
+
 # Override for "personal" profile (smaller budget)
 [throttle.perProfile.personal]
 softPct = 0.5
@@ -366,6 +385,22 @@ budgetTokens = 8000000
 
 [throttle.perProfile.personal.windows.weekly]
 budgetTokens = 25000000
+
+# Per-profile weekly reset overrides (optional)
+# Example: match different Codex account reset times
+[throttle.perProfile.apple.reset.weekly]
+# Mon 7:05pm
+dayOfWeek = 1
+hour = 19
+minute = 5
+timeZone = "America/Indiana/Indianapolis"
+
+[throttle.perProfile.google.reset.weekly]
+# Thu 7:09pm
+dayOfWeek = 4
+hour = 19
+minute = 9
+timeZone = "America/Indiana/Indianapolis"
 ```
 
 ### Checking profile status
