@@ -280,26 +280,108 @@ Schema: `{ "mode": "running"|"draining", "pause_requested"?: boolean, "opencode_
 
 ## OpenCode profiles (multi-account)
 
-Ralph can run OpenCode under named XDG roots so each account keeps separate `auth.json`, storage, and usage logs.
+Ralph can run OpenCode under named XDG roots so each account keeps separate `auth.json`, storage, and usage logs. This lets you cycle between Codex accounts—Ralph spends from account A while you work interactively on account B.
 
-Example `~/.ralph/config.toml`:
+### Setting up a new profile
+
+1. **Create profile directories:**
+
+```bash
+mkdir -p ~/.opencode-profiles/work/{data,config,state,cache}
+mkdir -p ~/.opencode-profiles/personal/{data,config,state,cache}
+```
+
+2. **Authenticate each profile with OpenCode:**
+
+```bash
+# Authenticate the "work" profile
+XDG_DATA_HOME=~/.opencode-profiles/work/data \
+XDG_CONFIG_HOME=~/.opencode-profiles/work/config \
+XDG_STATE_HOME=~/.opencode-profiles/work/state \
+XDG_CACHE_HOME=~/.opencode-profiles/work/cache \
+opencode auth login
+
+# Authenticate the "personal" profile
+XDG_DATA_HOME=~/.opencode-profiles/personal/data \
+XDG_CONFIG_HOME=~/.opencode-profiles/personal/config \
+XDG_STATE_HOME=~/.opencode-profiles/personal/state \
+XDG_CACHE_HOME=~/.opencode-profiles/personal/cache \
+opencode auth login
+```
+
+3. **Configure profiles in Ralph** (`~/.ralph/config.toml`):
 
 ```toml
 [opencode]
-defaultProfile = "apple"
+defaultProfile = "work"
 
-[opencode.profiles.apple]
-xdgDataHome = "/absolute/path/to/opencode-apple/data"
-xdgConfigHome = "/absolute/path/to/opencode-apple/config"
-xdgStateHome = "/absolute/path/to/opencode-apple/state"
-xdgCacheHome = "/absolute/path/to/opencode-apple/cache"
+[opencode.profiles.work]
+xdgDataHome = "/Users/you/.opencode-profiles/work/data"
+xdgConfigHome = "/Users/you/.opencode-profiles/work/config"
+xdgStateHome = "/Users/you/.opencode-profiles/work/state"
+xdgCacheHome = "/Users/you/.opencode-profiles/work/cache"
+
+[opencode.profiles.personal]
+xdgDataHome = "/Users/you/.opencode-profiles/personal/data"
+xdgConfigHome = "/Users/you/.opencode-profiles/personal/config"
+xdgStateHome = "/Users/you/.opencode-profiles/personal/state"
+xdgCacheHome = "/Users/you/.opencode-profiles/personal/cache"
 ```
 
-Notes:
+### Switching the active profile
+
+Edit the control file (`~/.local/state/ralph/control.json`):
+
+```json
+{ "mode": "running", "opencode_profile": "personal" }
+```
+
+Or send `SIGUSR1` to the daemon for immediate reload after editing.
+
+New tasks will start under the active profile. In-flight tasks continue under their pinned profile.
+
+### Per-profile throttle overrides
+
+You can set different throttle budgets per profile:
+
+```toml
+[throttle]
+enabled = true
+softPct = 0.65
+hardPct = 0.75
+
+[throttle.windows.rolling5h]
+budgetTokens = 16987015
+
+[throttle.windows.weekly]
+budgetTokens = 55769305
+
+# Override for "personal" profile (smaller budget)
+[throttle.perProfile.personal]
+softPct = 0.5
+hardPct = 0.6
+
+[throttle.perProfile.personal.windows.rolling5h]
+budgetTokens = 8000000
+
+[throttle.perProfile.personal.windows.weekly]
+budgetTokens = 25000000
+```
+
+### Checking profile status
+
+```bash
+ralph status --json | jq '{mode, activeProfile, throttle: .throttle.state}'
+```
+
+Shows active profile, throttle state, and per-task profile assignments.
+
+### Notes
 
 - Paths must be absolute (no `~` expansion).
 - New tasks start under the active `opencode_profile` from the control file (or `defaultProfile` when unset).
 - Tasks persist `opencode-profile` in frontmatter and always resume under the same profile.
+- Throttle is computed per profile—a throttled profile won't affect tasks on other profiles.
 
 ## Watchdog (Hung Tool Calls)
 
