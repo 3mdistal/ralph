@@ -10,7 +10,13 @@
 import { existsSync, watch } from "fs";
 import { join } from "path";
 
-import { ensureBwrbVaultLayout, getRepoMaxWorkers, getRepoPath, loadConfig } from "./config";
+import {
+  ensureBwrbVaultLayout,
+  getOpencodeDefaultProfileName,
+  getRepoMaxWorkers,
+  getRepoPath,
+  loadConfig,
+} from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
   initialPoll,
@@ -30,7 +36,7 @@ import { startQueuedTasks } from "./scheduler";
 
 import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
-import { getThrottleDecision, isHardThrottled } from "./throttle";
+import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { initStateDb, recordPrSnapshot } from "./state";
@@ -53,6 +59,23 @@ let drainMonitor: DrainMonitor | null = null;
 function getDaemonMode(): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
   return isDraining() ? "draining" : "running";
+}
+
+function getActiveOpencodeProfileName(): string | null {
+  const control = drainMonitor
+    ? drainMonitor.getState()
+    : readControlStateSnapshot({ log: (message) => console.warn(message) });
+
+  const fromControl = control.opencodeProfile?.trim() ?? "";
+  if (fromControl) return fromControl;
+
+  return getOpencodeDefaultProfileName();
+}
+
+function getTaskOpencodeProfileName(task: Pick<AgentTask, "opencode-profile">): string | null {
+  const raw = task["opencode-profile"];
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  return trimmed ? trimmed : null;
 }
 
 function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
@@ -176,15 +199,19 @@ async function attemptResumeThrottledTasks(): Promise<void> {
   const throttled = await getTasksByStatus("throttled");
   if (throttled.length === 0) return;
 
-  const throttle = await isHardThrottled();
-  if (throttle.hard) {
-    if (shouldLog("daemon:hard-throttle-resume", 60_000)) {
-      console.warn(
-        `[ralph] Hard throttle active; deferring resume of throttled tasks until ${throttle.decision.snapshot.resumeAt ?? "unknown"}`
-      );
-    }
-    return;
-  }
+  const activeProfile = getActiveOpencodeProfileName();
+  const profileKeys = Array.from(
+    new Set(throttled.map((t) => getTaskOpencodeProfileName(t) ?? activeProfile ?? ""))
+  );
+
+  const hardByProfile = new Map<string, { hard: boolean; decision: ThrottleDecision }>();
+
+  await Promise.all(
+    profileKeys.map(async (profileKey) => {
+      const decision = await getThrottleDecision(Date.now(), { opencodeProfile: profileKey ? profileKey : null });
+      hardByProfile.set(profileKey, { hard: decision.state === "hard", decision });
+    })
+  );
 
   const now = Date.now();
 
@@ -195,6 +222,18 @@ async function attemptResumeThrottledTasks(): Promise<void> {
     const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;
     if (Number.isFinite(resumeAtTs) && resumeAtTs > now) continue;
 
+    const profileKey = getTaskOpencodeProfileName(task) ?? activeProfile ?? "";
+    const throttleForProfile = hardByProfile.get(profileKey);
+
+    if (throttleForProfile?.hard) {
+      if (shouldLog(`daemon:hard-throttle-resume:${profileKey || "ambient"}`, 60_000)) {
+        console.warn(
+          `[ralph] Hard throttle active (profile=${profileKey || "ambient"}); deferring resume of throttled tasks until ` +
+            `${throttleForProfile.decision.snapshot.resumeAt ?? "unknown"}`
+        );
+      }
+      continue;
+    }
 
     const sessionId = task["session-id"]?.trim() ?? "";
     if (!sessionId) {
@@ -296,7 +335,7 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
 
   if (getDaemonMode() === "draining") return;
 
-  const throttle = await getThrottleDecision();
+  const throttle = await getThrottleDecision(Date.now(), { opencodeProfile: getActiveOpencodeProfileName() });
   if (throttle.state === "hard") {
     if (shouldLog("daemon:hard-throttle", 30_000)) {
       console.warn(
@@ -676,6 +715,7 @@ function printGlobalHelp(): void {
       "",
       "Notes:",
       "  Drain mode: set mode=draining|running in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json).",
+      "  OpenCode profile: set opencode_profile=\"<name>\" in the same control file (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
   );
@@ -806,8 +846,9 @@ if (args[0] === "status") {
 
   const json = args.includes("--json");
 
-  const throttle = await getThrottleDecision();
   const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+  const activeProfile = control.opencodeProfile?.trim() || getOpencodeDefaultProfileName();
+  const throttle = await getThrottleDecision(Date.now(), { opencodeProfile: activeProfile });
 
   const mode = control.mode === "draining"
     ? "draining"
@@ -829,15 +870,17 @@ if (args[0] === "status") {
       inProgress.map(async (task) => {
         const sessionId = task["session-id"]?.trim() || null;
         const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
-        return {
-          name: task.name,
-          repo: task.repo,
-          issue: task.issue,
-          priority: task.priority ?? "p2-medium",
-          sessionId,
-          nowDoing,
-          line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
-        };
+          return {
+            name: task.name,
+            repo: task.repo,
+            issue: task.issue,
+            priority: task.priority ?? "p2-medium",
+            opencodeProfile: getTaskOpencodeProfileName(task),
+            sessionId,
+            nowDoing,
+            line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
+          };
+
       })
     );
 
@@ -845,6 +888,7 @@ if (args[0] === "status") {
       JSON.stringify(
         {
           mode,
+          activeProfile: activeProfile ?? null,
           throttle: throttle.snapshot,
           inProgress: inProgressWithStatus,
           starting: starting.map((t) => ({
@@ -852,18 +896,21 @@ if (args[0] === "status") {
             repo: t.repo,
             issue: t.issue,
             priority: t.priority ?? "p2-medium",
+            opencodeProfile: getTaskOpencodeProfileName(t),
           })),
           queued: queued.map((t) => ({
             name: t.name,
             repo: t.repo,
             issue: t.issue,
             priority: t.priority ?? "p2-medium",
+            opencodeProfile: getTaskOpencodeProfileName(t),
           })),
           throttled: throttled.map((t) => ({
             name: t.name,
             repo: t.repo,
             issue: t.issue,
             priority: t.priority ?? "p2-medium",
+            opencodeProfile: getTaskOpencodeProfileName(t),
             sessionId: t["session-id"]?.trim() || null,
             resumeAt: t["resume-at"]?.trim() || null,
           })),
@@ -876,6 +923,9 @@ if (args[0] === "status") {
   }
 
   console.log(`Mode: ${mode}`);
+  if (activeProfile) {
+    console.log(`Active OpenCode profile: ${activeProfile}`);
+  }
 
   console.log(`Starting tasks: ${starting.length}`);
   for (const task of starting) {
