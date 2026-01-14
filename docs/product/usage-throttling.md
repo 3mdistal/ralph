@@ -40,6 +40,13 @@ When using multiple OpenCode profiles (multi-account), Ralph may apply throttle 
 
 When no effective profile is known, Ralph should fall back to global throttle settings.
 
+#### Profile failover (new work)
+
+Hard throttle is evaluated against the **effective** OpenCode profile used for that operation.
+
+- For **starting new tasks** (starting a new OpenCode session), if the requested/default profile is hard-throttled and another configured profile is not, Ralph may **fail over** to that other profile so the daemon can continue making progress.
+- For **in-flight work / resume**, Ralph does **not** attempt to switch profiles mid-session; if the session’s profile is hard-throttled, work pauses until `resumeAt`.
+
 ### Pacing
 
 Throttle decisions should pace usage toward the next reset time, rather than distributing evenly from window start.
