@@ -370,7 +370,7 @@ export async function updateTaskStatus(
 
         const taskId =
           (typeof path === "string" && path) || (typeof taskObj._path === "string" && taskObj._path) || undefined;
-        const workerId = `${taskObj.repo}#${taskId ?? taskObj.issue}`;
+        const workerId: string | undefined = taskId ? `${taskObj.repo}#${taskId}` : undefined;
         const sessionId: string | undefined = extraFields?.["session-id"] ?? taskObj["session-id"];
 
         ralphEventBus.publish(
