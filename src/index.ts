@@ -700,7 +700,7 @@ async function main(): Promise<void> {
       buildRalphEvent({
         type: "daemon.stopped",
         level: "info",
-        data: { reason },
+        data: { reason: signal },
       })
     );
 

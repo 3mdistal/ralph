@@ -343,111 +343,111 @@ export async function updateTaskStatus(
       .quiet();
   };
 
-  try {
-    const recordAfterUpdate = (path: string | null) => {
-      try {
-        if (!taskObj) return;
-        if (typeof taskObj.repo !== "string" || typeof taskObj.issue !== "string") return;
+  const recordAfterUpdate = (path: string | null) => {
+    try {
+      if (!taskObj) return;
+      if (typeof taskObj.repo !== "string" || typeof taskObj.issue !== "string") return;
 
-        recordTaskSnapshot({
+      recordTaskSnapshot({
+        repo: taskObj.repo,
+        issue: taskObj.issue,
+        taskPath: path ?? taskObj._path ?? "",
+        taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
+        status,
+        sessionId: extraFields?.["session-id"] ?? taskObj["session-id"],
+        worktreePath: extraFields?.["worktree-path"] ?? taskObj["worktree-path"],
+      });
+    } catch {
+      // best-effort
+    }
+  };
+
+  const publishAfterUpdate = (path: string | null) => {
+    try {
+      if (!taskObj) return;
+      if (typeof taskObj.repo !== "string" || typeof taskObj.issue !== "string") return;
+
+      const taskId =
+        (typeof path === "string" && path) || (typeof taskObj._path === "string" && taskObj._path) || undefined;
+      const workerId: string | undefined = taskId ? `${taskObj.repo}#${taskId}` : undefined;
+      const sessionId: string | undefined = extraFields?.["session-id"] ?? taskObj["session-id"];
+
+      ralphEventBus.publish(
+        buildRalphEvent({
+          type: "task.status_changed",
+          level: "info",
+          workerId,
           repo: taskObj.repo,
-          issue: taskObj.issue,
-          taskPath: path ?? taskObj._path ?? "",
-          taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
-          status,
-          sessionId: extraFields?.["session-id"] ?? taskObj["session-id"],
-          worktreePath: extraFields?.["worktree-path"] ?? taskObj["worktree-path"],
-        });
-      } catch {
-        // best-effort
-      }
-    };
+          taskId,
+          sessionId,
+          data: { from: fromStatus, to: status },
+        })
+      );
 
-    const publishAfterUpdate = (path: string | null) => {
-      try {
-        if (!taskObj) return;
-        if (typeof taskObj.repo !== "string" || typeof taskObj.issue !== "string") return;
-
-        const taskId =
-          (typeof path === "string" && path) || (typeof taskObj._path === "string" && taskObj._path) || undefined;
-        const workerId: string | undefined = taskId ? `${taskObj.repo}#${taskId}` : undefined;
-        const sessionId: string | undefined = extraFields?.["session-id"] ?? taskObj["session-id"];
-
+      if (status === "starting") {
         ralphEventBus.publish(
           buildRalphEvent({
-            type: "task.status_changed",
+            type: "task.assigned",
             level: "info",
             workerId,
             repo: taskObj.repo,
             taskId,
             sessionId,
-            data: { from: fromStatus, to: status },
+            data: {
+              taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
+              issue: typeof taskObj.issue === "string" ? taskObj.issue : undefined,
+            },
           })
         );
-
-        if (status === "starting") {
-          ralphEventBus.publish(
-            buildRalphEvent({
-              type: "task.assigned",
-              level: "info",
-              workerId,
-              repo: taskObj.repo,
-              taskId,
-              sessionId,
-              data: {
-                taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
-                issue: typeof taskObj.issue === "string" ? taskObj.issue : undefined,
-              },
-            })
-          );
-        }
-
-        if (status === "done") {
-          ralphEventBus.publish(
-            buildRalphEvent({
-              type: "task.completed",
-              level: "info",
-              workerId,
-              repo: taskObj.repo,
-              taskId,
-              sessionId,
-              data: {},
-            })
-          );
-        }
-
-        if (status === "escalated") {
-          ralphEventBus.publish(
-            buildRalphEvent({
-              type: "task.escalated",
-              level: "warn",
-              workerId,
-              repo: taskObj.repo,
-              taskId,
-              sessionId,
-              data: {},
-            })
-          );
-        }
-
-        if (status === "blocked") {
-          ralphEventBus.publish(
-            buildRalphEvent({
-              type: "task.blocked",
-              level: "warn",
-              workerId,
-              repo: taskObj.repo,
-              taskId,
-              sessionId,
-              data: {},
-            })
-          );
-        }
-      } catch {
-        // best-effort
       }
-    };
 
+      if (status === "done") {
+        ralphEventBus.publish(
+          buildRalphEvent({
+            type: "task.completed",
+            level: "info",
+            workerId,
+            repo: taskObj.repo,
+            taskId,
+            sessionId,
+            data: {},
+          })
+        );
+      }
+
+      if (status === "escalated") {
+        ralphEventBus.publish(
+          buildRalphEvent({
+            type: "task.escalated",
+            level: "warn",
+            workerId,
+            repo: taskObj.repo,
+            taskId,
+            sessionId,
+            data: {},
+          })
+        );
+      }
+
+      if (status === "blocked") {
+        ralphEventBus.publish(
+          buildRalphEvent({
+            type: "task.blocked",
+            level: "warn",
+            workerId,
+            repo: taskObj.repo,
+            taskId,
+            sessionId,
+            data: {},
+          })
+        );
+      }
+    } catch {
+      // best-effort
+    }
+  };
+
+  try {
     if (exactPath) {
       await editByPath(exactPath);
       recordAfterUpdate(exactPath);
