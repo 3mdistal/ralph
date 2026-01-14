@@ -8,3 +8,6 @@ src/ralph.json
 
 # bwrb vault content (gitignored; still traversed by bwrb via .bwrbignore)
 orchestration/
+
+# bwrb local state
+.bwrb/

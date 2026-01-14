@@ -1,6 +1,9 @@
 # bwrb traversal overrides for this vault.
-# bwrb respects .gitignore by default; keep orchestration notes visible.
+# This repo gitignores `orchestration/`, but Ralph needs bwrb to traverse it.
+# Keep these patterns redundant (anchored + unanchored) so ignore-matchers agree.
 # Requires bwrb >= 0.1.3 for '!' negation support.
 
 !orchestration/
 !orchestration/**
+!/orchestration/
+!/orchestration/**
