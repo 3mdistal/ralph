@@ -1,5 +1,5 @@
 import { listOpencodeProfileNames } from "./config";
-import { getThrottleDecision } from "./throttle";
+import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 
 type Candidate = {
   name: string;
@@ -116,6 +116,101 @@ export async function resolveAutoOpencodeProfileName(now: number = Date.now()): 
   }
 
   return null;
+}
+
+export type OpencodeProfileSelectionSource = "requested" | "auto" | "failover";
+
+export type ResolvedOpencodeProfileForNewWork = {
+  profileName: string | null;
+  decision: ThrottleDecision;
+  source: OpencodeProfileSelectionSource;
+  requestedProfile: string | null;
+};
+
+/**
+ * Pick an OpenCode profile for starting new work.
+ *
+ * - If requested is "auto", uses the auto selector.
+ * - Otherwise, uses the requested/default profile unless it is hard-throttled.
+ * - If the requested/default profile is hard-throttled, attempts a best-effort failover
+ *   to another configured profile.
+ *
+ * This is safe for *new sessions* only. Do not use it when resuming an existing session.
+ */
+export async function resolveOpencodeProfileForNewWork(
+  now: number = Date.now(),
+  requestedProfile: string | null = null
+): Promise<ResolvedOpencodeProfileForNewWork> {
+  const requested = (requestedProfile ?? "").trim();
+
+  if (requested === "auto") {
+    const chosen = await resolveAutoOpencodeProfileName(now);
+    const decision = await getThrottleDecision(now, { opencodeProfile: chosen });
+
+    return {
+      profileName: decision.snapshot.opencodeProfile ?? null,
+      decision,
+      source: "auto",
+      requestedProfile: "auto",
+    };
+  }
+
+  const baseDecision = await getThrottleDecision(now, { opencodeProfile: requested ? requested : null });
+  if (baseDecision.state !== "hard") {
+    return {
+      profileName: baseDecision.snapshot.opencodeProfile ?? null,
+      decision: baseDecision,
+      source: "requested",
+      requestedProfile: requested ? requested : null,
+    };
+  }
+
+  const effectiveProfile = baseDecision.snapshot.opencodeProfile ?? null;
+  if (!effectiveProfile) {
+    return {
+      profileName: null,
+      decision: baseDecision,
+      source: "requested",
+      requestedProfile: requested ? requested : null,
+    };
+  }
+
+  const profiles = listOpencodeProfileNames();
+  if (profiles.length < 2) {
+    return {
+      profileName: baseDecision.snapshot.opencodeProfile ?? null,
+      decision: baseDecision,
+      source: "requested",
+      requestedProfile: requested ? requested : null,
+    };
+  }
+
+  const chosen = await resolveAutoOpencodeProfileName(now);
+  if (!chosen) {
+    return {
+      profileName: baseDecision.snapshot.opencodeProfile ?? null,
+      decision: baseDecision,
+      source: "requested",
+      requestedProfile: requested ? requested : null,
+    };
+  }
+
+  const failoverDecision = await getThrottleDecision(now, { opencodeProfile: chosen });
+  if (failoverDecision.state === "hard") {
+    return {
+      profileName: baseDecision.snapshot.opencodeProfile ?? null,
+      decision: baseDecision,
+      source: "requested",
+      requestedProfile: requested ? requested : null,
+    };
+  }
+
+  return {
+    profileName: failoverDecision.snapshot.opencodeProfile ?? null,
+    decision: failoverDecision,
+    source: "failover",
+    requestedProfile: requested ? requested : null,
+  };
 }
 
 export function __resetAutoOpencodeProfileSelectionForTests(): void {

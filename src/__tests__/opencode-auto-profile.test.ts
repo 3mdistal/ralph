@@ -26,6 +26,7 @@ const defaultGetThrottleDecisionImpl = async (now: number, opts?: GetThrottleArg
     snapshot: {
       computedAt: new Date(now).toISOString(),
       providerID: "openai",
+      opencodeProfile: name || null,
       state: args.state,
       resumeAt: null,
       windows: [
@@ -74,7 +75,11 @@ mock.module("../throttle", () => ({
   getThrottleDecision: getThrottleDecisionMock,
 }));
 
-import { __resetAutoOpencodeProfileSelectionForTests, resolveAutoOpencodeProfileName } from "../opencode-auto-profile";
+import {
+  __resetAutoOpencodeProfileSelectionForTests,
+  resolveAutoOpencodeProfileName,
+  resolveOpencodeProfileForNewWork,
+} from "../opencode-auto-profile";
 
 describe("auto opencode profile selection", () => {
   beforeEach(() => {
@@ -119,5 +124,29 @@ describe("auto opencode profile selection", () => {
 
     const chosen = await resolveAutoOpencodeProfileName(now);
     expect(chosen).toBe("apple");
+  });
+
+  test("fails over from a hard-throttled requested profile for new work", async () => {
+    const now = Date.parse("2026-01-13T12:00:00Z");
+
+    getThrottleDecisionMock.mockImplementation(async (_now: number, opts?: GetThrottleArgs) => {
+      const name = (opts?.opencodeProfile ?? "").trim();
+      const base = await defaultGetThrottleDecisionImpl(_now, opts);
+
+      if (name === "google") {
+        return {
+          ...base,
+          state: "hard",
+          snapshot: { ...base.snapshot, state: "hard" },
+        } as any;
+      }
+
+      return base;
+    });
+
+    const selection = await resolveOpencodeProfileForNewWork(now, "google");
+    expect(selection.source).toBe("failover");
+    expect(selection.profileName).toBe("apple");
+    expect(selection.decision.state).toBe("ok");
   });
 });

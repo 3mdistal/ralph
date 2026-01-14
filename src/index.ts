@@ -37,7 +37,7 @@ import { startQueuedTasks } from "./scheduler";
 import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
-import { resolveAutoOpencodeProfileName } from "./opencode-auto-profile";
+import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { initStateDb, recordPrSnapshot } from "./state";
@@ -75,8 +75,8 @@ function getActiveOpencodeProfileName(): string | null {
 
 async function resolveEffectiveOpencodeProfileNameForNewTasks(now: number): Promise<string | null> {
   const requested = getActiveOpencodeProfileName();
-  if (requested === "auto") return await resolveAutoOpencodeProfileName(now);
-  return requested;
+  const resolved = await resolveOpencodeProfileForNewWork(now, requested);
+  return resolved.profileName;
 }
 
 function getTaskOpencodeProfileName(task: Pick<AgentTask, "opencode-profile">): string | null {
@@ -343,12 +343,24 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
 
   if (getDaemonMode() === "draining") return;
 
-  const effectiveProfile = await resolveEffectiveOpencodeProfileNameForNewTasks(Date.now());
-  const throttle = await getThrottleDecision(Date.now(), { opencodeProfile: effectiveProfile });
+  const selection = await resolveOpencodeProfileForNewWork(Date.now(), getActiveOpencodeProfileName());
+  const throttle = selection.decision;
+
+  if (selection.source === "failover") {
+    const requested = selection.requestedProfile ?? "default";
+    const chosen = throttle.snapshot.opencodeProfile ?? "ambient";
+
+    if (shouldLog(`daemon:opencode-profile-failover:${requested}->${chosen}`, 60_000)) {
+      console.warn(`[ralph] Hard throttle on profile=${requested}; failing over to profile=${chosen} for new tasks`);
+    }
+  }
+
   if (throttle.state === "hard") {
     if (shouldLog("daemon:hard-throttle", 30_000)) {
       console.warn(
-        `[ralph] Hard throttle active; skipping task scheduling until ${throttle.snapshot.resumeAt ?? "unknown"}`
+        `[ralph] Hard throttle active (profile=${throttle.snapshot.opencodeProfile ?? "ambient"}); skipping task scheduling until ${
+          throttle.snapshot.resumeAt ?? "unknown"
+        }`
       );
     }
     return;
@@ -858,12 +870,12 @@ if (args[0] === "status") {
   const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
   const controlProfile = control.opencodeProfile?.trim() || "";
 
-  let resolvedProfile: string | null = controlProfile || getOpencodeDefaultProfileName();
-  if (controlProfile === "auto") {
-    resolvedProfile = (await resolveAutoOpencodeProfileName(Date.now())) || getOpencodeDefaultProfileName();
-  }
+  const requestedProfile =
+    controlProfile === "auto" ? "auto" : controlProfile || getOpencodeDefaultProfileName() || null;
 
-  const throttle = await getThrottleDecision(Date.now(), { opencodeProfile: resolvedProfile });
+  const selection = await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile);
+  const resolvedProfile: string | null = selection.profileName;
+  const throttle = selection.decision;
 
   const mode = control.mode === "draining"
     ? "draining"
@@ -941,6 +953,8 @@ if (args[0] === "status") {
   console.log(`Mode: ${mode}`);
   if (controlProfile === "auto") {
     console.log(`Active OpenCode profile: auto (resolved: ${resolvedProfile ?? "ambient"})`);
+  } else if (selection.source === "failover") {
+    console.log(`Active OpenCode profile: ${resolvedProfile ?? "ambient"} (failover from: ${requestedProfile ?? "default"})`);
   } else if (resolvedProfile) {
     console.log(`Active OpenCode profile: ${resolvedProfile}`);
   }

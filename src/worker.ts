@@ -29,7 +29,7 @@ import {
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { getThrottleDecision } from "./throttle";
-import { resolveAutoOpencodeProfileName } from "./opencode-auto-profile";
+import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
 import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
 import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
@@ -966,6 +966,18 @@ export class RepoWorker {
         console.log(`[ralph:worker:${this.repo}] Auto-selected OpenCode profile=${JSON.stringify(chosen ?? "")}`);
       }
       resolved = chosen ? resolveOpencodeProfile(chosen) : resolveOpencodeProfile(null);
+    } else if (phase === "start") {
+      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requested || null);
+      const chosen = selection.profileName;
+
+      if (selection.source === "failover") {
+        console.log(
+          `[ralph:worker:${this.repo}] Hard throttle on profile=${selection.requestedProfile ?? "default"}; ` +
+            `failing over to profile=${chosen ?? "ambient"}`
+        );
+      }
+
+      resolved = chosen ? resolveOpencodeProfile(chosen) : null;
     } else {
       resolved = requested ? resolveOpencodeProfile(requested) : null;
     }
@@ -998,20 +1010,32 @@ export class RepoWorker {
 
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
     const pinned = this.getPinnedOpencodeProfileName(task);
-    const controlProfile = pinned ? null : (readControlStateSnapshot({ log: (message) => console.warn(message) }).opencodeProfile?.trim() ?? null);
+    const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
+    const hasSession = !!sid;
 
-    let opencodeProfile = pinned ?? controlProfile ?? getOpencodeDefaultProfileName();
+    let decision: Awaited<ReturnType<typeof getThrottleDecision>>;
 
-    if (!pinned && controlProfile === "auto") {
-      opencodeProfile = (await resolveAutoOpencodeProfileName(Date.now())) ?? getOpencodeDefaultProfileName();
+    if (pinned) {
+      decision = await getThrottleDecision(Date.now(), { opencodeProfile: pinned });
+    } else {
+      const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message) }).opencodeProfile?.trim() ?? "";
+
+      if (controlProfile === "auto") {
+        const chosen = await resolveAutoOpencodeProfileName(Date.now());
+        decision = await getThrottleDecision(Date.now(), { opencodeProfile: chosen ?? getOpencodeDefaultProfileName() });
+      } else if (!hasSession) {
+        // Safe to fail over between profiles before starting a new session.
+        decision = (await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null)).decision;
+      } else {
+        // Do not fail over while a session is in flight/resuming.
+        decision = await getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
+      }
     }
 
-    const decision = await getThrottleDecision(Date.now(), { opencodeProfile });
     if (decision.state !== "hard") return null;
 
     const throttledAt = new Date().toISOString();
     const resumeAt = decision.resumeAtTs ? new Date(decision.resumeAtTs).toISOString() : "";
-    const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
 
     const extraFields: Record<string, string> = {
       "throttled-at": throttledAt,
