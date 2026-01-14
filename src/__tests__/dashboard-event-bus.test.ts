@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { RalphEventBus } from "../dashboard/event-bus";
-import { buildRalphEvent, isRalphEvent } from "../dashboard/events";
+import { assertRalphEvent, buildRalphEvent, isRalphEvent, safeJsonStringifyRalphEvent } from "../dashboard/events";
 
 describe("dashboard event bus", () => {
   test("replays the last N events to new subscribers", () => {
@@ -65,6 +65,10 @@ describe("dashboard event schema", () => {
     });
 
     expect(isRalphEvent(ok)).toBe(true);
+    expect(() => assertRalphEvent(ok, "ok")).not.toThrow();
+
+    const roundTrip = JSON.parse(safeJsonStringifyRalphEvent(ok));
+    expect(isRalphEvent(roundTrip)).toBe(true);
 
     const bad: any = {
       ...ok,
@@ -72,5 +76,6 @@ describe("dashboard event schema", () => {
     };
 
     expect(isRalphEvent(bad)).toBe(false);
+    expect(() => assertRalphEvent(bad, "bad")).toThrow();
   });
 });
