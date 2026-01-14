@@ -112,6 +112,19 @@ describe("integration-ish harness: full task lifecycle", () => {
     continueSessionMock.mockClear();
     continueCommandMock.mockClear();
     getThrottleDecisionMock.mockClear();
+    getThrottleDecisionMock.mockImplementation(async () =>
+      ({
+        state: "ok",
+        resumeAtTs: null,
+        snapshot: {
+          computedAt: new Date(0).toISOString(),
+          providerID: "openai",
+          state: "ok",
+          resumeAt: null,
+          windows: [],
+        },
+      }) as any
+    );
   });
 
   test("queued → in-progress → build → PR → merge → survey → done", async () => {
@@ -196,7 +209,7 @@ describe("integration-ish harness: full task lifecycle", () => {
   test("hard throttle pauses before any model send", async () => {
     const resumeAtTs = Date.now() + 60_000;
 
-    getThrottleDecisionMock.mockImplementationOnce(async () => ({
+    getThrottleDecisionMock.mockImplementation(async () => ({
       state: "hard",
       resumeAtTs,
       snapshot: {
