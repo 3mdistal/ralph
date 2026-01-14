@@ -5,6 +5,8 @@ import crypto from "crypto";
 import { ensureBwrbVaultLayout, getRepoBotBranch, getRepoPath, loadConfig } from "./config";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
+import { ralphEventBus } from "./dashboard/bus";
+import { buildRalphEvent } from "./dashboard/events";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -317,6 +319,8 @@ export async function updateTaskStatus(
   const json = JSON.stringify({ status, ...extraFields });
 
   const taskObj: any = typeof task === "object" ? task : null;
+  const fromStatus: string | undefined =
+    taskObj && typeof taskObj.status === "string" ? (taskObj.status as string) : undefined;
 
   if (taskObj && typeof taskObj._path === "string") {
     taskObj._path = normalizeBwrbNoteRef(taskObj._path);
@@ -359,14 +363,101 @@ export async function updateTaskStatus(
       }
     };
 
+    const publishAfterUpdate = (path: string | null) => {
+      try {
+        if (!taskObj) return;
+        if (typeof taskObj.repo !== "string" || typeof taskObj.issue !== "string") return;
+
+        const taskId =
+          (typeof path === "string" && path) || (typeof taskObj._path === "string" && taskObj._path) || undefined;
+        const workerId = `${taskObj.repo}#${taskId ?? taskObj.issue}`;
+        const sessionId: string | undefined = extraFields?.["session-id"] ?? taskObj["session-id"];
+
+        ralphEventBus.publish(
+          buildRalphEvent({
+            type: "task.status_changed",
+            level: "info",
+            workerId,
+            repo: taskObj.repo,
+            taskId,
+            sessionId,
+            data: { from: fromStatus, to: status },
+          })
+        );
+
+        if (status === "starting") {
+          ralphEventBus.publish(
+            buildRalphEvent({
+              type: "task.assigned",
+              level: "info",
+              workerId,
+              repo: taskObj.repo,
+              taskId,
+              sessionId,
+              data: {
+                taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
+                issue: typeof taskObj.issue === "string" ? taskObj.issue : undefined,
+              },
+            })
+          );
+        }
+
+        if (status === "done") {
+          ralphEventBus.publish(
+            buildRalphEvent({
+              type: "task.completed",
+              level: "info",
+              workerId,
+              repo: taskObj.repo,
+              taskId,
+              sessionId,
+              data: {},
+            })
+          );
+        }
+
+        if (status === "escalated") {
+          ralphEventBus.publish(
+            buildRalphEvent({
+              type: "task.escalated",
+              level: "warn",
+              workerId,
+              repo: taskObj.repo,
+              taskId,
+              sessionId,
+              data: {},
+            })
+          );
+        }
+
+        if (status === "blocked") {
+          ralphEventBus.publish(
+            buildRalphEvent({
+              type: "task.blocked",
+              level: "warn",
+              workerId,
+              repo: taskObj.repo,
+              taskId,
+              sessionId,
+              data: {},
+            })
+          );
+        }
+      } catch {
+        // best-effort
+      }
+    };
+
     if (exactPath) {
       await editByPath(exactPath);
       recordAfterUpdate(exactPath);
+      publishAfterUpdate(exactPath);
       return true;
     }
 
     await editByQuery();
     recordAfterUpdate(taskObj?._path ?? null);
+    publishAfterUpdate(taskObj?._path ?? null);
     return true;
   } catch (e: any) {
     const identifier = exactPath || (typeof task === "string" ? task : (task as any).name);
@@ -398,6 +489,8 @@ export async function updateTaskStatus(
 
         try {
           await editByPath(resolved._path);
+          recordAfterUpdate(resolved._path);
+          publishAfterUpdate(resolved._path);
           return true;
         } catch (e2: any) {
           const retryText = extractBwrbErrorText(e2);
