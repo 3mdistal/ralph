@@ -93,3 +93,69 @@ export function startQueuedTasks<Task extends { repo: string }>(deps: SchedulerD
 
   return startedCount;
 }
+
+export type SchedulerTimers = {
+  setTimeout: typeof setTimeout;
+  clearTimeout: typeof clearTimeout;
+};
+
+export type SchedulerControllerDeps<Task> = {
+  getDaemonMode: () => "running" | "draining";
+  isShuttingDown: () => boolean;
+  getRunnableTasks: () => Promise<Task[]>;
+  onRunnableTasks: (tasks: Task[]) => Promise<void> | void;
+  getPendingResumeTasks: () => Task[];
+  onPendingResumeTasks: (tasks: Task[]) => void;
+  timers?: SchedulerTimers;
+  queuedDebounceMs?: number;
+  resumeDebounceMs?: number;
+};
+
+export type SchedulerController = {
+  scheduleQueuedTasksSoon: () => void;
+  scheduleResumeTasksSoon: () => void;
+  clearTimers: () => void;
+};
+
+export function createSchedulerController<Task>(deps: SchedulerControllerDeps<Task>): SchedulerController {
+  const timers = deps.timers ?? { setTimeout, clearTimeout };
+  const queuedDebounceMs = deps.queuedDebounceMs ?? 250;
+  const resumeDebounceMs = deps.resumeDebounceMs ?? 250;
+
+  let scheduleQueuedTimer: ReturnType<typeof setTimeout> | null = null;
+  let scheduleResumeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleQueuedTasksSoon = (): void => {
+    if (scheduleQueuedTimer) return;
+    scheduleQueuedTimer = timers.setTimeout(() => {
+      scheduleQueuedTimer = null;
+      if (deps.isShuttingDown()) return;
+      if (deps.getDaemonMode() === "draining") return;
+      void deps.getRunnableTasks().then((tasks) => deps.onRunnableTasks(tasks));
+    }, queuedDebounceMs);
+  };
+
+  const scheduleResumeTasksSoon = (): void => {
+    if (scheduleResumeTimer) return;
+    scheduleResumeTimer = timers.setTimeout(() => {
+      scheduleResumeTimer = null;
+      if (deps.isShuttingDown()) return;
+      const pending = deps.getPendingResumeTasks();
+      if (pending.length === 0) return;
+      deps.onPendingResumeTasks(pending);
+    }, resumeDebounceMs);
+  };
+
+  const clearTimers = (): void => {
+    if (scheduleQueuedTimer) {
+      timers.clearTimeout(scheduleQueuedTimer);
+      scheduleQueuedTimer = null;
+    }
+    if (scheduleResumeTimer) {
+      timers.clearTimeout(scheduleResumeTimer);
+      scheduleResumeTimer = null;
+    }
+  };
+
+  return { scheduleQueuedTasksSoon, scheduleResumeTasksSoon, clearTimers };
+}

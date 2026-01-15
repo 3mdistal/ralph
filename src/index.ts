@@ -32,7 +32,7 @@ import {
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
-import { startQueuedTasks } from "./scheduler";
+import { createSchedulerController, startQueuedTasks } from "./scheduler";
 
 import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { shouldLog } from "./logging";
@@ -181,29 +181,15 @@ async function getRunnableTasks(): Promise<AgentTask[]> {
   return [...starting, ...queued];
 }
 
-let scheduleQueuedTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleQueuedTasksSoon(): void {
-  if (scheduleQueuedTimer) return;
-  scheduleQueuedTimer = setTimeout(() => {
-    scheduleQueuedTimer = null;
-    if (isShuttingDown) return;
-    if (getDaemonMode() === "draining" && pendingResumeTasks.size === 0) return;
-    void getRunnableTasks().then((tasks) => processNewTasks(tasks));
-  }, 250);
-}
-
-let scheduleResumeTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleResumeTasksSoon(): void {
-  if (scheduleResumeTimer) return;
-  scheduleResumeTimer = setTimeout(() => {
-    scheduleResumeTimer = null;
-    if (isShuttingDown) return;
-
+const schedulerController = createSchedulerController({
+  getDaemonMode: () => getDaemonMode(),
+  isShuttingDown: () => isShuttingDown,
+  getRunnableTasks: () => getRunnableTasks(),
+  onRunnableTasks: (tasks) => processNewTasks(tasks),
+  getPendingResumeTasks: () => Array.from(pendingResumeTasks.values()),
+  onPendingResumeTasks: (priorityTasks) => {
     ensureSemaphores();
     if (!globalSemaphore) return;
-
-    const priorityTasks = Array.from(pendingResumeTasks.values());
-    if (priorityTasks.length === 0) return;
 
     startQueuedTasks({
       gate: "running",
@@ -220,7 +206,15 @@ function scheduleResumeTasksSoon(): void {
       startTask,
       startPriorityTask: startResumeTask,
     });
-  }, 250);
+  },
+});
+
+function scheduleQueuedTasksSoon(): void {
+  schedulerController.scheduleQueuedTasksSoon();
+}
+
+function scheduleResumeTasksSoon(): void {
+  schedulerController.scheduleResumeTasksSoon();
 }
 
 let escalationWatcher: ReturnType<typeof watch> | null = null;
@@ -777,6 +771,7 @@ async function main(): Promise<void> {
       clearTimeout(escalationDebounceTimer);
       escalationDebounceTimer = null;
     }
+    schedulerController.clearTimers();
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
     clearInterval(throttleResumeTimer);
