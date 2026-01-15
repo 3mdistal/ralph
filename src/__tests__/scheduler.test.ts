@@ -1,7 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 
 import { Semaphore } from "../semaphore";
-import { startQueuedTasks } from "../scheduler";
+import { createSchedulerController, startQueuedTasks } from "../scheduler";
 import { attemptResumeResolvedEscalations } from "../escalation-resume-scheduler";
 import type { AgentTask } from "../queue";
 
@@ -37,6 +37,121 @@ describe("Scheduler invariants", () => {
 
     expect(startedCount).toBe(0);
     expect(started.length).toBe(0);
+  });
+
+  test("drain allows resume scheduling without dequeues", () => {
+    const pendingResumes: TestTask[] = [{ repo: "a", _path: "t1", name: "resume" }];
+    const expectedResumes = [...pendingResumes];
+    const runnableCalls: TestTask[][] = [];
+    const resumed: TestTask[] = [];
+
+    const controller = createSchedulerController<TestTask>({
+      getDaemonMode: () => "draining",
+      isShuttingDown: () => false,
+      getRunnableTasks: async () => {
+        runnableCalls.push([]);
+        return [];
+      },
+      onRunnableTasks: async () => {},
+      getPendingResumeTasks: () => pendingResumes,
+      onPendingResumeTasks: (tasks) => {
+        resumed.push(...tasks);
+        pendingResumes.splice(0, pendingResumes.length);
+      },
+      timers: {
+        setTimeout: (fn: (...args: any[]) => void) => {
+          fn();
+          return 1 as any;
+        },
+        clearTimeout: () => {},
+      } as any,
+    });
+
+    controller.scheduleQueuedTasksSoon();
+    controller.scheduleResumeTasksSoon();
+
+    expect(runnableCalls.length).toBe(0);
+    expect(resumed).toEqual(expectedResumes);
+
+    const runningController = createSchedulerController<TestTask>({
+      getDaemonMode: () => "running",
+      isShuttingDown: () => false,
+      getRunnableTasks: async () => {
+        runnableCalls.push([]);
+        return [];
+      },
+      onRunnableTasks: async () => {},
+      getPendingResumeTasks: () => [],
+      onPendingResumeTasks: () => {},
+      timers: {
+        setTimeout: (fn: (...args: any[]) => void) => {
+          fn();
+          return 1 as any;
+        },
+        clearTimeout: () => {},
+      } as any,
+    });
+
+    runningController.scheduleQueuedTasksSoon();
+    expect(runnableCalls.length).toBe(1);
+  });
+
+  test("startQueuedTasks skips in-flight tasks", () => {
+    const inFlightTasks = new Set<string>();
+    const started: TestTask[] = [];
+
+    const globalSemaphore = new Semaphore(10);
+
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(10);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const rrCursor = { value: 0 };
+
+    const startTask = ({ repo, task }: { repo: string; task: TestTask }) => {
+      inFlightTasks.add(task._path || task.name);
+      started.push({ ...task, repo });
+    };
+
+    const tasks = [{ repo: "a", _path: "orchestration/tasks/t1.md", name: "t1" }];
+
+    const first = startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks,
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor,
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+    });
+
+    const second = startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks,
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor,
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+    });
+
+    expect(first).toBe(1);
+    expect(second).toBe(0);
+    expect(started.length).toBe(1);
   });
 
   test("no duplicate scheduling when watcher double-fires", () => {
