@@ -64,7 +64,7 @@ describe("Scheduler invariants", () => {
           return 1 as any;
         },
         clearTimeout: () => {},
-      },
+      } as any,
     });
 
     controller.scheduleQueuedTasksSoon();
@@ -89,7 +89,7 @@ describe("Scheduler invariants", () => {
           return 1 as any;
         },
         clearTimeout: () => {},
-      },
+      } as any,
     });
 
     runningController.scheduleQueuedTasksSoon();
