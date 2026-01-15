@@ -45,6 +45,7 @@ import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationConte
 import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
+import { recordIssueSnapshot } from "./state";
 import {
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
@@ -725,8 +726,7 @@ export class RepoWorker {
     try {
       const result = await gh`gh issue view ${number} --repo ${repo} --json state,stateReason,closedAt,url,labels,title`.quiet();
       const data = JSON.parse(result.stdout.toString());
-
-      return {
+      const metadata: IssueMetadata = {
         labels: data.labels?.map((l: any) => l.name) ?? [],
         title: data.title ?? "",
         state: typeof data.state === "string" ? data.state : undefined,
@@ -734,6 +734,16 @@ export class RepoWorker {
         closedAt: typeof data.closedAt === "string" ? data.closedAt : undefined,
         url: typeof data.url === "string" ? data.url : undefined,
       };
+
+      recordIssueSnapshot({
+        repo,
+        issue,
+        title: metadata.title,
+        state: metadata.state,
+        url: metadata.url,
+      });
+
+      return metadata;
     } catch {
       return { labels: [], title: "" };
     }
