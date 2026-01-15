@@ -2,15 +2,7 @@ import { spawn as nodeSpawn, type ChildProcess } from "child_process";
 
 type SpawnFn = typeof nodeSpawn;
 
-let spawnFn: SpawnFn = nodeSpawn;
-
-export function __setSpawnForTests(fn: SpawnFn): void {
-  spawnFn = fn;
-}
-
-export function __resetSpawnForTests(): void {
-  spawnFn = nodeSpawn;
-}
+const spawnFn: SpawnFn = nodeSpawn;
 
 type Scheduler = {
   now: () => number;
@@ -27,16 +19,6 @@ const defaultScheduler: Scheduler = {
   setInterval,
   clearInterval,
 };
-
-let schedulerForTests: Scheduler | null = null;
-
-export function __setSchedulerForTests(scheduler: Scheduler): void {
-  schedulerForTests = scheduler;
-}
-
-export function __resetSchedulerForTests(): void {
-  schedulerForTests = null;
-}
 
 import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
@@ -428,10 +410,11 @@ async function runSession(
     __testOverrides?: {
       spawn?: SpawnFn;
       scheduler?: Scheduler;
+      sessionsDir?: string;
     };
   }
 ): Promise<SessionResult> {
-  const scheduler = options?.__testOverrides?.scheduler ?? schedulerForTests ?? defaultScheduler;
+  const scheduler = options?.__testOverrides?.scheduler ?? defaultScheduler;
   const truncate = (value: string, max: number) => (value.length > max ? value.slice(0, max) + "…" : value);
 
   const mergeThresholds = (overrides?: Partial<WatchdogThresholdsMs>): WatchdogThresholdsMs => {
@@ -773,9 +756,23 @@ async function runSession(
     openRunLogStream();
   }
 
+  const sessionsDirOverride = options?.__testOverrides?.sessionsDir?.trim();
+  const getSessionDirForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id);
+    return getSessionDir(id);
+  };
+  const getSessionEventsPathForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id, "events.jsonl");
+    return getSessionEventsPath(id);
+  };
+  const getSessionLockPathForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id, "active.lock");
+    return getRalphSessionLockPath(id);
+  };
+
   // If continuing an existing session, mark it as active for `ralph nudge`.
   const continueSessionId = options?.continueSession;
-  const lockPath = continueSessionId ? getRalphSessionLockPath(continueSessionId) : null;
+  const lockPath = continueSessionId ? getSessionLockPathForRun(continueSessionId) : null;
   const cleanupLock = () => {
     if (!lockPath) return;
     try {
@@ -787,7 +784,7 @@ async function runSession(
 
   if (lockPath && continueSessionId) {
     try {
-      mkdirSync(getSessionDir(continueSessionId), { recursive: true });
+      mkdirSync(getSessionDirForRun(continueSessionId), { recursive: true });
       writeFileSync(
         lockPath,
         JSON.stringify({ ts: scheduler.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
@@ -860,8 +857,8 @@ async function runSession(
     if (eventStream) return;
 
     try {
-      mkdirSync(getSessionDir(id), { recursive: true });
-      eventStream = createWriteStream(getSessionEventsPath(id), { flags: "a" });
+      mkdirSync(getSessionDirForRun(id), { recursive: true });
+      eventStream = createWriteStream(getSessionEventsPathForRun(id), { flags: "a" });
       for (const line of bufferedEventLines) {
         try {
           eventStream.write(line + "\n");
@@ -1230,6 +1227,7 @@ export async function runCommand(
   testOverrides?: {
     spawn?: SpawnFn;
     scheduler?: Scheduler;
+    sessionsDir?: string;
   }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;

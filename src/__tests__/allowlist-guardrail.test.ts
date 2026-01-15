@@ -2,9 +2,9 @@ import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
 const updateTaskStatusMock = mock(async () => true);
 
-mock.module("../queue", () => ({
+const queueAdapter = {
   updateTaskStatus: updateTaskStatusMock,
-}));
+};
 
 mock.module("../config", () => ({
   loadConfig: () => ({
@@ -49,7 +49,7 @@ describe("allowlist guardrail", () => {
   });
 
   test("processTask blocks without touching gh when repo owner is not allowed", async () => {
-    const worker = new RepoWorker("builder-org/repo", "/tmp");
+    const worker = new RepoWorker("builder-org/repo", "/tmp", { queue: queueAdapter });
 
     let agentRunData: any = null;
     (worker as any).createAgentRun = async (_task: any, data: any) => {
@@ -76,7 +76,7 @@ describe("allowlist guardrail", () => {
   });
 
   test("resumeTask blocks without touching gh when repo owner is not allowed", async () => {
-    const worker = new RepoWorker("builder-org/repo", "/tmp");
+    const worker = new RepoWorker("builder-org/repo", "/tmp", { queue: queueAdapter });
 
     let agentRunData: any = null;
     (worker as any).createAgentRun = async (_task: any, data: any) => {

@@ -46,6 +46,12 @@ describe("throttle config validation", () => {
       "[throttle.windows.weekly]",
       "budgetTokens = 2000",
       "",
+      "[throttle.reset.weekly]",
+      "dayOfWeek = 1",
+      "hour = 19",
+      "minute = 5",
+      'timeZone = "America/Indiana/Indianapolis"',
+      "",
       "[throttle.perProfile.p1]",
       'providerID = "openai"',
       "softPct = 0.2",
@@ -57,6 +63,12 @@ describe("throttle config validation", () => {
       "",
       "[throttle.perProfile.p1.windows.weekly]",
       "budgetTokens = 1234",
+      "",
+      "[throttle.perProfile.p1.reset.weekly]",
+      "dayOfWeek = 4",
+      "hour = 19",
+      "minute = 9",
+      'timeZone = "America/Indiana/Indianapolis"',
       "",
     ]);
 
@@ -74,10 +86,20 @@ describe("throttle config validation", () => {
     expect(cfg.throttle?.windows?.rolling5h?.budgetTokens).toBe(200);
     expect(cfg.throttle?.windows?.weekly?.budgetTokens).toBe(2000);
 
+    expect(cfg.throttle?.reset?.weekly?.dayOfWeek).toBe(1);
+    expect(cfg.throttle?.reset?.weekly?.hour).toBe(19);
+    expect(cfg.throttle?.reset?.weekly?.minute).toBe(5);
+    expect(cfg.throttle?.reset?.weekly?.timeZone).toBe("America/Indiana/Indianapolis");
+
     expect(cfg.throttle?.perProfile?.p1?.softPct).toBe(0.2);
     expect(cfg.throttle?.perProfile?.p1?.hardPct).toBe(0.3);
     expect(cfg.throttle?.perProfile?.p1?.windows?.rolling5h?.budgetTokens).toBe(123);
     expect(cfg.throttle?.perProfile?.p1?.windows?.weekly?.budgetTokens).toBe(1234);
+
+    expect(cfg.throttle?.perProfile?.p1?.reset?.weekly?.dayOfWeek).toBe(4);
+    expect(cfg.throttle?.perProfile?.p1?.reset?.weekly?.hour).toBe(19);
+    expect(cfg.throttle?.perProfile?.p1?.reset?.weekly?.minute).toBe(9);
+    expect(cfg.throttle?.perProfile?.p1?.reset?.weekly?.timeZone).toBe("America/Indiana/Indianapolis");
   });
 
   test("sanitizes invalid throttle config", async () => {

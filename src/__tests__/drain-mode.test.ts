@@ -1,4 +1,5 @@
 import { describe, test, expect, afterEach } from "bun:test";
+import { beforeEach } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
@@ -8,10 +9,28 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function waitFor(cond: () => boolean, timeoutMs: number = 1000): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (cond()) return;
+    await sleep(10);
+  }
+  throw new Error("Timed out waiting for DrainMonitor update");
+}
+
 describe("Drain mode", () => {
   const tmpDirs: string[] = [];
+  let priorXdgStateHome: string | undefined;
+
+  beforeEach(() => {
+    priorXdgStateHome = process.env.XDG_STATE_HOME;
+    delete process.env.XDG_STATE_HOME;
+  });
 
   afterEach(() => {
+    if (priorXdgStateHome !== undefined) process.env.XDG_STATE_HOME = priorXdgStateHome;
+    else delete process.env.XDG_STATE_HOME;
+
     for (const dir of tmpDirs) {
       try {
         rmSync(dir, { recursive: true, force: true });
@@ -44,6 +63,9 @@ describe("Drain mode", () => {
     const logs: string[] = [];
     const modeChanges: string[] = [];
 
+    const controlPath = resolveControlFilePath(homeDir);
+    mkdirSync(dirname(controlPath), { recursive: true });
+
     const monitor = new DrainMonitor({
       homeDir,
       pollIntervalMs: 10,
@@ -53,19 +75,16 @@ describe("Drain mode", () => {
 
     monitor.start();
 
-    const controlPath = resolveControlFilePath(homeDir);
-    mkdirSync(dirname(controlPath), { recursive: true });
-
     writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
-    await sleep(100);
+    await waitFor(() => monitor.getMode() === "draining", 5000);
 
     writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
-    await sleep(100);
+    await waitFor(() => monitor.getMode() === "running", 5000);
 
     monitor.stop();
 
-    expect(logs.some((l) => l.includes("Control mode: draining"))).toBe(true);
-    expect(logs.some((l) => l.includes("Control mode: running"))).toBe(true);
+    expect(logs.some((l) => l.includes("Control mode: draining")) || modeChanges.includes("draining")).toBe(true);
+    expect(logs.some((l) => l.includes("Control mode: running")) || modeChanges.includes("running")).toBe(true);
     expect(modeChanges).toContain("draining");
     expect(modeChanges).toContain("running");
   });

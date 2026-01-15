@@ -7,30 +7,83 @@
   "types": {
     "agent-task": {
       "fields": {
-        "issue": { "prompt": "text", "required": true },
-        "repo": { "prompt": "text", "required": true },
-        "scope": { "prompt": "text", "required": true },
+        "issue": {
+          "prompt": "text",
+          "required": true
+        },
+        "repo": {
+          "prompt": "text",
+          "required": true
+        },
         "status": {
           "prompt": "select",
-          "options": ["queued", "starting", "in-progress", "throttled", "blocked", "escalated", "done"],
+          "options": [
+            "queued",
+            "starting",
+            "in-progress",
+            "throttled",
+            "blocked",
+            "escalated",
+            "done"
+          ],
           "required": true
         },
         "priority": {
           "prompt": "select",
-          "options": ["p0-critical", "p1-high", "p2-medium", "p3-low", "p4-backlog"],
+          "options": [
+            "p0-critical",
+            "p1-high",
+            "p2-medium",
+            "p3-low",
+            "p4-backlog"
+          ],
           "required": false
         },
-        "creation-date": { "prompt": "date", "required": true },
-        "assigned-at": { "prompt": "date", "required": false },
-        "completed-at": { "prompt": "date", "required": false },
-        "throttled-at": { "prompt": "text", "required": false },
-        "resume-at": { "prompt": "text", "required": false },
-        "usage-snapshot": { "prompt": "text", "required": false },
-        "session-id": { "prompt": "text", "required": false },
-        "run-log-path": { "prompt": "text", "required": false },
-        "worktree-path": { "prompt": "text", "required": false },
-        "watchdog-retries": { "prompt": "text", "required": false },
-        "run": { "prompt": "relation", "source": "agent-run", "required": false }
+        "creation-date": {
+          "prompt": "date",
+          "required": true
+        },
+        "assigned-at": {
+          "prompt": "date",
+          "required": false
+        },
+        "completed-at": {
+          "prompt": "date",
+          "required": false
+        },
+        "throttled-at": {
+          "prompt": "text",
+          "required": false
+        },
+        "resume-at": {
+          "prompt": "text",
+          "required": false
+        },
+        "usage-snapshot": {
+          "prompt": "text",
+          "required": false
+        },
+        "session-id": {
+          "prompt": "text",
+          "required": false
+        },
+        "run-log-path": {
+          "prompt": "text",
+          "required": false
+        },
+        "worktree-path": {
+          "prompt": "text",
+          "required": false
+        },
+        "watchdog-retries": {
+          "prompt": "text",
+          "required": false
+        },
+        "run": {
+          "prompt": "relation",
+          "source": "agent-run",
+          "required": false
+        }
       },
       "field_order": [
         "issue",
@@ -53,41 +106,124 @@
     },
     "agent-run": {
       "fields": {
-        "task": { "prompt": "relation", "source": "agent-task", "required": true },
-        "started": { "prompt": "date", "required": true },
-        "completed": { "prompt": "date", "required": true },
-        "outcome": {
-          "prompt": "select",
-          "options": ["success", "throttled", "escalated", "failed"],
+        "task": {
+          "prompt": "relation",
+          "source": "agent-task",
           "required": true
         },
-        "pr": { "prompt": "text", "required": false },
-        "creation-date": { "prompt": "date", "required": true },
-        "scope": { "prompt": "text", "required": true }
+        "started": {
+          "prompt": "date",
+          "required": true
+        },
+        "completed": {
+          "prompt": "date",
+          "required": true
+        },
+        "outcome": {
+          "prompt": "select",
+          "options": [
+            "success",
+            "throttled",
+            "escalated",
+            "failed"
+          ],
+          "required": true
+        },
+        "pr": {
+          "prompt": "text",
+          "required": false
+        },
+        "creation-date": {
+          "prompt": "date",
+          "required": true
+        },
+        "scope": {
+          "prompt": "text",
+          "required": true
+        }
       },
-      "field_order": ["task", "started", "completed", "outcome", "pr", "creation-date", "scope"],
+      "field_order": [
+        "task",
+        "started",
+        "completed",
+        "outcome",
+        "pr",
+        "creation-date",
+        "scope"
+      ],
       "output_dir": "orchestration/runs"
     },
     "agent-escalation": {
       "fields": {
-        "task": { "prompt": "relation", "source": "agent-task", "required": true },
-        "task-path": { "prompt": "text", "required": true },
-        "issue": { "prompt": "text", "required": true },
-        "repo": { "prompt": "text", "required": true },
-        "session-id": { "prompt": "text", "required": false },
-        "escalation-type": {
-          "prompt": "select",
-          "options": ["product-gap", "low-confidence", "ambiguous-requirements", "blocked", "other"],
+        "task": {
+          "prompt": "relation",
+          "source": "agent-task",
           "required": true
         },
-        "status": { "prompt": "select", "options": ["pending", "resolved", "wont-fix"], "required": true },
-        "resolved-at": { "prompt": "date", "required": false },
-        "creation-date": { "prompt": "date", "required": true },
-        "scope": { "prompt": "text", "required": true },
-        "resume-status": { "prompt": "text", "required": false },
-        "resume-attempted-at": { "prompt": "text", "required": false },
-        "resume-deferred-at": { "prompt": "text", "required": false },
-        "resume-error": { "prompt": "text", "required": false }
+        "task-path": {
+          "prompt": "text",
+          "required": true
+        },
+        "issue": {
+          "prompt": "text",
+          "required": true
+        },
+        "repo": {
+          "prompt": "text",
+          "required": true
+        },
+        "session-id": {
+          "prompt": "text",
+          "required": false
+        },
+        "escalation-type": {
+          "prompt": "select",
+          "options": [
+            "product-gap",
+            "low-confidence",
+            "ambiguous-requirements",
+            "blocked",
+            "other"
+          ],
+          "required": true
+        },
+        "status": {
+          "prompt": "select",
+          "options": [
+            "pending",
+            "resolved",
+            "wont-fix"
+          ],
+          "required": true
+        },
+        "resolved-at": {
+          "prompt": "date",
+          "required": false
+        },
+        "creation-date": {
+          "prompt": "date",
+          "required": true
+        },
+        "scope": {
+          "prompt": "text",
+          "required": true
+        },
+        "resume-status": {
+          "prompt": "text",
+          "required": false
+        },
+        "resume-attempted-at": {
+          "prompt": "text",
+          "required": false
+        },
+        "resume-deferred-at": {
+          "prompt": "text",
+          "required": false
+        },
+        "resume-error": {
+          "prompt": "text",
+          "required": false
+        }
       },
       "field_order": [
         "task",
@@ -109,27 +245,62 @@
     },
     "dx-recommendation": {
       "fields": {
-        "creation-date": { "prompt": "date", "required": true },
-        "scope": { "prompt": "text", "required": true },
-        "title": { "prompt": "text", "required": true },
-        "repo": { "prompt": "text", "required": true },
+        "creation-date": {
+          "prompt": "date",
+          "required": true
+        },
+        "scope": {
+          "prompt": "text",
+          "required": true
+        },
+        "title": {
+          "prompt": "text",
+          "required": true
+        },
+        "repo": {
+          "prompt": "text",
+          "required": true
+        },
         "recommendation-type": {
           "prompt": "select",
-          "options": ["task", "docs", "refactor", "feature", "bug"],
+          "options": [
+            "task",
+            "docs",
+            "refactor",
+            "feature",
+            "bug"
+          ],
           "required": true
         },
         "priority": {
           "prompt": "select",
-          "options": ["p0-critical", "p1-high", "p2-medium", "p3-low", "p4-backlog"],
+          "options": [
+            "p0-critical",
+            "p1-high",
+            "p2-medium",
+            "p3-low",
+            "p4-backlog"
+          ],
           "required": true
         },
         "status": {
           "prompt": "select",
-          "options": ["pending", "filed", "rejected", "done"],
+          "options": [
+            "pending",
+            "filed",
+            "rejected",
+            "done"
+          ],
           "required": true
         },
-        "issue-url": { "prompt": "text", "required": false },
-        "name": { "prompt": "text", "required": true }
+        "issue-url": {
+          "prompt": "text",
+          "required": false
+        },
+        "name": {
+          "prompt": "text",
+          "required": true
+        }
       },
       "field_order": [
         "creation-date",
@@ -146,10 +317,19 @@
     },
     "idea": {
       "fields": {
-        "creation-date": { "prompt": "date", "required": true },
-        "scope": { "prompt": "text", "required": true }
+        "creation-date": {
+          "prompt": "date",
+          "required": true
+        },
+        "scope": {
+          "prompt": "text",
+          "required": true
+        }
       },
-      "field_order": ["creation-date", "scope"],
+      "field_order": [
+        "creation-date",
+        "scope"
+      ],
       "output_dir": "orchestration/notifications"
     }
   }

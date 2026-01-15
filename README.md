@@ -30,7 +30,7 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 
 - [Bun](https://bun.sh) >= 1.0.0
 - [OpenCode](https://opencode.ai) CLI
-- [bwrb](https://github.com/3mdistal/bwrb) CLI (`npm install -g bwrb`)
+- [bwrb](https://github.com/3mdistal/bwrb) CLI >= 0.1.3 (`npm install -g bwrb`) (needed for `.bwrbignore` negation)
 - [gh](https://cli.github.com) CLI
 
 If you previously installed bwrb via `pnpm link -g`, unlink it first so Ralph uses the published CLI on your PATH (Bun just shells out to the `bwrb` binary).
@@ -48,6 +48,8 @@ bun install
 Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
 By default, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
+
+Note: `orchestration/` is gitignored in this repo, but bwrb still needs to traverse it for queue operations. `.bwrbignore` re-includes `orchestration/**` for bwrb even when `.gitignore` excludes it; if your queue appears empty, check `bwrb --version` and upgrade to >= 0.1.3.
 
 Config is loaded once at startup, so restart the daemon after editing.
 
@@ -338,11 +340,19 @@ Edit the control file (`~/.local/state/ralph/control.json`):
 
 Or send `SIGUSR1` to the daemon for immediate reload after editing.
 
+You can also use automatic selection for new tasks:
+
+```json
+{ "mode": "running", "opencode_profile": "auto" }
+```
+
 New tasks will start under the active profile. In-flight tasks continue under their pinned profile.
 
 ### Per-profile throttle overrides
 
-You can set different throttle budgets per profile:
+You can set different throttle budgets per profile.
+
+If you configure a weekly reset schedule, the weekly throttle is computed as **tokens since the last reset boundary** (instead of a rolling 7-day window), and hard throttle resumes at the **next** reset time.
 
 ```toml
 [throttle]
@@ -356,6 +366,17 @@ budgetTokens = 16987015
 [throttle.windows.weekly]
 budgetTokens = 55769305
 
+# Weekly reset schedule (optional)
+[throttle.reset.weekly]
+# 0=Sun ... 6=Sat
+# (example below is Thu 7:09pm)
+dayOfWeek = 4
+hour = 19
+minute = 9
+# Use an explicit IANA timezone so it matches Codex reliably
+# (example: Indianapolis)
+timeZone = "America/Indiana/Indianapolis"
+
 # Override for "personal" profile (smaller budget)
 [throttle.perProfile.personal]
 softPct = 0.5
@@ -366,6 +387,22 @@ budgetTokens = 8000000
 
 [throttle.perProfile.personal.windows.weekly]
 budgetTokens = 25000000
+
+# Per-profile weekly reset overrides (optional)
+# Example: match different Codex account reset times
+[throttle.perProfile.apple.reset.weekly]
+# Mon 7:05pm
+dayOfWeek = 1
+hour = 19
+minute = 5
+timeZone = "America/Indiana/Indianapolis"
+
+[throttle.perProfile.google.reset.weekly]
+# Thu 7:09pm
+dayOfWeek = 4
+hour = 19
+minute = 9
+timeZone = "America/Indiana/Indianapolis"
 ```
 
 ### Checking profile status
