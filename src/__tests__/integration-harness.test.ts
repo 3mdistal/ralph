@@ -191,27 +191,26 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(statuses[statuses.length - 1]).toBe("done");
 
     // Per-run log path is persisted for restart survivability.
-    const calls = updateTaskStatusMock.mock.calls;
-    const runLogUpdates = calls.filter((call: any[]) => {
-      const extra = call?.[2];
-      return extra && typeof extra === "object" && typeof extra["run-log-path"] === "string" && extra["run-log-path"].length > 0;
+    const calls = updateTaskStatusMock.mock.calls as any[];
+    const runLogUpdates = calls.filter((call) => {
+      const extra = call?.[2] as Record<string, unknown> | undefined;
+      return typeof extra?.["run-log-path"] === "string" && extra["run-log-path"].length > 0;
     });
     expect(runLogUpdates.length).toBeGreaterThan(0);
 
     // Pre-session log updates should stay in starting; only in-progress once session exists.
-    const firstSessionIndex = calls.findIndex((call: any[]) => {
-      const extra = call?.[2];
+    const firstSessionIndex = calls.findIndex((call) => {
+      const extra = call?.[2] as Record<string, unknown> | undefined;
       const sessionId = typeof extra?.["session-id"] === "string" ? extra["session-id"].trim() : "";
       return sessionId.length > 0;
     });
 
     for (let i = 0; i < calls.length; i += 1) {
-      const call = calls[i];
-      const status = call?.[1];
-      const extra = call?.[2];
-      const hasRunLog =
-        extra && typeof extra === "object" && typeof extra["run-log-path"] === "string" && extra["run-log-path"].length > 0;
-      if (!hasRunLog) continue;
+      const call = calls[i] as any[];
+      const status = call?.[1] as string | undefined;
+      const extra = call?.[2] as Record<string, unknown> | undefined;
+      const runLogPath = typeof extra?.["run-log-path"] === "string" ? extra["run-log-path"] : "";
+      if (!runLogPath) continue;
 
       if (firstSessionIndex === -1 || i < firstSessionIndex) {
         expect(status).toBe("starting");
