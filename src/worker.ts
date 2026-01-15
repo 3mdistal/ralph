@@ -29,6 +29,7 @@ import {
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { getThrottleDecision } from "./throttle";
+
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
 import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
@@ -50,6 +51,48 @@ import {
   stripHeadsRef,
   type GitWorktreeEntry,
 } from "./git-worktree";
+
+type SessionAdapter = {
+  runCommand: typeof runCommand;
+  continueSession: typeof continueSession;
+  continueCommand: typeof continueCommand;
+  getRalphXdgCacheHome: typeof getRalphXdgCacheHome;
+};
+
+const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
+  runCommand,
+  continueSession,
+  continueCommand,
+  getRalphXdgCacheHome,
+};
+
+type QueueAdapter = {
+  updateTaskStatus: typeof updateTaskStatus;
+};
+
+type NotifyAdapter = {
+  notifyEscalation: typeof notifyEscalation;
+  notifyError: typeof notifyError;
+  notifyTaskComplete: typeof notifyTaskComplete;
+};
+
+type ThrottleAdapter = {
+  getThrottleDecision: typeof getThrottleDecision;
+};
+
+const DEFAULT_QUEUE_ADAPTER: QueueAdapter = {
+  updateTaskStatus,
+};
+
+const DEFAULT_NOTIFY_ADAPTER: NotifyAdapter = {
+  notifyEscalation,
+  notifyError,
+  notifyTaskComplete,
+};
+
+const DEFAULT_THROTTLE_ADAPTER: ThrottleAdapter = {
+  getThrottleDecision,
+};
 
 // Ralph introspection logs location
 const RALPH_SESSIONS_DIR = getRalphSessionsDir();
@@ -159,12 +202,86 @@ type RequiredChecksSummary = {
   available: string[];
 };
 
+type RestrictionEntry = { login?: string | null; slug?: string | null };
+
+type RestrictionList = {
+  users?: RestrictionEntry[] | null;
+  teams?: RestrictionEntry[] | null;
+  apps?: RestrictionEntry[] | null;
+};
+
+type BranchProtection = {
+  required_status_checks?: {
+    strict?: boolean | null;
+    contexts?: string[] | null;
+    checks?: Array<{ context?: string | null }> | null;
+  } | null;
+  enforce_admins?: { enabled?: boolean | null } | boolean | null;
+  required_pull_request_reviews?: {
+    dismissal_restrictions?: RestrictionList | null;
+    dismiss_stale_reviews?: boolean | null;
+    require_code_owner_reviews?: boolean | null;
+    required_approving_review_count?: number | null;
+    require_last_push_approval?: boolean | null;
+    bypass_pull_request_allowances?: RestrictionList | null;
+  } | null;
+  restrictions?: RestrictionList | null;
+  required_linear_history?: { enabled?: boolean | null } | boolean | null;
+  allow_force_pushes?: { enabled?: boolean | null } | boolean | null;
+  allow_deletions?: { enabled?: boolean | null } | boolean | null;
+  block_creations?: { enabled?: boolean | null } | boolean | null;
+  required_conversation_resolution?: { enabled?: boolean | null } | boolean | null;
+  required_signatures?: { enabled?: boolean | null } | boolean | null;
+  lock_branch?: { enabled?: boolean | null } | boolean | null;
+  allow_fork_syncing?: { enabled?: boolean | null } | boolean | null;
+};
+
+type CheckRunsResponse = {
+  check_runs?: Array<{ name?: string | null }> | null;
+};
+
 function splitRepoFullName(full: string): { owner: string; name: string } {
   const [owner, name] = full.split("/");
   if (!owner || !name) {
     throw new Error(`Invalid repo name (expected owner/name): ${full}`);
   }
   return { owner, name };
+}
+
+function toSortedUniqueStrings(values: Array<string | null | undefined>): string[] {
+  const normalized = values.map((value) => (value ?? "").trim()).filter(Boolean);
+  return Array.from(new Set(normalized)).sort();
+}
+
+function areStringArraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
+}
+
+function normalizeEnabledFlag(value: { enabled?: boolean | null } | boolean | null | undefined): boolean {
+  if (typeof value === "boolean") return value;
+  return Boolean(value?.enabled);
+}
+
+function normalizeRestrictions(source: RestrictionList | null | undefined): { users: string[]; teams: string[]; apps: string[] } | null {
+  const users = toSortedUniqueStrings(source?.users?.map((entry) => entry?.login ?? "") ?? []);
+  const teams = toSortedUniqueStrings(source?.teams?.map((entry) => entry?.slug ?? "") ?? []);
+  const apps = toSortedUniqueStrings(source?.apps?.map((entry) => entry?.slug ?? "") ?? []);
+  if (users.length === 0 && teams.length === 0 && apps.length === 0) return null;
+  return { users, teams, apps };
+}
+
+function hasBypassAllowances(source: RestrictionList | null | undefined): boolean {
+  const normalized = normalizeRestrictions(source);
+  if (!normalized) return false;
+  return normalized.users.length > 0 || normalized.teams.length > 0 || normalized.apps.length > 0;
+}
+
+function getProtectionContexts(protection: BranchProtection | null): string[] {
+  const contexts = protection?.required_status_checks?.contexts ?? [];
+  const checks = protection?.required_status_checks?.checks ?? [];
+  const checkContexts = checks.map((check) => check?.context ?? "");
+  return toSortedUniqueStrings([...contexts, ...checkContexts]);
 }
 
 function extractPullRequestNumber(url: string): number | null {
@@ -231,9 +348,29 @@ function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
 }
 
 export class RepoWorker {
-  constructor(public readonly repo: string, public readonly repoPath: string) {}
+  private session: SessionAdapter;
+  private queue: QueueAdapter;
+  private notify: NotifyAdapter;
+  private throttle: ThrottleAdapter;
+
+  constructor(
+    public readonly repo: string,
+    public readonly repoPath: string,
+    opts?: {
+      session?: SessionAdapter;
+      queue?: QueueAdapter;
+      notify?: NotifyAdapter;
+      throttle?: ThrottleAdapter;
+    }
+  ) {
+    this.session = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+    this.queue = opts?.queue ?? DEFAULT_QUEUE_ADAPTER;
+    this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
+    this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
+  }
 
   private ensureLabelsPromise: Promise<void> | null = null;
+  private ensureBranchProtectionPromise: Promise<void> | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -258,7 +395,7 @@ export class RepoWorker {
       ].join("\n"),
     });
 
-    await updateTaskStatus(task, "blocked", {
+    await this.queue.updateTaskStatus(task, "blocked", {
       "completed-at": completedAt,
       "session-id": "",
       "watchdog-retries": "",
@@ -275,7 +412,7 @@ export class RepoWorker {
 
   private async recordRunLogPath(task: AgentTask, issueNumber: string, stepTitle: string): Promise<string | undefined> {
     const runLogPath = getRalphRunLogPath({ repo: this.repo, issueNumber, stepTitle, ts: Date.now() });
-    const updated = await updateTaskStatus(task, "in-progress", { "run-log-path": runLogPath });
+    const updated = await this.queue.updateTaskStatus(task, "in-progress", { "run-log-path": runLogPath });
     if (!updated) {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
     }
@@ -319,6 +456,145 @@ export class RepoWorker {
     })();
 
     return this.ensureLabelsPromise;
+  }
+
+  private getGitHubToken(): string {
+    const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+    if (!token) {
+      throw new Error("Missing GH_TOKEN/GITHUB_TOKEN; cannot update branch protection.");
+    }
+    return token;
+  }
+
+  private async githubApiRequest<T>(
+    path: string,
+    opts: { method?: string; body?: unknown; allowNotFound?: boolean } = {}
+  ): Promise<T | null> {
+    const token = this.getGitHubToken();
+    const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      Authorization: `token ${token}`,
+      "User-Agent": "ralph-loop",
+    };
+
+    const init: RequestInit = {
+      method: opts.method ?? "GET",
+      headers,
+    };
+
+    if (opts.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(opts.body);
+    }
+
+    const res = await fetch(url, init);
+    if (opts.allowNotFound && res.status === 404) return null;
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(
+        `GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}`.trim()
+      );
+    }
+
+    if (!text) return null;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  private async fetchCheckRunNames(branch: string): Promise<string[]> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const payload = await this.githubApiRequest<CheckRunsResponse>(
+      `/repos/${owner}/${name}/commits/${branch}/check-runs?per_page=100`
+    );
+    return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
+  }
+
+  private async fetchBranchProtection(branch: string): Promise<BranchProtection | null> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    return this.githubApiRequest<BranchProtection>(
+      `/repos/${owner}/${name}/branches/${encodeURIComponent(branch)}/protection`,
+      { allowNotFound: true }
+    );
+  }
+
+  private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
+    if (requiredChecks.length === 0) return;
+
+    const availableChecks = await this.fetchCheckRunNames(branch);
+    const missingChecks = requiredChecks.filter((check) => !availableChecks.includes(check));
+    if (missingChecks.length > 0) {
+      throw new Error(
+        `Required checks missing for ${this.repo}@${branch}: ${missingChecks.join(", ")}. ` +
+          `Available checks: ${availableChecks.join(", ") || "(none)"}`
+      );
+    }
+
+    const existing = await this.fetchBranchProtection(branch);
+    const contexts = toSortedUniqueStrings([...getProtectionContexts(existing), ...requiredChecks]);
+    const strict = existing?.required_status_checks?.strict === true;
+    const reviews = existing?.required_pull_request_reviews;
+
+    const desiredReviews = {
+      dismissal_restrictions: normalizeRestrictions(reviews?.dismissal_restrictions),
+      dismiss_stale_reviews: reviews?.dismiss_stale_reviews ?? false,
+      require_code_owner_reviews: reviews?.require_code_owner_reviews ?? false,
+      required_approving_review_count: 0,
+      require_last_push_approval: reviews?.require_last_push_approval ?? false,
+      bypass_pull_request_allowances: { users: [], teams: [], apps: [] },
+    };
+
+    const desiredPayload = {
+      required_status_checks: { strict, contexts },
+      enforce_admins: true,
+      required_pull_request_reviews: desiredReviews,
+      restrictions: normalizeRestrictions(existing?.restrictions),
+      required_linear_history: normalizeEnabledFlag(existing?.required_linear_history),
+      allow_force_pushes: normalizeEnabledFlag(existing?.allow_force_pushes),
+      allow_deletions: normalizeEnabledFlag(existing?.allow_deletions),
+      block_creations: normalizeEnabledFlag(existing?.block_creations),
+      required_conversation_resolution: normalizeEnabledFlag(existing?.required_conversation_resolution),
+      required_signatures: normalizeEnabledFlag(existing?.required_signatures),
+      lock_branch: normalizeEnabledFlag(existing?.lock_branch),
+      allow_fork_syncing: normalizeEnabledFlag(existing?.allow_fork_syncing),
+    };
+
+    const existingContexts = getProtectionContexts(existing);
+    const needsStatusUpdate = !existing || !areStringArraysEqual(existingContexts, contexts);
+    const existingApprovals = reviews?.required_approving_review_count ?? null;
+    const needsReviewUpdate =
+      !reviews || existingApprovals !== 0 || hasBypassAllowances(reviews?.bypass_pull_request_allowances);
+    const needsAdminUpdate = !normalizeEnabledFlag(existing?.enforce_admins);
+
+    if (!existing || needsStatusUpdate || needsReviewUpdate || needsAdminUpdate) {
+      const { owner, name } = splitRepoFullName(this.repo);
+      await this.githubApiRequest(
+        `/repos/${owner}/${name}/branches/${encodeURIComponent(branch)}/protection`,
+        { method: "PUT", body: desiredPayload }
+      );
+      console.log(
+        `[ralph:worker:${this.repo}] Ensured branch protection for ${branch} (required checks: ${requiredChecks.join(", ")})`
+      );
+    }
+  }
+
+  private async ensureBranchProtectionOnce(): Promise<void> {
+    if (this.ensureBranchProtectionPromise) return this.ensureBranchProtectionPromise;
+
+    this.ensureBranchProtectionPromise = (async () => {
+      const botBranch = getRepoBotBranch(this.repo);
+      const branches = Array.from(new Set([botBranch, "main"]));
+      const requiredChecks = getRepoRequiredChecks(this.repo);
+      for (const branch of branches) {
+        await this.ensureBranchProtectionForBranch(branch, requiredChecks);
+      }
+    })();
+
+    return this.ensureBranchProtectionPromise;
   }
 
   private async resolveWorktreeRef(): Promise<string> {
@@ -432,7 +708,7 @@ export class RepoWorker {
     const worktreePath = join(RALPH_WORKTREES_DIR, repoKey, issueNumber, taskKey);
 
     await this.ensureGitWorktree(worktreePath);
-    await updateTaskStatus(task, "starting", { "worktree-path": worktreePath });
+    await this.queue.updateTaskStatus(task, "starting", { "worktree-path": worktreePath });
 
     return { repoPath: worktreePath, worktreePath };
   }
@@ -767,7 +1043,7 @@ export class RepoWorker {
       const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
       const runLogPath = await this.recordRunLogPath(params.task, issueNumber, `${params.watchdogStagePrefix}-fix-ci`);
 
-      const fixResult = await continueSession(params.repoPath, sessionId, fixMessage, {
+      const fixResult = await this.session.continueSession(params.repoPath, sessionId, fixMessage, {
         repo: this.repo,
         cacheKey: params.cacheKey,
         runLogPath,
@@ -798,8 +1074,8 @@ export class RepoWorker {
 
         const reason = `Failed while fixing CI before merge: ${fixResult.output}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await updateTaskStatus(params.task, "blocked");
-        await notifyError(params.notifyTitle, reason, params.task.name);
+        await this.queue.updateTaskStatus(params.task, "blocked");
+        await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
         return {
           ok: false,
@@ -814,7 +1090,7 @@ export class RepoWorker {
       }
 
       if (fixResult.sessionId) {
-        await updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
+        await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
       }
 
       const updatedPrUrl = extractPrUrl(fixResult.output);
@@ -825,8 +1101,8 @@ export class RepoWorker {
     const reason = `Required checks not passing; refusing to merge ${prUrl}`;
     console.warn(`[ralph:worker:${this.repo}] ${reason}`);
 
-    await updateTaskStatus(params.task, "blocked");
-    await notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
+    await this.queue.updateTaskStatus(params.task, "blocked");
+    await this.notify.notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
 
     return {
       ok: false,
@@ -868,7 +1144,7 @@ export class RepoWorker {
         .join("\n"),
     });
 
-    await updateTaskStatus(task, "done", {
+    await this.queue.updateTaskStatus(task, "done", {
       "completed-at": completedAt,
       "session-id": "",
       "watchdog-retries": "",
@@ -961,13 +1237,17 @@ export class RepoWorker {
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
     if (requested === "auto") {
-      const chosen = await resolveAutoOpencodeProfileName(Date.now());
+      const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+        getThrottleDecision: this.throttle.getThrottleDecision,
+      });
       if (phase === "start") {
         console.log(`[ralph:worker:${this.repo}] Auto-selected OpenCode profile=${JSON.stringify(chosen ?? "")}`);
       }
       resolved = chosen ? resolveOpencodeProfile(chosen) : resolveOpencodeProfile(null);
     } else if (phase === "start") {
-      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requested || null);
+      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requested || null, {
+        getThrottleDecision: this.throttle.getThrottleDecision,
+      });
       const chosen = selection.profileName;
 
       if (selection.source === "failover") {
@@ -1016,19 +1296,28 @@ export class RepoWorker {
     let decision: Awaited<ReturnType<typeof getThrottleDecision>>;
 
     if (pinned) {
-      decision = await getThrottleDecision(Date.now(), { opencodeProfile: pinned });
+      decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
       const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message) }).opencodeProfile?.trim() ?? "";
 
       if (controlProfile === "auto") {
-        const chosen = await resolveAutoOpencodeProfileName(Date.now());
-        decision = await getThrottleDecision(Date.now(), { opencodeProfile: chosen ?? getOpencodeDefaultProfileName() });
+        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+          getThrottleDecision: this.throttle.getThrottleDecision,
+        });
+
+        decision = await this.throttle.getThrottleDecision(Date.now(), {
+          opencodeProfile: chosen ?? getOpencodeDefaultProfileName(),
+        });
       } else if (!hasSession) {
         // Safe to fail over between profiles before starting a new session.
-        decision = (await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null)).decision;
+        decision = (
+          await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null, {
+            getThrottleDecision: this.throttle.getThrottleDecision,
+          })
+        ).decision;
       } else {
         // Do not fail over while a session is in flight/resuming.
-        decision = await getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
+        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
       }
     }
 
@@ -1045,7 +1334,7 @@ export class RepoWorker {
 
     if (sid) extraFields["session-id"] = sid;
 
-    await updateTaskStatus(task, "throttled", extraFields);
+    await this.queue.updateTaskStatus(task, "throttled", extraFields);
 
     console.log(
       `[ralph:worker:${this.repo}] Hard throttle active; pausing at checkpoint stage=${stage} resumeAt=${resumeAt || "unknown"}`
@@ -1082,7 +1371,7 @@ export class RepoWorker {
 
         const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`);
 
-        const res = await continueSession(repoPath, sid, message, {
+        const res = await this.session.continueSession(repoPath, sid, message, {
           repo: this.repo,
           cacheKey,
           runLogPath,
@@ -1120,14 +1409,14 @@ export class RepoWorker {
 
     // Cleanup per-task OpenCode cache on watchdog timeouts (best-effort)
     try {
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
+      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
     } catch {
       // ignore
     }
 
     if (retryCount === 0) {
       console.warn(`[ralph:worker:${this.repo}] Watchdog hard timeout; re-queuing once for recovery: ${reason}`);
-      await updateTaskStatus(task, "queued", {
+      await this.queue.updateTaskStatus(task, "queued", {
         "session-id": "",
         "watchdog-retries": String(nextRetryCount),
       });
@@ -1148,9 +1437,9 @@ export class RepoWorker {
     };
     if (result.sessionId) escalationFields["session-id"] = result.sessionId;
 
-    await updateTaskStatus(task, "escalated", escalationFields);
+    await this.queue.updateTaskStatus(task, "escalated", escalationFields);
 
-    await notifyEscalation({
+    await this.notify.notifyEscalation({
       taskName: task.name,
       taskFileName: task._name,
       taskPath: task._path,
@@ -1189,6 +1478,7 @@ export class RepoWorker {
     }
 
     await this.ensureBaselineLabelsOnce();
+    await this.ensureBranchProtectionOnce();
 
     const issueMatch = task.issue.match(/#(\d+)$/);
     const issueNumber = issueMatch?.[1] ?? "";
@@ -1200,7 +1490,7 @@ export class RepoWorker {
       if (!existingSessionId) {
         const reason = "In-progress task has no session-id; cannot resume";
         console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
-        await updateTaskStatus(task, "starting", { "session-id": "" });
+        await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
         return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
       }
 
@@ -1214,7 +1504,7 @@ export class RepoWorker {
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
       if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
-        await updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
+        await this.queue.updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
       }
 
       const botBranch = getRepoBotBranch(this.repo);
@@ -1233,7 +1523,7 @@ export class RepoWorker {
 
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume");
 
-      let buildResult = await continueSession(taskRepoPath, existingSessionId, resumeMessage, {
+      let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
         cacheKey,
         runLogPath: resumeRunLogPath,
@@ -1260,7 +1550,7 @@ export class RepoWorker {
         console.warn(`[ralph:worker:${this.repo}] Resume failed; falling back to fresh run: ${reason}`);
 
         // Fall back to a fresh run by clearing session-id and re-queueing.
-        await updateTaskStatus(task, "queued", { "session-id": "" });
+        await this.queue.updateTaskStatus(task, "queued", { "session-id": "" });
 
         return {
           taskName: task.name,
@@ -1272,7 +1562,7 @@ export class RepoWorker {
       }
 
       if (buildResult.sessionId) {
-        await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
+        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
       await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
@@ -1315,8 +1605,8 @@ export class RepoWorker {
             const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
-            await updateTaskStatus(task, "escalated");
-            await notifyEscalation({
+            await this.queue.updateTaskStatus(task, "escalated");
+            await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
               taskPath: task._path,
@@ -1344,7 +1634,7 @@ export class RepoWorker {
 
           const loopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume loop-break");
 
-          buildResult = await continueSession(
+          buildResult = await this.session.continueSession(
             taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
@@ -1396,7 +1686,7 @@ export class RepoWorker {
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
         const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue");
 
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
+        buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
           runLogPath: resumeContinueRunLogPath,
@@ -1458,8 +1748,8 @@ export class RepoWorker {
         const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await updateTaskStatus(task, "escalated");
-        await notifyEscalation({
+        await this.queue.updateTaskStatus(task, "escalated");
+        await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
           taskPath: task._path,
@@ -1514,7 +1804,7 @@ export class RepoWorker {
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
       const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey");
 
-        const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
+        const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
           repo: this.repo,
           cacheKey,
           runLogPath: resumeSurveyRunLogPath,
@@ -1543,7 +1833,7 @@ export class RepoWorker {
         surveyResults: surveyResult.output,
       });
 
-      await updateTaskStatus(task, "done", {
+      await this.queue.updateTaskStatus(task, "done", {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
@@ -1551,7 +1841,7 @@ export class RepoWorker {
       });
 
       // Cleanup per-task OpenCode cache on success
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
+      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
 
       if (worktreePath) {
         await this.cleanupGitWorktree(worktreePath);
@@ -1569,8 +1859,8 @@ export class RepoWorker {
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
-      await updateTaskStatus(task, "blocked");
-      await notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+      await this.queue.updateTaskStatus(task, "blocked");
+      await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
 
       return {
         taskName: task.name,
@@ -1617,7 +1907,7 @@ export class RepoWorker {
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
       // 3. Mark task starting (restart-safe pre-session state)
-      const markedStarting = await updateTaskStatus(task, "starting", {
+      const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
         ...(!task["opencode-profile"]?.trim() && opencodeProfileName ? { "opencode-profile": opencodeProfileName } : {}),
       });
@@ -1626,6 +1916,7 @@ export class RepoWorker {
       }
 
       await this.ensureBaselineLabelsOnce();
+      await this.ensureBranchProtectionOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber, "start");
 
@@ -1646,7 +1937,7 @@ export class RepoWorker {
 
       const nextTaskRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task");
 
-      let planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
+      let planResult = await this.session.runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
         runLogPath: nextTaskRunLogPath,
@@ -1673,7 +1964,7 @@ export class RepoWorker {
         await new Promise((r) => setTimeout(r, 750));
         const nextTaskRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task-retry");
 
-        planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
+        planResult = await this.session.runCommand(taskRepoPath, "next-task", [issueNumber], {
           repo: this.repo,
           cacheKey,
           runLogPath: nextTaskRetryRunLogPath,
@@ -1701,7 +1992,7 @@ export class RepoWorker {
 
       // Persist OpenCode session ID for crash recovery
       if (planResult.sessionId) {
-        await updateTaskStatus(task, "in-progress", { "session-id": planResult.sessionId });
+        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": planResult.sessionId });
       }
 
       // 5. Parse routing decision
@@ -1728,7 +2019,7 @@ export class RepoWorker {
 
         const devexRunLogPath = await this.recordRunLogPath(task, issueNumber, "consult devex");
 
-        const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, {
+        const devexResult = await this.session.continueSession(taskRepoPath, baseSessionId, devexPrompt, {
           agent: "devex",
           repo: this.repo,
           cacheKey,
@@ -1784,7 +2075,7 @@ export class RepoWorker {
 
           const rerouteRunLogPath = await this.recordRunLogPath(task, issueNumber, "reroute after devex");
 
-          const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
+          const rerouteResult = await this.session.continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
             repo: this.repo,
             cacheKey,
             runLogPath: rerouteRunLogPath,
@@ -1809,7 +2100,7 @@ export class RepoWorker {
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
             if (rerouteResult.sessionId) {
-              await updateTaskStatus(task, "in-progress", { "session-id": rerouteResult.sessionId });
+              await this.queue.updateTaskStatus(task, "in-progress", { "session-id": rerouteResult.sessionId });
             }
 
             const updatedRouting = parseRoutingDecision(rerouteResult.output);
@@ -1847,8 +2138,8 @@ export class RepoWorker {
 
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await updateTaskStatus(task, "escalated");
-        await notifyEscalation({
+        await this.queue.updateTaskStatus(task, "escalated");
+        await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
           taskPath: task._path,
@@ -1888,7 +2179,7 @@ export class RepoWorker {
 
       const buildRunLogPath = await this.recordRunLogPath(task, issueNumber, "build");
 
-      let buildResult = await continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
+      let buildResult = await this.session.continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
         runLogPath: buildRunLogPath,
@@ -1915,7 +2206,7 @@ export class RepoWorker {
 
       // Keep the latest session ID persisted
       if (buildResult.sessionId) {
-        await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
+        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
       await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build", opencodeXdg);
@@ -1961,8 +2252,8 @@ export class RepoWorker {
             const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
-            await updateTaskStatus(task, "escalated");
-            await notifyEscalation({
+            await this.queue.updateTaskStatus(task, "escalated");
+            await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
               taskPath: task._path,
@@ -1991,7 +2282,7 @@ export class RepoWorker {
 
           const buildLoopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber, "build loop-break");
 
-          buildResult = await continueSession(
+          buildResult = await this.session.continueSession(
             taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
@@ -2039,7 +2330,7 @@ export class RepoWorker {
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
         const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue");
 
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
+        buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
           runLogPath: buildContinueRunLogPath,
@@ -2098,8 +2389,8 @@ export class RepoWorker {
         const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await updateTaskStatus(task, "escalated");
-        await notifyEscalation({
+        await this.queue.updateTaskStatus(task, "escalated");
+        await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
           taskPath: task._path,
@@ -2151,7 +2442,7 @@ export class RepoWorker {
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
       const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey");
 
-      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
+      const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         runLogPath: surveyRunLogPath,
@@ -2189,7 +2480,7 @@ export class RepoWorker {
       });
 
       // 11. Mark task done
-      await updateTaskStatus(task, "done", {
+      await this.queue.updateTaskStatus(task, "done", {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
@@ -2197,14 +2488,14 @@ export class RepoWorker {
       });
 
       // 12. Cleanup per-task OpenCode cache on success
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
+      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
 
       if (worktreePath) {
         await this.cleanupGitWorktree(worktreePath);
       }
 
       // 13. Send desktop notification for completion
-      await notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
+      await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
 
       console.log(`[ralph:worker:${this.repo}] Task completed: ${task.name}`);
 
@@ -2218,8 +2509,8 @@ export class RepoWorker {
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
-      await updateTaskStatus(task, "blocked");
-      await notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+      await this.queue.updateTaskStatus(task, "blocked");
+      await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
 
       return {
         taskName: task.name,
