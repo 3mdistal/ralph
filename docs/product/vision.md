@@ -52,12 +52,18 @@ This provides full auditability and integrates with existing Obsidian workflows.
 
 ### 2. Bot Branch Strategy
 
-Agents merge to `bot/integration`, not main directly. Every ~10 PRs, create a rollup PR to main for batch human review.
+Ralph/agents should merge to `bot/integration`, not `main` directly. Every ~10 PRs, create a rollup PR from `bot/integration` to `main` for batch human review.
+
+Humans/maintainers may still merge directly to `main` when needed; the bot-branch strategy is a Ralph policy, not a repo-wide prohibition.
 
 Benefits:
 - Reduces interrupt frequency
 - Batches related changes for easier review
 - Provides a checkpoint for E2E testing
+
+**Merge policy:** If `gh pr merge` fails because the head branch is out of date, Ralph should run `gh pr update-branch`, then wait for required checks again on the updated head SHA before retrying the merge. If update-branch fails, mark the task `blocked` and notify with the error.
+
+**Worktree GC policy:** On startup, Ralph should prune only worktrees within `RALPH_WORKTREES_DIR`. Treat a worktree as stale if `git worktree list --porcelain` registers it but the directory or `.git` marker is missing, or if a worktree directory exists under `RALPH_WORKTREES_DIR/<repo>/<issue>/` that is not present in the porcelain list. Cleanup runs once at startup and is best-effort (log failures, do not block startup). Never delete paths outside the managed worktree directory.
 
 ### 3. Escalation-First Design
 
