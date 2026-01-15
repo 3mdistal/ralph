@@ -90,7 +90,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
-- `githubApp` (object, optional): GitHub App installation auth for `gh` + REST
+- `githubApp` (object, optional): GitHub App installation auth for `gh` + REST (tokens cached in memory)
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
@@ -167,6 +167,8 @@ bun run watch
 ```bash
 ralph repos
 ```
+
+Uses the GitHub App installation token when configured and filters results to the configured `allowedOwners`.
 
 Machine-readable output:
 
