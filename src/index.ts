@@ -761,7 +761,7 @@ function printCommandHelp(command: string): void {
           "Usage:",
           "  ralph status [--json]",
           "",
-          "Shows daemon mode plus starting, queued, in-progress, and throttled tasks.",
+          "Shows daemon mode plus starting, queued, in-progress, and throttled tasks, plus pending escalations.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -885,11 +885,12 @@ if (args[0] === "status") {
         ? "soft-throttled"
         : "running";
 
-  const [starting, inProgress, queued, throttled] = await Promise.all([
+  const [starting, inProgress, queued, throttled, pendingEscalations] = await Promise.all([
     getTasksByStatus("starting"),
     getTasksByStatus("in-progress"),
     getQueuedTasks(),
     getTasksByStatus("throttled"),
+    getEscalationsByStatus("pending"),
   ]);
 
   if (json) {
@@ -918,6 +919,9 @@ if (args[0] === "status") {
           controlProfile: controlProfile || null,
           activeProfile: resolvedProfile ?? null,
           throttle: throttle.snapshot,
+          escalations: {
+            pending: pendingEscalations.length,
+          },
           inProgress: inProgressWithStatus,
           starting: starting.map((t) => ({
             name: t.name,
@@ -959,6 +963,7 @@ if (args[0] === "status") {
     console.log(`Active OpenCode profile: ${resolvedProfile}`);
   }
 
+  console.log(`Escalations: ${pendingEscalations.length} pending`);
   console.log(`Starting tasks: ${starting.length}`);
   for (const task of starting) {
     console.log(`  - ${await getTaskNowDoingLine(task)}`);

@@ -59,7 +59,7 @@ function printCommandHelp(command: string): void {
           "Usage:",
           "  ralph status [--json]",
           "",
-          "Shows daemon mode plus starting, queued, in-progress, and throttled tasks.",
+          "Shows daemon mode plus starting, queued, in-progress, and throttled tasks, plus pending escalations.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
