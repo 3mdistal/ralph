@@ -94,7 +94,7 @@ describe("Scheduler invariants", () => {
     expect(runnableCalls.length).toBe(1);
   });
 
-  test("no duplicate scheduling when watcher double-fires", () => {
+  test("startQueuedTasks skips in-flight tasks", () => {
     const inFlightTasks = new Set<string>();
     const started: TestTask[] = [];
 

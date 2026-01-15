@@ -130,7 +130,11 @@ export function createSchedulerController<Task>(deps: SchedulerControllerDeps<Ta
     scheduleQueuedTimer = timers.setTimeout(() => {
       scheduleQueuedTimer = null;
       if (deps.isShuttingDown()) return;
-      if (deps.getDaemonMode() === "draining") return;
+      if (deps.getDaemonMode() === "draining") {
+        const pending = deps.getPendingResumeTasks();
+        if (pending.length > 0) deps.onPendingResumeTasks(pending);
+        return;
+      }
       void deps.getRunnableTasks().then((tasks) => deps.onRunnableTasks(tasks));
     }, queuedDebounceMs);
   };
