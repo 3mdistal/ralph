@@ -189,6 +189,42 @@ export function recordRepoSync(params: {
     .run({ $repo_id: repoId, $last_sync_at: at });
 }
 
+export function recordIssueSnapshot(input: {
+  repo: string;
+  issue: string;
+  title?: string;
+  state?: string;
+  url?: string;
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = input.at ?? nowIso();
+  const repoId = upsertRepo({ repo: input.repo, at });
+  const issueNumber = parseIssueNumber(input.issue);
+
+  if (issueNumber === null) return;
+
+  database
+    .query(
+      `INSERT INTO issues(repo_id, number, title, state, url, created_at, updated_at)
+       VALUES ($repo_id, $number, $title, $state, $url, $created_at, $updated_at)
+       ON CONFLICT(repo_id, number) DO UPDATE SET
+         title = COALESCE(excluded.title, issues.title),
+         state = COALESCE(excluded.state, issues.state),
+         url = COALESCE(excluded.url, issues.url),
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $number: issueNumber,
+      $title: input.title ?? null,
+      $state: input.state ?? null,
+      $url: input.url ?? null,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
 export function recordTaskSnapshot(input: {
   repo: string;
   issue: string;
