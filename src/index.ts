@@ -173,6 +173,7 @@ function getOrCreateWorker(repo: string): RepoWorker {
   const created = new RepoWorker(repo, repoPath);
   workers.set(repo, created);
   console.log(`[ralph] Created worker for ${repo} -> ${repoPath}`);
+  void created.runStartupCleanup();
   return created;
 }
 
@@ -544,9 +545,20 @@ async function resumeTasksOnStartup(opts?: {
   const schedulingMode = opts?.schedulingMode ?? resumeSchedulingMode;
 
   const inProgress = await getTasksByStatus("in-progress");
-  if (inProgress.length === 0) return;
 
-  console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
+  if (inProgress.length > 0) {
+    console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
+  }
+
+  const byRepo = groupByRepo(inProgress);
+  await Promise.all(
+    Array.from(byRepo.entries()).map(async ([repo, tasks]) => {
+      const worker = getOrCreateWorker(repo);
+      await worker.runTaskCleanup(tasks);
+    })
+  );
+
+  if (inProgress.length === 0) return;
 
   const withoutSession = inProgress.filter((t) => !(t["session-id"]?.trim()));
   for (const task of withoutSession) {

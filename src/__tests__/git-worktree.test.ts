@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 
 import {
+  isPathUnderDir,
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
   stripHeadsRef,
@@ -54,5 +55,24 @@ describe("git-worktree helpers", () => {
     const picked = pickWorktreeForIssue(entries, "346", { deprioritizeBranches: ["main", "bot/integration"] });
     expect(picked?.worktreePath).toContain("worktree-346");
     expect(stripHeadsRef(picked?.branch ?? undefined)).toBe("fix/audit-fix-writes-346");
+  });
+
+  test("parseGitWorktreeListPorcelain handles detached entry", () => {
+    const input = ["worktree /repo", "HEAD deadbeef", "detached", ""].join("\n");
+    const entries = parseGitWorktreeListPorcelain(input);
+    expect(entries).toEqual([{ worktreePath: "/repo", head: "deadbeef", detached: true }]);
+  });
+
+  test("parseGitWorktreeListPorcelain skips blank lines", () => {
+    const input = ["", "worktree /repo", "", "HEAD deadbeef", "", ""].join("\n");
+    const entries = parseGitWorktreeListPorcelain(input);
+    expect(entries).toEqual([{ worktreePath: "/repo", head: "deadbeef" }]);
+  });
+
+  test("isPathUnderDir matches nested paths", () => {
+    expect(isPathUnderDir("/tmp/ralph/worktrees/a", "/tmp/ralph/worktrees")).toBe(true);
+    expect(isPathUnderDir("/tmp/ralph/worktrees", "/tmp/ralph/worktrees")).toBe(true);
+    expect(isPathUnderDir("/tmp/ralph/worktrees-2", "/tmp/ralph/worktrees")).toBe(false);
+    expect(isPathUnderDir("/tmp/ralph/worktrees/a/b", "/tmp/ralph/worktrees/a")).toBe(true);
   });
 });
