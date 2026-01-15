@@ -159,12 +159,86 @@ type RequiredChecksSummary = {
   available: string[];
 };
 
+type RestrictionEntry = { login?: string | null; slug?: string | null };
+
+type RestrictionList = {
+  users?: RestrictionEntry[] | null;
+  teams?: RestrictionEntry[] | null;
+  apps?: RestrictionEntry[] | null;
+};
+
+type BranchProtection = {
+  required_status_checks?: {
+    strict?: boolean | null;
+    contexts?: string[] | null;
+    checks?: Array<{ context?: string | null }> | null;
+  } | null;
+  enforce_admins?: { enabled?: boolean | null } | boolean | null;
+  required_pull_request_reviews?: {
+    dismissal_restrictions?: RestrictionList | null;
+    dismiss_stale_reviews?: boolean | null;
+    require_code_owner_reviews?: boolean | null;
+    required_approving_review_count?: number | null;
+    require_last_push_approval?: boolean | null;
+    bypass_pull_request_allowances?: RestrictionList | null;
+  } | null;
+  restrictions?: RestrictionList | null;
+  required_linear_history?: { enabled?: boolean | null } | boolean | null;
+  allow_force_pushes?: { enabled?: boolean | null } | boolean | null;
+  allow_deletions?: { enabled?: boolean | null } | boolean | null;
+  block_creations?: { enabled?: boolean | null } | boolean | null;
+  required_conversation_resolution?: { enabled?: boolean | null } | boolean | null;
+  required_signatures?: { enabled?: boolean | null } | boolean | null;
+  lock_branch?: { enabled?: boolean | null } | boolean | null;
+  allow_fork_syncing?: { enabled?: boolean | null } | boolean | null;
+};
+
+type CheckRunsResponse = {
+  check_runs?: Array<{ name?: string | null }> | null;
+};
+
 function splitRepoFullName(full: string): { owner: string; name: string } {
   const [owner, name] = full.split("/");
   if (!owner || !name) {
     throw new Error(`Invalid repo name (expected owner/name): ${full}`);
   }
   return { owner, name };
+}
+
+function toSortedUniqueStrings(values: Array<string | null | undefined>): string[] {
+  const normalized = values.map((value) => (value ?? "").trim()).filter(Boolean);
+  return Array.from(new Set(normalized)).sort();
+}
+
+function areStringArraysEqual(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
+}
+
+function normalizeEnabledFlag(value: { enabled?: boolean | null } | boolean | null | undefined): boolean {
+  if (typeof value === "boolean") return value;
+  return Boolean(value?.enabled);
+}
+
+function normalizeRestrictions(source: RestrictionList | null | undefined): { users: string[]; teams: string[]; apps: string[] } | null {
+  const users = toSortedUniqueStrings(source?.users?.map((entry) => entry?.login ?? "") ?? []);
+  const teams = toSortedUniqueStrings(source?.teams?.map((entry) => entry?.slug ?? "") ?? []);
+  const apps = toSortedUniqueStrings(source?.apps?.map((entry) => entry?.slug ?? "") ?? []);
+  if (users.length === 0 && teams.length === 0 && apps.length === 0) return null;
+  return { users, teams, apps };
+}
+
+function hasBypassAllowances(source: RestrictionList | null | undefined): boolean {
+  const normalized = normalizeRestrictions(source);
+  if (!normalized) return false;
+  return normalized.users.length > 0 || normalized.teams.length > 0 || normalized.apps.length > 0;
+}
+
+function getProtectionContexts(protection: BranchProtection | null): string[] {
+  const contexts = protection?.required_status_checks?.contexts ?? [];
+  const checks = protection?.required_status_checks?.checks ?? [];
+  const checkContexts = checks.map((check) => check?.context ?? "");
+  return toSortedUniqueStrings([...contexts, ...checkContexts]);
 }
 
 function extractPullRequestNumber(url: string): number | null {
@@ -234,6 +308,7 @@ export class RepoWorker {
   constructor(public readonly repo: string, public readonly repoPath: string) {}
 
   private ensureLabelsPromise: Promise<void> | null = null;
+  private ensureBranchProtectionPromise: Promise<void> | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -319,6 +394,145 @@ export class RepoWorker {
     })();
 
     return this.ensureLabelsPromise;
+  }
+
+  private getGitHubToken(): string {
+    const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+    if (!token) {
+      throw new Error("Missing GH_TOKEN/GITHUB_TOKEN; cannot update branch protection.");
+    }
+    return token;
+  }
+
+  private async githubApiRequest<T>(
+    path: string,
+    opts: { method?: string; body?: unknown; allowNotFound?: boolean } = {}
+  ): Promise<T | null> {
+    const token = this.getGitHubToken();
+    const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      Authorization: `token ${token}`,
+      "User-Agent": "ralph-loop",
+    };
+
+    const init: RequestInit = {
+      method: opts.method ?? "GET",
+      headers,
+    };
+
+    if (opts.body !== undefined) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(opts.body);
+    }
+
+    const res = await fetch(url, init);
+    if (opts.allowNotFound && res.status === 404) return null;
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(
+        `GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}`.trim()
+      );
+    }
+
+    if (!text) return null;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  private async fetchCheckRunNames(branch: string): Promise<string[]> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const payload = await this.githubApiRequest<CheckRunsResponse>(
+      `/repos/${owner}/${name}/commits/${branch}/check-runs?per_page=100`
+    );
+    return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
+  }
+
+  private async fetchBranchProtection(branch: string): Promise<BranchProtection | null> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    return this.githubApiRequest<BranchProtection>(
+      `/repos/${owner}/${name}/branches/${encodeURIComponent(branch)}/protection`,
+      { allowNotFound: true }
+    );
+  }
+
+  private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
+    if (requiredChecks.length === 0) return;
+
+    const availableChecks = await this.fetchCheckRunNames(branch);
+    const missingChecks = requiredChecks.filter((check) => !availableChecks.includes(check));
+    if (missingChecks.length > 0) {
+      throw new Error(
+        `Required checks missing for ${this.repo}@${branch}: ${missingChecks.join(", ")}. ` +
+          `Available checks: ${availableChecks.join(", ") || "(none)"}`
+      );
+    }
+
+    const existing = await this.fetchBranchProtection(branch);
+    const contexts = toSortedUniqueStrings([...getProtectionContexts(existing), ...requiredChecks]);
+    const strict = existing?.required_status_checks?.strict === true;
+    const reviews = existing?.required_pull_request_reviews;
+
+    const desiredReviews = {
+      dismissal_restrictions: normalizeRestrictions(reviews?.dismissal_restrictions),
+      dismiss_stale_reviews: reviews?.dismiss_stale_reviews ?? false,
+      require_code_owner_reviews: reviews?.require_code_owner_reviews ?? false,
+      required_approving_review_count: 0,
+      require_last_push_approval: reviews?.require_last_push_approval ?? false,
+      bypass_pull_request_allowances: { users: [], teams: [], apps: [] },
+    };
+
+    const desiredPayload = {
+      required_status_checks: { strict, contexts },
+      enforce_admins: true,
+      required_pull_request_reviews: desiredReviews,
+      restrictions: normalizeRestrictions(existing?.restrictions),
+      required_linear_history: normalizeEnabledFlag(existing?.required_linear_history),
+      allow_force_pushes: normalizeEnabledFlag(existing?.allow_force_pushes),
+      allow_deletions: normalizeEnabledFlag(existing?.allow_deletions),
+      block_creations: normalizeEnabledFlag(existing?.block_creations),
+      required_conversation_resolution: normalizeEnabledFlag(existing?.required_conversation_resolution),
+      required_signatures: normalizeEnabledFlag(existing?.required_signatures),
+      lock_branch: normalizeEnabledFlag(existing?.lock_branch),
+      allow_fork_syncing: normalizeEnabledFlag(existing?.allow_fork_syncing),
+    };
+
+    const existingContexts = getProtectionContexts(existing);
+    const needsStatusUpdate = !existing || !areStringArraysEqual(existingContexts, contexts);
+    const existingApprovals = reviews?.required_approving_review_count ?? null;
+    const needsReviewUpdate =
+      !reviews || existingApprovals !== 0 || hasBypassAllowances(reviews?.bypass_pull_request_allowances);
+    const needsAdminUpdate = !normalizeEnabledFlag(existing?.enforce_admins);
+
+    if (!existing || needsStatusUpdate || needsReviewUpdate || needsAdminUpdate) {
+      const { owner, name } = splitRepoFullName(this.repo);
+      await this.githubApiRequest(
+        `/repos/${owner}/${name}/branches/${encodeURIComponent(branch)}/protection`,
+        { method: "PUT", body: desiredPayload }
+      );
+      console.log(
+        `[ralph:worker:${this.repo}] Ensured branch protection for ${branch} (required checks: ${requiredChecks.join(", ")})`
+      );
+    }
+  }
+
+  private async ensureBranchProtectionOnce(): Promise<void> {
+    if (this.ensureBranchProtectionPromise) return this.ensureBranchProtectionPromise;
+
+    this.ensureBranchProtectionPromise = (async () => {
+      const botBranch = getRepoBotBranch(this.repo);
+      const branches = Array.from(new Set([botBranch, "main"]));
+      const requiredChecks = getRepoRequiredChecks(this.repo);
+      for (const branch of branches) {
+        await this.ensureBranchProtectionForBranch(branch, requiredChecks);
+      }
+    })();
+
+    return this.ensureBranchProtectionPromise;
   }
 
   private async resolveWorktreeRef(): Promise<string> {
@@ -1189,6 +1403,7 @@ export class RepoWorker {
     }
 
     await this.ensureBaselineLabelsOnce();
+    await this.ensureBranchProtectionOnce();
 
     const issueMatch = task.issue.match(/#(\d+)$/);
     const issueNumber = issueMatch?.[1] ?? "";
@@ -1626,6 +1841,7 @@ export class RepoWorker {
       }
 
       await this.ensureBaselineLabelsOnce();
+      await this.ensureBranchProtectionOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber, "start");
 

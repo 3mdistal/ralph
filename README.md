@@ -104,6 +104,8 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 
 Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
+Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require the configured `repos[].requiredChecks` and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
+
 ### Environment variables
 
 Only these env vars are currently supported:
