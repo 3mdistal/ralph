@@ -55,6 +55,7 @@ describe("Scheduler invariants", () => {
       getPendingResumeTasks: () => pendingResumes,
       onPendingResumeTasks: (tasks) => {
         resumed.push(...tasks);
+        pendingResumes.splice(0, pendingResumes.length);
       },
       timers: {
         setTimeout: (fn: (...args: any[]) => void) => {
