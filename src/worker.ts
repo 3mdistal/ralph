@@ -29,6 +29,7 @@ import {
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { getThrottleDecision } from "./throttle";
+
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
 import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
@@ -50,6 +51,20 @@ import {
   stripHeadsRef,
   type GitWorktreeEntry,
 } from "./git-worktree";
+
+type SessionAdapter = {
+  runCommand: typeof runCommand;
+  continueSession: typeof continueSession;
+  continueCommand: typeof continueCommand;
+  getRalphXdgCacheHome: typeof getRalphXdgCacheHome;
+};
+
+const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
+  runCommand,
+  continueSession,
+  continueCommand,
+  getRalphXdgCacheHome,
+};
 
 // Ralph introspection logs location
 const RALPH_SESSIONS_DIR = getRalphSessionsDir();
@@ -231,7 +246,15 @@ function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
 }
 
 export class RepoWorker {
-  constructor(public readonly repo: string, public readonly repoPath: string) {}
+  private session: SessionAdapter;
+
+  constructor(
+    public readonly repo: string,
+    public readonly repoPath: string,
+    opts?: { session?: SessionAdapter }
+  ) {
+    this.session = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+  }
 
   private ensureLabelsPromise: Promise<void> | null = null;
 
@@ -767,7 +790,7 @@ export class RepoWorker {
       const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
       const runLogPath = await this.recordRunLogPath(params.task, issueNumber, `${params.watchdogStagePrefix}-fix-ci`);
 
-      const fixResult = await continueSession(params.repoPath, sessionId, fixMessage, {
+      const fixResult = await this.session.continueSession(params.repoPath, sessionId, fixMessage, {
         repo: this.repo,
         cacheKey: params.cacheKey,
         runLogPath,
@@ -1082,7 +1105,7 @@ export class RepoWorker {
 
         const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`);
 
-        const res = await continueSession(repoPath, sid, message, {
+        const res = await this.session.continueSession(repoPath, sid, message, {
           repo: this.repo,
           cacheKey,
           runLogPath,
@@ -1120,7 +1143,7 @@ export class RepoWorker {
 
     // Cleanup per-task OpenCode cache on watchdog timeouts (best-effort)
     try {
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
+      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
     } catch {
       // ignore
     }
@@ -1233,7 +1256,7 @@ export class RepoWorker {
 
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume");
 
-      let buildResult = await continueSession(taskRepoPath, existingSessionId, resumeMessage, {
+      let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
         cacheKey,
         runLogPath: resumeRunLogPath,
@@ -1344,7 +1367,7 @@ export class RepoWorker {
 
           const loopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume loop-break");
 
-          buildResult = await continueSession(
+          buildResult = await this.session.continueSession(
             taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
@@ -1396,7 +1419,7 @@ export class RepoWorker {
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
         const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue");
 
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
+        buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
           runLogPath: resumeContinueRunLogPath,
@@ -1514,7 +1537,7 @@ export class RepoWorker {
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
       const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey");
 
-        const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
+        const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
           repo: this.repo,
           cacheKey,
           runLogPath: resumeSurveyRunLogPath,
@@ -1551,7 +1574,7 @@ export class RepoWorker {
       });
 
       // Cleanup per-task OpenCode cache on success
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
+      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
 
       if (worktreePath) {
         await this.cleanupGitWorktree(worktreePath);
@@ -1646,7 +1669,7 @@ export class RepoWorker {
 
       const nextTaskRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task");
 
-      let planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
+      let planResult = await this.session.runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
         cacheKey,
         runLogPath: nextTaskRunLogPath,
@@ -1673,7 +1696,7 @@ export class RepoWorker {
         await new Promise((r) => setTimeout(r, 750));
         const nextTaskRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task-retry");
 
-        planResult = await runCommand(taskRepoPath, "next-task", [issueNumber], {
+        planResult = await this.session.runCommand(taskRepoPath, "next-task", [issueNumber], {
           repo: this.repo,
           cacheKey,
           runLogPath: nextTaskRetryRunLogPath,
@@ -1728,7 +1751,7 @@ export class RepoWorker {
 
         const devexRunLogPath = await this.recordRunLogPath(task, issueNumber, "consult devex");
 
-        const devexResult = await continueSession(taskRepoPath, baseSessionId, devexPrompt, {
+        const devexResult = await this.session.continueSession(taskRepoPath, baseSessionId, devexPrompt, {
           agent: "devex",
           repo: this.repo,
           cacheKey,
@@ -1784,7 +1807,7 @@ export class RepoWorker {
 
           const rerouteRunLogPath = await this.recordRunLogPath(task, issueNumber, "reroute after devex");
 
-          const rerouteResult = await continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
+          const rerouteResult = await this.session.continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
             repo: this.repo,
             cacheKey,
             runLogPath: rerouteRunLogPath,
@@ -1888,7 +1911,7 @@ export class RepoWorker {
 
       const buildRunLogPath = await this.recordRunLogPath(task, issueNumber, "build");
 
-      let buildResult = await continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
+      let buildResult = await this.session.continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
         cacheKey,
         runLogPath: buildRunLogPath,
@@ -1991,7 +2014,7 @@ export class RepoWorker {
 
           const buildLoopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber, "build loop-break");
 
-          buildResult = await continueSession(
+          buildResult = await this.session.continueSession(
             taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
@@ -2039,7 +2062,7 @@ export class RepoWorker {
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
         const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue");
 
-        buildResult = await continueSession(taskRepoPath, buildResult.sessionId, nudge, {
+        buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
           cacheKey,
           runLogPath: buildContinueRunLogPath,
@@ -2151,7 +2174,7 @@ export class RepoWorker {
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
       const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey");
 
-      const surveyResult = await continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
+      const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
         cacheKey,
         runLogPath: surveyRunLogPath,
@@ -2197,7 +2220,7 @@ export class RepoWorker {
       });
 
       // 12. Cleanup per-task OpenCode cache on success
-      await rm(getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
+      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
 
       if (worktreePath) {
         await this.cleanupGitWorktree(worktreePath);

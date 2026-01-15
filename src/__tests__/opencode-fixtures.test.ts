@@ -160,11 +160,9 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
   beforeEach(async () => {
     sessionsDir = await mkdtemp(join(tmpdir(), "ralph-sessions-"));
-    process.env.RALPH_SESSIONS_DIR = sessionsDir;
   });
 
   afterEach(async () => {
-    delete process.env.RALPH_SESSIONS_DIR;
     await rm(sessionsDir, { recursive: true, force: true });
   });
 
@@ -174,6 +172,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     const testOverrides = {
       scheduler: scheduler as any,
+      sessionsDir,
       spawn: spawnFromFixture({ lines, scheduler }) as any,
     };
 
@@ -211,6 +210,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     const testOverrides = {
       scheduler: scheduler as any,
+      sessionsDir,
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 
@@ -230,6 +230,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     const testOverrides = {
       scheduler: scheduler as any,
+      sessionsDir,
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 
@@ -252,6 +253,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     const testOverrides = {
       scheduler: scheduler as any,
+      sessionsDir,
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 

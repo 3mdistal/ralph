@@ -428,6 +428,7 @@ async function runSession(
     __testOverrides?: {
       spawn?: SpawnFn;
       scheduler?: Scheduler;
+      sessionsDir?: string;
     };
   }
 ): Promise<SessionResult> {
@@ -775,7 +776,7 @@ async function runSession(
 
   // If continuing an existing session, mark it as active for `ralph nudge`.
   const continueSessionId = options?.continueSession;
-  const lockPath = continueSessionId ? getRalphSessionLockPath(continueSessionId) : null;
+  const lockPath = continueSessionId ? getSessionLockPathForRun(continueSessionId) : null;
   const cleanupLock = () => {
     if (!lockPath) return;
     try {
@@ -787,7 +788,7 @@ async function runSession(
 
   if (lockPath && continueSessionId) {
     try {
-      mkdirSync(getSessionDir(continueSessionId), { recursive: true });
+      mkdirSync(getSessionDirForRun(continueSessionId), { recursive: true });
       writeFileSync(
         lockPath,
         JSON.stringify({ ts: scheduler.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
@@ -831,6 +832,20 @@ async function runSession(
 
   const introspection = options?.introspection;
 
+  const sessionsDirOverride = options?.__testOverrides?.sessionsDir?.trim();
+  const getSessionDirForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id);
+    return getSessionDir(id);
+  };
+  const getSessionEventsPathForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id, "events.jsonl");
+    return getSessionEventsPath(id);
+  };
+  const getSessionLockPathForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id, "active.lock");
+    return getRalphSessionLockPath(id);
+  };
+
   let eventStream: Writable | null = null;
   let bufferedEventLines: string[] = [];
 
@@ -860,8 +875,8 @@ async function runSession(
     if (eventStream) return;
 
     try {
-      mkdirSync(getSessionDir(id), { recursive: true });
-      eventStream = createWriteStream(getSessionEventsPath(id), { flags: "a" });
+      mkdirSync(getSessionDirForRun(id), { recursive: true });
+      eventStream = createWriteStream(getSessionEventsPathForRun(id), { flags: "a" });
       for (const line of bufferedEventLines) {
         try {
           eventStream.write(line + "\n");
@@ -1230,6 +1245,7 @@ export async function runCommand(
   testOverrides?: {
     spawn?: SpawnFn;
     scheduler?: Scheduler;
+    sessionsDir?: string;
   }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
