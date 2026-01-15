@@ -66,6 +66,34 @@ const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
   getRalphXdgCacheHome,
 };
 
+type QueueAdapter = {
+  updateTaskStatus: typeof updateTaskStatus;
+};
+
+type NotifyAdapter = {
+  notifyEscalation: typeof notifyEscalation;
+  notifyError: typeof notifyError;
+  notifyTaskComplete: typeof notifyTaskComplete;
+};
+
+type ThrottleAdapter = {
+  getThrottleDecision: typeof getThrottleDecision;
+};
+
+const DEFAULT_QUEUE_ADAPTER: QueueAdapter = {
+  updateTaskStatus,
+};
+
+const DEFAULT_NOTIFY_ADAPTER: NotifyAdapter = {
+  notifyEscalation,
+  notifyError,
+  notifyTaskComplete,
+};
+
+const DEFAULT_THROTTLE_ADAPTER: ThrottleAdapter = {
+  getThrottleDecision,
+};
+
 // Ralph introspection logs location
 const RALPH_SESSIONS_DIR = getRalphSessionsDir();
 
@@ -247,13 +275,24 @@ function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
 
 export class RepoWorker {
   private session: SessionAdapter;
+  private queue: QueueAdapter;
+  private notify: NotifyAdapter;
+  private throttle: ThrottleAdapter;
 
   constructor(
     public readonly repo: string,
     public readonly repoPath: string,
-    opts?: { session?: SessionAdapter }
+    opts?: {
+      session?: SessionAdapter;
+      queue?: QueueAdapter;
+      notify?: NotifyAdapter;
+      throttle?: ThrottleAdapter;
+    }
   ) {
     this.session = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+    this.queue = opts?.queue ?? DEFAULT_QUEUE_ADAPTER;
+    this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
+    this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
   }
 
   private ensureLabelsPromise: Promise<void> | null = null;
@@ -281,7 +320,7 @@ export class RepoWorker {
       ].join("\n"),
     });
 
-    await updateTaskStatus(task, "blocked", {
+    await this.queue.updateTaskStatus(task, "blocked", {
       "completed-at": completedAt,
       "session-id": "",
       "watchdog-retries": "",
@@ -298,7 +337,7 @@ export class RepoWorker {
 
   private async recordRunLogPath(task: AgentTask, issueNumber: string, stepTitle: string): Promise<string | undefined> {
     const runLogPath = getRalphRunLogPath({ repo: this.repo, issueNumber, stepTitle, ts: Date.now() });
-    const updated = await updateTaskStatus(task, "in-progress", { "run-log-path": runLogPath });
+    const updated = await this.queue.updateTaskStatus(task, "in-progress", { "run-log-path": runLogPath });
     if (!updated) {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
     }
@@ -455,7 +494,7 @@ export class RepoWorker {
     const worktreePath = join(RALPH_WORKTREES_DIR, repoKey, issueNumber, taskKey);
 
     await this.ensureGitWorktree(worktreePath);
-    await updateTaskStatus(task, "starting", { "worktree-path": worktreePath });
+    await this.queue.updateTaskStatus(task, "starting", { "worktree-path": worktreePath });
 
     return { repoPath: worktreePath, worktreePath };
   }
@@ -821,8 +860,8 @@ export class RepoWorker {
 
         const reason = `Failed while fixing CI before merge: ${fixResult.output}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await updateTaskStatus(params.task, "blocked");
-        await notifyError(params.notifyTitle, reason, params.task.name);
+        await this.queue.updateTaskStatus(params.task, "blocked");
+        await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
         return {
           ok: false,
@@ -837,7 +876,7 @@ export class RepoWorker {
       }
 
       if (fixResult.sessionId) {
-        await updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
+        await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
       }
 
       const updatedPrUrl = extractPrUrl(fixResult.output);
@@ -848,8 +887,8 @@ export class RepoWorker {
     const reason = `Required checks not passing; refusing to merge ${prUrl}`;
     console.warn(`[ralph:worker:${this.repo}] ${reason}`);
 
-    await updateTaskStatus(params.task, "blocked");
-    await notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
+    await this.queue.updateTaskStatus(params.task, "blocked");
+    await this.notify.notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
 
     return {
       ok: false,
@@ -891,7 +930,7 @@ export class RepoWorker {
         .join("\n"),
     });
 
-    await updateTaskStatus(task, "done", {
+    await this.queue.updateTaskStatus(task, "done", {
       "completed-at": completedAt,
       "session-id": "",
       "watchdog-retries": "",
@@ -984,13 +1023,17 @@ export class RepoWorker {
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
     if (requested === "auto") {
-      const chosen = await resolveAutoOpencodeProfileName(Date.now());
+      const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+        getThrottleDecision: this.throttle.getThrottleDecision,
+      });
       if (phase === "start") {
         console.log(`[ralph:worker:${this.repo}] Auto-selected OpenCode profile=${JSON.stringify(chosen ?? "")}`);
       }
       resolved = chosen ? resolveOpencodeProfile(chosen) : resolveOpencodeProfile(null);
     } else if (phase === "start") {
-      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requested || null);
+      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requested || null, {
+        getThrottleDecision: this.throttle.getThrottleDecision,
+      });
       const chosen = selection.profileName;
 
       if (selection.source === "failover") {
@@ -1039,19 +1082,28 @@ export class RepoWorker {
     let decision: Awaited<ReturnType<typeof getThrottleDecision>>;
 
     if (pinned) {
-      decision = await getThrottleDecision(Date.now(), { opencodeProfile: pinned });
+      decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
       const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message) }).opencodeProfile?.trim() ?? "";
 
       if (controlProfile === "auto") {
-        const chosen = await resolveAutoOpencodeProfileName(Date.now());
-        decision = await getThrottleDecision(Date.now(), { opencodeProfile: chosen ?? getOpencodeDefaultProfileName() });
+        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+          getThrottleDecision: this.throttle.getThrottleDecision,
+        });
+
+        decision = await this.throttle.getThrottleDecision(Date.now(), {
+          opencodeProfile: chosen ?? getOpencodeDefaultProfileName(),
+        });
       } else if (!hasSession) {
         // Safe to fail over between profiles before starting a new session.
-        decision = (await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null)).decision;
+        decision = (
+          await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null, {
+            getThrottleDecision: this.throttle.getThrottleDecision,
+          })
+        ).decision;
       } else {
         // Do not fail over while a session is in flight/resuming.
-        decision = await getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
+        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
       }
     }
 
@@ -1068,7 +1120,7 @@ export class RepoWorker {
 
     if (sid) extraFields["session-id"] = sid;
 
-    await updateTaskStatus(task, "throttled", extraFields);
+    await this.queue.updateTaskStatus(task, "throttled", extraFields);
 
     console.log(
       `[ralph:worker:${this.repo}] Hard throttle active; pausing at checkpoint stage=${stage} resumeAt=${resumeAt || "unknown"}`
@@ -1150,7 +1202,7 @@ export class RepoWorker {
 
     if (retryCount === 0) {
       console.warn(`[ralph:worker:${this.repo}] Watchdog hard timeout; re-queuing once for recovery: ${reason}`);
-      await updateTaskStatus(task, "queued", {
+      await this.queue.updateTaskStatus(task, "queued", {
         "session-id": "",
         "watchdog-retries": String(nextRetryCount),
       });
@@ -1171,9 +1223,9 @@ export class RepoWorker {
     };
     if (result.sessionId) escalationFields["session-id"] = result.sessionId;
 
-    await updateTaskStatus(task, "escalated", escalationFields);
+    await this.queue.updateTaskStatus(task, "escalated", escalationFields);
 
-    await notifyEscalation({
+    await this.notify.notifyEscalation({
       taskName: task.name,
       taskFileName: task._name,
       taskPath: task._path,
@@ -1223,7 +1275,7 @@ export class RepoWorker {
       if (!existingSessionId) {
         const reason = "In-progress task has no session-id; cannot resume";
         console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
-        await updateTaskStatus(task, "starting", { "session-id": "" });
+        await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
         return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
       }
 
@@ -1237,7 +1289,7 @@ export class RepoWorker {
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
       if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
-        await updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
+        await this.queue.updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
       }
 
       const botBranch = getRepoBotBranch(this.repo);
@@ -1283,7 +1335,7 @@ export class RepoWorker {
         console.warn(`[ralph:worker:${this.repo}] Resume failed; falling back to fresh run: ${reason}`);
 
         // Fall back to a fresh run by clearing session-id and re-queueing.
-        await updateTaskStatus(task, "queued", { "session-id": "" });
+        await this.queue.updateTaskStatus(task, "queued", { "session-id": "" });
 
         return {
           taskName: task.name,
@@ -1295,7 +1347,7 @@ export class RepoWorker {
       }
 
       if (buildResult.sessionId) {
-        await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
+        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
       await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
@@ -1338,8 +1390,8 @@ export class RepoWorker {
             const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
-            await updateTaskStatus(task, "escalated");
-            await notifyEscalation({
+            await this.queue.updateTaskStatus(task, "escalated");
+            await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
               taskPath: task._path,
@@ -1481,8 +1533,8 @@ export class RepoWorker {
         const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await updateTaskStatus(task, "escalated");
-        await notifyEscalation({
+        await this.queue.updateTaskStatus(task, "escalated");
+        await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
           taskPath: task._path,
@@ -1566,7 +1618,7 @@ export class RepoWorker {
         surveyResults: surveyResult.output,
       });
 
-      await updateTaskStatus(task, "done", {
+      await this.queue.updateTaskStatus(task, "done", {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
@@ -1592,8 +1644,8 @@ export class RepoWorker {
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
-      await updateTaskStatus(task, "blocked");
-      await notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+      await this.queue.updateTaskStatus(task, "blocked");
+      await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
 
       return {
         taskName: task.name,
@@ -1640,7 +1692,7 @@ export class RepoWorker {
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
       // 3. Mark task starting (restart-safe pre-session state)
-      const markedStarting = await updateTaskStatus(task, "starting", {
+      const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
         ...(!task["opencode-profile"]?.trim() && opencodeProfileName ? { "opencode-profile": opencodeProfileName } : {}),
       });
@@ -1724,7 +1776,7 @@ export class RepoWorker {
 
       // Persist OpenCode session ID for crash recovery
       if (planResult.sessionId) {
-        await updateTaskStatus(task, "in-progress", { "session-id": planResult.sessionId });
+        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": planResult.sessionId });
       }
 
       // 5. Parse routing decision
@@ -1832,7 +1884,7 @@ export class RepoWorker {
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
             if (rerouteResult.sessionId) {
-              await updateTaskStatus(task, "in-progress", { "session-id": rerouteResult.sessionId });
+              await this.queue.updateTaskStatus(task, "in-progress", { "session-id": rerouteResult.sessionId });
             }
 
             const updatedRouting = parseRoutingDecision(rerouteResult.output);
@@ -1870,8 +1922,8 @@ export class RepoWorker {
 
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await updateTaskStatus(task, "escalated");
-        await notifyEscalation({
+        await this.queue.updateTaskStatus(task, "escalated");
+        await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
           taskPath: task._path,
@@ -1938,7 +1990,7 @@ export class RepoWorker {
 
       // Keep the latest session ID persisted
       if (buildResult.sessionId) {
-        await updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
+        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
       }
 
       await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build", opencodeXdg);
@@ -1984,8 +2036,8 @@ export class RepoWorker {
             const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
-            await updateTaskStatus(task, "escalated");
-            await notifyEscalation({
+            await this.queue.updateTaskStatus(task, "escalated");
+            await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
               taskPath: task._path,
@@ -2121,8 +2173,8 @@ export class RepoWorker {
         const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await updateTaskStatus(task, "escalated");
-        await notifyEscalation({
+        await this.queue.updateTaskStatus(task, "escalated");
+        await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
           taskPath: task._path,
@@ -2212,7 +2264,7 @@ export class RepoWorker {
       });
 
       // 11. Mark task done
-      await updateTaskStatus(task, "done", {
+      await this.queue.updateTaskStatus(task, "done", {
         "completed-at": endTime.toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
@@ -2227,7 +2279,7 @@ export class RepoWorker {
       }
 
       // 13. Send desktop notification for completion
-      await notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
+      await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
 
       console.log(`[ralph:worker:${this.repo}] Task completed: ${task.name}`);
 
@@ -2241,8 +2293,8 @@ export class RepoWorker {
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
-      await updateTaskStatus(task, "blocked");
-      await notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+      await this.queue.updateTaskStatus(task, "blocked");
+      await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
 
       return {
         taskName: task.name,
