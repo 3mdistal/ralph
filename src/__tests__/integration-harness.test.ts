@@ -141,6 +141,7 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     // Avoid touching the real gh CLI.
     (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],
       title: "Test issue",
@@ -227,6 +228,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
     (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],
       title: "Test issue",
@@ -258,6 +260,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
     (worker as any).drainNudges = async () => {};
     (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],
       title: "Test issue",
