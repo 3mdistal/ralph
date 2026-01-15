@@ -410,10 +410,10 @@ timeZone = "America/Indiana/Indianapolis"
 ### Checking profile status
 
 ```bash
-ralph status --json | jq '{mode, activeProfile, throttle: .throttle.state}'
+ralph status --json | jq '{mode, activeProfile, throttle: .throttle.state, pendingEscalations: .escalations.pending}'
 ```
 
-Shows active profile, throttle state, and per-task profile assignments.
+Shows active profile, throttle state, pending escalations, and per-task profile assignments.
 
 ### Notes
 
