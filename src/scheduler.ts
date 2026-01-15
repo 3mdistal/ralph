@@ -95,8 +95,12 @@ export function startQueuedTasks<Task extends { repo: string }>(deps: SchedulerD
 }
 
 export type SchedulerTimers = {
-  setTimeout: typeof setTimeout;
-  clearTimeout: typeof clearTimeout;
+  setTimeout: <TArgs extends any[]>(
+    fn: (...args: TArgs) => void,
+    delay?: number,
+    ...args: TArgs
+  ) => ReturnType<typeof setTimeout>;
+  clearTimeout: (timeoutId: ReturnType<typeof setTimeout>) => void;
 };
 
 export type SchedulerControllerDeps<Task> = {
