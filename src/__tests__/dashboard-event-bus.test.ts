@@ -78,4 +78,29 @@ describe("dashboard event schema", () => {
     expect(isRalphEvent(bad)).toBe(false);
     expect(() => assertRalphEvent(bad, "bad")).toThrow();
   });
+
+  test("validates worker.summary.updated payload", () => {
+    const ok = buildRalphEvent({
+      type: "worker.summary.updated",
+      level: "info",
+      workerId: "3mdistal/ralph#orchestration/tasks/30",
+      data: { text: "Summarized", confidence: 0.7, top_activities: ["planning"] },
+    });
+
+    expect(isRalphEvent(ok)).toBe(true);
+
+    const missingText: any = {
+      ...ok,
+      data: { confidence: 0.4 },
+    };
+
+    expect(isRalphEvent(missingText)).toBe(false);
+
+    const invalidTopActivities: any = {
+      ...ok,
+      data: { text: "ok", top_activities: [1] },
+    };
+
+    expect(isRalphEvent(invalidTopActivities)).toBe(false);
+  });
 });
