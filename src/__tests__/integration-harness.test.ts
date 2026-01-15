@@ -1,23 +1,14 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
-// --- Mocks (must be declared before importing worker) ---
+import { RepoWorker } from "../worker";
+
+// --- Mocks used by adapters ---
 
 const updateTaskStatusMock = mock(async () => true);
 
-mock.module("../queue", () => ({
-  updateTaskStatus: updateTaskStatusMock,
-}));
-
 const notifyEscalationMock = mock(async () => true);
-const notifyErrorMock = mock(async () => true);
-const notifyTaskCompleteMock = mock(async () => true);
-
-mock.module("../notify", () => ({
-  notifyEscalation: notifyEscalationMock,
-  notifyError: notifyErrorMock,
-  notifyTaskComplete: notifyTaskCompleteMock,
-}));
-
+const notifyErrorMock = mock(async () => {});
+const notifyTaskCompleteMock = mock(async () => {});
 
 const runCommandMock = mock(async () => ({
   sessionId: "ses_plan",
@@ -59,12 +50,22 @@ const continueCommandMock = mock(async () => ({
   output: "survey: ok",
 }));
 
-mock.module("../session", () => ({
+const sessionAdapter = {
   runCommand: runCommandMock,
   continueSession: continueSessionMock,
   continueCommand: continueCommandMock,
   getRalphXdgCacheHome: () => "/tmp/ralph-opencode-cache-test",
-}));
+};
+
+const queueAdapter = {
+  updateTaskStatus: updateTaskStatusMock,
+};
+
+const notifyAdapter = {
+  notifyEscalation: notifyEscalationMock,
+  notifyError: notifyErrorMock,
+  notifyTaskComplete: notifyTaskCompleteMock,
+};
 
 const getThrottleDecisionMock = mock(async () =>
   ({
@@ -80,11 +81,9 @@ const getThrottleDecisionMock = mock(async () =>
   }) as any
 );
 
-mock.module("../throttle", () => ({
+const throttleAdapter = {
   getThrottleDecision: getThrottleDecisionMock,
-}));
-
-import { RepoWorker } from "../worker";
+};
 
 function createMockTask(overrides: Record<string, unknown> = {}) {
   return {
@@ -101,6 +100,10 @@ function createMockTask(overrides: Record<string, unknown> = {}) {
     ...overrides,
   } as any;
 }
+
+afterAll(() => {
+  mock.restore();
+});
 
 describe("integration-ish harness: full task lifecycle", () => {
   beforeEach(() => {
@@ -128,7 +131,7 @@ describe("integration-ish harness: full task lifecycle", () => {
   });
 
   test("queued → in-progress → build → PR → merge → survey → done", async () => {
-    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
     // Avoid touching git worktree creation (depends on local config).
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
@@ -222,7 +225,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       },
     }));
 
-    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
@@ -253,7 +256,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       output: "spawn opencode ENOENT (is opencode installed and on PATH?)",
     }));
 
-    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
     (worker as any).drainNudges = async () => {};
     (worker as any).ensureBaselineLabelsOnce = async () => {};
