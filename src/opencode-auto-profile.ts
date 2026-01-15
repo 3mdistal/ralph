@@ -12,6 +12,10 @@ type Candidate = {
   rolling5hRemainingToHard: number;
 };
 
+type ThrottleDecisionProvider = {
+  getThrottleDecision?: typeof getThrottleDecision;
+};
+
 const MIN_SWITCH_INTERVAL_MS = 15 * 60 * 1000;
 const MIN_REMAINING_FRAC_TO_CHASE_SOONER = 0.05;
 
@@ -97,12 +101,16 @@ function chooseBest(candidates: Candidate[], now: number): Candidate {
   return best;
 }
 
-export async function resolveAutoOpencodeProfileName(now: number = Date.now()): Promise<string | null> {
+export async function resolveAutoOpencodeProfileName(
+  now: number = Date.now(),
+  opts?: ThrottleDecisionProvider
+): Promise<string | null> {
+  const throttle = opts?.getThrottleDecision ?? getThrottleDecision;
   const profiles = listOpencodeProfileNames();
   if (profiles.length === 0) return null;
 
   const decisions = await Promise.all(
-    profiles.map(async (name) => ({ name, decision: await getThrottleDecision(now, { opencodeProfile: name }) }))
+    profiles.map(async (name) => ({ name, decision: await throttle(now, { opencodeProfile: name }) }))
   );
 
   const candidates = decisions.map(({ name, decision }) => toCandidate(name, decision));
@@ -139,13 +147,15 @@ export type ResolvedOpencodeProfileForNewWork = {
  */
 export async function resolveOpencodeProfileForNewWork(
   now: number = Date.now(),
-  requestedProfile: string | null = null
+  requestedProfile: string | null = null,
+  opts?: ThrottleDecisionProvider
 ): Promise<ResolvedOpencodeProfileForNewWork> {
+  const throttle = opts?.getThrottleDecision ?? getThrottleDecision;
   const requested = (requestedProfile ?? "").trim();
 
   if (requested === "auto") {
-    const chosen = await resolveAutoOpencodeProfileName(now);
-    const decision = await getThrottleDecision(now, { opencodeProfile: chosen });
+    const chosen = await resolveAutoOpencodeProfileName(now, opts);
+    const decision = await throttle(now, { opencodeProfile: chosen });
 
     return {
       profileName: decision.snapshot.opencodeProfile ?? null,
@@ -155,7 +165,7 @@ export async function resolveOpencodeProfileForNewWork(
     };
   }
 
-  const baseDecision = await getThrottleDecision(now, { opencodeProfile: requested ? requested : null });
+  const baseDecision = await throttle(now, { opencodeProfile: requested ? requested : null });
   if (baseDecision.state !== "hard") {
     return {
       profileName: baseDecision.snapshot.opencodeProfile ?? null,
@@ -185,7 +195,7 @@ export async function resolveOpencodeProfileForNewWork(
     };
   }
 
-  const chosen = await resolveAutoOpencodeProfileName(now);
+  const chosen = await resolveAutoOpencodeProfileName(now, opts);
   if (!chosen) {
     return {
       profileName: baseDecision.snapshot.opencodeProfile ?? null,
@@ -195,7 +205,7 @@ export async function resolveOpencodeProfileForNewWork(
     };
   }
 
-  const failoverDecision = await getThrottleDecision(now, { opencodeProfile: chosen });
+  const failoverDecision = await throttle(now, { opencodeProfile: chosen });
   if (failoverDecision.state === "hard") {
     return {
       profileName: baseDecision.snapshot.opencodeProfile ?? null,

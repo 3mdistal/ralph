@@ -42,6 +42,8 @@ import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { initStateDb, recordPrSnapshot } from "./state";
 import { queueNudge } from "./nudge";
+import { ralphEventBus } from "./dashboard/bus";
+import { buildRalphEvent } from "./dashboard/events";
 import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
 import {
   buildWaitingResolutionUpdate,
@@ -634,6 +636,14 @@ async function main(): Promise<void> {
   // Initialize durable local state (SQLite)
   initStateDb();
 
+  ralphEventBus.publish(
+    buildRalphEvent({
+      type: "daemon.started",
+      level: "info",
+      data: {},
+    })
+  );
+
   console.log("[ralph] Configuration:");
   console.log(`        Vault: ${config.bwrbVault}`);
   console.log(`        Max workers: ${config.maxWorkers}`);
@@ -794,6 +804,14 @@ async function main(): Promise<void> {
       }
     }
     
+    ralphEventBus.publish(
+      buildRalphEvent({
+        type: "daemon.stopped",
+        level: "info",
+        data: { reason: signal },
+      })
+    );
+
     console.log("[ralph] Goodbye!");
     process.exit(0);
   };
