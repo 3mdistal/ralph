@@ -774,6 +774,20 @@ async function runSession(
     openRunLogStream();
   }
 
+  const sessionsDirOverride = options?.__testOverrides?.sessionsDir?.trim();
+  const getSessionDirForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id);
+    return getSessionDir(id);
+  };
+  const getSessionEventsPathForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id, "events.jsonl");
+    return getSessionEventsPath(id);
+  };
+  const getSessionLockPathForRun = (id: string): string => {
+    if (sessionsDirOverride) return join(sessionsDirOverride, id, "active.lock");
+    return getRalphSessionLockPath(id);
+  };
+
   // If continuing an existing session, mark it as active for `ralph nudge`.
   const continueSessionId = options?.continueSession;
   const lockPath = continueSessionId ? getSessionLockPathForRun(continueSessionId) : null;
@@ -831,20 +845,6 @@ async function runSession(
   let prUrlFromEvents: string | null = null;
 
   const introspection = options?.introspection;
-
-  const sessionsDirOverride = options?.__testOverrides?.sessionsDir?.trim();
-  const getSessionDirForRun = (id: string): string => {
-    if (sessionsDirOverride) return join(sessionsDirOverride, id);
-    return getSessionDir(id);
-  };
-  const getSessionEventsPathForRun = (id: string): string => {
-    if (sessionsDirOverride) return join(sessionsDirOverride, id, "events.jsonl");
-    return getSessionEventsPath(id);
-  };
-  const getSessionLockPathForRun = (id: string): string => {
-    if (sessionsDirOverride) return join(sessionsDirOverride, id, "active.lock");
-    return getRalphSessionLockPath(id);
-  };
 
   let eventStream: Writable | null = null;
   let bufferedEventLines: string[] = [];
