@@ -191,11 +191,30 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(statuses[statuses.length - 1]).toBe("done");
 
     // Per-run log path is persisted for restart survivability.
-    const hasRunLogPath = updateTaskStatusMock.mock.calls.some((call: any[]) => {
+    const runLogUpdates = updateTaskStatusMock.mock.calls.filter((call: any[]) => {
       const extra = call?.[2];
       return extra && typeof extra === "object" && typeof extra["run-log-path"] === "string" && extra["run-log-path"].length > 0;
     });
-    expect(hasRunLogPath).toBe(true);
+    expect(runLogUpdates.length).toBeGreaterThan(0);
+
+    // Pre-session log updates should stay in starting; only in-progress once session exists.
+    const sessionIds = updateTaskStatusMock.mock.calls
+      .map((call: any[]) => call?.[2])
+      .filter((extra) => extra && typeof extra === "object" && typeof extra["session-id"] === "string")
+      .map((extra) => String(extra["session-id"]).trim())
+      .filter(Boolean);
+    const firstSessionId = sessionIds[0] ?? "";
+
+    for (const call of runLogUpdates) {
+      const status = call?.[1];
+      const extra = call?.[2] ?? {};
+      const sessionId = typeof extra["session-id"] === "string" ? extra["session-id"].trim() : "";
+      if (sessionId || (firstSessionId && status === "in-progress")) {
+        expect(status).toBe("in-progress");
+      } else {
+        expect(status).toBe("starting");
+      }
+    }
 
     // Agent-run captures PR + survey output.
     expect(agentRunData?.outcome).toBe("success");
