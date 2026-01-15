@@ -3,9 +3,9 @@ import { describe, expect, mock, test, beforeEach } from "bun:test";
 // Mock queue updates so tests don't touch the real vault.
 const updateTaskStatusMock = mock(async () => true);
 
-mock.module("../queue", () => ({
+const queueAdapter = {
   updateTaskStatus: updateTaskStatusMock,
-}));
+};
 
 import { RepoWorker } from "../worker";
 
@@ -31,7 +31,7 @@ describe("closed issue guardrail", () => {
   });
 
   test("processTask skips when gh reports CLOSED", async () => {
-    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { queue: queueAdapter });
 
     const issueMeta = {
       labels: [],
@@ -76,7 +76,7 @@ describe("closed issue guardrail", () => {
   });
 
   test("resumeTask skips when gh reports CLOSED", async () => {
-    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { queue: queueAdapter });
 
     const issueMeta = {
       labels: [],

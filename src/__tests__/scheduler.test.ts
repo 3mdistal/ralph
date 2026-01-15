@@ -97,6 +97,52 @@ describe("Scheduler invariants", () => {
     expect(started.length).toBe(1);
   });
 
+  test("priority resumes do not block queued starts", () => {
+    const inFlightTasks = new Set<string>();
+    const started: string[] = [];
+
+    const globalSemaphore = new Semaphore(2);
+
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(2);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const startPriorityTask = mock(({ task }: { task: TestTask }) => {
+      started.push(`resume:${task._path}`);
+    });
+
+    const startTask = mock(({ task }: { task: TestTask }) => {
+      started.push(`queued:${task._path}`);
+    });
+
+    const startedCount = startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks: [{ repo: "a", _path: "t2", name: "queued" }],
+      priorityTasks: [{ repo: "a", _path: "t1", name: "resume" }],
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor: { value: 0 },
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+      startPriorityTask: startPriorityTask as any,
+    });
+
+    expect(startedCount).toBe(2);
+    expect(startPriorityTask).toHaveBeenCalledTimes(1);
+    expect(startTask).toHaveBeenCalledTimes(1);
+    expect(started[0]).toBe("resume:t1");
+  });
+
   test("resume still runs under drain (resolved escalations)", async () => {
     const resumeTask = mock(async () => ({ taskName: "", repo: "", outcome: "success" } as any));
 
