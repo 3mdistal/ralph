@@ -987,6 +987,22 @@ export class RepoWorker {
     await gh`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
   }
 
+  private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
+    await gh`gh pr update-branch ${prUrl} --repo ${this.repo}`.cwd(cwd).quiet();
+  }
+
+  private isOutOfDateMergeError(error: any): boolean {
+    const message = String(error?.stderr ?? error?.message ?? "");
+    if (!message) return false;
+    return /not up to date with the base branch/i.test(message);
+  }
+
+  private formatGhError(error: any): string {
+    const message = String(error?.message ?? "").trim();
+    const stderr = String(error?.stderr ?? "").trim();
+    return [message, stderr].filter(Boolean).join("\n");
+  }
+
   private async mergePrWithRequiredChecks(params: {
     task: AgentTask;
     repoPath: string;
@@ -1004,6 +1020,7 @@ export class RepoWorker {
     let prUrl = params.prUrl;
     let sessionId = params.sessionId;
     let lastSummary: RequiredChecksSummary | null = null;
+    let didUpdateBranch = false;
 
     for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
       const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
@@ -1015,8 +1032,37 @@ export class RepoWorker {
 
       if (checkResult.summary.status === "success") {
         console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
-        await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-        return { ok: true, prUrl, sessionId };
+        try {
+          await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+          return { ok: true, prUrl, sessionId };
+        } catch (error: any) {
+          if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
+            console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
+            didUpdateBranch = true;
+            try {
+              await this.updatePullRequestBranch(prUrl, params.repoPath);
+              continue;
+            } catch (updateError: any) {
+              const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
+              console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+              await this.queue.updateTaskStatus(params.task, "blocked");
+              await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+
+              return {
+                ok: false,
+                run: {
+                  taskName: params.task.name,
+                  repo: this.repo,
+                  outcome: "failed",
+                  sessionId,
+                  escalationReason: reason,
+                },
+              };
+            }
+          }
+          throw error;
+        }
+      }
       }
 
       if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
