@@ -550,9 +550,9 @@ async function resumeTasksOnStartup(opts?: {
     console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
   }
 
-  const byRepo = groupByRepo(inProgress);
+  const inProgressByRepo = groupByRepo(inProgress);
   await Promise.all(
-    Array.from(byRepo.entries()).map(async ([repo, tasks]) => {
+    Array.from(inProgressByRepo.entries()).map(async ([repo, tasks]) => {
       const worker = getOrCreateWorker(repo);
       await worker.runTaskCleanup(tasks);
     })
@@ -571,8 +571,8 @@ async function resumeTasksOnStartup(opts?: {
 
   const globalLimit = loadConfig().maxWorkers;
 
-  const byRepo = groupByRepo(withSession);
-  const repos = Array.from(byRepo.keys());
+  const withSessionByRepo = groupByRepo(withSession);
+  const repos = Array.from(withSessionByRepo.keys());
   const perRepoResumed = new Map<string, number>();
 
   const toResume: AgentTask[] = [];
@@ -584,7 +584,7 @@ async function resumeTasksOnStartup(opts?: {
     for (let i = 0; i < repos.length; i++) {
       const idx = (cursor + i) % repos.length;
       const repo = repos[idx];
-      const repoTasks = byRepo.get(repo);
+      const repoTasks = withSessionByRepo.get(repo);
       if (!repoTasks || repoTasks.length === 0) continue;
 
       const limit = getRepoMaxWorkers(repo);
@@ -604,7 +604,7 @@ async function resumeTasksOnStartup(opts?: {
 
   const toRequeue: AgentTask[] = [];
   for (const repo of repos) {
-    const remaining = byRepo.get(repo) ?? [];
+    const remaining = withSessionByRepo.get(repo) ?? [];
     for (const task of remaining) toRequeue.push(task);
   }
 
