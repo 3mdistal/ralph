@@ -1063,7 +1063,6 @@ export class RepoWorker {
           throw error;
         }
       }
-      }
 
       if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
 
