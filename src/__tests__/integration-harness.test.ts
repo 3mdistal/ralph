@@ -6,9 +6,9 @@ import { RepoWorker } from "../worker";
 
 const updateTaskStatusMock = mock(async () => true);
 
-const notifyEscalationMock = mock(async () => {});
-const notifyErrorMock = mock(async () => {});
-const notifyTaskCompleteMock = mock(async () => {});
+const notifyEscalationMock = mock(async () => true);
+const notifyErrorMock = mock(async () => true);
+const notifyTaskCompleteMock = mock(async () => true);
 
 const runCommandMock = mock(async () => ({
   sessionId: "ses_plan",
