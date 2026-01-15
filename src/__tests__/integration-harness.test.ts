@@ -226,15 +226,25 @@ describe("integration-ish harness: full task lifecycle", () => {
       stateReason: null,
     });
 
-    const waitForRequiredChecksMock = mock(async () => ({
-      headSha: "deadbeef",
-      summary: {
-        status: "success",
-        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
-        available: ["ci"],
-      },
-      timedOut: false,
-    }));
+    const waitForRequiredChecksMock = mock()
+      .mockImplementationOnce(async () => ({
+        headSha: "deadbeef",
+        summary: {
+          status: "success",
+          required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+          available: ["ci"],
+        },
+        timedOut: false,
+      }))
+      .mockImplementationOnce(async () => ({
+        headSha: "beadfeed",
+        summary: {
+          status: "success",
+          required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+          available: ["ci"],
+        },
+        timedOut: false,
+      }));
 
     const mergePullRequestMock = mock()
       .mockImplementationOnce(async () => {
@@ -256,7 +266,10 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     expect(result.outcome).toBe("success");
     expect(updatePullRequestBranchMock).toHaveBeenCalledTimes(1);
+    expect(waitForRequiredChecksMock).toHaveBeenCalledTimes(2);
     expect(mergePullRequestMock).toHaveBeenCalledTimes(2);
+    expect(mergePullRequestMock.mock.calls[0][1]).toBe("deadbeef");
+    expect(mergePullRequestMock.mock.calls[1][1]).toBe("beadfeed");
   });
 
   test("merge escalates when update-branch fails", async () => {
