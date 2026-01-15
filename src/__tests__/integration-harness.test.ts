@@ -191,28 +191,32 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(statuses[statuses.length - 1]).toBe("done");
 
     // Per-run log path is persisted for restart survivability.
-    const runLogUpdates = updateTaskStatusMock.mock.calls.filter((call: any[]) => {
+    const calls = updateTaskStatusMock.mock.calls;
+    const runLogUpdates = calls.filter((call: any[]) => {
       const extra = call?.[2];
       return extra && typeof extra === "object" && typeof extra["run-log-path"] === "string" && extra["run-log-path"].length > 0;
     });
     expect(runLogUpdates.length).toBeGreaterThan(0);
 
     // Pre-session log updates should stay in starting; only in-progress once session exists.
-    const sessionIds = updateTaskStatusMock.mock.calls
-      .map((call: any[]) => call?.[2])
-      .filter((extra) => extra && typeof extra === "object" && typeof extra["session-id"] === "string")
-      .map((extra) => String(extra["session-id"]).trim())
-      .filter(Boolean);
-    const firstSessionId = sessionIds[0] ?? "";
+    const firstSessionIndex = calls.findIndex((call: any[]) => {
+      const extra = call?.[2];
+      const sessionId = typeof extra?.["session-id"] === "string" ? extra["session-id"].trim() : "";
+      return sessionId.length > 0;
+    });
 
-    for (const call of runLogUpdates) {
+    for (let i = 0; i < calls.length; i += 1) {
+      const call = calls[i];
       const status = call?.[1];
-      const extra = call?.[2] ?? {};
-      const sessionId = typeof extra["session-id"] === "string" ? extra["session-id"].trim() : "";
-      if (sessionId || (firstSessionId && status === "in-progress")) {
-        expect(status).toBe("in-progress");
-      } else {
+      const extra = call?.[2];
+      const hasRunLog =
+        extra && typeof extra === "object" && typeof extra["run-log-path"] === "string" && extra["run-log-path"].length > 0;
+      if (!hasRunLog) continue;
+
+      if (firstSessionIndex === -1 || i < firstSessionIndex) {
         expect(status).toBe("starting");
+      } else {
+        expect(status).toBe("in-progress");
       }
     }
 
