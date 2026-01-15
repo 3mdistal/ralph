@@ -17,6 +17,7 @@ export type RalphEventType =
   | "worker.pause.cleared"
   | "worker.activity.updated"
   | "worker.anomaly.updated"
+  | "worker.summary.updated"
   | "log.ralph"
   | "log.worker"
   | "log.opencode.event"
@@ -60,6 +61,7 @@ export type RalphEvent =
   | RalphEventEnvelope<"worker.pause.cleared", {}>
   | RalphEventEnvelope<"worker.activity.updated", { activity: string }>
   | RalphEventEnvelope<"worker.anomaly.updated", { total?: number; recentBurst?: boolean }>
+  | RalphEventEnvelope<"worker.summary.updated", { text: string; confidence?: number; top_activities?: string[] }>
   | RalphEventEnvelope<"log.ralph", { message: string }>
   | RalphEventEnvelope<"log.worker", { message: string }>
   | RalphEventEnvelope<"log.opencode.event", { event: unknown }>
@@ -83,6 +85,7 @@ const EVENT_TYPES: ReadonlySet<string> = new Set<string>([
   "worker.pause.cleared",
   "worker.activity.updated",
   "worker.anomaly.updated",
+  "worker.summary.updated",
   "log.ralph",
   "log.worker",
   "log.opencode.event",
@@ -150,6 +153,18 @@ export function isRalphEvent(value: unknown): value is RalphEvent {
 
   if (type === "worker.activity.updated") {
     return typeof (data as any).activity === "string";
+  }
+
+  if (type === "worker.summary.updated") {
+    const text = (data as any).text;
+    const confidence = (data as any).confidence;
+    const topActivities = (data as any).top_activities;
+    const confidenceOk = confidence === undefined || typeof confidence === "number";
+    const topActivitiesOk =
+      topActivities === undefined ||
+      (Array.isArray(topActivities) && topActivities.every((entry) => typeof entry === "string"));
+
+    return typeof text === "string" && confidenceOk && topActivitiesOk;
   }
 
   if (type === "error") {
