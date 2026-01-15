@@ -92,6 +92,52 @@ function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
 // Track in-flight tasks to avoid double-processing
 const inFlightTasks = new Set<string>();
 
+type Deferred = {
+  promise: Promise<void>;
+  resolve: () => void;
+};
+
+const pendingResumeTasks = new Map<string, AgentTask>();
+const pendingResumeWaiters = new Map<string, Deferred>();
+let resumeSchedulingMode: "shared" | "resume-only" = "shared";
+
+function createDeferred(): Deferred {
+  let resolvePromise: () => void = () => {};
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
+}
+
+function queueResumeTasks(tasks: AgentTask[], trackCompletion: boolean): Promise<void>[] {
+  const completions: Promise<void>[] = [];
+
+  for (const task of tasks) {
+    const key = getTaskKey(task);
+    if (!pendingResumeTasks.has(key)) {
+      pendingResumeTasks.set(key, task);
+    }
+
+    if (!trackCompletion) continue;
+
+    let deferred = pendingResumeWaiters.get(key);
+    if (!deferred) {
+      deferred = createDeferred();
+      pendingResumeWaiters.set(key, deferred);
+    }
+    completions.push(deferred.promise);
+  }
+
+  return completions;
+}
+
+function resolveResumeCompletion(key: string): void {
+  const deferred = pendingResumeWaiters.get(key);
+  if (!deferred) return;
+  pendingResumeWaiters.delete(key);
+  deferred.resolve();
+}
+
 let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
@@ -139,8 +185,39 @@ function scheduleQueuedTasksSoon(): void {
   scheduleQueuedTimer = setTimeout(() => {
     scheduleQueuedTimer = null;
     if (isShuttingDown) return;
-    if (getDaemonMode() === "draining") return;
+    if (getDaemonMode() === "draining" && pendingResumeTasks.size === 0) return;
     void getRunnableTasks().then((tasks) => processNewTasks(tasks));
+  }, 250);
+}
+
+let scheduleResumeTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleResumeTasksSoon(): void {
+  if (scheduleResumeTimer) return;
+  scheduleResumeTimer = setTimeout(() => {
+    scheduleResumeTimer = null;
+    if (isShuttingDown) return;
+
+    ensureSemaphores();
+    if (!globalSemaphore) return;
+
+    const priorityTasks = Array.from(pendingResumeTasks.values());
+    if (priorityTasks.length === 0) return;
+
+    startQueuedTasks({
+      gate: "running",
+      tasks: [],
+      priorityTasks,
+      inFlightTasks,
+      getTaskKey: (t) => getTaskKey(t),
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor,
+      shouldLog,
+      log: (message) => console.log(message),
+      startTask,
+      startPriorityTask: startResumeTask,
+    });
   }, 250);
 }
 
@@ -335,13 +412,46 @@ function startTask(opts: {
     });
 }
 
+function startResumeTask(opts: {
+  repo: string;
+  task: AgentTask;
+  releaseGlobal: () => void;
+  releaseRepo: () => void;
+}): void {
+  const { repo, task, releaseGlobal, releaseRepo } = opts;
+  const key = getTaskKey(task);
+
+  pendingResumeTasks.delete(key);
+  inFlightTasks.add(key);
+
+  void getOrCreateWorker(repo)
+    .resumeTask(task)
+    .then(() => {
+      // ignore
+    })
+    .catch((e: any) => {
+      console.error(`[ralph] Error resuming task ${task.name}:`, e);
+    })
+    .finally(() => {
+      inFlightTasks.delete(key);
+      releaseGlobal();
+      releaseRepo();
+      resolveResumeCompletion(key);
+      if (!isShuttingDown) {
+        const scheduleNext = resumeSchedulingMode === "resume-only" ? scheduleResumeTasksSoon : scheduleQueuedTasksSoon;
+        scheduleNext();
+      }
+    });
+}
+
 // --- Main Logic ---
 
 async function processNewTasks(tasks: AgentTask[]): Promise<void> {
   ensureSemaphores();
   if (!globalSemaphore) return;
 
-  if (getDaemonMode() === "draining") return;
+  const isDraining = getDaemonMode() === "draining";
+  if (isDraining && pendingResumeTasks.size === 0) return;
 
   const selection = await resolveOpencodeProfileForNewWork(Date.now(), getActiveOpencodeProfileName());
   const throttle = selection.decision;
@@ -368,9 +478,12 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
 
   if (throttle.state === "soft") return;
 
+  const queueTasks = isDraining ? [] : tasks;
+
   const startedCount = startQueuedTasks({
     gate: "running",
-    tasks,
+    tasks: queueTasks,
+    priorityTasks: Array.from(pendingResumeTasks.values()),
     inFlightTasks,
     getTaskKey: (t) => getTaskKey(t),
     groupByRepo,
@@ -380,6 +493,7 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
     shouldLog,
     log: (message) => console.log(message),
     startTask,
+    startPriorityTask: startResumeTask,
   });
 
   if (startedCount > 0) {
@@ -417,11 +531,15 @@ async function printHeartbeatTick(): Promise<void> {
   }
 }
 
-async function resumeTasksOnStartup(opts?: { awaitCompletion?: boolean }): Promise<void> {
+async function resumeTasksOnStartup(opts?: {
+  awaitCompletion?: boolean;
+  schedulingMode?: "shared" | "resume-only";
+}): Promise<void> {
   ensureSemaphores();
   if (!globalSemaphore) return;
 
   const awaitCompletion = opts?.awaitCompletion ?? true;
+  const schedulingMode = opts?.schedulingMode ?? resumeSchedulingMode;
 
   const inProgress = await getTasksByStatus("in-progress");
   if (inProgress.length === 0) return;
@@ -485,47 +603,16 @@ async function resumeTasksOnStartup(opts?: { awaitCompletion?: boolean }): Promi
 
   if (toResume.length === 0) return;
 
-  const promises: Promise<void>[] = [];
+  const completionPromises = queueResumeTasks(toResume, awaitCompletion);
 
-  for (const task of toResume) {
-    const repo = task.repo;
-
-    const releaseGlobal = globalSemaphore.tryAcquire();
-    if (!releaseGlobal) {
-      console.warn(`[ralph] Global concurrency limit reached unexpectedly; skipping resume: ${task.name}`);
-      continue;
-    }
-
-    const releaseRepo = getRepoSemaphore(repo).tryAcquire();
-    if (!releaseRepo) {
-      releaseGlobal();
-      console.warn(`[ralph] Repo concurrency limit reached unexpectedly; skipping resume: ${task.name}`);
-      continue;
-    }
-
-    const key = getTaskKey(task);
-    inFlightTasks.add(key);
-
-    const promise = getOrCreateWorker(repo)
-      .resumeTask(task)
-      .then(() => {
-        // ignore
-      })
-      .catch((e: any) => {
-        console.error(`[ralph] Error resuming task ${task.name}:`, e);
-      })
-      .finally(() => {
-        inFlightTasks.delete(key);
-        releaseGlobal();
-        releaseRepo();
-        if (!isShuttingDown) scheduleQueuedTasksSoon();
-      });
-
-    promises.push(promise);
+  if (schedulingMode === "resume-only") {
+    scheduleResumeTasksSoon();
+  } else {
+    scheduleQueuedTasksSoon();
   }
 
   if (awaitCompletion) {
-    await Promise.allSettled(promises);
+    await Promise.allSettled(completionPromises);
   }
 }
 
@@ -573,7 +660,7 @@ async function main(): Promise<void> {
   rollupMonitor = new RollupMonitor(config.batchSize);
 
   // Resume orphaned tasks from previous daemon runs
-  await resumeTasksOnStartup();
+  void resumeTasksOnStartup({ awaitCompletion: false });
 
   // Resume any resolved escalations (HITL checkpoint) from the same session.
   await attemptResumeResolvedEscalations();
@@ -853,7 +940,8 @@ if (args[0] === "resume") {
   requireBwrbVaultOrExit();
 
   // Resume any orphaned in-progress tasks and exit
-  await resumeTasksOnStartup();
+  resumeSchedulingMode = "resume-only";
+  await resumeTasksOnStartup({ schedulingMode: "resume-only" });
   process.exit(0);
 }
 
