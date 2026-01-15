@@ -61,9 +61,7 @@ Benefits:
 - Batches related changes for easier review
 - Provides a checkpoint for E2E testing
 
-**Merge policy:** If `gh pr merge` fails because the head branch is out of date, Ralph should run `gh pr update-branch`, then wait for required checks again on the updated head SHA before retrying the merge. If update-branch fails, mark the task `blocked` and notify with the error.
-
-**Worktree GC policy:** On startup, Ralph should prune only worktrees within `RALPH_WORKTREES_DIR`. Treat a worktree as stale if `git worktree list --porcelain` registers it but the directory or `.git` marker is missing, or if a worktree directory exists under `RALPH_WORKTREES_DIR/<repo>/<issue>/` that is not present in the porcelain list. Cleanup runs once at startup and is best-effort (log failures, do not block startup). Never delete paths outside the managed worktree directory.
+Operational details (merge recovery, worktree cleanup): see `docs/escalation-policy.md`.
 
 ### 3. Escalation-First Design
 
