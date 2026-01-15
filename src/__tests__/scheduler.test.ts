@@ -41,6 +41,7 @@ describe("Scheduler invariants", () => {
 
   test("drain allows resume scheduling without dequeues", () => {
     const pendingResumes: TestTask[] = [{ repo: "a", _path: "t1", name: "resume" }];
+    const expectedResumes = [...pendingResumes];
     const runnableCalls: TestTask[][] = [];
     const resumed: TestTask[] = [];
 
@@ -70,7 +71,7 @@ describe("Scheduler invariants", () => {
     controller.scheduleResumeTasksSoon();
 
     expect(runnableCalls.length).toBe(0);
-    expect(resumed).toEqual(pendingResumes);
+    expect(resumed).toEqual(expectedResumes);
 
     const runningController = createSchedulerController<TestTask>({
       getDaemonMode: () => "running",
