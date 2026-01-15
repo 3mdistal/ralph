@@ -2,15 +2,7 @@ import { spawn as nodeSpawn, type ChildProcess } from "child_process";
 
 type SpawnFn = typeof nodeSpawn;
 
-let spawnFn: SpawnFn = nodeSpawn;
-
-export function __setSpawnForTests(fn: SpawnFn): void {
-  spawnFn = fn;
-}
-
-export function __resetSpawnForTests(): void {
-  spawnFn = nodeSpawn;
-}
+const spawnFn: SpawnFn = nodeSpawn;
 
 type Scheduler = {
   now: () => number;
@@ -27,16 +19,6 @@ const defaultScheduler: Scheduler = {
   setInterval,
   clearInterval,
 };
-
-let schedulerForTests: Scheduler | null = null;
-
-export function __setSchedulerForTests(scheduler: Scheduler): void {
-  schedulerForTests = scheduler;
-}
-
-export function __resetSchedulerForTests(): void {
-  schedulerForTests = null;
-}
 
 import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
@@ -432,7 +414,7 @@ async function runSession(
     };
   }
 ): Promise<SessionResult> {
-  const scheduler = options?.__testOverrides?.scheduler ?? schedulerForTests ?? defaultScheduler;
+  const scheduler = options?.__testOverrides?.scheduler ?? defaultScheduler;
   const truncate = (value: string, max: number) => (value.length > max ? value.slice(0, max) + "…" : value);
 
   const mergeThresholds = (overrides?: Partial<WatchdogThresholdsMs>): WatchdogThresholdsMs => {
