@@ -151,16 +151,28 @@ describe("integration-ish harness: full task lifecycle", () => {
       stateReason: null,
     });
 
-    // Avoid hitting GitHub APIs during merge gating.
-    const waitForRequiredChecksMock = mock(async () => ({
-      headSha: "deadbeef",
-      summary: {
-        status: "success",
-        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
-        available: ["ci"],
-      },
-      timedOut: false,
-    }));
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+
+    const waitForRequiredChecksMock = mock()
+      .mockImplementationOnce(async () => ({
+        headSha: "deadbeef",
+        summary: {
+          status: "success",
+          required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+          available: ["ci"],
+        },
+        timedOut: false,
+      }))
+      .mockImplementationOnce(async () => ({
+        headSha: "beadfeed",
+        summary: {
+          status: "success",
+          required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+          available: ["ci"],
+        },
+        timedOut: false,
+      }));
+
 
     const mergePullRequestMock = mock(async () => {});
 
@@ -210,6 +222,54 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(notifyErrorMock).not.toHaveBeenCalled();
   });
 
+  test("ci-only PR blocks non-CI issue", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+
+    (worker as any).getPullRequestFiles = async () => [".github/workflows/ci.yml"];
+
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      timedOut: false,
+    }));
+
+    const mergePullRequestMock = mock(async () => {});
+
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+
+    let agentRunData: any = null;
+    (worker as any).createAgentRun = async (_task: any, data: any) => {
+      agentRunData = data;
+    };
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("failed");
+    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
+    expect(waitForRequiredChecksMock).not.toHaveBeenCalled();
+    expect(mergePullRequestMock).not.toHaveBeenCalled();
+    expect(notifyErrorMock).toHaveBeenCalled();
+    expect(agentRunData?.bodyPrefix).toContain("Blocked: CI-only PR for non-CI issue");
+  });
+
   test("merge retries after updating out-of-date branch", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
@@ -225,6 +285,8 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
+
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
 
     const waitForRequiredChecksMock = mock()
       .mockImplementationOnce(async () => ({
@@ -260,6 +322,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
 
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -287,6 +350,8 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
+
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
@@ -348,6 +413,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -380,6 +446,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
