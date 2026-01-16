@@ -44,7 +44,7 @@ import {
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
-import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
+import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { recordIssueSnapshot } from "./state";
 import {
   isPathUnderDir,
