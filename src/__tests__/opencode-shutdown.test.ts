@@ -14,11 +14,10 @@ describe("OpenCode shutdown handling", () => {
     const proc = { pid: 4321 } as any;
     registerOpencodeRun(proc, { useProcessGroup: true, command: "run" });
 
-    const calls: Array<{ pid: number; signal: unknown }> = [];
-    const processKill = (pid: number, signal?: unknown) => {
+    const calls: Array<{ pid: number; signal: string | number | undefined }> = [];
+    const processKill = (pid: number, signal?: string | number) => {
       calls.push({ pid, signal });
-      if (signal === "SIGTERM" || signal === "SIGKILL" || signal === 0) return true;
-      return true;
+      return true as const;
     };
 
     const result = await terminateOpencodeRuns({ graceMs: 0, processKill });

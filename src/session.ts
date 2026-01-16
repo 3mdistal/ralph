@@ -409,6 +409,8 @@ async function runSession(
       context?: string;
     };
     __testOverrides?: {
+      scheduler?: Scheduler;
+      sessionsDir?: string;
       spawn?: SpawnFn;
       processKill?: typeof process.kill;
     };
@@ -1385,6 +1387,8 @@ async function* streamSession(
       cacheHome?: string;
     };
     __testOverrides?: {
+      scheduler?: Scheduler;
+      sessionsDir?: string;
       spawn?: SpawnFn;
       processKill?: typeof process.kill;
     };
@@ -1481,6 +1485,8 @@ export async function* __streamSessionForTests(
     repo?: string;
     cacheKey?: string;
     __testOverrides?: {
+      scheduler?: Scheduler;
+      sessionsDir?: string;
       spawn?: SpawnFn;
       processKill?: typeof process.kill;
     };
