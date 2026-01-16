@@ -1,5 +1,5 @@
 import { $ } from "bun";
-import { appendFile, mkdir, readFile, rm } from "fs/promises";
+import { appendFile, mkdir, readFile, readdir, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { dirname, isAbsolute, join } from "path";
 
@@ -47,6 +47,7 @@ import { computeMissingBaselineLabels } from "./github-labels";
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
 import { recordIssueSnapshot } from "./state";
 import {
+  isPathUnderDir,
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
   stripHeadsRef,
@@ -411,9 +412,14 @@ export class RepoWorker {
     };
   }
 
-  private async recordRunLogPath(task: AgentTask, issueNumber: string, stepTitle: string): Promise<string | undefined> {
+  private async recordRunLogPath(
+    task: AgentTask,
+    issueNumber: string,
+    stepTitle: string,
+    status: AgentTask["status"]
+  ): Promise<string | undefined> {
     const runLogPath = getRalphRunLogPath({ repo: this.repo, issueNumber, stepTitle, ts: Date.now() });
-    const updated = await this.queue.updateTaskStatus(task, "in-progress", { "run-log-path": runLogPath });
+    const updated = await this.queue.updateTaskStatus(task, status, { "run-log-path": runLogPath });
     if (!updated) {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
     }
@@ -608,10 +614,49 @@ export class RepoWorker {
     }
   }
 
-  private async ensureGitWorktree(worktreePath: string): Promise<void> {
-    const worktreeGitMarker = join(worktreePath, ".git");
+  private isManagedWorktreePath(worktreePath: string, baseDir = RALPH_WORKTREES_DIR): boolean {
+    return isPathUnderDir(worktreePath, baseDir);
+  }
 
-    const hasHealthyWorktree = () => existsSync(worktreePath) && existsSync(worktreeGitMarker);
+  private isRepoWorktreePath(worktreePath: string): boolean {
+    const repoSlug = this.repo.split("/")[1] ?? this.repo;
+    const repoKey = safeNoteName(this.repo);
+    return (
+      this.isManagedWorktreePath(worktreePath, join(RALPH_WORKTREES_DIR, repoSlug)) ||
+      this.isManagedWorktreePath(worktreePath, join(RALPH_WORKTREES_DIR, repoKey))
+    );
+  }
+
+  private isSameRepoRootPath(worktreePath: string): boolean {
+    return this.repoPath === worktreePath;
+  }
+
+  private isHealthyWorktreePath(worktreePath: string): boolean {
+    return existsSync(worktreePath) && existsSync(join(worktreePath, ".git"));
+  }
+
+  private async safeRemoveWorktree(worktreePath: string, opts?: { allowDiskCleanup?: boolean }): Promise<void> {
+    const allowDiskCleanup = opts?.allowDiskCleanup ?? false;
+
+    try {
+      await $`git worktree remove --force ${worktreePath}`.cwd(this.repoPath).quiet();
+      return;
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      console.warn(`[ralph:worker:${this.repo}] Failed to remove worktree ${worktreePath}: ${msg}`);
+    }
+
+    if (!allowDiskCleanup) return;
+
+    try {
+      await rm(worktreePath, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
+
+  private async ensureGitWorktree(worktreePath: string): Promise<void> {
+    const hasHealthyWorktree = () => this.isHealthyWorktreePath(worktreePath);
 
     const cleanupBrokenWorktree = async (): Promise<void> => {
       try {
@@ -666,14 +711,67 @@ export class RepoWorker {
   }
 
   private async cleanupGitWorktree(worktreePath: string): Promise<void> {
-    try {
-      await $`git worktree remove --force ${worktreePath}`.cwd(this.repoPath).quiet();
-    } catch (e: any) {
-      console.warn(`[ralph:worker:${this.repo}] Failed to remove worktree ${worktreePath}: ${e?.message ?? String(e)}`);
+    await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: true });
+  }
+
+  private async cleanupOrphanedWorktrees(): Promise<void> {
+    const entries = await this.getGitWorktrees();
+    const knownWorktrees = new Set(entries.map((entry) => entry.worktreePath));
+
+    if (entries.length > 0) {
+      for (const entry of entries) {
+        if (!this.isRepoWorktreePath(entry.worktreePath)) continue;
+        if (this.isHealthyWorktreePath(entry.worktreePath)) continue;
+
+        console.warn(
+          `[ralph:worker:${this.repo}] Worktree registered but unhealthy; pruning: ${entry.worktreePath}`
+        );
+        await this.safeRemoveWorktree(entry.worktreePath, { allowDiskCleanup: false });
+      }
+    }
+
+    const repoRoot = this.repoPath;
+    const repoRootManaged = this.isManagedWorktreePath(repoRoot);
+    if (repoRootManaged) return;
+
+    const repoSlug = this.repo.split("/")[1] ?? this.repo;
+    const repoKey = safeNoteName(this.repo);
+
+    const repoCandidates = [join(RALPH_WORKTREES_DIR, repoSlug), join(RALPH_WORKTREES_DIR, repoKey)];
+
+    for (const repoDir of repoCandidates) {
+      if (!existsSync(repoDir)) continue;
+
+      let issueDirs: { name: string; isDirectory(): boolean }[] = [];
       try {
-        await rm(worktreePath, { recursive: true, force: true });
+        issueDirs = await readdir(repoDir, { withFileTypes: true });
       } catch {
-        // ignore
+        continue;
+      }
+
+      for (const issueEntry of issueDirs) {
+        if (!issueEntry.isDirectory()) continue;
+        const issueDir = join(repoDir, issueEntry.name);
+
+        let taskDirs: { name: string; isDirectory(): boolean }[] = [];
+        try {
+          taskDirs = await readdir(issueDir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+
+        for (const taskEntry of taskDirs) {
+          if (!taskEntry.isDirectory()) continue;
+          const worktreeDir = join(issueDir, taskEntry.name);
+          if (knownWorktrees.has(worktreeDir)) continue;
+          if (!existsSync(worktreeDir)) continue;
+          if (!this.isRepoWorktreePath(worktreeDir)) continue;
+          if (this.isManagedWorktreePath(repoRoot, worktreeDir)) continue;
+          if (this.isSameRepoRootPath(worktreeDir)) continue;
+
+          console.warn(`[ralph:worker:${this.repo}] Stale worktree directory; pruning: ${worktreeDir}`);
+          await this.safeRemoveWorktree(worktreeDir, { allowDiskCleanup: true });
+        }
       }
     }
   }
@@ -776,6 +874,50 @@ export class RepoWorker {
     } catch {
       return [];
     }
+  }
+
+  private async cleanupWorktreesOnStartup(): Promise<void> {
+    try {
+      await $`git worktree prune`.cwd(this.repoPath).quiet();
+    } catch (e: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to prune git worktrees on startup: ${e?.message ?? String(e)}`
+      );
+    }
+
+    try {
+      await this.cleanupOrphanedWorktrees();
+    } catch (e: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to cleanup orphaned worktrees on startup: ${e?.message ?? String(e)}`
+      );
+    }
+  }
+
+  private async cleanupWorktreesForTasks(tasks: AgentTask[]): Promise<void> {
+    const managedPaths = new Set<string>();
+    for (const task of tasks) {
+      const recorded = task["worktree-path"]?.trim();
+      if (recorded) managedPaths.add(recorded);
+    }
+
+    for (const worktreePath of managedPaths) {
+      if (!this.isRepoWorktreePath(worktreePath)) continue;
+      if (this.isHealthyWorktreePath(worktreePath)) continue;
+
+      console.warn(
+        `[ralph:worker:${this.repo}] Recorded worktree-path unhealthy; pruning: ${worktreePath}`
+      );
+      await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: false });
+    }
+  }
+
+  async runStartupCleanup(): Promise<void> {
+    await this.cleanupWorktreesOnStartup();
+  }
+
+  async runTaskCleanup(tasks: AgentTask[]): Promise<void> {
+    await this.cleanupWorktreesForTasks(tasks);
   }
 
   private async tryEnsurePrFromWorktree(params: {
@@ -997,6 +1139,22 @@ export class RepoWorker {
     await gh`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
   }
 
+  private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
+    await gh`gh pr update-branch ${prUrl} --repo ${this.repo}`.cwd(cwd).quiet();
+  }
+
+  private isOutOfDateMergeError(error: any): boolean {
+    const message = String(error?.stderr ?? error?.message ?? "");
+    if (!message) return false;
+    return /not up to date with the base branch/i.test(message);
+  }
+
+  private formatGhError(error: any): string {
+    const message = String(error?.message ?? "").trim();
+    const stderr = String(error?.stderr ?? "").trim();
+    return [message, stderr].filter(Boolean).join("\n");
+  }
+
   private async mergePrWithRequiredChecks(params: {
     task: AgentTask;
     repoPath: string;
@@ -1014,6 +1172,7 @@ export class RepoWorker {
     let prUrl = params.prUrl;
     let sessionId = params.sessionId;
     let lastSummary: RequiredChecksSummary | null = null;
+    let didUpdateBranch = false;
 
     for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
       const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
@@ -1025,8 +1184,36 @@ export class RepoWorker {
 
       if (checkResult.summary.status === "success") {
         console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
-        await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-        return { ok: true, prUrl, sessionId };
+        try {
+          await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+          return { ok: true, prUrl, sessionId };
+        } catch (error: any) {
+          if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
+            console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
+            didUpdateBranch = true;
+            try {
+              await this.updatePullRequestBranch(prUrl, params.repoPath);
+              continue;
+            } catch (updateError: any) {
+              const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
+              console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+              await this.queue.updateTaskStatus(params.task, "blocked");
+              await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+
+              return {
+                ok: false,
+                run: {
+                  taskName: params.task.name,
+                  repo: this.repo,
+                  outcome: "failed",
+                  sessionId,
+                  escalationReason: reason,
+                },
+              };
+            }
+          }
+          throw error;
+        }
       }
 
       if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
@@ -1051,7 +1238,12 @@ export class RepoWorker {
       ].join("\n");
 
       const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
-      const runLogPath = await this.recordRunLogPath(params.task, issueNumber, `${params.watchdogStagePrefix}-fix-ci`);
+      const runLogPath = await this.recordRunLogPath(
+        params.task,
+        issueNumber,
+        `${params.watchdogStagePrefix}-fix-ci`,
+        "in-progress"
+      );
 
       const fixResult = await this.session.continueSession(params.repoPath, sessionId, fixMessage, {
         repo: this.repo,
@@ -1379,7 +1571,7 @@ export class RepoWorker {
           return { success: false, error: "hard throttled" };
         }
 
-        const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`);
+        const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`, "in-progress");
 
         const res = await this.session.continueSession(repoPath, sid, message, {
           repo: this.repo,
@@ -1531,7 +1723,7 @@ export class RepoWorker {
       const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
       if (pausedBefore) return pausedBefore;
 
-      const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume");
+      const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
       let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, resumeMessage, {
         repo: this.repo,
@@ -1642,7 +1834,12 @@ export class RepoWorker {
           const pausedLoopBreak = await this.pauseIfHardThrottled(task, "resume loop-break", buildResult.sessionId || existingSessionId);
           if (pausedLoopBreak) return pausedLoopBreak;
 
-          const loopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume loop-break");
+          const loopBreakRunLogPath = await this.recordRunLogPath(
+            task,
+            issueNumber || cacheKey,
+            "resume loop-break",
+            "in-progress"
+          );
 
           buildResult = await this.session.continueSession(
             taskRepoPath,
@@ -1694,7 +1891,7 @@ export class RepoWorker {
         if (pausedContinue) return pausedContinue;
 
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
-        const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue");
+        const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue", "in-progress");
 
         buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
@@ -1812,7 +2009,7 @@ export class RepoWorker {
       if (pausedSurvey) return pausedSurvey;
 
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
-      const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey");
+      const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey", "in-progress");
 
         const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
           repo: this.repo,
@@ -1945,7 +2142,7 @@ export class RepoWorker {
       const pausedNextTask = await this.pauseIfHardThrottled(task, "next-task");
       if (pausedNextTask) return pausedNextTask;
 
-      const nextTaskRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task");
+      const nextTaskRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task", "starting");
 
       let planResult = await this.session.runCommand(taskRepoPath, "next-task", [issueNumber], {
         repo: this.repo,
@@ -1972,7 +2169,7 @@ export class RepoWorker {
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
         console.warn(`[ralph:worker:${this.repo}] /next-task hit transient cache ENOENT; retrying once...`);
         await new Promise((r) => setTimeout(r, 750));
-        const nextTaskRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task-retry");
+        const nextTaskRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task-retry", "starting");
 
         planResult = await this.session.runCommand(taskRepoPath, "next-task", [issueNumber], {
           repo: this.repo,
@@ -2027,7 +2224,7 @@ export class RepoWorker {
         const pausedDevexConsult = await this.pauseIfHardThrottled(task, "consult devex", baseSessionId);
         if (pausedDevexConsult) return pausedDevexConsult;
 
-        const devexRunLogPath = await this.recordRunLogPath(task, issueNumber, "consult devex");
+        const devexRunLogPath = await this.recordRunLogPath(task, issueNumber, "consult devex", "in-progress");
 
         const devexResult = await this.session.continueSession(taskRepoPath, baseSessionId, devexPrompt, {
           agent: "devex",
@@ -2083,7 +2280,7 @@ export class RepoWorker {
           const pausedReroute = await this.pauseIfHardThrottled(task, "reroute after devex", baseSessionId);
           if (pausedReroute) return pausedReroute;
 
-          const rerouteRunLogPath = await this.recordRunLogPath(task, issueNumber, "reroute after devex");
+          const rerouteRunLogPath = await this.recordRunLogPath(task, issueNumber, "reroute after devex", "in-progress");
 
           const rerouteResult = await this.session.continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
             repo: this.repo,
@@ -2187,7 +2384,7 @@ export class RepoWorker {
       const pausedBuild = await this.pauseIfHardThrottled(task, "build", planResult.sessionId);
       if (pausedBuild) return pausedBuild;
 
-      const buildRunLogPath = await this.recordRunLogPath(task, issueNumber, "build");
+      const buildRunLogPath = await this.recordRunLogPath(task, issueNumber, "build", "in-progress");
 
       let buildResult = await this.session.continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
         repo: this.repo,
@@ -2290,7 +2487,12 @@ export class RepoWorker {
           const pausedBuildLoopBreak = await this.pauseIfHardThrottled(task, "build loop-break", buildResult.sessionId);
           if (pausedBuildLoopBreak) return pausedBuildLoopBreak;
 
-          const buildLoopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber, "build loop-break");
+          const buildLoopBreakRunLogPath = await this.recordRunLogPath(
+            task,
+            issueNumber,
+            "build loop-break",
+            "in-progress"
+          );
 
           buildResult = await this.session.continueSession(
             taskRepoPath,
@@ -2338,7 +2540,7 @@ export class RepoWorker {
         if (pausedBuildContinue) return pausedBuildContinue;
 
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
-        const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue");
+        const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue", "in-progress");
 
         buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
           repo: this.repo,
@@ -2450,7 +2652,7 @@ export class RepoWorker {
       if (pausedSurvey) return pausedSurvey;
 
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
-      const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey");
+      const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
 
       const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
         repo: this.repo,
