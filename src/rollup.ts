@@ -202,7 +202,7 @@ ${issueList}
 ## Testing
 
 Please test the following areas affected by these changes:
-- Run the full test suite: `bun test`
+- Run the full test suite: \`bun test\`
 - Manually verify any UI changes
 - Check for regressions in core functionality
 
