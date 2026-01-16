@@ -113,7 +113,7 @@ We want a stable operator interface that works without the dashboard, but can be
 Two phases:
 
 - Phase 0 (no control plane required):
-  - CLI writes a control file, e.g. `$XDG_STATE_HOME/ralph/control.json`.
+  - CLI writes a control file, e.g. `$XDG_STATE_HOME/ralph/control.json` (fallback `~/.local/state/ralph/control.json`, last resort `/tmp/ralph/<uid>/control.json`).
   - Daemon watches/polls it.
   - Optional: CLI sends `SIGUSR1` to prompt immediate reload.
 
