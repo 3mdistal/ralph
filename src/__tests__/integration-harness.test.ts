@@ -419,11 +419,18 @@ describe("integration-ish harness: full task lifecycle", () => {
       throw new Error("GraphQL: branch protection rule prevents update");
     });
     const isPrBehindMock = mock(async () => false);
+    const getPullRequestChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+    }));
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
     (worker as any).isPrBehind = isPrBehindMock;
+    (worker as any).getPullRequestChecks = getPullRequestChecksMock;
 
     (worker as any).createAgentRun = async () => {};
 
