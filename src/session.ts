@@ -798,6 +798,8 @@ async function runSession(
     unregisterOpencodeRun(runMeta.pgid);
   };
 
+  const canListen = typeof (proc as any)?.on === "function";
+
   if (lockPath && continueSessionId) {
     try {
       mkdirSync(getSessionDirForRun(continueSessionId), { recursive: true });
@@ -805,17 +807,39 @@ async function runSession(
         lockPath,
         JSON.stringify({ ts: scheduler.now(), pid: proc.pid ?? null, sessionId: continueSessionId }) + "\n"
       );
-      proc.on("close", cleanupLock);
-      proc.on("error", cleanupLock);
+      if (canListen) {
+        proc.on("close", cleanupLock);
+        proc.on("error", cleanupLock);
+      }
     } catch {
       // If we can't write the lock file, proceed anyway.
     }
   }
 
-  proc.on("close", cleanupRun);
-  proc.on("error", cleanupRun);
+  if (canListen) {
+    proc.on("close", cleanupRun);
+    proc.on("error", cleanupRun);
+  }
 
   const requestKill = () => {
+    if (options?.__testOverrides?.spawn && !options?.__testOverrides?.processKill) {
+      if (typeof (proc as any)?.kill === "function") {
+        try {
+          (proc as any).kill("SIGTERM");
+        } catch {
+          // ignore
+        }
+        scheduler.setTimeout(() => {
+          try {
+            (proc as any).kill("SIGKILL");
+          } catch {
+            // ignore
+          }
+        }, 5000);
+      }
+      return;
+    }
+
     const target = runMeta && runMeta.useProcessGroup ? -runMeta.pgid : proc.pid;
     if (!target) return;
 
@@ -1415,8 +1439,10 @@ async function* streamSession(
     unregisterOpencodeRun(runMeta.pgid);
   };
 
-  proc.on("close", cleanupRun);
-  proc.on("error", cleanupRun);
+  if (typeof (proc as any)?.on === "function") {
+    proc.on("close", cleanupRun);
+    proc.on("error", cleanupRun);
+  }
 
   let buffer = "";
 
