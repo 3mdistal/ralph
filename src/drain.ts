@@ -96,6 +96,10 @@ function formatWarning(message: string): string {
   return `[ralph] ${message}`;
 }
 
+function formatInfo(message: string): string {
+  return `[ralph] ${message}`;
+}
+
 type Sigusr1Subscriber = () => void;
 
 let sigusr1Installed = false;
@@ -142,7 +146,7 @@ function describeControlReadFailure(path: string, reason: unknown): string {
   return `Failed to load control file ${path}; defaulting to mode=running (reason: ${message})`;
 }
 
-function shouldSuppressMissingWarning(reason: unknown): boolean {
+function isMissingControlFileError(reason: unknown): boolean {
   return reason instanceof Error && (reason as any).code === "ENOENT";
 }
 
@@ -180,7 +184,7 @@ function writeDefaultControlFile(path: string, log?: (message: string) => void):
 
   try {
     writeFileSync(path, `${JSON.stringify({ mode: "running" }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-    log?.(formatWarning(`Control file created at ${path} (defaulting to mode=running)`));
+    log?.(formatInfo(`Control file created at ${path} (defaulting to mode=running)`));
     return true;
   } catch (e: any) {
     if (e?.code === "EEXIST") return true;
@@ -206,7 +210,7 @@ export function readControlStateSnapshot(opts?: {
     const raw = readFileSync(path, "utf8");
     return parseControlStateJson(raw);
   } catch (e: any) {
-    if (!defaults.suppressMissingWarnings || !shouldSuppressMissingWarning(e)) {
+    if (!defaults.suppressMissingWarnings || !isMissingControlFileError(e)) {
       opts?.log?.(formatWarning(describeControlReadFailure(path, e)));
     }
     return { mode: "running" };
