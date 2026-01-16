@@ -50,8 +50,9 @@ function ensureSchema(database: Database): void {
 
   const existingVersion = existing?.value ? Number(existing.value) : null;
   if (existingVersion && existingVersion > SCHEMA_VERSION) {
+    const schemaLabel = existing?.value ?? "unknown";
     throw new Error(
-      `Unsupported state.sqlite schema_version=${existing.value}; expected ${SCHEMA_VERSION}`
+      `Unsupported state.sqlite schema_version=${schemaLabel}; expected ${SCHEMA_VERSION}`
     );
   }
 
