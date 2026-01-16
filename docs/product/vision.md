@@ -56,6 +56,11 @@ Ralph/agents should merge to `bot/integration`, not `main` directly. Every ~10 P
 
 Humans/maintainers may still merge directly to `main` when needed; the bot-branch strategy is a Ralph policy, not a repo-wide prohibition.
 
+Rollup automation policy:
+- Default batch size is 10 (configurable globally or per repo).
+- If there are no queued or in-flight tasks for 5 minutes, check for unrolled changes on `bot/integration`.
+- Create a rollup PR from `bot/integration` to `main` when there are unrolled changes, unless one is already open.
+
 Benefits:
 - Reduces interrupt frequency
 - Batches related changes for easier review
