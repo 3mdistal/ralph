@@ -97,6 +97,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
+- Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
