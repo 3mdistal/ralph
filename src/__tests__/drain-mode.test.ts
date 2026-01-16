@@ -56,9 +56,10 @@ describe("Drain mode", () => {
     expect(isDraining(homeDir)).toBe(false);
   });
 
-  test("resolveControlFilePath falls back to /tmp when home missing", () => {
+  test("resolveControlFilePath falls back to uid-scoped /tmp when home missing", () => {
     const controlPath = resolveControlFilePath("", "");
-    expect(controlPath).toBe(join("/tmp", "ralph", "control.json"));
+    const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
+    expect(controlPath).toBe(join("/tmp", "ralph", String(uid), "control.json"));
   });
 
   test("DrainMonitor emits transition logs", async () => {
@@ -170,6 +171,7 @@ describe("Drain mode", () => {
     const controlDir = dirname(controlPath);
 
     rmSync(controlDir, { recursive: true, force: true });
+    mkdirSync(dirname(controlDir), { recursive: true });
     symlinkSync(realDir, controlDir, "dir");
 
     expect(isDraining(homeDir)).toBe(false);
