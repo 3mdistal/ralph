@@ -63,6 +63,8 @@ This provides full auditability and integrates with existing Obsidian workflows.
 
 Ralph/agents should merge to `bot/integration`, not `main` directly. Every ~10 PRs, create a rollup PR from `bot/integration` to `main` for batch human review.
 
+If the bot branch is missing on the remote, create it from the repository default branch head before applying branch protections or running tasks.
+
 Humans/maintainers may still merge directly to `main` when needed; the bot-branch strategy is a Ralph policy, not a repo-wide prohibition.
 
 Rollup automation policy:

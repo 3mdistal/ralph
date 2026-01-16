@@ -258,6 +258,113 @@ describe("Scheduler invariants", () => {
     expect(started[0]).toBe("resume:t1");
   });
 
+  test("resume scheduling does not block queued tasks", () => {
+    const inFlightTasks = new Set<string>();
+    const started: string[] = [];
+
+    const globalSemaphore = new Semaphore(2);
+
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(2);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const startPriorityTask = ({ task }: { task: TestTask }) => {
+      started.push(`resume:${task._path}`);
+    };
+
+    const startTask = ({ task }: { task: TestTask }) => {
+      started.push(`queued:${task._path}`);
+    };
+
+    const startedCount = startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks: [{ repo: "repo-a", _path: "queued-1", name: "queued" }],
+      priorityTasks: [{ repo: "repo-a", _path: "resume-1", name: "resume" }],
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor: { value: 0 },
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+      startPriorityTask: startPriorityTask as any,
+    });
+
+    expect(startedCount).toBe(2);
+    expect(started).toEqual(["resume:resume-1", "queued:queued-1"]);
+  });
+
+  test("queued tasks still schedule when resume tasks are pending", async () => {
+    type ControllerTask = { repo: string; _path: string; name: string };
+    const pendingResumes: ControllerTask[] = [{ repo: "repo-a", _path: "resume-1", name: "resume" }];
+    const queuedTasks: ControllerTask[] = [{ repo: "repo-a", _path: "queued-1", name: "queued" }];
+    const log: string[] = [];
+
+    const globalSemaphore = new Semaphore(2);
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(2);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const inFlightTasks = new Set<string>();
+    const started: string[] = [];
+    const rrCursor = { value: 0 };
+
+    const controller = createSchedulerController<ControllerTask>({
+      getDaemonMode: () => "running",
+      isShuttingDown: () => false,
+      getRunnableTasks: async () => queuedTasks,
+      onRunnableTasks: (tasks) => {
+        const startedCount = startQueuedTasks<ControllerTask>({
+          gate: "running",
+          tasks,
+          priorityTasks: pendingResumes,
+          inFlightTasks,
+          getTaskKey: (t) => t._path || t.name,
+          groupByRepo,
+          globalSemaphore,
+          getRepoSemaphore,
+          rrCursor,
+          shouldLog: () => false,
+          log: (message) => log.push(message),
+          startTask: ({ task }) => started.push(`queued:${task._path}`),
+          startPriorityTask: ({ task }) => started.push(`resume:${task._path}`),
+        });
+
+        log.push(`started:${startedCount}`);
+      },
+      getPendingResumeTasks: () => pendingResumes,
+      onPendingResumeTasks: () => {},
+      timers: {
+        setTimeout: (fn: (...args: any[]) => void) => {
+          fn();
+          return 1 as any;
+        },
+        clearTimeout: () => {},
+      } as any,
+    });
+
+    controller.scheduleQueuedTasksSoon();
+    controller.scheduleQueuedTasksSoon();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(started).toEqual(["resume:resume-1", "queued:queued-1"]);
+    expect(log).toContain("started:2");
+  });
+
   test("resume still runs under drain (resolved escalations)", async () => {
     const resumeTask = mock(async () => ({ taskName: "", repo: "", outcome: "success" } as any));
 
