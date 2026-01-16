@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { beforeEach } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { DrainMonitor, isDraining, resolveControlFilePath } from "../drain";
@@ -54,6 +54,12 @@ describe("Drain mode", () => {
 
     writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
     expect(isDraining(homeDir)).toBe(false);
+  });
+
+  test("resolveControlFilePath falls back to uid-scoped /tmp when home missing", () => {
+    const controlPath = resolveControlFilePath("", "");
+    const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
+    expect(controlPath).toBe(join("/tmp", "ralph", String(uid), "control.json"));
   });
 
   test("DrainMonitor emits transition logs", async () => {
@@ -122,5 +128,52 @@ describe("Drain mode", () => {
 
     monitor.stop();
     expect(monitor.getMode()).toBe("running");
+  });
+
+  test("DrainMonitor creates control directory on startup", async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+    tmpDirs.push(homeDir);
+
+    const controlPath = resolveControlFilePath(homeDir);
+    const controlDir = dirname(controlPath);
+
+    expect(existsSync(controlDir)).toBe(false);
+
+    const monitor = new DrainMonitor({
+      homeDir,
+      pollIntervalMs: 10,
+    });
+
+    monitor.start();
+    await sleep(25);
+
+    expect(existsSync(controlDir)).toBe(true);
+    expect(() => statSync(controlDir)).not.toThrow();
+
+    monitor.stop();
+  });
+
+  test("falls back to uid-scoped tmp dir when homes missing", () => {
+    const homeDir = "";
+    const path = resolveControlFilePath(homeDir, "");
+    const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
+    expect(path).toBe(`/tmp/ralph/${uid}/control.json`);
+  });
+
+  test("refuses symlinked control dir", () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+    tmpDirs.push(homeDir);
+
+    const realDir = mkdtempSync(join(tmpdir(), "ralph-drain-real-"));
+    tmpDirs.push(realDir);
+
+    const controlPath = resolveControlFilePath(homeDir);
+    const controlDir = dirname(controlPath);
+
+    rmSync(controlDir, { recursive: true, force: true });
+    mkdirSync(dirname(controlDir), { recursive: true });
+    symlinkSync(realDir, controlDir, "dir");
+
+    expect(isDraining(homeDir)).toBe(false);
   });
 });

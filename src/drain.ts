@@ -1,6 +1,6 @@
-import { readFileSync, statSync } from "fs";
+import { lstatSync, mkdirSync, readFileSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 
 export type DaemonMode = "running" | "draining";
 
@@ -11,12 +11,40 @@ export type ControlState = {
   opencodeProfile?: string;
 };
 
+function resolveTmpControlDir(): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
+  return join("/tmp", "ralph", String(uid));
+}
+
+function resolveHomeDirFallback(): string | undefined {
+  const homeEnv = process.env.HOME?.trim();
+  if (homeEnv) return homeEnv;
+  try {
+    return homedir();
+  } catch {
+    return undefined;
+  }
+}
+
 export function resolveControlFilePath(
-  homeDir: string = homedir(),
+  homeDir?: string,
   xdgStateHome: string | undefined = process.env.XDG_STATE_HOME
 ): string {
-  const stateHome = xdgStateHome?.trim() ? xdgStateHome.trim() : join(homeDir, ".local", "state");
-  return join(stateHome, "ralph", "control.json");
+  const trimmedStateHome = xdgStateHome?.trim();
+  if (trimmedStateHome) return join(trimmedStateHome, "ralph", "control.json");
+
+  const resolvedHome = homeDir?.trim() ?? resolveHomeDirFallback();
+  if (resolvedHome) return join(resolvedHome, ".local", "state", "ralph", "control.json");
+
+  return join(resolveTmpControlDir(), "control.json");
+}
+
+function ensureControlFileDir(path: string, opts?: { log?: (message: string) => void }): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch (e: any) {
+    opts?.log?.(formatWarning(`Failed to create control directory for ${path} (reason: ${e?.message ?? String(e)})`));
+  }
 }
 
 function parseControlStateJson(raw: string): ControlState {
@@ -99,23 +127,53 @@ function subscribeSigusr1(cb: Sigusr1Subscriber): () => void {
   };
 }
 
+function describeControlReadFailure(path: string, reason: unknown): string {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  return `Failed to load control file ${path}; defaulting to mode=running (reason: ${message})`;
+}
+
+function assertSafeControlFile(path: string): void {
+  const dir = dirname(path);
+  const dirStat = lstatSync(dir);
+  if (!dirStat.isDirectory()) {
+    throw new Error(`Control directory is not a directory: ${dir}`);
+  }
+  if (dirStat.isSymbolicLink()) {
+    throw new Error(`Control directory is a symlink: ${dir}`);
+  }
+
+  const fileStat = lstatSync(path);
+  if (!fileStat.isFile()) {
+    throw new Error(`Control file is not a regular file: ${path}`);
+  }
+  if (fileStat.isSymbolicLink()) {
+    throw new Error(`Control file is a symlink: ${path}`);
+  }
+}
+
+function ensureControlParentDir(path: string, log?: (message: string) => void): void {
+  const dir = dirname(path);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  } catch (e: any) {
+    log?.(formatWarning(`Failed to ensure control dir ${dir}; continuing (reason: ${e?.message ?? String(e)})`));
+  }
+}
+
 export function readControlStateSnapshot(opts?: {
   homeDir?: string;
   xdgStateHome?: string;
   log?: (message: string) => void;
 }): ControlState {
   const path = resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
+  ensureControlParentDir(path, opts?.log);
 
   try {
+    assertSafeControlFile(path);
     const raw = readFileSync(path, "utf8");
     return parseControlStateJson(raw);
   } catch (e: any) {
-    opts?.log?.(
-      formatWarning(
-        `Failed to load control file ${path}; defaulting to mode=running (reason: ${e?.message ?? String(e)})`
-      )
-    );
-
+    opts?.log?.(formatWarning(describeControlReadFailure(path, e)));
     return { mode: "running" };
   }
 }
@@ -234,15 +292,23 @@ export class DrainMonitor {
 
   private reloadNow(reason: string, opts?: { force?: boolean }): void {
     const path = resolveControlFilePath(this.options.homeDir, this.options.xdgStateHome);
+    if (reason === "startup") {
+      ensureControlFileDir(path, { log: this.options.warn ?? this.options.log });
+    }
 
     let mtimeMs: number | null = null;
 
     try {
-      const stat = statSync(path);
+      assertSafeControlFile(path);
+      const stat = lstatSync(path);
       mtimeMs = stat.mtimeMs;
       this.lastMissing = false;
     } catch (e: any) {
       if (e?.code === "ENOENT") {
+        if (reason === "startup") {
+          ensureControlFileDir(path, { log: this.options.warn ?? this.options.log });
+        }
+
         this.warnOnceForMissing(path);
 
         const fallback: ControlState = this.lastKnownGood ?? { mode: "running" };

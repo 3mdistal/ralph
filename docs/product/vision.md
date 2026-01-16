@@ -52,7 +52,9 @@ This provides full auditability and integrates with existing Obsidian workflows.
 
 ### 2. Bot Branch Strategy
 
-Agents merge to `bot/integration`, not main directly. Every ~10 PRs, create a rollup PR to main for batch human review.
+Ralph/agents should merge to `bot/integration`, not `main` directly. Every ~10 PRs, create a rollup PR from `bot/integration` to `main` for batch human review.
+
+Humans/maintainers may still merge directly to `main` when needed; the bot-branch strategy is a Ralph policy, not a repo-wide prohibition.
 
 Rollup automation policy:
 - Default batch size is 10 (configurable globally or per repo).
@@ -63,6 +65,8 @@ Benefits:
 - Reduces interrupt frequency
 - Batches related changes for easier review
 - Provides a checkpoint for E2E testing
+
+Operational details (merge recovery, worktree cleanup): see `docs/escalation-policy.md`.
 
 ### 3. Escalation-First Design
 

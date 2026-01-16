@@ -32,7 +32,7 @@ import {
 import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
-import { startQueuedTasks } from "./scheduler";
+import { createSchedulerController, startQueuedTasks } from "./scheduler";
 
 import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { formatDuration, shouldLog } from "./logging";
@@ -42,6 +42,7 @@ import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { initStateDb, recordPrSnapshot } from "./state";
 import { queueNudge } from "./nudge";
+import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
@@ -279,6 +280,7 @@ function getOrCreateWorker(repo: string): RepoWorker {
   const created = new RepoWorker(repo, repoPath);
   workers.set(repo, created);
   console.log(`[ralph] Created worker for ${repo} -> ${repoPath}`);
+  void created.runStartupCleanup();
   return created;
 }
 
@@ -287,29 +289,15 @@ async function getRunnableTasks(): Promise<AgentTask[]> {
   return [...starting, ...queued];
 }
 
-let scheduleQueuedTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleQueuedTasksSoon(): void {
-  if (scheduleQueuedTimer) return;
-  scheduleQueuedTimer = setTimeout(() => {
-    scheduleQueuedTimer = null;
-    if (isShuttingDown) return;
-    if (getDaemonMode() === "draining" && pendingResumeTasks.size === 0) return;
-    void getRunnableTasks().then((tasks) => processNewTasks(tasks));
-  }, 250);
-}
-
-let scheduleResumeTimer: ReturnType<typeof setTimeout> | null = null;
-function scheduleResumeTasksSoon(): void {
-  if (scheduleResumeTimer) return;
-  scheduleResumeTimer = setTimeout(() => {
-    scheduleResumeTimer = null;
-    if (isShuttingDown) return;
-
+const schedulerController = createSchedulerController({
+  getDaemonMode: () => getDaemonMode(),
+  isShuttingDown: () => isShuttingDown,
+  getRunnableTasks: () => getRunnableTasks(),
+  onRunnableTasks: (tasks) => processNewTasks(tasks),
+  getPendingResumeTasks: () => Array.from(pendingResumeTasks.values()),
+  onPendingResumeTasks: (priorityTasks) => {
     ensureSemaphores();
     if (!globalSemaphore) return;
-
-    const priorityTasks = Array.from(pendingResumeTasks.values());
-    if (priorityTasks.length === 0) return;
 
     startQueuedTasks({
       gate: "running",
@@ -326,7 +314,15 @@ function scheduleResumeTasksSoon(): void {
       startTask,
       startPriorityTask: startResumeTask,
     });
-  }, 250);
+  },
+});
+
+function scheduleQueuedTasksSoon(): void {
+  schedulerController.scheduleQueuedTasksSoon();
+}
+
+function scheduleResumeTasksSoon(): void {
+  schedulerController.scheduleResumeTasksSoon();
 }
 
 let escalationWatcher: ReturnType<typeof watch> | null = null;
@@ -662,9 +658,20 @@ async function resumeTasksOnStartup(opts?: {
   const schedulingMode = opts?.schedulingMode ?? resumeSchedulingMode;
 
   const inProgress = await getTasksByStatus("in-progress");
-  if (inProgress.length === 0) return;
 
-  console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
+  if (inProgress.length > 0) {
+    console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
+  }
+
+  const inProgressByRepo = groupByRepo(inProgress);
+  await Promise.all(
+    Array.from(inProgressByRepo.entries()).map(async ([repo, tasks]) => {
+      const worker = getOrCreateWorker(repo);
+      await worker.runTaskCleanup(tasks);
+    })
+  );
+
+  if (inProgress.length === 0) return;
 
   const withoutSession = inProgress.filter((t) => !(t["session-id"]?.trim()));
   for (const task of withoutSession) {
@@ -677,8 +684,8 @@ async function resumeTasksOnStartup(opts?: {
 
   const globalLimit = loadConfig().maxWorkers;
 
-  const byRepo = groupByRepo(withSession);
-  const repos = Array.from(byRepo.keys());
+  const withSessionByRepo = groupByRepo(withSession);
+  const repos = Array.from(withSessionByRepo.keys());
   const perRepoResumed = new Map<string, number>();
 
   const toResume: AgentTask[] = [];
@@ -690,7 +697,7 @@ async function resumeTasksOnStartup(opts?: {
     for (let i = 0; i < repos.length; i++) {
       const idx = (cursor + i) % repos.length;
       const repo = repos[idx];
-      const repoTasks = byRepo.get(repo);
+      const repoTasks = withSessionByRepo.get(repo);
       if (!repoTasks || repoTasks.length === 0) continue;
 
       const limit = getRepoMaxWorkers(repo);
@@ -710,7 +717,7 @@ async function resumeTasksOnStartup(opts?: {
 
   const toRequeue: AgentTask[] = [];
   for (const repo of repos) {
-    const remaining = byRepo.get(repo) ?? [];
+    const remaining = withSessionByRepo.get(repo) ?? [];
     for (const task of remaining) toRequeue.push(task);
   }
 
@@ -912,11 +919,19 @@ async function main(): Promise<void> {
       clearTimeout(escalationDebounceTimer);
       escalationDebounceTimer = null;
     }
+    schedulerController.clearTimers();
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
     clearInterval(idleRollupTimer);
     clearInterval(throttleResumeTimer);
     
+    // Terminate in-flight OpenCode runs spawned by Ralph.
+    const termination = await terminateOpencodeRuns({ graceMs: 5000 });
+    if (termination.total > 0) {
+      const suffix = termination.remaining > 0 ? ` (${termination.remaining} required SIGKILL)` : "";
+      console.log(`[ralph] Terminated ${termination.total} OpenCode run(s)${suffix}.`);
+    }
+
     // Wait for in-flight tasks
     if (inFlightTasks.size > 0) {
       console.log(`[ralph] Waiting for ${inFlightTasks.size} in-flight task(s)...`);
@@ -976,7 +991,7 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Drain mode: set mode=draining|running in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json).",
+      "  Drain mode: set mode=draining|running in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
       "  OpenCode profile: set opencode_profile=\"<name>\" in the same control file (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
