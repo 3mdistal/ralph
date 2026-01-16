@@ -39,6 +39,14 @@ export function resolveControlFilePath(
   return join(resolveTmpControlDir(), "control.json");
 }
 
+function ensureControlFileDir(path: string, opts?: { log?: (message: string) => void }): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch (e: any) {
+    opts?.log?.(formatWarning(`Failed to create control directory for ${path} (reason: ${e?.message ?? String(e)})`));
+  }
+}
+
 function parseControlStateJson(raw: string): ControlState {
   let parsed: unknown;
   try {
@@ -284,7 +292,9 @@ export class DrainMonitor {
 
   private reloadNow(reason: string, opts?: { force?: boolean }): void {
     const path = resolveControlFilePath(this.options.homeDir, this.options.xdgStateHome);
-    ensureControlParentDir(path, this.options.log);
+    if (reason === "startup") {
+      ensureControlFileDir(path, { log: this.options.warn ?? this.options.log });
+    }
 
     let mtimeMs: number | null = null;
 
@@ -295,6 +305,10 @@ export class DrainMonitor {
       this.lastMissing = false;
     } catch (e: any) {
       if (e?.code === "ENOENT") {
+        if (reason === "startup") {
+          ensureControlFileDir(path, { log: this.options.warn ?? this.options.log });
+        }
+
         this.warnOnceForMissing(path);
 
         const fallback: ControlState = this.lastKnownGood ?? { mode: "running" };
