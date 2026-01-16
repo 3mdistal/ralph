@@ -27,6 +27,7 @@ import { dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
+import { registerOpencodeRun, unregisterOpencodeRun, updateOpencodeRun } from "./opencode-process-registry";
 import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
 
 export interface ServerHandle {
@@ -409,8 +410,7 @@ async function runSession(
     };
     __testOverrides?: {
       spawn?: SpawnFn;
-      scheduler?: Scheduler;
-      sessionsDir?: string;
+      processKill?: typeof process.kill;
     };
   }
 ): Promise<SessionResult> {
@@ -583,14 +583,25 @@ async function runSession(
     XDG_CACHE_HOME: xdgCacheHome,
   };
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
+  const processKill = options?.__testOverrides?.processKill ?? process.kill;
+  const useProcessGroup = process.platform !== "win32";
 
   const proc = spawn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env,
+    ...(useProcessGroup ? { detached: true } : {}),
   });
 
   const runLogPath = options?.runLogPath?.trim();
+
+  const runMeta = registerOpencodeRun(proc, {
+    useProcessGroup,
+    repo: options?.introspection?.repo,
+    issue: options?.introspection?.issue,
+    taskName: options?.introspection?.taskName,
+    command,
+  });
 
   const parsePositiveInt = (value: string | undefined): number | null => {
     const v = (value ?? "").trim();
@@ -782,6 +793,11 @@ async function runSession(
     }
   };
 
+  const cleanupRun = () => {
+    if (!runMeta) return;
+    unregisterOpencodeRun(runMeta.pgid);
+  };
+
   if (lockPath && continueSessionId) {
     try {
       mkdirSync(getSessionDirForRun(continueSessionId), { recursive: true });
@@ -796,9 +812,15 @@ async function runSession(
     }
   }
 
+  proc.on("close", cleanupRun);
+  proc.on("error", cleanupRun);
+
   const requestKill = () => {
+    const target = runMeta && runMeta.useProcessGroup ? -runMeta.pgid : proc.pid;
+    if (!target) return;
+
     try {
-      proc.kill();
+      processKill(target, "SIGTERM");
     } catch {
       // ignore
     }
@@ -806,7 +828,7 @@ async function runSession(
     // Some processes ignore SIGTERM. Follow up with SIGKILL.
     scheduler.setTimeout(() => {
       try {
-        proc.kill("SIGKILL");
+        processKill(target, "SIGKILL");
       } catch {
         // ignore
       }
@@ -955,6 +977,7 @@ async function runSession(
         const eventSessionId = event.sessionID ?? event.sessionId;
         if (eventSessionId && !sessionId) {
           sessionId = String(eventSessionId);
+          if (runMeta) updateOpencodeRun(runMeta.pgid, { sessionId });
           ensureEventStream(sessionId);
         } else if (eventSessionId && !eventStream) {
           ensureEventStream(String(eventSessionId));
@@ -1228,6 +1251,7 @@ export async function runCommand(
     spawn?: SpawnFn;
     scheduler?: Scheduler;
     sessionsDir?: string;
+    processKill?: typeof process.kill;
   }
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
@@ -1338,6 +1362,7 @@ async function* streamSession(
     };
     __testOverrides?: {
       spawn?: SpawnFn;
+      processKill?: typeof process.kill;
     };
   }
 ): AsyncGenerator<any, void, unknown> {
@@ -1365,6 +1390,7 @@ async function* streamSession(
   mkdirSync(xdgCacheHome, { recursive: true });
 
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
+  const useProcessGroup = process.platform !== "win32";
 
   const proc = spawn("opencode", args, {
     cwd: repoPath,
@@ -1376,7 +1402,21 @@ async function* streamSession(
       ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
       XDG_CACHE_HOME: xdgCacheHome,
     },
+    ...(useProcessGroup ? { detached: true } : {}),
   });
+
+  const runMeta = registerOpencodeRun(proc, {
+    useProcessGroup,
+    command,
+  });
+
+  const cleanupRun = () => {
+    if (!runMeta) return;
+    unregisterOpencodeRun(runMeta.pgid);
+  };
+
+  proc.on("close", cleanupRun);
+  proc.on("error", cleanupRun);
 
   let buffer = "";
 
@@ -1416,6 +1456,7 @@ export async function* __streamSessionForTests(
     cacheKey?: string;
     __testOverrides?: {
       spawn?: SpawnFn;
+      processKill?: typeof process.kill;
     };
   }
 ): AsyncGenerator<any, void, unknown> {
