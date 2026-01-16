@@ -10,6 +10,7 @@ import {
   recordIdempotencyKey,
   hasIdempotencyKey,
   recordRepoSync,
+  recordIssueSnapshot,
   recordTaskSnapshot,
   recordPrSnapshot,
 } from "../state";
@@ -40,6 +41,15 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repoPath: "/tmp/ralph",
       botBranch: "bot/integration",
       lastSyncAt: "2026-01-11T00:00:00.000Z",
+    });
+
+    recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      title: "Local state + config",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/59",
+      at: "2026-01-11T00:00:00.500Z",
     });
 
     recordTaskSnapshot({
@@ -75,6 +85,15 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
+
+      const issueRow = db.query("SELECT title, state, url FROM issues").get() as {
+        title?: string;
+        state?: string;
+        url?: string;
+      };
+      expect(issueRow.title).toBe("Local state + config");
+      expect(issueRow.state).toBe("OPEN");
+      expect(issueRow.url).toBe("https://github.com/3mdistal/ralph/issues/59");
 
       const taskCount = db.query("SELECT COUNT(*) as n FROM tasks").get() as { n: number };
       expect(taskCount.n).toBe(1);
