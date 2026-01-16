@@ -107,6 +107,8 @@ Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must ma
 
 Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require the configured `repos[].requiredChecks` and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
 
+If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs, or update `repos[].requiredChecks` to match actual check names.
+
 ### Environment variables
 
 Only these env vars are currently supported:
