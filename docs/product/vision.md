@@ -41,6 +41,15 @@ When reviewing ~40 PRs/day and almost never rejecting them, the human becomes a 
 
 ## Architecture Decisions
 
+### Task note naming
+
+Task note filenames are derived from note names. Ralph sanitizes names before creating bwrb notes:
+- Replace path separators (`/` and `\`) with ` - `
+- Replace other forbidden filename characters (`:*?"<>|`) with `-`
+- Collapse whitespace, trim ends, and cap length to 180 characters
+- If sanitization yields an empty name, use `Untitled`
+- If a note already exists, append a short UUID suffix
+
 ### 1. Queue Lives in bwrb
 
 Use bwrb notes for task management:

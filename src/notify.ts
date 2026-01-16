@@ -5,6 +5,7 @@ import { isAbsolute, join } from "path";
 import { loadConfig } from "./config";
 import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
+import { sanitizeNoteName } from "./util/sanitize-note-name";
 
 export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
 
@@ -71,15 +72,6 @@ async function sendDesktopNotification(opts: {
     console.warn("[ralph:notify] Failed to send desktop notification:", e);
     return false;
   }
-}
-
-function sanitizeNoteTitle(title: string): string {
-  return title
-    .replace(/[\\/]/g, " - ")
-    .replace(/[:*?"<>|]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 180);
 }
 
 function getNotificationPrefix(type: NotificationType): string {
@@ -157,7 +149,7 @@ async function createNotification(
     .filter(Boolean)
     .join("\n");
 
-  const baseTitle = sanitizeNoteTitle(`${prefix} ${title}`);
+  const baseTitle = sanitizeNoteName(`${prefix} ${title}`);
 
   let output = await bwrbNewIdea(
     JSON.stringify({
