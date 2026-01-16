@@ -44,7 +44,7 @@ export function unregisterOpencodeRun(pgid: number): void {
   runs.delete(pgid);
 }
 
-export function listOpencodeRuns(): OpencodeRun[] {
+function listOpencodeRuns(): OpencodeRun[] {
   return Array.from(runs.values());
 }
 
