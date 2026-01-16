@@ -11,4 +11,5 @@ src/ralph.json
 orchestration/
 
 # bwrb local state
-.bwrb/
+.bwrb/*
+!.bwrb/schema.json

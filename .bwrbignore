@@ -3,6 +3,12 @@
 # Keep these patterns redundant (anchored + unanchored) so ignore-matchers agree.
 # Requires bwrb >= 0.1.3 for '!' negation support.
 
+# Exclude non-note repo docs at the root.
+README.md
+/README.md
+AGENTS.md
+/AGENTS.md
+
 !orchestration
 !orchestration/
 !orchestration/**
