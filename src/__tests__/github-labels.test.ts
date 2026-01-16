@@ -9,7 +9,7 @@ describe("computeMissingBaselineLabels", () => {
   });
 
   test("returns empty when all baseline labels exist (case-insensitive)", () => {
-    const existing = ["DX", "Refactor", " bug ", "Chore", "TEST"];
+    const existing = ["DX", "Refactor", " bug ", "Chore", "TEST", "ALLOW-MAIN"];
     const missing = computeMissingBaselineLabels(existing);
     expect(missing).toEqual([]);
   });
@@ -17,6 +17,6 @@ describe("computeMissingBaselineLabels", () => {
   test("returns only missing baseline labels", () => {
     const existing = ["bug", "dx"];
     const missing = computeMissingBaselineLabels(existing);
-    expect(missing.map((l) => l.name)).toEqual(["refactor", "chore", "test"]);
+    expect(missing.map((l) => l.name)).toEqual(["refactor", "chore", "test", "allow-main"]);
   });
 });

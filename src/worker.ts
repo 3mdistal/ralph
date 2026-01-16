@@ -429,6 +429,20 @@ function formatRequiredChecksGuidance(input: RequiredChecksGuidanceInput): strin
   return lines.join("\n");
 }
 
+const MAIN_MERGE_OVERRIDE_LABEL = "allow-main";
+
+function isMainMergeOverride(labels: string[]): boolean {
+  return labels.some((label) => label.toLowerCase() === MAIN_MERGE_OVERRIDE_LABEL);
+}
+
+function isMainMergeAllowed(baseBranch: string | null, botBranch: string, labels: string[]): boolean {
+  if (!baseBranch) return true;
+  if (baseBranch !== "main") return true;
+  if (botBranch === "main") return true;
+  if (isMainMergeOverride(labels)) return true;
+  return false;
+}
+
 export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuidanceInput): string {
   return formatRequiredChecksGuidance(input);
 }
@@ -1278,6 +1292,31 @@ ${guidance}`
     return { headSha, checks };
   }
 
+  private async getPullRequestBaseBranch(prUrl: string): Promise<string | null> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) return null;
+
+    const { owner, name } = splitRepoFullName(this.repo);
+    const query = [
+      "query($owner:String!,$name:String!,$number:Int!){",
+      "repository(owner:$owner,name:$name){",
+      "pullRequest(number:$number){",
+      "baseRefName",
+      "}",
+      "}",
+      "}",
+    ].join(" ");
+
+    const result = await gh`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
+    const parsed = JSON.parse(result.stdout.toString());
+    const base = parsed?.data?.repository?.pullRequest?.baseRefName;
+    return typeof base === "string" && base.trim() ? base.trim() : null;
+  }
+
+  private isMainMergeAllowed(baseBranch: string | null, botBranch: string, labels: string[]): boolean {
+    return isMainMergeAllowed(baseBranch, botBranch, labels);
+  }
+
   private async getPullRequestFiles(prUrl: string): Promise<string[]> {
     const prNumber = extractPullRequestNumber(prUrl);
     if (!prNumber) {
@@ -1384,6 +1423,48 @@ ${guidance}`
     const prFiles = await this.getPullRequestFiles(prUrl);
     const ciOnly = isCiOnlyChangeSet(prFiles);
     const isCiIssue = isCiRelatedIssue(params.issueMeta.labels ?? []);
+
+    const baseBranch = await this.getPullRequestBaseBranch(prUrl);
+    if (!this.isMainMergeAllowed(baseBranch, params.botBranch, params.issueMeta.labels ?? [])) {
+      const completed = new Date();
+      const completedAt = completed.toISOString().split("T")[0];
+      const reason = `Blocked: Ralph refuses to auto-merge PRs targeting '${baseBranch}'. Use ${params.botBranch} or an explicit override.`;
+
+      await this.createAgentRun(params.task, {
+        outcome: "failed",
+        started: completed,
+        completed,
+        sessionId,
+        bodyPrefix: [
+          reason,
+          "",
+          `Issue: ${params.task.issue}`,
+          `PR: ${prUrl}`,
+          baseBranch ? `Base: ${baseBranch}` : "Base: unknown",
+        ].join("\n"),
+      });
+
+      await this.queue.updateTaskStatus(params.task, "blocked", {
+        "completed-at": completedAt,
+        "session-id": "",
+        "watchdog-retries": "",
+        ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+      });
+
+      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+
+      return {
+        ok: false,
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          pr: prUrl ?? undefined,
+          sessionId,
+          escalationReason: reason,
+        },
+      };
+    }
 
     if (ciOnly && !isCiIssue) {
       const completed = new Date();
