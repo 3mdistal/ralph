@@ -348,6 +348,31 @@ function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
   return lines.join("\n");
 }
 
+type RequiredChecksGuidanceInput = {
+  repo: string;
+  branch: string;
+  requiredChecks: string[];
+  missingChecks: string[];
+  availableChecks: string[];
+};
+
+function formatRequiredChecksGuidance(input: RequiredChecksGuidanceInput): string {
+  const lines = [
+    `Repo: ${input.repo}`,
+    `Branch: ${input.branch}`,
+    `Required checks: ${input.requiredChecks.join(", ") || "(none)"}`,
+    `Missing checks: ${input.missingChecks.join(", ") || "(none)"}`,
+    `Available check contexts: ${input.availableChecks.join(", ") || "(none)"}`,
+    "Next steps: trigger CI on this branch (push a commit or rerun workflows), or update repos[].requiredChecks (set [] to disable gating).",
+  ];
+
+  return lines.join("\n");
+}
+
+export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuidanceInput): string {
+  return formatRequiredChecksGuidance(input);
+}
+
 export class RepoWorker {
   private session: SessionAdapter;
   private queue: QueueAdapter;
@@ -529,9 +554,26 @@ export class RepoWorker {
     const availableChecks = await this.fetchCheckRunNames(branch);
     const missingChecks = requiredChecks.filter((check) => !availableChecks.includes(check));
     if (missingChecks.length > 0) {
+      const guidance = formatRequiredChecksGuidance({
+        repo: this.repo,
+        branch,
+        requiredChecks,
+        missingChecks,
+        availableChecks,
+      });
+      if (availableChecks.length === 0) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Required checks not yet available for ${branch}. ` +
+            `Proceeding without branch protection until CI runs.
+${guidance}`
+        );
+        return;
+      }
+
       throw new Error(
-        `Required checks missing for ${this.repo}@${branch}: ${missingChecks.join(", ")}. ` +
-          `Available checks: ${availableChecks.join(", ") || "(none)"}`
+        `Required checks missing for ${this.repo}@${branch}. ` +
+          `The configured required check contexts are not present.
+${guidance}`
       );
     }
 
