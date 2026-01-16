@@ -15,6 +15,7 @@ import {
 export class RollupMonitor {
   private mergeCount: Map<string, number> = new Map();
   private mergedPRs: Map<string, string[]> = new Map();
+  private repoKeys: Map<string, string> = new Map();
   private batchSize: number;
 
   constructor(batchSize?: number) {
@@ -27,9 +28,19 @@ export class RollupMonitor {
 
     for (const batch of batches) {
       const entries = listRollupBatchEntries(batch.id);
-      this.mergeCount.set(batch.repo, entries.length);
-      this.mergedPRs.set(batch.repo, entries.map((entry) => entry.prUrl));
+      const key = this.getRepoKey(batch.repo, batch.botBranch);
+      this.mergeCount.set(key, entries.length);
+      this.mergedPRs.set(key, entries.map((entry) => entry.prUrl));
+      this.repoKeys.set(batch.repo, key);
     }
+  }
+
+  private getRepoKey(repo: string, botBranch: string): string {
+    return `${repo}::${botBranch}`;
+  }
+
+  private getRepoKeyForRepo(repo: string, botBranch: string): string {
+    return this.repoKeys.get(repo) ?? this.getRepoKey(repo, botBranch);
   }
 
   /**
@@ -44,9 +55,11 @@ export class RollupMonitor {
       prUrl,
     });
 
+    const key = this.getRepoKeyForRepo(repo, botBranch);
     const count = snapshot.entries.length;
-    this.mergeCount.set(repo, count);
-    this.mergedPRs.set(repo, snapshot.entries.map((entry) => entry.prUrl));
+    this.mergeCount.set(key, count);
+    this.mergedPRs.set(key, snapshot.entries.map((entry) => entry.prUrl));
+    this.repoKeys.set(repo, key);
 
     if (!snapshot.entryInserted) {
       console.log(`[ralph:rollup] Duplicate merge ignored for ${repo}: ${prUrl}`);
@@ -74,7 +87,7 @@ export class RollupMonitor {
     const search = `Ralph-Rollup-Batch: ${params.batchId}`;
 
     try {
-      const result = await $`gh pr list --repo ${params.repo} --base main --search ${search} --state open --json url,number`.quiet();
+      const result = await $`gh pr list --repo ${params.repo} --base main --search ${search} --state all --json url,number`.quiet();
       const rows = JSON.parse(result.stdout.toString() || "[]") as Array<{ url?: string; number?: number }>;
 
       if (rows.length > 0 && rows[0]?.url) {
@@ -88,9 +101,15 @@ export class RollupMonitor {
     } catch (e: any) {
       console.error(`[ralph:rollup] Failed to query existing rollup for ${params.repo} (${params.batchId}):`, e);
       await notifyError(`Querying rollup PR for ${params.repo} (${params.batchId})`, e.message);
+      return null;
     }
 
-    return null;
+    console.error(`[ralph:rollup] No rollup PR detected for ${params.repo} (${params.batchId}); skipping creation to avoid duplicates.`);
+    await notifyError(
+      `Creating rollup PR for ${params.repo} (${params.batchId})`,
+      "Unable to verify existing rollup PR state; manual confirmation required."
+    );
+    return { prUrl: "", prNumber: null };
   }
 
   /**
@@ -119,9 +138,13 @@ export class RollupMonitor {
 
     const existing = await this.ensureRollupPrRecorded({ repo, botBranch, batchId: batch.id });
     if (existing) {
+      if (!existing.prUrl) {
+        return null;
+      }
       console.log(`[ralph:rollup] Rollup PR already exists for ${repo} (${batch.id}): ${existing.prUrl}`);
-      this.mergeCount.set(repo, 0);
-      this.mergedPRs.set(repo, []);
+      const key = this.getRepoKeyForRepo(repo, botBranch);
+      this.mergeCount.set(key, 0);
+      this.mergedPRs.set(key, []);
       createNewRollupBatch({ repo, botBranch, batchSize: batch.batchSize });
       return existing.prUrl;
     }
@@ -172,8 +195,9 @@ Ralph-Rollup-Batch: ${batch.id}
         rollupPrNumber: prNumber ? Number(prNumber) : null,
       });
 
-      this.mergeCount.set(repo, 0);
-      this.mergedPRs.set(repo, []);
+      const key = this.getRepoKeyForRepo(repo, botBranch);
+      this.mergeCount.set(key, 0);
+      this.mergedPRs.set(key, []);
       createNewRollupBatch({ repo, botBranch, batchSize: batch.batchSize });
 
       await notifyRollupReady(repo, prUrl, prs);
@@ -205,10 +229,10 @@ Ralph-Rollup-Batch: ${batch.id}
   getStatus(): Map<string, { count: number; prs: string[] }> {
     const status = new Map<string, { count: number; prs: string[] }>();
 
-    for (const [repo, count] of this.mergeCount) {
+    for (const [repo, key] of this.repoKeys.entries()) {
       status.set(repo, {
-        count,
-        prs: this.mergedPRs.get(repo) || [],
+        count: this.mergeCount.get(key) ?? 0,
+        prs: this.mergedPRs.get(key) || [],
       });
     }
 

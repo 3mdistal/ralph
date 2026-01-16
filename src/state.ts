@@ -48,7 +48,8 @@ function ensureSchema(database: Database): void {
     .query("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value?: string } | undefined;
 
-  if (existing?.value && String(existing.value) !== String(SCHEMA_VERSION)) {
+  const existingVersion = existing?.value ? Number(existing.value) : null;
+  if (existingVersion && existingVersion > SCHEMA_VERSION) {
     throw new Error(
       `Unsupported state.sqlite schema_version=${existing.value}; expected ${SCHEMA_VERSION}`
     );
