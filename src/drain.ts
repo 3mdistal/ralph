@@ -1,6 +1,6 @@
-import { readFileSync, statSync } from "fs";
+import { mkdirSync, readFileSync, statSync } from "fs";
 import { homedir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 
 export type DaemonMode = "running" | "draining";
 
@@ -15,8 +15,23 @@ export function resolveControlFilePath(
   homeDir: string = homedir(),
   xdgStateHome: string | undefined = process.env.XDG_STATE_HOME
 ): string {
-  const stateHome = xdgStateHome?.trim() ? xdgStateHome.trim() : join(homeDir, ".local", "state");
+  const hasXdg = !!xdgStateHome?.trim();
+  const hasHome = !!homeDir?.trim();
+  const stateHome = hasXdg
+    ? xdgStateHome!.trim()
+    : hasHome
+      ? join(homeDir, ".local", "state")
+      : "/tmp";
+
   return join(stateHome, "ralph", "control.json");
+}
+
+function ensureControlFileDir(path: string, opts?: { log?: (message: string) => void }): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+  } catch (e: any) {
+    opts?.log?.(formatWarning(`Failed to create control directory for ${path} (reason: ${e?.message ?? String(e)})`));
+  }
 }
 
 function parseControlStateJson(raw: string): ControlState {
@@ -234,6 +249,9 @@ export class DrainMonitor {
 
   private reloadNow(reason: string, opts?: { force?: boolean }): void {
     const path = resolveControlFilePath(this.options.homeDir, this.options.xdgStateHome);
+    if (reason === "startup") {
+      ensureControlFileDir(path, { log: this.options.warn ?? this.options.log });
+    }
 
     let mtimeMs: number | null = null;
 
@@ -243,6 +261,10 @@ export class DrainMonitor {
       this.lastMissing = false;
     } catch (e: any) {
       if (e?.code === "ENOENT") {
+        if (reason === "startup") {
+          ensureControlFileDir(path, { log: this.options.warn ?? this.options.log });
+        }
+
         this.warnOnceForMissing(path);
 
         const fallback: ControlState = this.lastKnownGood ?? { mode: "running" };
