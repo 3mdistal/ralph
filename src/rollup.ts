@@ -3,6 +3,16 @@ import { loadConfig, getRepoPath, getRepoBotBranch } from "./config";
 import { ensureGhTokenEnv } from "./github-app-auth";
 import { notifyRollupReady, notifyError } from "./notify";
 
+type IssueRef = {
+  number: number;
+  raw: string;
+};
+
+type RollupPullRequest = {
+  url: string;
+  body: string;
+};
+
 type ClosingIssueOptions = {
   today: string;
   botBranch: string;
@@ -11,39 +21,25 @@ type ClosingIssueOptions = {
   generatedAt: string;
 };
 
-function splitRepoFullName(full: string): { owner: string; name: string } {
-  const [owner, name] = full.split("/");
-  if (!owner || !name) {
-    throw new Error(`Invalid repo name (expected owner/name): ${full}`);
-  }
-  return { owner, name };
-}
+const CLOSING_KEYWORDS = ["fixes", "closes", "resolves"];
 
-function extractPullRequestNumber(url: string): number | null {
-  const match = url.match(/\/pull\/(\d+)(?:$|\b|\/)/);
-  if (!match) return null;
-  return Number.parseInt(match[1], 10);
+function parseIssueRefs(body: string): IssueRef[] {
+  const regex = new RegExp(`\\b(?:${CLOSING_KEYWORDS.join("|")})\\s+#(\\d+)\\b`, "gi");
+  const refs = new Map<number, IssueRef>();
+
+  let match: RegExpExecArray | null = null;
+  while ((match = regex.exec(body)) !== null) {
+    const number = Number.parseInt(match[1] ?? "", 10);
+    if (!Number.isNaN(number)) {
+      refs.set(number, { number, raw: match[0] });
+    }
+  }
+
+  return [...refs.values()].sort((a, b) => a.number - b.number);
 }
 
 function extractClosingIssuesFromBody(body: string): string[] {
-  const regex = /\b(?:fixes|closes|resolves)\s+#(\d+)\b/gi;
-  const numbers = new Set<number>();
-  let match: RegExpExecArray | null;
-  while ((match = regex.exec(body)) !== null) {
-    const issueNumber = Number.parseInt(match[1], 10);
-    if (!Number.isNaN(issueNumber)) {
-      numbers.add(issueNumber);
-    }
-  }
-  return Array.from(numbers)
-    .sort((a, b) => a - b)
-    .map((value) => String(value));
-}
-
-function formatGhError(error: any): string {
-  const message = String(error?.message ?? "").trim();
-  const stderr = String(error?.stderr ?? "").trim();
-  return [message, stderr].filter(Boolean).join("\n");
+  return parseIssueRefs(body).map((ref) => String(ref.number));
 }
 
 function buildRollupBody(options: ClosingIssueOptions): string {
@@ -94,29 +90,29 @@ export class RollupMonitor {
   private mergeCount: Map<string, number> = new Map();
   private mergedPRs: Map<string, string[]> = new Map();
   private batchSize: number;
-  
+
   constructor(batchSize?: number) {
     this.batchSize = batchSize ?? loadConfig().batchSize;
   }
-  
+
   /**
    * Record a successful merge to bot/integration
    */
   async recordMerge(repo: string, prUrl: string): Promise<void> {
     const count = (this.mergeCount.get(repo) || 0) + 1;
     this.mergeCount.set(repo, count);
-    
+
     const prs = this.mergedPRs.get(repo) || [];
     prs.push(prUrl);
     this.mergedPRs.set(repo, prs);
-    
-    console.log(`[ralph:rollup] Recorded merge for ${repo}: ${prUrl} (${count}/${this.batchSize})`);
-    
+
+    console.log(`[ralph:rollup:${repo}] Recorded merge for ${repo}: ${prUrl} (${count}/${this.batchSize})`);
+
     if (count >= this.batchSize) {
       await this.createRollupPR(repo);
     }
   }
-  
+
   /**
    * Create a rollup PR from bot/integration to main
    */
@@ -124,29 +120,39 @@ export class RollupMonitor {
     const repoPath = getRepoPath(repo);
     const botBranch = getRepoBotBranch(repo);
     const prs = this.mergedPRs.get(repo) || [];
+    const logPrefix = `[ralph:rollup:${repo}]`;
 
-    console.log(`[ralph:rollup] Creating rollup PR for ${repo}...`);
+    console.log(`${logPrefix} Creating rollup PR for ${repo}...`);
 
     try {
+      await ensureGhTokenEnv();
+
+      const existing = await this.findExistingRollupPR(repo, botBranch, repoPath, logPrefix);
+      if (existing) {
+        console.log(`${logPrefix} RALPH_ROLLUP_IDEMPOTENT existing=${existing.url}`);
+        this.mergeCount.set(repo, 0);
+        this.mergedPRs.set(repo, []);
+        return existing.url;
+      }
+
       const today = new Date().toISOString().split("T")[0];
-      const generatedAt = new Date().toISOString();
-      const closingIssues = await this.collectClosingIssues(repo, prs);
+      const issueRefs = await this.collectIssueRefs(repo, prs, repoPath, logPrefix);
+      const closingIssues = issueRefs.map((ref) => String(ref.number));
 
       const body = buildRollupBody({
         today,
         botBranch,
         prs,
         closingIssues,
-        generatedAt,
+        generatedAt: new Date().toISOString(),
       });
 
-      await ensureGhTokenEnv();
       const result = await $`gh pr create --repo ${repo} --base main --head ${botBranch} --title "Rollup: ${today} batch (${prs.length} PRs)" --body ${body}`
         .cwd(repoPath)
         .quiet();
 
       const prUrl = result.stdout.toString().trim();
-      console.log(`[ralph:rollup] Created rollup PR: ${prUrl}`);
+      console.log(`${logPrefix} Created rollup PR: ${prUrl}`);
 
       this.mergeCount.set(repo, 0);
       this.mergedPRs.set(repo, []);
@@ -154,27 +160,91 @@ export class RollupMonitor {
       await notifyRollupReady(repo, prUrl, prs);
 
       return prUrl;
-
     } catch (e: any) {
-      console.error(`[ralph:rollup] Failed to create rollup PR:`, e);
-      await notifyError(`Creating rollup PR for ${repo}`, e.message);
+      console.error(`${logPrefix} RALPH_ROLLUP_CREATE_FAILED`, e);
+      const message = [e?.message ?? String(e), e?.stderr?.toString?.()].filter(Boolean).join("\n");
+      await notifyError(`Creating rollup PR for ${repo}`, message);
       return null;
     }
   }
-  
+
+  private async findExistingRollupPR(
+    repo: string,
+    botBranch: string,
+    repoPath: string,
+    logPrefix: string
+  ): Promise<RollupPullRequest | null> {
+    try {
+      const result = await $`gh pr list --repo ${repo} --state open --base main --head ${botBranch} --json url,body --limit 5`
+        .cwd(repoPath)
+        .quiet();
+      const output = result.stdout.toString().trim();
+      if (!output) {
+        return null;
+      }
+
+      const parsed = JSON.parse(output);
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        return null;
+      }
+
+      const match = parsed[0];
+      if (!match?.url || !match?.body) {
+        return null;
+      }
+
+      return { url: match.url, body: match.body };
+    } catch (e: any) {
+      console.warn(`${logPrefix} Failed to check existing rollup PRs`, e);
+      return null;
+    }
+  }
+
+  private async collectIssueRefs(repo: string, prs: string[], repoPath: string, logPrefix: string): Promise<IssueRef[]> {
+    const refs = new Map<number, IssueRef>();
+
+    for (const pr of prs) {
+      const issueRefs = await this.extractIssueRefsFromPr(repo, pr, repoPath, logPrefix);
+      for (const ref of issueRefs) {
+        refs.set(ref.number, ref);
+      }
+    }
+
+    return [...refs.values()].sort((a, b) => a.number - b.number);
+  }
+
+  private async extractIssueRefsFromPr(repo: string, pr: string, repoPath: string, logPrefix: string): Promise<IssueRef[]> {
+    try {
+      const result = await $`gh pr view --repo ${repo} ${pr} --json body`
+        .cwd(repoPath)
+        .quiet();
+      const output = result.stdout.toString().trim();
+      if (!output) {
+        return [];
+      }
+
+      const parsed = JSON.parse(output);
+      const body = typeof parsed?.body === "string" ? parsed.body : "";
+      return parseIssueRefs(body);
+    } catch (e: any) {
+      console.warn(`${logPrefix} Failed to read PR body for issue refs (${pr})`, e);
+      return [];
+    }
+  }
+
   /**
    * Force a rollup for a specific repo (manual trigger)
    */
   async forceRollup(repo: string): Promise<string | null> {
     const count = this.mergeCount.get(repo) || 0;
     if (count === 0) {
-      console.log(`[ralph:rollup] No merges to roll up for ${repo}`);
+      console.log(`[ralph:rollup:${repo}] No merges to roll up for ${repo}`);
       return null;
     }
-    
+
     return this.createRollupPR(repo);
   }
-  
+
   /**
    * Get current status
    */
@@ -189,40 +259,5 @@ export class RollupMonitor {
     }
 
     return status;
-  }
-
-  private async collectClosingIssues(repo: string, prs: string[]): Promise<string[]> {
-    await ensureGhTokenEnv();
-    const { owner, name } = splitRepoFullName(repo);
-    const issues = new Set<string>();
-
-    for (const prUrl of prs) {
-      const prNumber = extractPullRequestNumber(prUrl);
-      if (!prNumber) continue;
-
-      try {
-        const query = [
-          "query($owner:String!,$name:String!,$number:Int!){",
-          "repository(owner:$owner,name:$name){",
-          "pullRequest(number:$number){",
-          "body",
-          "}",
-          "}",
-          "}",
-        ].join(" ");
-
-        const result = await $`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
-        const parsed = JSON.parse(result.stdout.toString());
-        const body = String(parsed?.data?.repository?.pullRequest?.body ?? "");
-
-        for (const issue of extractClosingIssuesFromBody(body)) {
-          issues.add(issue);
-        }
-      } catch (error: any) {
-        console.warn(`[ralph:rollup] Could not fetch PR body for ${prUrl}: ${formatGhError(error)}`);
-      }
-    }
-
-    return Array.from(issues).sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10));
   }
 }
