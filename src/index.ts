@@ -35,7 +35,7 @@ import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 
 import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
-import { shouldLog } from "./logging";
+import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
@@ -59,6 +59,19 @@ const workers = new Map<string, RepoWorker>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
+
+const IDLE_ROLLUP_CHECK_MS = 15_000;
+const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
+
+const idleState = new Map<
+  string,
+  {
+    idleSince: number | null;
+    lastQueuedCount: number;
+    lastInFlightCount: number;
+    lastCheckedAt: number;
+  }
+>();
 
 function getDaemonMode(): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
@@ -164,6 +177,99 @@ function getRepoSemaphore(repo: string): Semaphore {
     repoSemaphores.set(repo, sem);
   }
   return sem;
+}
+
+async function checkIdleRollups(): Promise<void> {
+  if (isShuttingDown) return;
+  if (getDaemonMode() === "draining") return;
+  if (inFlightTasks.size > 0) return;
+
+  const queued = await getRunnableTasks();
+  if (queued.length > 0) {
+    resetIdleState(queued);
+    return;
+  }
+
+  const repos = new Set(loadConfig().repos.map((repo) => repo.name));
+  for (const repo of workers.keys()) repos.add(repo);
+  if (repos.size === 0) return;
+
+  const now = Date.now();
+  const repoList = Array.from(repos);
+  const idleRepos: string[] = [];
+
+  for (const repo of repoList) {
+    const state = idleState.get(repo) ?? {
+      idleSince: null,
+      lastQueuedCount: 0,
+      lastInFlightCount: 0,
+      lastCheckedAt: 0,
+    };
+
+    if (!state.idleSince) {
+      state.idleSince = now;
+    }
+
+    state.lastQueuedCount = 0;
+    state.lastInFlightCount = 0;
+    state.lastCheckedAt = now;
+    idleState.set(repo, state);
+
+    const idleFor = now - state.idleSince;
+    if (idleFor >= IDLE_ROLLUP_THRESHOLD_MS) {
+      idleRepos.push(repo);
+    } else if (shouldLog(`rollup:idle-wait:${repo}`, 60_000)) {
+      console.log(
+        `[ralph:rollup] Waiting ${formatDuration(IDLE_ROLLUP_THRESHOLD_MS - idleFor)} before idle rollup check for ${repo}`
+      );
+    }
+  }
+
+  if (idleRepos.length === 0) return;
+
+  await Promise.all(
+    idleRepos.map(async (repo) => {
+      try {
+        const prUrl = await rollupMonitor.checkIdleRollup(repo);
+        if (prUrl && shouldLog(`rollup:idle:${repo}`, 60_000)) {
+          console.log(`[ralph:rollup] Idle rollup created for ${repo}: ${prUrl}`);
+        }
+      } catch (e: any) {
+        console.error(`[ralph:rollup] Idle rollup check failed for ${repo}:`, e);
+      } finally {
+        idleState.set(repo, {
+          idleSince: now,
+          lastQueuedCount: 0,
+          lastInFlightCount: 0,
+          lastCheckedAt: now,
+        });
+      }
+    })
+  );
+}
+
+function resetIdleState(queued: AgentTask[]): void {
+  const now = Date.now();
+  const countsByRepo = groupByRepo(queued);
+
+  for (const [repo, tasks] of countsByRepo) {
+    idleState.set(repo, {
+      idleSince: null,
+      lastQueuedCount: tasks.length,
+      lastInFlightCount: inFlightTasks.size,
+      lastCheckedAt: now,
+    });
+  }
+
+  for (const repo of idleState.keys()) {
+    if (countsByRepo.has(repo)) continue;
+    idleState.set(repo, {
+      idleSince: null,
+      lastQueuedCount: 0,
+      lastInFlightCount: inFlightTasks.size,
+      lastCheckedAt: now,
+    });
+  }
 }
 
 function getOrCreateWorker(repo: string): RepoWorker {
@@ -366,12 +472,16 @@ async function attemptResumeThrottledTasks(): Promise<void> {
       .catch((e: any) => {
         console.error(`[ralph] Error resuming throttled task ${task.name}:`, e);
       })
-      .finally(() => {
-        inFlightTasks.delete(taskKey);
-        releaseGlobal();
-        releaseRepo();
-        if (!isShuttingDown) scheduleQueuedTasksSoon();
-      });
+    .finally(() => {
+      inFlightTasks.delete(taskKey);
+      releaseGlobal();
+      releaseRepo();
+      if (!isShuttingDown) {
+        scheduleQueuedTasksSoon();
+        void checkIdleRollups();
+      }
+    });
+
   }
 }
 
@@ -406,7 +516,10 @@ function startTask(opts: {
       inFlightTasks.delete(key);
       releaseGlobal();
       releaseRepo();
-      if (!isShuttingDown) scheduleQueuedTasksSoon();
+      if (!isShuttingDown) {
+        scheduleQueuedTasksSoon();
+        void checkIdleRollups();
+      }
     });
 }
 
@@ -438,6 +551,7 @@ function startResumeTask(opts: {
       if (!isShuttingDown) {
         const scheduleNext = resumeSchedulingMode === "resume-only" ? scheduleResumeTasksSoon : scheduleQueuedTasksSoon;
         scheduleNext();
+        void checkIdleRollups();
       }
     });
 }
@@ -477,6 +591,10 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
   if (throttle.state === "soft") return;
 
   const queueTasks = isDraining ? [] : tasks;
+
+  if (queueTasks.length > 0) {
+    resetIdleState(queueTasks);
+  }
 
   const startedCount = startQueuedTasks({
     gate: "running",
@@ -692,6 +810,8 @@ async function main(): Promise<void> {
 
   if (initialTasks.length > 0 && getDaemonMode() !== "draining") {
     await processNewTasks(initialTasks);
+  } else {
+    resetIdleState(initialTasks);
   }
 
   // Start file watching (no polling - watcher is reliable)
@@ -743,6 +863,21 @@ async function main(): Promise<void> {
       });
   }, heartbeatIntervalMs);
 
+  let idleRollupInFlight = false;
+  const idleRollupTimer = setInterval(() => {
+    if (isShuttingDown) return;
+    if (idleRollupInFlight) return;
+    idleRollupInFlight = true;
+
+    checkIdleRollups()
+      .catch(() => {
+        // ignore
+      })
+      .finally(() => {
+        idleRollupInFlight = false;
+      });
+  }, IDLE_ROLLUP_CHECK_MS);
+
   const throttleResumeIntervalMs = 15_000;
   let throttleResumeInFlight = false;
 
@@ -787,6 +922,7 @@ async function main(): Promise<void> {
     schedulerController.clearTimers();
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
+    clearInterval(idleRollupTimer);
     clearInterval(throttleResumeTimer);
     
     // Terminate in-flight OpenCode runs spawned by Ralph.

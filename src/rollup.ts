@@ -1,5 +1,6 @@
 import { $ } from "bun";
-import { loadConfig, getRepoPath, getRepoBotBranch } from "./config";
+
+import { loadConfig, getRepoPath, getRepoBotBranch, getRepoRollupBatchSize } from "./config";
 import { ensureGhTokenEnv } from "./github-app-auth";
 import { notifyRollupReady, notifyError } from "./notify";
 import {
@@ -99,6 +100,7 @@ export class RollupMonitor {
   private mergeCount: Map<string, number> = new Map();
   private mergedPRs: Map<string, string[]> = new Map();
   private repoKeys: Map<string, string> = new Map();
+  private perRepoBatchSize: Map<string, number> = new Map();
   private batchSize: number;
 
   constructor(batchSize?: number) {
@@ -115,7 +117,16 @@ export class RollupMonitor {
       this.mergeCount.set(key, entries.length);
       this.mergedPRs.set(key, entries.map((entry) => entry.prUrl));
       this.repoKeys.set(batch.repo, key);
+      this.perRepoBatchSize.set(batch.repo, batch.batchSize);
     }
+  }
+
+  private getBatchSize(repo: string): number {
+    const cached = this.perRepoBatchSize.get(repo);
+    if (cached) return cached;
+    const size = getRepoRollupBatchSize(repo, this.batchSize);
+    this.perRepoBatchSize.set(repo, size);
+    return size;
   }
 
   private getRepoKey(repo: string, botBranch: string): string {
@@ -131,10 +142,11 @@ export class RollupMonitor {
    */
   async recordMerge(repo: string, prUrl: string): Promise<void> {
     const botBranch = getRepoBotBranch(repo);
+    const batchSize = this.getBatchSize(repo);
     const snapshot = recordRollupMerge({
       repo,
       botBranch,
-      batchSize: this.batchSize,
+      batchSize,
       prUrl,
     });
 
@@ -149,9 +161,9 @@ export class RollupMonitor {
       return;
     }
 
-    console.log(`[ralph:rollup] Recorded merge for ${repo}: ${prUrl} (${count}/${this.batchSize})`);
+    console.log(`[ralph:rollup] Recorded merge for ${repo}: ${prUrl} (${count}/${snapshot.batch.batchSize})`);
 
-    if (count >= this.batchSize) {
+    if (count >= snapshot.batch.batchSize) {
       await this.createRollupPR(repo, snapshot.batch.id);
     }
   }
@@ -203,7 +215,7 @@ export class RollupMonitor {
     const botBranch = getRepoBotBranch(repo);
     const batch = batchId
       ? loadRollupBatchById(batchId)
-      : getOrCreateRollupBatch({ repo, botBranch, batchSize: this.batchSize });
+      : getOrCreateRollupBatch({ repo, botBranch, batchSize: this.getBatchSize(repo) });
 
     if (!batch) {
       console.error(`[ralph:rollup] No rollup batch found for ${repo}`);
@@ -353,6 +365,10 @@ export class RollupMonitor {
       return null;
     }
 
+    return this.createRollupPR(repo);
+  }
+
+  async checkIdleRollup(repo: string): Promise<string | null> {
     return this.createRollupPR(repo);
   }
 
