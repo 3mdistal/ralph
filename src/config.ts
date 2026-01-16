@@ -20,6 +20,8 @@ export interface RepoConfig {
   requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
+  /** PRs before rollup for this repo (defaults to global batchSize) */
+  rollupBatchSize?: number;
 }
 
 
@@ -252,17 +254,30 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.maxWorkers = DEFAULT_GLOBAL_MAX_WORKERS;
   }
 
-  // Validate per-repo maxWorkers. We keep it optional in the config, but sanitize invalid values.
+  // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
+    const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
+    const updates: Partial<RepoConfig> = {};
+
     if ((repo as any).maxWorkers !== undefined && !mw) {
       console.warn(
         `[ralph] Invalid config maxWorkers for repo ${repo.name}: ${JSON.stringify((repo as any).maxWorkers)}; ` +
           `falling back to default ${DEFAULT_REPO_MAX_WORKERS}`
       );
-      return { ...repo, maxWorkers: DEFAULT_REPO_MAX_WORKERS };
+      updates.maxWorkers = DEFAULT_REPO_MAX_WORKERS;
     }
-    return repo;
+
+    if ((repo as any).rollupBatchSize !== undefined && !rollupBatch) {
+      console.warn(
+        `[ralph] Invalid config rollupBatchSize for repo ${repo.name}: ${JSON.stringify((repo as any).rollupBatchSize)}; ` +
+          `falling back to global batchSize`
+      );
+      updates.rollupBatchSize = undefined;
+    }
+
+    if (Object.keys(updates).length === 0) return repo;
+    return { ...repo, ...updates };
   });
 
   // Guardrail allowlist. Default to [owner].
@@ -803,6 +818,13 @@ export function getRepoMaxWorkers(repoName: string): number {
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const maxWorkers = toPositiveIntOrNull(explicit?.maxWorkers);
   return maxWorkers ?? DEFAULT_REPO_MAX_WORKERS;
+}
+
+export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {
+  const cfg = loadConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const rollupBatch = toPositiveIntOrNull(explicit?.rollupBatchSize);
+  return rollupBatch ?? fallback ?? cfg.batchSize;
 }
 
 export function normalizeRepoName(repo: string): string {

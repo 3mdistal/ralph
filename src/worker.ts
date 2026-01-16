@@ -292,6 +292,41 @@ function extractPullRequestNumber(url: string): number | null {
   return Number.parseInt(match[1], 10);
 }
 
+const CI_ONLY_PATH_PREFIXES = [".github/workflows/", ".github/actions/"] as const;
+const CI_ONLY_PATH_EXACT = [".github/action.yml", ".github/action.yaml"] as const;
+const CI_LABEL_KEYWORDS = ["ci", "build", "infra"] as const;
+
+function isCiOnlyPath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").trim();
+  if (!normalized) return false;
+  if (CI_ONLY_PATH_EXACT.includes(normalized as (typeof CI_ONLY_PATH_EXACT)[number])) return true;
+  return CI_ONLY_PATH_PREFIXES.some((prefix) => normalized.startsWith(prefix));
+}
+
+function isCiOnlyChangeSet(files: string[]): boolean {
+  const normalized = files.map((file) => file.trim()).filter(Boolean);
+  if (normalized.length === 0) return false;
+  return normalized.every((file) => isCiOnlyPath(file));
+}
+
+function isCiRelatedIssue(labels: string[]): boolean {
+  return labels.some((label) => {
+    const normalized = label.toLowerCase();
+    return CI_LABEL_KEYWORDS.some((keyword) => {
+      const re = new RegExp(`(^|[-_/])${keyword}($|[-_/])`);
+      return re.test(normalized);
+    });
+  });
+}
+
+export function __isCiOnlyChangeSetForTests(files: string[]): boolean {
+  return isCiOnlyChangeSet(files);
+}
+
+export function __isCiRelatedIssueForTests(labels: string[]): boolean {
+  return isCiRelatedIssue(labels);
+}
+
 function normalizeRequiredCheckState(raw: string | null | undefined): RequiredCheckState {
   const val = String(raw ?? "").toUpperCase();
   if (!val) return "UNKNOWN";
@@ -347,6 +382,31 @@ function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
   }
 
   return lines.join("\n");
+}
+
+type RequiredChecksGuidanceInput = {
+  repo: string;
+  branch: string;
+  requiredChecks: string[];
+  missingChecks: string[];
+  availableChecks: string[];
+};
+
+function formatRequiredChecksGuidance(input: RequiredChecksGuidanceInput): string {
+  const lines = [
+    `Repo: ${input.repo}`,
+    `Branch: ${input.branch}`,
+    `Required checks: ${input.requiredChecks.join(", ") || "(none)"}`,
+    `Missing checks: ${input.missingChecks.join(", ") || "(none)"}`,
+    `Available check contexts: ${input.availableChecks.join(", ") || "(none)"}`,
+    "Next steps: trigger CI on this branch (push a commit or rerun workflows), or update repos[].requiredChecks (set [] to disable gating).",
+  ];
+
+  return lines.join("\n");
+}
+
+export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuidanceInput): string {
+  return formatRequiredChecksGuidance(input);
 }
 
 export class RepoWorker {
@@ -535,9 +595,26 @@ export class RepoWorker {
     const availableChecks = await this.fetchCheckRunNames(branch);
     const missingChecks = requiredChecks.filter((check) => !availableChecks.includes(check));
     if (missingChecks.length > 0) {
+      const guidance = formatRequiredChecksGuidance({
+        repo: this.repo,
+        branch,
+        requiredChecks,
+        missingChecks,
+        availableChecks,
+      });
+      if (availableChecks.length === 0) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Required checks not yet available for ${branch}. ` +
+            `Proceeding without branch protection until CI runs.
+${guidance}`
+        );
+        return;
+      }
+
       throw new Error(
-        `Required checks missing for ${this.repo}@${branch}: ${missingChecks.join(", ")}. ` +
-          `Available checks: ${availableChecks.join(", ") || "(none)"}`
+        `Required checks missing for ${this.repo}@${branch}. ` +
+          `The configured required check contexts are not present.
+${guidance}`
       );
     }
 
@@ -1101,6 +1178,35 @@ export class RepoWorker {
     return { headSha, checks };
   }
 
+  private async getPullRequestFiles(prUrl: string): Promise<string[]> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+    const files: string[] = [];
+    let page = 1;
+
+    while (true) {
+      const payload = await this.githubApiRequest<Array<{ filename?: string | null }>>(
+        `/repos/${owner}/${name}/pulls/${prNumber}/files?per_page=100&page=${page}`
+      );
+
+      if (!payload || payload.length === 0) break;
+
+      for (const entry of payload) {
+        const filename = String(entry?.filename ?? "").trim();
+        if (filename) files.push(filename);
+      }
+
+      if (payload.length < 100) break;
+      page += 1;
+    }
+
+    return files;
+  }
+
   private async waitForRequiredChecks(
     prUrl: string,
     requiredChecks: string[],
@@ -1162,6 +1268,7 @@ export class RepoWorker {
     botBranch: string;
     prUrl: string;
     sessionId: string;
+    issueMeta: IssueMetadata;
     watchdogStagePrefix: string;
     notifyTitle: string;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
@@ -1173,6 +1280,51 @@ export class RepoWorker {
     let sessionId = params.sessionId;
     let lastSummary: RequiredChecksSummary | null = null;
     let didUpdateBranch = false;
+
+    const prFiles = await this.getPullRequestFiles(prUrl);
+    const ciOnly = isCiOnlyChangeSet(prFiles);
+    const isCiIssue = isCiRelatedIssue(params.issueMeta.labels ?? []);
+
+    if (ciOnly && !isCiIssue) {
+      const completed = new Date();
+      const completedAt = completed.toISOString().split("T")[0];
+      const reason = `Guardrail: PR only changes CI/workflows for non-CI issue ${params.task.issue}`;
+
+      await this.createAgentRun(params.task, {
+        outcome: "failed",
+        started: completed,
+        completed,
+        sessionId,
+        bodyPrefix: [
+          "Blocked: CI-only PR for non-CI issue",
+          "",
+          `Issue: ${params.task.issue}`,
+          `PR: ${prUrl}`,
+          `Files: ${prFiles.join(", ") || "(none)"}`,
+        ].join("\n"),
+      });
+
+      await this.queue.updateTaskStatus(params.task, "blocked", {
+        "completed-at": completedAt,
+        "session-id": "",
+        "watchdog-retries": "",
+        ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+      });
+
+      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+
+      return {
+        ok: false,
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          pr: prUrl ?? undefined,
+          sessionId,
+          escalationReason: reason,
+        },
+      };
+    }
 
     for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
       const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
@@ -1987,10 +2139,12 @@ export class RepoWorker {
         botBranch,
         prUrl,
         sessionId: buildResult.sessionId,
-        watchdogStagePrefix: "resume-merge",
-        notifyTitle: `Resuming ${task.name}`,
+        issueMeta,
+        watchdogStagePrefix: "merge",
+        notifyTitle: `Merging ${task.name}`,
         opencodeXdg,
       });
+
 
       if (!mergeGate.ok) return mergeGate.run;
 
@@ -2633,6 +2787,7 @@ export class RepoWorker {
         botBranch,
         prUrl,
         sessionId: buildResult.sessionId,
+        issueMeta,
         watchdogStagePrefix: "merge",
         notifyTitle: `Merging ${task.name}`,
         opencodeXdg,

@@ -1,15 +1,31 @@
 import { mkdirSync } from "fs";
 import { dirname } from "path";
+import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 let db: Database | null = null;
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function toJson(value: unknown): string {
+  if (value === undefined) return "[]";
+  return JSON.stringify(value);
+}
+
+function parseJsonArray(value?: string | null): string[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
 }
 
 function requireDb(): Database {
@@ -32,9 +48,11 @@ function ensureSchema(database: Database): void {
     .query("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value?: string } | undefined;
 
-  if (existing?.value && String(existing.value) !== String(SCHEMA_VERSION)) {
+  const existingVersion = existing?.value ? Number(existing.value) : null;
+  if (existingVersion && existingVersion > SCHEMA_VERSION) {
+    const schemaLabel = existing?.value ?? "unknown";
     throw new Error(
-      `Unsupported state.sqlite schema_version=${existing.value}; expected ${SCHEMA_VERSION}`
+      `Unsupported state.sqlite schema_version=${schemaLabel}; expected ${SCHEMA_VERSION}`
     );
   }
 
@@ -107,8 +125,37 @@ function ensureSchema(database: Database): void {
       payload_json TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS rollup_batches (
+      id TEXT PRIMARY KEY,
+      repo_id INTEGER NOT NULL,
+      bot_branch TEXT NOT NULL,
+      batch_size INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      rollup_pr_url TEXT,
+      rollup_pr_number INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      rollup_created_at TEXT,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+      UNIQUE(repo_id, bot_branch, status)
+    );
+
+    CREATE TABLE IF NOT EXISTS rollup_batch_prs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id TEXT NOT NULL,
+      pr_url TEXT NOT NULL,
+      pr_number INTEGER,
+      issue_refs_json TEXT,
+      merged_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(batch_id) REFERENCES rollup_batches(id) ON DELETE CASCADE,
+      UNIQUE(batch_id, pr_url)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
+    CREATE INDEX IF NOT EXISTS idx_rollup_batches_repo_status ON rollup_batches(repo_id, bot_branch, status);
+    CREATE INDEX IF NOT EXISTS idx_rollup_batch_prs_batch ON rollup_batch_prs(batch_id);
   `);
 }
 
@@ -355,4 +402,341 @@ export function recordIdempotencyKey(input: {
     });
 
   return result.changes > 0;
+}
+
+export type RollupBatchStatus = "open" | "rolled-up";
+
+export type RollupBatch = {
+  id: string;
+  repo: string;
+  botBranch: string;
+  batchSize: number;
+  status: RollupBatchStatus;
+  rollupPrUrl?: string | null;
+  rollupPrNumber?: number | null;
+  createdAt: string;
+  updatedAt: string;
+  rollupCreatedAt?: string | null;
+};
+
+export type RollupBatchEntry = {
+  prUrl: string;
+  prNumber?: number | null;
+  issueRefs: string[];
+  mergedAt: string;
+};
+
+function resolveRollupBatch(database: Database, params: {
+  repo: string;
+  botBranch: string;
+  batchSize: number;
+  at?: string;
+}): RollupBatch {
+  const at = params.at ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, botBranch: params.botBranch, at });
+  const existing = database
+    .query(
+      `SELECT id, bot_branch, batch_size, status, rollup_pr_url, rollup_pr_number,
+              created_at, updated_at, rollup_created_at
+       FROM rollup_batches
+       WHERE repo_id = $repo_id AND bot_branch = $bot_branch AND status = 'open'`
+    )
+    .get({ $repo_id: repoId, $bot_branch: params.botBranch }) as {
+      id?: string;
+      bot_branch?: string;
+      batch_size?: number;
+      status?: RollupBatchStatus;
+      rollup_pr_url?: string | null;
+      rollup_pr_number?: number | null;
+      created_at?: string;
+      updated_at?: string;
+      rollup_created_at?: string | null;
+    } | undefined;
+
+  if (existing?.id) {
+    return {
+      id: existing.id,
+      repo: params.repo,
+      botBranch: existing.bot_branch ?? params.botBranch,
+      batchSize: existing.batch_size ?? params.batchSize,
+      status: (existing.status ?? "open") as RollupBatchStatus,
+      rollupPrUrl: existing.rollup_pr_url ?? null,
+      rollupPrNumber: existing.rollup_pr_number ?? null,
+      createdAt: existing.created_at ?? at,
+      updatedAt: existing.updated_at ?? at,
+      rollupCreatedAt: existing.rollup_created_at ?? null,
+    };
+  }
+
+  const id = randomUUID();
+  database
+    .query(
+      `INSERT INTO rollup_batches(
+         id, repo_id, bot_branch, batch_size, status, created_at, updated_at
+       ) VALUES (
+         $id, $repo_id, $bot_branch, $batch_size, 'open', $created_at, $updated_at
+       )`
+    )
+    .run({
+      $id: id,
+      $repo_id: repoId,
+      $bot_branch: params.botBranch,
+      $batch_size: params.batchSize,
+      $created_at: at,
+      $updated_at: at,
+    });
+
+  return {
+    id,
+    repo: params.repo,
+    botBranch: params.botBranch,
+    batchSize: params.batchSize,
+    status: "open",
+    rollupPrUrl: null,
+    rollupPrNumber: null,
+    createdAt: at,
+    updatedAt: at,
+    rollupCreatedAt: null,
+  };
+}
+
+export function getOrCreateRollupBatch(params: {
+  repo: string;
+  botBranch: string;
+  batchSize: number;
+  at?: string;
+}): RollupBatch {
+  const database = requireDb();
+  return resolveRollupBatch(database, params);
+}
+
+export function listOpenRollupBatches(): RollupBatch[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT b.id, r.name as repo, b.bot_branch, b.batch_size, b.status, b.rollup_pr_url,
+              b.rollup_pr_number, b.created_at, b.updated_at, b.rollup_created_at
+       FROM rollup_batches b
+       JOIN repos r ON r.id = b.repo_id
+       WHERE b.status = 'open'
+       ORDER BY b.created_at ASC`
+    )
+    .all() as Array<{
+      id: string;
+      repo: string;
+      bot_branch: string;
+      batch_size: number;
+      status: RollupBatchStatus;
+      rollup_pr_url?: string | null;
+      rollup_pr_number?: number | null;
+      created_at: string;
+      updated_at: string;
+      rollup_created_at?: string | null;
+    }>;
+
+  return rows.map((row) => ({
+    id: row.id,
+    repo: row.repo,
+    botBranch: row.bot_branch,
+    batchSize: row.batch_size,
+    status: row.status,
+    rollupPrUrl: row.rollup_pr_url ?? null,
+    rollupPrNumber: row.rollup_pr_number ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    rollupCreatedAt: row.rollup_created_at ?? null,
+  }));
+}
+
+export function listRollupBatchEntries(batchId: string): RollupBatchEntry[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT pr_url, pr_number, issue_refs_json, merged_at
+       FROM rollup_batch_prs
+       WHERE batch_id = $batch_id
+       ORDER BY merged_at ASC, id ASC`
+    )
+    .all({ $batch_id: batchId }) as Array<{
+      pr_url: string;
+      pr_number?: number | null;
+      issue_refs_json?: string | null;
+      merged_at: string;
+    }>;
+
+  return rows.map((row) => ({
+    prUrl: row.pr_url,
+    prNumber: row.pr_number ?? null,
+    issueRefs: parseJsonArray(row.issue_refs_json),
+    mergedAt: row.merged_at,
+  }));
+}
+
+
+export function recordRollupMerge(params: {
+  repo: string;
+  botBranch: string;
+  batchSize: number;
+  prUrl: string;
+  issueRefs?: string[];
+  mergedAt?: string;
+}): { batch: RollupBatch; entries: RollupBatchEntry[]; entryInserted: boolean } {
+  const database = requireDb();
+  const mergedAt = params.mergedAt ?? nowIso();
+  const issueRefs = params.issueRefs ?? [];
+  let snapshot: { batch: RollupBatch; entries: RollupBatchEntry[]; entryInserted: boolean } | null = null;
+
+  database.transaction(() => {
+    const batch = resolveRollupBatch(database, {
+      repo: params.repo,
+      botBranch: params.botBranch,
+      batchSize: params.batchSize,
+      at: mergedAt,
+    });
+
+    const prNumber = parsePrNumber(params.prUrl);
+
+    const insertResult = database
+      .query(
+        `INSERT INTO rollup_batch_prs(
+           batch_id, pr_url, pr_number, issue_refs_json, merged_at, created_at
+         ) VALUES (
+           $batch_id, $pr_url, $pr_number, $issue_refs_json, $merged_at, $created_at
+         )
+         ON CONFLICT(batch_id, pr_url) DO NOTHING`
+      )
+      .run({
+        $batch_id: batch.id,
+        $pr_url: params.prUrl,
+        $pr_number: prNumber,
+        $issue_refs_json: toJson(issueRefs),
+        $merged_at: mergedAt,
+        $created_at: mergedAt,
+      });
+
+    database
+      .query("UPDATE rollup_batches SET updated_at = $updated_at WHERE id = $id")
+      .run({ $updated_at: mergedAt, $id: batch.id });
+
+    snapshot = {
+      batch,
+      entries: listRollupBatchEntries(batch.id),
+      entryInserted: insertResult.changes > 0,
+    };
+  })();
+
+  if (!snapshot) {
+    throw new Error("Failed to record rollup merge");
+  }
+
+  return snapshot;
+}
+
+export function markRollupBatchRolledUp(params: {
+  batchId: string;
+  rollupPrUrl: string;
+  rollupPrNumber?: number | null;
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+
+  database
+    .query(
+      `UPDATE rollup_batches
+       SET status = 'rolled-up',
+           rollup_pr_url = $rollup_pr_url,
+           rollup_pr_number = $rollup_pr_number,
+           rollup_created_at = $rollup_created_at,
+           updated_at = $updated_at
+       WHERE id = $id`
+    )
+    .run({
+      $id: params.batchId,
+      $rollup_pr_url: params.rollupPrUrl,
+      $rollup_pr_number: params.rollupPrNumber ?? null,
+      $rollup_created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function createNewRollupBatch(params: {
+  repo: string;
+  botBranch: string;
+  batchSize: number;
+  at?: string;
+}): RollupBatch {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, botBranch: params.botBranch, at });
+  const id = randomUUID();
+
+  database
+    .query(
+      `INSERT INTO rollup_batches(
+         id, repo_id, bot_branch, batch_size, status, created_at, updated_at
+       ) VALUES (
+         $id, $repo_id, $bot_branch, $batch_size, 'open', $created_at, $updated_at
+       )`
+    )
+    .run({
+      $id: id,
+      $repo_id: repoId,
+      $bot_branch: params.botBranch,
+      $batch_size: params.batchSize,
+      $created_at: at,
+      $updated_at: at,
+    });
+
+  return {
+    id,
+    repo: params.repo,
+    botBranch: params.botBranch,
+    batchSize: params.batchSize,
+    status: "open",
+    rollupPrUrl: null,
+    rollupPrNumber: null,
+    createdAt: at,
+    updatedAt: at,
+    rollupCreatedAt: null,
+  };
+}
+
+export function loadRollupBatchById(batchId: string): RollupBatch | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT b.id, r.name as repo, b.bot_branch, b.batch_size, b.status, b.rollup_pr_url,
+              b.rollup_pr_number, b.created_at, b.updated_at, b.rollup_created_at
+       FROM rollup_batches b
+       JOIN repos r ON r.id = b.repo_id
+       WHERE b.id = $id`
+    )
+    .get({ $id: batchId }) as {
+      id?: string;
+      repo?: string;
+      bot_branch?: string;
+      batch_size?: number;
+      status?: RollupBatchStatus;
+      rollup_pr_url?: string | null;
+      rollup_pr_number?: number | null;
+      created_at?: string;
+      updated_at?: string;
+      rollup_created_at?: string | null;
+    } | undefined;
+
+  if (!row?.id || !row.repo) return null;
+
+  return {
+    id: row.id,
+    repo: row.repo,
+    botBranch: row.bot_branch ?? "",
+    batchSize: row.batch_size ?? 0,
+    status: (row.status ?? "open") as RollupBatchStatus,
+    rollupPrUrl: row.rollup_pr_url ?? null,
+    rollupPrNumber: row.rollup_pr_number ?? null,
+    createdAt: row.created_at ?? nowIso(),
+    updatedAt: row.updated_at ?? nowIso(),
+    rollupCreatedAt: row.rollup_created_at ?? null,
+  };
 }
