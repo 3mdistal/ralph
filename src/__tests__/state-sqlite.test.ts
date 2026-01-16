@@ -6,13 +6,19 @@ import { Database } from "bun:sqlite";
 
 import {
   closeStateDbForTests,
+  createNewRollupBatch,
+  getOrCreateRollupBatch,
   initStateDb,
+  listOpenRollupBatches,
+  listRollupBatchEntries,
+  markRollupBatchRolledUp,
   recordIdempotencyKey,
   hasIdempotencyKey,
   recordRepoSync,
   recordIssueSnapshot,
   recordTaskSnapshot,
   recordPrSnapshot,
+  recordRollupMerge,
 } from "../state";
 import { getRalphStateDbPath } from "../paths";
 
@@ -81,7 +87,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("1");
+      expect(meta.value).toBe("2");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -106,5 +112,75 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("records rollup batches and merges", () => {
+    initStateDb();
+
+    const batch = getOrCreateRollupBatch({
+      repo: "3mdistal/ralph",
+      botBranch: "bot/integration",
+      batchSize: 2,
+    });
+
+    expect(batch.status).toBe("open");
+    expect(batch.batchSize).toBe(2);
+
+    const first = recordRollupMerge({
+      repo: "3mdistal/ralph",
+      botBranch: "bot/integration",
+      batchSize: 2,
+      prUrl: "https://github.com/3mdistal/ralph/pull/101",
+      issueRefs: ["3mdistal/ralph#101"],
+      mergedAt: "2026-01-11T00:00:03.000Z",
+    });
+
+    expect(first.entries).toHaveLength(1);
+    expect(first.entryInserted).toBe(true);
+
+    const duplicate = recordRollupMerge({
+      repo: "3mdistal/ralph",
+      botBranch: "bot/integration",
+      batchSize: 2,
+      prUrl: "https://github.com/3mdistal/ralph/pull/101",
+      mergedAt: "2026-01-11T00:00:03.500Z",
+    });
+
+    expect(duplicate.entries).toHaveLength(1);
+    expect(duplicate.entryInserted).toBe(false);
+
+    const second = recordRollupMerge({
+      repo: "3mdistal/ralph",
+      botBranch: "bot/integration",
+      batchSize: 2,
+      prUrl: "https://github.com/3mdistal/ralph/pull/102",
+      mergedAt: "2026-01-11T00:00:04.000Z",
+    });
+
+    expect(second.entries).toHaveLength(2);
+
+    const entries = listRollupBatchEntries(batch.id);
+    expect(entries).toHaveLength(2);
+    expect(entries[0].prUrl).toBe("https://github.com/3mdistal/ralph/pull/101");
+
+    markRollupBatchRolledUp({
+      batchId: batch.id,
+      rollupPrUrl: "https://github.com/3mdistal/ralph/pull/999",
+      rollupPrNumber: 999,
+      at: "2026-01-11T00:00:05.000Z",
+    });
+
+    const newBatch = createNewRollupBatch({
+      repo: "3mdistal/ralph",
+      botBranch: "bot/integration",
+      batchSize: 2,
+      at: "2026-01-11T00:00:06.000Z",
+    });
+
+    expect(newBatch.id).not.toBe(batch.id);
+
+    const openBatches = listOpenRollupBatches();
+    expect(openBatches).toHaveLength(1);
+    expect(openBatches[0].id).toBe(newBatch.id);
   });
 });
