@@ -508,18 +508,23 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
       summary: {
         status: "success",
         required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         available: ["ci"],
       },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
       timedOut: false,
     }));
 
     const mergePullRequestMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).isPrBehind = isPrBehindMock;
 
     const result = await worker.processTask(createMockTask());
 
