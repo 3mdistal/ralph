@@ -273,6 +273,7 @@ Control file:
 
 - `$XDG_STATE_HOME/ralph/control.json`
 - Fallback: `~/.local/state/ralph/control.json`
+- Last resort: `/tmp/ralph/<uid>/control.json`
 
 Example:
 
