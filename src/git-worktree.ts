@@ -1,8 +1,16 @@
+import { resolve, sep } from "path";
+
 export interface GitWorktreeEntry {
   worktreePath: string;
   head?: string;
   branch?: string;
   detached?: boolean;
+}
+
+export function isPathUnderDir(path: string, baseDir: string): boolean {
+  const resolvedPath = resolve(path);
+  const resolvedBase = resolve(baseDir);
+  return resolvedPath === resolvedBase || resolvedPath.startsWith(`${resolvedBase}${sep}`);
 }
 
 export function parseGitWorktreeListPorcelain(output: string): GitWorktreeEntry[] {
