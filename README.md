@@ -213,7 +213,7 @@ orchestration/
 ~/.ralph/
   config.toml     # preferred config (if present)
   config.json     # fallback config
-  state.sqlite    # durable metadata for idempotency + recovery (repos/issues/tasks/prs)
+  state.sqlite    # durable metadata for idempotency + recovery (repos/issues/tasks/prs + sync/idempotency)
   sessions/       # introspection logs per session
 ```
 
