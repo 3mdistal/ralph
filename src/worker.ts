@@ -138,7 +138,7 @@ async function readIntrospectionSummary(sessionId: string): Promise<Introspectio
  * Returns total count and whether there's been a recent burst.
  */
 async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount> {
-  const eventsPath = join(RALPH_SESSIONS_DIR, sessionId, "events.jsonl");
+  const eventsPath = getSessionEventsPath(sessionId);
   if (!existsSync(eventsPath)) return { total: 0, recentBurst: false };
 
   try {
