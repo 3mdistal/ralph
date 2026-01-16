@@ -426,11 +426,6 @@ export type RollupBatchEntry = {
   mergedAt: string;
 };
 
-export type RollupBatchSnapshot = {
-  batch: RollupBatch;
-  entries: RollupBatchEntry[];
-};
-
 function resolveRollupBatch(database: Database, params: {
   repo: string;
   botBranch: string;
