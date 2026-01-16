@@ -113,7 +113,7 @@ If Ralph logs that required checks are unavailable with `Available check context
 
 ### Environment variables
 
-Only these env vars are currently supported:
+Only these env vars are currently supported (unless noted otherwise):
 
 | Setting | Env Var | Default |
 |---------|---------|---------|
@@ -121,6 +121,7 @@ Only these env vars are currently supported:
 | Worktrees dir | `RALPH_WORKTREES_DIR` | `~/.ralph/worktrees` |
 | Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
 | Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
+| CI remediation attempts | `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` | `2` |
 
 Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
