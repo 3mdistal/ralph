@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { mkdir } from "fs/promises";
 
 import { classifyActivity } from "../activity-classifier";
 import { getSessionEventsPath } from "../paths";
@@ -10,7 +11,7 @@ const ensureDirForFile = async (filePath: string): Promise<void> => {
   const url = new URL(filePath, "file://");
   const dir = url.pathname.split("/").slice(0, -1).join("/") || ".";
   if (dir !== ".") {
-    await Bun.mkdir(dir, { recursive: true });
+    await mkdir(dir, { recursive: true });
   }
 };
 
