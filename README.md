@@ -97,8 +97,8 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
-
-Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
+- Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
+- Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
@@ -107,6 +107,8 @@ Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph
 Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
 Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require the configured `repos[].requiredChecks` and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
+
+If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs, or update `repos[].requiredChecks` to match actual check names.
 
 ### Environment variables
 
@@ -217,7 +219,7 @@ orchestration/
 ~/.ralph/
   config.toml     # preferred config (if present)
   config.json     # fallback config
-  state.sqlite    # durable metadata for idempotency + recovery (repos/issues/tasks/prs)
+  state.sqlite    # durable metadata for idempotency + recovery (repos/issues/tasks/prs + sync/idempotency)
   sessions/       # introspection logs per session
 ```
 

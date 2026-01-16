@@ -42,6 +42,7 @@ import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { initStateDb, recordPrSnapshot } from "./state";
 import { queueNudge } from "./nudge";
+import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
@@ -788,6 +789,13 @@ async function main(): Promise<void> {
     clearInterval(heartbeatTimer);
     clearInterval(throttleResumeTimer);
     
+    // Terminate in-flight OpenCode runs spawned by Ralph.
+    const termination = await terminateOpencodeRuns({ graceMs: 5000 });
+    if (termination.total > 0) {
+      const suffix = termination.remaining > 0 ? ` (${termination.remaining} required SIGKILL)` : "";
+      console.log(`[ralph] Terminated ${termination.total} OpenCode run(s)${suffix}.`);
+    }
+
     // Wait for in-flight tasks
     if (inFlightTasks.size > 0) {
       console.log(`[ralph] Waiting for ${inFlightTasks.size} in-flight task(s)...`);
