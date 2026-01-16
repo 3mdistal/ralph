@@ -39,7 +39,7 @@ describe("Config precedence (~/.ralph)", () => {
         "pollInterval = 12345",
         "owner = \"toml-owner\"",
         "devDir = \"/tmp/toml-dev\"",
-        "repos = []",
+        "repos = [{ name = \"demo/repo\", rollupBatchSize = 4 }]",
         "",
       ].join("\n"),
       "utf8"
@@ -49,7 +49,7 @@ describe("Config precedence (~/.ralph)", () => {
       bwrbVault: "json-vault",
       maxWorkers: 2,
       batchSize: 99,
-      repos: [],
+      repos: [{ name: "demo/repo", rollupBatchSize: 22 }],
     });
 
     const cfgMod = await import("../config?config-precedence");
@@ -60,6 +60,7 @@ describe("Config precedence (~/.ralph)", () => {
     expect(cfg.maxWorkers).toBe(3);
     expect(cfg.batchSize).toBe(11);
     expect(cfg.owner).toBe("toml-owner");
+    expect(cfg.repos[0]?.rollupBatchSize).toBe(4);
   });
 
   test("falls back to ~/.ralph/config.json when TOML missing", async () => {

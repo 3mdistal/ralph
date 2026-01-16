@@ -1,16 +1,27 @@
 import { $ } from "bun";
-import { loadConfig, getRepoPath, getRepoBotBranch } from "./config";
+import { loadConfig, getRepoPath, getRepoBotBranch, getRepoRollupBatchSize } from "./config";
 import { ensureGhTokenEnv } from "./github-app-auth";
 import { notifyRollupReady, notifyError } from "./notify";
+import { shouldLog } from "./logging";
 
 export class RollupMonitor {
   private mergeCount: Map<string, number> = new Map();
   private mergedPRs: Map<string, string[]> = new Map();
-  private batchSize: number;
+  private batchSize: number | null;
+  private perRepoBatchSize: Map<string, number> = new Map();
   
   constructor(batchSize?: number) {
-    this.batchSize = batchSize ?? loadConfig().batchSize;
+    this.batchSize = batchSize ?? null;
   }
+
+  private getBatchSize(repo: string): number {
+    const cached = this.perRepoBatchSize.get(repo);
+    if (cached) return cached;
+    const size = getRepoRollupBatchSize(repo, this.batchSize ?? undefined);
+    this.perRepoBatchSize.set(repo, size);
+    return size;
+  }
+
   
   /**
    * Record a successful merge to bot/integration
@@ -23,9 +34,10 @@ export class RollupMonitor {
     prs.push(prUrl);
     this.mergedPRs.set(repo, prs);
     
-    console.log(`[ralph:rollup] Recorded merge for ${repo}: ${prUrl} (${count}/${this.batchSize})`);
+    const batchSize = this.getBatchSize(repo);
+    console.log(`[ralph:rollup] Recorded merge for ${repo}: ${prUrl} (${count}/${batchSize})`);
     
-    if (count >= this.batchSize) {
+    if (count >= batchSize) {
       await this.createRollupPR(repo);
     }
   }
@@ -41,9 +53,28 @@ export class RollupMonitor {
     console.log(`[ralph:rollup] Creating rollup PR for ${repo}...`);
     
     try {
+      const existing = await this.getOpenRollupPR(repo, botBranch);
+      if (existing) {
+        if (shouldLog(`rollup:dedupe:${repo}`, 5 * 60_000)) {
+          console.log(`[ralph:rollup] Rollup PR already open for ${repo}: ${existing}`);
+        }
+        return existing;
+      }
+
+      const needsRollup = await this.needsRollup(repo, botBranch, repoPath);
+      if (!needsRollup) {
+        if (shouldLog(`rollup:clean:${repo}`, 5 * 60_000)) {
+          console.log(`[ralph:rollup] No differences to roll up for ${repo}`);
+        }
+        return null;
+      }
+
       // Build PR body
       const today = new Date().toISOString().split("T")[0];
       const prList = prs.map(pr => `- ${pr}`).join("\n");
+      const includedSection = prList
+        ? prList
+        : "(Merged PR list unavailable; no merge history recorded in this session.)";
       
       const body = `## Rollup: ${today} batch
 
@@ -51,7 +82,7 @@ This PR consolidates ${prs.length} changes from the \`${botBranch}\` branch.
 
 ### Included PRs
 
-${prList}
+${includedSection}
 
 ### Testing
 
@@ -89,6 +120,22 @@ This is an automated rollup created by Ralph Loop. Each individual PR was review
       return null;
     }
   }
+
+  private async getOpenRollupPR(repo: string, botBranch: string): Promise<string | null> {
+    const repoPath = getRepoPath(repo);
+    try {
+      await ensureGhTokenEnv();
+      const result = await $`gh pr list --repo ${repo} --base main --head ${botBranch} --state open --json url`.cwd(repoPath).quiet();
+      const raw = result.stdout.toString().trim();
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as Array<{ url?: string }>;
+      return parsed[0]?.url ?? null;
+    } catch (e: any) {
+      console.error(`[ralph:rollup] Failed to check existing rollup PR for ${repo}:`, e);
+      await notifyError(`Checking existing rollup PR for ${repo}`, e.message);
+      return null;
+    }
+  }
   
   /**
    * Force a rollup for a specific repo (manual trigger)
@@ -101,6 +148,25 @@ This is an automated rollup created by Ralph Loop. Each individual PR was review
     }
     
     return this.createRollupPR(repo);
+  }
+
+  async checkIdleRollup(repo: string): Promise<string | null> {
+    return this.createRollupPR(repo);
+  }
+
+  private async needsRollup(repo: string, botBranch: string, repoPath: string): Promise<boolean> {
+    try {
+      await $`git fetch --quiet --all`.cwd(repoPath).quiet();
+      const result = await $`git rev-list --count main..${botBranch}`.cwd(repoPath).quiet();
+      const raw = result.stdout.toString().trim();
+      const count = Number.parseInt(raw, 10);
+      if (!Number.isFinite(count)) return true;
+      return count > 0;
+    } catch (e: any) {
+      console.error(`[ralph:rollup] Failed to compare ${botBranch} vs main for ${repo}:`, e);
+      await notifyError(`Comparing ${botBranch} vs main for ${repo}`, e.message);
+      return true;
+    }
   }
   
   /**

@@ -54,6 +54,11 @@ This provides full auditability and integrates with existing Obsidian workflows.
 
 Agents merge to `bot/integration`, not main directly. Every ~10 PRs, create a rollup PR to main for batch human review.
 
+Rollup automation policy:
+- Default batch size is 10 (configurable globally or per repo).
+- If there are no queued or in-flight tasks for 5 minutes, check for unrolled changes on `bot/integration`.
+- Create a rollup PR from `bot/integration` to `main` when there are unrolled changes, unless one is already open.
+
 Benefits:
 - Reduces interrupt frequency
 - Batches related changes for easier review
