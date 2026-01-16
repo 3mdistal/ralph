@@ -242,6 +242,14 @@ type CheckRunsResponse = {
   check_runs?: Array<{ name?: string | null }> | null;
 };
 
+type RepoDetails = {
+  default_branch?: string | null;
+};
+
+type GitRef = {
+  object?: { sha?: string | null } | null;
+};
+
 function splitRepoFullName(full: string): { owner: string; name: string } {
   const [owner, name] = full.split("/");
   if (!owner || !name) {
@@ -368,6 +376,22 @@ export function __summarizeRequiredChecksForTests(
   requiredChecks: string[]
 ): RequiredChecksSummary {
   return summarizeRequiredChecks(allChecks, requiredChecks);
+}
+
+export const __TEST_ONLY_DEFAULT_BRANCH = "__default_branch__";
+
+export const __TEST_ONLY_DEFAULT_SHA = "__default_sha__";
+
+export function __buildRepoDefaultBranchResponse(): RepoDetails {
+  return { default_branch: __TEST_ONLY_DEFAULT_BRANCH };
+}
+
+export function __buildGitRefResponse(sha: string): GitRef {
+  return { object: { sha } };
+}
+
+export function __buildCheckRunsResponse(names: string[]): CheckRunsResponse {
+  return { check_runs: names.map((name) => ({ name })) };
 }
 
 function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
@@ -575,10 +599,70 @@ export class RepoWorker {
 
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
     const { owner, name } = splitRepoFullName(this.repo);
-    const payload = await this.githubApiRequest<CheckRunsResponse>(
-      `/repos/${owner}/${name}/commits/${branch}/check-runs?per_page=100`
-    );
-    return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
+    try {
+      const payload = await this.githubApiRequest<CheckRunsResponse>(
+        `/repos/${owner}/${name}/commits/${branch}/check-runs?per_page=100`
+      );
+      return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      if (/HTTP 422/.test(msg) && /No commit found/i.test(msg)) {
+        const missingBranchError = new Error(msg);
+        missingBranchError.cause = "missing-branch";
+        throw missingBranchError;
+      }
+      throw e;
+    }
+  }
+
+  private async fetchRepoDefaultBranch(): Promise<string | null> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const payload = await this.githubApiRequest<RepoDetails>(`/repos/${owner}/${name}`);
+    const branch = payload?.default_branch ?? null;
+    return branch ? String(branch) : null;
+  }
+
+  private async fetchGitRef(ref: string): Promise<GitRef | null> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    return this.githubApiRequest<GitRef>(`/repos/${owner}/${name}/git/ref/${ref}`, { allowNotFound: true });
+  }
+
+  private async createGitRef(ref: string, sha: string): Promise<void> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    await this.githubApiRequest(`/repos/${owner}/${name}/git/refs`, {
+      method: "POST",
+      body: { ref: `refs/${ref}`, sha },
+    });
+  }
+
+  private async ensureRemoteBranchExists(branch: string): Promise<boolean> {
+    const ref = `heads/${branch}`;
+    const existing = await this.fetchGitRef(ref);
+    if (existing?.object?.sha) return false;
+
+    const defaultBranch = await this.fetchRepoDefaultBranch();
+    if (!defaultBranch) {
+      throw new Error(`Unable to resolve default branch for ${this.repo}; cannot create ${branch}.`);
+    }
+
+    const defaultRef = await this.fetchGitRef(`heads/${defaultBranch}`);
+    const defaultSha = defaultRef?.object?.sha ? String(defaultRef.object.sha) : null;
+    if (!defaultSha) {
+      throw new Error(`Unable to resolve ${this.repo}@${defaultBranch} sha; cannot create ${branch}.`);
+    }
+
+    try {
+      await this.createGitRef(ref, defaultSha);
+      console.log(
+        `[ralph:worker:${this.repo}] Created missing branch ${branch} from ${defaultBranch} (${defaultSha}).`
+      );
+      return true;
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      if (/Reference already exists/i.test(msg)) return false;
+      if (/HTTP 422/.test(msg) && /already exists/i.test(msg)) return false;
+      throw e;
+    }
   }
 
   private async fetchBranchProtection(branch: string): Promise<BranchProtection | null> {
@@ -592,7 +676,23 @@ export class RepoWorker {
   private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
     if (requiredChecks.length === 0) return;
 
-    const availableChecks = await this.fetchCheckRunNames(branch);
+    const botBranch = getRepoBotBranch(this.repo);
+    if (branch === botBranch) {
+      await this.ensureRemoteBranchExists(branch);
+    }
+
+    let availableChecks: string[] = [];
+    try {
+      availableChecks = await this.fetchCheckRunNames(branch);
+    } catch (e: any) {
+      if (branch === botBranch && e?.cause === "missing-branch") {
+        await this.ensureRemoteBranchExists(branch);
+        availableChecks = await this.fetchCheckRunNames(branch);
+      } else {
+        throw e;
+      }
+    }
+
     const missingChecks = requiredChecks.filter((check) => !availableChecks.includes(check));
     if (missingChecks.length > 0) {
       const guidance = formatRequiredChecksGuidance({
