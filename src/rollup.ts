@@ -1,3 +1,5 @@
+import { $ } from "bun";
+
 import { loadConfig, getRepoPath, getRepoBotBranch, getRepoRollupBatchSize } from "./config";
 import { ensureGhTokenEnv } from "./github-app-auth";
 import { notifyRollupReady, notifyError } from "./notify";
