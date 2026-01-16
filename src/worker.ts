@@ -1585,7 +1585,7 @@ ${guidance}`
       };
     }
 
-    const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+    const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: loadConfig().control });
     const requested = control.opencodeProfile?.trim() ?? "";
 
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
@@ -1652,7 +1652,8 @@ ${guidance}`
     if (pinned) {
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
-      const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message) }).opencodeProfile?.trim() ?? "";
+      const controlProfile =
+        readControlStateSnapshot({ log: (message) => console.warn(message), defaults: loadConfig().control }).opencodeProfile?.trim() ?? "";
 
       if (controlProfile === "auto") {
         const chosen = await resolveAutoOpencodeProfileName(Date.now(), {

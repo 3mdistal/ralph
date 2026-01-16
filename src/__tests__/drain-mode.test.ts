@@ -46,14 +46,14 @@ describe("Drain mode", () => {
     tmpDirs.push(homeDir);
 
     const controlPath = resolveControlFilePath(homeDir);
-    expect(isDraining(homeDir)).toBe(false);
+    expect(isDraining(homeDir, { autoCreate: false, suppressMissingWarnings: true })).toBe(false);
 
     mkdirSync(dirname(controlPath), { recursive: true });
     writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
-    expect(isDraining(homeDir)).toBe(true);
+    expect(isDraining(homeDir, { autoCreate: false, suppressMissingWarnings: true })).toBe(true);
 
     writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
-    expect(isDraining(homeDir)).toBe(false);
+    expect(isDraining(homeDir, { autoCreate: false, suppressMissingWarnings: true })).toBe(false);
   });
 
   test("resolveControlFilePath falls back to uid-scoped /tmp when home missing", () => {
@@ -130,7 +130,7 @@ describe("Drain mode", () => {
     expect(monitor.getMode()).toBe("running");
   });
 
-  test("DrainMonitor creates control directory on startup", async () => {
+  test("DrainMonitor creates control file on startup", async () => {
     const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
     tmpDirs.push(homeDir);
 
@@ -138,6 +138,7 @@ describe("Drain mode", () => {
     const controlDir = dirname(controlPath);
 
     expect(existsSync(controlDir)).toBe(false);
+    expect(existsSync(controlPath)).toBe(false);
 
     const monitor = new DrainMonitor({
       homeDir,
@@ -149,6 +150,70 @@ describe("Drain mode", () => {
 
     expect(existsSync(controlDir)).toBe(true);
     expect(() => statSync(controlDir)).not.toThrow();
+    expect(existsSync(controlPath)).toBe(true);
+
+    monitor.stop();
+  });
+
+  test("DrainMonitor respects autoCreate=false", async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+    tmpDirs.push(homeDir);
+
+    const controlPath = resolveControlFilePath(homeDir);
+    const controlDir = dirname(controlPath);
+
+    expect(existsSync(controlDir)).toBe(false);
+
+    const monitor = new DrainMonitor({
+      homeDir,
+      pollIntervalMs: 10,
+      defaults: { autoCreate: false },
+    });
+
+    monitor.start();
+    await sleep(25);
+
+    expect(existsSync(controlDir)).toBe(false);
+
+    monitor.stop();
+  });
+
+  test("DrainMonitor respects suppressMissingWarnings", async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+    tmpDirs.push(homeDir);
+
+    const warnings: string[] = [];
+    const monitor = new DrainMonitor({
+      homeDir,
+      pollIntervalMs: 10,
+      defaults: { suppressMissingWarnings: true, autoCreate: false },
+      warn: (message) => warnings.push(message),
+    });
+
+    monitor.start();
+    await sleep(50);
+
+    expect(warnings.length).toBe(0);
+
+    monitor.stop();
+  });
+
+  test("DrainMonitor warns when suppressMissingWarnings=false", async () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+    tmpDirs.push(homeDir);
+
+    const warnings: string[] = [];
+    const monitor = new DrainMonitor({
+      homeDir,
+      pollIntervalMs: 10,
+      defaults: { suppressMissingWarnings: false, autoCreate: false },
+      warn: (message) => warnings.push(message),
+    });
+
+    monitor.start();
+    await sleep(50);
+
+    expect(warnings.length).toBeGreaterThan(0);
 
     monitor.stop();
   });
@@ -174,6 +239,6 @@ describe("Drain mode", () => {
     mkdirSync(dirname(controlDir), { recursive: true });
     symlinkSync(realDir, controlDir, "dir");
 
-    expect(isDraining(homeDir)).toBe(false);
+    expect(isDraining(homeDir, { autoCreate: false, suppressMissingWarnings: true })).toBe(false);
   });
 });

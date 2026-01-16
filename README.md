@@ -104,8 +104,12 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 - `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
+- `control` (object, optional): control file defaults
+  - `autoCreate` (boolean): create `control.json` on startup (default: true)
+  - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
 
 Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
+
 
 Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require the configured `repos[].requiredChecks` and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
 
@@ -275,6 +279,8 @@ Control file:
 - `$XDG_STATE_HOME/ralph/control.json`
 - Fallback: `~/.local/state/ralph/control.json`
 - Last resort: `/tmp/ralph/<uid>/control.json`
+
+Ralph auto-creates the control file on startup with `{ "mode": "running" }` unless disabled via config.
 
 Example:
 

@@ -114,7 +114,7 @@ Two phases:
 
 - Phase 0 (no control plane required):
   - CLI writes a control file, e.g. `$XDG_STATE_HOME/ralph/control.json` (fallback `~/.local/state/ralph/control.json`, last resort `/tmp/ralph/<uid>/control.json`).
-  - Daemon watches/polls it.
+  - Daemon watches/polls it, and creates it on startup with `{ "mode": "running" }` if missing (configurable).
   - Optional: CLI sends `SIGUSR1` to prompt immediate reload.
 
 - Phase 1 (dashboard/control plane):

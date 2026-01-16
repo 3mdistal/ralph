@@ -75,13 +75,13 @@ const idleState = new Map<
 
 function getDaemonMode(): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
-  return isDraining() ? "draining" : "running";
+  return isDraining(undefined, loadConfig().control) ? "draining" : "running";
 }
 
 function getActiveOpencodeProfileName(): string | null {
   const control = drainMonitor
     ? drainMonitor.getState()
-    : readControlStateSnapshot({ log: (message) => console.warn(message) });
+    : readControlStateSnapshot({ log: (message) => console.warn(message), defaults: loadConfig().control });
 
   const fromControl = control.opencodeProfile?.trim() ?? "";
   if (fromControl) return fromControl;
@@ -779,6 +779,7 @@ async function main(): Promise<void> {
   // Start drain monitor (operator control file)
   drainMonitor = new DrainMonitor({
     log: (message) => console.log(message),
+    defaults: config.control,
     onModeChange: (mode) => {
       if (isShuttingDown) return;
       if (mode !== "running") return;
@@ -1124,7 +1125,7 @@ if (args[0] === "status") {
 
   const json = args.includes("--json");
 
-  const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: loadConfig().control });
   const controlProfile = control.opencodeProfile?.trim() || "";
 
   const requestedProfile =
