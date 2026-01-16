@@ -577,16 +577,6 @@ export function listRollupBatchEntries(batchId: string): RollupBatchEntry[] {
   }));
 }
 
-export function getRollupBatchSnapshot(params: {
-  repo: string;
-  botBranch: string;
-  batchSize: number;
-}): RollupBatchSnapshot {
-  const database = requireDb();
-  const batch = resolveRollupBatch(database, params);
-  const entries = listRollupBatchEntries(batch.id);
-  return { batch, entries };
-}
 
 export function recordRollupMerge(params: {
   repo: string;
