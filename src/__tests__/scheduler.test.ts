@@ -302,7 +302,7 @@ describe("Scheduler invariants", () => {
     expect(started).toEqual(["resume:resume-1", "queued:queued-1"]);
   });
 
-  test("queued tasks still schedule when resume tasks are pending", () => {
+  test("queued tasks still schedule when resume tasks are pending", async () => {
     type ControllerTask = { repo: string; _path: string; name: string };
     const pendingResumes: ControllerTask[] = [{ repo: "repo-a", _path: "resume-1", name: "resume" }];
     const queuedTasks: ControllerTask[] = [{ repo: "repo-a", _path: "queued-1", name: "queued" }];
@@ -358,6 +358,8 @@ describe("Scheduler invariants", () => {
     });
 
     controller.scheduleQueuedTasksSoon();
+    controller.scheduleQueuedTasksSoon();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(started).toEqual(["resume:resume-1", "queued:queued-1"]);
     expect(log).toContain("started:2");
