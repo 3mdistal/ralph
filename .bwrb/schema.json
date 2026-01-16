@@ -2,11 +2,30 @@
   "version": 2,
   "schemaVersion": "2.0.0",
   "config": {
-    "link_format": "wikilink"
+    "link_format": "wikilink",
+    "excluded_directories": [
+      "docs",
+      "src",
+      ".github",
+      ".bwrb",
+      "node_modules"
+    ]
   },
   "types": {
     "agent-task": {
       "fields": {
+        "id": {
+          "prompt": "text",
+          "required": false
+        },
+        "name": {
+          "prompt": "text",
+          "required": false
+        },
+        "opencode-profile": {
+          "prompt": "text",
+          "required": false
+        },
         "issue": {
           "prompt": "text",
           "required": true
@@ -86,9 +105,11 @@
         }
       },
       "field_order": [
+        "id",
+        "name",
         "issue",
         "repo",
-        "scope",
+        "opencode-profile",
         "status",
         "priority",
         "creation-date",
@@ -106,6 +127,14 @@
     },
     "agent-run": {
       "fields": {
+        "id": {
+          "prompt": "text",
+          "required": false
+        },
+        "name": {
+          "prompt": "text",
+          "required": false
+        },
         "task": {
           "prompt": "relation",
           "source": "agent-task",
@@ -136,25 +165,30 @@
         "creation-date": {
           "prompt": "date",
           "required": true
-        },
-        "scope": {
-          "prompt": "text",
-          "required": true
         }
       },
       "field_order": [
+        "id",
+        "name",
         "task",
         "started",
         "completed",
         "outcome",
         "pr",
-        "creation-date",
-        "scope"
+        "creation-date"
       ],
       "output_dir": "orchestration/runs"
     },
     "agent-escalation": {
       "fields": {
+        "id": {
+          "prompt": "text",
+          "required": false
+        },
+        "name": {
+          "prompt": "text",
+          "required": false
+        },
         "task": {
           "prompt": "relation",
           "source": "agent-task",
@@ -204,10 +238,6 @@
           "prompt": "date",
           "required": true
         },
-        "scope": {
-          "prompt": "text",
-          "required": true
-        },
         "resume-status": {
           "prompt": "text",
           "required": false
@@ -226,6 +256,8 @@
         }
       },
       "field_order": [
+        "id",
+        "name",
         "task",
         "task-path",
         "issue",
@@ -234,7 +266,6 @@
         "status",
         "resolved-at",
         "creation-date",
-        "scope",
         "session-id",
         "resume-status",
         "resume-attempted-at",
@@ -247,10 +278,6 @@
       "fields": {
         "creation-date": {
           "prompt": "date",
-          "required": true
-        },
-        "scope": {
-          "prompt": "text",
           "required": true
         },
         "title": {
@@ -304,7 +331,6 @@
       },
       "field_order": [
         "creation-date",
-        "scope",
         "title",
         "repo",
         "recommendation-type",
@@ -317,18 +343,23 @@
     },
     "idea": {
       "fields": {
+        "id": {
+          "prompt": "text",
+          "required": false
+        },
+        "name": {
+          "prompt": "text",
+          "required": false
+        },
         "creation-date": {
           "prompt": "date",
-          "required": true
-        },
-        "scope": {
-          "prompt": "text",
           "required": true
         }
       },
       "field_order": [
-        "creation-date",
-        "scope"
+        "id",
+        "name",
+        "creation-date"
       ],
       "output_dir": "orchestration/notifications"
     }
