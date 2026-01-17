@@ -7,6 +7,8 @@ import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 
+const sanitizeNoteTitle = sanitizeNoteName;
+
 export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
 
 // Cache for terminal-notifier availability check
