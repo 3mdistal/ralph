@@ -46,6 +46,12 @@ import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import {
+  ACTIVITY_EMIT_INTERVAL_MS,
+  ACTIVITY_WINDOW_MS,
+  classifyActivity,
+} from "./activity-classifier";
+import type { ActivityLabel } from "./activity-classifier";
 import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
 import {
   buildWaitingResolutionUpdate,
@@ -111,6 +117,26 @@ function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
 
 // Track in-flight tasks to avoid double-processing
 const inFlightTasks = new Set<string>();
+const activeSessionTasks = new Map<
+  string,
+  { task: AgentTask; workerId?: string; taskId?: string }
+>();
+const activityStateBySession = new Map<string, { activity: ActivityLabel; lastEmittedAt: number }>();
+
+function shouldEmitActivityUpdate(params: {
+  sessionId: string;
+  activity: ActivityLabel;
+  now: number;
+}): boolean {
+  const existing = activityStateBySession.get(params.sessionId);
+  if (!existing) return true;
+  if (existing.activity !== params.activity) return true;
+  return params.now - existing.lastEmittedAt >= ACTIVITY_EMIT_INTERVAL_MS;
+}
+
+function recordActivityState(params: { sessionId: string; activity: ActivityLabel; now: number }): void {
+  activityStateBySession.set(params.sessionId, { activity: params.activity, lastEmittedAt: params.now });
+}
 
 type Deferred = {
   promise: Promise<void>;
@@ -647,6 +673,45 @@ async function getTaskNowDoingLine(task: AgentTask): Promise<string> {
   return formatNowDoingLine(nowDoing, label);
 }
 
+async function emitActivityUpdate(params: {
+  sessionId: string;
+  task: AgentTask;
+  workerId?: string;
+  taskId?: string;
+}): Promise<void> {
+  const sessionId = params.sessionId?.trim();
+  if (!sessionId) return;
+
+  try {
+    const now = Date.now();
+    const snapshot = await classifyActivity({
+      sessionId,
+      runLogPath: params.task["run-log-path"],
+      now,
+      windowMs: ACTIVITY_WINDOW_MS,
+    });
+
+    if (!shouldEmitActivityUpdate({ sessionId, activity: snapshot.activity, now })) return;
+
+    ralphEventBus.publish(
+      buildRalphEvent({
+        type: "worker.activity.updated",
+        level: "info",
+        workerId: params.workerId,
+        repo: params.task.repo,
+        taskId: params.taskId,
+        sessionId,
+        data: { activity: snapshot.activity },
+      })
+    );
+
+    recordActivityState({ sessionId, activity: snapshot.activity, now });
+  } catch (e: any) {
+    const msg = e?.message ?? String(e);
+    console.warn(`[ralph] Failed to classify activity: ${msg}`);
+  }
+}
+
 async function printHeartbeatTick(): Promise<void> {
   const [starting, inProgress] = await Promise.all([getTasksByStatus("starting"), getTasksByStatus("in-progress")]);
   const tasks = [...starting, ...inProgress];
@@ -655,6 +720,24 @@ async function printHeartbeatTick(): Promise<void> {
   for (const task of tasks) {
     const line = await getTaskNowDoingLine(task);
     console.log(`[ralph:hb] ${line}`);
+
+    const sessionId = task["session-id"]?.trim();
+    if (!sessionId) continue;
+
+    const taskId = task._path || task.name;
+    const workerId = taskId ? `${task.repo}#${taskId}` : undefined;
+    activeSessionTasks.set(sessionId, { task, workerId, taskId });
+  }
+
+  const activeSessionIds = new Set(tasks.map((task) => task["session-id"]?.trim()).filter(Boolean) as string[]);
+
+  for (const [sessionId, payload] of activeSessionTasks) {
+    if (!activeSessionIds.has(sessionId)) {
+      activeSessionTasks.delete(sessionId);
+      continue;
+    }
+
+    await emitActivityUpdate({ sessionId, ...payload });
   }
 }
 

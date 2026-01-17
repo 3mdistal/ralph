@@ -43,7 +43,7 @@ import {
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
-import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
+import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { recordIssueSnapshot } from "./state";
 import {
   isPathUnderDir,
@@ -137,7 +137,7 @@ async function readIntrospectionSummary(sessionId: string): Promise<Introspectio
  * Returns total count and whether there's been a recent burst.
  */
 async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount> {
-  const eventsPath = join(RALPH_SESSIONS_DIR, sessionId, "events.jsonl");
+  const eventsPath = getSessionEventsPath(sessionId);
   if (!existsSync(eventsPath)) return { total: 0, recentBurst: false };
 
   try {

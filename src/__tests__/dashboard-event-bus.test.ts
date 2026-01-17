@@ -103,4 +103,22 @@ describe("dashboard event schema", () => {
 
     expect(isRalphEvent(invalidTopActivities)).toBe(false);
   });
+
+  test("accepts worker.activity.updated payload", () => {
+    const ok = buildRalphEvent({
+      type: "worker.activity.updated",
+      level: "info",
+      workerId: "3mdistal/ralph#orchestration/tasks/41",
+      data: { activity: "testing" },
+    });
+
+    expect(isRalphEvent(ok)).toBe(true);
+
+    const bad: any = {
+      ...ok,
+      data: { activity: 123 },
+    };
+
+    expect(isRalphEvent(bad)).toBe(false);
+  });
 });
