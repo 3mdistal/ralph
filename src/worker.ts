@@ -20,7 +20,6 @@ import { type AgentTask, updateTaskStatus } from "./queue";
 import {
   getOpencodeDefaultProfileName,
   getRepoBotBranch,
-  getRepoMaxWorkers,
   getRepoRequiredChecks,
   isOpencodeProfilesEnabled,
   loadConfig,
@@ -553,6 +552,52 @@ export class RepoWorker {
     return runLogPath;
   }
 
+  private async getRepoRootStatusPorcelain(): Promise<string> {
+    try {
+      const status = await $`git status --porcelain`.cwd(this.repoPath).quiet();
+      return status.stdout.toString().trim();
+    } catch (e: any) {
+      throw new Error(`Failed to check repo root status: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  private async assertRepoRootClean(task: AgentTask, phase: "start" | "resume" | "post-run"): Promise<void> {
+    const status = await this.getRepoRootStatusPorcelain();
+    if (!status) return;
+
+    const reason = `Repo root has uncommitted changes; refusing to run to protect main checkout (${phase}).`;
+    const message = [reason, "", "Status:", status].join("\n");
+
+    await this.queue.updateTaskStatus(task, "blocked", {
+      "completed-at": new Date().toISOString().split("T")[0],
+      "session-id": "",
+      "watchdog-retries": "",
+      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+    });
+
+    await this.createAgentRun(task, {
+      outcome: "failed",
+      started: new Date(),
+      completed: new Date(),
+      sessionId: task["session-id"]?.trim() || undefined,
+      bodyPrefix: [
+        "Blocked: repo root dirty",
+        "",
+        `Phase: ${phase}`,
+        `Repo: ${task.repo}`,
+        "",
+        "Status:",
+        status,
+      ].join("\n"),
+    });
+
+    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, task.name);
+
+    const error = new Error(reason) as Error & { ralphRootDirty?: boolean };
+    error.ralphRootDirty = true;
+    throw error;
+  }
+
   private async ensureBaselineLabelsOnce(): Promise<void> {
 
 
@@ -1000,26 +1045,28 @@ ${guidance}`
     task: AgentTask,
     issueNumber: string,
     mode: "start" | "resume"
-  ): Promise<{ repoPath: string; worktreePath?: string }> {
+  ): Promise<{ repoPath: string; worktreePath: string }> {
     const recorded = task["worktree-path"]?.trim();
-    if (recorded && existsSync(recorded)) {
-      return { repoPath: recorded, worktreePath: recorded };
+    if (recorded) {
+      if (this.isSameRepoRootPath(recorded)) {
+        throw new Error(`Recorded worktree-path matches repo root; refusing to run in main checkout: ${recorded}`);
+      }
+      if (!this.isRepoWorktreePath(recorded)) {
+        throw new Error(`Recorded worktree-path is outside managed worktrees dir: ${recorded}`);
+      }
+      if (this.isHealthyWorktreePath(recorded)) {
+        return { repoPath: recorded, worktreePath: recorded };
+      }
+
+      if (!existsSync(recorded)) {
+        throw new Error(`Recorded worktree-path does not exist: ${recorded}`);
+      }
+
+      throw new Error(`Recorded worktree-path is not a valid git worktree: ${recorded}`);
     }
 
-    if (recorded && !existsSync(recorded)) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Recorded worktree-path does not exist; falling back to main repo checkout: ${recorded}`
-      );
-    }
-
-    // Only create worktrees for new runs (not resume), and only when per-repo concurrency > 1.
     if (mode === "resume") {
-      return { repoPath: this.repoPath };
-    }
-
-    const maxWorkers = getRepoMaxWorkers(this.repo);
-    if (maxWorkers <= 1) {
-      return { repoPath: this.repoPath };
+      throw new Error("Missing worktree-path for in-progress task; refusing to resume in main checkout");
     }
 
     const taskKey = safeNoteName(task._path || task._name || task.name);
@@ -2356,14 +2403,15 @@ ${guidance}`
 
     const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber || cacheKey, "resume");
 
-      const existingSessionId = task["session-id"]?.trim();
-      if (!existingSessionId) {
-        const reason = "In-progress task has no session-id; cannot resume";
-        console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
-        await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
-        return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
-      }
+    await this.assertRepoRootClean(task, "resume");
 
+    const existingSessionId = task["session-id"]?.trim();
+    if (!existingSessionId) {
+      const reason = "In-progress task has no session-id; cannot resume";
+      console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
+      await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
+      return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
+    }
 
     try {
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
@@ -2724,6 +2772,8 @@ ${guidance}`
         await this.cleanupGitWorktree(worktreePath);
       }
 
+      await this.assertRepoRootClean(task, "post-run");
+
       console.log(`[ralph:worker:${this.repo}] Task resumed to completion: ${task.name}`);
 
       return {
@@ -2736,8 +2786,10 @@ ${guidance}`
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
-      await this.queue.updateTaskStatus(task, "blocked");
-      await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+      if (!error?.ralphRootDirty) {
+        await this.queue.updateTaskStatus(task, "blocked");
+        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+      }
 
       return {
         taskName: task.name,
@@ -2796,6 +2848,8 @@ ${guidance}`
       await this.ensureBranchProtectionOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber, "start");
+
+      await this.assertRepoRootClean(task, "start");
 
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
@@ -3377,6 +3431,8 @@ ${guidance}`
         await this.cleanupGitWorktree(worktreePath);
       }
 
+      await this.assertRepoRootClean(task, "post-run");
+
       // 13. Send desktop notification for completion
       await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
 
@@ -3392,8 +3448,10 @@ ${guidance}`
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
-      await this.queue.updateTaskStatus(task, "blocked");
-      await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+      if (!error?.ralphRootDirty) {
+        await this.queue.updateTaskStatus(task, "blocked");
+        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+      }
 
       return {
         taskName: task.name,

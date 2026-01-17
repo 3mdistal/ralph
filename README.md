@@ -33,6 +33,10 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 - [bwrb](https://github.com/3mdistal/bwrb) CLI >= 0.1.3 (`npm install -g bwrb`) (needed for `.bwrbignore` negation)
 - [gh](https://cli.github.com) CLI
 
+## Worktree isolation guardrail
+
+Ralph always runs workers inside a per-task git worktree and blocks execution if it cannot prove isolation. If the repo root checkout is dirty or a task is missing a valid `worktree-path`, the worker fails closed and reports the issue. This protects the main checkout from accidental writes.
+
 If you previously installed bwrb via `pnpm link -g`, unlink it first so Ralph uses the published CLI on your PATH (Bun just shells out to the `bwrb` binary).
 
 ## Installation
