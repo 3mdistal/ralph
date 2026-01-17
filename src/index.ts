@@ -16,6 +16,7 @@ import {
   getRepoMaxWorkers,
   getRepoPath,
   loadConfig,
+  type ControlConfig,
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
@@ -79,15 +80,15 @@ const idleState = new Map<
   }
 >();
 
-function getDaemonMode(): DaemonMode {
+function getDaemonMode(defaults?: Partial<ControlConfig>): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
-  return isDraining() ? "draining" : "running";
+  return isDraining(undefined, defaults) ? "draining" : "running";
 }
 
-function getActiveOpencodeProfileName(): string | null {
+function getActiveOpencodeProfileName(defaults?: Partial<ControlConfig>): string | null {
   const control = drainMonitor
     ? drainMonitor.getState()
-    : readControlStateSnapshot({ log: (message) => console.warn(message) });
+    : readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
 
   const fromControl = control.opencodeProfile?.trim() ?? "";
   if (fromControl) return fromControl;
@@ -95,8 +96,11 @@ function getActiveOpencodeProfileName(): string | null {
   return getOpencodeDefaultProfileName();
 }
 
-async function resolveEffectiveOpencodeProfileNameForNewTasks(now: number): Promise<string | null> {
-  const requested = getActiveOpencodeProfileName();
+async function resolveEffectiveOpencodeProfileNameForNewTasks(
+  now: number,
+  defaults?: Partial<ControlConfig>
+): Promise<string | null> {
+  const requested = getActiveOpencodeProfileName(defaults);
   const resolved = await resolveOpencodeProfileForNewWork(now, requested);
   return resolved.profileName;
 }
@@ -207,7 +211,8 @@ function getRepoSemaphore(repo: string): Semaphore {
 
 async function checkIdleRollups(): Promise<void> {
   if (isShuttingDown) return;
-  if (getDaemonMode() === "draining") return;
+  const config = loadConfig();
+  if (getDaemonMode(config.control) === "draining") return;
   if (inFlightTasks.size > 0) return;
 
   const queued = await getRunnableTasks();
@@ -216,7 +221,7 @@ async function checkIdleRollups(): Promise<void> {
     return;
   }
 
-  const repos = new Set(loadConfig().repos.map((repo) => repo.name));
+  const repos = new Set(config.repos.map((repo) => repo.name));
   for (const repo of workers.keys()) repos.add(repo);
   if (repos.size === 0) return;
 
@@ -316,10 +321,16 @@ async function getRunnableTasks(): Promise<AgentTask[]> {
 }
 
 const schedulerController = createSchedulerController({
-  getDaemonMode: () => getDaemonMode(),
+  getDaemonMode: () => {
+    const config = loadConfig();
+    return getDaemonMode(config.control);
+  },
   isShuttingDown: () => isShuttingDown,
   getRunnableTasks: () => getRunnableTasks(),
-  onRunnableTasks: (tasks) => processNewTasks(tasks),
+  onRunnableTasks: (tasks) => {
+    const config = loadConfig();
+    return processNewTasks(tasks, config.control ?? {});
+  },
   getPendingResumeTasks: () => Array.from(pendingResumeTasks.values()),
   onPendingResumeTasks: (priorityTasks) => {
     ensureSemaphores();
@@ -404,8 +415,8 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
   });
 }
 
-async function attemptResumeThrottledTasks(): Promise<void> {
-  if (getDaemonMode() === "draining" || isShuttingDown) return;
+async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Promise<void> {
+  if (getDaemonMode(defaults) === "draining" || isShuttingDown) return;
 
   ensureSemaphores();
   if (!globalSemaphore) return;
@@ -413,7 +424,7 @@ async function attemptResumeThrottledTasks(): Promise<void> {
   const throttled = await getTasksByStatus("throttled");
   if (throttled.length === 0) return;
 
-  const controlProfile = getActiveOpencodeProfileName();
+  const controlProfile = getActiveOpencodeProfileName(defaults);
   const activeProfile = controlProfile === "auto" ? await resolveAutoOpencodeProfileName(Date.now()) : controlProfile;
   const profileKeys = Array.from(
     new Set(throttled.map((t) => getTaskOpencodeProfileName(t) ?? activeProfile ?? ""))
@@ -431,7 +442,7 @@ async function attemptResumeThrottledTasks(): Promise<void> {
   const now = Date.now();
 
   for (const task of throttled) {
-    if (getDaemonMode() === "draining" || isShuttingDown) return;
+    if (getDaemonMode(defaults) === "draining" || isShuttingDown) return;
 
     const resumeAtRaw = task["resume-at"]?.trim() ?? "";
     const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;
@@ -584,14 +595,14 @@ function startResumeTask(opts: {
 
 // --- Main Logic ---
 
-async function processNewTasks(tasks: AgentTask[]): Promise<void> {
+async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConfig>): Promise<void> {
   ensureSemaphores();
   if (!globalSemaphore) return;
 
-  const isDraining = getDaemonMode() === "draining";
+  const isDraining = getDaemonMode(defaults) === "draining";
   if (isDraining && pendingResumeTasks.size === 0) return;
 
-  const selection = await resolveOpencodeProfileForNewWork(Date.now(), getActiveOpencodeProfileName());
+  const selection = await resolveOpencodeProfileForNewWork(Date.now(), getActiveOpencodeProfileName(defaults));
   const throttle = selection.decision;
 
   if (selection.source === "failover") {
@@ -862,13 +873,14 @@ async function main(): Promise<void> {
   // Start drain monitor (operator control file)
   drainMonitor = new DrainMonitor({
     log: (message) => console.log(message),
+    defaults: config.control,
     onModeChange: (mode) => {
       if (isShuttingDown) return;
       if (mode !== "running") return;
 
       void (async () => {
         const tasks = await getRunnableTasks();
-        await processNewTasks(tasks);
+        await processNewTasks(tasks, config.control ?? {});
       })();
     },
   });
@@ -882,8 +894,8 @@ async function main(): Promise<void> {
   const initialTasks = await initialPoll();
   console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
 
-  if (initialTasks.length > 0 && getDaemonMode() !== "draining") {
-    await processNewTasks(initialTasks);
+  if (initialTasks.length > 0 && getDaemonMode(config.control) !== "draining") {
+    await processNewTasks(initialTasks, config.control ?? {});
   } else {
     resetIdleState(initialTasks);
   }
@@ -891,8 +903,8 @@ async function main(): Promise<void> {
   // Start file watching (no polling - watcher is reliable)
   console.log("[ralph] Starting queue watcher...");
   startWatching(async (tasks) => {
-    if (!isShuttingDown && getDaemonMode() !== "draining") {
-      await processNewTasks(tasks);
+    if (!isShuttingDown && getDaemonMode(config.control) !== "draining") {
+      await processNewTasks(tasks, config.control ?? {});
     }
   });
 
@@ -903,7 +915,7 @@ async function main(): Promise<void> {
   void attemptResumeResolvedEscalations();
 
   // Resume any tasks paused by hard throttle.
-  void attemptResumeThrottledTasks();
+  void attemptResumeThrottledTasks(config.control ?? {});
 
   // Watch escalations for resolution and resume the same OpenCode session.
   const escalationsDir = join(config.bwrbVault, "orchestration/escalations");
@@ -966,11 +978,11 @@ async function main(): Promise<void> {
 
   const throttleResumeTimer = setInterval(() => {
     if (isShuttingDown) return;
-    if (getDaemonMode() === "draining") return;
+    if (getDaemonMode(config.control) === "draining") return;
     if (throttleResumeInFlight) return;
     throttleResumeInFlight = true;
 
-    attemptResumeThrottledTasks()
+    attemptResumeThrottledTasks(config.control ?? {})
       .catch(() => {
         // ignore
       })
@@ -1207,7 +1219,8 @@ if (args[0] === "status") {
 
   const json = args.includes("--json");
 
-  const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+  const config = loadConfig();
+  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
   const controlProfile = control.opencodeProfile?.trim() || "";
 
   const requestedProfile =
