@@ -344,7 +344,7 @@ let resumeDisabledUntil = 0;
 const RESUME_DISABLE_MS = 60_000;
 
 async function attemptResumeResolvedEscalations(): Promise<void> {
-  return await attemptResumeResolvedEscalationsImpl({
+  return attemptResumeResolvedEscalationsImpl({
     isShuttingDown: () => isShuttingDown,
     now: () => Date.now(),
 
@@ -809,10 +809,10 @@ async function main(): Promise<void> {
   void resumeTasksOnStartup({ awaitCompletion: false });
 
   // Resume any resolved escalations (HITL checkpoint) from the same session.
-  await attemptResumeResolvedEscalations();
+  void attemptResumeResolvedEscalations();
 
   // Resume any tasks paused by hard throttle.
-  await attemptResumeThrottledTasks(config.control ?? {});
+  void attemptResumeThrottledTasks(config.control ?? {});
 
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
@@ -832,6 +832,15 @@ async function main(): Promise<void> {
       await processNewTasks(tasks, config.control ?? {});
     }
   });
+
+  // Resume orphaned tasks from previous daemon runs.
+  void resumeTasksOnStartup({ awaitCompletion: false });
+
+  // Resume any resolved escalations (HITL checkpoint) from the same session.
+  void attemptResumeResolvedEscalations();
+
+  // Resume any tasks paused by hard throttle.
+  void attemptResumeThrottledTasks();
 
   // Watch escalations for resolution and resume the same OpenCode session.
   const escalationsDir = join(config.bwrbVault, "orchestration/escalations");
