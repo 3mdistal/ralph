@@ -55,9 +55,14 @@ export interface AgentTask {
   "run-log-path"?: string;
   /** Git worktree path for this task (for per-repo concurrency + resume) */
   "worktree-path"?: string;
+  /** Stable worker identity (repo#taskId). */
+  "worker-id"?: string;
+  /** Per-repo concurrency slot (0..max-1). */
+  "repo-slot"?: string;
   /** Watchdog recovery attempts (string in frontmatter) */
   "watchdog-retries"?: string;
 }
+
 
 export type QueueChangeHandler = (tasks: AgentTask[]) => void;
 
@@ -147,6 +152,8 @@ function recordQueueStateSnapshot(tasks: AgentTask[]): void {
         status: task.status,
         sessionId: task["session-id"],
         worktreePath: task["worktree-path"],
+        workerId: task["worker-id"],
+        repoSlot: task["repo-slot"],
         at,
       });
     } catch {
@@ -308,15 +315,43 @@ export async function createAgentTask(opts: {
 export async function updateTaskStatus(
   task: AgentTask | Pick<AgentTask, "_path" | "_name" | "name" | "issue" | "repo"> | string,
   status: AgentTask["status"],
-  extraFields?: Record<string, string>
+  extraFields?: Record<string, string | number>
 ): Promise<boolean> {
+  const normalizeOptionalString = (value: unknown): string | undefined => {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  };
+
+  const getOptionalField = (
+    fields: Record<string, string> | undefined,
+    taskObj: Record<string, unknown> | null,
+    key: string
+  ): string | undefined => {
+    if (fields && Object.prototype.hasOwnProperty.call(fields, key)) {
+      return normalizeOptionalString(fields[key]);
+    }
+    const fallback = taskObj ? (taskObj[key] as string | undefined) : undefined;
+    return fallback;
+  };
   if (!VALID_TASK_STATUSES.has(status)) {
     console.error(`[ralph:queue] Invalid task status: ${String(status)}`);
     return false;
   }
 
   const config = loadConfig();
-  const json = JSON.stringify({ status, ...extraFields });
+  const normalizedExtraFields = extraFields
+    ? Object.fromEntries(
+        Object.entries(extraFields).map(([key, value]) => {
+          if (typeof value === "number") return [key, String(value)];
+          if (value === null) return [key, ""];
+          if (typeof value === "string") return [key, value];
+          return [key, ""];
+        })
+      )
+    : undefined;
+
+  const json = JSON.stringify({ status, ...normalizedExtraFields });
 
   const taskObj: any = typeof task === "object" ? task : null;
   const fromStatus: string | undefined =
@@ -354,8 +389,10 @@ export async function updateTaskStatus(
         taskPath: path ?? taskObj._path ?? "",
         taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
         status,
-        sessionId: extraFields?.["session-id"] ?? taskObj["session-id"],
-        worktreePath: extraFields?.["worktree-path"] ?? taskObj["worktree-path"],
+        sessionId: getOptionalField(normalizedExtraFields, taskObj, "session-id"),
+        worktreePath: getOptionalField(normalizedExtraFields, taskObj, "worktree-path"),
+        workerId: getOptionalField(normalizedExtraFields, taskObj, "worker-id"),
+        repoSlot: getOptionalField(normalizedExtraFields, taskObj, "repo-slot"),
       });
     } catch {
       // best-effort
@@ -369,14 +406,16 @@ export async function updateTaskStatus(
 
       const taskId =
         (typeof path === "string" && path) || (typeof taskObj._path === "string" && taskObj._path) || undefined;
-      const workerId: string | undefined = taskId ? `${taskObj.repo}#${taskId}` : undefined;
-      const sessionId: string | undefined = extraFields?.["session-id"] ?? taskObj["session-id"];
+      const workerId: string | undefined = getOptionalField(normalizedExtraFields, taskObj, "worker-id");
+      const fallbackWorkerId = normalizeOptionalString(taskObj?.["worker-id"] as string | undefined);
+      const eventWorkerId = workerId ?? fallbackWorkerId;
+      const sessionId: string | undefined = getOptionalField(normalizedExtraFields, taskObj, "session-id");
 
       ralphEventBus.publish(
         buildRalphEvent({
           type: "task.status_changed",
           level: "info",
-          workerId,
+          ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
           repo: taskObj.repo,
           taskId,
           sessionId,
@@ -389,7 +428,7 @@ export async function updateTaskStatus(
           buildRalphEvent({
             type: "task.assigned",
             level: "info",
-            workerId,
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
             repo: taskObj.repo,
             taskId,
             sessionId,
@@ -406,7 +445,7 @@ export async function updateTaskStatus(
           buildRalphEvent({
             type: "task.completed",
             level: "info",
-            workerId,
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
             repo: taskObj.repo,
             taskId,
             sessionId,
@@ -420,7 +459,7 @@ export async function updateTaskStatus(
           buildRalphEvent({
             type: "task.escalated",
             level: "warn",
-            workerId,
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
             repo: taskObj.repo,
             taskId,
             sessionId,
@@ -434,7 +473,7 @@ export async function updateTaskStatus(
           buildRalphEvent({
             type: "task.blocked",
             level: "warn",
-            workerId,
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
             repo: taskObj.repo,
             taskId,
             sessionId,

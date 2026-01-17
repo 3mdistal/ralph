@@ -66,7 +66,21 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       status: "queued",
       sessionId: "ses_123",
       worktreePath: "/tmp/worktree",
+      workerId: "3mdistal/ralph#orchestration/tasks/test.md",
+      repoSlot: "1",
       at: "2026-01-11T00:00:01.000Z",
+    });
+
+    recordTaskSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#60",
+      taskPath: "orchestration/tasks/test-no-slot.md",
+      taskName: "Test Task No Slot",
+      status: "queued",
+      sessionId: "ses_124",
+      worktreePath: "/tmp/worktree-2",
+      workerId: "w_123",
+      at: "2026-01-11T00:00:01.500Z",
     });
 
     recordPrSnapshot({
@@ -87,7 +101,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("2");
+      expect(meta.value).toBe("3");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -101,8 +115,17 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       expect(issueRow.state).toBe("OPEN");
       expect(issueRow.url).toBe("https://github.com/3mdistal/ralph/issues/59");
 
+      const taskRows = db.query("SELECT worker_id, repo_slot FROM tasks ORDER BY task_path").all() as Array<{
+        worker_id?: string;
+        repo_slot?: string;
+      }>;
+      expect(taskRows).toEqual([
+        { worker_id: "w_123", repo_slot: null },
+        { worker_id: "3mdistal/ralph#orchestration/tasks/test.md", repo_slot: "1" },
+      ]);
+
       const taskCount = db.query("SELECT COUNT(*) as n FROM tasks").get() as { n: number };
-      expect(taskCount.n).toBe(1);
+      expect(taskCount.n).toBe(2);
 
       const prCount = db.query("SELECT COUNT(*) as n FROM prs").get() as { n: number };
       expect(prCount.n).toBe(1);

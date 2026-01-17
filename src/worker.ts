@@ -2,6 +2,7 @@ import { $ } from "bun";
 import { appendFile, mkdir, readFile, readdir, rm } from "fs/promises";
 import { existsSync } from "fs";
 import { dirname, isAbsolute, join } from "path";
+import { randomUUID } from "crypto";
 
 type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -46,6 +47,8 @@ import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
 import { recordIssueSnapshot } from "./state";
+import { ralphEventBus } from "./dashboard/bus";
+import { buildRalphEvent } from "./dashboard/events";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -433,6 +436,7 @@ export class RepoWorker {
 
   private ensureLabelsPromise: Promise<void> | null = null;
   private ensureBranchProtectionPromise: Promise<void> | null = null;
+  private repoSlotsInUse: Set<number> | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -462,6 +466,8 @@ export class RepoWorker {
       "session-id": "",
       "watchdog-retries": "",
       ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+      ...(task["worker-id"] ? { "worker-id": "" } : {}),
+      ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
     });
 
     return {
@@ -856,7 +862,8 @@ ${guidance}`
   private async resolveTaskRepoPath(
     task: AgentTask,
     issueNumber: string,
-    mode: "start" | "resume"
+    mode: "start" | "resume",
+    repoSlot?: number | null
   ): Promise<{ repoPath: string; worktreePath?: string }> {
     const recorded = task["worktree-path"]?.trim();
     if (recorded && existsSync(recorded)) {
@@ -879,12 +886,15 @@ ${guidance}`
       return { repoPath: this.repoPath };
     }
 
+    const resolvedSlot = typeof repoSlot === "number" && Number.isFinite(repoSlot) ? repoSlot : 0;
     const taskKey = safeNoteName(task._path || task._name || task.name);
     const repoKey = safeNoteName(this.repo);
-    const worktreePath = join(RALPH_WORKTREES_DIR, repoKey, issueNumber, taskKey);
+    const worktreePath = join(RALPH_WORKTREES_DIR, repoKey, `slot-${resolvedSlot}`, issueNumber, taskKey);
 
     await this.ensureGitWorktree(worktreePath);
-    await this.queue.updateTaskStatus(task, "starting", { "worktree-path": worktreePath });
+    await this.queue.updateTaskStatus(task, task.status === "in-progress" ? "in-progress" : "starting", {
+      "worktree-path": worktreePath,
+    });
 
     return { repoPath: worktreePath, worktreePath };
   }
@@ -995,6 +1005,79 @@ ${guidance}`
 
   async runTaskCleanup(tasks: AgentTask[]): Promise<void> {
     await this.cleanupWorktreesForTasks(tasks);
+  }
+
+  private buildWorkerId(task: AgentTask, taskId?: string | null): string | undefined {
+    const rawTaskId = taskId ?? task._path ?? task._name ?? task.name;
+    const normalizedTaskId = rawTaskId?.trim();
+    if (!normalizedTaskId) return undefined;
+    return `${this.repo}#${normalizedTaskId}`;
+  }
+
+  private async ensureWorkerId(task: AgentTask, taskId?: string | null): Promise<string> {
+    const existing = task["worker-id"]?.trim();
+    if (existing) return existing;
+    const derived = this.buildWorkerId(task, taskId);
+    if (derived) return derived;
+    const fallback = `w_${randomUUID()}`;
+    await this.queue.updateTaskStatus(task, task.status === "in-progress" ? "in-progress" : "starting", {
+      "worker-id": fallback,
+    });
+    return fallback;
+  }
+
+  private async formatWorkerId(task: AgentTask, taskId?: string | null): Promise<string> {
+    const workerId = await this.ensureWorkerId(task, taskId);
+    const trimmed = workerId.trim();
+    if (trimmed && trimmed.length <= 256) return trimmed;
+    const fallback = `w_${randomUUID()}`;
+    console.warn(
+      `[dashboard] invalid workerId; falling back (repo=${this.repo}, task=${taskId ?? task._path ?? task._name ?? task.name})`
+    );
+    await this.queue.updateTaskStatus(task, task.status === "in-progress" ? "in-progress" : "starting", {
+      "worker-id": fallback,
+    });
+    return fallback;
+  }
+
+  private sanitizeRepoSlot(value: number): number {
+    return this.normalizeRepoSlot(value, this.getRepoSlotLimit());
+  }
+
+  private normalizeRepoSlot(value: number, limit: number): number {
+    if (Number.isInteger(value) && value >= 0 && value < limit) return value;
+    console.warn(`[scheduler] repoSlot allocation failed; using slot 0 (repo=${this.repo})`);
+    return 0;
+  }
+
+  private getRepoSlotLimit(): number {
+    const limit = getRepoMaxWorkers(this.repo);
+    return Number.isFinite(limit) && limit > 0 ? limit : 1;
+  }
+
+  private allocateRepoSlot(): number {
+    const limit = this.getRepoSlotLimit();
+
+    if (!this.repoSlotsInUse) {
+      this.repoSlotsInUse = new Set<number>();
+    }
+
+    for (let slot = 0; slot < limit; slot++) {
+      if (!this.repoSlotsInUse.has(slot)) {
+        this.repoSlotsInUse.add(slot);
+        return slot;
+      }
+    }
+
+    console.warn(`[scheduler] repoSlot allocation failed; using slot 0 (repo=${this.repo})`);
+    this.repoSlotsInUse.add(0);
+    return 0;
+  }
+
+  private releaseRepoSlot(slot: number | null): void {
+    if (slot === null) return;
+    if (!this.repoSlotsInUse) return;
+    this.repoSlotsInUse.delete(slot);
   }
 
   private async tryEnsurePrFromWorktree(params: {
@@ -1503,6 +1586,8 @@ ${guidance}`
       "session-id": "",
       "watchdog-retries": "",
       ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+      ...(task["worker-id"] ? { "worker-id": "" } : {}),
+      ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
     });
 
     return {
@@ -1838,19 +1923,55 @@ ${guidance}`
     const issueNumber = issueMatch?.[1] ?? "";
     const cacheKey = issueNumber || task._name;
 
-    const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber || cacheKey, "resume");
+    const existingSessionId = task["session-id"]?.trim();
+    if (!existingSessionId) {
+      const reason = "In-progress task has no session-id; cannot resume";
+      console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
+      await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
+      return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
+    }
 
-      const existingSessionId = task["session-id"]?.trim();
-      if (!existingSessionId) {
-        const reason = "In-progress task has no session-id; cannot resume";
-        console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
-        await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
-        return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
-      }
+    const workerId = await this.formatWorkerId(task, task._path);
+    const allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot());
+    const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
+      task,
+      issueNumber || cacheKey,
+      "resume",
+      allocatedSlot
+    );
 
+    const workerIdChanged = task["worker-id"]?.trim() !== workerId;
+    const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
+
+    if (workerIdChanged || repoSlotChanged) {
+      await this.queue.updateTaskStatus(task, "in-progress", {
+        ...(workerIdChanged ? { "worker-id": workerId } : {}),
+        ...(repoSlotChanged ? { "repo-slot": String(allocatedSlot) } : {}),
+      });
+      task["worker-id"] = workerId;
+      task["repo-slot"] = String(allocatedSlot);
+    }
+
+    const eventWorkerId = task["worker-id"]?.trim();
+
+    ralphEventBus.publish(
+      buildRalphEvent({
+        type: "worker.created",
+        level: "info",
+        ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
+        repo: this.repo,
+        taskId: task._path,
+        sessionId: existingSessionId,
+        data: {
+          ...(worktreePath ? { worktreePath } : {}),
+          ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
+        },
+      })
+    );
 
     try {
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
+
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
 
       const opencodeProfileName = resolvedOpencode.profileName;
@@ -2165,16 +2286,20 @@ ${guidance}`
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
       const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey", "in-progress");
 
-        const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
-          repo: this.repo,
-          cacheKey,
-          runLogPath: resumeSurveyRunLogPath,
-          ...this.buildWatchdogOptions(task, "resume-survey"),
-          ...opencodeSessionOptions,
-        });
+      const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
+        repo: this.repo,
+        cacheKey,
+        runLogPath: resumeSurveyRunLogPath,
+        ...this.buildWatchdogOptions(task, "resume-survey"),
+        ...opencodeSessionOptions,
+      });
 
 
-      const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "resume survey (post)", surveyResult.sessionId || buildResult.sessionId || existingSessionId);
+      const pausedSurveyAfter = await this.pauseIfHardThrottled(
+        task,
+        "resume survey (post)",
+        surveyResult.sessionId || buildResult.sessionId || existingSessionId
+      );
       if (pausedSurveyAfter) return pausedSurveyAfter;
 
       if (!surveyResult.success) {
@@ -2195,10 +2320,12 @@ ${guidance}`
       });
 
       await this.queue.updateTaskStatus(task, "done", {
-        "completed-at": endTime.toISOString().split("T")[0],
+        "completed-at": completedAt,
         "session-id": "",
         "watchdog-retries": "",
         ...(worktreePath ? { "worktree-path": "" } : {}),
+        ...(workerId ? { "worker-id": "" } : {}),
+        ...(typeof allocatedSlot === "number" ? { "repo-slot": "" } : {}),
       });
 
       // Cleanup per-task OpenCode cache on success
@@ -2230,6 +2357,9 @@ ${guidance}`
         escalationReason: error?.message ?? String(error),
       };
     } finally {
+      if (typeof allocatedSlot === "number") {
+        this.releaseRepoSlot(allocatedSlot);
+      }
     }
   }
 
@@ -2237,6 +2367,8 @@ ${guidance}`
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Starting task: ${task.name}`);
 
+    let workerId: string | undefined;
+    let allocatedSlot: number | null = null;
 
     try {
       // 1. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
@@ -2257,6 +2389,9 @@ ${guidance}`
         return await this.skipClosedIssue(task, issueMeta, startTime);
       }
 
+      workerId = await this.formatWorkerId(task, task._path);
+      allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot());
+
       const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
       if (pausedPreStart) return pausedPreStart;
 
@@ -2271,7 +2406,11 @@ ${guidance}`
       const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
         ...(!task["opencode-profile"]?.trim() && opencodeProfileName ? { "opencode-profile": opencodeProfileName } : {}),
+        ...(workerId ? { "worker-id": workerId } : {}),
+        ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
       });
+      if (workerId) task["worker-id"] = workerId;
+      if (typeof allocatedSlot === "number") task["repo-slot"] = String(allocatedSlot);
       if (!markedStarting) {
         throw new Error("Failed to mark task starting (bwrb edit failed)");
       }
@@ -2279,7 +2418,27 @@ ${guidance}`
       await this.ensureBaselineLabelsOnce();
       await this.ensureBranchProtectionOnce();
 
-      const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(task, issueNumber, "start");
+      const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
+        task,
+        issueNumber,
+        "start",
+        allocatedSlot
+      );
+
+      ralphEventBus.publish(
+        buildRalphEvent({
+          type: "worker.created",
+          level: "info",
+          ...(workerId ? { workerId } : {}),
+          repo: this.repo,
+          taskId: task._path,
+          sessionId: task["session-id"]?.trim() || undefined,
+          data: {
+            ...(worktreePath ? { worktreePath } : {}),
+            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
+          },
+        })
+      );
 
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
@@ -2353,7 +2512,11 @@ ${guidance}`
 
       // Persist OpenCode session ID for crash recovery
       if (planResult.sessionId) {
-        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": planResult.sessionId });
+        await this.queue.updateTaskStatus(task, "in-progress", {
+          "session-id": planResult.sessionId,
+          ...(workerId ? { "worker-id": workerId } : {}),
+          ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
+        });
       }
 
       // 5. Parse routing decision
@@ -2852,6 +3015,8 @@ ${guidance}`
         "session-id": "",
         "watchdog-retries": "",
         ...(worktreePath ? { "worktree-path": "" } : {}),
+        ...(workerId ? { "worker-id": "" } : {}),
+        ...(typeof allocatedSlot === "number" ? { "repo-slot": "" } : {}),
       });
 
       // 12. Cleanup per-task OpenCode cache on success
@@ -2886,8 +3051,12 @@ ${guidance}`
         escalationReason: error?.message ?? String(error),
       };
     } finally {
+      if (typeof allocatedSlot === "number") {
+        this.releaseRepoSlot(allocatedSlot);
+      }
     }
   }
+
 
   private async createAgentRun(
     task: AgentTask,
