@@ -8,5 +8,6 @@ export function sanitizeNoteName(name: string): string {
     .trim()
     .slice(0, MAX_NOTE_NAME_LENGTH);
 
-  return sanitized || "Untitled";
+  const stripped = sanitized.replace(/[\s-]+/g, "");
+  return stripped ? sanitized : "Untitled";
 }
