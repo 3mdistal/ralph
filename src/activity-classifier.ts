@@ -16,7 +16,7 @@ export type ActivityLabel =
   | "unknown";
 
 export const ACTIVITY_WINDOW_MS = 60_000;
-export const ACTIVITY_IDLE_MS = 10_000;
+const ACTIVITY_IDLE_MS = 10_000;
 export const ACTIVITY_EMIT_INTERVAL_MS = 15_000;
 
 const ACTIVITY_PRECEDENCE: ActivityLabel[] = [
@@ -286,6 +286,6 @@ export async function classifyActivity(params: {
   return { activity, lastSignalTs };
 }
 
-export function parseActivityLabel(value: string): ActivityLabel {
+function parseActivityLabel(value: string): ActivityLabel {
   return toActivityLabel(value) ?? "unknown";
 }
