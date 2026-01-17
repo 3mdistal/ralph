@@ -106,6 +106,13 @@ export interface OpencodeConfig {
   profiles?: Record<string, OpencodeProfileConfig>;
 }
 
+export interface ControlConfig {
+  /** Auto-create control.json when missing (default: true). */
+  autoCreate?: boolean;
+  /** Suppress missing control.json warnings (default: true). */
+  suppressMissingWarnings?: boolean;
+}
+
 export interface RalphConfig {
   repos: RepoConfig[];
   /** Global max concurrent tasks across all repos (default: 6) */
@@ -133,6 +140,7 @@ export interface RalphConfig {
   watchdog?: WatchdogConfig;
   throttle?: ThrottleConfig;
   opencode?: OpencodeConfig;
+  control?: ControlConfig;
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
@@ -302,6 +310,43 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
   if (rawGithubApp !== undefined && rawGithubApp !== null && typeof rawGithubApp !== "object") {
     console.warn(`[ralph] Invalid config githubApp=${JSON.stringify(rawGithubApp)}; ignoring`);
     (loaded as any).githubApp = undefined;
+  }
+
+  // Best-effort validation for control file config.
+  const rawControl = (loaded as any).control;
+  if (rawControl !== undefined && rawControl !== null && (typeof rawControl !== "object" || Array.isArray(rawControl))) {
+    console.warn(`[ralph] Invalid config control=${JSON.stringify(rawControl)}; ignoring`);
+    (loaded as any).control = undefined;
+  } else if (rawControl && typeof rawControl === "object") {
+    const autoCreateRaw = (rawControl as any).autoCreate;
+    const suppressMissingWarningsRaw = (rawControl as any).suppressMissingWarnings;
+    const next: ControlConfig = {};
+
+    if (autoCreateRaw !== undefined) {
+      if (typeof autoCreateRaw === "boolean") {
+        next.autoCreate = autoCreateRaw;
+      } else {
+        console.warn(`[ralph] Invalid config control.autoCreate=${JSON.stringify(autoCreateRaw)}; defaulting to true`);
+        next.autoCreate = true;
+      }
+    }
+
+    if (suppressMissingWarningsRaw !== undefined) {
+      if (typeof suppressMissingWarningsRaw === "boolean") {
+        next.suppressMissingWarnings = suppressMissingWarningsRaw;
+      } else {
+        console.warn(
+          `[ralph] Invalid config control.suppressMissingWarnings=${JSON.stringify(suppressMissingWarningsRaw)}; defaulting to true`
+        );
+        next.suppressMissingWarnings = true;
+      }
+    }
+
+    if (Object.keys(next).length > 0) {
+      loaded.control = next;
+    } else {
+      loaded.control = undefined;
+    }
   }
 
   // Best-effort validation for OpenCode profile config.
