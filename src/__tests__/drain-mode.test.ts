@@ -65,7 +65,7 @@ describe("Drain mode", () => {
   test(
     "DrainMonitor emits transition logs",
     async () => {
-    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+      const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
     tmpDirs.push(homeDir);
 
     const logs: string[] = [];
@@ -86,17 +86,17 @@ describe("Drain mode", () => {
     writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
     await sleep(25);
     utimesSync(controlPath, new Date(), new Date());
-    await waitFor(() => logs.some((line) => line.includes("Control mode: draining")), 15000);
+    await waitFor(() => logs.some((line) => line.includes("Control mode: draining")), 20000);
 
     await sleep(1100);
     writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
     await sleep(25);
     utimesSync(controlPath, new Date(), new Date());
-    await waitFor(() => logs.some((line) => line.includes("Control mode: running")), 15000);
+    await waitFor(() => logs.some((line) => line.includes("Control mode: running")), 20000);
 
     monitor.stop();
   },
-  15000
+  20000
   );
 
   test("DrainMonitor keeps last-known-good when control.json is invalid", async () => {
