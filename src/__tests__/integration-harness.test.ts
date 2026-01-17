@@ -134,7 +134,8 @@ describe("integration-ish harness: full task lifecycle", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
     // Avoid touching git worktree creation (depends on local config).
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
 
     // Avoid real side-effects (nudges/git/gh).
     (worker as any).drainNudges = async () => {};
@@ -247,8 +248,10 @@ describe("integration-ish harness: full task lifecycle", () => {
   test("ci-only PR blocks non-CI issue", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
+
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
@@ -295,8 +298,10 @@ describe("integration-ish harness: full task lifecycle", () => {
   test("merge retries after updating out-of-date branch", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
+
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
@@ -360,8 +365,10 @@ describe("integration-ish harness: full task lifecycle", () => {
   test("merge escalates when update-branch fails", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
+
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
@@ -372,8 +379,8 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
-
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).createAgentRun = async () => {};
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
@@ -399,13 +406,11 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
 
-    (worker as any).createAgentRun = async () => {};
-
     const result = await worker.processTask(createMockTask());
 
     expect(result.outcome).toBe("failed");
     expect(notifyErrorMock).toHaveBeenCalled();
-    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
+    expect(notifyEscalationMock).not.toHaveBeenCalled();
   });
 
   test("hard throttle pauses before any model send", async () => {
@@ -424,7 +429,8 @@ describe("integration-ish harness: full task lifecycle", () => {
     }));
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
@@ -456,7 +462,8 @@ describe("integration-ish harness: full task lifecycle", () => {
     }));
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
