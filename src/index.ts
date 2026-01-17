@@ -16,6 +16,7 @@ import {
   getRepoMaxWorkers,
   getRepoPath,
   loadConfig,
+  type ControlConfig,
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
@@ -805,15 +806,6 @@ async function main(): Promise<void> {
   // Initialize rollup monitor
   rollupMonitor = new RollupMonitor(config.batchSize);
 
-  // Resume orphaned tasks from previous daemon runs
-  void resumeTasksOnStartup({ awaitCompletion: false });
-
-  // Resume any resolved escalations (HITL checkpoint) from the same session.
-  void attemptResumeResolvedEscalations();
-
-  // Resume any tasks paused by hard throttle.
-  void attemptResumeThrottledTasks(config.control ?? {});
-
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
   const initialTasks = await initialPoll();
@@ -840,7 +832,7 @@ async function main(): Promise<void> {
   void attemptResumeResolvedEscalations();
 
   // Resume any tasks paused by hard throttle.
-  void attemptResumeThrottledTasks();
+  void attemptResumeThrottledTasks(config.control ?? {});
 
   // Watch escalations for resolution and resume the same OpenCode session.
   const escalationsDir = join(config.bwrbVault, "orchestration/escalations");
