@@ -119,6 +119,8 @@ export interface RalphConfig {
   maxWorkers: number;
   batchSize: number;       // PRs before rollup (default: 10)
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
+  /** Ownership TTL in ms for task heartbeats (default: 60000). */
+  ownershipTtlMs: number;
   bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // default GitHub owner (default: "3mdistal")
 
@@ -145,6 +147,7 @@ export interface RalphConfig {
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
+const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
 const DEFAULT_THROTTLE_SOFT_PCT = 0.65;
@@ -206,6 +209,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   maxWorkers: DEFAULT_GLOBAL_MAX_WORKERS,
   batchSize: 10,
   pollInterval: 30000,
+  ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
   bwrbVault: detectDefaultBwrbVault(),
   owner: "3mdistal",
   devDir: join(homedir(), "Developer"),
@@ -260,6 +264,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       );
     }
     loaded.maxWorkers = DEFAULT_GLOBAL_MAX_WORKERS;
+  }
+
+  const ownershipTtlMs = toPositiveIntOrNull((loaded as any).ownershipTtlMs);
+  if (!ownershipTtlMs) {
+    const raw = (loaded as any).ownershipTtlMs;
+    if (raw !== undefined) {
+      console.warn(
+        `[ralph] Invalid config ownershipTtlMs=${JSON.stringify(raw)}; falling back to default ${DEFAULT_OWNERSHIP_TTL_MS}`
+      );
+    }
+    loaded.ownershipTtlMs = DEFAULT_OWNERSHIP_TTL_MS;
   }
 
   // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.

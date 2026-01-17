@@ -37,6 +37,7 @@ describe("Config precedence (~/.ralph)", () => {
         "maxWorkers = 3",
         "batchSize = 11",
         "pollInterval = 12345",
+        "ownershipTtlMs = 45000",
         "owner = \"toml-owner\"",
         "devDir = \"/tmp/toml-dev\"",
         "repos = [{ name = \"demo/repo\", rollupBatchSize = 4 }]",
@@ -49,6 +50,7 @@ describe("Config precedence (~/.ralph)", () => {
       bwrbVault: "json-vault",
       maxWorkers: 2,
       batchSize: 99,
+      ownershipTtlMs: 33000,
       repos: [{ name: "demo/repo", rollupBatchSize: 22 }],
     });
 
@@ -60,6 +62,7 @@ describe("Config precedence (~/.ralph)", () => {
     expect(cfg.maxWorkers).toBe(3);
     expect(cfg.batchSize).toBe(11);
     expect(cfg.owner).toBe("toml-owner");
+    expect(cfg.ownershipTtlMs).toBe(45000);
     expect(cfg.repos[0]?.rollupBatchSize).toBe(4);
   });
 
@@ -78,6 +81,7 @@ describe("Config precedence (~/.ralph)", () => {
 
     expect(cfg.bwrbVault).toBe("json-vault");
     expect(cfg.maxWorkers).toBe(4);
+    expect(cfg.ownershipTtlMs).toBe(33000);
   });
 
   test("falls back to legacy ~/.config/opencode/ralph/ralph.json with warning", async () => {
@@ -85,6 +89,7 @@ describe("Config precedence (~/.ralph)", () => {
     await writeJson(legacyPath, {
       bwrbVault: "legacy-vault",
       maxWorkers: 5,
+      ownershipTtlMs: 120000,
       repos: [],
     });
 
@@ -99,6 +104,7 @@ describe("Config precedence (~/.ralph)", () => {
 
       expect(cfg.bwrbVault).toBe("legacy-vault");
       expect(cfg.maxWorkers).toBe(5);
+      expect(cfg.ownershipTtlMs).toBe(120000);
       expect(warn).toHaveBeenCalled();
     } finally {
       console.warn = priorWarn;

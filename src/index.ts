@@ -9,6 +9,7 @@
 
 import { existsSync, watch } from "fs";
 import { join } from "path";
+import crypto from "crypto";
 
 import {
   ensureBwrbVaultLayout,
@@ -28,6 +29,8 @@ import {
   getTasksByStatus,
   getTaskByPath,
   updateTaskStatus,
+  tryClaimTask,
+  heartbeatTask,
   type AgentTask,
 } from "./queue";
 import { RepoWorker, type AgentRun } from "./worker";
@@ -41,6 +44,7 @@ import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
+import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot } from "./state";
 import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
@@ -66,6 +70,7 @@ const workers = new Map<string, RepoWorker>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
+const daemonId = `d_${crypto.randomUUID()}`;
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
@@ -122,6 +127,7 @@ const activeSessionTasks = new Map<
   { task: AgentTask; workerId?: string; taskId?: string }
 >();
 const activityStateBySession = new Map<string, { activity: ActivityLabel; lastEmittedAt: number }>();
+const ownedTasks = new Map<string, string>();
 
 function shouldEmitActivityUpdate(params: {
   sessionId: string;
@@ -320,6 +326,17 @@ async function getRunnableTasks(): Promise<AgentTask[]> {
   return [...starting, ...queued];
 }
 
+function recordOwnedTask(task: AgentTask): void {
+  const key = getTaskKey(task);
+  const path = task._path || "";
+  if (path) ownedTasks.set(key, path);
+}
+
+function forgetOwnedTask(task: AgentTask): void {
+  const key = getTaskKey(task);
+  ownedTasks.delete(key);
+}
+
 const schedulerController = createSchedulerController({
   getDaemonMode: () => {
     const config = loadConfig();
@@ -389,6 +406,10 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
 
     getTaskKey,
     inFlightTasks,
+    tryClaimTask,
+    recordOwnedTask,
+    forgetOwnedTask,
+    daemonId,
 
     getEscalationsByStatus,
     editEscalation,
@@ -424,10 +445,32 @@ async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Pr
   const throttled = await getTasksByStatus("throttled");
   if (throttled.length === 0) return;
 
+  const nowMs = Date.now();
+  const claimable: AgentTask[] = [];
+  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  for (const task of throttled) {
+    const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
+    if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
+      console.warn(
+        `[ralph] Task heartbeat is stale; eligible for takeover: ${task.name} (last ${new Date(heartbeatMs).toISOString()})`
+      );
+    }
+
+    const claim = await tryClaimTask({ task, daemonId, nowMs });
+    if (claim.claimed && claim.task) {
+      recordOwnedTask(claim.task);
+      claimable.push(claim.task);
+    } else if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
+      console.log(`[ralph] Skipping throttled task ${task.name}: ${claim.reason}`);
+    }
+  }
+
+  if (claimable.length === 0) return;
+
   const controlProfile = getActiveOpencodeProfileName(defaults);
   const activeProfile = controlProfile === "auto" ? await resolveAutoOpencodeProfileName(Date.now()) : controlProfile;
   const profileKeys = Array.from(
-    new Set(throttled.map((t) => getTaskOpencodeProfileName(t) ?? activeProfile ?? ""))
+    new Set(claimable.map((t) => getTaskOpencodeProfileName(t) ?? activeProfile ?? ""))
   );
 
   const hardByProfile = new Map<string, { hard: boolean; decision: ThrottleDecision }>();
@@ -441,8 +484,13 @@ async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Pr
 
   const now = Date.now();
 
+<<<<<<< HEAD
   for (const task of throttled) {
     if (getDaemonMode(defaults) === "draining" || isShuttingDown) return;
+=======
+  for (const task of claimable) {
+    if (getDaemonMode() === "draining" || isShuttingDown) return;
+>>>>>>> 5ba6772 (feat: guard rolling restarts with task ownership heartbeats)
 
     const resumeAtRaw = task["resume-at"]?.trim() ?? "";
     const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;
@@ -511,6 +559,7 @@ async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Pr
       })
     .finally(() => {
       inFlightTasks.delete(taskKey);
+      forgetOwnedTask(task);
       releaseGlobal();
       releaseRepo();
       if (!isShuttingDown) {
@@ -551,6 +600,7 @@ function startTask(opts: {
     })
     .finally(() => {
       inFlightTasks.delete(key);
+      forgetOwnedTask(task);
       releaseGlobal();
       releaseRepo();
       if (!isShuttingDown) {
@@ -582,6 +632,7 @@ function startResumeTask(opts: {
     })
     .finally(() => {
       inFlightTasks.delete(key);
+      forgetOwnedTask(task);
       releaseGlobal();
       releaseRepo();
       resolveResumeCompletion(key);
@@ -627,10 +678,32 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
 
   if (throttle.state === "soft") return;
 
-  const queueTasks = isDraining ? [] : tasks;
+  const nowMs = Date.now();
+  const claimable: AgentTask[] = [];
+  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  for (const task of tasks) {
+    const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
+    if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
+      console.warn(
+        `[ralph] Task heartbeat is stale; eligible for takeover: ${task.name} (last ${new Date(heartbeatMs).toISOString()})`
+      );
+    }
+
+    const claim = await tryClaimTask({ task, daemonId, nowMs });
+    if (claim.claimed && claim.task) {
+      recordOwnedTask(claim.task);
+      claimable.push(claim.task);
+    } else if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
+      console.log(`[ralph] Skipping task ${task.name}: ${claim.reason}`);
+    }
+  }
+
+  const queueTasks = isDraining ? [] : claimable;
 
   if (queueTasks.length > 0) {
     resetIdleState(queueTasks);
+  } else if (!isDraining) {
+    resetIdleState(tasks);
   }
 
   const startedCount = startQueuedTasks({
@@ -741,6 +814,29 @@ async function printHeartbeatTick(): Promise<void> {
   }
 }
 
+async function refreshTaskOwnershipHeartbeat(nowMs: number): Promise<void> {
+  if (ownedTasks.size === 0) return;
+
+  const keys = Array.from(ownedTasks.keys());
+  await Promise.all(
+    keys.map(async (key) => {
+      const path = ownedTasks.get(key);
+      if (!path) return;
+
+      const task = await getTaskByPath(path);
+      if (!task) {
+        ownedTasks.delete(key);
+        return;
+      }
+
+      const updated = await heartbeatTask({ task, daemonId, nowMs });
+      if (!updated) {
+        ownedTasks.delete(key);
+      }
+    })
+  );
+}
+
 async function resumeTasksOnStartup(opts?: {
   awaitCompletion?: boolean;
   schedulingMode?: "shared" | "resume-only";
@@ -757,7 +853,27 @@ async function resumeTasksOnStartup(opts?: {
     console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
   }
 
-  const inProgressByRepo = groupByRepo(inProgress);
+  const nowMs = Date.now();
+  const claimable: AgentTask[] = [];
+  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  for (const task of inProgress) {
+    const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
+    if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
+      console.warn(
+        `[ralph] Task heartbeat is stale; eligible for takeover: ${task.name} (last ${new Date(heartbeatMs).toISOString()})`
+      );
+    }
+
+    const claim = await tryClaimTask({ task, daemonId, nowMs });
+    if (claim.claimed && claim.task) {
+      recordOwnedTask(claim.task);
+      claimable.push(claim.task);
+    } else if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
+      console.log(`[ralph] Skipping resume for ${task.name}: ${claim.reason}`);
+    }
+  }
+
+  const inProgressByRepo = groupByRepo(claimable);
   await Promise.all(
     Array.from(inProgressByRepo.entries()).map(async ([repo, tasks]) => {
       const worker = getOrCreateWorker(repo);
@@ -765,15 +881,15 @@ async function resumeTasksOnStartup(opts?: {
     })
   );
 
-  if (inProgress.length === 0) return;
+  if (claimable.length === 0) return;
 
-  const withoutSession = inProgress.filter((t) => !(t["session-id"]?.trim()));
+  const withoutSession = claimable.filter((t) => !(t["session-id"]?.trim()));
   for (const task of withoutSession) {
     console.warn(`[ralph] In-progress task has no session ID, resetting to starting: ${task.name}`);
     await updateTaskStatus(task, "starting", { "session-id": "" });
   }
 
-  const withSession = inProgress.filter((t) => t["session-id"]?.trim());
+  const withSession = claimable.filter((t) => t["session-id"]?.trim());
   if (withSession.length === 0) return;
 
   const globalLimit = loadConfig().maxWorkers;
@@ -868,6 +984,8 @@ async function main(): Promise<void> {
   console.log(`        Max workers: ${config.maxWorkers}`);
   console.log(`        Batch size: ${config.batchSize} PRs before rollup`);
   console.log(`        Dev directory: ${config.devDir}`);
+  console.log(`        Daemon ID: ${daemonId}`);
+  console.log(`        Ownership TTL: ${config.ownershipTtlMs}ms`);
   console.log("");
 
   // Start drain monitor (operator control file)
@@ -936,20 +1054,21 @@ async function main(): Promise<void> {
     console.log(`[ralph:escalations] Escalations dir not found: ${escalationsDir}`);
   }
 
-  const heartbeatIntervalMs = 5_000;
+  const ownershipTtlMs = loadConfig().ownershipTtlMs;
+  const heartbeatIntervalMs = computeHeartbeatIntervalMs(ownershipTtlMs);
   let heartbeatInFlight = false;
 
   const heartbeatTimer = setInterval(() => {
     if (isShuttingDown) return;
 
     // Avoid hitting bwrb repeatedly when the daemon is idle.
-    if (inFlightTasks.size === 0) return;
+    if (inFlightTasks.size === 0 && ownedTasks.size === 0) return;
 
     // Avoid overlapping ticks if bwrb/filesystem are slow.
     if (heartbeatInFlight) return;
     heartbeatInFlight = true;
 
-    printHeartbeatTick()
+    Promise.all([printHeartbeatTick(), refreshTaskOwnershipHeartbeat(Date.now())])
       .catch(() => {
         // ignore
       })

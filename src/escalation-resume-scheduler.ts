@@ -23,6 +23,14 @@ export type AttemptResumeResolvedEscalationsDeps = {
 
   getTaskKey: (task: Pick<AgentTask, "_path" | "name">) => string;
   inFlightTasks: Set<string>;
+  tryClaimTask: (opts: { task: AgentTask; daemonId: string; nowMs: number }) => Promise<{
+    claimed: boolean;
+    task: AgentTask | null;
+    reason?: string;
+  }>;
+  recordOwnedTask: (task: AgentTask) => void;
+  forgetOwnedTask: (task: AgentTask) => void;
+  daemonId: string;
 
   getEscalationsByStatus: (status: string) => Promise<AgentEscalationNote[]>;
   editEscalation: (path: string, fields: Record<string, string>) => Promise<EditEscalationResult>;
@@ -192,8 +200,21 @@ export async function attemptResumeResolvedEscalations(deps: AttemptResumeResolv
       continue;
     }
 
+    const claim = await deps.tryClaimTask({ task, daemonId: deps.daemonId, nowMs: deps.now() });
+    if (!claim.claimed || !claim.task) {
+      await safeEditEscalation(deps, escalation._path, {
+        "resume-status": "failed",
+        "resume-error": claim.reason ?? "Ownership claim failed",
+      });
+      releaseGlobal();
+      releaseRepo();
+      continue;
+    }
+
+    deps.recordOwnedTask(claim.task);
+
     // Ensure the task is resumable and marked in-progress.
-    await deps.updateTaskStatus(task, "in-progress", {
+    await deps.updateTaskStatus(claim.task, "in-progress", {
       "assigned-at": new Date().toISOString().split("T")[0],
       "session-id": sessionId,
     });
@@ -201,7 +222,7 @@ export async function attemptResumeResolvedEscalations(deps: AttemptResumeResolv
     deps.inFlightTasks.add(taskKey);
 
     worker
-      .resumeTask(task, { resumeMessage })
+      .resumeTask(claim.task, { resumeMessage })
       .then(async (run) => {
         if (run.outcome === "success") {
           if (run.pr) {
@@ -233,6 +254,7 @@ export async function attemptResumeResolvedEscalations(deps: AttemptResumeResolv
       })
       .finally(() => {
         deps.inFlightTasks.delete(taskKey);
+        deps.forgetOwnedTask(claim.task);
         releaseGlobal();
         releaseRepo();
         if (!deps.isShuttingDown()) deps.scheduleQueuedTasksSoon();
