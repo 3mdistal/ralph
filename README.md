@@ -109,11 +109,13 @@ Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must ma
 
 Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require the configured `repos[].requiredChecks` and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
 
+Ralph refuses to auto-merge PRs targeting `main` unless the issue has the `allow-main` label. This guardrail only affects Ralph automation; humans can still merge to `main` normally.
+
 If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs, or update `repos[].requiredChecks` to match actual check names.
 
 ### Environment variables
 
-Only these env vars are currently supported:
+Only these env vars are currently supported (unless noted otherwise):
 
 | Setting | Env Var | Default |
 |---------|---------|---------|
@@ -121,6 +123,7 @@ Only these env vars are currently supported:
 | Worktrees dir | `RALPH_WORKTREES_DIR` | `~/.ralph/worktrees` |
 | Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
 | Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
+| CI remediation attempts | `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` | `2` |
 
 Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
