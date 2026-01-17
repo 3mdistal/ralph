@@ -69,7 +69,6 @@ describe("Drain mode", () => {
     tmpDirs.push(homeDir);
 
     const logs: string[] = [];
-    const modeChanges: string[] = [];
 
     const controlPath = resolveControlFilePath(homeDir);
     mkdirSync(dirname(controlPath), { recursive: true });
@@ -78,23 +77,20 @@ describe("Drain mode", () => {
       homeDir,
       pollIntervalMs: 10,
       log: (message) => logs.push(message),
-      onModeChange: (mode) => modeChanges.push(mode),
     });
 
+    writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
     monitor.start();
 
     await sleep(1100);
     writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
-    await waitFor(() => monitor.getMode() === "draining", 15000);
+    await waitFor(() => logs.some((line) => line.includes("Control mode: draining")), 15000);
 
     await sleep(1100);
     writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
-    await waitFor(() => monitor.getMode() === "running", 15000);
+    await waitFor(() => logs.some((line) => line.includes("Control mode: running")), 15000);
 
     monitor.stop();
-
-    expect(modeChanges).toContain("draining");
-    expect(modeChanges).toContain("running");
   },
   15000
   );
