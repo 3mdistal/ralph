@@ -153,6 +153,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     });
 
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
 
     const waitForRequiredChecksMock = mock()
       .mockImplementationOnce(async () => ({
@@ -264,6 +265,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     });
 
     (worker as any).getPullRequestFiles = async () => [".github/workflows/ci.yml"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
@@ -314,6 +316,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     });
 
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
 
     const waitForRequiredChecksMock = mock()
       .mockImplementationOnce(async () => ({
@@ -349,7 +352,6 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
 
-    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -380,6 +382,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       stateReason: null,
     });
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
     (worker as any).createAgentRun = async () => {};
 
     const waitForRequiredChecksMock = mock(async () => ({
@@ -413,6 +416,90 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(notifyEscalationMock).not.toHaveBeenCalled();
   });
 
+  test("blocks main merge without override label", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "main";
+    (worker as any).createAgentRun = async () => {};
+
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      timedOut: false,
+    }));
+
+    const mergePullRequestMock = mock(async () => {});
+
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("failed");
+    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
+    expect(waitForRequiredChecksMock).not.toHaveBeenCalled();
+    expect(mergePullRequestMock).not.toHaveBeenCalled();
+    expect(notifyErrorMock).toHaveBeenCalled();
+  });
+
+  test("allows main merge with override label", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: ["allow-main"],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "main";
+    (worker as any).createAgentRun = async () => {};
+
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      timedOut: false,
+    }));
+
+    const mergePullRequestMock = mock(async () => {});
+
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("success");
+    expect(waitForRequiredChecksMock).toHaveBeenCalled();
+    expect(mergePullRequestMock).toHaveBeenCalled();
+  });
+
   test("hard throttle pauses before any model send", async () => {
     const resumeAtTs = Date.now() + 60_000;
 
@@ -442,6 +529,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       stateReason: null,
     });
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -476,6 +564,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       stateReason: null,
     });
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
