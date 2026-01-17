@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { beforeEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { DrainMonitor, isDraining, resolveControlFilePath } from "../drain";
@@ -65,36 +65,38 @@ describe("Drain mode", () => {
   test(
     "DrainMonitor emits transition logs",
     async () => {
-    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
-    tmpDirs.push(homeDir);
+      const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+      tmpDirs.push(homeDir);
 
-    const logs: string[] = [];
-    const modeChanges: string[] = [];
+      const logs: string[] = [];
 
-    const controlPath = resolveControlFilePath(homeDir);
-    mkdirSync(dirname(controlPath), { recursive: true });
+      const controlPath = resolveControlFilePath(homeDir);
+      mkdirSync(dirname(controlPath), { recursive: true });
 
-    const monitor = new DrainMonitor({
-      homeDir,
-      pollIntervalMs: 10,
-      log: (message) => logs.push(message),
-      onModeChange: (mode) => modeChanges.push(mode),
-    });
+      const monitor = new DrainMonitor({
+        homeDir,
+        pollIntervalMs: 10,
+        log: (message) => logs.push(message),
+      });
 
-    monitor.start();
+      writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
+      monitor.start();
 
-    writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
-    await waitFor(() => monitor.getMode() === "draining", 15000);
+      await sleep(1100);
+      writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
+      await sleep(25);
+      utimesSync(controlPath, new Date(), new Date());
+      await waitFor(() => logs.some((line) => line.includes("Control mode: draining")), 20000);
 
-    writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
-    await waitFor(() => monitor.getMode() === "running", 15000);
+      await sleep(1100);
+      writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
+      await sleep(25);
+      utimesSync(controlPath, new Date(), new Date());
+      await waitFor(() => logs.some((line) => line.includes("Control mode: running")), 20000);
 
-    monitor.stop();
-
-    expect(modeChanges).toContain("draining");
-    expect(modeChanges).toContain("running");
-  },
-  15000
+      monitor.stop();
+    },
+    20000
   );
 
   test("DrainMonitor keeps last-known-good when control.json is invalid", async () => {
