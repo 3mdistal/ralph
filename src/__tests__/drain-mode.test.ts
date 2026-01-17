@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { beforeEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { DrainMonitor, isDraining, resolveControlFilePath } from "../drain";
@@ -84,10 +84,14 @@ describe("Drain mode", () => {
 
     await sleep(1100);
     writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
+    await sleep(25);
+    utimesSync(controlPath, new Date(), new Date());
     await waitFor(() => logs.some((line) => line.includes("Control mode: draining")), 15000);
 
     await sleep(1100);
     writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
+    await sleep(25);
+    utimesSync(controlPath, new Date(), new Date());
     await waitFor(() => logs.some((line) => line.includes("Control mode: running")), 15000);
 
     monitor.stop();
