@@ -62,7 +62,9 @@ describe("Drain mode", () => {
     expect(controlPath).toBe(join("/tmp", "ralph", String(uid), "control.json"));
   });
 
-  test("DrainMonitor emits transition logs", { timeout: 15000 }, async () => {
+  test(
+    "DrainMonitor emits transition logs",
+    async () => {
     const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
     tmpDirs.push(homeDir);
 
@@ -93,7 +95,9 @@ describe("Drain mode", () => {
     expect(logs.some((l) => l.includes("Control mode: running")) || modeChanges.includes("running")).toBe(true);
     expect(modeChanges).toContain("draining");
     expect(modeChanges).toContain("running");
-  });
+  },
+  15000
+  );
 
   test("DrainMonitor keeps last-known-good when control.json is invalid", async () => {
     const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
