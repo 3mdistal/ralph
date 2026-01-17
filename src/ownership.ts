@@ -22,7 +22,8 @@ export function canActOnTask(
 }
 
 export function computeHeartbeatIntervalMs(ttlMs: number): number {
-  const base = Math.min(10_000, Math.floor(ttlMs / 3));
-  const bounded = Math.max(2_000, base);
-  return Math.min(60_000, bounded);
+  const base = Math.floor(ttlMs / 3);
+  const minInterval = 2_000;
+  const maxInterval = ttlMs <= 60_000 ? 10_000 : 60_000;
+  return Math.min(maxInterval, Math.max(minInterval, base));
 }

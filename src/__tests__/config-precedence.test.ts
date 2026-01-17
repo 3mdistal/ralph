@@ -72,6 +72,7 @@ describe("Config precedence (~/.ralph)", () => {
     await writeJson(configJsonPath, {
       bwrbVault: "json-vault",
       maxWorkers: 4,
+      ownershipTtlMs: 33000,
       repos: [],
     });
 
