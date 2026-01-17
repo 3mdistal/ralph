@@ -1,3 +1,4 @@
+import { describe, expect, test } from "bun:test";
 import { RepoWorker } from "../worker";
 
 describe("worker isolation guardrails", () => {
