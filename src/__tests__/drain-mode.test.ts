@@ -83,9 +83,11 @@ describe("Drain mode", () => {
 
     monitor.start();
 
+    await sleep(1100);
     writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
     await waitFor(() => monitor.getMode() === "draining", 15000);
 
+    await sleep(1100);
     writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
     await waitFor(() => monitor.getMode() === "running", 15000);
 
