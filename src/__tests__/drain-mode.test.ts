@@ -91,8 +91,6 @@ describe("Drain mode", () => {
 
     monitor.stop();
 
-    expect(logs.some((l) => l.includes("Control mode: draining")) || modeChanges.includes("draining")).toBe(true);
-    expect(logs.some((l) => l.includes("Control mode: running")) || modeChanges.includes("running")).toBe(true);
     expect(modeChanges).toContain("draining");
     expect(modeChanges).toContain("running");
   },
