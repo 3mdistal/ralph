@@ -157,28 +157,36 @@ describe("integration-ish harness: full task lifecycle", () => {
     const waitForRequiredChecksMock = mock()
       .mockImplementationOnce(async () => ({
         headSha: "deadbeef",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
         summary: {
           status: "success",
           required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
           available: ["ci"],
         },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }))
       .mockImplementationOnce(async () => ({
         headSha: "beadfeed",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
         summary: {
           status: "success",
           required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
           available: ["ci"],
         },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }));
 
 
     const mergePullRequestMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).isPrBehind = isPrBehindMock;
 
     let agentRunData: any = null;
     (worker as any).createAgentRun = async (_task: any, data: any) => {
@@ -266,18 +274,23 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
       summary: {
         status: "success",
         required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         available: ["ci"],
       },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
       timedOut: false,
     }));
 
     const mergePullRequestMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).isPrBehind = isPrBehindMock;
 
     let agentRunData: any = null;
     (worker as any).createAgentRun = async (_task: any, data: any) => {
@@ -316,20 +329,26 @@ describe("integration-ish harness: full task lifecycle", () => {
     const waitForRequiredChecksMock = mock()
       .mockImplementationOnce(async () => ({
         headSha: "deadbeef",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
         summary: {
           status: "success",
           required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
           available: ["ci"],
         },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }))
       .mockImplementationOnce(async () => ({
         headSha: "beadfeed",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
         summary: {
           status: "success",
           required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
           available: ["ci"],
         },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }));
 
@@ -342,10 +361,12 @@ describe("integration-ish harness: full task lifecycle", () => {
       .mockImplementationOnce(async () => {});
 
     const updatePullRequestBranchMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
+    (worker as any).isPrBehind = isPrBehindMock;
 
     (worker as any).createAgentRun = async () => {};
 
@@ -380,11 +401,14 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
       summary: {
         status: "success",
         required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         available: ["ci"],
       },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
       timedOut: false,
     }));
 
@@ -397,10 +421,19 @@ describe("integration-ish harness: full task lifecycle", () => {
     const updatePullRequestBranchMock = mock(async () => {
       throw new Error("GraphQL: branch protection rule prevents update");
     });
+    const isPrBehindMock = mock(async () => false);
+    const getPullRequestChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+    }));
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
+    (worker as any).isPrBehind = isPrBehindMock;
+    (worker as any).getPullRequestChecks = getPullRequestChecksMock;
 
     (worker as any).createAgentRun = async () => {};
 
@@ -475,18 +508,23 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
       summary: {
         status: "success",
         required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         available: ["ci"],
       },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
       timedOut: false,
     }));
 
     const mergePullRequestMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).isPrBehind = isPrBehindMock;
 
     const result = await worker.processTask(createMockTask());
 
