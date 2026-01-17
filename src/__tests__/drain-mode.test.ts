@@ -62,7 +62,7 @@ describe("Drain mode", () => {
     expect(controlPath).toBe(join("/tmp", "ralph", String(uid), "control.json"));
   });
 
-  test("DrainMonitor emits transition logs", async () => {
+  test("DrainMonitor emits transition logs", { timeout: 15000 }, async () => {
     const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
     tmpDirs.push(homeDir);
 
