@@ -149,6 +149,8 @@ A daemon may only act on a task if:
 - it owns it (`daemon-id` matches), OR
 - the previous owner’s `heartbeat-at` is stale beyond TTL (e.g. 30s / 60s).
 
+Ownership TTL is configured via `ownershipTtlMs` (default 60s) in `~/.ralph/config.toml` or `~/.ralph/config.json`.
+
 This is the core protection against duplicate resumes and double-processing.
 
 ## Flow: rolling restart (checkpoint-based)
