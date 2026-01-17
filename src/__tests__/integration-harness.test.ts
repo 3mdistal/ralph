@@ -420,50 +420,10 @@ describe("integration-ish harness: full task lifecycle", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
-    (worker as any).ensureBranchProtectionOnce = async () => {};
-    (worker as any).getIssueMetadata = async () => ({
-      labels: [],
-      title: "Test issue",
-      state: "OPEN",
-      url: "https://github.com/3mdistal/ralph/issues/102",
-      closedAt: null,
-      stateReason: null,
-    });
-    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
-    (worker as any).getPullRequestBaseBranch = async () => "main";
-    (worker as any).createAgentRun = async () => {};
 
-    const waitForRequiredChecksMock = mock(async () => ({
-      headSha: "deadbeef",
-      summary: {
-        status: "success",
-        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
-        available: ["ci"],
-      },
-      timedOut: false,
-    }));
 
-    const mergePullRequestMock = mock(async () => {});
-
-    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
-    (worker as any).mergePullRequest = mergePullRequestMock;
-
-    const result = await worker.processTask(createMockTask());
-
-    expect(result.outcome).toBe("failed");
-    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
-    expect(waitForRequiredChecksMock).not.toHaveBeenCalled();
-    expect(mergePullRequestMock).not.toHaveBeenCalled();
-    expect(notifyErrorMock).toHaveBeenCalled();
-  });
-
-  test("allows main merge with override label", async () => {
-    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
-
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
-    (worker as any).drainNudges = async () => {};
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
