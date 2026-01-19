@@ -117,7 +117,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
       const taskRows = db.query("SELECT worker_id, repo_slot FROM tasks ORDER BY task_path").all() as Array<{
         worker_id?: string;
-        repo_slot?: string;
+        repo_slot?: string | null;
       }>;
       expect(taskRows).toEqual([
         { worker_id: "w_123", repo_slot: null },

@@ -2876,6 +2876,7 @@ ${guidance}`
       }
 
       const endTime = new Date();
+      const completedAt = endTime.toISOString().split("T")[0];
       await this.createAgentRun(task, {
         sessionId: buildResult.sessionId,
         pr: prUrl,
