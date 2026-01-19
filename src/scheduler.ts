@@ -1,7 +1,7 @@
 import type { ReleaseFn } from "./semaphore";
 import type { Semaphore } from "./semaphore";
 
-export type SchedulerGate = "running" | "draining" | "soft-throttled";
+export type SchedulerGate = "running" | "draining" | "paused" | "soft-throttled";
 
 export interface SchedulerDeps<Task> {
   gate: SchedulerGate;
@@ -104,7 +104,7 @@ export type SchedulerTimers = {
 };
 
 export type SchedulerControllerDeps<Task> = {
-  getDaemonMode: () => "running" | "draining";
+  getDaemonMode: () => "running" | "draining" | "paused";
   isShuttingDown: () => boolean;
   getRunnableTasks: () => Promise<Task[]>;
   onRunnableTasks: (tasks: Task[]) => Promise<void> | void;
@@ -134,11 +134,13 @@ export function createSchedulerController<Task>(deps: SchedulerControllerDeps<Ta
     scheduleQueuedTimer = timers.setTimeout(() => {
       scheduleQueuedTimer = null;
       if (deps.isShuttingDown()) return;
-      if (deps.getDaemonMode() === "draining") {
+      const mode = deps.getDaemonMode();
+      if (mode === "draining") {
         const pending = deps.getPendingResumeTasks();
         if (pending.length > 0) deps.onPendingResumeTasks(pending);
         return;
       }
+      if (mode === "paused") return;
       void deps.getRunnableTasks().then((tasks) => deps.onRunnableTasks(tasks));
     }, queuedDebounceMs);
   };
@@ -148,6 +150,7 @@ export function createSchedulerController<Task>(deps: SchedulerControllerDeps<Ta
     scheduleResumeTimer = timers.setTimeout(() => {
       scheduleResumeTimer = null;
       if (deps.isShuttingDown()) return;
+      if (deps.getDaemonMode() === "paused") return;
       const pending = deps.getPendingResumeTasks();
       if (pending.length === 0) return;
       deps.onPendingResumeTasks(pending);

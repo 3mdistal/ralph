@@ -103,7 +103,7 @@ function isStringOrUndefined(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string";
 }
 
-function isCheckpoint(value: unknown): value is RalphCheckpoint {
+export function isRalphCheckpoint(value: unknown): value is RalphCheckpoint {
   return (
     value === "planned" ||
     value === "routed" ||
@@ -135,12 +135,12 @@ export function isRalphEvent(value: unknown): value is RalphEvent {
   if (!isObject(data)) return false;
 
   if (type === "worker.checkpoint.reached") {
-    return isCheckpoint((data as any).checkpoint);
+    return isRalphCheckpoint((data as any).checkpoint);
   }
 
   if (type === "worker.pause.reached") {
     const checkpoint = (data as any).checkpoint;
-    return checkpoint === undefined || isCheckpoint(checkpoint);
+    return checkpoint === undefined || isRalphCheckpoint(checkpoint);
   }
 
   if (type === "log.ralph" || type === "log.worker") {

@@ -268,7 +268,7 @@ On daemon startup, Ralph checks for orphaned starting/in-progress tasks:
 
 ## Drain mode (pause new work)
 
-Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue.
+Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue, plus a paused mode that halts scheduling entirely.
 
 Control file:
 
@@ -279,16 +279,18 @@ Control file:
 Example:
 
 ```json
-{ "mode": "draining" }
+{ "version": 1, "mode": "draining" }
 ```
 
-Schema: `{ "mode": "running"|"draining", "pause_requested"?: boolean, "opencode_profile"?: string }` (unknown fields ignored)
+Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested"?: boolean, "pause_at_checkpoint"?: string, "drain_timeout_ms"?: number, "opencode_profile"?: string }` (unknown fields ignored)
 
 - Enable drain: set `mode` to `draining`
 - Disable drain: set `mode` to `running`
+- Pause all scheduling: set `mode` to `paused`
+- Pause at checkpoint: set `pause_requested=true` and optionally `pause_at_checkpoint`
 - Active OpenCode profile: set `opencode_profile` (affects new tasks only; tasks pin their profile on start)
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
-- Observability: logs emit `Control mode: draining|running`, and `ralph status` shows `Mode: ...`
+- Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
 
 ## OpenCode profiles (multi-account)
 

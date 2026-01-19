@@ -49,10 +49,10 @@ describe("Drain mode", () => {
     expect(isDraining(homeDir)).toBe(false);
 
     mkdirSync(dirname(controlPath), { recursive: true });
-    writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
+    writeFileSync(controlPath, JSON.stringify({ version: 1, mode: "draining" }));
     expect(isDraining(homeDir)).toBe(true);
 
-    writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
+    writeFileSync(controlPath, JSON.stringify({ version: 1, mode: "running" }));
     expect(isDraining(homeDir)).toBe(false);
   });
 
@@ -81,10 +81,10 @@ describe("Drain mode", () => {
 
     monitor.start();
 
-    writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
+    writeFileSync(controlPath, JSON.stringify({ version: 1, mode: "draining" }));
     await waitFor(() => monitor.getMode() === "draining", 5000);
 
-    writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
+    writeFileSync(controlPath, JSON.stringify({ version: 1, mode: "running" }));
     await waitFor(() => monitor.getMode() === "running", 5000);
 
     monitor.stop();
@@ -109,11 +109,11 @@ describe("Drain mode", () => {
     const controlPath = resolveControlFilePath(homeDir);
     mkdirSync(dirname(controlPath), { recursive: true });
 
-    writeFileSync(controlPath, JSON.stringify({ mode: "draining" }));
+    writeFileSync(controlPath, JSON.stringify({ version: 1, mode: "draining" }));
     monitor.start();
     await sleep(50);
 
-    writeFileSync(controlPath, "{\"mode\":\"draining\"");
+    writeFileSync(controlPath, "{\"version\":1,\"mode\":\"draining\"");
     await sleep(50);
 
     expect(monitor.getMode()).toBe("draining");
@@ -123,7 +123,7 @@ describe("Drain mode", () => {
     await sleep(50);
     expect(warnings.length).toBe(warningCount);
 
-    writeFileSync(controlPath, JSON.stringify({ mode: "running" }));
+    writeFileSync(controlPath, JSON.stringify({ version: 1, mode: "running" }));
     await sleep(50);
 
     monitor.stop();

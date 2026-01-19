@@ -1,15 +1,23 @@
-import { lstatSync, mkdirSync, readFileSync } from "fs";
+import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 
-export type DaemonMode = "running" | "draining";
+export type DaemonMode = "running" | "draining" | "paused";
 
 export type ControlState = {
   mode: DaemonMode;
   pauseRequested?: boolean;
+  pauseAtCheckpoint?: string;
+  drainTimeoutMs?: number;
   /** Active OpenCode profile for starting new tasks (control file key: opencode_profile). */
   opencodeProfile?: string;
 };
+
+export type ControlFile = ControlState & {
+  version: 1;
+};
+
+const CONTROL_FILE_VERSION = 1;
 
 function resolveTmpControlDir(): string {
   const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
@@ -41,7 +49,7 @@ export function resolveControlFilePath(
 
 function ensureControlFileDir(path: string, opts?: { log?: (message: string) => void }): void {
   try {
-    mkdirSync(dirname(path), { recursive: true });
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   } catch (e: any) {
     opts?.log?.(formatWarning(`Failed to create control directory for ${path} (reason: ${e?.message ?? String(e)})`));
   }
@@ -60,17 +68,33 @@ function parseControlStateJson(raw: string): ControlState {
   }
 
   const obj = parsed as Record<string, unknown>;
+  const version = obj.version;
+  if (version !== CONTROL_FILE_VERSION) {
+    throw new Error(`Invalid control schema: version must be ${CONTROL_FILE_VERSION} (got ${JSON.stringify(version)})`);
+  }
+
   const mode = obj.mode;
 
-  if (mode !== "running" && mode !== "draining") {
-    throw new Error(`Invalid control schema: mode must be 'running' or 'draining' (got ${JSON.stringify(mode)})`);
+  if (mode !== "running" && mode !== "draining" && mode !== "paused") {
+    throw new Error(`Invalid control schema: mode must be 'running', 'draining', or 'paused' (got ${JSON.stringify(mode)})`);
   }
 
   const pauseRequestedRaw = obj.pause_requested;
+  const pauseAtRaw = obj.pause_at_checkpoint;
+  const drainTimeoutRaw = obj.drain_timeout_ms;
   const state: ControlState = { mode };
 
   if (typeof pauseRequestedRaw === "boolean") {
     state.pauseRequested = pauseRequestedRaw;
+  }
+
+  if (typeof pauseAtRaw === "string") {
+    const trimmed = pauseAtRaw.trim();
+    if (trimmed) state.pauseAtCheckpoint = trimmed;
+  }
+
+  if (typeof drainTimeoutRaw === "number" && Number.isFinite(drainTimeoutRaw) && drainTimeoutRaw >= 0) {
+    state.drainTimeoutMs = drainTimeoutRaw;
   }
 
   const opencodeProfileRaw = obj.opencode_profile;
@@ -178,6 +202,48 @@ export function readControlStateSnapshot(opts?: {
   }
 }
 
+export function writeControlStateSnapshot(
+  state: ControlState,
+  opts?: { homeDir?: string; xdgStateHome?: string }
+): string {
+  const path = resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
+  ensureControlParentDir(path);
+
+  const payload: ControlFile = {
+    version: CONTROL_FILE_VERSION,
+    mode: state.mode,
+  };
+
+  if (typeof state.pauseRequested === "boolean") payload.pauseRequested = state.pauseRequested;
+  if (typeof state.pauseAtCheckpoint === "string" && state.pauseAtCheckpoint.trim()) {
+    payload.pauseAtCheckpoint = state.pauseAtCheckpoint.trim();
+  }
+  if (typeof state.drainTimeoutMs === "number" && Number.isFinite(state.drainTimeoutMs) && state.drainTimeoutMs >= 0) {
+    payload.drainTimeoutMs = Math.floor(state.drainTimeoutMs);
+  }
+  if (typeof state.opencodeProfile === "string" && state.opencodeProfile.trim()) {
+    payload.opencodeProfile = state.opencodeProfile.trim();
+  }
+
+  const json = JSON.stringify(
+    {
+      version: payload.version,
+      mode: payload.mode,
+      pause_requested: payload.pauseRequested,
+      pause_at_checkpoint: payload.pauseAtCheckpoint,
+      drain_timeout_ms: payload.drainTimeoutMs,
+      opencode_profile: payload.opencodeProfile,
+    },
+    null,
+    2
+  );
+
+  const tmpPath = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmpPath, json, { mode: 0o600 });
+  renameSync(tmpPath, path);
+  return path;
+}
+
 export function isDraining(homeDir?: string): boolean {
   return readControlStateSnapshot({ homeDir }).mode === "draining";
 }
@@ -202,6 +268,7 @@ export class DrainMonitor {
       log?: (message: string) => void;
       warn?: (message: string) => void;
       onModeChange?: (mode: DaemonMode) => void;
+      onStateChange?: (state: ControlState) => void;
     } = {}
   ) {}
 
@@ -277,17 +344,20 @@ export class DrainMonitor {
       if (nextMode !== "running") {
         this.options.log?.(formatWarning(`Control mode: ${nextMode}`));
       }
+      this.options.onStateChange?.(this.state);
       return;
     }
 
     if (prevMode === nextMode) {
       this.state = next;
+      this.options.onStateChange?.(this.state);
       return;
     }
 
     this.state = next;
     this.options.log?.(formatWarning(`Control mode: ${nextMode}`));
     this.options.onModeChange?.(nextMode);
+    this.options.onStateChange?.(this.state);
   }
 
   private reloadNow(reason: string, opts?: { force?: boolean }): void {
