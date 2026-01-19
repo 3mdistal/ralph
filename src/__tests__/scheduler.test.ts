@@ -428,6 +428,10 @@ describe("Scheduler invariants", () => {
 
       getTaskKey: (t) => t._path || t.name,
       inFlightTasks,
+      tryClaimTask: async ({ task }) => ({ claimed: true, task }),
+      recordOwnedTask: () => {},
+      forgetOwnedTask: () => {},
+      daemonId: "d_test",
 
       getEscalationsByStatus: async () => [escalation],
       editEscalation: async () => ({ ok: true }),
@@ -525,6 +529,10 @@ describe("Scheduler invariants", () => {
 
       getTaskKey: (t) => t._path || t.name,
       inFlightTasks,
+      tryClaimTask: async ({ task }) => ({ claimed: true, task }),
+      recordOwnedTask: () => {},
+      forgetOwnedTask: () => {},
+      daemonId: "d_test",
 
       getEscalationsByStatus: async () => escalations,
       editEscalation: async () => ({ ok: true }),
