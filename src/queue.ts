@@ -25,6 +25,31 @@ let bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
 
 const CLAIM_MAX_ATTEMPTS = 2;
 const TASK_STATUS_FIELDS = new Set(["status", "assigned-at", "completed-at", "throttled-at", "resume-at", "usage-snapshot"]);
+const TASK_FINGERPRINT_FIELDS = [
+  "_path",
+  "_name",
+  "type",
+  "creation-date",
+  "scope",
+  "issue",
+  "repo",
+  "status",
+  "priority",
+  "name",
+  "run",
+  "assigned-at",
+  "completed-at",
+  "throttled-at",
+  "resume-at",
+  "usage-snapshot",
+  "session-id",
+  "opencode-profile",
+  "run-log-path",
+  "worktree-path",
+  "worker-id",
+  "repo-slot",
+  "watchdog-retries",
+] as const;
 
 export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
   bwrb = runner;
@@ -78,6 +103,7 @@ export type QueueChangeHandler = (tasks: AgentTask[]) => void;
 let watcher: ReturnType<typeof watch> | null = null;
 let changeHandlers: QueueChangeHandler[] = [];
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+const lastTaskFingerprints = new Map<string, string>();
 
 export function normalizeBwrbNoteRef(value: string): string {
   // Defensive normalization: bwrb identifiers can include accidental whitespace/newlines.
@@ -100,6 +126,34 @@ function normalizeAgentTaskIdentity(task: AgentTask): AgentTask {
     _path: normalizedPath,
     _name: normalizedName,
   };
+}
+
+function buildTaskFingerprint(task: AgentTask): string {
+  const snapshot: Record<string, unknown> = {};
+  for (const key of TASK_FINGERPRINT_FIELDS) {
+    snapshot[key] = task[key as keyof AgentTask] ?? null;
+  }
+  return JSON.stringify(snapshot);
+}
+
+function computeHeartbeatOnlyChange(task: AgentTask): { isHeartbeatOnly: boolean; fingerprint: string } {
+  if (!task._path) return { isHeartbeatOnly: false, fingerprint: "" };
+  const fingerprint = buildTaskFingerprint(task);
+  const lastFingerprint = lastTaskFingerprints.get(task._path);
+  return { isHeartbeatOnly: Boolean(lastFingerprint) && lastFingerprint === fingerprint, fingerprint };
+}
+
+function refreshTaskFingerprints(tasks: AgentTask[]): void {
+  const seen = new Set<string>();
+  for (const task of tasks) {
+    if (!task._path) continue;
+    seen.add(task._path);
+    lastTaskFingerprints.set(task._path, buildTaskFingerprint(task));
+  }
+
+  for (const cachedPath of lastTaskFingerprints.keys()) {
+    if (!seen.has(cachedPath)) lastTaskFingerprints.delete(cachedPath);
+  }
 }
 
 function extractBwrbErrorText(e: any): string {
@@ -209,6 +263,7 @@ async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentT
     const normalized = tasks.map((t) => normalizeAgentTaskIdentity(t));
     warnIfNestedTaskPaths(normalized);
     recordQueueStateSnapshot(normalized);
+    refreshTaskFingerprints(normalized);
     return normalized;
   } catch (e) {
     console.error(`[ralph:queue] Failed to list tasks under ${TASKS_GLOB_PATH}:`, e);
@@ -689,11 +744,22 @@ export function startWatching(onChange: QueueChangeHandler): void {
 
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(async () => {
-      if (shouldLog("queue:change", 2_000)) {
-        console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
-      }
       const [queued, starting] = await Promise.all([getQueuedTasks(), getTasksByStatus("starting")]);
       const tasks = [...starting, ...queued];
+      const fingerprints = tasks.map((task) => ({ task, ...computeHeartbeatOnlyChange(task) }));
+      const hasNonHeartbeatChange = fingerprints.some(({ isHeartbeatOnly }) => !isHeartbeatOnly);
+
+      fingerprints.forEach(({ task, fingerprint }) => {
+        if (!task._path) return;
+        lastTaskFingerprints.set(task._path, fingerprint);
+      });
+
+      if (hasNonHeartbeatChange && shouldLog("queue:change", 2_000)) {
+        console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
+      }
+
+      if (!hasNonHeartbeatChange) return;
+
       for (const handler of changeHandlers) handler(tasks);
     }, 500);
   });
