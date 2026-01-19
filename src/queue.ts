@@ -25,6 +25,7 @@ let bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
 
 const CLAIM_MAX_ATTEMPTS = 2;
 const TASK_STATUS_FIELDS = new Set(["status", "assigned-at", "completed-at", "throttled-at", "resume-at", "usage-snapshot"]);
+const HEARTBEAT_ONLY_FIELDS = new Set(["heartbeat-at", "daemon-id"]);
 
 export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
   bwrb = runner;
@@ -78,6 +79,7 @@ export type QueueChangeHandler = (tasks: AgentTask[]) => void;
 let watcher: ReturnType<typeof watch> | null = null;
 let changeHandlers: QueueChangeHandler[] = [];
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+const lastTaskFingerprints = new Map<string, string>();
 
 export function normalizeBwrbNoteRef(value: string): string {
   // Defensive normalization: bwrb identifiers can include accidental whitespace/newlines.
@@ -100,6 +102,20 @@ function normalizeAgentTaskIdentity(task: AgentTask): AgentTask {
     _path: normalizedPath,
     _name: normalizedName,
   };
+}
+
+function buildTaskFingerprint(task: AgentTask): string {
+  const entries = Object.entries(task).filter(([key]) => !HEARTBEAT_ONLY_FIELDS.has(key));
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify(entries);
+}
+
+function isHeartbeatOnlyChange(task: AgentTask): boolean {
+  if (!task._path) return false;
+  const fingerprint = buildTaskFingerprint(task);
+  const lastFingerprint = lastTaskFingerprints.get(task._path);
+  lastTaskFingerprints.set(task._path, fingerprint);
+  return Boolean(lastFingerprint) && lastFingerprint === fingerprint;
 }
 
 function extractBwrbErrorText(e: any): string {
@@ -209,6 +225,10 @@ async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentT
     const normalized = tasks.map((t) => normalizeAgentTaskIdentity(t));
     warnIfNestedTaskPaths(normalized);
     recordQueueStateSnapshot(normalized);
+    normalized.forEach((task) => {
+      if (!task._path) return;
+      lastTaskFingerprints.set(task._path, buildTaskFingerprint(task));
+    });
     return normalized;
   } catch (e) {
     console.error(`[ralph:queue] Failed to list tasks under ${TASKS_GLOB_PATH}:`, e);
@@ -689,11 +709,16 @@ export function startWatching(onChange: QueueChangeHandler): void {
 
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(async () => {
-      if (shouldLog("queue:change", 2_000)) {
-        console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
-      }
       const [queued, starting] = await Promise.all([getQueuedTasks(), getTasksByStatus("starting")]);
       const tasks = [...starting, ...queued];
+      const hasNonHeartbeatChange = tasks.some((task) => !isHeartbeatOnlyChange(task));
+
+      if (hasNonHeartbeatChange && shouldLog("queue:change", 2_000)) {
+        console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
+      }
+
+      if (!hasNonHeartbeatChange) return;
+
       for (const handler of changeHandlers) handler(tasks);
     }, 500);
   });
