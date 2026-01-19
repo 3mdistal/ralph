@@ -8,6 +8,7 @@ import { recordRepoSync, recordTaskSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
+import { canActOnTask, isHeartbeatStale } from "./ownership";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -21,6 +22,9 @@ type BwrbRunner = (strings: TemplateStringsArray, ...values: unknown[]) => BwrbP
 const DEFAULT_BWRB_RUNNER: BwrbRunner = $ as unknown as BwrbRunner;
 
 let bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
+
+const CLAIM_MAX_ATTEMPTS = 2;
+const TASK_STATUS_FIELDS = new Set(["status", "assigned-at", "completed-at", "throttled-at", "resume-at", "usage-snapshot"]);
 
 export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
   bwrb = runner;
@@ -50,6 +54,10 @@ export interface AgentTask {
   "usage-snapshot"?: string;
   /** OpenCode session ID used to resume after restarts */
   "session-id"?: string;
+  /** Daemon identifier owning this task (for rolling restart safety). */
+  "daemon-id"?: string;
+  /** Last heartbeat timestamp from owning daemon. */
+  "heartbeat-at"?: string;
   /** OpenCode profile name used for this task (persisted for resume). */
   "opencode-profile"?: string;
   /** Path to restart-survivable OpenCode run output log */
@@ -59,6 +67,7 @@ export interface AgentTask {
   /** Watchdog recovery attempts (string in frontmatter) */
   "watchdog-retries"?: string;
 }
+
 
 export type QueueChangeHandler = (tasks: AgentTask[]) => void;
 
@@ -229,6 +238,81 @@ export async function getTaskByPath(taskPath: string): Promise<AgentTask | null>
   return tasks.find((t) => t._path === normalizedPath) ?? null;
 }
 
+export async function tryClaimTask(opts: {
+  task: AgentTask;
+  daemonId: string;
+  nowMs: number;
+}): Promise<{ claimed: boolean; task: AgentTask | null; reason?: string }> {
+  const config = loadConfig();
+  const ttlMs = config.ownershipTtlMs;
+  const normalizedPath = normalizeBwrbNoteRef(opts.task._path);
+
+  if (!normalizedPath) {
+    return { claimed: false, task: null, reason: "Task path missing" };
+  }
+
+  for (let attempt = 0; attempt < CLAIM_MAX_ATTEMPTS; attempt += 1) {
+    const current = await getTaskByPath(normalizedPath);
+    if (!current) {
+      return { claimed: false, task: null, reason: `Task not found: ${normalizedPath}` };
+    }
+
+    const canAct = canActOnTask(current, opts.daemonId, opts.nowMs, ttlMs);
+    if (!canAct) {
+      const owner = current["daemon-id"]?.trim() ?? "";
+      const heartbeatAt = current["heartbeat-at"]?.trim() ?? "";
+      const isStale = isHeartbeatStale(heartbeatAt, opts.nowMs, ttlMs);
+      const reason = owner
+        ? `Task owned by ${owner}; heartbeat ${isStale ? "stale" : "fresh"}`
+        : "Task has fresh heartbeat";
+      return { claimed: false, task: current, reason };
+    }
+
+    const nowIso = new Date(opts.nowMs).toISOString();
+    const updated = await updateTaskStatus(current, current.status, {
+      "daemon-id": opts.daemonId,
+      "heartbeat-at": nowIso,
+    });
+
+    if (!updated) {
+      if (attempt < CLAIM_MAX_ATTEMPTS - 1) continue;
+      return { claimed: false, task: current, reason: "Failed to update task ownership" };
+    }
+
+    const refreshed = await getTaskByPath(normalizedPath);
+    if (!refreshed) {
+      return { claimed: false, task: null, reason: `Task missing after claim: ${normalizedPath}` };
+    }
+
+    if ((refreshed["daemon-id"]?.trim() ?? "") !== opts.daemonId) {
+      if (attempt < CLAIM_MAX_ATTEMPTS - 1) continue;
+      return { claimed: false, task: refreshed, reason: "Ownership lost during claim" };
+    }
+
+    return { claimed: true, task: refreshed };
+  }
+
+  return { claimed: false, task: null, reason: "Failed to claim task" };
+}
+
+export async function heartbeatTask(opts: {
+  task: AgentTask;
+  daemonId: string;
+  nowMs: number;
+}): Promise<boolean> {
+  const owner = opts.task["daemon-id"]?.trim() ?? "";
+  if (owner && owner !== opts.daemonId) return false;
+
+  const normalizedPath = normalizeBwrbNoteRef(opts.task._path);
+  if (!normalizedPath) return false;
+
+  const nowIso = new Date(opts.nowMs).toISOString();
+  return await updateTaskStatus(opts.task, opts.task.status, {
+    "daemon-id": opts.daemonId,
+    "heartbeat-at": nowIso,
+  });
+}
+
 /**
  * Resolve an agent-task note by stable identifier.
  *
@@ -318,7 +402,8 @@ export async function updateTaskStatus(
   }
 
   const config = loadConfig();
-  const json = JSON.stringify({ status, ...extraFields });
+  const payload = { status, ...extraFields };
+  const json = JSON.stringify(payload);
 
   const taskObj: any = typeof task === "object" ? task : null;
   const fromStatus: string | undefined =
@@ -368,25 +453,30 @@ export async function updateTaskStatus(
     try {
       if (!taskObj) return;
       if (typeof taskObj.repo !== "string" || typeof taskObj.issue !== "string") return;
+      if (!extraFields || Object.keys(extraFields).some((key) => TASK_STATUS_FIELDS.has(key))) {
+        if (fromStatus === status) return;
+      }
 
       const taskId =
         (typeof path === "string" && path) || (typeof taskObj._path === "string" && taskObj._path) || undefined;
       const workerId: string | undefined = taskId ? `${taskObj.repo}#${taskId}` : undefined;
       const sessionId: string | undefined = extraFields?.["session-id"] ?? taskObj["session-id"];
 
-      ralphEventBus.publish(
-        buildRalphEvent({
-          type: "task.status_changed",
-          level: "info",
-          workerId,
-          repo: taskObj.repo,
-          taskId,
-          sessionId,
-          data: { from: fromStatus, to: status },
-        })
-      );
+      if (fromStatus !== status) {
+        ralphEventBus.publish(
+          buildRalphEvent({
+            type: "task.status_changed",
+            level: "info",
+            workerId,
+            repo: taskObj.repo,
+            taskId,
+            sessionId,
+            data: { from: fromStatus, to: status },
+          })
+        );
+      }
 
-      if (status === "starting") {
+      if (status === "starting" && fromStatus !== status) {
         ralphEventBus.publish(
           buildRalphEvent({
             type: "task.assigned",
@@ -403,7 +493,7 @@ export async function updateTaskStatus(
         );
       }
 
-      if (status === "done") {
+      if (status === "done" && fromStatus !== status) {
         ralphEventBus.publish(
           buildRalphEvent({
             type: "task.completed",
@@ -417,7 +507,7 @@ export async function updateTaskStatus(
         );
       }
 
-      if (status === "escalated") {
+      if (status === "escalated" && fromStatus !== status) {
         ralphEventBus.publish(
           buildRalphEvent({
             type: "task.escalated",
@@ -431,7 +521,7 @@ export async function updateTaskStatus(
         );
       }
 
-      if (status === "blocked") {
+      if (status === "blocked" && fromStatus !== status) {
         ralphEventBus.publish(
           buildRalphEvent({
             type: "task.blocked",
