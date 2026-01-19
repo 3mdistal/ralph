@@ -33,6 +33,10 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 - [bwrb](https://github.com/3mdistal/bwrb) CLI >= 0.1.3 (`npm install -g bwrb`) (needed for `.bwrbignore` negation)
 - [gh](https://cli.github.com) CLI
 
+## Worktree isolation guardrail
+
+Ralph always runs workers inside a per-task git worktree and blocks execution if it cannot prove isolation. If the repo root checkout is dirty or a task is missing a valid `worktree-path`, the worker fails closed and reports the issue. This protects the main checkout from accidental writes.
+
 If you previously installed bwrb via `pnpm link -g`, unlink it first so Ralph uses the published CLI on your PATH (Bun just shells out to the `bwrb` binary).
 
 ## Installation
@@ -104,16 +108,22 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 - `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
+- `control` (object, optional): control file defaults
+  - `autoCreate` (boolean): create `control.json` on startup (default: true)
+  - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
 
 Note: `repos[].requiredChecks` defaults to `["ci"]` when omitted. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
+
 Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require the configured `repos[].requiredChecks` and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
+
+Ralph refuses to auto-merge PRs targeting `main` unless the issue has the `allow-main` label. This guardrail only affects Ralph automation; humans can still merge to `main` normally.
 
 If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs, or update `repos[].requiredChecks` to match actual check names.
 
 ### Environment variables
 
-Only these env vars are currently supported:
+Only these env vars are currently supported (unless noted otherwise):
 
 | Setting | Env Var | Default |
 |---------|---------|---------|
@@ -121,6 +131,7 @@ Only these env vars are currently supported:
 | Worktrees dir | `RALPH_WORKTREES_DIR` | `~/.ralph/worktrees` |
 | Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
 | Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
+| CI remediation attempts | `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` | `2` |
 
 Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
@@ -275,6 +286,8 @@ Control file:
 - `$XDG_STATE_HOME/ralph/control.json`
 - Fallback: `~/.local/state/ralph/control.json`
 - Last resort: `/tmp/ralph/<uid>/control.json`
+
+Ralph auto-creates the control file on startup with `{ "mode": "running" }` unless disabled via config.
 
 Example:
 

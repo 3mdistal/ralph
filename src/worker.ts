@@ -21,7 +21,6 @@ import { type AgentTask, updateTaskStatus } from "./queue";
 import {
   getOpencodeDefaultProfileName,
   getRepoBotBranch,
-  getRepoMaxWorkers,
   getRepoRequiredChecks,
   isOpencodeProfilesEnabled,
   loadConfig,
@@ -45,7 +44,7 @@ import {
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
 import { computeMissingBaselineLabels } from "./github-labels";
-import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir } from "./paths";
+import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { recordIssueSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
@@ -141,7 +140,7 @@ async function readIntrospectionSummary(sessionId: string): Promise<Introspectio
  * Returns total count and whether there's been a recent burst.
  */
 async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount> {
-  const eventsPath = join(RALPH_SESSIONS_DIR, sessionId, "events.jsonl");
+  const eventsPath = getSessionEventsPath(sessionId);
   if (!existsSync(eventsPath)) return { total: 0, recentBurst: false };
 
   try {
@@ -199,12 +198,26 @@ type PrCheck = {
   name: string;
   state: RequiredCheckState;
   rawState: string;
+  detailsUrl?: string | null;
 };
 
 type RequiredChecksSummary = {
   status: "success" | "pending" | "failure";
-  required: Array<{ name: string; state: RequiredCheckState; rawState: string }>;
+  required: Array<{ name: string; state: RequiredCheckState; rawState: string; detailsUrl?: string | null }>;
   available: string[];
+};
+
+type FailedCheck = {
+  name: string;
+  state: RequiredCheckState;
+  rawState: string;
+  detailsUrl?: string | null;
+};
+
+type FailedCheckLog = FailedCheck & {
+  runId?: string;
+  runUrl?: string;
+  logExcerpt?: string;
 };
 
 type RestrictionEntry = { login?: string | null; slug?: string | null };
@@ -243,6 +256,14 @@ type BranchProtection = {
 
 type CheckRunsResponse = {
   check_runs?: Array<{ name?: string | null }> | null;
+};
+
+type RepoDetails = {
+  default_branch?: string | null;
+};
+
+type GitRef = {
+  object?: { sha?: string | null } | null;
 };
 
 function splitRepoFullName(full: string): { owner: string; name: string } {
@@ -350,7 +371,7 @@ function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: string[])
   const required = requiredChecks.map((name) => {
     const match = allChecks.find((c) => c.name === name);
     if (!match) return { name, state: "UNKNOWN" as const, rawState: "missing" };
-    return { name, state: match.state, rawState: match.rawState };
+    return { name, state: match.state, rawState: match.rawState, detailsUrl: match.detailsUrl };
   });
 
   if (requiredChecks.length === 0) {
@@ -373,11 +394,28 @@ export function __summarizeRequiredChecksForTests(
   return summarizeRequiredChecks(allChecks, requiredChecks);
 }
 
+export const __TEST_ONLY_DEFAULT_BRANCH = "__default_branch__";
+
+export const __TEST_ONLY_DEFAULT_SHA = "__default_sha__";
+
+export function __buildRepoDefaultBranchResponse(): RepoDetails {
+  return { default_branch: __TEST_ONLY_DEFAULT_BRANCH };
+}
+
+export function __buildGitRefResponse(sha: string): GitRef {
+  return { object: { sha } };
+}
+
+export function __buildCheckRunsResponse(names: string[]): CheckRunsResponse {
+  return { check_runs: names.map((name) => ({ name })) };
+}
+
 function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
   const lines: string[] = [];
   lines.push(`Required checks: ${summary.required.map((c) => c.name).join(", ") || "(none)"}`);
   for (const chk of summary.required) {
-    lines.push(`- ${chk.name}: ${chk.rawState}`);
+    const details = chk.detailsUrl ? ` (${chk.detailsUrl})` : "";
+    lines.push(`- ${chk.name}: ${chk.rawState}${details}`);
   }
 
   if (summary.available.length > 0) {
@@ -395,6 +433,20 @@ type RequiredChecksGuidanceInput = {
   availableChecks: string[];
 };
 
+type CheckLogResult = {
+  runId?: string;
+  runUrl?: string;
+  logExcerpt?: string;
+};
+
+type RemediationFailureContext = {
+  summary: RequiredChecksSummary;
+  failedChecks: FailedCheck[];
+  logs: FailedCheckLog[];
+  logWarnings: string[];
+  commands: string[];
+};
+
 function formatRequiredChecksGuidance(input: RequiredChecksGuidanceInput): string {
   const lines = [
     `Repo: ${input.repo}`,
@@ -406,6 +458,20 @@ function formatRequiredChecksGuidance(input: RequiredChecksGuidanceInput): strin
   ];
 
   return lines.join("\n");
+}
+
+const MAIN_MERGE_OVERRIDE_LABEL = "allow-main";
+
+function isMainMergeOverride(labels: string[]): boolean {
+  return labels.some((label) => label.toLowerCase() === MAIN_MERGE_OVERRIDE_LABEL);
+}
+
+function isMainMergeAllowed(baseBranch: string | null, botBranch: string, labels: string[]): boolean {
+  if (!baseBranch) return true;
+  if (baseBranch !== "main") return true;
+  if (botBranch === "main") return true;
+  if (isMainMergeOverride(labels)) return true;
+  return false;
 }
 
 export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuidanceInput): string {
@@ -490,6 +556,52 @@ export class RepoWorker {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
     }
     return runLogPath;
+  }
+
+  private async getRepoRootStatusPorcelain(): Promise<string> {
+    try {
+      const status = await $`git status --porcelain`.cwd(this.repoPath).quiet();
+      return status.stdout.toString().trim();
+    } catch (e: any) {
+      throw new Error(`Failed to check repo root status: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  private async assertRepoRootClean(task: AgentTask, phase: "start" | "resume" | "post-run"): Promise<void> {
+    const status = await this.getRepoRootStatusPorcelain();
+    if (!status) return;
+
+    const reason = `Repo root has uncommitted changes; refusing to run to protect main checkout (${phase}).`;
+    const message = [reason, "", "Status:", status].join("\n");
+
+    await this.queue.updateTaskStatus(task, "blocked", {
+      "completed-at": new Date().toISOString().split("T")[0],
+      "session-id": "",
+      "watchdog-retries": "",
+      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+    });
+
+    await this.createAgentRun(task, {
+      outcome: "failed",
+      started: new Date(),
+      completed: new Date(),
+      sessionId: task["session-id"]?.trim() || undefined,
+      bodyPrefix: [
+        "Blocked: repo root dirty",
+        "",
+        `Phase: ${phase}`,
+        `Repo: ${task.repo}`,
+        "",
+        "Status:",
+        status,
+      ].join("\n"),
+    });
+
+    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, task.name);
+
+    const error = new Error(reason) as Error & { ralphRootDirty?: boolean };
+    error.ralphRootDirty = true;
+    throw error;
   }
 
   private async ensureBaselineLabelsOnce(): Promise<void> {
@@ -581,10 +693,70 @@ export class RepoWorker {
 
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
     const { owner, name } = splitRepoFullName(this.repo);
-    const payload = await this.githubApiRequest<CheckRunsResponse>(
-      `/repos/${owner}/${name}/commits/${branch}/check-runs?per_page=100`
-    );
-    return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
+    try {
+      const payload = await this.githubApiRequest<CheckRunsResponse>(
+        `/repos/${owner}/${name}/commits/${branch}/check-runs?per_page=100`
+      );
+      return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      if (/HTTP 422/.test(msg) && /No commit found/i.test(msg)) {
+        const missingBranchError = new Error(msg);
+        missingBranchError.cause = "missing-branch";
+        throw missingBranchError;
+      }
+      throw e;
+    }
+  }
+
+  private async fetchRepoDefaultBranch(): Promise<string | null> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const payload = await this.githubApiRequest<RepoDetails>(`/repos/${owner}/${name}`);
+    const branch = payload?.default_branch ?? null;
+    return branch ? String(branch) : null;
+  }
+
+  private async fetchGitRef(ref: string): Promise<GitRef | null> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    return this.githubApiRequest<GitRef>(`/repos/${owner}/${name}/git/ref/${ref}`, { allowNotFound: true });
+  }
+
+  private async createGitRef(ref: string, sha: string): Promise<void> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    await this.githubApiRequest(`/repos/${owner}/${name}/git/refs`, {
+      method: "POST",
+      body: { ref: `refs/${ref}`, sha },
+    });
+  }
+
+  private async ensureRemoteBranchExists(branch: string): Promise<boolean> {
+    const ref = `heads/${branch}`;
+    const existing = await this.fetchGitRef(ref);
+    if (existing?.object?.sha) return false;
+
+    const defaultBranch = await this.fetchRepoDefaultBranch();
+    if (!defaultBranch) {
+      throw new Error(`Unable to resolve default branch for ${this.repo}; cannot create ${branch}.`);
+    }
+
+    const defaultRef = await this.fetchGitRef(`heads/${defaultBranch}`);
+    const defaultSha = defaultRef?.object?.sha ? String(defaultRef.object.sha) : null;
+    if (!defaultSha) {
+      throw new Error(`Unable to resolve ${this.repo}@${defaultBranch} sha; cannot create ${branch}.`);
+    }
+
+    try {
+      await this.createGitRef(ref, defaultSha);
+      console.log(
+        `[ralph:worker:${this.repo}] Created missing branch ${branch} from ${defaultBranch} (${defaultSha}).`
+      );
+      return true;
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      if (/Reference already exists/i.test(msg)) return false;
+      if (/HTTP 422/.test(msg) && /already exists/i.test(msg)) return false;
+      throw e;
+    }
   }
 
   private async fetchBranchProtection(branch: string): Promise<BranchProtection | null> {
@@ -598,7 +770,23 @@ export class RepoWorker {
   private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
     if (requiredChecks.length === 0) return;
 
-    const availableChecks = await this.fetchCheckRunNames(branch);
+    const botBranch = getRepoBotBranch(this.repo);
+    if (branch === botBranch) {
+      await this.ensureRemoteBranchExists(branch);
+    }
+
+    let availableChecks: string[] = [];
+    try {
+      availableChecks = await this.fetchCheckRunNames(branch);
+    } catch (e: any) {
+      if (branch === botBranch && e?.cause === "missing-branch") {
+        await this.ensureRemoteBranchExists(branch);
+        availableChecks = await this.fetchCheckRunNames(branch);
+      } else {
+        throw e;
+      }
+    }
+
     const missingChecks = requiredChecks.filter((check) => !availableChecks.includes(check));
     if (missingChecks.length > 0) {
       const guidance = formatRequiredChecksGuidance({
@@ -866,24 +1054,26 @@ ${guidance}`
     repoSlot?: number | null
   ): Promise<{ repoPath: string; worktreePath?: string }> {
     const recorded = task["worktree-path"]?.trim();
-    if (recorded && existsSync(recorded)) {
-      return { repoPath: recorded, worktreePath: recorded };
+    if (recorded) {
+      if (this.isSameRepoRootPath(recorded)) {
+        throw new Error(`Recorded worktree-path matches repo root; refusing to run in main checkout: ${recorded}`);
+      }
+      if (!this.isRepoWorktreePath(recorded)) {
+        throw new Error(`Recorded worktree-path is outside managed worktrees dir: ${recorded}`);
+      }
+      if (this.isHealthyWorktreePath(recorded)) {
+        return { repoPath: recorded, worktreePath: recorded };
+      }
+
+      if (!existsSync(recorded)) {
+        throw new Error(`Recorded worktree-path does not exist: ${recorded}`);
+      }
+
+      throw new Error(`Recorded worktree-path is not a valid git worktree: ${recorded}`);
     }
 
-    if (recorded && !existsSync(recorded)) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Recorded worktree-path does not exist; falling back to main repo checkout: ${recorded}`
-      );
-    }
-
-    // Only create worktrees for new runs (not resume), and only when per-repo concurrency > 1.
     if (mode === "resume") {
-      return { repoPath: this.repoPath };
-    }
-
-    const maxWorkers = getRepoMaxWorkers(this.repo);
-    if (maxWorkers <= 1) {
-      return { repoPath: this.repoPath };
+      throw new Error("Missing worktree-path for in-progress task; refusing to resume in main checkout");
     }
 
     const resolvedSlot = typeof repoSlot === "number" && Number.isFinite(repoSlot) ? repoSlot : 0;
@@ -1197,7 +1387,9 @@ ${guidance}`
     return { prUrl: null, diagnostics: diagnostics.join("\n") };
   }
 
-  private async getPullRequestChecks(prUrl: string): Promise<{ headSha: string; checks: PrCheck[] }> {
+  private async getPullRequestChecks(
+    prUrl: string
+  ): Promise<{ headSha: string; mergeStateStatus: string | null; baseRefName: string; checks: PrCheck[] }> {
     const prNumber = extractPullRequestNumber(prUrl);
     if (!prNumber) {
       throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
@@ -1210,8 +1402,10 @@ ${guidance}`
       "repository(owner:$owner,name:$name){",
       "pullRequest(number:$number){",
       "headRefOid",
+      "mergeStateStatus",
+      "baseRefName",
       "statusCheckRollup{",
-      "contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion} ... on StatusContext{context state}}}",
+      "contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl} ... on StatusContext{context state targetUrl}}}",
       "}",
       "}",
       "}",
@@ -1225,6 +1419,12 @@ ${guidance}`
     const headSha = pr?.headRefOid as string | undefined;
     if (!headSha) {
       throw new Error(`Failed to read pull request head SHA for ${prUrl}`);
+    }
+
+    const mergeStateStatus = String(pr?.mergeStateStatus ?? "").trim() || null;
+    const baseRefName = String(pr?.baseRefName ?? "").trim();
+    if (!baseRefName) {
+      throw new Error(`Failed to read pull request base branch for ${prUrl}`);
     }
 
     const nodes = pr?.statusCheckRollup?.contexts?.nodes;
@@ -1241,10 +1441,11 @@ ${guidance}`
 
         const status = String(node?.status ?? "");
         const conclusion = String(node?.conclusion ?? "");
+        const detailsUrl = node?.detailsUrl ? String(node.detailsUrl).trim() : null;
 
         // If it's not completed yet, treat status as the state.
         const rawState = status && status !== "COMPLETED" ? status : conclusion || status || "UNKNOWN";
-        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState) });
+        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState), detailsUrl });
         continue;
       }
 
@@ -1253,12 +1454,38 @@ ${guidance}`
         if (!name) continue;
 
         const rawState = String(node?.state ?? "UNKNOWN");
-        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState) });
+        const detailsUrl = node?.targetUrl ? String(node.targetUrl).trim() : null;
+        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState), detailsUrl });
         continue;
       }
     }
 
-    return { headSha, checks };
+    return { headSha, mergeStateStatus, baseRefName, checks };
+  }
+
+  private async getPullRequestBaseBranch(prUrl: string): Promise<string | null> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) return null;
+
+    const { owner, name } = splitRepoFullName(this.repo);
+    const query = [
+      "query($owner:String!,$name:String!,$number:Int!){",
+      "repository(owner:$owner,name:$name){",
+      "pullRequest(number:$number){",
+      "baseRefName",
+      "}",
+      "}",
+      "}",
+    ].join(" ");
+
+    const result = await gh`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
+    const parsed = JSON.parse(result.stdout.toString());
+    const base = parsed?.data?.repository?.pullRequest?.baseRefName;
+    return typeof base === "string" && base.trim() ? base.trim() : null;
+  }
+
+  private isMainMergeAllowed(baseBranch: string | null, botBranch: string, labels: string[]): boolean {
+    return isMainMergeAllowed(baseBranch, botBranch, labels);
   }
 
   private async getPullRequestFiles(prUrl: string): Promise<string[]> {
@@ -1294,31 +1521,41 @@ ${guidance}`
     prUrl: string,
     requiredChecks: string[],
     opts: { timeoutMs: number; pollIntervalMs: number }
-  ): Promise<{ headSha: string; summary: RequiredChecksSummary; timedOut: boolean }> {
+  ): Promise<{
+    headSha: string;
+    mergeStateStatus: string | null;
+    baseRefName: string;
+    summary: RequiredChecksSummary;
+    checks: PrCheck[];
+    timedOut: boolean;
+  }> {
     const startedAt = Date.now();
-    let last: { headSha: string; summary: RequiredChecksSummary } | null = null;
+    let last: { headSha: string; mergeStateStatus: string | null; baseRefName: string; summary: RequiredChecksSummary; checks: PrCheck[] } | null = null;
 
     while (Date.now() - startedAt < opts.timeoutMs) {
-      const { headSha, checks } = await this.getPullRequestChecks(prUrl);
+      const { headSha, mergeStateStatus, baseRefName, checks } = await this.getPullRequestChecks(prUrl);
       const summary = summarizeRequiredChecks(checks, requiredChecks);
-      last = { headSha, summary };
+      last = { headSha, mergeStateStatus, baseRefName, summary, checks };
 
       if (summary.status === "success" || summary.status === "failure") {
-        return { headSha, summary, timedOut: false };
+        return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
       }
 
       await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
     }
 
     if (last) {
-      return { headSha: last.headSha, summary: last.summary, timedOut: true };
+      return { ...last, timedOut: true };
     }
 
     // Should be unreachable, but keep types happy.
     const fallback = await this.getPullRequestChecks(prUrl);
     return {
       headSha: fallback.headSha,
+      mergeStateStatus: fallback.mergeStateStatus,
+      baseRefName: fallback.baseRefName,
       summary: summarizeRequiredChecks(fallback.checks, requiredChecks),
+      checks: fallback.checks,
       timedOut: true,
     };
   }
@@ -1330,6 +1567,193 @@ ${guidance}`
 
   private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
     await gh`gh pr update-branch ${prUrl} --repo ${this.repo}`.cwd(cwd).quiet();
+  }
+
+  private parseCiFixAttempts(raw: string | undefined): number | null {
+    const trimmed = (raw ?? "").trim();
+    if (!trimmed) return null;
+    const parsed = Number.parseInt(trimmed, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+
+  private resolveCiFixAttempts(): number {
+    return this.parseCiFixAttempts(process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS) ?? 2;
+  }
+
+  private isActionableCheckFailure(rawState: string): boolean {
+    const normalized = rawState.trim().toLowerCase();
+    if (!normalized) return false;
+    if (normalized.includes("action_required")) return false;
+    if (normalized.includes("stale")) return false;
+    if (normalized.includes("cancel")) return false;
+    return true;
+  }
+
+  private parseGhRunId(detailsUrl: string | null | undefined): string | null {
+    if (!detailsUrl) return null;
+    const match = detailsUrl.match(/\/actions\/runs\/(\d+)/);
+    if (!match) return null;
+    return match[1] ?? null;
+  }
+
+  private extractCommandsFromLog(log: string): string[] {
+    const lines = log.split("\n");
+    const commands = new Set<string>();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const bunMatch = trimmed.match(/\b(bun\s+(?:run\s+)?[\w:.-]+(?:\s+[^\s].*)?)$/i);
+      if (bunMatch?.[1]) {
+        commands.add(bunMatch[1]);
+      }
+      const npmMatch = trimmed.match(/\b(npm\s+(?:run\s+)?[\w:.-]+(?:\s+[^\s].*)?)$/i);
+      if (npmMatch?.[1]) {
+        commands.add(npmMatch[1]);
+      }
+      const pnpmMatch = trimmed.match(/\b(pnpm\s+(?:run\s+)?[\w:.-]+(?:\s+[^\s].*)?)$/i);
+      if (pnpmMatch?.[1]) {
+        commands.add(pnpmMatch[1]);
+      }
+    }
+    return Array.from(commands).sort();
+  }
+
+  private clipLogExcerpt(log: string, maxLines = 120): string {
+    const lines = log.split("\n").filter((line) => line.trim().length > 0);
+    if (lines.length <= maxLines) return lines.join("\n");
+    const head = lines.slice(0, Math.floor(maxLines * 0.6));
+    const tail = lines.slice(lines.length - Math.ceil(maxLines * 0.4));
+    return [...head, "...", ...tail].join("\n");
+  }
+
+  private async getCheckLog(runId: string): Promise<CheckLogResult> {
+    try {
+      const result = await gh`gh run view ${runId} --repo ${this.repo} --log-failed`.quiet();
+      const output = result.stdout.toString();
+      if (!output.trim()) return { runId };
+      return { runId, logExcerpt: this.clipLogExcerpt(output) };
+    } catch (error: any) {
+      const message = this.formatGhError(error);
+      console.warn(`[ralph:worker:${this.repo}] Failed to fetch CI logs for run ${runId}: ${message}`);
+      return { runId };
+    }
+  }
+
+  private async buildRemediationFailureContext(
+    summary: RequiredChecksSummary,
+    opts: { includeLogs: boolean }
+  ): Promise<RemediationFailureContext> {
+    const failedChecks = summary.required.filter((check) => check.state === "FAILURE");
+    const logs: FailedCheckLog[] = [];
+    const logWarnings: string[] = [];
+    const commands = new Set<string>();
+
+    for (const check of failedChecks) {
+      if (!opts.includeLogs) {
+        logs.push({ ...check });
+        continue;
+      }
+
+      const runId = this.parseGhRunId(check.detailsUrl);
+      if (!runId) {
+        logs.push({ ...check });
+        continue;
+      }
+
+      const logResult = await this.getCheckLog(runId);
+      if (logResult.logExcerpt) {
+        this.extractCommandsFromLog(logResult.logExcerpt).forEach((cmd) => commands.add(cmd));
+      }
+
+      if (!logResult.logExcerpt) {
+        logWarnings.push(`No failing log output captured for ${check.name} (run ${runId}).`);
+      }
+
+      if (!this.isActionableCheckFailure(check.rawState)) {
+        logWarnings.push(`Check ${check.name} returned non-actionable status (${check.rawState}).`);
+      }
+
+      logs.push({ ...check, ...logResult, runUrl: check.detailsUrl ?? undefined });
+    }
+
+    return {
+      summary,
+      failedChecks,
+      logs,
+      logWarnings,
+      commands: Array.from(commands).sort(),
+    };
+  }
+
+  private formatRemediationFailureContext(context: RemediationFailureContext): string {
+    const lines: string[] = [];
+    lines.push(formatRequiredChecksForHumans(context.summary));
+
+    if (context.failedChecks.length === 0) {
+      lines.push("", "Failed checks: (none)");
+    } else {
+      lines.push("", "Failed checks:");
+      for (const check of context.failedChecks) {
+        const details = check.detailsUrl ? ` (${check.detailsUrl})` : "";
+        lines.push(`- ${check.name}: ${check.rawState}${details}`);
+      }
+    }
+
+    if (context.logs.length > 0) {
+      lines.push("", "Failed log excerpts:");
+      for (const entry of context.logs) {
+        if (!entry.logExcerpt) continue;
+        lines.push("", `### ${entry.name}`, "```", entry.logExcerpt, "```");
+      }
+    }
+
+    if (context.commands.length > 0) {
+      lines.push("", "Detected failing commands:", ...context.commands.map((cmd) => `- ${cmd}`));
+    }
+
+    if (context.logWarnings.length > 0) {
+      lines.push("", "Log warnings:", ...context.logWarnings.map((warning) => `- ${warning}`));
+    }
+
+    return lines.join("\n");
+  }
+
+  private formatFailureSignature(summary: RequiredChecksSummary): string {
+    const failed = summary.required
+      .filter((check) => check.state === "FAILURE")
+      .map((check) => `${check.name}:${check.rawState}`)
+      .sort();
+    return failed.join("|") || "none";
+  }
+
+  private async ensurePrNotBehind(prUrl: string, cwd: string): Promise<{ updated: boolean; reason?: string }> {
+    try {
+      const status = await this.getPullRequestChecks(prUrl);
+      if (status.mergeStateStatus !== "BEHIND") return { updated: false };
+      console.log(`[ralph:worker:${this.repo}] PR behind ${status.baseRefName}; updating branch ${prUrl}`);
+      await this.updatePullRequestBranch(prUrl, cwd);
+      return { updated: true };
+    } catch (error: any) {
+      const reason = `Failed to update PR branch while behind: ${this.formatGhError(error)}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return { updated: false, reason };
+    }
+  }
+
+  private async isPrBehind(prUrl: string): Promise<boolean> {
+    const status = await this.getPullRequestChecks(prUrl);
+    return status.mergeStateStatus === "BEHIND";
+  }
+
+  private isActionableFailureContext(context: RemediationFailureContext): boolean {
+    if (context.failedChecks.length === 0) return false;
+    if (!context.failedChecks.every((check) => this.isActionableCheckFailure(check.rawState))) return false;
+    if (context.commands.length > 0) return true;
+
+    return context.failedChecks.some((check) => {
+      const name = check.name.toLowerCase();
+      return name.includes("test") || name.includes("lint") || name.includes("typecheck") || name.includes("knip");
+    });
   }
 
   private isOutOfDateMergeError(error: any): boolean {
@@ -1357,16 +1781,59 @@ ${guidance}`
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
     const REQUIRED_CHECKS = getRepoRequiredChecks(this.repo);
-    const MAX_CI_FIX_ATTEMPTS = 3;
+    const MAX_CI_FIX_ATTEMPTS = this.resolveCiFixAttempts();
 
     let prUrl = params.prUrl;
     let sessionId = params.sessionId;
     let lastSummary: RequiredChecksSummary | null = null;
+    let lastFailureSignature = "";
     let didUpdateBranch = false;
 
     const prFiles = await this.getPullRequestFiles(prUrl);
     const ciOnly = isCiOnlyChangeSet(prFiles);
     const isCiIssue = isCiRelatedIssue(params.issueMeta.labels ?? []);
+
+    const baseBranch = await this.getPullRequestBaseBranch(prUrl);
+    if (!this.isMainMergeAllowed(baseBranch, params.botBranch, params.issueMeta.labels ?? [])) {
+      const completed = new Date();
+      const completedAt = completed.toISOString().split("T")[0];
+      const reason = `Blocked: Ralph refuses to auto-merge PRs targeting '${baseBranch}'. Use ${params.botBranch} or an explicit override.`;
+
+      await this.createAgentRun(params.task, {
+        outcome: "failed",
+        started: completed,
+        completed,
+        sessionId,
+        bodyPrefix: [
+          reason,
+          "",
+          `Issue: ${params.task.issue}`,
+          `PR: ${prUrl}`,
+          baseBranch ? `Base: ${baseBranch}` : "Base: unknown",
+        ].join("\n"),
+      });
+
+      await this.queue.updateTaskStatus(params.task, "blocked", {
+        "completed-at": completedAt,
+        "session-id": "",
+        "watchdog-retries": "",
+        ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+      });
+
+      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+
+      return {
+        ok: false,
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          pr: prUrl ?? undefined,
+          sessionId,
+          escalationReason: reason,
+        },
+      };
+    }
 
     if (ciOnly && !isCiIssue) {
       const completed = new Date();
@@ -1410,12 +1877,57 @@ ${guidance}`
     }
 
     for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
+      let isBehind = false;
+      try {
+        isBehind = await this.isPrBehind(prUrl);
+      } catch (error: any) {
+        const reason = `Failed to read PR merge state: ${this.formatGhError(error)}`;
+        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+        await this.queue.updateTaskStatus(params.task, "blocked");
+        await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: reason,
+          },
+        };
+      }
+
+      if (isBehind) {
+        const behindResult = await this.ensurePrNotBehind(prUrl, params.repoPath);
+        if (behindResult.updated) {
+          didUpdateBranch = true;
+        } else if (behindResult.reason) {
+          await this.queue.updateTaskStatus(params.task, "blocked");
+          await this.notify.notifyError(params.notifyTitle, behindResult.reason, params.task.name);
+
+          return {
+            ok: false,
+            run: {
+              taskName: params.task.name,
+              repo: this.repo,
+              outcome: "failed",
+              sessionId,
+              escalationReason: behindResult.reason,
+            },
+          };
+        }
+      }
+
       const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
         timeoutMs: 45 * 60_000,
         pollIntervalMs: 30_000,
       });
 
       lastSummary = checkResult.summary;
+
+      const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
+      if (throttled) return { ok: false, run: throttled };
 
       if (checkResult.summary.status === "success") {
         console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
@@ -1451,8 +1963,56 @@ ${guidance}`
         }
       }
 
+      const baseFailureContext = await this.buildRemediationFailureContext(checkResult.summary, { includeLogs: false });
+      const failureSignature = this.formatFailureSignature(checkResult.summary);
+      if (failureSignature !== "none" && failureSignature === lastFailureSignature) {
+        const reason = `CI failed repeatedly with identical failures; stopping remediation for ${prUrl}`;
+        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+        await this.queue.updateTaskStatus(params.task, "blocked");
+        await this.notify.notifyError(
+          params.notifyTitle,
+          [reason, this.formatRemediationFailureContext(baseFailureContext)].filter(Boolean).join("\n\n"),
+          params.task.name
+        );
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: reason,
+          },
+        };
+      }
+      lastFailureSignature = failureSignature;
+
+      const actionCheckContext = await this.buildRemediationFailureContext(checkResult.summary, { includeLogs: true });
+      if (!this.isActionableFailureContext(actionCheckContext)) {
+        const reason = `CI failed with non-actionable status; refusing to remediate ${prUrl}`;
+        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+        await this.queue.updateTaskStatus(params.task, "blocked");
+        await this.notify.notifyError(
+          params.notifyTitle,
+          [reason, this.formatRemediationFailureContext(actionCheckContext)].filter(Boolean).join("\n\n"),
+          params.task.name
+        );
+
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: reason,
+          },
+        };
+      }
+
       if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
 
+      const remediationContext = this.formatRemediationFailureContext(actionCheckContext);
       const fixMessage = [
         `CI is required before merging to '${params.botBranch}'.`,
         `PR: ${prUrl}`,
@@ -1461,7 +2021,7 @@ ${guidance}`
           ? "Timed out waiting for required checks to complete."
           : "One or more required checks failed.",
         "",
-        formatRequiredChecksForHumans(checkResult.summary),
+        remediationContext,
         "",
         "Do NOT merge yet.",
         "Fix the CI failure (or rerun CI), push updates to the PR branch, and reply when CI is green.",
@@ -1535,7 +2095,7 @@ ${guidance}`
     }
 
     const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
-    const reason = `Required checks not passing; refusing to merge ${prUrl}`;
+    const reason = `Required checks not passing after ${MAX_CI_FIX_ATTEMPTS} attempt(s); refusing to merge ${prUrl}`;
     console.warn(`[ralph:worker:${this.repo}] ${reason}`);
 
     await this.queue.updateTaskStatus(params.task, "blocked");
@@ -1670,7 +2230,8 @@ ${guidance}`
       };
     }
 
-    const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+    const defaults = loadConfig().control;
+    const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
     const requested = control.opencodeProfile?.trim() ?? "";
 
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
@@ -1737,7 +2298,9 @@ ${guidance}`
     if (pinned) {
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
-      const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message) }).opencodeProfile?.trim() ?? "";
+      const defaults = loadConfig().control;
+      const controlProfile =
+        readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
 
       if (controlProfile === "auto") {
         const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
@@ -1930,6 +2493,8 @@ ${guidance}`
       await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
       return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
     }
+
+    await this.assertRepoRootClean(task, "resume");
 
     const workerId = await this.formatWorkerId(task, task._path);
     const allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot());
@@ -2335,6 +2900,8 @@ ${guidance}`
         await this.cleanupGitWorktree(worktreePath);
       }
 
+      await this.assertRepoRootClean(task, "post-run");
+
       console.log(`[ralph:worker:${this.repo}] Task resumed to completion: ${task.name}`);
 
       return {
@@ -2347,8 +2914,10 @@ ${guidance}`
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
-      await this.queue.updateTaskStatus(task, "blocked");
-      await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+      if (!error?.ralphRootDirty) {
+        await this.queue.updateTaskStatus(task, "blocked");
+        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+      }
 
       return {
         taskName: task.name,
@@ -2439,6 +3008,8 @@ ${guidance}`
           },
         })
       );
+
+      await this.assertRepoRootClean(task, "start");
 
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
@@ -3026,6 +3597,8 @@ ${guidance}`
         await this.cleanupGitWorktree(worktreePath);
       }
 
+      await this.assertRepoRootClean(task, "post-run");
+
       // 13. Send desktop notification for completion
       await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
 
@@ -3041,8 +3614,10 @@ ${guidance}`
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
-      await this.queue.updateTaskStatus(task, "blocked");
-      await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+      if (!error?.ralphRootDirty) {
+        await this.queue.updateTaskStatus(task, "blocked");
+        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+      }
 
       return {
         taskName: task.name,

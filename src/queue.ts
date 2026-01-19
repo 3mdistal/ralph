@@ -7,6 +7,7 @@ import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import { sanitizeNoteName } from "./util/sanitize-note-name";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -288,10 +289,11 @@ export async function createAgentTask(opts: {
     }
   };
 
-  let output = await runNew(opts.name);
+  const sanitizedName = sanitizeNoteName(opts.name);
+  let output = await runNew(sanitizedName);
   if (!output.success && typeof output.error === "string" && output.error.includes("File already exists")) {
     const suffix = crypto.randomUUID().slice(0, 8);
-    output = await runNew(`${opts.name} [${suffix}]`);
+    output = await runNew(`${sanitizedName} [${suffix}]`);
   }
 
   if (output.success && typeof output.path === "string") {
