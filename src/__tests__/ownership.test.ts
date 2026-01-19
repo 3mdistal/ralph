@@ -1,3 +1,5 @@
+import { describe, expect, test } from "bun:test";
+
 import { canActOnTask, computeHeartbeatIntervalMs, isHeartbeatStale } from "../ownership";
 
 describe("ownership helpers", () => {

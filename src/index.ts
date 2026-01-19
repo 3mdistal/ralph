@@ -484,13 +484,8 @@ async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Pr
 
   const now = Date.now();
 
-<<<<<<< HEAD
-  for (const task of throttled) {
-    if (getDaemonMode(defaults) === "draining" || isShuttingDown) return;
-=======
   for (const task of claimable) {
-    if (getDaemonMode() === "draining" || isShuttingDown) return;
->>>>>>> 5ba6772 (feat: guard rolling restarts with task ownership heartbeats)
+    if (getDaemonMode(defaults) === "draining" || isShuttingDown) return;
 
     const resumeAtRaw = task["resume-at"]?.trim() ?? "";
     const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;

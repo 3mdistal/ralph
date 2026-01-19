@@ -254,7 +254,7 @@ export async function attemptResumeResolvedEscalations(deps: AttemptResumeResolv
       })
       .finally(() => {
         deps.inFlightTasks.delete(taskKey);
-        deps.forgetOwnedTask(claim.task);
+        if (claim.task) deps.forgetOwnedTask(claim.task);
         releaseGlobal();
         releaseRepo();
         if (!deps.isShuttingDown()) deps.scheduleQueuedTasksSoon();
