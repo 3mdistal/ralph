@@ -106,12 +106,21 @@ export interface OpencodeConfig {
   profiles?: Record<string, OpencodeProfileConfig>;
 }
 
+export interface ControlConfig {
+  /** Auto-create control.json when missing (default: true). */
+  autoCreate?: boolean;
+  /** Suppress missing control.json warnings (default: true). */
+  suppressMissingWarnings?: boolean;
+}
+
 export interface RalphConfig {
   repos: RepoConfig[];
   /** Global max concurrent tasks across all repos (default: 6) */
   maxWorkers: number;
   batchSize: number;       // PRs before rollup (default: 10)
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
+  /** Ownership TTL in ms for task heartbeats (default: 60000). */
+  ownershipTtlMs: number;
   bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // default GitHub owner (default: "3mdistal")
 
@@ -133,10 +142,12 @@ export interface RalphConfig {
   watchdog?: WatchdogConfig;
   throttle?: ThrottleConfig;
   opencode?: OpencodeConfig;
+  control?: ControlConfig;
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
+const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
 const DEFAULT_THROTTLE_SOFT_PCT = 0.65;
@@ -198,6 +209,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   maxWorkers: DEFAULT_GLOBAL_MAX_WORKERS,
   batchSize: 10,
   pollInterval: 30000,
+  ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
   bwrbVault: detectDefaultBwrbVault(),
   owner: "3mdistal",
   devDir: join(homedir(), "Developer"),
@@ -254,6 +266,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.maxWorkers = DEFAULT_GLOBAL_MAX_WORKERS;
   }
 
+  const ownershipTtlMs = toPositiveIntOrNull((loaded as any).ownershipTtlMs);
+  if (!ownershipTtlMs) {
+    const raw = (loaded as any).ownershipTtlMs;
+    if (raw !== undefined) {
+      console.warn(
+        `[ralph] Invalid config ownershipTtlMs=${JSON.stringify(raw)}; falling back to default ${DEFAULT_OWNERSHIP_TTL_MS}`
+      );
+    }
+    loaded.ownershipTtlMs = DEFAULT_OWNERSHIP_TTL_MS;
+  }
+
   // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
@@ -302,6 +325,43 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
   if (rawGithubApp !== undefined && rawGithubApp !== null && typeof rawGithubApp !== "object") {
     console.warn(`[ralph] Invalid config githubApp=${JSON.stringify(rawGithubApp)}; ignoring`);
     (loaded as any).githubApp = undefined;
+  }
+
+  // Best-effort validation for control file config.
+  const rawControl = (loaded as any).control;
+  if (rawControl !== undefined && rawControl !== null && (typeof rawControl !== "object" || Array.isArray(rawControl))) {
+    console.warn(`[ralph] Invalid config control=${JSON.stringify(rawControl)}; ignoring`);
+    (loaded as any).control = undefined;
+  } else if (rawControl && typeof rawControl === "object") {
+    const autoCreateRaw = (rawControl as any).autoCreate;
+    const suppressMissingWarningsRaw = (rawControl as any).suppressMissingWarnings;
+    const next: ControlConfig = {};
+
+    if (autoCreateRaw !== undefined) {
+      if (typeof autoCreateRaw === "boolean") {
+        next.autoCreate = autoCreateRaw;
+      } else {
+        console.warn(`[ralph] Invalid config control.autoCreate=${JSON.stringify(autoCreateRaw)}; defaulting to true`);
+        next.autoCreate = true;
+      }
+    }
+
+    if (suppressMissingWarningsRaw !== undefined) {
+      if (typeof suppressMissingWarningsRaw === "boolean") {
+        next.suppressMissingWarnings = suppressMissingWarningsRaw;
+      } else {
+        console.warn(
+          `[ralph] Invalid config control.suppressMissingWarnings=${JSON.stringify(suppressMissingWarningsRaw)}; defaulting to true`
+        );
+        next.suppressMissingWarnings = true;
+      }
+    }
+
+    if (Object.keys(next).length > 0) {
+      loaded.control = next;
+    } else {
+      loaded.control = undefined;
+    }
   }
 
   // Best-effort validation for OpenCode profile config.

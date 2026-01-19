@@ -226,9 +226,21 @@ We compute an `activity` label continuously using whichever source is available:
 Initial labels:
 - `planning`, `searching`, `reading`, `editing`, `testing`, `git`, `github`, `docs`, `waiting`, `unknown`
 
+Deterministic rules (MVP defaults):
+- Rolling window: 60s of signals; score matches in that window.
+- Tie-breaking precedence: `testing` > `github` > `git` > `editing` > `reading` > `searching` > `planning` > `docs` > `waiting` > `unknown`.
+- Waiting detection: if a worker is busy but no signals for 10s, set `waiting`; if idle, also `waiting`.
+- Emit `worker.activity.updated` on label change, or every 15s while busy (rate-limited).
+- Regex fallback matches common commands:
+  - tests: `pytest`, `go test`, `npm test`, `bun test`, `cargo test`
+  - github: `gh ...`
+  - git: `git ...`
+  - reading: `read`, `cat`, `sed -n`, `less`
+  - editing: `edit`, `write`, `apply patch`, `sed -i`
+  - searching: `rg`, `ripgrep`, `grep`, `glob`, `find`
+
 Examples:
 - frequent `bun test`/`pytest`/`go test` => `testing`
-- many edits under `__tests__` or `tests/` => `testing` or `fixing_tests`
 - `gh pr create` / `gh issue view` => `github`
 
 This gives the “agent is close to done” cues you mentioned (testing + gh activity often precede completion).
