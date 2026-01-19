@@ -21,6 +21,7 @@ import { type AgentTask, updateTaskStatus } from "./queue";
 import {
   getOpencodeDefaultProfileName,
   getRepoBotBranch,
+  getRepoMaxWorkers,
   getRepoRequiredChecks,
   isOpencodeProfilesEnabled,
   loadConfig,
