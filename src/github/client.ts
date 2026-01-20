@@ -61,7 +61,7 @@ function safeJsonParse<T>(text: string): T | null {
 
 export class GitHubClient {
   private readonly repo: string;
-  private readonly token: string;
+  private readonly token: string | null;
   private readonly userAgent: string;
 
   constructor(repo: string, opts?: ClientOptions) {
@@ -70,18 +70,22 @@ export class GitHubClient {
     this.userAgent = opts?.userAgent ?? "ralph-loop";
   }
 
-  private resolveToken(): string {
+  private resolveToken(): string | null {
     const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
-    if (!token) {
+    return token ?? null;
+  }
+
+  private requireToken(): string {
+    if (!this.token) {
       throw new Error("Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests.");
     }
-    return token;
+    return this.token;
   }
 
   private buildHeaders(opts: RequestOptions): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
-      Authorization: `token ${this.token}`,
+      Authorization: `token ${this.requireToken()}`,
       "User-Agent": this.userAgent,
     };
 
