@@ -22,6 +22,12 @@ export interface RepoConfig {
   maxWorkers?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
+  /** Enable proactive update-branch when a PR is BEHIND (default: false). */
+  autoUpdateBehindPrs?: boolean;
+  /** Optional label gate for proactive update-branch (default: none). */
+  autoUpdateBehindLabel?: string;
+  /** Minimum minutes between proactive updates per PR (default: 30). */
+  autoUpdateBehindMinMinutes?: number;
 }
 
 
@@ -148,6 +154,7 @@ export interface RalphConfig {
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
+const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
 const DEFAULT_THROTTLE_SOFT_PCT = 0.65;
@@ -281,6 +288,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
     const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
+    const autoUpdateMin = toPositiveIntOrNull((repo as any).autoUpdateBehindMinMinutes);
     const updates: Partial<RepoConfig> = {};
 
     if ((repo as any).maxWorkers !== undefined && !mw) {
@@ -297,6 +305,36 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           `falling back to global batchSize`
       );
       updates.rollupBatchSize = undefined;
+    }
+
+    const rawAutoUpdate = (repo as any).autoUpdateBehindPrs;
+    if (rawAutoUpdate !== undefined && typeof rawAutoUpdate !== "boolean") {
+      console.warn(
+        `[ralph] Invalid config autoUpdateBehindPrs for repo ${repo.name}: ${JSON.stringify(rawAutoUpdate)}; ` +
+          `defaulting to false`
+      );
+      updates.autoUpdateBehindPrs = false;
+    }
+
+    const rawLabelGate = (repo as any).autoUpdateBehindLabel;
+    if (rawLabelGate !== undefined) {
+      if (typeof rawLabelGate === "string" && rawLabelGate.trim()) {
+        updates.autoUpdateBehindLabel = rawLabelGate.trim();
+      } else {
+        console.warn(
+          `[ralph] Invalid config autoUpdateBehindLabel for repo ${repo.name}: ${JSON.stringify(rawLabelGate)}; ` +
+            `disabling label gate`
+        );
+        updates.autoUpdateBehindLabel = undefined;
+      }
+    }
+
+    if ((repo as any).autoUpdateBehindMinMinutes !== undefined && !autoUpdateMin) {
+      console.warn(
+        `[ralph] Invalid config autoUpdateBehindMinMinutes for repo ${repo.name}: ` +
+          `${JSON.stringify((repo as any).autoUpdateBehindMinMinutes)}; falling back to ${DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES}`
+      );
+      updates.autoUpdateBehindMinMinutes = DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES;
     }
 
     if (Object.keys(updates).length === 0) return repo;
@@ -885,6 +923,26 @@ export function getRepoRollupBatchSize(repoName: string, fallback?: number): num
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const rollupBatch = toPositiveIntOrNull(explicit?.rollupBatchSize);
   return rollupBatch ?? fallback ?? cfg.batchSize;
+}
+
+export function isAutoUpdateBehindEnabled(repoName: string): boolean {
+  const cfg = loadConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  return explicit?.autoUpdateBehindPrs ?? false;
+}
+
+export function getAutoUpdateBehindLabelGate(repoName: string): string | null {
+  const cfg = loadConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const label = explicit?.autoUpdateBehindLabel;
+  return typeof label === "string" && label.trim() ? label.trim() : null;
+}
+
+export function getAutoUpdateBehindMinMinutes(repoName: string): number {
+  const cfg = loadConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const parsed = toPositiveIntOrNull(explicit?.autoUpdateBehindMinMinutes);
+  return parsed ?? DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES;
 }
 
 export function normalizeRepoName(repo: string): string {
