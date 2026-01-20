@@ -852,6 +852,7 @@ export class RepoWorker {
 
       const botBranch = getRepoBotBranch(this.repo);
       let lastError: { branch: string; error: unknown } | null = null;
+      let fallbackBranch = botBranch;
       const tryFetchProtection = async (branch: string): Promise<BranchProtection | null> => {
         try {
           return await this.fetchBranchProtection(branch);
@@ -866,7 +867,7 @@ export class RepoWorker {
         return { checks: getProtectionContexts(botProtection), source: "protection", branch: botBranch };
       }
 
-      const fallbackBranch = await this.resolveFallbackBranch(botBranch);
+      fallbackBranch = await this.resolveFallbackBranch(botBranch);
       if (fallbackBranch !== botBranch) {
         const fallbackProtection = await tryFetchProtection(fallbackBranch);
         if (fallbackProtection) {
@@ -877,6 +878,11 @@ export class RepoWorker {
       if (lastError) {
         const msg = (lastError.error as any)?.message ?? String(lastError.error);
         console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${lastError.branch}: ${msg}`);
+      } else {
+        const attempted = Array.from(new Set([botBranch, fallbackBranch])).join(", ");
+        console.log(
+          `[ralph:worker:${this.repo}] No branch protection found for ${attempted}; merge gating disabled.`
+        );
       }
 
       return { checks: [], source: "none" };
