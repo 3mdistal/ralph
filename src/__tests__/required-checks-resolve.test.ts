@@ -10,6 +10,20 @@ import { RepoWorker } from "../worker";
 let homeDir: string;
 let priorHome: string | undefined;
 let priorGhToken: string | undefined;
+let releaseLock: (() => void) | null = null;
+
+const TEST_LOCK_KEY = "__ralphTestLock";
+
+async function acquireGlobalLock(): Promise<() => void> {
+  const current = (globalThis as any)[TEST_LOCK_KEY] ?? Promise.resolve();
+  let release: () => void;
+  const next = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  (globalThis as any)[TEST_LOCK_KEY] = current.then(() => next);
+  await current;
+  return release!;
+}
 
 async function writeJson(path: string, obj: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
@@ -20,6 +34,7 @@ describe("required checks resolution", () => {
   beforeEach(async () => {
     priorHome = process.env.HOME;
     priorGhToken = process.env.GH_TOKEN;
+    releaseLock = await acquireGlobalLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
     __resetConfigForTests();
@@ -34,6 +49,8 @@ describe("required checks resolution", () => {
     }
     await rm(homeDir, { recursive: true, force: true });
     __resetConfigForTests();
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("uses explicit requiredChecks override without derivation", async () => {

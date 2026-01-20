@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import {
   __buildCheckRunsResponse,
@@ -11,7 +11,31 @@ import {
   RepoWorker,
 } from "../worker";
 
+let releaseLock: (() => void) | null = null;
+
+const TEST_LOCK_KEY = "__ralphTestLock";
+
+async function acquireGlobalLock(): Promise<() => void> {
+  const current = (globalThis as any)[TEST_LOCK_KEY] ?? Promise.resolve();
+  let release: () => void;
+  const next = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  (globalThis as any)[TEST_LOCK_KEY] = current.then(() => next);
+  await current;
+  return release!;
+}
+
 describe("requiredChecks semantics", () => {
+  beforeEach(async () => {
+    releaseLock = await acquireGlobalLock();
+  });
+
+  afterEach(() => {
+    releaseLock?.();
+    releaseLock = null;
+  });
+
   test("requiredChecks=[] is treated as no gating (success)", () => {
     const summary = __summarizeRequiredChecksForTests(
       [{ name: "ci", state: "FAILURE", rawState: "FAILURE" }] as any,
