@@ -22,7 +22,7 @@ import {
   getOpencodeDefaultProfileName,
   getRepoBotBranch,
   getRepoMaxWorkers,
-  getRepoRequiredChecks,
+  getRepoRequiredChecksOverride,
   isOpencodeProfilesEnabled,
   loadConfig,
   resolveOpencodeProfile,
@@ -208,6 +208,12 @@ type RequiredChecksSummary = {
   available: string[];
 };
 
+type ResolvedRequiredChecks = {
+  checks: string[];
+  source: "config" | "protection" | "none";
+  branch?: string;
+};
+
 type FailedCheck = {
   name: string;
   state: RequiredCheckState;
@@ -257,6 +263,10 @@ type BranchProtection = {
 
 type CheckRunsResponse = {
   check_runs?: Array<{ name?: string | null }> | null;
+};
+
+type CommitStatusResponse = {
+  statuses?: Array<{ context?: string | null }> | null;
 };
 
 type RepoDetails = {
@@ -503,6 +513,7 @@ export class RepoWorker {
 
   private ensureLabelsPromise: Promise<void> | null = null;
   private ensureBranchProtectionPromise: Promise<void> | null = null;
+  private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
   private repoSlotsInUse: Set<number> | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -710,6 +721,61 @@ export class RepoWorker {
     }
   }
 
+  private async fetchStatusContextNames(branch: string): Promise<string[]> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    try {
+      const payload = await this.githubApiRequest<CommitStatusResponse>(
+        `/repos/${owner}/${name}/commits/${branch}/status?per_page=100`
+      );
+      return toSortedUniqueStrings(payload?.statuses?.map((status) => status?.context ?? "") ?? []);
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      if (/HTTP 422/.test(msg) && /No commit found/i.test(msg)) {
+        const missingBranchError = new Error(msg);
+        missingBranchError.cause = "missing-branch";
+        throw missingBranchError;
+      }
+      throw e;
+    }
+  }
+
+  private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
+    const errors: string[] = [];
+    let missingBranchError: Error | null = null;
+    let checkRuns: string[] = [];
+    let statusContexts: string[] = [];
+
+    try {
+      checkRuns = await this.fetchCheckRunNames(branch);
+    } catch (e: any) {
+      if (e?.cause === "missing-branch") {
+        missingBranchError = e;
+      } else {
+        errors.push(`check-runs: ${e?.message ?? String(e)}`);
+      }
+    }
+
+    try {
+      statusContexts = await this.fetchStatusContextNames(branch);
+    } catch (e: any) {
+      if (e?.cause === "missing-branch") {
+        missingBranchError = e;
+      } else {
+        errors.push(`status: ${e?.message ?? String(e)}`);
+      }
+    }
+
+    if (missingBranchError) throw missingBranchError;
+
+    if (errors.length > 0) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to fetch some check contexts for ${branch}: ${errors.join(" | ")}`
+      );
+    }
+
+    return toSortedUniqueStrings([...checkRuns, ...statusContexts]);
+  }
+
   private async fetchRepoDefaultBranch(): Promise<string | null> {
     const { owner, name } = splitRepoFullName(this.repo);
     const payload = await this.githubApiRequest<RepoDetails>(`/repos/${owner}/${name}`);
@@ -768,6 +834,47 @@ export class RepoWorker {
     );
   }
 
+  private async resolveRequiredChecksForMerge(): Promise<ResolvedRequiredChecks> {
+    if (this.requiredChecksForMergePromise) return this.requiredChecksForMergePromise;
+
+    this.requiredChecksForMergePromise = (async () => {
+      const override = getRepoRequiredChecksOverride(this.repo);
+      if (override !== null) {
+        return { checks: override, source: "config" };
+      }
+
+      const botBranch = getRepoBotBranch(this.repo);
+      const branches = Array.from(new Set([botBranch, "main"]));
+      for (const branch of branches) {
+        let protection: BranchProtection | null = null;
+        try {
+          protection = await this.fetchBranchProtection(branch);
+        } catch (e: any) {
+          const msg = e?.message ?? String(e);
+          console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${branch}: ${msg}`);
+          return { checks: [], source: "none" };
+        }
+
+        if (!protection) continue;
+        return { checks: getProtectionContexts(protection), source: "protection", branch };
+      }
+
+      return { checks: [], source: "none" };
+    })();
+
+    return this.requiredChecksForMergePromise;
+  }
+
+  private async ensureBotBranchExistsBestEffort(): Promise<void> {
+    const botBranch = getRepoBotBranch(this.repo);
+    try {
+      await this.ensureRemoteBranchExists(botBranch);
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      console.warn(`[ralph:worker:${this.repo}] Unable to ensure bot branch ${botBranch}: ${msg}`);
+    }
+  }
+
   private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
     if (requiredChecks.length === 0) return;
 
@@ -778,11 +885,11 @@ export class RepoWorker {
 
     let availableChecks: string[] = [];
     try {
-      availableChecks = await this.fetchCheckRunNames(branch);
+      availableChecks = await this.fetchAvailableCheckContexts(branch);
     } catch (e: any) {
       if (branch === botBranch && e?.cause === "missing-branch") {
         await this.ensureRemoteBranchExists(branch);
-        availableChecks = await this.fetchCheckRunNames(branch);
+        availableChecks = await this.fetchAvailableCheckContexts(branch);
       } else {
         throw e;
       }
@@ -867,9 +974,16 @@ ${guidance}`
     this.ensureBranchProtectionPromise = (async () => {
       const botBranch = getRepoBotBranch(this.repo);
       const branches = Array.from(new Set([botBranch, "main"]));
-      const requiredChecks = getRepoRequiredChecks(this.repo);
+      const requiredChecksOverride = getRepoRequiredChecksOverride(this.repo);
+
+      await this.ensureBotBranchExistsBestEffort();
+
+      if (!requiredChecksOverride || requiredChecksOverride.length === 0) {
+        return;
+      }
+
       for (const branch of branches) {
-        await this.ensureBranchProtectionForBranch(branch, requiredChecks);
+        await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
       }
     })();
 
@@ -1781,7 +1895,7 @@ ${guidance}`
     notifyTitle: string;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
-    const REQUIRED_CHECKS = getRepoRequiredChecks(this.repo);
+    const { checks: REQUIRED_CHECKS } = await this.resolveRequiredChecksForMerge();
     const MAX_CI_FIX_ATTEMPTS = this.resolveCiFixAttempts();
 
     let prUrl = params.prUrl;

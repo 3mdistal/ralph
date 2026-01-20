@@ -862,11 +862,10 @@ export function getRepoBotBranch(repoName: string): string {
   return explicit?.botBranch ?? "bot/integration";
 }
 
-export function getRepoRequiredChecks(repoName: string): string[] {
+export function getRepoRequiredChecksOverride(repoName: string): string[] | null {
   const cfg = loadConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
-  const checks = toStringArrayOrNull(explicit?.requiredChecks);
-  return checks ?? ["ci"];
+  return toStringArrayOrNull(explicit?.requiredChecks);
 }
 
 export function getGlobalMaxWorkers(): number {
