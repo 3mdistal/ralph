@@ -74,6 +74,7 @@ Rollup automation policy:
 
 Merge gating defaults:
 - When Ralph derives required checks from branch protection and protection is missing or unreadable, it should fail open (treat required checks as empty) to avoid blocking automation.
+- Branch protection enforcement should only run when `repos[].requiredChecks` is explicitly configured; otherwise leave existing branch protection unchanged.
 
 Benefits:
 - Reduces interrupt frequency

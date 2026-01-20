@@ -67,8 +67,12 @@ describe("requiredChecks semantics", () => {
         return new Response("", { status: 201 });
       }
 
-      if (url.endsWith("/repos/acme/rocket/commits/bot/integration/check-runs?per_page=100")) {
+      if (url.endsWith("/repos/acme/rocket/commits/bot%2Fintegration/check-runs?per_page=100")) {
         return new Response(JSON.stringify(__buildCheckRunsResponse(["ci"])), { status: 200 });
+      }
+
+      if (url.endsWith("/repos/acme/rocket/commits/bot%2Fintegration/status?per_page=100")) {
+        return new Response(JSON.stringify({ statuses: [] }), { status: 200 });
       }
 
       if (url.endsWith("/repos/acme/rocket/branches/bot%2Fintegration/protection")) {

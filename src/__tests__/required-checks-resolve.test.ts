@@ -153,10 +153,10 @@ describe("required checks resolution", () => {
   test("includes legacy status contexts in available checks", async () => {
     process.env.GH_TOKEN = "test-token";
     const fetchMock = mock(async (url: string) => {
-      if (url.endsWith("/repos/acme/rocket/commits/bot/integration/check-runs?per_page=100")) {
+      if (url.endsWith("/repos/acme/rocket/commits/bot%2Fintegration/check-runs?per_page=100")) {
         return new Response(JSON.stringify({ check_runs: [] }), { status: 200 });
       }
-      if (url.endsWith("/repos/acme/rocket/commits/bot/integration/status?per_page=100")) {
+      if (url.endsWith("/repos/acme/rocket/commits/bot%2Fintegration/status?per_page=100")) {
         return new Response(JSON.stringify({ statuses: [{ context: "Vercel" }] }), { status: 200 });
       }
       throw new Error(`Unexpected fetch: ${url}`);

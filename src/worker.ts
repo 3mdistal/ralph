@@ -705,9 +705,10 @@ export class RepoWorker {
 
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
     const { owner, name } = splitRepoFullName(this.repo);
+    const encodedBranch = encodeURIComponent(branch);
     try {
       const payload = await this.githubApiRequest<CheckRunsResponse>(
-        `/repos/${owner}/${name}/commits/${branch}/check-runs?per_page=100`
+        `/repos/${owner}/${name}/commits/${encodedBranch}/check-runs?per_page=100`
       );
       return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
     } catch (e: any) {
@@ -723,9 +724,10 @@ export class RepoWorker {
 
   private async fetchStatusContextNames(branch: string): Promise<string[]> {
     const { owner, name } = splitRepoFullName(this.repo);
+    const encodedBranch = encodeURIComponent(branch);
     try {
       const payload = await this.githubApiRequest<CommitStatusResponse>(
-        `/repos/${owner}/${name}/commits/${branch}/status?per_page=100`
+        `/repos/${owner}/${name}/commits/${encodedBranch}/status?per_page=100`
       );
       return toSortedUniqueStrings(payload?.statuses?.map((status) => status?.context ?? "") ?? []);
     } catch (e: any) {
