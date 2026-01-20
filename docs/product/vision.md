@@ -50,14 +50,12 @@ Task note filenames are derived from note names. Ralph sanitizes names before cr
 - If sanitization yields an empty name, use `Untitled`
 - If a note already exists, append a short UUID suffix
 
-### 1. Queue Lives in bwrb
+### 1. Queue Lives in GitHub Issues
 
-Use bwrb notes for task management:
-- `agent-task` - Work items in the queue
-- `agent-run` - Completed work records with decisions
-- `agent-escalation` - Items needing human attention
+GitHub Issues are the source of truth for queue state and dependency relationships.
+SQLite under `~/.ralph` stores operational state (session IDs, worktree paths, cursors).
 
-This provides full auditability and integrates with existing Obsidian workflows.
+See `docs/product/github-first-orchestration.md` for the canonical contract.
 
 ### 2. Bot Branch Strategy
 

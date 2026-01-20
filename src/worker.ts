@@ -44,7 +44,8 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { computeMissingBaselineLabels } from "./github-labels";
+import { computeMissingBaselineLabels, computeMissingRalphLabels } from "./github-labels";
+import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { recordIssueSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
@@ -267,14 +268,6 @@ type GitRef = {
   object?: { sha?: string | null } | null;
 };
 
-function splitRepoFullName(full: string): { owner: string; name: string } {
-  const [owner, name] = full.split("/");
-  if (!owner || !name) {
-    throw new Error(`Invalid repo name (expected owner/name): ${full}`);
-  }
-  return { owner, name };
-}
-
 function toSortedUniqueStrings(values: Array<string | null | undefined>): string[] {
   const normalized = values.map((value) => (value ?? "").trim()).filter(Boolean);
   return Array.from(new Set(normalized)).sort();
@@ -484,6 +477,7 @@ export class RepoWorker {
   private queue: QueueAdapter;
   private notify: NotifyAdapter;
   private throttle: ThrottleAdapter;
+  private github: GitHubClient;
 
   constructor(
     public readonly repo: string,
@@ -499,6 +493,7 @@ export class RepoWorker {
     this.queue = opts?.queue ?? DEFAULT_QUEUE_ADAPTER;
     this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
     this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
+    this.github = new GitHubClient(this.repo);
   }
 
   private ensureLabelsPromise: Promise<void> | null = null;
@@ -606,25 +601,23 @@ export class RepoWorker {
   }
 
   private async ensureBaselineLabelsOnce(): Promise<void> {
-
-
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
 
     this.ensureLabelsPromise = (async () => {
       try {
-        const result = await gh`gh label list --repo ${this.repo} --json name`.quiet();
-        const raw = JSON.parse(result.stdout.toString());
-        const existing = Array.isArray(raw) ? raw.map((l: any) => String(l?.name ?? "")) : [];
-
-        const missing = computeMissingBaselineLabels(existing);
+        const existing = await this.github.listLabels();
+        const missing = [...computeMissingBaselineLabels(existing), ...computeMissingRalphLabels(existing)];
         if (missing.length === 0) return;
 
         const created: string[] = [];
         for (const label of missing) {
           try {
-            await gh`gh label create ${label.name} --repo ${this.repo} --color ${label.color} --description ${label.description}`.quiet();
+            await this.github.createLabel(label);
             created.push(label.name);
           } catch (e: any) {
+            if (e instanceof GitHubApiError) {
+              if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
+            }
             const msg = e?.message ?? String(e);
             if (/already exists/i.test(msg)) continue;
             throw e;
@@ -644,52 +637,12 @@ export class RepoWorker {
     return this.ensureLabelsPromise;
   }
 
-  private getGitHubToken(): string {
-    const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
-    if (!token) {
-      throw new Error("Missing GH_TOKEN/GITHUB_TOKEN; cannot update branch protection.");
-    }
-    return token;
-  }
-
   private async githubApiRequest<T>(
     path: string,
     opts: { method?: string; body?: unknown; allowNotFound?: boolean } = {}
   ): Promise<T | null> {
-    const token = this.getGitHubToken();
-    const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
-    const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json",
-      Authorization: `token ${token}`,
-      "User-Agent": "ralph-loop",
-    };
-
-    const init: RequestInit = {
-      method: opts.method ?? "GET",
-      headers,
-    };
-
-    if (opts.body !== undefined) {
-      headers["Content-Type"] = "application/json";
-      init.body = JSON.stringify(opts.body);
-    }
-
-    const res = await fetch(url, init);
-    if (opts.allowNotFound && res.status === 404) return null;
-
-    const text = await res.text();
-    if (!res.ok) {
-      throw new Error(
-        `GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}`.trim()
-      );
-    }
-
-    if (!text) return null;
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      return null;
-    }
+    const response = await this.github.request<T>(path, opts);
+    return response.data;
   }
 
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
