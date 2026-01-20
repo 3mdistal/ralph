@@ -95,10 +95,6 @@ export interface AgentTask {
   "repo-slot"?: string;
   /** Watchdog recovery attempts (string in frontmatter) */
   "watchdog-retries"?: string;
-  /** Current daemon owner for rolling restart */
-  "daemon-id"?: string;
-  /** Last heartbeat timestamp (ISO string) */
-  "heartbeat-at"?: string;
   /** Last checkpoint reached by worker */
   checkpoint?: string;
   /** Pause requested at next checkpoint */
