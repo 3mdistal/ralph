@@ -1,19 +1,40 @@
-import { lstatSync, mkdirSync, readFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 
-export type DaemonMode = "running" | "draining";
+export type DaemonMode = "running" | "draining" | "paused";
 
 export type ControlState = {
   mode: DaemonMode;
   pauseRequested?: boolean;
+  pauseAtCheckpoint?: string;
+  drainTimeoutMs?: number;
   /** Active OpenCode profile for starting new tasks (control file key: opencode_profile). */
   opencodeProfile?: string;
+};
+
+export type ControlDefaults = {
+  autoCreate: boolean;
+  suppressMissingWarnings: boolean;
+};
+
+const CONTROL_FILE_VERSION = 1;
+
+const DEFAULT_CONTROL_DEFAULTS: ControlDefaults = {
+  autoCreate: true,
+  suppressMissingWarnings: true,
 };
 
 function resolveTmpControlDir(): string {
   const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
   return join("/tmp", "ralph", String(uid));
+}
+
+function getControlDefaults(opts?: { defaults?: Partial<ControlDefaults> }): ControlDefaults {
+  return {
+    autoCreate: opts?.defaults?.autoCreate ?? DEFAULT_CONTROL_DEFAULTS.autoCreate,
+    suppressMissingWarnings: opts?.defaults?.suppressMissingWarnings ?? DEFAULT_CONTROL_DEFAULTS.suppressMissingWarnings,
+  };
 }
 
 function resolveHomeDirFallback(): string | undefined {
@@ -39,14 +60,6 @@ export function resolveControlFilePath(
   return join(resolveTmpControlDir(), "control.json");
 }
 
-function ensureControlFileDir(path: string, opts?: { log?: (message: string) => void }): void {
-  try {
-    mkdirSync(dirname(path), { recursive: true });
-  } catch (e: any) {
-    opts?.log?.(formatWarning(`Failed to create control directory for ${path} (reason: ${e?.message ?? String(e)})`));
-  }
-}
-
 function parseControlStateJson(raw: string): ControlState {
   let parsed: unknown;
   try {
@@ -60,17 +73,40 @@ function parseControlStateJson(raw: string): ControlState {
   }
 
   const obj = parsed as Record<string, unknown>;
-  const mode = obj.mode;
 
-  if (mode !== "running" && mode !== "draining") {
-    throw new Error(`Invalid control schema: mode must be 'running' or 'draining' (got ${JSON.stringify(mode)})`);
+  const versionRaw = obj.version;
+  const version = versionRaw === undefined ? 0 : versionRaw;
+
+  if (version !== 0 && version !== CONTROL_FILE_VERSION) {
+    throw new Error(
+      `Invalid control schema: version must be ${CONTROL_FILE_VERSION} (got ${JSON.stringify(versionRaw)})`
+    );
+  }
+
+  const mode = obj.mode;
+  const allowPaused = version === CONTROL_FILE_VERSION;
+
+  if (mode !== "running" && mode !== "draining" && (!allowPaused || mode !== "paused")) {
+    const expected = allowPaused ? "'running', 'draining', or 'paused'" : "'running' or 'draining'";
+    throw new Error(`Invalid control schema: mode must be ${expected} (got ${JSON.stringify(mode)})`);
   }
 
   const pauseRequestedRaw = obj.pause_requested;
-  const state: ControlState = { mode };
+  const pauseAtRaw = obj.pause_at_checkpoint;
+  const drainTimeoutRaw = obj.drain_timeout_ms;
+  const state: ControlState = { mode: mode as DaemonMode };
 
   if (typeof pauseRequestedRaw === "boolean") {
     state.pauseRequested = pauseRequestedRaw;
+  }
+
+  if (typeof pauseAtRaw === "string") {
+    const trimmed = pauseAtRaw.trim();
+    if (trimmed) state.pauseAtCheckpoint = trimmed;
+  }
+
+  if (typeof drainTimeoutRaw === "number" && Number.isFinite(drainTimeoutRaw) && drainTimeoutRaw >= 0) {
+    state.drainTimeoutMs = drainTimeoutRaw;
   }
 
   const opencodeProfileRaw = obj.opencode_profile;
@@ -83,6 +119,10 @@ function parseControlStateJson(raw: string): ControlState {
 }
 
 function formatWarning(message: string): string {
+  return `[ralph] ${message}`;
+}
+
+function formatInfo(message: string): string {
   return `[ralph] ${message}`;
 }
 
@@ -132,6 +172,10 @@ function describeControlReadFailure(path: string, reason: unknown): string {
   return `Failed to load control file ${path}; defaulting to mode=running (reason: ${message})`;
 }
 
+function isMissingControlFileError(reason: unknown): boolean {
+  return reason instanceof Error && (reason as any).code === "ENOENT";
+}
+
 function assertSafeControlFile(path: string): void {
   const dir = dirname(path);
   const dirStat = lstatSync(dir);
@@ -160,26 +204,51 @@ function ensureControlParentDir(path: string, log?: (message: string) => void): 
   }
 }
 
+function writeDefaultControlFile(path: string, log?: (message: string) => void): boolean {
+  if (existsSync(path)) return true;
+  ensureControlParentDir(path, log);
+
+  try {
+    writeFileSync(
+      path,
+      `${JSON.stringify({ version: CONTROL_FILE_VERSION, mode: "running" }, null, 2)}\n`,
+      { mode: 0o600, flag: "wx" }
+    );
+    log?.(formatInfo(`Control file created at ${path} (defaulting to mode=running)`));
+    return true;
+  } catch (e: any) {
+    if (e?.code === "EEXIST") return true;
+    log?.(formatWarning(`Failed to write control file ${path} (reason: ${e?.message ?? String(e)})`));
+    return false;
+  }
+}
+
 export function readControlStateSnapshot(opts?: {
   homeDir?: string;
   xdgStateHome?: string;
   log?: (message: string) => void;
+  defaults?: Partial<ControlDefaults>;
 }): ControlState {
   const path = resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
-  ensureControlParentDir(path, opts?.log);
+  const defaults = getControlDefaults({ defaults: opts?.defaults });
+  if (defaults.autoCreate) {
+    writeDefaultControlFile(path, opts?.log);
+  }
 
   try {
     assertSafeControlFile(path);
     const raw = readFileSync(path, "utf8");
     return parseControlStateJson(raw);
   } catch (e: any) {
-    opts?.log?.(formatWarning(describeControlReadFailure(path, e)));
+    if (!defaults.suppressMissingWarnings || !isMissingControlFileError(e)) {
+      opts?.log?.(formatWarning(describeControlReadFailure(path, e)));
+    }
     return { mode: "running" };
   }
 }
 
-export function isDraining(homeDir?: string): boolean {
-  return readControlStateSnapshot({ homeDir }).mode === "draining";
+export function isDraining(homeDir?: string, defaults?: Partial<ControlDefaults>): boolean {
+  return readControlStateSnapshot({ homeDir, defaults }).mode === "draining";
 }
 
 export class DrainMonitor {
@@ -202,6 +271,8 @@ export class DrainMonitor {
       log?: (message: string) => void;
       warn?: (message: string) => void;
       onModeChange?: (mode: DaemonMode) => void;
+      onStateChange?: (state: ControlState) => void;
+      defaults?: Partial<ControlDefaults>;
     } = {}
   ) {}
 
@@ -243,7 +314,8 @@ export class DrainMonitor {
     return this.state;
   }
 
-  private warnOnceForMissing(path: string): void {
+  private warnOnceForMissing(path: string, defaults: ControlDefaults): void {
+    if (defaults.suppressMissingWarnings) return;
     if (this.lastMissing) return;
     this.lastMissing = true;
 
@@ -277,23 +349,27 @@ export class DrainMonitor {
       if (nextMode !== "running") {
         this.options.log?.(formatWarning(`Control mode: ${nextMode}`));
       }
+      this.options.onStateChange?.(this.state);
       return;
     }
 
     if (prevMode === nextMode) {
       this.state = next;
+      this.options.onStateChange?.(this.state);
       return;
     }
 
     this.state = next;
     this.options.log?.(formatWarning(`Control mode: ${nextMode}`));
     this.options.onModeChange?.(nextMode);
+    this.options.onStateChange?.(this.state);
   }
 
   private reloadNow(reason: string, opts?: { force?: boolean }): void {
     const path = resolveControlFilePath(this.options.homeDir, this.options.xdgStateHome);
-    if (reason === "startup") {
-      ensureControlFileDir(path, { log: this.options.warn ?? this.options.log });
+    const defaults = getControlDefaults({ defaults: this.options.defaults });
+    if (reason === "startup" && defaults.autoCreate) {
+      writeDefaultControlFile(path, this.options.warn ?? this.options.log);
     }
 
     let mtimeMs: number | null = null;
@@ -305,11 +381,11 @@ export class DrainMonitor {
       this.lastMissing = false;
     } catch (e: any) {
       if (e?.code === "ENOENT") {
-        if (reason === "startup") {
-          ensureControlFileDir(path, { log: this.options.warn ?? this.options.log });
+        if (reason === "startup" && defaults.autoCreate) {
+          writeDefaultControlFile(path, this.options.warn ?? this.options.log);
         }
 
-        this.warnOnceForMissing(path);
+        this.warnOnceForMissing(path, defaults);
 
         const fallback: ControlState = this.lastKnownGood ?? { mode: "running" };
         this.setState(fallback);
@@ -318,7 +394,11 @@ export class DrainMonitor {
       }
 
       const warn = this.options.warn ?? this.options.log;
-      warn?.(formatWarning(`Failed to stat control file ${path}; defaulting to mode=running (reason: ${e?.message ?? String(e)})`));
+      warn?.(
+        formatWarning(
+          `Failed to stat control file ${path}; defaulting to mode=running (reason: ${e?.message ?? String(e)})`
+        )
+      );
 
       const fallback: ControlState = this.lastKnownGood ?? { mode: "running" };
       this.setState(fallback);

@@ -9,6 +9,7 @@
 
 import { existsSync, watch } from "fs";
 import { join } from "path";
+import crypto from "crypto";
 
 import {
   ensureBwrbVaultLayout,
@@ -16,6 +17,7 @@ import {
   getRepoMaxWorkers,
   getRepoPath,
   loadConfig,
+  type ControlConfig,
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
@@ -27,6 +29,8 @@ import {
   getTasksByStatus,
   getTaskByPath,
   updateTaskStatus,
+  tryClaimTask,
+  heartbeatTask,
   type AgentTask,
 } from "./queue";
 import { RepoWorker, type AgentRun } from "./worker";
@@ -34,17 +38,25 @@ import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 
-import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
+import { DrainMonitor, readControlStateSnapshot, type DaemonMode } from "./drain";
+import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
 import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
+import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot } from "./state";
 import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import {
+  ACTIVITY_EMIT_INTERVAL_MS,
+  ACTIVITY_WINDOW_MS,
+  classifyActivity,
+} from "./activity-classifier";
+import type { ActivityLabel } from "./activity-classifier";
 import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
 import {
   buildWaitingResolutionUpdate,
@@ -59,6 +71,12 @@ const workers = new Map<string, RepoWorker>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
+let drainRequestedAt: number | null = null;
+let drainTimeoutMs: number | null = null;
+let pauseRequestedByControl = false;
+let pauseAtCheckpoint: RalphCheckpoint | null = null;
+
+const daemonId = `d_${crypto.randomUUID()}`;
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
@@ -73,15 +91,74 @@ const idleState = new Map<
   }
 >();
 
-function getDaemonMode(): DaemonMode {
+function getDaemonMode(defaults?: Partial<ControlConfig>): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
-  return isDraining() ? "draining" : "running";
+  return readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).mode;
 }
 
-function getActiveOpencodeProfileName(): string | null {
+function applyControlState(control: {
+  mode: DaemonMode;
+  pauseRequested?: boolean;
+  pauseAtCheckpoint?: string;
+  drainTimeoutMs?: number;
+}): void {
+  const mode = control.mode;
+  if (mode === "draining" && drainRequestedAt === null) {
+    drainRequestedAt = Date.now();
+  }
+  if (mode !== "draining") {
+    drainRequestedAt = null;
+  }
+
+  if (typeof control.drainTimeoutMs === "number") {
+    drainTimeoutMs = control.drainTimeoutMs;
+  } else {
+    drainTimeoutMs = null;
+  }
+
+  pauseRequestedByControl = control.pauseRequested === true;
+
+  if (typeof control.pauseAtCheckpoint === "string" && isRalphCheckpoint(control.pauseAtCheckpoint)) {
+    pauseAtCheckpoint = control.pauseAtCheckpoint as RalphCheckpoint;
+  } else {
+    pauseAtCheckpoint = null;
+  }
+}
+
+type DaemonGate = {
+  allowDequeue: boolean;
+  allowResume: boolean;
+  allowModelSend: boolean;
+  reason: "running" | "draining" | "paused" | "hard-throttled";
+};
+
+function computeDaemonGate(opts: {
+  mode: DaemonMode;
+  throttle: ThrottleDecision;
+  isShuttingDown: boolean;
+}): DaemonGate {
+  if (opts.isShuttingDown) {
+    return { allowDequeue: false, allowResume: false, allowModelSend: false, reason: "paused" };
+  }
+  if (opts.mode === "paused") {
+    return { allowDequeue: false, allowResume: false, allowModelSend: false, reason: "paused" };
+  }
+  if (opts.throttle.state === "hard") {
+    return { allowDequeue: false, allowResume: false, allowModelSend: false, reason: "hard-throttled" };
+  }
+  if (opts.mode === "draining") {
+    return { allowDequeue: false, allowResume: true, allowModelSend: true, reason: "draining" };
+  }
+  if (opts.throttle.state === "soft") {
+    return { allowDequeue: false, allowResume: true, allowModelSend: true, reason: "running" };
+  }
+  return { allowDequeue: true, allowResume: true, allowModelSend: true, reason: "running" };
+}
+
+function getActiveOpencodeProfileName(defaults?: Partial<ControlConfig>): string | null {
   const control = drainMonitor
     ? drainMonitor.getState()
-    : readControlStateSnapshot({ log: (message) => console.warn(message) });
+    : readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
 
   const fromControl = control.opencodeProfile?.trim() ?? "";
   if (fromControl) return fromControl;
@@ -89,8 +166,11 @@ function getActiveOpencodeProfileName(): string | null {
   return getOpencodeDefaultProfileName();
 }
 
-async function resolveEffectiveOpencodeProfileNameForNewTasks(now: number): Promise<string | null> {
-  const requested = getActiveOpencodeProfileName();
+async function resolveEffectiveOpencodeProfileNameForNewTasks(
+  now: number,
+  defaults?: Partial<ControlConfig>
+): Promise<string | null> {
+  const requested = getActiveOpencodeProfileName(defaults);
   const resolved = await resolveOpencodeProfileForNewWork(now, requested);
   return resolved.profileName;
 }
@@ -107,6 +187,27 @@ function getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
 
 // Track in-flight tasks to avoid double-processing
 const inFlightTasks = new Set<string>();
+const activeSessionTasks = new Map<
+  string,
+  { task: AgentTask; workerId?: string; taskId?: string }
+>();
+const activityStateBySession = new Map<string, { activity: ActivityLabel; lastEmittedAt: number }>();
+const ownedTasks = new Map<string, string>();
+
+function shouldEmitActivityUpdate(params: {
+  sessionId: string;
+  activity: ActivityLabel;
+  now: number;
+}): boolean {
+  const existing = activityStateBySession.get(params.sessionId);
+  if (!existing) return true;
+  if (existing.activity !== params.activity) return true;
+  return params.now - existing.lastEmittedAt >= ACTIVITY_EMIT_INTERVAL_MS;
+}
+
+function recordActivityState(params: { sessionId: string; activity: ActivityLabel; now: number }): void {
+  activityStateBySession.set(params.sessionId, { activity: params.activity, lastEmittedAt: params.now });
+}
 
 type Deferred = {
   promise: Promise<void>;
@@ -181,7 +282,8 @@ function getRepoSemaphore(repo: string): Semaphore {
 
 async function checkIdleRollups(): Promise<void> {
   if (isShuttingDown) return;
-  if (getDaemonMode() === "draining") return;
+  const config = loadConfig();
+  if (getDaemonMode(config.control) === "draining") return;
   if (inFlightTasks.size > 0) return;
 
   const queued = await getRunnableTasks();
@@ -190,7 +292,7 @@ async function checkIdleRollups(): Promise<void> {
     return;
   }
 
-  const repos = new Set(loadConfig().repos.map((repo) => repo.name));
+  const repos = new Set(config.repos.map((repo) => repo.name));
   for (const repo of workers.keys()) repos.add(repo);
   if (repos.size === 0) return;
 
@@ -289,11 +391,28 @@ async function getRunnableTasks(): Promise<AgentTask[]> {
   return [...starting, ...queued];
 }
 
+function recordOwnedTask(task: AgentTask): void {
+  const key = getTaskKey(task);
+  const path = task._path || "";
+  if (path) ownedTasks.set(key, path);
+}
+
+function forgetOwnedTask(task: AgentTask): void {
+  const key = getTaskKey(task);
+  ownedTasks.delete(key);
+}
+
 const schedulerController = createSchedulerController({
-  getDaemonMode: () => getDaemonMode(),
+  getDaemonMode: () => {
+    const config = loadConfig();
+    return getDaemonMode(config.control);
+  },
   isShuttingDown: () => isShuttingDown,
   getRunnableTasks: () => getRunnableTasks(),
-  onRunnableTasks: (tasks) => processNewTasks(tasks),
+  onRunnableTasks: (tasks) => {
+    const config = loadConfig();
+    return processNewTasks(tasks, config.control ?? {});
+  },
   getPendingResumeTasks: () => Array.from(pendingResumeTasks.values()),
   onPendingResumeTasks: (priorityTasks) => {
     ensureSemaphores();
@@ -334,7 +453,7 @@ let resumeDisabledUntil = 0;
 const RESUME_DISABLE_MS = 60_000;
 
 async function attemptResumeResolvedEscalations(): Promise<void> {
-  return await attemptResumeResolvedEscalationsImpl({
+  return attemptResumeResolvedEscalationsImpl({
     isShuttingDown: () => isShuttingDown,
     now: () => Date.now(),
 
@@ -352,6 +471,10 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
 
     getTaskKey,
     inFlightTasks,
+    tryClaimTask,
+    recordOwnedTask,
+    forgetOwnedTask,
+    daemonId,
 
     getEscalationsByStatus,
     editEscalation,
@@ -378,8 +501,8 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
   });
 }
 
-async function attemptResumeThrottledTasks(): Promise<void> {
-  if (getDaemonMode() === "draining" || isShuttingDown) return;
+async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Promise<void> {
+  if (getDaemonMode(defaults) === "draining" || isShuttingDown) return;
 
   ensureSemaphores();
   if (!globalSemaphore) return;
@@ -387,10 +510,32 @@ async function attemptResumeThrottledTasks(): Promise<void> {
   const throttled = await getTasksByStatus("throttled");
   if (throttled.length === 0) return;
 
-  const controlProfile = getActiveOpencodeProfileName();
+  const nowMs = Date.now();
+  const claimable: AgentTask[] = [];
+  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  for (const task of throttled) {
+    const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
+    if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
+      console.warn(
+        `[ralph] Task heartbeat is stale; eligible for takeover: ${task.name} (last ${new Date(heartbeatMs).toISOString()})`
+      );
+    }
+
+    const claim = await tryClaimTask({ task, daemonId, nowMs });
+    if (claim.claimed && claim.task) {
+      recordOwnedTask(claim.task);
+      claimable.push(claim.task);
+    } else if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
+      console.log(`[ralph] Skipping throttled task ${task.name}: ${claim.reason}`);
+    }
+  }
+
+  if (claimable.length === 0) return;
+
+  const controlProfile = getActiveOpencodeProfileName(defaults);
   const activeProfile = controlProfile === "auto" ? await resolveAutoOpencodeProfileName(Date.now()) : controlProfile;
   const profileKeys = Array.from(
-    new Set(throttled.map((t) => getTaskOpencodeProfileName(t) ?? activeProfile ?? ""))
+    new Set(claimable.map((t) => getTaskOpencodeProfileName(t) ?? activeProfile ?? ""))
   );
 
   const hardByProfile = new Map<string, { hard: boolean; decision: ThrottleDecision }>();
@@ -404,8 +549,8 @@ async function attemptResumeThrottledTasks(): Promise<void> {
 
   const now = Date.now();
 
-  for (const task of throttled) {
-    if (getDaemonMode() === "draining" || isShuttingDown) return;
+  for (const task of claimable) {
+    if (getDaemonMode(defaults) === "draining" || isShuttingDown) return;
 
     const resumeAtRaw = task["resume-at"]?.trim() ?? "";
     const resumeAtTs = resumeAtRaw ? Date.parse(resumeAtRaw) : Number.NaN;
@@ -474,6 +619,7 @@ async function attemptResumeThrottledTasks(): Promise<void> {
       })
     .finally(() => {
       inFlightTasks.delete(taskKey);
+      forgetOwnedTask(task);
       releaseGlobal();
       releaseRepo();
       if (!isShuttingDown) {
@@ -514,6 +660,7 @@ function startTask(opts: {
     })
     .finally(() => {
       inFlightTasks.delete(key);
+      forgetOwnedTask(task);
       releaseGlobal();
       releaseRepo();
       if (!isShuttingDown) {
@@ -545,6 +692,7 @@ function startResumeTask(opts: {
     })
     .finally(() => {
       inFlightTasks.delete(key);
+      forgetOwnedTask(task);
       releaseGlobal();
       releaseRepo();
       resolveResumeCompletion(key);
@@ -558,15 +706,16 @@ function startResumeTask(opts: {
 
 // --- Main Logic ---
 
-async function processNewTasks(tasks: AgentTask[]): Promise<void> {
+async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConfig>): Promise<void> {
   ensureSemaphores();
   if (!globalSemaphore) return;
 
-  const isDraining = getDaemonMode() === "draining";
+  const isDraining = getDaemonMode(defaults) === "draining";
   if (isDraining && pendingResumeTasks.size === 0) return;
 
-  const selection = await resolveOpencodeProfileForNewWork(Date.now(), getActiveOpencodeProfileName());
+  const selection = await resolveOpencodeProfileForNewWork(Date.now(), getActiveOpencodeProfileName(defaults));
   const throttle = selection.decision;
+  const gate = computeDaemonGate({ mode: getDaemonMode(), throttle, isShuttingDown });
 
   if (selection.source === "failover") {
     const requested = selection.requestedProfile ?? "default";
@@ -577,8 +726,8 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
     }
   }
 
-  if (throttle.state === "hard") {
-    if (shouldLog("daemon:hard-throttle", 30_000)) {
+  if (!gate.allowModelSend) {
+    if (gate.reason === "hard-throttled" && shouldLog("daemon:hard-throttle", 30_000)) {
       console.warn(
         `[ralph] Hard throttle active (profile=${throttle.snapshot.opencodeProfile ?? "ambient"}); skipping task scheduling until ${
           throttle.snapshot.resumeAt ?? "unknown"
@@ -588,12 +737,35 @@ async function processNewTasks(tasks: AgentTask[]): Promise<void> {
     return;
   }
 
+  if (!gate.allowDequeue && pendingResumeTasks.size === 0) return;
   if (throttle.state === "soft") return;
 
-  const queueTasks = isDraining ? [] : tasks;
+  const nowMs = Date.now();
+  const claimable: AgentTask[] = [];
+  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  for (const task of tasks) {
+    const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
+    if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
+      console.warn(
+        `[ralph] Task heartbeat is stale; eligible for takeover: ${task.name} (last ${new Date(heartbeatMs).toISOString()})`
+      );
+    }
+
+    const claim = await tryClaimTask({ task, daemonId, nowMs });
+    if (claim.claimed && claim.task) {
+      recordOwnedTask(claim.task);
+      claimable.push(claim.task);
+    } else if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
+      console.log(`[ralph] Skipping task ${task.name}: ${claim.reason}`);
+    }
+  }
+
+  const queueTasks = isDraining ? [] : claimable;
 
   if (queueTasks.length > 0) {
     resetIdleState(queueTasks);
+  } else if (!isDraining) {
+    resetIdleState(tasks);
   }
 
   const startedCount = startQueuedTasks({
@@ -636,6 +808,45 @@ async function getTaskNowDoingLine(task: AgentTask): Promise<string> {
   return formatNowDoingLine(nowDoing, label);
 }
 
+async function emitActivityUpdate(params: {
+  sessionId: string;
+  task: AgentTask;
+  workerId?: string;
+  taskId?: string;
+}): Promise<void> {
+  const sessionId = params.sessionId?.trim();
+  if (!sessionId) return;
+
+  try {
+    const now = Date.now();
+    const snapshot = await classifyActivity({
+      sessionId,
+      runLogPath: params.task["run-log-path"],
+      now,
+      windowMs: ACTIVITY_WINDOW_MS,
+    });
+
+    if (!shouldEmitActivityUpdate({ sessionId, activity: snapshot.activity, now })) return;
+
+    ralphEventBus.publish(
+      buildRalphEvent({
+        type: "worker.activity.updated",
+        level: "info",
+        workerId: params.workerId,
+        repo: params.task.repo,
+        taskId: params.taskId,
+        sessionId,
+        data: { activity: snapshot.activity },
+      })
+    );
+
+    recordActivityState({ sessionId, activity: snapshot.activity, now });
+  } catch (e: any) {
+    const msg = e?.message ?? String(e);
+    console.warn(`[ralph] Failed to classify activity: ${msg}`);
+  }
+}
+
 async function printHeartbeatTick(): Promise<void> {
   const [starting, inProgress] = await Promise.all([getTasksByStatus("starting"), getTasksByStatus("in-progress")]);
   const tasks = [...starting, ...inProgress];
@@ -644,7 +855,48 @@ async function printHeartbeatTick(): Promise<void> {
   for (const task of tasks) {
     const line = await getTaskNowDoingLine(task);
     console.log(`[ralph:hb] ${line}`);
+
+    const sessionId = task["session-id"]?.trim();
+    if (!sessionId) continue;
+
+    const taskId = task._path || task.name;
+    const workerId = taskId ? `${task.repo}#${taskId}` : undefined;
+    activeSessionTasks.set(sessionId, { task, workerId, taskId });
   }
+
+  const activeSessionIds = new Set(tasks.map((task) => task["session-id"]?.trim()).filter(Boolean) as string[]);
+
+  for (const [sessionId, payload] of activeSessionTasks) {
+    if (!activeSessionIds.has(sessionId)) {
+      activeSessionTasks.delete(sessionId);
+      continue;
+    }
+
+    await emitActivityUpdate({ sessionId, ...payload });
+  }
+}
+
+async function refreshTaskOwnershipHeartbeat(nowMs: number): Promise<void> {
+  if (ownedTasks.size === 0) return;
+
+  const keys = Array.from(ownedTasks.keys());
+  await Promise.all(
+    keys.map(async (key) => {
+      const path = ownedTasks.get(key);
+      if (!path) return;
+
+      const task = await getTaskByPath(path);
+      if (!task) {
+        ownedTasks.delete(key);
+        return;
+      }
+
+      const updated = await heartbeatTask({ task, daemonId, nowMs });
+      if (!updated) {
+        ownedTasks.delete(key);
+      }
+    })
+  );
 }
 
 async function resumeTasksOnStartup(opts?: {
@@ -663,7 +915,27 @@ async function resumeTasksOnStartup(opts?: {
     console.log(`[ralph] Found ${inProgress.length} in-progress task(s) on startup`);
   }
 
-  const inProgressByRepo = groupByRepo(inProgress);
+  const nowMs = Date.now();
+  const claimable: AgentTask[] = [];
+  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  for (const task of inProgress) {
+    const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
+    if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
+      console.warn(
+        `[ralph] Task heartbeat is stale; eligible for takeover: ${task.name} (last ${new Date(heartbeatMs).toISOString()})`
+      );
+    }
+
+    const claim = await tryClaimTask({ task, daemonId, nowMs });
+    if (claim.claimed && claim.task) {
+      recordOwnedTask(claim.task);
+      claimable.push(claim.task);
+    } else if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
+      console.log(`[ralph] Skipping resume for ${task.name}: ${claim.reason}`);
+    }
+  }
+
+  const inProgressByRepo = groupByRepo(claimable);
   await Promise.all(
     Array.from(inProgressByRepo.entries()).map(async ([repo, tasks]) => {
       const worker = getOrCreateWorker(repo);
@@ -671,15 +943,15 @@ async function resumeTasksOnStartup(opts?: {
     })
   );
 
-  if (inProgress.length === 0) return;
+  if (claimable.length === 0) return;
 
-  const withoutSession = inProgress.filter((t) => !(t["session-id"]?.trim()));
+  const withoutSession = claimable.filter((t) => !(t["session-id"]?.trim()));
   for (const task of withoutSession) {
     console.warn(`[ralph] In-progress task has no session ID, resetting to starting: ${task.name}`);
     await updateTaskStatus(task, "starting", { "session-id": "" });
   }
 
-  const withSession = inProgress.filter((t) => t["session-id"]?.trim());
+  const withSession = claimable.filter((t) => t["session-id"]?.trim());
   if (withSession.length === 0) return;
 
   const globalLimit = loadConfig().maxWorkers;
@@ -774,42 +1046,40 @@ async function main(): Promise<void> {
   console.log(`        Max workers: ${config.maxWorkers}`);
   console.log(`        Batch size: ${config.batchSize} PRs before rollup`);
   console.log(`        Dev directory: ${config.devDir}`);
+  console.log(`        Daemon ID: ${daemonId}`);
+  console.log(`        Ownership TTL: ${config.ownershipTtlMs}ms`);
   console.log("");
 
   // Start drain monitor (operator control file)
   drainMonitor = new DrainMonitor({
     log: (message) => console.log(message),
+    defaults: config.control,
+    onStateChange: (state) => {
+      applyControlState(state);
+    },
     onModeChange: (mode) => {
       if (isShuttingDown) return;
       if (mode !== "running") return;
 
       void (async () => {
         const tasks = await getRunnableTasks();
-        await processNewTasks(tasks);
+        await processNewTasks(tasks, config.control ?? {});
       })();
     },
   });
   drainMonitor.start();
+  applyControlState(drainMonitor.getState());
 
   // Initialize rollup monitor
   rollupMonitor = new RollupMonitor(config.batchSize);
-
-  // Resume orphaned tasks from previous daemon runs
-  void resumeTasksOnStartup({ awaitCompletion: false });
-
-  // Resume any resolved escalations (HITL checkpoint) from the same session.
-  await attemptResumeResolvedEscalations();
-
-  // Resume any tasks paused by hard throttle.
-  await attemptResumeThrottledTasks();
 
   // Do initial poll on startup
   console.log("[ralph] Running initial poll...");
   const initialTasks = await initialPoll();
   console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
 
-  if (initialTasks.length > 0 && getDaemonMode() !== "draining") {
-    await processNewTasks(initialTasks);
+  if (initialTasks.length > 0 && getDaemonMode(config.control) !== "draining") {
+    await processNewTasks(initialTasks, config.control ?? {});
   } else {
     resetIdleState(initialTasks);
   }
@@ -817,10 +1087,19 @@ async function main(): Promise<void> {
   // Start file watching (no polling - watcher is reliable)
   console.log("[ralph] Starting queue watcher...");
   startWatching(async (tasks) => {
-    if (!isShuttingDown && getDaemonMode() !== "draining") {
-      await processNewTasks(tasks);
+    if (!isShuttingDown && getDaemonMode(config.control) !== "draining") {
+      await processNewTasks(tasks, config.control ?? {});
     }
   });
+
+  // Resume orphaned tasks from previous daemon runs.
+  void resumeTasksOnStartup({ awaitCompletion: false });
+
+  // Resume any resolved escalations (HITL checkpoint) from the same session.
+  void attemptResumeResolvedEscalations();
+
+  // Resume any tasks paused by hard throttle.
+  void attemptResumeThrottledTasks(config.control ?? {});
 
   // Watch escalations for resolution and resume the same OpenCode session.
   const escalationsDir = join(config.bwrbVault, "orchestration/escalations");
@@ -841,20 +1120,21 @@ async function main(): Promise<void> {
     console.log(`[ralph:escalations] Escalations dir not found: ${escalationsDir}`);
   }
 
-  const heartbeatIntervalMs = 5_000;
+  const ownershipTtlMs = loadConfig().ownershipTtlMs;
+  const heartbeatIntervalMs = computeHeartbeatIntervalMs(ownershipTtlMs);
   let heartbeatInFlight = false;
 
   const heartbeatTimer = setInterval(() => {
     if (isShuttingDown) return;
 
     // Avoid hitting bwrb repeatedly when the daemon is idle.
-    if (inFlightTasks.size === 0) return;
+    if (inFlightTasks.size === 0 && ownedTasks.size === 0) return;
 
     // Avoid overlapping ticks if bwrb/filesystem are slow.
     if (heartbeatInFlight) return;
     heartbeatInFlight = true;
 
-    printHeartbeatTick()
+    Promise.all([printHeartbeatTick(), refreshTaskOwnershipHeartbeat(Date.now())])
       .catch(() => {
         // ignore
       })
@@ -883,11 +1163,11 @@ async function main(): Promise<void> {
 
   const throttleResumeTimer = setInterval(() => {
     if (isShuttingDown) return;
-    if (getDaemonMode() === "draining") return;
+    if (getDaemonMode(config.control) === "draining") return;
     if (throttleResumeInFlight) return;
     throttleResumeInFlight = true;
 
-    attemptResumeThrottledTasks()
+    attemptResumeThrottledTasks(config.control ?? {})
       .catch(() => {
         // ignore
       })
@@ -991,7 +1271,7 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Drain mode: set mode=draining|running in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
+      "  Control file: set version=1 and mode=running|draining|paused in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
       "  OpenCode profile: set opencode_profile=\"<name>\" in the same control file (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
@@ -1124,7 +1404,8 @@ if (args[0] === "status") {
 
   const json = args.includes("--json");
 
-  const control = readControlStateSnapshot({ log: (message) => console.warn(message) });
+  const config = loadConfig();
+  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
   const controlProfile = control.opencodeProfile?.trim() || "";
 
   const requestedProfile =
@@ -1133,14 +1414,17 @@ if (args[0] === "status") {
   const selection = await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile);
   const resolvedProfile: string | null = selection.profileName;
   const throttle = selection.decision;
+  const gate = computeDaemonGate({ mode: control.mode, throttle, isShuttingDown: false });
 
-  const mode = control.mode === "draining"
-    ? "draining"
-    : throttle.state === "hard"
-      ? "hard-throttled"
-      : throttle.state === "soft"
-        ? "soft-throttled"
-        : "running";
+  const mode = gate.reason === "hard-throttled"
+    ? "hard-throttled"
+    : gate.reason === "paused"
+      ? "paused"
+      : gate.reason === "draining"
+        ? "draining"
+        : throttle.state === "soft"
+          ? "soft-throttled"
+          : "running";
 
   const [starting, inProgress, queued, throttled, pendingEscalations] = await Promise.all([
     getTasksByStatus("starting"),
@@ -1187,6 +1471,12 @@ if (args[0] === "status") {
             priority: t.priority ?? "p2-medium",
             opencodeProfile: getTaskOpencodeProfileName(t),
           })),
+          drain: {
+            requestedAt: drainRequestedAt ? new Date(drainRequestedAt).toISOString() : null,
+            timeoutMs: drainTimeoutMs ?? null,
+            pauseRequested: pauseRequestedByControl,
+            pauseAtCheckpoint,
+          },
           queued: queued.map((t) => ({
             name: t.name,
             repo: t.repo,
@@ -1212,6 +1502,9 @@ if (args[0] === "status") {
   }
 
   console.log(`Mode: ${mode}`);
+  if (pauseRequestedByControl) {
+    console.log(`Pause requested: true${pauseAtCheckpoint ? ` (checkpoint: ${pauseAtCheckpoint})` : ""}`);
+  }
   if (controlProfile === "auto") {
     console.log(`Active OpenCode profile: auto (resolved: ${resolvedProfile ?? "ambient"})`);
   } else if (selection.source === "failover") {

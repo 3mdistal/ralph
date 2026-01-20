@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 let db: Database | null = null;
 
@@ -56,6 +56,21 @@ function ensureSchema(database: Database): void {
     );
   }
 
+  if (!existingVersion || existingVersion < SCHEMA_VERSION) {
+    if (existingVersion && existingVersion < 3) {
+      try {
+        database.exec("ALTER TABLE tasks ADD COLUMN worker_id TEXT");
+      } catch {
+        // ignore if already present
+      }
+      try {
+        database.exec("ALTER TABLE tasks ADD COLUMN repo_slot TEXT");
+      } catch {
+        // ignore if already present
+      }
+    }
+  }
+
   database.exec(
     `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
      ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
@@ -93,6 +108,8 @@ function ensureSchema(database: Database): void {
       status TEXT,
       session_id TEXT,
       worktree_path TEXT,
+      worker_id TEXT,
+      repo_slot TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(repo_id, task_path),
@@ -280,6 +297,8 @@ export function recordTaskSnapshot(input: {
   status?: string;
   sessionId?: string;
   worktreePath?: string;
+  workerId?: string;
+  repoSlot?: string;
   at?: string;
 }): void {
   const database = requireDb();
@@ -305,9 +324,9 @@ export function recordTaskSnapshot(input: {
   database
     .query(
       `INSERT INTO tasks(
-         repo_id, issue_number, task_path, task_name, status, session_id, worktree_path, created_at, updated_at
+         repo_id, issue_number, task_path, task_name, status, session_id, worktree_path, worker_id, repo_slot, created_at, updated_at
        ) VALUES (
-         $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $worktree_path, $created_at, $updated_at
+         $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $worktree_path, $worker_id, $repo_slot, $created_at, $updated_at
        )
        ON CONFLICT(repo_id, task_path) DO UPDATE SET
          issue_number = COALESCE(excluded.issue_number, tasks.issue_number),
@@ -315,6 +334,8 @@ export function recordTaskSnapshot(input: {
          status = COALESCE(excluded.status, tasks.status),
          session_id = COALESCE(excluded.session_id, tasks.session_id),
          worktree_path = COALESCE(excluded.worktree_path, tasks.worktree_path),
+         worker_id = COALESCE(excluded.worker_id, tasks.worker_id),
+         repo_slot = COALESCE(excluded.repo_slot, tasks.repo_slot),
          updated_at = excluded.updated_at`
     )
     .run({
@@ -325,6 +346,8 @@ export function recordTaskSnapshot(input: {
       $status: input.status ?? null,
       $session_id: input.sessionId ?? null,
       $worktree_path: input.worktreePath ?? null,
+      $worker_id: input.workerId ?? null,
+      $repo_slot: input.repoSlot ?? null,
       $created_at: at,
       $updated_at: at,
     });

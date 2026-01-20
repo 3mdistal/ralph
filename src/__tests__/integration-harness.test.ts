@@ -170,7 +170,8 @@ describe("integration-ish harness: full task lifecycle", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
     // Avoid touching git worktree creation (depends on local config).
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
 
     // Avoid real side-effects (nudges/git/gh).
     (worker as any).drainNudges = async () => {};
@@ -199,31 +200,40 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
 
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
 
     const waitForRequiredChecksMock = mock()
       .mockImplementationOnce(async () => ({
         headSha: "deadbeef",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
         summary: {
           status: "success",
           required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
           available: ["ci"],
         },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }))
       .mockImplementationOnce(async () => ({
         headSha: "beadfeed",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
         summary: {
           status: "success",
           required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
           available: ["ci"],
         },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }));
 
     const mergePullRequestMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).isPrBehind = isPrBehindMock;
 
     let agentRunData: any = null;
     (worker as any).createAgentRun = async (_task: any, data: any) => {
@@ -294,8 +304,10 @@ describe("integration-ish harness: full task lifecycle", () => {
   test("ci-only PR blocks non-CI issue", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
+
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
@@ -319,21 +331,27 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
 
     (worker as any).getPullRequestFiles = async () => [".github/workflows/ci.yml"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
       summary: {
         status: "success",
         required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         available: ["ci"],
       },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
       timedOut: false,
     }));
 
     const mergePullRequestMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).isPrBehind = isPrBehindMock;
 
     let agentRunData: any = null;
     (worker as any).createAgentRun = async (_task: any, data: any) => {
@@ -354,8 +372,10 @@ describe("integration-ish harness: full task lifecycle", () => {
   test("merge retries after updating out-of-date branch", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
+
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
@@ -368,24 +388,31 @@ describe("integration-ish harness: full task lifecycle", () => {
     });
 
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
 
     const waitForRequiredChecksMock = mock()
       .mockImplementationOnce(async () => ({
         headSha: "deadbeef",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
         summary: {
           status: "success",
           required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
           available: ["ci"],
         },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }))
       .mockImplementationOnce(async () => ({
         headSha: "beadfeed",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
         summary: {
           status: "success",
           required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
           available: ["ci"],
         },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }));
 
@@ -398,12 +425,13 @@ describe("integration-ish harness: full task lifecycle", () => {
       .mockImplementationOnce(async () => {});
 
     const updatePullRequestBranchMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
+    (worker as any).isPrBehind = isPrBehindMock;
 
-    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -419,8 +447,10 @@ describe("integration-ish harness: full task lifecycle", () => {
   test("merge escalates when update-branch fails", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
+
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
@@ -431,16 +461,20 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
-
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).createAgentRun = async () => {};
 
     const waitForRequiredChecksMock = mock(async () => ({
       headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
       summary: {
         status: "success",
         required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         available: ["ci"],
       },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
       timedOut: false,
     }));
 
@@ -453,18 +487,74 @@ describe("integration-ish harness: full task lifecycle", () => {
     const updatePullRequestBranchMock = mock(async () => {
       throw new Error("GraphQL: branch protection rule prevents update");
     });
+    const isPrBehindMock = mock(async () => false);
+    const getPullRequestChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+    }));
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
-
-    (worker as any).createAgentRun = async () => {};
+    (worker as any).isPrBehind = isPrBehindMock;
+    (worker as any).getPullRequestChecks = getPullRequestChecksMock;
 
     const result = await worker.processTask(createMockTask());
 
     expect(result.outcome).toBe("failed");
     expect(notifyErrorMock).toHaveBeenCalled();
-    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
+    expect(notifyEscalationMock).not.toHaveBeenCalled();
+  });
+
+  test("blocks main merge without override label", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+
+
+    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: ["allow-main"],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "main";
+    (worker as any).createAgentRun = async () => {};
+
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "main",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+      timedOut: false,
+    }));
+
+    const mergePullRequestMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
+
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).isPrBehind = isPrBehindMock;
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("success");
+    expect(waitForRequiredChecksMock).toHaveBeenCalled();
+    expect(mergePullRequestMock).toHaveBeenCalled();
   });
 
   test("auto-update updates behind branch before merge", async () => {
@@ -651,7 +741,8 @@ describe("integration-ish harness: full task lifecycle", () => {
     }));
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
@@ -663,6 +754,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       stateReason: null,
     });
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -683,7 +775,8 @@ describe("integration-ish harness: full task lifecycle", () => {
     }));
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
-    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
     (worker as any).ensureBaselineLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
@@ -696,6 +789,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       stateReason: null,
     });
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());

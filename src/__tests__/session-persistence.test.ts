@@ -38,6 +38,22 @@ describe("Session Persistence", () => {
       expect(taskWithSession["session-id"]).toBe("ses_abc123");
     });
 
+    test("daemon-id field is optional", () => {
+      const taskWithoutDaemon = createMockTask();
+      expect(taskWithoutDaemon["daemon-id"]).toBeUndefined();
+
+      const taskWithDaemon = createMockTask({ "daemon-id": "d_123" });
+      expect(taskWithDaemon["daemon-id"]).toBe("d_123");
+    });
+
+    test("heartbeat-at field is optional", () => {
+      const taskWithoutHeartbeat = createMockTask();
+      expect(taskWithoutHeartbeat["heartbeat-at"]).toBeUndefined();
+
+      const taskWithHeartbeat = createMockTask({ "heartbeat-at": "2026-01-16T12:00:00.000Z" });
+      expect(taskWithHeartbeat["heartbeat-at"]).toBe("2026-01-16T12:00:00.000Z");
+    });
+
     test("session-id can be empty string", () => {
       const task = createMockTask({ "session-id": "" });
       expect(task["session-id"]).toBe("");
@@ -67,6 +83,25 @@ describe("Session Persistence", () => {
 
       const taskWithRetries = createMockTask({ "watchdog-retries": "1" });
       expect(taskWithRetries["watchdog-retries"]).toBe("1");
+    });
+
+    test("ownership fields are optional", () => {
+      const taskWithoutOwnership = createMockTask();
+      expect(taskWithoutOwnership["daemon-id"]).toBeUndefined();
+      expect(taskWithoutOwnership["heartbeat-at"]).toBeUndefined();
+      expect(taskWithoutOwnership["pause-requested"]).toBeUndefined();
+      expect(taskWithoutOwnership.checkpoint).toBeUndefined();
+
+      const taskWithOwnership = createMockTask({
+        "daemon-id": "d_test",
+        "heartbeat-at": "2026-01-18T00:00:00.000Z",
+        "pause-requested": "true",
+        checkpoint: "planned",
+      });
+      expect(taskWithOwnership["daemon-id"]).toBe("d_test");
+      expect(taskWithOwnership["heartbeat-at"]).toBe("2026-01-18T00:00:00.000Z");
+      expect(taskWithOwnership["pause-requested"]).toBe("true");
+      expect(taskWithOwnership.checkpoint).toBe("planned");
     });
   });
 
