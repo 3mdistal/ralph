@@ -9,6 +9,7 @@ import { RepoWorker } from "../worker";
 
 let homeDir: string;
 let priorHome: string | undefined;
+let priorGhToken: string | undefined;
 
 async function writeJson(path: string, obj: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
@@ -18,6 +19,7 @@ async function writeJson(path: string, obj: unknown): Promise<void> {
 describe("required checks resolution", () => {
   beforeEach(async () => {
     priorHome = process.env.HOME;
+    priorGhToken = process.env.GH_TOKEN;
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
     __resetConfigForTests();
@@ -25,6 +27,11 @@ describe("required checks resolution", () => {
 
   afterEach(async () => {
     process.env.HOME = priorHome;
+    if (priorGhToken === undefined) {
+      delete process.env.GH_TOKEN;
+    } else {
+      process.env.GH_TOKEN = priorGhToken;
+    }
     await rm(homeDir, { recursive: true, force: true });
     __resetConfigForTests();
   });
@@ -118,6 +125,9 @@ describe("required checks resolution", () => {
     const fetchMock = mock(async (url: string) => {
       if (url.endsWith("/repos/acme/rocket/branches/bot%2Fintegration/protection")) {
         return new Response("Forbidden", { status: 403 });
+      }
+      if (url.endsWith("/repos/acme/rocket/branches/main/protection")) {
+        return new Response("Not Found", { status: 404 });
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });

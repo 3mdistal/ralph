@@ -767,6 +767,13 @@ export class RepoWorker {
 
     if (missingBranchError) throw missingBranchError;
 
+    const hasData = checkRuns.length > 0 || statusContexts.length > 0;
+    const hasAuthError = errors.some((entry) => /HTTP 401|HTTP 403|Missing GH_TOKEN/i.test(entry));
+
+    if (hasAuthError || (errors.length >= 2 && !hasData)) {
+      throw new Error(`Unable to read check contexts for ${branch}: ${errors.join(" | ")}`);
+    }
+
     if (errors.length > 0) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to fetch some check contexts for ${branch}: ${errors.join(" | ")}`
@@ -845,18 +852,23 @@ export class RepoWorker {
 
       const botBranch = getRepoBotBranch(this.repo);
       const branches = Array.from(new Set([botBranch, "main"]));
+      let lastError: { branch: string; error: unknown } | null = null;
       for (const branch of branches) {
         let protection: BranchProtection | null = null;
         try {
           protection = await this.fetchBranchProtection(branch);
         } catch (e: any) {
-          const msg = e?.message ?? String(e);
-          console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${branch}: ${msg}`);
-          return { checks: [], source: "none" };
+          lastError = { branch, error: e };
+          continue;
         }
 
         if (!protection) continue;
         return { checks: getProtectionContexts(protection), source: "protection", branch };
+      }
+
+      if (lastError) {
+        const msg = (lastError.error as any)?.message ?? String(lastError.error);
+        console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${lastError.branch}: ${msg}`);
       }
 
       return { checks: [], source: "none" };
@@ -976,11 +988,11 @@ ${guidance}`
       const branches = Array.from(new Set([botBranch, "main"]));
       const requiredChecksOverride = getRepoRequiredChecksOverride(this.repo);
 
-      await this.ensureBotBranchExistsBestEffort();
-
       if (!requiredChecksOverride || requiredChecksOverride.length === 0) {
         return;
       }
+
+      await this.ensureBotBranchExistsBestEffort();
 
       for (const branch of branches) {
         await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
