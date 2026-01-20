@@ -7,6 +7,8 @@ import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import { sanitizeNoteName } from "./util/sanitize-note-name";
+import { canActOnTask, isHeartbeatStale } from "./ownership";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -20,6 +22,34 @@ type BwrbRunner = (strings: TemplateStringsArray, ...values: unknown[]) => BwrbP
 const DEFAULT_BWRB_RUNNER: BwrbRunner = $ as unknown as BwrbRunner;
 
 let bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
+
+const CLAIM_MAX_ATTEMPTS = 2;
+const TASK_STATUS_FIELDS = new Set(["status", "assigned-at", "completed-at", "throttled-at", "resume-at", "usage-snapshot"]);
+const TASK_FINGERPRINT_FIELDS = [
+  "_path",
+  "_name",
+  "type",
+  "creation-date",
+  "scope",
+  "issue",
+  "repo",
+  "status",
+  "priority",
+  "name",
+  "run",
+  "assigned-at",
+  "completed-at",
+  "throttled-at",
+  "resume-at",
+  "usage-snapshot",
+  "session-id",
+  "opencode-profile",
+  "run-log-path",
+  "worktree-path",
+  "worker-id",
+  "repo-slot",
+  "watchdog-retries",
+] as const;
 
 export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
   bwrb = runner;
@@ -49,12 +79,20 @@ export interface AgentTask {
   "usage-snapshot"?: string;
   /** OpenCode session ID used to resume after restarts */
   "session-id"?: string;
+  /** Daemon identifier owning this task (for rolling restart safety). */
+  "daemon-id"?: string;
+  /** Last heartbeat timestamp from owning daemon. */
+  "heartbeat-at"?: string;
   /** OpenCode profile name used for this task (persisted for resume). */
   "opencode-profile"?: string;
   /** Path to restart-survivable OpenCode run output log */
   "run-log-path"?: string;
   /** Git worktree path for this task (for per-repo concurrency + resume) */
   "worktree-path"?: string;
+  /** Stable worker identity (repo#taskId). */
+  "worker-id"?: string;
+  /** Per-repo concurrency slot (0..max-1). */
+  "repo-slot"?: string;
   /** Watchdog recovery attempts (string in frontmatter) */
   "watchdog-retries"?: string;
   /** Current daemon owner for rolling restart */
@@ -67,11 +105,13 @@ export interface AgentTask {
   "pause-requested"?: string;
 }
 
+
 export type QueueChangeHandler = (tasks: AgentTask[]) => void;
 
 let watcher: ReturnType<typeof watch> | null = null;
 let changeHandlers: QueueChangeHandler[] = [];
 let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+const lastTaskFingerprints = new Map<string, string>();
 
 export function normalizeBwrbNoteRef(value: string): string {
   // Defensive normalization: bwrb identifiers can include accidental whitespace/newlines.
@@ -94,6 +134,34 @@ function normalizeAgentTaskIdentity(task: AgentTask): AgentTask {
     _path: normalizedPath,
     _name: normalizedName,
   };
+}
+
+function buildTaskFingerprint(task: AgentTask): string {
+  const snapshot: Record<string, unknown> = {};
+  for (const key of TASK_FINGERPRINT_FIELDS) {
+    snapshot[key] = task[key as keyof AgentTask] ?? null;
+  }
+  return JSON.stringify(snapshot);
+}
+
+function computeHeartbeatOnlyChange(task: AgentTask): { isHeartbeatOnly: boolean; fingerprint: string } {
+  if (!task._path) return { isHeartbeatOnly: false, fingerprint: "" };
+  const fingerprint = buildTaskFingerprint(task);
+  const lastFingerprint = lastTaskFingerprints.get(task._path);
+  return { isHeartbeatOnly: Boolean(lastFingerprint) && lastFingerprint === fingerprint, fingerprint };
+}
+
+function refreshTaskFingerprints(tasks: AgentTask[]): void {
+  const seen = new Set<string>();
+  for (const task of tasks) {
+    if (!task._path) continue;
+    seen.add(task._path);
+    lastTaskFingerprints.set(task._path, buildTaskFingerprint(task));
+  }
+
+  for (const cachedPath of lastTaskFingerprints.keys()) {
+    if (!seen.has(cachedPath)) lastTaskFingerprints.delete(cachedPath);
+  }
 }
 
 function extractBwrbErrorText(e: any): string {
@@ -155,6 +223,8 @@ function recordQueueStateSnapshot(tasks: AgentTask[]): void {
         status: task.status,
         sessionId: task["session-id"],
         worktreePath: task["worktree-path"],
+        workerId: task["worker-id"],
+        repoSlot: task["repo-slot"],
         at,
       });
     } catch {
@@ -201,6 +271,7 @@ async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentT
     const normalized = tasks.map((t) => normalizeAgentTaskIdentity(t));
     warnIfNestedTaskPaths(normalized);
     recordQueueStateSnapshot(normalized);
+    refreshTaskFingerprints(normalized);
     return normalized;
   } catch (e) {
     console.error(`[ralph:queue] Failed to list tasks under ${TASKS_GLOB_PATH}:`, e);
@@ -234,6 +305,81 @@ export async function getTaskByPath(taskPath: string): Promise<AgentTask | null>
   const normalizedPath = normalizeBwrbNoteRef(taskPath);
   const tasks = await listTasksInQueueDir();
   return tasks.find((t) => t._path === normalizedPath) ?? null;
+}
+
+export async function tryClaimTask(opts: {
+  task: AgentTask;
+  daemonId: string;
+  nowMs: number;
+}): Promise<{ claimed: boolean; task: AgentTask | null; reason?: string }> {
+  const config = loadConfig();
+  const ttlMs = config.ownershipTtlMs;
+  const normalizedPath = normalizeBwrbNoteRef(opts.task._path);
+
+  if (!normalizedPath) {
+    return { claimed: false, task: null, reason: "Task path missing" };
+  }
+
+  for (let attempt = 0; attempt < CLAIM_MAX_ATTEMPTS; attempt += 1) {
+    const current = await getTaskByPath(normalizedPath);
+    if (!current) {
+      return { claimed: false, task: null, reason: `Task not found: ${normalizedPath}` };
+    }
+
+    const canAct = canActOnTask(current, opts.daemonId, opts.nowMs, ttlMs);
+    if (!canAct) {
+      const owner = current["daemon-id"]?.trim() ?? "";
+      const heartbeatAt = current["heartbeat-at"]?.trim() ?? "";
+      const isStale = isHeartbeatStale(heartbeatAt, opts.nowMs, ttlMs);
+      const reason = owner
+        ? `Task owned by ${owner}; heartbeat ${isStale ? "stale" : "fresh"}`
+        : "Task has fresh heartbeat";
+      return { claimed: false, task: current, reason };
+    }
+
+    const nowIso = new Date(opts.nowMs).toISOString();
+    const updated = await updateTaskStatus(current, current.status, {
+      "daemon-id": opts.daemonId,
+      "heartbeat-at": nowIso,
+    });
+
+    if (!updated) {
+      if (attempt < CLAIM_MAX_ATTEMPTS - 1) continue;
+      return { claimed: false, task: current, reason: "Failed to update task ownership" };
+    }
+
+    const refreshed = await getTaskByPath(normalizedPath);
+    if (!refreshed) {
+      return { claimed: false, task: null, reason: `Task missing after claim: ${normalizedPath}` };
+    }
+
+    if ((refreshed["daemon-id"]?.trim() ?? "") !== opts.daemonId) {
+      if (attempt < CLAIM_MAX_ATTEMPTS - 1) continue;
+      return { claimed: false, task: refreshed, reason: "Ownership lost during claim" };
+    }
+
+    return { claimed: true, task: refreshed };
+  }
+
+  return { claimed: false, task: null, reason: "Failed to claim task" };
+}
+
+export async function heartbeatTask(opts: {
+  task: AgentTask;
+  daemonId: string;
+  nowMs: number;
+}): Promise<boolean> {
+  const owner = opts.task["daemon-id"]?.trim() ?? "";
+  if (owner && owner !== opts.daemonId) return false;
+
+  const normalizedPath = normalizeBwrbNoteRef(opts.task._path);
+  if (!normalizedPath) return false;
+
+  const nowIso = new Date(opts.nowMs).toISOString();
+  return await updateTaskStatus(opts.task, opts.task.status, {
+    "daemon-id": opts.daemonId,
+    "heartbeat-at": nowIso,
+  });
 }
 
 /**
@@ -289,10 +435,11 @@ export async function createAgentTask(opts: {
     }
   };
 
-  let output = await runNew(opts.name);
+  const sanitizedName = sanitizeNoteName(opts.name);
+  let output = await runNew(sanitizedName);
   if (!output.success && typeof output.error === "string" && output.error.includes("File already exists")) {
     const suffix = crypto.randomUUID().slice(0, 8);
-    output = await runNew(`${opts.name} [${suffix}]`);
+    output = await runNew(`${sanitizedName} [${suffix}]`);
   }
 
   if (output.success && typeof output.path === "string") {
@@ -316,15 +463,43 @@ export async function createAgentTask(opts: {
 export async function updateTaskStatus(
   task: AgentTask | Pick<AgentTask, "_path" | "_name" | "name" | "issue" | "repo"> | string,
   status: AgentTask["status"],
-  extraFields?: Record<string, string>
+  extraFields?: Record<string, string | number>
 ): Promise<boolean> {
+  const normalizeOptionalString = (value: unknown): string | undefined => {
+    if (typeof value !== "string") return undefined;
+    const trimmed = value.trim();
+    return trimmed ? trimmed : undefined;
+  };
+
+  const getOptionalField = (
+    fields: Record<string, string> | undefined,
+    taskObj: Record<string, unknown> | null,
+    key: string
+  ): string | undefined => {
+    if (fields && Object.prototype.hasOwnProperty.call(fields, key)) {
+      return normalizeOptionalString(fields[key]);
+    }
+    const fallback = taskObj ? (taskObj[key] as string | undefined) : undefined;
+    return fallback;
+  };
   if (!VALID_TASK_STATUSES.has(status)) {
     console.error(`[ralph:queue] Invalid task status: ${String(status)}`);
     return false;
   }
 
   const config = loadConfig();
-  const json = JSON.stringify({ status, ...extraFields });
+  const normalizedExtraFields = extraFields
+    ? Object.fromEntries(
+        Object.entries(extraFields).map(([key, value]) => {
+          if (typeof value === "number") return [key, String(value)];
+          if (value === null) return [key, ""];
+          if (typeof value === "string") return [key, value];
+          return [key, ""];
+        })
+      )
+    : undefined;
+
+  const json = JSON.stringify({ status, ...normalizedExtraFields });
 
   const taskObj: any = typeof task === "object" ? task : null;
   const fromStatus: string | undefined =
@@ -362,8 +537,10 @@ export async function updateTaskStatus(
         taskPath: path ?? taskObj._path ?? "",
         taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
         status,
-        sessionId: extraFields?.["session-id"] ?? taskObj["session-id"],
-        worktreePath: extraFields?.["worktree-path"] ?? taskObj["worktree-path"],
+        sessionId: getOptionalField(normalizedExtraFields, taskObj, "session-id"),
+        worktreePath: getOptionalField(normalizedExtraFields, taskObj, "worktree-path"),
+        workerId: getOptionalField(normalizedExtraFields, taskObj, "worker-id"),
+        repoSlot: getOptionalField(normalizedExtraFields, taskObj, "repo-slot"),
       });
     } catch {
       // best-effort
@@ -374,30 +551,37 @@ export async function updateTaskStatus(
     try {
       if (!taskObj) return;
       if (typeof taskObj.repo !== "string" || typeof taskObj.issue !== "string") return;
+      if (!extraFields || Object.keys(extraFields).some((key) => TASK_STATUS_FIELDS.has(key))) {
+        if (fromStatus === status) return;
+      }
 
       const taskId =
         (typeof path === "string" && path) || (typeof taskObj._path === "string" && taskObj._path) || undefined;
-      const workerId: string | undefined = taskId ? `${taskObj.repo}#${taskId}` : undefined;
-      const sessionId: string | undefined = extraFields?.["session-id"] ?? taskObj["session-id"];
+      const workerId: string | undefined = getOptionalField(normalizedExtraFields, taskObj, "worker-id");
+      const fallbackWorkerId = normalizeOptionalString(taskObj?.["worker-id"] as string | undefined);
+      const eventWorkerId = workerId ?? fallbackWorkerId;
+      const sessionId: string | undefined = getOptionalField(normalizedExtraFields, taskObj, "session-id");
 
-      ralphEventBus.publish(
-        buildRalphEvent({
-          type: "task.status_changed",
-          level: "info",
-          workerId,
-          repo: taskObj.repo,
-          taskId,
-          sessionId,
-          data: { from: fromStatus, to: status },
-        })
-      );
+      if (fromStatus !== status) {
+        ralphEventBus.publish(
+          buildRalphEvent({
+            type: "task.status_changed",
+            level: "info",
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
+            repo: taskObj.repo,
+            taskId,
+            sessionId,
+            data: { from: fromStatus, to: status },
+          })
+        );
+      }
 
-      if (status === "starting") {
+      if (status === "starting" && fromStatus !== status) {
         ralphEventBus.publish(
           buildRalphEvent({
             type: "task.assigned",
             level: "info",
-            workerId,
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
             repo: taskObj.repo,
             taskId,
             sessionId,
@@ -409,12 +593,12 @@ export async function updateTaskStatus(
         );
       }
 
-      if (status === "done") {
+      if (status === "done" && fromStatus !== status) {
         ralphEventBus.publish(
           buildRalphEvent({
             type: "task.completed",
             level: "info",
-            workerId,
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
             repo: taskObj.repo,
             taskId,
             sessionId,
@@ -423,12 +607,12 @@ export async function updateTaskStatus(
         );
       }
 
-      if (status === "escalated") {
+      if (status === "escalated" && fromStatus !== status) {
         ralphEventBus.publish(
           buildRalphEvent({
             type: "task.escalated",
             level: "warn",
-            workerId,
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
             repo: taskObj.repo,
             taskId,
             sessionId,
@@ -437,12 +621,12 @@ export async function updateTaskStatus(
         );
       }
 
-      if (status === "blocked") {
+      if (status === "blocked" && fromStatus !== status) {
         ralphEventBus.publish(
           buildRalphEvent({
             type: "task.blocked",
             level: "warn",
-            workerId,
+            ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
             repo: taskObj.repo,
             taskId,
             sessionId,
@@ -568,11 +752,22 @@ export function startWatching(onChange: QueueChangeHandler): void {
 
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(async () => {
-      if (shouldLog("queue:change", 2_000)) {
-        console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
-      }
       const [queued, starting] = await Promise.all([getQueuedTasks(), getTasksByStatus("starting")]);
       const tasks = [...starting, ...queued];
+      const fingerprints = tasks.map((task) => ({ task, ...computeHeartbeatOnlyChange(task) }));
+      const hasNonHeartbeatChange = fingerprints.some(({ isHeartbeatOnly }) => !isHeartbeatOnly);
+
+      fingerprints.forEach(({ task, fingerprint }) => {
+        if (!task._path) return;
+        lastTaskFingerprints.set(task._path, fingerprint);
+      });
+
+      if (hasNonHeartbeatChange && shouldLog("queue:change", 2_000)) {
+        console.log(`[ralph:queue] Change detected: ${eventType} ${filename}`);
+      }
+
+      if (!hasNonHeartbeatChange) return;
+
       for (const handler of changeHandlers) handler(tasks);
     }, 500);
   });

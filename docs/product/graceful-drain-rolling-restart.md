@@ -114,7 +114,7 @@ Two phases:
 
 - Phase 0 (no control plane required):
   - CLI writes a control file, e.g. `$XDG_STATE_HOME/ralph/control.json` (fallback `~/.local/state/ralph/control.json`, last resort `/tmp/ralph/<uid>/control.json`).
-  - Daemon watches/polls it.
+  - Daemon watches/polls it, and creates it on startup with `{ "mode": "running" }` if missing (configurable).
   - Optional: CLI sends `SIGUSR1` to prompt immediate reload.
 
 - Phase 1 (dashboard/control plane):
@@ -148,6 +148,8 @@ To safely run “old daemon + new daemon” overlap (rolling restart), introduce
 A daemon may only act on a task if:
 - it owns it (`daemon-id` matches), OR
 - the previous owner’s `heartbeat-at` is stale beyond TTL (e.g. 30s / 60s).
+
+Ownership TTL is configured via `ownershipTtlMs` (default 60s) in `~/.ralph/config.toml` or `~/.ralph/config.json`.
 
 This is the core protection against duplicate resumes and double-processing.
 

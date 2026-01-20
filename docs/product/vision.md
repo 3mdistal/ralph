@@ -41,6 +41,15 @@ When reviewing ~40 PRs/day and almost never rejecting them, the human becomes a 
 
 ## Architecture Decisions
 
+### Task note naming
+
+Task note filenames are derived from note names. Ralph sanitizes names before creating bwrb notes:
+- Replace path separators (`/` and `\`) with ` - `
+- Replace other forbidden filename characters (`:*?"<>|`) with `-`
+- Collapse whitespace, trim ends, and cap length to 180 characters
+- If sanitization yields an empty name, use `Untitled`
+- If a note already exists, append a short UUID suffix
+
 ### 1. Queue Lives in bwrb
 
 Use bwrb notes for task management:
@@ -53,6 +62,8 @@ This provides full auditability and integrates with existing Obsidian workflows.
 ### 2. Bot Branch Strategy
 
 Ralph/agents should merge to `bot/integration`, not `main` directly. Every ~10 PRs, create a rollup PR from `bot/integration` to `main` for batch human review.
+
+If the bot branch is missing on the remote, create it from the repository default branch head before applying branch protections or running tasks.
 
 Humans/maintainers may still merge directly to `main` when needed; the bot-branch strategy is a Ralph policy, not a repo-wide prohibition.
 
