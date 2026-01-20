@@ -85,17 +85,20 @@ describe("required checks resolution", () => {
     }
   });
 
-  test("falls back to main branch protection when bot branch missing", async () => {
+  test("falls back to default branch protection when bot branch missing", async () => {
     await writeJson(getRalphConfigJsonPath(), {
       repos: [{ name: "acme/rocket" }],
     });
 
     process.env.GH_TOKEN = "test-token";
     const fetchMock = mock(async (url: string) => {
+      if (url.endsWith("/repos/acme/rocket")) {
+        return new Response(JSON.stringify({ default_branch: "master" }), { status: 200 });
+      }
       if (url.endsWith("/repos/acme/rocket/branches/bot%2Fintegration/protection")) {
         return new Response("Not Found", { status: 404 });
       }
-      if (url.endsWith("/repos/acme/rocket/branches/main/protection")) {
+      if (url.endsWith("/repos/acme/rocket/branches/master/protection")) {
         return new Response(
           JSON.stringify({ required_status_checks: { contexts: ["CI"] } }),
           { status: 200 }
@@ -110,7 +113,7 @@ describe("required checks resolution", () => {
     try {
       const worker = new RepoWorker("acme/rocket", "/tmp");
       const result = await (worker as any).resolveRequiredChecksForMerge();
-      expect(result).toEqual({ checks: ["CI"], source: "protection", branch: "main" });
+      expect(result).toEqual({ checks: ["CI"], source: "protection", branch: "master" });
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -123,10 +126,13 @@ describe("required checks resolution", () => {
 
     process.env.GH_TOKEN = "test-token";
     const fetchMock = mock(async (url: string) => {
+      if (url.endsWith("/repos/acme/rocket")) {
+        return new Response(JSON.stringify({ default_branch: "master" }), { status: 200 });
+      }
       if (url.endsWith("/repos/acme/rocket/branches/bot%2Fintegration/protection")) {
         return new Response("Forbidden", { status: 403 });
       }
-      if (url.endsWith("/repos/acme/rocket/branches/main/protection")) {
+      if (url.endsWith("/repos/acme/rocket/branches/master/protection")) {
         return new Response("Not Found", { status: 404 });
       }
       throw new Error(`Unexpected fetch: ${url}`);

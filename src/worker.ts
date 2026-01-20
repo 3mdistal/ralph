@@ -851,19 +851,27 @@ export class RepoWorker {
       }
 
       const botBranch = getRepoBotBranch(this.repo);
-      const branches = Array.from(new Set([botBranch, "main"]));
       let lastError: { branch: string; error: unknown } | null = null;
-      for (const branch of branches) {
-        let protection: BranchProtection | null = null;
+      const tryFetchProtection = async (branch: string): Promise<BranchProtection | null> => {
         try {
-          protection = await this.fetchBranchProtection(branch);
+          return await this.fetchBranchProtection(branch);
         } catch (e: any) {
           lastError = { branch, error: e };
-          continue;
+          return null;
         }
+      };
 
-        if (!protection) continue;
-        return { checks: getProtectionContexts(protection), source: "protection", branch };
+      const botProtection = await tryFetchProtection(botBranch);
+      if (botProtection) {
+        return { checks: getProtectionContexts(botProtection), source: "protection", branch: botBranch };
+      }
+
+      const fallbackBranch = await this.resolveFallbackBranch(botBranch);
+      if (fallbackBranch !== botBranch) {
+        const fallbackProtection = await tryFetchProtection(fallbackBranch);
+        if (fallbackProtection) {
+          return { checks: getProtectionContexts(fallbackProtection), source: "protection", branch: fallbackBranch };
+        }
       }
 
       if (lastError) {
@@ -875,6 +883,17 @@ export class RepoWorker {
     })();
 
     return this.requiredChecksForMergePromise;
+  }
+
+  private async resolveFallbackBranch(botBranch: string): Promise<string> {
+    try {
+      const defaultBranch = await this.fetchRepoDefaultBranch();
+      if (defaultBranch && defaultBranch !== botBranch) return defaultBranch;
+    } catch {
+      // ignore; fallback handled below
+    }
+
+    return "main";
   }
 
   private async ensureBotBranchExistsBestEffort(): Promise<void> {
