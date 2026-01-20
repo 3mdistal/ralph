@@ -247,37 +247,6 @@ export function readControlStateSnapshot(opts?: {
   }
 }
 
-export function writeControlStateSnapshot(
-  state: ControlState,
-  opts?: { homeDir?: string; xdgStateHome?: string }
-): string {
-  const path = resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
-  ensureControlParentDir(path);
-
-  const payload = {
-    version: CONTROL_FILE_VERSION,
-    mode: state.mode,
-    pause_requested: typeof state.pauseRequested === "boolean" ? state.pauseRequested : undefined,
-    pause_at_checkpoint:
-      typeof state.pauseAtCheckpoint === "string" && state.pauseAtCheckpoint.trim()
-        ? state.pauseAtCheckpoint.trim()
-        : undefined,
-    drain_timeout_ms:
-      typeof state.drainTimeoutMs === "number" && Number.isFinite(state.drainTimeoutMs) && state.drainTimeoutMs >= 0
-        ? Math.floor(state.drainTimeoutMs)
-        : undefined,
-    opencode_profile:
-      typeof state.opencodeProfile === "string" && state.opencodeProfile.trim() ? state.opencodeProfile.trim() : undefined,
-  };
-
-  const tmpPath = `${path}.tmp-${process.pid}`;
-  const json = `${JSON.stringify(payload, null, 2)}\n`;
-
-  writeFileSync(tmpPath, json, { mode: 0o600 });
-  renameSync(tmpPath, path);
-  return path;
-}
-
 export function isDraining(homeDir?: string, defaults?: Partial<ControlDefaults>): boolean {
   return readControlStateSnapshot({ homeDir, defaults }).mode === "draining";
 }
