@@ -75,19 +75,13 @@ export class GitHubClient {
     return token ?? null;
   }
 
-  private requireToken(): string {
-    if (!this.token) {
-      throw new Error("Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests.");
-    }
-    return this.token;
-  }
-
   private buildHeaders(opts: RequestOptions): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
-      Authorization: `token ${this.requireToken()}`,
       "User-Agent": this.userAgent,
     };
+
+    if (this.token) headers.Authorization = `token ${this.token}`;
 
     if (opts.etag) headers["If-Match"] = opts.etag;
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
@@ -112,9 +106,15 @@ export class GitHubClient {
 
     const text = await res.text();
     if (!res.ok) {
+      const code = classifyStatus(res.status);
+      const missingTokenHint =
+        code === "auth" && !this.token
+          ? "Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests. "
+          : "";
+
       throw new GitHubApiError({
-        message: `GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}`.trim(),
-        code: classifyStatus(res.status),
+        message: `${missingTokenHint}GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}`.trim(),
+        code,
         status: res.status,
         requestId: res.headers.get("x-github-request-id"),
         responseText: text,
