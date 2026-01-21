@@ -12,6 +12,14 @@ let priorHome: string | undefined;
 let priorGhToken: string | undefined;
 let priorGithubToken: string | undefined;
 
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}
+
 async function writeJson(path: string, obj: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(obj, null, 2), "utf8");
@@ -34,9 +42,9 @@ describe("queue backend selection", () => {
   });
 
   afterEach(async () => {
-    process.env.HOME = priorHome;
-    process.env.GH_TOKEN = priorGhToken;
-    process.env.GITHUB_TOKEN = priorGithubToken;
+    restoreEnv("HOME", priorHome);
+    restoreEnv("GH_TOKEN", priorGhToken);
+    restoreEnv("GITHUB_TOKEN", priorGithubToken);
 
     await rm(homeDir, { recursive: true, force: true });
     __resetConfigForTests();
