@@ -1,5 +1,3 @@
-import type { LabelSpec } from "../github-labels";
-
 import type { ExistingLabelSpec, LabelSpec } from "../github-labels";
 
 export type GitHubErrorCode = "rate_limit" | "not_found" | "conflict" | "auth" | "unknown";
