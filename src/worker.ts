@@ -47,7 +47,7 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { computeMissingBaselineLabels, computeMissingRalphLabels } from "./github-labels";
+import { computeRalphLabelSync } from "./github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
@@ -634,37 +634,38 @@ export class RepoWorker {
     throw error;
   }
 
-  private async ensureBaselineLabelsOnce(): Promise<void> {
+  private async ensureRalphWorkflowLabelsOnce(): Promise<void> {
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
 
     this.ensureLabelsPromise = (async () => {
-      try {
-        const existing = await this.github.listLabels();
-        const missing = [...computeMissingBaselineLabels(existing), ...computeMissingRalphLabels(existing)];
-        if (missing.length === 0) return;
+      const existing = await this.github.listLabelSpecs();
+      const { toCreate, toUpdate } = computeRalphLabelSync(existing);
+      if (toCreate.length === 0 && toUpdate.length === 0) return;
 
-        const created: string[] = [];
-        for (const label of missing) {
-          try {
-            await this.github.createLabel(label);
-            created.push(label.name);
-          } catch (e: any) {
-            if (e instanceof GitHubApiError) {
-              if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
-            }
-            const msg = e?.message ?? String(e);
-            if (/already exists/i.test(msg)) continue;
-            throw e;
+      const created: string[] = [];
+      for (const label of toCreate) {
+        try {
+          await this.github.createLabel(label);
+          created.push(label.name);
+        } catch (e: any) {
+          if (e instanceof GitHubApiError) {
+            if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
           }
+          throw e;
         }
+      }
 
-        if (created.length > 0) {
-          console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
-        }
-      } catch (e: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to ensure baseline GitHub labels (continuing): ${e?.message ?? String(e)}`
-        );
+      const updated: string[] = [];
+      for (const update of toUpdate) {
+        await this.github.updateLabel(update.currentName, update.patch);
+        updated.push(update.currentName);
+      }
+
+      if (created.length > 0) {
+        console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
+      }
+      if (updated.length > 0) {
+        console.log(`[ralph:worker:${this.repo}] Updated GitHub label(s): ${updated.join(", ")}`);
       }
     })();
 
@@ -2840,7 +2841,7 @@ ${guidance}`
       return await this.skipClosedIssue(task, issueMeta, startTime);
     }
 
-    await this.ensureBaselineLabelsOnce();
+    await this.ensureRalphWorkflowLabelsOnce();
     await this.ensureBranchProtectionOnce();
 
     const issueMatch = task.issue.match(/#(\d+)$/);
@@ -3346,7 +3347,7 @@ ${guidance}`
         throw new Error("Failed to mark task starting (bwrb edit failed)");
       }
 
-      await this.ensureBaselineLabelsOnce();
+      await this.ensureRalphWorkflowLabelsOnce();
       await this.ensureBranchProtectionOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(

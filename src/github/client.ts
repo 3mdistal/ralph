@@ -1,5 +1,7 @@
 import type { LabelSpec } from "../github-labels";
 
+import type { ExistingLabelSpec, LabelSpec } from "../github-labels";
+
 export type GitHubErrorCode = "rate_limit" | "not_found" | "conflict" | "auth" | "unknown";
 
 export class GitHubApiError extends Error {
@@ -146,6 +148,32 @@ export class GitHubClient {
     return results;
   }
 
+  async listLabelSpecs(): Promise<ExistingLabelSpec[]> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const results: ExistingLabelSpec[] = [];
+    let page = 1;
+
+    while (page <= 10) {
+      const response = await this.request<
+        Array<{ name?: string | null; color?: string | null; description?: string | null }>
+      >(`/repos/${owner}/${name}/labels?per_page=100&page=${page}`);
+      const labels = response.data ?? [];
+      results.push(
+        ...labels
+          .filter((label) => Boolean(label?.name))
+          .map((label) => ({
+            name: label?.name ?? "",
+            color: label?.color ?? null,
+            description: label?.description ?? null,
+          }))
+      );
+      if (labels.length < 100) break;
+      page += 1;
+    }
+
+    return results;
+  }
+
   async createLabel(label: LabelSpec): Promise<void> {
     const { owner, name } = splitRepoFullName(this.repo);
     await this.request(`/repos/${owner}/${name}/labels`, {
@@ -155,6 +183,19 @@ export class GitHubClient {
         color: label.color,
         description: label.description,
       },
+    });
+  }
+
+  async updateLabel(labelName: string, patch: { color?: string; description?: string }): Promise<void> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const body: { color?: string; description?: string } = {};
+    if (patch.color !== undefined) body.color = patch.color;
+    if (patch.description !== undefined) body.description = patch.description;
+    if (Object.keys(body).length === 0) return;
+
+    await this.request(`/repos/${owner}/${name}/labels/${encodeURIComponent(labelName)}`, {
+      method: "PATCH",
+      body,
     });
   }
 }
