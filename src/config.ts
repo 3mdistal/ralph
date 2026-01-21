@@ -875,9 +875,7 @@ export function loadConfig(): ConfigLoadResult {
     meta = {
       source,
       queueBackendExplicit: Boolean(
-        fileConfig &&
-          Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend") &&
-          isQueueBackendValue(fileConfig.queueBackend)
+        fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend")
       ),
     };
   };
