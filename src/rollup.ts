@@ -1,6 +1,6 @@
 import { $ } from "bun";
 
-import { loadConfig, getRepoPath, getRepoBotBranch, getRepoRollupBatchSize } from "./config";
+import { getConfig, getRepoPath, getRepoBotBranch, getRepoRollupBatchSize } from "./config";
 import { ensureGhTokenEnv } from "./github-app-auth";
 import { notifyRollupReady, notifyError } from "./notify";
 import {
@@ -104,7 +104,7 @@ export class RollupMonitor {
   private batchSize: number;
 
   constructor(batchSize?: number) {
-    this.batchSize = batchSize ?? loadConfig().batchSize;
+    this.batchSize = batchSize ?? getConfig().batchSize;
     this.rehydrateFromState();
   }
 

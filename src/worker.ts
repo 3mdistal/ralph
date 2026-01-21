@@ -17,7 +17,7 @@ const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 
 const gh: GhRunner = DEFAULT_GH_RUNNER;
 
-import { type AgentTask, updateTaskStatus } from "./queue";
+import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "./queue-backend";
 import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
@@ -27,7 +27,7 @@ import {
   getRepoRequiredChecksOverride,
   isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
-  loadConfig,
+  getConfig,
   resolveOpencodeProfile,
 } from "./config";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
@@ -213,7 +213,8 @@ function summarizeForNote(text: string, maxChars = 900): string {
 }
 
 function resolveVaultPath(p: string): string {
-  const vault = loadConfig().bwrbVault;
+  const vault = getBwrbVaultIfValid();
+  if (!vault) return p;
   return isAbsolute(p) ? p : join(vault, p);
 }
 
@@ -2543,7 +2544,7 @@ ${guidance}`
   }
 
   private buildWatchdogOptions(task: AgentTask, stage: string) {
-    const cfg = loadConfig().watchdog;
+    const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
 
     return {
@@ -2597,7 +2598,7 @@ ${guidance}`
       };
     }
 
-    const defaults = loadConfig().control;
+    const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
     const requested = control.opencodeProfile?.trim() ?? "";
 
@@ -2665,7 +2666,7 @@ ${guidance}`
     if (pinned) {
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
-      const defaults = loadConfig().control;
+      const defaults = getConfig().control;
       const controlProfile =
         readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
 
@@ -4014,7 +4015,10 @@ ${guidance}`
       bodyPrefix?: string;
     }
   ): Promise<void> {
-    const vault = loadConfig().bwrbVault;
+    const vault = getBwrbVaultForStorage("create agent-run note");
+    if (!vault) {
+      return;
+    }
     const today = data.completed.toISOString().split("T")[0];
     const shortIssue = task.issue.split("/").pop() || task.issue;
 
