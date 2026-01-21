@@ -18,6 +18,7 @@ import {
   hasIdempotencyKey,
   recordRepoSync,
   recordIssueSnapshot,
+  recordIssueLabelsSnapshot,
   recordTaskSnapshot,
   recordPrSnapshot,
   recordRollupMerge,
@@ -63,7 +64,16 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       title: "Local state + config",
       state: "OPEN",
       url: "https://github.com/3mdistal/ralph/issues/59",
+      githubNodeId: "MDU6SXNzdWUxMjM0NTY=",
+      githubUpdatedAt: "2026-01-11T00:00:00.250Z",
       at: "2026-01-11T00:00:00.500Z",
+    });
+
+    recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      labels: ["ralph:queued", "dx"],
+      at: "2026-01-11T00:00:00.750Z",
     });
 
     recordTaskSnapshot({
@@ -115,19 +125,30 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("3");
+      expect(meta.value).toBe("4");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
 
-      const issueRow = db.query("SELECT title, state, url FROM issues").get() as {
+      const issueRow = db
+        .query("SELECT title, state, url, github_node_id, github_updated_at FROM issues")
+        .get() as {
         title?: string;
         state?: string;
         url?: string;
+        github_node_id?: string;
+        github_updated_at?: string;
       };
       expect(issueRow.title).toBe("Local state + config");
       expect(issueRow.state).toBe("OPEN");
       expect(issueRow.url).toBe("https://github.com/3mdistal/ralph/issues/59");
+      expect(issueRow.github_node_id).toBe("MDU6SXNzdWUxMjM0NTY=");
+      expect(issueRow.github_updated_at).toBe("2026-01-11T00:00:00.250Z");
+
+      const labelRows = db
+        .query("SELECT name FROM issue_labels ORDER BY name")
+        .all() as Array<{ name: string }>;
+      expect(labelRows).toEqual([{ name: "dx" }, { name: "ralph:queued" }]);
 
       const taskRows = db.query("SELECT worker_id, repo_slot FROM tasks ORDER BY task_path").all() as Array<{
         worker_id?: string;

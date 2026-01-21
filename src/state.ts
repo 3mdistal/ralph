@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 let db: Database | null = null;
 
@@ -69,6 +69,18 @@ function ensureSchema(database: Database): void {
         // ignore if already present
       }
     }
+    if (existingVersion && existingVersion < 4) {
+      try {
+        database.exec("ALTER TABLE issues ADD COLUMN github_node_id TEXT");
+      } catch {
+        // ignore if already present
+      }
+      try {
+        database.exec("ALTER TABLE issues ADD COLUMN github_updated_at TEXT");
+      } catch {
+        // ignore if already present
+      }
+    }
   }
 
   database.exec(
@@ -93,10 +105,20 @@ function ensureSchema(database: Database): void {
       title TEXT,
       state TEXT,
       url TEXT,
+      github_node_id TEXT,
+      github_updated_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(repo_id, number),
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS issue_labels (
+      issue_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(issue_id, name),
+      FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS tasks (
@@ -171,6 +193,8 @@ function ensureSchema(database: Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
+    CREATE INDEX IF NOT EXISTS idx_issues_repo_github_updated_at ON issues(repo_id, github_updated_at);
+    CREATE INDEX IF NOT EXISTS idx_issue_labels_issue_id ON issue_labels(issue_id);
     CREATE INDEX IF NOT EXISTS idx_rollup_batches_repo_status ON rollup_batches(repo_id, bot_branch, status);
     CREATE INDEX IF NOT EXISTS idx_rollup_batch_prs_batch ON rollup_batch_prs(batch_id);
   `);
@@ -253,12 +277,28 @@ export function recordRepoSync(params: {
     .run({ $repo_id: repoId, $last_sync_at: at });
 }
 
+export function getRepoLastSyncAt(repo: string): string | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT rs.last_sync_at as last_sync_at
+       FROM repo_sync rs
+       JOIN repos r ON r.id = rs.repo_id
+       WHERE r.name = $name`
+    )
+    .get({ $name: repo }) as { last_sync_at?: string } | undefined;
+
+  return typeof row?.last_sync_at === "string" ? row.last_sync_at : null;
+}
+
 export function recordIssueSnapshot(input: {
   repo: string;
   issue: string;
   title?: string;
   state?: string;
   url?: string;
+  githubNodeId?: string;
+  githubUpdatedAt?: string;
   at?: string;
 }): void {
   const database = requireDb();
@@ -270,13 +310,19 @@ export function recordIssueSnapshot(input: {
 
   database
     .query(
-      `INSERT INTO issues(repo_id, number, title, state, url, created_at, updated_at)
-       VALUES ($repo_id, $number, $title, $state, $url, $created_at, $updated_at)
+      `INSERT INTO issues(
+         repo_id, number, title, state, url, github_node_id, github_updated_at, created_at, updated_at
+       )
+       VALUES (
+         $repo_id, $number, $title, $state, $url, $github_node_id, $github_updated_at, $created_at, $updated_at
+       )
        ON CONFLICT(repo_id, number) DO UPDATE SET
-         title = COALESCE(excluded.title, issues.title),
-         state = COALESCE(excluded.state, issues.state),
-         url = COALESCE(excluded.url, issues.url),
-         updated_at = excluded.updated_at`
+          title = COALESCE(excluded.title, issues.title),
+          state = COALESCE(excluded.state, issues.state),
+          url = COALESCE(excluded.url, issues.url),
+          github_node_id = COALESCE(excluded.github_node_id, issues.github_node_id),
+          github_updated_at = COALESCE(excluded.github_updated_at, issues.github_updated_at),
+          updated_at = excluded.updated_at`
     )
     .run({
       $repo_id: repoId,
@@ -284,9 +330,64 @@ export function recordIssueSnapshot(input: {
       $title: input.title ?? null,
       $state: input.state ?? null,
       $url: input.url ?? null,
+      $github_node_id: input.githubNodeId ?? null,
+      $github_updated_at: input.githubUpdatedAt ?? null,
       $created_at: at,
       $updated_at: at,
     });
+}
+
+export function recordIssueLabelsSnapshot(input: {
+  repo: string;
+  issue: string;
+  labels: string[];
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = input.at ?? nowIso();
+  const repoId = upsertRepo({ repo: input.repo, at });
+  const issueNumber = parseIssueNumber(input.issue);
+
+  if (issueNumber === null) return;
+
+  database.transaction(() => {
+    database
+      .query(
+        `INSERT INTO issues(repo_id, number, created_at, updated_at)
+         VALUES ($repo_id, $number, $created_at, $updated_at)
+         ON CONFLICT(repo_id, number) DO UPDATE SET updated_at = excluded.updated_at`
+      )
+      .run({
+        $repo_id: repoId,
+        $number: issueNumber,
+        $created_at: at,
+        $updated_at: at,
+      });
+
+    const issueRow = database
+      .query("SELECT id FROM issues WHERE repo_id = $repo_id AND number = $number")
+      .get({ $repo_id: repoId, $number: issueNumber }) as { id?: number } | undefined;
+
+    if (!issueRow?.id) {
+      throw new Error(`Failed to resolve issue id for ${input.repo}#${issueNumber}`);
+    }
+
+    database.query("DELETE FROM issue_labels WHERE issue_id = $issue_id").run({ $issue_id: issueRow.id });
+
+    for (const label of input.labels) {
+      database
+        .query(
+          `INSERT INTO issue_labels(issue_id, name, created_at)
+           VALUES ($issue_id, $name, $created_at)
+           ON CONFLICT(issue_id, name) DO NOTHING`
+        )
+        .run({
+          $issue_id: issueRow.id,
+          $name: label,
+          $created_at: at,
+        });
+    }
+  })();
 }
 
 export function recordTaskSnapshot(input: {
