@@ -113,6 +113,8 @@ export interface ControlConfig {
   suppressMissingWarnings?: boolean;
 }
 
+export type QueueBackend = "github" | "bwrb" | "none";
+
 export interface RalphConfig {
   repos: RepoConfig[];
   /** Global max concurrent tasks across all repos (default: 6) */
@@ -121,6 +123,8 @@ export interface RalphConfig {
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
   /** Ownership TTL in ms for task heartbeats (default: 60000). */
   ownershipTtlMs: number;
+  /** Queue backend selection (default: "github"). */
+  queueBackend?: QueueBackend;
   bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // default GitHub owner (default: "3mdistal")
 
@@ -210,12 +214,17 @@ const DEFAULT_CONFIG: RalphConfig = {
   batchSize: 10,
   pollInterval: 30000,
   ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
+  queueBackend: "github",
   bwrbVault: detectDefaultBwrbVault(),
   owner: "3mdistal",
   devDir: join(homedir(), "Developer"),
 };
 
 let config: RalphConfig | null = null;
+
+type ConfigSource = "default" | "toml" | "json" | "legacy";
+let configSource: ConfigSource = "default";
+let queueBackendExplicit = false;
 
 function toPositiveIntOrNull(value: unknown): number | null {
   if (typeof value !== "number") return null;
@@ -275,6 +284,20 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       );
     }
     loaded.ownershipTtlMs = DEFAULT_OWNERSHIP_TTL_MS;
+  }
+
+  const rawQueueBackend = (loaded as any).queueBackend;
+  if (rawQueueBackend !== undefined) {
+    if (rawQueueBackend === "github" || rawQueueBackend === "bwrb" || rawQueueBackend === "none") {
+      loaded.queueBackend = rawQueueBackend;
+    } else {
+      console.warn(
+        `[ralph] Invalid config queueBackend=${JSON.stringify(rawQueueBackend)}; falling back to "github"`
+      );
+      loaded.queueBackend = "github";
+    }
+  } else if (!loaded.queueBackend) {
+    loaded.queueBackend = "github";
   }
 
   // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
@@ -790,6 +813,8 @@ export function loadConfig(): RalphConfig {
 
   // Start with defaults
   let loaded: RalphConfig = { ...DEFAULT_CONFIG };
+  configSource = "default";
+  queueBackendExplicit = false;
 
   // Try to load from file (precedence: ~/.ralph/config.toml > ~/.ralph/config.json > legacy ~/.config/opencode/ralph/ralph.json)
   const configTomlPath = getRalphConfigTomlPath();
@@ -820,12 +845,23 @@ export function loadConfig(): RalphConfig {
     }
   };
 
+  const recordConfigSource = (source: ConfigSource, fileConfig: any | null) => {
+    configSource = source;
+    queueBackendExplicit = Boolean(fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend"));
+  };
+
   if (existsSync(configTomlPath)) {
     const fileConfig = tryLoadToml(configTomlPath);
-    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+    if (fileConfig) {
+      loaded = { ...loaded, ...fileConfig };
+    }
+    recordConfigSource("toml", fileConfig);
   } else if (existsSync(configJsonPath)) {
     const fileConfig = tryLoadJson(configJsonPath);
-    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+    if (fileConfig) {
+      loaded = { ...loaded, ...fileConfig };
+    }
+    recordConfigSource("json", fileConfig);
   } else if (existsSync(legacyConfigPath)) {
     console.warn(
       `[ralph] Using legacy config path ${legacyConfigPath}. ` +
@@ -833,7 +869,10 @@ export function loadConfig(): RalphConfig {
     );
 
     const fileConfig = tryLoadJson(legacyConfigPath);
-    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+    if (fileConfig) {
+      loaded = { ...loaded, ...fileConfig };
+    }
+    recordConfigSource("legacy", fileConfig);
   }
 
   config = validateConfig(loaded);
@@ -842,6 +881,18 @@ export function loadConfig(): RalphConfig {
 
 export function __resetConfigForTests(): void {
   config = null;
+  configSource = "default";
+  queueBackendExplicit = false;
+}
+
+export function getConfigSource(): ConfigSource {
+  loadConfig();
+  return configSource;
+}
+
+export function isQueueBackendExplicit(): boolean {
+  loadConfig();
+  return queueBackendExplicit;
 }
 
 export function getRepoPath(repoName: string): string {

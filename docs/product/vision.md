@@ -50,14 +50,15 @@ Task note filenames are derived from note names. Ralph sanitizes names before cr
 - If sanitization yields an empty name, use `Untitled`
 - If a note already exists, append a short UUID suffix
 
-### 1. Queue Lives in bwrb
+### 1. Queue Lives in GitHub (migration: bwrb optional)
 
-Use bwrb notes for task management:
-- `agent-task` - Work items in the queue
-- `agent-run` - Completed work records with decisions
-- `agent-escalation` - Items needing human attention
+GitHub Issues are the source of truth for tasks during the GitHub-first migration:
+- GitHub Issues + labels drive the queue
+- `~/.ralph/state.sqlite` stores operational state for idempotency/recovery
 
-This provides full auditability and integrates with existing Obsidian workflows.
+bwrb remains supported as a legacy backend during the migration:
+- Enable via `queueBackend = "bwrb"` in `~/.ralph/config.toml` or `~/.ralph/config.json`
+- GitHub remains authoritative when both are configured (no dual-write in v0.1.0)
 
 ### 2. Bot Branch Strategy
 
