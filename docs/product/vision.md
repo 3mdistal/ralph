@@ -26,6 +26,7 @@ Keep this doc focused on product intent; update routing/escalation policy in one
 
 - `docs/product/dashboard-mvp-control-plane-tui.md`
 - `docs/product/graceful-drain-rolling-restart.md`
+- `docs/product/deterministic-gates.md`
 - `docs/product/usage-throttling.md`
 
 ## The Problem We're Solving
