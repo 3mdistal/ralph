@@ -882,14 +882,14 @@ export function loadConfig(): ConfigLoadResult {
     const fileConfig = tryLoadToml(configTomlPath);
     if (fileConfig) {
       loaded = { ...loaded, ...fileConfig };
+      recordConfigSource("toml", fileConfig);
     }
-    recordConfigSource("toml", fileConfig);
   } else if (existsSync(configJsonPath)) {
     const fileConfig = tryLoadJson(configJsonPath);
     if (fileConfig) {
       loaded = { ...loaded, ...fileConfig };
+      recordConfigSource("json", fileConfig);
     }
-    recordConfigSource("json", fileConfig);
   } else if (existsSync(legacyConfigPath)) {
     console.warn(
       `[ralph] Using legacy config path ${legacyConfigPath}. ` +
@@ -899,8 +899,8 @@ export function loadConfig(): ConfigLoadResult {
     const fileConfig = tryLoadJson(legacyConfigPath);
     if (fileConfig) {
       loaded = { ...loaded, ...fileConfig };
+      recordConfigSource("legacy", fileConfig);
     }
-    recordConfigSource("legacy", fileConfig);
   }
 
   configResult = {

@@ -17,7 +17,7 @@ const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 
 const gh: GhRunner = DEFAULT_GH_RUNNER;
 
-import { type AgentTask, ensureBwrbQueueOrWarn, getQueueBackendState, updateTaskStatus } from "./queue-backend";
+import { type AgentTask, ensureBwrbQueueOrWarn, getBwrbVaultOrNull, updateTaskStatus } from "./queue-backend";
 import {
   getOpencodeDefaultProfileName,
   getRepoBotBranch,
@@ -189,7 +189,8 @@ function summarizeForNote(text: string, maxChars = 900): string {
 }
 
 function resolveVaultPath(p: string): string {
-  const vault = getQueueBackendState().bwrbVault ?? "";
+  const vault = getBwrbVaultOrNull();
+  if (!vault) return p;
   return isAbsolute(p) ? p : join(vault, p);
 }
 
@@ -3650,7 +3651,8 @@ ${guidance}`
   ): Promise<void> {
     if (!ensureBwrbQueueOrWarn("create agent-run note")) return;
 
-    const vault = getQueueBackendState().bwrbVault ?? "";
+    const vault = getBwrbVaultOrNull();
+    if (!vault) return;
     const today = data.completed.toISOString().split("T")[0];
     const shortIssue = task.issue.split("/").pop() || task.issue;
 

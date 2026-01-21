@@ -2,7 +2,7 @@ import { $ } from "bun";
 import crypto from "crypto";
 import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
-import { createAgentTask, ensureBwrbQueueOrWarn, getQueueBackendState, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
+import { createAgentTask, ensureBwrbQueueOrWarn, getBwrbVaultOrNull, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 
@@ -91,7 +91,8 @@ function getNotificationPrefix(type: NotificationType): string {
 }
 
 function resolveVaultPath(p: string): string {
-  const vault = getQueueBackendState().bwrbVault ?? "";
+  const vault = getBwrbVaultOrNull();
+  if (!vault) return p;
   return isAbsolute(p) ? p : join(vault, p);
 }
 
@@ -100,7 +101,10 @@ async function bwrbNewIdea(json: string): Promise<{ success: boolean; path?: str
     return { success: false, error: "Queue backend is not bwrb" };
   }
 
-  const vault = getQueueBackendState().bwrbVault ?? "";
+  const vault = getBwrbVaultOrNull();
+  if (!vault) {
+    return { success: false, error: "Queue backend is not bwrb" };
+  }
   try {
     const result = await $`bwrb new idea --json ${json}`.cwd(vault).quiet();
     return JSON.parse(result.stdout.toString());
@@ -119,7 +123,10 @@ async function bwrbNewEscalation(json: string): Promise<{ success: boolean; path
     return { success: false, error: "Queue backend is not bwrb" };
   }
 
-  const vault = getQueueBackendState().bwrbVault ?? "";
+  const vault = getBwrbVaultOrNull();
+  if (!vault) {
+    return { success: false, error: "Queue backend is not bwrb" };
+  }
   try {
     const result = await $`bwrb new agent-escalation --json ${json}`.cwd(vault).quiet();
     return JSON.parse(result.stdout.toString());

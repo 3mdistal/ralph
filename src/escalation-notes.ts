@@ -2,7 +2,7 @@ import { $ } from "bun";
 import { existsSync } from "fs";
 import { readFile } from "fs/promises";
 import { join } from "path";
-import { ensureBwrbQueueOrWarn, getQueueBackendState } from "./queue-backend";
+import { ensureBwrbQueueOrWarn, getBwrbVaultOrNull } from "./queue-backend";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -46,7 +46,7 @@ let warnedMissingVault = false;
 function resolveBwrbVault(action: string): string | null {
   if (!ensureBwrbQueueOrWarn(action)) return null;
 
-  const vault = getQueueBackendState().bwrbVault ?? "";
+  const vault = getBwrbVaultOrNull();
   if (vault && existsSync(vault)) return vault;
 
   if (!warnedMissingVault) {

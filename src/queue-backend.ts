@@ -137,6 +137,12 @@ export function isBwrbQueueEnabled(): boolean {
   return state.backend === "bwrb" && state.health === "ok";
 }
 
+export function getBwrbVaultOrNull(): string | null {
+  const state = getQueueBackendState();
+  if (state.backend !== "bwrb" || state.health !== "ok") return null;
+  return state.bwrbVault ?? null;
+}
+
 export function ensureBwrbQueueOrWarn(action: string): boolean {
   const state = getQueueBackendState();
   if (state.backend === "bwrb" && state.health === "ok") return true;

@@ -21,6 +21,7 @@ import {
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
+  getBwrbVaultOrNull,
   getQueueBackendState,
   initialPoll,
   startWatching,
@@ -411,7 +412,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
       resumeDisabledUntil = ts;
     },
     resumeDisableMs: RESUME_DISABLE_MS,
-    getVaultPathForLogs: () => getQueueBackendState().bwrbVault ?? "",
+    getVaultPathForLogs: () => getBwrbVaultOrNull() ?? "<unknown>",
 
     ensureSemaphores,
     getGlobalSemaphore: () => globalSemaphore,
