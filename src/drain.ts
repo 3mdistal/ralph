@@ -1,13 +1,14 @@
-import { lstatSync, mkdirSync, readFileSync } from "fs";
-import { existsSync, writeFileSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 
-export type DaemonMode = "running" | "draining";
+export type DaemonMode = "running" | "draining" | "paused";
 
 export type ControlState = {
   mode: DaemonMode;
   pauseRequested?: boolean;
+  pauseAtCheckpoint?: string;
+  drainTimeoutMs?: number;
   /** Active OpenCode profile for starting new tasks (control file key: opencode_profile). */
   opencodeProfile?: string;
 };
@@ -16,6 +17,8 @@ export type ControlDefaults = {
   autoCreate: boolean;
   suppressMissingWarnings: boolean;
 };
+
+const CONTROL_FILE_VERSION = 1;
 
 const DEFAULT_CONTROL_DEFAULTS: ControlDefaults = {
   autoCreate: true,
@@ -70,17 +73,40 @@ function parseControlStateJson(raw: string): ControlState {
   }
 
   const obj = parsed as Record<string, unknown>;
-  const mode = obj.mode;
 
-  if (mode !== "running" && mode !== "draining") {
-    throw new Error(`Invalid control schema: mode must be 'running' or 'draining' (got ${JSON.stringify(mode)})`);
+  const versionRaw = obj.version;
+  const version = versionRaw === undefined ? 0 : versionRaw;
+
+  if (version !== 0 && version !== CONTROL_FILE_VERSION) {
+    throw new Error(
+      `Invalid control schema: version must be ${CONTROL_FILE_VERSION} (got ${JSON.stringify(versionRaw)})`
+    );
+  }
+
+  const mode = obj.mode;
+  const allowPaused = version === CONTROL_FILE_VERSION;
+
+  if (mode !== "running" && mode !== "draining" && (!allowPaused || mode !== "paused")) {
+    const expected = allowPaused ? "'running', 'draining', or 'paused'" : "'running' or 'draining'";
+    throw new Error(`Invalid control schema: mode must be ${expected} (got ${JSON.stringify(mode)})`);
   }
 
   const pauseRequestedRaw = obj.pause_requested;
-  const state: ControlState = { mode };
+  const pauseAtRaw = obj.pause_at_checkpoint;
+  const drainTimeoutRaw = obj.drain_timeout_ms;
+  const state: ControlState = { mode: mode as DaemonMode };
 
   if (typeof pauseRequestedRaw === "boolean") {
     state.pauseRequested = pauseRequestedRaw;
+  }
+
+  if (typeof pauseAtRaw === "string") {
+    const trimmed = pauseAtRaw.trim();
+    if (trimmed) state.pauseAtCheckpoint = trimmed;
+  }
+
+  if (typeof drainTimeoutRaw === "number" && Number.isFinite(drainTimeoutRaw) && drainTimeoutRaw >= 0) {
+    state.drainTimeoutMs = drainTimeoutRaw;
   }
 
   const opencodeProfileRaw = obj.opencode_profile;
@@ -183,7 +209,11 @@ function writeDefaultControlFile(path: string, log?: (message: string) => void):
   ensureControlParentDir(path, log);
 
   try {
-    writeFileSync(path, `${JSON.stringify({ mode: "running" }, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    writeFileSync(
+      path,
+      `${JSON.stringify({ version: CONTROL_FILE_VERSION, mode: "running" }, null, 2)}\n`,
+      { mode: 0o600, flag: "wx" }
+    );
     log?.(formatInfo(`Control file created at ${path} (defaulting to mode=running)`));
     return true;
   } catch (e: any) {
@@ -241,6 +271,7 @@ export class DrainMonitor {
       log?: (message: string) => void;
       warn?: (message: string) => void;
       onModeChange?: (mode: DaemonMode) => void;
+      onStateChange?: (state: ControlState) => void;
       defaults?: Partial<ControlDefaults>;
     } = {}
   ) {}
@@ -318,17 +349,20 @@ export class DrainMonitor {
       if (nextMode !== "running") {
         this.options.log?.(formatWarning(`Control mode: ${nextMode}`));
       }
+      this.options.onStateChange?.(this.state);
       return;
     }
 
     if (prevMode === nextMode) {
       this.state = next;
+      this.options.onStateChange?.(this.state);
       return;
     }
 
     this.state = next;
     this.options.log?.(formatWarning(`Control mode: ${nextMode}`));
     this.options.onModeChange?.(nextMode);
+    this.options.onStateChange?.(this.state);
   }
 
   private reloadNow(reason: string, opts?: { force?: boolean }): void {
@@ -360,7 +394,11 @@ export class DrainMonitor {
       }
 
       const warn = this.options.warn ?? this.options.log;
-      warn?.(formatWarning(`Failed to stat control file ${path}; defaulting to mode=running (reason: ${e?.message ?? String(e)})`));
+      warn?.(
+        formatWarning(
+          `Failed to stat control file ${path}; defaulting to mode=running (reason: ${e?.message ?? String(e)})`
+        )
+      );
 
       const fallback: ControlState = this.lastKnownGood ?? { mode: "running" };
       this.setState(fallback);

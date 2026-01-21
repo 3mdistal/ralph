@@ -1,6 +1,47 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
+import { dirname, join } from "path";
+import { tmpdir } from "os";
 
+import { __resetConfigForTests } from "../config";
+import { getRalphConfigJsonPath } from "../paths";
 import { RepoWorker } from "../worker";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
+
+let autoUpdateEnabled = false;
+let autoUpdateLabelGate: string | null = null;
+let autoUpdateMinMinutes = 30;
+
+let homeDir: string;
+let priorHome: string | undefined;
+let releaseLock: (() => void) | null = null;
+
+async function writeJson(path: string, obj: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(obj, null, 2), "utf8");
+}
+
+async function writeTestConfig(): Promise<void> {
+  await writeJson(getRalphConfigJsonPath(), {
+    repos: [
+      {
+        name: "3mdistal/ralph",
+        requiredChecks: ["ci"],
+        autoUpdateBehindPrs: autoUpdateEnabled,
+        autoUpdateBehindMinMinutes: autoUpdateMinMinutes,
+        autoUpdateBehindLabel: autoUpdateLabelGate,
+      },
+    ],
+    maxWorkers: 1,
+    batchSize: 10,
+    pollInterval: 30_000,
+    bwrbVault: "/tmp",
+    owner: "3mdistal",
+    allowedOwners: ["3mdistal"],
+    devDir: "/tmp",
+  });
+  __resetConfigForTests();
+}
 
 // --- Mocks used by adapters ---
 
@@ -106,7 +147,13 @@ afterAll(() => {
 });
 
 describe("integration-ish harness: full task lifecycle", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    releaseLock = await acquireGlobalTestLock();
+    priorHome = process.env.HOME;
+    homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
+    process.env.HOME = homeDir;
+    __resetConfigForTests();
+
     updateTaskStatusMock.mockClear();
     notifyEscalationMock.mockClear();
     notifyErrorMock.mockClear();
@@ -115,6 +162,9 @@ describe("integration-ish harness: full task lifecycle", () => {
     continueSessionMock.mockClear();
     continueCommandMock.mockClear();
     getThrottleDecisionMock.mockClear();
+    autoUpdateEnabled = false;
+    autoUpdateLabelGate = null;
+    autoUpdateMinMinutes = 30;
     getThrottleDecisionMock.mockImplementation(async () =>
       ({
         state: "ok",
@@ -128,6 +178,16 @@ describe("integration-ish harness: full task lifecycle", () => {
         },
       }) as any
     );
+
+    await writeTestConfig();
+  });
+
+  afterEach(async () => {
+    process.env.HOME = priorHome;
+    await rm(homeDir, { recursive: true, force: true });
+    __resetConfigForTests();
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("queued → in-progress → build → PR → merge → survey → done", async () => {
@@ -151,6 +211,17 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
+    const getPullRequestMergeStateMock = mock(async () => ({
+      number: 999,
+      url: "https://github.com/3mdistal/ralph/pull/999",
+      mergeStateStatus: "CLEAN",
+      isCrossRepository: false,
+      headRefName: "feature-branch",
+      headRepoFullName: "3mdistal/ralph",
+      baseRefName: "bot/integration",
+      labels: [],
+    }));
+    (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
 
     (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
     (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
@@ -180,7 +251,6 @@ describe("integration-ish harness: full task lifecycle", () => {
         checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
         timedOut: false,
       }));
-
 
     const mergePullRequestMock = mock(async () => {});
     const isPrBehindMock = mock(async () => false);
@@ -271,6 +341,17 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
+    const getPullRequestMergeStateMock = mock(async () => ({
+      number: 999,
+      url: "https://github.com/3mdistal/ralph/pull/999",
+      mergeStateStatus: "CLEAN",
+      isCrossRepository: false,
+      headRefName: "feature-branch",
+      headRepoFullName: "3mdistal/ralph",
+      baseRefName: "bot/integration",
+      labels: [],
+    }));
+    (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
 
     (worker as any).getPullRequestFiles = async () => [".github/workflows/ci.yml"];
     (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
@@ -496,6 +577,183 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("success");
     expect(waitForRequiredChecksMock).toHaveBeenCalled();
     expect(mergePullRequestMock).toHaveBeenCalled();
+  });
+
+  test("auto-update updates behind branch before merge", async () => {
+    autoUpdateEnabled = true;
+    await writeTestConfig();
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+
+    const getPullRequestMergeStateMock = mock(async () => ({
+      number: 999,
+      url: "https://github.com/3mdistal/ralph/pull/999",
+      mergeStateStatus: "BEHIND",
+      isCrossRepository: false,
+      headRefName: "feature-branch",
+      headRepoFullName: "3mdistal/ralph",
+      baseRefName: "bot/integration",
+      labels: ["ready"],
+    }));
+    const updatePullRequestBranchMock = mock(async () => {});
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      timedOut: false,
+    }));
+    const mergePullRequestMock = mock(async () => {});
+
+    (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
+    (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).createAgentRun = async () => {};
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("success");
+    expect(getPullRequestMergeStateMock).toHaveBeenCalledTimes(1);
+    expect(updatePullRequestBranchMock).toHaveBeenCalledTimes(1);
+    expect(waitForRequiredChecksMock).toHaveBeenCalledTimes(1);
+    expect(mergePullRequestMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("auto-update respects label gate", async () => {
+    autoUpdateEnabled = true;
+    autoUpdateLabelGate = "autoupdate";
+    await writeTestConfig();
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+
+    const getPullRequestMergeStateMock = mock(async () => ({
+      number: 999,
+      url: "https://github.com/3mdistal/ralph/pull/999",
+      mergeStateStatus: "BEHIND",
+      isCrossRepository: false,
+      headRefName: "feature-branch",
+      headRepoFullName: "3mdistal/ralph",
+      baseRefName: "bot/integration",
+      labels: [],
+    }));
+    const updatePullRequestBranchMock = mock(async () => {});
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      timedOut: false,
+    }));
+    const mergePullRequestMock = mock(async () => {});
+
+    (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
+    (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).createAgentRun = async () => {};
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("success");
+    expect(getPullRequestMergeStateMock).toHaveBeenCalledTimes(1);
+    expect(updatePullRequestBranchMock).not.toHaveBeenCalled();
+    expect(waitForRequiredChecksMock).toHaveBeenCalledTimes(1);
+    expect(mergePullRequestMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("auto-update escalates on conflicts", async () => {
+    autoUpdateEnabled = true;
+    await writeTestConfig();
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+
+    const getPullRequestMergeStateMock = mock(async () => ({
+      number: 999,
+      url: "https://github.com/3mdistal/ralph/pull/999",
+      mergeStateStatus: "DIRTY",
+      isCrossRepository: false,
+      headRefName: "feature-branch",
+      headRepoFullName: "3mdistal/ralph",
+      baseRefName: "bot/integration",
+      labels: [],
+    }));
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      timedOut: false,
+    }));
+
+    (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).createAgentRun = async () => {};
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("failed");
+    expect(getPullRequestMergeStateMock).toHaveBeenCalledTimes(1);
+    expect(waitForRequiredChecksMock).not.toHaveBeenCalled();
+    expect(notifyErrorMock).toHaveBeenCalled();
+    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
   });
 
   test("hard throttle pauses before any model send", async () => {

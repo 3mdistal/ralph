@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import {
   __buildCheckRunsResponse,
@@ -10,8 +10,20 @@ import {
   __TEST_ONLY_DEFAULT_SHA,
   RepoWorker,
 } from "../worker";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
+
+let releaseLock: (() => void) | null = null;
 
 describe("requiredChecks semantics", () => {
+  beforeEach(async () => {
+    releaseLock = await acquireGlobalTestLock();
+  });
+
+  afterEach(() => {
+    releaseLock?.();
+    releaseLock = null;
+  });
+
   test("requiredChecks=[] is treated as no gating (success)", () => {
     const summary = __summarizeRequiredChecksForTests(
       [{ name: "ci", state: "FAILURE", rawState: "FAILURE" }] as any,
@@ -67,8 +79,12 @@ describe("requiredChecks semantics", () => {
         return new Response("", { status: 201 });
       }
 
-      if (url.endsWith("/repos/acme/rocket/commits/bot/integration/check-runs?per_page=100")) {
+      if (url.endsWith("/repos/acme/rocket/commits/bot%2Fintegration/check-runs?per_page=100")) {
         return new Response(JSON.stringify(__buildCheckRunsResponse(["ci"])), { status: 200 });
+      }
+
+      if (url.endsWith("/repos/acme/rocket/commits/bot%2Fintegration/status?per_page=100")) {
+        return new Response(JSON.stringify({ statuses: [] }), { status: 200 });
       }
 
       if (url.endsWith("/repos/acme/rocket/branches/bot%2Fintegration/protection")) {
