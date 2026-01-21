@@ -4,6 +4,8 @@ Ralph's primary goal is to reduce micromanagement by making the "last mile" of a
 
 This doc defines the deterministic gates the orchestrator enforces so individual workers can stay focused on implementation, while Ralph retains oversight across the whole repo.
 
+Status: target spec (some pieces exist today; see "Current State")
+
 ## Goals
 
 - Reduce human interrupt surface by preventing avoidable PR churn.
@@ -13,7 +15,7 @@ This doc defines the deterministic gates the orchestrator enforces so individual
 
 ## Core Idea
 
-Workers implement and commit.
+Coding agents implement and commit.
 
 The orchestrator (not the worker) is responsible for:
 - running required checks before a PR can be opened
@@ -21,12 +23,38 @@ The orchestrator (not the worker) is responsible for:
 - enforcing that CI is green before merge
 - triaging failures and resuming/spawning follow-up work
 
+Where this applies:
+- Ralph-generated PRs should target `bot/integration` by default.
+- These gates are required before merging to `bot/integration`.
+- A rollup PR from `bot/integration` to `main` remains the primary human review surface and a natural E2E checkpoint.
+
+## Glossary
+
+- Agent: an OpenCode session doing implementation work for a task.
+- Orchestrator: Ralph Loop.
+- Repo worker: the Ralph process responsible for a repo (in code: `RepoWorker`).
+
+## Current State
+
+This doc is primarily a target contract for making progress deterministic.
+
+Already implemented today:
+- CI merge gating via `repos[].requiredChecks` and branch protection (see `README.md`).
+
+Not fully implemented today (this doc defines the intended behavior):
+- a durable, first-class gate record persisted across restarts (beyond ad-hoc run notes)
+- deterministic review-agent output format for Product/DevEx gate completion
+- CI failure triage that decides resume vs spawn vs quarantine
+
 ## Required Gate Fields
 
-Persist these on the run record (e.g. `agent-run`) so Ralph can be strict and deterministic:
+Persist gate metadata on an authoritative run record so Ralph can be strict and deterministic.
+
+Note: `agent-run` frontmatter in `.bwrb/schema.json` is currently modeled as a completed record and does not yet include these fields. Treat this list as the intended schema, not a statement of current implementation.
 
 - `preflight.status`: `pending|pass|fail|skipped`
 - `preflight.command`: string (exact commands run)
+- `preflight.skip_reason`: string (required when `skipped`)
 - `product_review.status`: `pending|pass|fail|skipped`
 - `devex_review.status`: `pending|pass|fail|skipped`
 - `ci.status`: `pending|pass|fail|skipped`
@@ -51,6 +79,9 @@ Recommended default preflight (repo-specific):
 - typecheck/build/compile
 - *targeted* unit tests when changing core logic
 
+Determinism requirement:
+- The preflight command must come from a repo-level configuration surface (not ad-hoc per agent). The run record stores the exact command string that was executed.
+
 ## Gate 2: Review Requests (Product + DevEx)
 
 Default: required for PRs produced by Ralph.
@@ -66,11 +97,27 @@ Minimum payload:
 
 This gate is complete when the review agents return explicit `pass|fail` and (if `fail`) an actionable reason.
 
+Deterministic review output contract:
+- The final line of the review agent response must include exactly one machine-parseable marker:
+
+  `RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}`
+
+Ralph treats any response without this marker as `fail` and routes via `docs/escalation-policy.md`.
+
 ## Gate 3: CI (Full Suite + Required Checks)
 
 Default: required.
 
-The orchestrator should run/await the required CI checks after the PR is opened.
+Ralph should run/await the required CI checks after the PR is opened.
+
+This should align with the existing merge gate:
+- Required checks are configured via `repos[].requiredChecks` (see `README.md`).
+- Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require these checks.
+
+Status mapping:
+- `ci.status=pass` maps to GitHub check state `success`.
+- `ci.status=fail` maps to GitHub check state `failure`.
+- `ci.status=pending` maps to GitHub check state `pending`.
 
 If CI is green: proceed.
 
@@ -90,6 +137,9 @@ When CI fails, Ralph creates a triage step that:
 Guidelines:
 - avoid pasting full CI logs into LLM context; summarize and attach a short excerpt
 - store the CI URL and any extracted snippets as artifacts on the run record
+
+Escalation policy:
+- CI failures should default to an internal rework loop (resume/spawn) and only escalate to a human when they meet an escalation condition in `docs/escalation-policy.md` (e.g. product doc gap, hard external blocker).
 
 ## Test Philosophy (Agentic Coding)
 
