@@ -104,4 +104,26 @@ describe("queue backend selection", () => {
     expect(state.health).toBe("unavailable");
     expect(state.fallback).toBe(false);
   });
+
+  test("invalid queueBackend falls back to bwrb when vault is available", async () => {
+    const vaultPath = join(homeDir, "vault-invalid");
+    await mkdir(join(vaultPath, ".bwrb"), { recursive: true });
+    await writeFile(join(vaultPath, ".bwrb", "schema.json"), "{}", "utf8");
+
+    const configPath = getRalphConfigJsonPath();
+    await writeJson(configPath, {
+      queueBackend: "githb",
+      bwrbVault: vaultPath,
+      repos: [],
+    });
+
+    __resetConfigForTests();
+    __resetQueueBackendStateForTests();
+
+    const state = getQueueBackendState();
+    expect(state.desiredBackend).toBe("github");
+    expect(state.backend).toBe("bwrb");
+    expect(state.health).toBe("ok");
+    expect(state.fallback).toBe(true);
+  });
 });

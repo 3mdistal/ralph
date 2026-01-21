@@ -874,7 +874,11 @@ export function loadConfig(): ConfigLoadResult {
   const recordConfigSource = (source: ConfigSource, fileConfig: any | null) => {
     meta = {
       source,
-      queueBackendExplicit: Boolean(fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend")),
+      queueBackendExplicit: Boolean(
+        fileConfig &&
+          Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend") &&
+          isQueueBackendValue(fileConfig.queueBackend)
+      ),
     };
   };
 
