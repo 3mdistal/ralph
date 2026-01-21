@@ -4,9 +4,11 @@ import { dirname, join } from "path";
 import { tmpdir } from "os";
 
 import { getRalphConfigJsonPath, getRalphConfigTomlPath, getRalphLegacyConfigPath } from "../paths";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
 let priorHome: string | undefined;
+let releaseLock: (() => void) | null = null;
 
 async function writeJson(path: string, obj: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
@@ -16,6 +18,7 @@ async function writeJson(path: string, obj: unknown): Promise<void> {
 describe("Config precedence (~/.ralph)", () => {
   beforeEach(async () => {
     priorHome = process.env.HOME;
+    releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
   });
@@ -23,6 +26,8 @@ describe("Config precedence (~/.ralph)", () => {
   afterEach(async () => {
     process.env.HOME = priorHome;
     await rm(homeDir, { recursive: true, force: true });
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("prefers ~/.ralph/config.toml over ~/.ralph/config.json", async () => {

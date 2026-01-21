@@ -7,6 +7,8 @@ import { Database } from "bun:sqlite";
 import {
   closeStateDbForTests,
   createNewRollupBatch,
+  deleteIdempotencyKey,
+  getIdempotencyPayload,
   getOrCreateRollupBatch,
   initStateDb,
   listOpenRollupBatches,
@@ -19,15 +21,19 @@ import {
   recordTaskSnapshot,
   recordPrSnapshot,
   recordRollupMerge,
+  upsertIdempotencyKey,
 } from "../state";
 import { getRalphStateDbPath } from "../paths";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
 let priorHome: string | undefined;
+let releaseLock: (() => void) | null = null;
 
 describe("State SQLite (~/.ralph/state.sqlite)", () => {
   beforeEach(async () => {
     priorHome = process.env.HOME;
+    releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
     closeStateDbForTests();
@@ -37,6 +43,8 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     closeStateDbForTests();
     process.env.HOME = priorHome;
     await rm(homeDir, { recursive: true, force: true });
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("initializes schema and supports metadata writes", () => {
@@ -95,6 +103,12 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(recordIdempotencyKey({ key: "k1", scope: "test" })).toBe(true);
     expect(recordIdempotencyKey({ key: "k1", scope: "test" })).toBe(false);
     expect(hasIdempotencyKey("k1")).toBe(true);
+
+    expect(getIdempotencyPayload("k1")).toBe(null);
+    upsertIdempotencyKey({ key: "k1", scope: "test", payloadJson: JSON.stringify({ ok: true }) });
+    expect(JSON.parse(getIdempotencyPayload("k1") ?? "{}")).toEqual({ ok: true });
+    deleteIdempotencyKey("k1");
+    expect(hasIdempotencyKey("k1")).toBe(false);
 
     const dbPath = getRalphStateDbPath();
     const db = new Database(dbPath);

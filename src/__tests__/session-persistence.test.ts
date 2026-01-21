@@ -84,6 +84,25 @@ describe("Session Persistence", () => {
       const taskWithRetries = createMockTask({ "watchdog-retries": "1" });
       expect(taskWithRetries["watchdog-retries"]).toBe("1");
     });
+
+    test("ownership fields are optional", () => {
+      const taskWithoutOwnership = createMockTask();
+      expect(taskWithoutOwnership["daemon-id"]).toBeUndefined();
+      expect(taskWithoutOwnership["heartbeat-at"]).toBeUndefined();
+      expect(taskWithoutOwnership["pause-requested"]).toBeUndefined();
+      expect(taskWithoutOwnership.checkpoint).toBeUndefined();
+
+      const taskWithOwnership = createMockTask({
+        "daemon-id": "d_test",
+        "heartbeat-at": "2026-01-18T00:00:00.000Z",
+        "pause-requested": "true",
+        checkpoint: "planned",
+      });
+      expect(taskWithOwnership["daemon-id"]).toBe("d_test");
+      expect(taskWithOwnership["heartbeat-at"]).toBe("2026-01-18T00:00:00.000Z");
+      expect(taskWithOwnership["pause-requested"]).toBe("true");
+      expect(taskWithOwnership.checkpoint).toBe("planned");
+    });
   });
 
   describe("Task categorization logic", () => {

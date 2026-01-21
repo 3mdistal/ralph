@@ -40,7 +40,8 @@ import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 
-import { DrainMonitor, isDraining, readControlStateSnapshot, type DaemonMode } from "./drain";
+import { DrainMonitor, readControlStateSnapshot, type DaemonMode } from "./drain";
+import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
 import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
@@ -72,6 +73,11 @@ const workers = new Map<string, RepoWorker>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
+let drainRequestedAt: number | null = null;
+let drainTimeoutMs: number | null = null;
+let pauseRequestedByControl = false;
+let pauseAtCheckpoint: RalphCheckpoint | null = null;
+
 const daemonId = `d_${crypto.randomUUID()}`;
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
@@ -89,7 +95,66 @@ const idleState = new Map<
 
 function getDaemonMode(defaults?: Partial<ControlConfig>): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
-  return isDraining(undefined, defaults) ? "draining" : "running";
+  return readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).mode;
+}
+
+function applyControlState(control: {
+  mode: DaemonMode;
+  pauseRequested?: boolean;
+  pauseAtCheckpoint?: string;
+  drainTimeoutMs?: number;
+}): void {
+  const mode = control.mode;
+  if (mode === "draining" && drainRequestedAt === null) {
+    drainRequestedAt = Date.now();
+  }
+  if (mode !== "draining") {
+    drainRequestedAt = null;
+  }
+
+  if (typeof control.drainTimeoutMs === "number") {
+    drainTimeoutMs = control.drainTimeoutMs;
+  } else {
+    drainTimeoutMs = null;
+  }
+
+  pauseRequestedByControl = control.pauseRequested === true;
+
+  if (typeof control.pauseAtCheckpoint === "string" && isRalphCheckpoint(control.pauseAtCheckpoint)) {
+    pauseAtCheckpoint = control.pauseAtCheckpoint as RalphCheckpoint;
+  } else {
+    pauseAtCheckpoint = null;
+  }
+}
+
+type DaemonGate = {
+  allowDequeue: boolean;
+  allowResume: boolean;
+  allowModelSend: boolean;
+  reason: "running" | "draining" | "paused" | "hard-throttled";
+};
+
+function computeDaemonGate(opts: {
+  mode: DaemonMode;
+  throttle: ThrottleDecision;
+  isShuttingDown: boolean;
+}): DaemonGate {
+  if (opts.isShuttingDown) {
+    return { allowDequeue: false, allowResume: false, allowModelSend: false, reason: "paused" };
+  }
+  if (opts.mode === "paused") {
+    return { allowDequeue: false, allowResume: false, allowModelSend: false, reason: "paused" };
+  }
+  if (opts.throttle.state === "hard") {
+    return { allowDequeue: false, allowResume: false, allowModelSend: false, reason: "hard-throttled" };
+  }
+  if (opts.mode === "draining") {
+    return { allowDequeue: false, allowResume: true, allowModelSend: true, reason: "draining" };
+  }
+  if (opts.throttle.state === "soft") {
+    return { allowDequeue: false, allowResume: true, allowModelSend: true, reason: "running" };
+  }
+  return { allowDequeue: true, allowResume: true, allowModelSend: true, reason: "running" };
 }
 
 function getActiveOpencodeProfileName(defaults?: Partial<ControlConfig>): string | null {
@@ -664,6 +729,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
 
   const selection = await resolveOpencodeProfileForNewWork(Date.now(), getActiveOpencodeProfileName(defaults));
   const throttle = selection.decision;
+  const gate = computeDaemonGate({ mode: getDaemonMode(), throttle, isShuttingDown });
 
   if (selection.source === "failover") {
     const requested = selection.requestedProfile ?? "default";
@@ -674,8 +740,8 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     }
   }
 
-  if (throttle.state === "hard") {
-    if (shouldLog("daemon:hard-throttle", 30_000)) {
+  if (!gate.allowModelSend) {
+    if (gate.reason === "hard-throttled" && shouldLog("daemon:hard-throttle", 30_000)) {
       console.warn(
         `[ralph] Hard throttle active (profile=${throttle.snapshot.opencodeProfile ?? "ambient"}); skipping task scheduling until ${
           throttle.snapshot.resumeAt ?? "unknown"
@@ -685,6 +751,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     return;
   }
 
+  if (!gate.allowDequeue && pendingResumeTasks.size === 0) return;
   if (throttle.state === "soft") return;
 
   const nowMs = Date.now();
@@ -1019,6 +1086,9 @@ async function main(): Promise<void> {
   drainMonitor = new DrainMonitor({
     log: (message) => console.log(message),
     defaults: config.control,
+    onStateChange: (state) => {
+      applyControlState(state);
+    },
     onModeChange: (mode) => {
       if (isShuttingDown) return;
       if (mode !== "running") return;
@@ -1030,6 +1100,7 @@ async function main(): Promise<void> {
     },
   });
   drainMonitor.start();
+  applyControlState(drainMonitor.getState());
 
   // Initialize rollup monitor
   rollupMonitor = new RollupMonitor(config.batchSize);
@@ -1238,7 +1309,7 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Drain mode: set mode=draining|running in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
+      "  Control file: set version=1 and mode=running|draining|paused in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
       "  OpenCode profile: set opencode_profile=\"<name>\" in the same control file (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
@@ -1380,14 +1451,17 @@ if (args[0] === "status") {
   const selection = await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile);
   const resolvedProfile: string | null = selection.profileName;
   const throttle = selection.decision;
+  const gate = computeDaemonGate({ mode: control.mode, throttle, isShuttingDown: false });
 
-  const mode = control.mode === "draining"
-    ? "draining"
-    : throttle.state === "hard"
-      ? "hard-throttled"
-      : throttle.state === "soft"
-        ? "soft-throttled"
-        : "running";
+  const mode = gate.reason === "hard-throttled"
+    ? "hard-throttled"
+    : gate.reason === "paused"
+      ? "paused"
+      : gate.reason === "draining"
+        ? "draining"
+        : throttle.state === "soft"
+          ? "soft-throttled"
+          : "running";
 
   const [starting, inProgress, queued, throttled, pendingEscalations] = await Promise.all([
     getTasksByStatus("starting"),
@@ -1440,6 +1514,12 @@ if (args[0] === "status") {
             priority: t.priority ?? "p2-medium",
             opencodeProfile: getTaskOpencodeProfileName(t),
           })),
+          drain: {
+            requestedAt: drainRequestedAt ? new Date(drainRequestedAt).toISOString() : null,
+            timeoutMs: drainTimeoutMs ?? null,
+            pauseRequested: pauseRequestedByControl,
+            pauseAtCheckpoint,
+          },
           queued: queued.map((t) => ({
             name: t.name,
             repo: t.repo,
@@ -1473,6 +1553,9 @@ if (args[0] === "status") {
   console.log(`Queue backend: ${queueState.backend}${statusSuffix}`);
   if (queueState.diagnostics) {
     console.log(`Queue diagnostics: ${queueState.diagnostics}`);
+  }
+  if (pauseRequestedByControl) {
+    console.log(`Pause requested: true${pauseAtCheckpoint ? ` (checkpoint: ${pauseAtCheckpoint})` : ""}`);
   }
   if (controlProfile === "auto") {
     console.log(`Active OpenCode profile: auto (resolved: ${resolvedProfile ?? "ambient"})`);

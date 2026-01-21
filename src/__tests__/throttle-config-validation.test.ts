@@ -4,6 +4,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 
 import { getRalphConfigTomlPath } from "../paths";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 type EnvSnapshot = {
   HOME?: string;
@@ -11,6 +12,7 @@ type EnvSnapshot = {
 
 let homeDir: string;
 let priorEnv: EnvSnapshot;
+let releaseLock: (() => void) | null = null;
 
 async function writeToml(lines: string[]): Promise<void> {
   await mkdir(join(homeDir, ".ralph"), { recursive: true });
@@ -20,6 +22,7 @@ async function writeToml(lines: string[]): Promise<void> {
 describe("throttle config validation", () => {
   beforeEach(async () => {
     priorEnv = { HOME: process.env.HOME };
+    releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
   });
@@ -27,6 +30,8 @@ describe("throttle config validation", () => {
   afterEach(async () => {
     process.env.HOME = priorEnv.HOME;
     await rm(homeDir, { recursive: true, force: true });
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("loads throttle config including per-profile overrides", async () => {

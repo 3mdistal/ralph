@@ -26,6 +26,7 @@ Keep this doc focused on product intent; update routing/escalation policy in one
 
 - `docs/product/dashboard-mvp-control-plane-tui.md`
 - `docs/product/graceful-drain-rolling-restart.md`
+- `docs/product/deterministic-gates.md`
 - `docs/product/usage-throttling.md`
 
 ## The Problem We're Solving
@@ -50,11 +51,12 @@ Task note filenames are derived from note names. Ralph sanitizes names before cr
 - If sanitization yields an empty name, use `Untitled`
 - If a note already exists, append a short UUID suffix
 
-### 1. Queue Lives in GitHub (migration: bwrb optional)
+### 1. Queue Lives in GitHub Issues (migration: bwrb optional)
 
-GitHub Issues are the source of truth for tasks during the GitHub-first migration:
-- GitHub Issues + labels drive the queue
-- `~/.ralph/state.sqlite` stores operational state for idempotency/recovery
+GitHub Issues are the source of truth for queue state and dependency relationships.
+SQLite under `~/.ralph` stores operational state (session IDs, worktree paths, cursors).
+
+See `docs/product/github-first-orchestration.md` for the canonical contract.
 
 bwrb remains supported as a legacy backend during the migration:
 - Enable via `queueBackend = "bwrb"` in `~/.ralph/config.toml` or `~/.ralph/config.json`
@@ -76,6 +78,10 @@ Rollup automation policy:
 - Default batch size is 10 (configurable globally or per repo).
 - If there are no queued or in-flight tasks for 5 minutes, check for unrolled changes on `bot/integration`.
 - Create a rollup PR from `bot/integration` to `main` when there are unrolled changes, unless one is already open.
+
+Merge gating defaults:
+- Policy decision: when Ralph derives required checks from branch protection and protection is missing or unreadable, it should fail open (treat required checks as empty) to avoid blocking automation.
+- Policy decision: branch protection enforcement (and bot branch creation for enforcement) only runs when `repos[].requiredChecks` is explicitly configured; otherwise leave existing branch protection unchanged.
 
 Benefits:
 - Reduces interrupt frequency

@@ -12,16 +12,24 @@ export interface RepoConfig {
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
   /**
-   * Required status checks for merge gating (default: ["ci"]).
+   * Required status checks for merge gating (default: derive from branch protection).
    *
    * Values must match the check context name shown by GitHub.
    * Set to [] to disable merge gating for a repo.
+   * When omitted, Ralph derives required checks from GitHub branch protection on the bot branch,
+   * falling back to the repo default branch. Missing/unreadable protection disables gating.
    */
   requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
+  /** Enable proactive update-branch when a PR is BEHIND (default: false). */
+  autoUpdateBehindPrs?: boolean;
+  /** Optional label gate for proactive update-branch (default: none). */
+  autoUpdateBehindLabel?: string;
+  /** Minimum minutes between proactive updates per PR (default: 30). */
+  autoUpdateBehindMinMinutes?: number;
 }
 
 
@@ -152,6 +160,7 @@ export interface RalphConfig {
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
+const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
 const DEFAULT_THROTTLE_SOFT_PCT = 0.65;
@@ -330,6 +339,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
     const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
+    const autoUpdateMin = toPositiveIntOrNull((repo as any).autoUpdateBehindMinMinutes);
     const updates: Partial<RepoConfig> = {};
 
     if ((repo as any).maxWorkers !== undefined && !mw) {
@@ -346,6 +356,36 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           `falling back to global batchSize`
       );
       updates.rollupBatchSize = undefined;
+    }
+
+    const rawAutoUpdate = (repo as any).autoUpdateBehindPrs;
+    if (rawAutoUpdate !== undefined && typeof rawAutoUpdate !== "boolean") {
+      console.warn(
+        `[ralph] Invalid config autoUpdateBehindPrs for repo ${repo.name}: ${JSON.stringify(rawAutoUpdate)}; ` +
+          `defaulting to false`
+      );
+      updates.autoUpdateBehindPrs = false;
+    }
+
+    const rawLabelGate = (repo as any).autoUpdateBehindLabel;
+    if (rawLabelGate !== undefined) {
+      if (typeof rawLabelGate === "string" && rawLabelGate.trim()) {
+        updates.autoUpdateBehindLabel = rawLabelGate.trim();
+      } else {
+        console.warn(
+          `[ralph] Invalid config autoUpdateBehindLabel for repo ${repo.name}: ${JSON.stringify(rawLabelGate)}; ` +
+            `disabling label gate`
+        );
+        updates.autoUpdateBehindLabel = undefined;
+      }
+    }
+
+    if ((repo as any).autoUpdateBehindMinMinutes !== undefined && !autoUpdateMin) {
+      console.warn(
+        `[ralph] Invalid config autoUpdateBehindMinMinutes for repo ${repo.name}: ` +
+          `${JSON.stringify((repo as any).autoUpdateBehindMinMinutes)}; falling back to ${DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES}`
+      );
+      updates.autoUpdateBehindMinMinutes = DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES;
     }
 
     if (Object.keys(updates).length === 0) return repo;
@@ -956,11 +996,10 @@ export function getRepoBotBranch(repoName: string): string {
   return explicit?.botBranch ?? "bot/integration";
 }
 
-export function getRepoRequiredChecks(repoName: string): string[] {
+export function getRepoRequiredChecksOverride(repoName: string): string[] | null {
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
-  const checks = toStringArrayOrNull(explicit?.requiredChecks);
-  return checks ?? ["ci"];
+  return toStringArrayOrNull(explicit?.requiredChecks);
 }
 
 export function getGlobalMaxWorkers(): number {
@@ -979,6 +1018,26 @@ export function getRepoRollupBatchSize(repoName: string, fallback?: number): num
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const rollupBatch = toPositiveIntOrNull(explicit?.rollupBatchSize);
   return rollupBatch ?? fallback ?? cfg.batchSize;
+}
+
+export function isAutoUpdateBehindEnabled(repoName: string): boolean {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  return explicit?.autoUpdateBehindPrs ?? false;
+}
+
+export function getAutoUpdateBehindLabelGate(repoName: string): string | null {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const label = explicit?.autoUpdateBehindLabel;
+  return typeof label === "string" && label.trim() ? label.trim() : null;
+}
+
+export function getAutoUpdateBehindMinMinutes(repoName: string): number {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const parsed = toPositiveIntOrNull(explicit?.autoUpdateBehindMinMinutes);
+  return parsed ?? DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES;
 }
 
 export function normalizeRepoName(repo: string): string {
