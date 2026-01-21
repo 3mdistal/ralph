@@ -94,13 +94,21 @@ export function getQueueBackendState(): QueueBackendState {
         }
       }
     } else if (!isGitHubAuthConfigured(config)) {
-      diagnostics =
-        "GitHub auth is not configured (set githubApp in ~/.ralph/config.* or GH_TOKEN/GITHUB_TOKEN).";
-      if (explicit) {
-        health = "unavailable";
+      const fallbackCheck = checkBwrbVaultLayout(config.bwrbVault);
+      if (!explicit && fallbackCheck.ok) {
+        backend = "bwrb";
+        health = "ok";
+        diagnostics =
+          "GitHub auth is not configured (set githubApp in ~/.ralph/config.* or GH_TOKEN/GITHUB_TOKEN); falling back to bwrb.";
       } else {
-        backend = "none";
-        health = "degraded";
+        diagnostics =
+          "GitHub auth is not configured (set githubApp in ~/.ralph/config.* or GH_TOKEN/GITHUB_TOKEN).";
+        if (explicit) {
+          health = "unavailable";
+        } else {
+          backend = "none";
+          health = "degraded";
+        }
       }
     }
   } else {
