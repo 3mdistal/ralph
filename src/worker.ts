@@ -658,7 +658,7 @@ export class RepoWorker {
   private getGitHubToken(): string {
     const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
     if (!token) {
-      throw new Error("Missing GH_TOKEN/GITHUB_TOKEN; cannot update branch protection.");
+      throw new Error("Missing GH_TOKEN/GITHUB_TOKEN; cannot call GitHub API.");
     }
     return token;
   }
