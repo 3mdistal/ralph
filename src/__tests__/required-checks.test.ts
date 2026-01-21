@@ -10,25 +10,13 @@ import {
   __TEST_ONLY_DEFAULT_SHA,
   RepoWorker,
 } from "../worker";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let releaseLock: (() => void) | null = null;
 
-const TEST_LOCK_KEY = "__ralphTestLock";
-
-async function acquireGlobalLock(): Promise<() => void> {
-  const current = (globalThis as any)[TEST_LOCK_KEY] ?? Promise.resolve();
-  let release: () => void;
-  const next = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  (globalThis as any)[TEST_LOCK_KEY] = current.then(() => next);
-  await current;
-  return release!;
-}
-
 describe("requiredChecks semantics", () => {
   beforeEach(async () => {
-    releaseLock = await acquireGlobalLock();
+    releaseLock = await acquireGlobalTestLock();
   });
 
   afterEach(() => {
