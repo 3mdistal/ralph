@@ -19,10 +19,13 @@ const gh: GhRunner = DEFAULT_GH_RUNNER;
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import {
+  getAutoUpdateBehindLabelGate,
+  getAutoUpdateBehindMinMinutes,
   getOpencodeDefaultProfileName,
   getRepoBotBranch,
   getRepoMaxWorkers,
   getRepoRequiredChecksOverride,
+  isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
   loadConfig,
   resolveOpencodeProfile,
@@ -44,11 +47,12 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { computeMissingBaselineLabels } from "./github-labels";
+import { computeMissingBaselineLabels, computeMissingRalphLabels } from "./github-labels";
+import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
-import { recordIssueSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import { getIdempotencyPayload, upsertIdempotencyKey, recordIssueSnapshot } from "./state";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -62,6 +66,26 @@ type SessionAdapter = {
   continueSession: typeof continueSession;
   continueCommand: typeof continueCommand;
   getRalphXdgCacheHome: typeof getRalphXdgCacheHome;
+};
+
+type PullRequestMergeStateStatus =
+  | "BEHIND"
+  | "BLOCKED"
+  | "CLEAN"
+  | "DIRTY"
+  | "DRAFT"
+  | "HAS_HOOKS"
+  | "UNKNOWN";
+
+type PullRequestMergeState = {
+  number: number;
+  url: string;
+  mergeStateStatus: PullRequestMergeStateStatus | null;
+  isCrossRepository: boolean;
+  headRefName: string;
+  headRepoFullName: string;
+  baseRefName: string;
+  labels: string[];
 };
 
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
@@ -277,14 +301,6 @@ type GitRef = {
   object?: { sha?: string | null } | null;
 };
 
-function splitRepoFullName(full: string): { owner: string; name: string } {
-  const [owner, name] = full.split("/");
-  if (!owner || !name) {
-    throw new Error(`Invalid repo name (expected owner/name): ${full}`);
-  }
-  return { owner, name };
-}
-
 function toSortedUniqueStrings(values: Array<string | null | undefined>): string[] {
   const normalized = values.map((value) => (value ?? "").trim()).filter(Boolean);
   return Array.from(new Set(normalized)).sort();
@@ -494,6 +510,7 @@ export class RepoWorker {
   private queue: QueueAdapter;
   private notify: NotifyAdapter;
   private throttle: ThrottleAdapter;
+  private github: GitHubClient;
 
   constructor(
     public readonly repo: string,
@@ -509,6 +526,7 @@ export class RepoWorker {
     this.queue = opts?.queue ?? DEFAULT_QUEUE_ADAPTER;
     this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
     this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
+    this.github = new GitHubClient(this.repo);
   }
 
   private ensureLabelsPromise: Promise<void> | null = null;
@@ -617,25 +635,23 @@ export class RepoWorker {
   }
 
   private async ensureBaselineLabelsOnce(): Promise<void> {
-
-
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
 
     this.ensureLabelsPromise = (async () => {
       try {
-        const result = await gh`gh label list --repo ${this.repo} --json name`.quiet();
-        const raw = JSON.parse(result.stdout.toString());
-        const existing = Array.isArray(raw) ? raw.map((l: any) => String(l?.name ?? "")) : [];
-
-        const missing = computeMissingBaselineLabels(existing);
+        const existing = await this.github.listLabels();
+        const missing = [...computeMissingBaselineLabels(existing), ...computeMissingRalphLabels(existing)];
         if (missing.length === 0) return;
 
         const created: string[] = [];
         for (const label of missing) {
           try {
-            await gh`gh label create ${label.name} --repo ${this.repo} --color ${label.color} --description ${label.description}`.quiet();
+            await this.github.createLabel(label);
             created.push(label.name);
           } catch (e: any) {
+            if (e instanceof GitHubApiError) {
+              if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
+            }
             const msg = e?.message ?? String(e);
             if (/already exists/i.test(msg)) continue;
             throw e;
@@ -655,52 +671,12 @@ export class RepoWorker {
     return this.ensureLabelsPromise;
   }
 
-  private getGitHubToken(): string {
-    const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
-    if (!token) {
-      throw new Error("Missing GH_TOKEN/GITHUB_TOKEN; cannot call GitHub API.");
-    }
-    return token;
-  }
-
   private async githubApiRequest<T>(
     path: string,
     opts: { method?: string; body?: unknown; allowNotFound?: boolean } = {}
   ): Promise<T | null> {
-    const token = this.getGitHubToken();
-    const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
-    const headers: Record<string, string> = {
-      Accept: "application/vnd.github+json",
-      Authorization: `token ${token}`,
-      "User-Agent": "ralph-loop",
-    };
-
-    const init: RequestInit = {
-      method: opts.method ?? "GET",
-      headers,
-    };
-
-    if (opts.body !== undefined) {
-      headers["Content-Type"] = "application/json";
-      init.body = JSON.stringify(opts.body);
-    }
-
-    const res = await fetch(url, init);
-    if (opts.allowNotFound && res.status === 404) return null;
-
-    const text = await res.text();
-    if (!res.ok) {
-      throw new Error(
-        `GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}`.trim()
-      );
-    }
-
-    if (!text) return null;
-    try {
-      return JSON.parse(text) as T;
-    } catch {
-      return null;
-    }
+    const response = await this.github.request<T>(path, opts);
+    return response.data;
   }
 
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
@@ -1730,7 +1706,15 @@ ${guidance}`
   }
 
   private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
-    await gh`gh pr update-branch ${prUrl} --repo ${this.repo}`.cwd(cwd).quiet();
+    try {
+      await gh`gh pr update-branch ${prUrl} --repo ${this.repo}`.cwd(cwd).quiet();
+      return;
+    } catch (error: any) {
+      const message = this.formatGhError(error);
+      if (!this.shouldFallbackToWorktreeUpdate(message)) throw error;
+    }
+
+    await this.updatePullRequestBranchViaWorktree(prUrl);
   }
 
   private parseCiFixAttempts(raw: string | undefined): number | null {
@@ -1926,10 +1910,194 @@ ${guidance}`
     return /not up to date with the base branch/i.test(message);
   }
 
+  private shouldFallbackToWorktreeUpdate(message: string): boolean {
+    const lowered = message.toLowerCase();
+    if (!lowered) return false;
+    if (lowered.includes("unknown command")) return true;
+    if (lowered.includes("not a known command")) return true;
+    if (lowered.includes("could not resolve to a pull request")) return true;
+    if (lowered.includes("requires a GitHub Enterprise")) return true;
+    if (lowered.includes("not supported")) return true;
+    return false;
+  }
+
   private formatGhError(error: any): string {
     const message = String(error?.message ?? "").trim();
     const stderr = String(error?.stderr ?? "").trim();
     return [message, stderr].filter(Boolean).join("\n");
+  }
+
+  private async updatePullRequestBranchViaWorktree(prUrl: string): Promise<void> {
+    const pr = await this.getPullRequestMergeState(prUrl);
+    const botBranch = this.normalizeGitRef(getRepoBotBranch(this.repo));
+    const headRef = this.normalizeGitRef(pr.headRefName);
+    const baseRef = this.normalizeGitRef(pr.baseRefName || botBranch);
+    if (pr.isCrossRepository || pr.headRepoFullName !== this.repo) {
+      throw new Error(`Cannot update cross-repo PR ${prUrl}; requires same-repo branch access`);
+    }
+
+    if (pr.mergeStateStatus === "DIRTY") {
+      throw new Error(`Refusing to update PR with merge conflicts: ${prUrl}`);
+    }
+
+    if (pr.mergeStateStatus === "DRAFT") {
+      throw new Error(`Refusing to update draft PR: ${prUrl}`);
+    }
+
+    if (!headRef) {
+      throw new Error(`PR missing head ref for update: ${prUrl}`);
+    }
+
+    const worktreePath = await this.createAutoUpdateWorktree(prUrl);
+
+    try {
+      await $`git fetch origin`.cwd(worktreePath).quiet();
+      await $`git checkout ${headRef}`.cwd(worktreePath).quiet();
+      await $`git merge --no-edit origin/${baseRef}`.cwd(worktreePath).quiet();
+      await $`git push origin ${headRef}`.cwd(worktreePath).quiet();
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      throw new Error(`Worktree update failed for ${prUrl}: ${message}`);
+    } finally {
+      await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: true });
+    }
+  }
+
+  private async createAutoUpdateWorktree(prUrl: string): Promise<string> {
+    const slug = safeNoteName(this.repo);
+    const prNumber = extractPullRequestNumber(prUrl) ?? "unknown";
+    const worktreePath = join(RALPH_WORKTREES_DIR, slug, `pr-${prNumber}-auto-update`);
+
+    if (existsSync(worktreePath)) {
+      try {
+        const status = await $`git status --porcelain`.cwd(worktreePath).quiet();
+        if (status.stdout.toString().trim()) {
+          await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: true });
+        }
+      } catch {
+        await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: true });
+      }
+    }
+
+    await this.ensureGitWorktree(worktreePath);
+    return worktreePath;
+  }
+
+  private async getPullRequestMergeState(prUrl: string): Promise<PullRequestMergeState> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+    const query = [
+      "query($owner:String!,$name:String!,$number:Int!){",
+      "repository(owner:$owner,name:$name){",
+      "pullRequest(number:$number){",
+      "number",
+      "url",
+      "mergeStateStatus",
+      "isCrossRepository",
+      "headRefName",
+      "baseRefName",
+      "headRepository{ nameWithOwner }",
+      "labels(first:100){nodes{name}}",
+      "}",
+      "}",
+      "}",
+    ].join(" ");
+
+    const result = await gh`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
+    const parsed = JSON.parse(result.stdout.toString());
+    const pr = parsed?.data?.repository?.pullRequest;
+
+    if (!pr?.url) {
+      throw new Error(`Failed to read pull request metadata for ${prUrl}`);
+    }
+
+    const labels = Array.isArray(pr?.labels?.nodes)
+      ? pr.labels.nodes.map((node: any) => String(node?.name ?? "").trim()).filter(Boolean)
+      : [];
+
+    return {
+      number: Number(pr?.number ?? prNumber),
+      url: String(pr?.url ?? prUrl),
+      mergeStateStatus: (pr?.mergeStateStatus ?? null) as PullRequestMergeStateStatus | null,
+      isCrossRepository: Boolean(pr?.isCrossRepository),
+      headRefName: String(pr?.headRefName ?? ""),
+      headRepoFullName: String(pr?.headRepository?.nameWithOwner ?? ""),
+      baseRefName: String(pr?.baseRefName ?? ""),
+      labels,
+    };
+  }
+
+  private shouldAttemptProactiveUpdate(pr: PullRequestMergeState): { ok: boolean; reason?: string } {
+    if (pr.mergeStateStatus !== "BEHIND") {
+      return { ok: false, reason: `Merge state is ${pr.mergeStateStatus ?? "unknown"}` };
+    }
+
+    const baseRef = this.normalizeGitRef(pr.baseRefName);
+    const botBranch = this.normalizeGitRef(getRepoBotBranch(this.repo));
+    if (baseRef && baseRef !== botBranch) {
+      return { ok: false, reason: `PR base branch is ${pr.baseRefName}` };
+    }
+
+    if (pr.isCrossRepository || pr.headRepoFullName !== this.repo) {
+      return { ok: false, reason: "PR head repo is not the same as base repo" };
+    }
+
+    if (!pr.headRefName) {
+      return { ok: false, reason: "PR missing head ref" };
+    }
+
+    return { ok: true };
+  }
+
+  private shouldRateLimitAutoUpdate(pr: PullRequestMergeState, minMinutes: number): boolean {
+    const key = `autoUpdateBehind:${this.repo}:${pr.number}`;
+    let payload: string | null = null;
+
+    try {
+      payload = getIdempotencyPayload(key);
+    } catch {
+      return false;
+    }
+
+    if (!payload) return false;
+
+    try {
+      const parsed = JSON.parse(payload) as { lastAttemptAt?: number };
+      const lastAttemptAt = typeof parsed?.lastAttemptAt === "number" ? parsed.lastAttemptAt : 0;
+      if (!lastAttemptAt) return false;
+      const expiresMs = minMinutes * 60_000;
+      return Date.now() - lastAttemptAt < expiresMs;
+    } catch {
+      return false;
+    }
+  }
+
+  private recordAutoUpdateAttempt(pr: PullRequestMergeState, minMinutes: number): void {
+    const key = `autoUpdateBehind:${this.repo}:${pr.number}`;
+    const payload = JSON.stringify({ lastAttemptAt: Date.now(), minMinutes });
+    try {
+      upsertIdempotencyKey({ key, scope: "auto-update-behind", payloadJson: payload });
+    } catch {
+      // best-effort
+    }
+  }
+
+  private recordAutoUpdateFailure(pr: PullRequestMergeState, minMinutes: number): void {
+    const key = `autoUpdateBehind:${this.repo}:${pr.number}`;
+    const payload = JSON.stringify({ lastAttemptAt: Date.now(), minMinutes, status: "failed" });
+    try {
+      upsertIdempotencyKey({ key, scope: "auto-update-behind", payloadJson: payload });
+    } catch {
+      // best-effort
+    }
+  }
+
+  private normalizeGitRef(ref: string): string {
+    return ref.trim().replace(/^refs\/heads\//, "");
   }
 
   private async mergePrWithRequiredChecks(params: {
@@ -2041,34 +2209,63 @@ ${guidance}`
     }
 
     for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
-      let isBehind = false;
-      try {
-        isBehind = await this.isPrBehind(prUrl);
-      } catch (error: any) {
-        const reason = `Failed to read PR merge state: ${this.formatGhError(error)}`;
-        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.queue.updateTaskStatus(params.task, "blocked");
-        await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+      if (!didUpdateBranch && isAutoUpdateBehindEnabled(this.repo)) {
+        try {
+          const prState = await this.getPullRequestMergeState(prUrl);
+          const guard = this.shouldAttemptProactiveUpdate(prState);
+          const labelGate = getAutoUpdateBehindLabelGate(this.repo);
+          const minMinutes = getAutoUpdateBehindMinMinutes(this.repo);
+          const rateLimited = this.shouldRateLimitAutoUpdate(prState, minMinutes);
 
-        return {
-          ok: false,
-          run: {
-            taskName: params.task.name,
-            repo: this.repo,
-            outcome: "failed",
-            sessionId,
-            escalationReason: reason,
-          },
-        };
-      }
+          if (prState.mergeStateStatus === "DIRTY") {
+            const reason = `PR has merge conflicts; refusing auto-update ${prUrl}`;
+            console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+            this.recordAutoUpdateFailure(prState, minMinutes);
+            await this.queue.updateTaskStatus(params.task, "blocked");
+            await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
-      if (isBehind) {
-        const behindResult = await this.ensurePrNotBehind(prUrl, params.repoPath);
-        if (behindResult.updated) {
-          didUpdateBranch = true;
-        } else if (behindResult.reason) {
+            return {
+              ok: false,
+              run: {
+                taskName: params.task.name,
+                repo: this.repo,
+                outcome: "failed",
+                sessionId,
+                escalationReason: reason,
+              },
+            };
+          }
+
+          const hasLabelGate = labelGate
+            ? prState.labels.map((label) => label.toLowerCase()).includes(labelGate.toLowerCase())
+            : true;
+
+          if (!hasLabelGate) {
+            console.log(
+              `[ralph:worker:${this.repo}] PR behind but missing label gate ${labelGate ?? ""}; skipping auto-update ${prUrl}`
+            );
+          } else if (!guard.ok) {
+            console.log(`[ralph:worker:${this.repo}] PR auto-update skipped (${guard.reason ?? "guardrail"}): ${prUrl}`);
+          } else if (rateLimited) {
+            console.log(`[ralph:worker:${this.repo}] PR auto-update rate-limited; skipping ${prUrl}`);
+          } else {
+            console.log(`[ralph:worker:${this.repo}] PR BEHIND; updating branch ${prUrl}`);
+            this.recordAutoUpdateAttempt(prState, minMinutes);
+            await this.updatePullRequestBranch(prUrl, params.repoPath);
+            didUpdateBranch = true;
+          }
+        } catch (updateError: any) {
+          const reason = `Failed while auto-updating PR branch: ${this.formatGhError(updateError)}`;
+          console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+          try {
+            const prState = await this.getPullRequestMergeState(prUrl);
+            const minMinutes = getAutoUpdateBehindMinMinutes(this.repo);
+            this.recordAutoUpdateFailure(prState, minMinutes);
+          } catch {
+            // best-effort
+          }
           await this.queue.updateTaskStatus(params.task, "blocked");
-          await this.notify.notifyError(params.notifyTitle, behindResult.reason, params.task.name);
+          await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
           return {
             ok: false,
@@ -2077,7 +2274,7 @@ ${guidance}`
               repo: this.repo,
               outcome: "failed",
               sessionId,
-              escalationReason: behindResult.reason,
+              escalationReason: reason,
             },
           };
         }

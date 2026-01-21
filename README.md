@@ -98,11 +98,14 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`, optional `rollupBatchSize`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `repos[].rollupBatchSize` (number): per-repo override for rollup batch size (defaults to `batchSize`)
 - `ownershipTtlMs` (number): task ownership TTL in milliseconds (defaults to 60000)
+- `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
+- `repos[].autoUpdateBehindLabel` (string): optional label gate required for proactive update-branch
+- `repos[].autoUpdateBehindMinMinutes` (number): minimum minutes between updates per PR (default: 30)
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
 - Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
@@ -281,7 +284,7 @@ On daemon startup, Ralph checks for orphaned starting/in-progress tasks:
 
 ## Drain mode (pause new work)
 
-Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue.
+Ralph supports an operator-controlled "draining" mode that stops scheduling/dequeuing new tasks while allowing in-flight work to continue, plus a paused mode that halts scheduling entirely.
 
 Control file:
 
@@ -294,16 +297,18 @@ Ralph auto-creates the control file on startup with `{ "mode": "running" }` unle
 Example:
 
 ```json
-{ "mode": "draining" }
+{ "version": 1, "mode": "draining" }
 ```
 
-Schema: `{ "mode": "running"|"draining", "pause_requested"?: boolean, "opencode_profile"?: string }` (unknown fields ignored)
+Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested"?: boolean, "pause_at_checkpoint"?: string, "drain_timeout_ms"?: number, "opencode_profile"?: string }` (unknown fields ignored)
 
 - Enable drain: set `mode` to `draining`
 - Disable drain: set `mode` to `running`
+- Pause all scheduling: set `mode` to `paused`
+- Pause at checkpoint: set `pause_requested=true` and optionally `pause_at_checkpoint`
 - Active OpenCode profile: set `opencode_profile` (affects new tasks only; tasks pin their profile on start)
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
-- Observability: logs emit `Control mode: draining|running`, and `ralph status` shows `Mode: ...`
+- Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
 
 ## OpenCode profiles (multi-account)
 

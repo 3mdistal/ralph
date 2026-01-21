@@ -19,6 +19,10 @@ mock.module("../config", () => ({
   }),
   getRepoBotBranch: () => "bot/integration",
   getRepoMaxWorkers: () => 1,
+  getRepoRequiredChecks: () => ["ci"],
+  isAutoUpdateBehindEnabled: () => false,
+  getAutoUpdateBehindLabelGate: () => null,
+  getAutoUpdateBehindMinMinutes: () => 30,
 }));
 
 import { RepoWorker } from "../worker";
