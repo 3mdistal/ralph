@@ -56,7 +56,17 @@ describe("queue backend selection", () => {
     expect(cfg.queueBackend).toBe("github");
   });
 
-  test("falls back to none when GitHub backend is not implemented", () => {
+  test("falls back to none when GitHub backend is not implemented", async () => {
+    const configPath = getRalphConfigJsonPath();
+    const missingVault = join(homeDir, "missing-vault");
+    await writeJson(configPath, {
+      bwrbVault: missingVault,
+      repos: [],
+    });
+
+    __resetConfigForTests();
+    __resetQueueBackendStateForTests();
+
     const state = getQueueBackendState();
     expect(state.desiredBackend).toBe("github");
     expect(state.backend).toBe("none");
