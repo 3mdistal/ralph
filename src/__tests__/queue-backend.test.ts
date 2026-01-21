@@ -48,14 +48,15 @@ describe("queue backend selection", () => {
     expect(cfg.queueBackend).toBe("github");
   });
 
-  test("falls back to none when GitHub auth missing and backend defaulted", () => {
+  test("falls back to none when GitHub backend is not implemented", () => {
     const state = getQueueBackendState();
     expect(state.desiredBackend).toBe("github");
     expect(state.backend).toBe("none");
     expect(state.health).toBe("degraded");
+    expect(state.diagnostics ?? "").toContain("not yet implemented");
   });
 
-  test("explicit github without auth is unavailable", async () => {
+  test("explicit github is unavailable when backend not implemented", async () => {
     const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {
       queueBackend: "github",

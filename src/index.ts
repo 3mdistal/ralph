@@ -12,6 +12,7 @@ import { join } from "path";
 import crypto from "crypto";
 
 import {
+  ensureBwrbVaultLayout,
   getOpencodeDefaultProfileName,
   getRepoMaxWorkers,
   getRepoPath,
@@ -197,7 +198,10 @@ const rrCursor = { value: 0 };
 
 function requireBwrbQueueOrExit(action: string): void {
   const state = getQueueBackendState();
-  if (state.backend === "bwrb" && state.health === "ok") return;
+  if (state.backend === "bwrb" && state.health === "ok") {
+    if (!ensureBwrbVaultLayout(loadConfig().bwrbVault)) process.exit(1);
+    return;
+  }
 
   if (state.backend !== "bwrb") {
     console.warn(`[ralph] ${action} requires bwrb queue backend (current: ${state.backend}).`);
@@ -974,6 +978,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  if (queueState.backend === "bwrb") {
+    if (!ensureBwrbVaultLayout(config.bwrbVault)) process.exit(1);
+  }
+
   // Initialize durable local state (SQLite)
   initStateDb();
 
@@ -1066,11 +1074,9 @@ async function main(): Promise<void> {
     } else {
       console.log(`[ralph:escalations] Escalations dir not found: ${escalationsDir}`);
     }
-  } else if (queueState.backend === "github") {
-    console.log("[ralph] GitHub queue backend is not yet implemented; running with no queued tasks.");
-    resetIdleState([]);
   } else {
-    console.log("[ralph] Queue backend disabled; running without queued tasks.");
+    const detail = queueState.diagnostics ? ` ${queueState.diagnostics}` : "";
+    console.log(`[ralph] Queue backend disabled; running without queued tasks.${detail}`);
     resetIdleState([]);
   }
 

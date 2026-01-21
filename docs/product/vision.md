@@ -59,6 +59,7 @@ GitHub Issues are the source of truth for tasks during the GitHub-first migratio
 bwrb remains supported as a legacy backend during the migration:
 - Enable via `queueBackend = "bwrb"` in `~/.ralph/config.toml` or `~/.ralph/config.json`
 - GitHub remains authoritative when both are configured (no dual-write in v0.1.0)
+- GitHub queue sync/claim semantics are tracked in #61/#63; use bwrb backend for active queue processing until then
 
 ### 2. Bot Branch Strategy
 

@@ -1,4 +1,4 @@
-import { ensureBwrbVaultLayout, isQueueBackendExplicit, loadConfig, type QueueBackend, type RalphConfig } from "./config";
+import { checkBwrbVaultLayout, isQueueBackendExplicit, loadConfig, type QueueBackend, type RalphConfig } from "./config";
 import { shouldLog } from "./logging";
 import * as bwrbQueue from "./queue";
 
@@ -14,6 +14,8 @@ export type QueueBackendState = {
 };
 
 let cachedState: QueueBackendState | null = null;
+
+const GITHUB_QUEUE_IMPLEMENTED = false;
 
 function isGitHubAuthConfigured(config: RalphConfig): boolean {
   if (config.githubApp) return true;
@@ -36,13 +38,21 @@ export function getQueueBackendState(): QueueBackendState {
   let diagnostics: string | undefined;
 
   if (desiredBackend === "bwrb") {
-    const ready = ensureBwrbVaultLayout(config.bwrbVault);
-    if (!ready) {
+    const check = checkBwrbVaultLayout(config.bwrbVault);
+    if (!check.ok) {
       health = "unavailable";
-      diagnostics = `bwrbVault is missing or invalid: ${JSON.stringify(config.bwrbVault)}`;
+      diagnostics = check.error ?? `bwrbVault is missing or invalid: ${JSON.stringify(config.bwrbVault)}`;
     }
   } else if (desiredBackend === "github") {
-    if (!isGitHubAuthConfigured(config)) {
+    if (!GITHUB_QUEUE_IMPLEMENTED) {
+      diagnostics = "GitHub queue backend is not yet implemented (see #61/#63).";
+      if (explicit) {
+        health = "unavailable";
+      } else {
+        backend = "none";
+        health = "degraded";
+      }
+    } else if (!isGitHubAuthConfigured(config)) {
       diagnostics =
         "GitHub auth is not configured (set githubApp in ~/.ralph/config.* or GH_TOKEN/GITHUB_TOKEN).";
       if (explicit) {
@@ -81,12 +91,13 @@ function logQueueBackendNote(action: string, state: QueueBackendState): void {
 }
 
 export function isBwrbQueueEnabled(): boolean {
-  return getQueueBackendState().backend === "bwrb";
+  const state = getQueueBackendState();
+  return state.backend === "bwrb" && state.health === "ok";
 }
 
 export function ensureBwrbQueueOrWarn(action: string): boolean {
   const state = getQueueBackendState();
-  if (state.backend === "bwrb") return true;
+  if (state.backend === "bwrb" && state.health === "ok") return true;
   logQueueBackendNote(action, state);
   return false;
 }

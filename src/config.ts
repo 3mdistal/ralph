@@ -172,21 +172,33 @@ function detectDefaultBwrbVault(): string {
   }
 }
 
-export function ensureBwrbVaultLayout(vault: string): boolean {
+export function checkBwrbVaultLayout(vault: string): { ok: boolean; error?: string } {
   if (!vault || !existsSync(vault)) {
-    console.error(
-      `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
-        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`
-    );
-    return false;
+    return {
+      ok: false,
+      error:
+        `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
+        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`,
+    };
   }
 
   const schemaPath = join(vault, ".bwrb", "schema.json");
   if (!existsSync(schemaPath)) {
-    console.error(
-      `[ralph] bwrbVault does not contain a bwrb schema: ${JSON.stringify(vault)} (missing ${schemaPath}). ` +
-        `Point bwrbVault at a directory that contains .bwrb/schema.json.`
-    );
+    return {
+      ok: false,
+      error:
+        `[ralph] bwrbVault does not contain a bwrb schema: ${JSON.stringify(vault)} (missing ${schemaPath}). ` +
+        `Point bwrbVault at a directory that contains .bwrb/schema.json.`,
+    };
+  }
+
+  return { ok: true };
+}
+
+export function ensureBwrbVaultLayout(vault: string): boolean {
+  const check = checkBwrbVaultLayout(vault);
+  if (!check.ok) {
+    console.error(check.error ?? `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}.`);
     return false;
   }
 
@@ -225,6 +237,10 @@ let config: RalphConfig | null = null;
 type ConfigSource = "default" | "toml" | "json" | "legacy";
 let configSource: ConfigSource = "default";
 let queueBackendExplicit = false;
+
+function isQueueBackendValue(value: unknown): value is QueueBackend {
+  return value === "github" || value === "bwrb" || value === "none";
+}
 
 function toPositiveIntOrNull(value: unknown): number | null {
   if (typeof value !== "number") return null;
@@ -288,7 +304,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
 
   const rawQueueBackend = (loaded as any).queueBackend;
   if (rawQueueBackend !== undefined) {
-    if (rawQueueBackend === "github" || rawQueueBackend === "bwrb" || rawQueueBackend === "none") {
+    if (isQueueBackendValue(rawQueueBackend)) {
       loaded.queueBackend = rawQueueBackend;
     } else {
       console.warn(
@@ -847,7 +863,7 @@ export function loadConfig(): RalphConfig {
 
   const recordConfigSource = (source: ConfigSource, fileConfig: any | null) => {
     configSource = source;
-    queueBackendExplicit = Boolean(fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend"));
+    queueBackendExplicit = Boolean(fileConfig && isQueueBackendValue((fileConfig as any).queueBackend));
   };
 
   if (existsSync(configTomlPath)) {
