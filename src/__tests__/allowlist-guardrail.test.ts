@@ -1,4 +1,11 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
+import { dirname, join } from "path";
+import { tmpdir } from "os";
+
+import { __resetConfigForTests } from "../config";
+import { getRalphConfigJsonPath } from "../paths";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 const updateTaskStatusMock = mock(async () => true);
 
@@ -7,6 +14,15 @@ const queueAdapter = {
 };
 
 import { RepoWorker } from "../worker";
+
+let homeDir: string;
+let priorHome: string | undefined;
+let releaseLock: (() => void) | null = null;
+
+async function writeJson(path: string, obj: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(obj, null, 2), "utf8");
+}
 
 function createMockTask(overrides: Record<string, unknown> = {}) {
   return {
@@ -29,8 +45,34 @@ afterAll(() => {
 });
 
 describe("allowlist guardrail", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    releaseLock = await acquireGlobalTestLock();
+    priorHome = process.env.HOME;
+    homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
+    process.env.HOME = homeDir;
+    __resetConfigForTests();
+
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+    });
+    __resetConfigForTests();
+
     updateTaskStatusMock.mockClear();
+  });
+
+  afterEach(async () => {
+    process.env.HOME = priorHome;
+    await rm(homeDir, { recursive: true, force: true });
+    __resetConfigForTests();
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("processTask blocks without touching gh when repo owner is not allowed", async () => {
