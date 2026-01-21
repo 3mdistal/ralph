@@ -70,6 +70,10 @@ Rollup automation policy:
 - If there are no queued or in-flight tasks for 5 minutes, check for unrolled changes on `bot/integration`.
 - Create a rollup PR from `bot/integration` to `main` when there are unrolled changes, unless one is already open.
 
+Merge gating defaults:
+- Policy decision: when Ralph derives required checks from branch protection and protection is missing or unreadable, it should fail open (treat required checks as empty) to avoid blocking automation.
+- Policy decision: branch protection enforcement (and bot branch creation for enforcement) only runs when `repos[].requiredChecks` is explicitly configured; otherwise leave existing branch protection unchanged.
+
 Benefits:
 - Reduces interrupt frequency
 - Batches related changes for easier review

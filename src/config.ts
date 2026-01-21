@@ -12,10 +12,12 @@ export interface RepoConfig {
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
   /**
-   * Required status checks for merge gating (default: ["ci"]).
+   * Required status checks for merge gating (default: derive from branch protection).
    *
    * Values must match the check context name shown by GitHub.
    * Set to [] to disable merge gating for a repo.
+   * When omitted, Ralph derives required checks from GitHub branch protection on the bot branch,
+   * falling back to the repo default branch. Missing/unreadable protection disables gating.
    */
   requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
@@ -900,11 +902,10 @@ export function getRepoBotBranch(repoName: string): string {
   return explicit?.botBranch ?? "bot/integration";
 }
 
-export function getRepoRequiredChecks(repoName: string): string[] {
+export function getRepoRequiredChecksOverride(repoName: string): string[] | null {
   const cfg = loadConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
-  const checks = toStringArrayOrNull(explicit?.requiredChecks);
-  return checks ?? ["ci"];
+  return toStringArrayOrNull(explicit?.requiredChecks);
 }
 
 export function getGlobalMaxWorkers(): number {

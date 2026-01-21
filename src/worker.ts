@@ -19,12 +19,12 @@ const gh: GhRunner = DEFAULT_GH_RUNNER;
 
 import { type AgentTask, updateTaskStatus } from "./queue";
 import {
+  getAutoUpdateBehindLabelGate,
+  getAutoUpdateBehindMinMinutes,
   getOpencodeDefaultProfileName,
   getRepoBotBranch,
   getRepoMaxWorkers,
-  getAutoUpdateBehindLabelGate,
-  getAutoUpdateBehindMinMinutes,
-  getRepoRequiredChecks,
+  getRepoRequiredChecksOverride,
   isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
   loadConfig,
@@ -232,6 +232,12 @@ type RequiredChecksSummary = {
   available: string[];
 };
 
+type ResolvedRequiredChecks = {
+  checks: string[];
+  source: "config" | "protection" | "none";
+  branch?: string;
+};
+
 type FailedCheck = {
   name: string;
   state: RequiredCheckState;
@@ -281,6 +287,10 @@ type BranchProtection = {
 
 type CheckRunsResponse = {
   check_runs?: Array<{ name?: string | null }> | null;
+};
+
+type CommitStatusResponse = {
+  statuses?: Array<{ context?: string | null }> | null;
 };
 
 type RepoDetails = {
@@ -521,6 +531,7 @@ export class RepoWorker {
 
   private ensureLabelsPromise: Promise<void> | null = null;
   private ensureBranchProtectionPromise: Promise<void> | null = null;
+  private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
   private repoSlotsInUse: Set<number> | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -670,9 +681,10 @@ export class RepoWorker {
 
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
     const { owner, name } = splitRepoFullName(this.repo);
+    const encodedBranch = encodeURIComponent(branch);
     try {
       const payload = await this.githubApiRequest<CheckRunsResponse>(
-        `/repos/${owner}/${name}/commits/${branch}/check-runs?per_page=100`
+        `/repos/${owner}/${name}/commits/${encodedBranch}/check-runs?per_page=100`
       );
       return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
     } catch (e: any) {
@@ -684,6 +696,69 @@ export class RepoWorker {
       }
       throw e;
     }
+  }
+
+  private async fetchStatusContextNames(branch: string): Promise<string[]> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const encodedBranch = encodeURIComponent(branch);
+    try {
+      const payload = await this.githubApiRequest<CommitStatusResponse>(
+        `/repos/${owner}/${name}/commits/${encodedBranch}/status?per_page=100`
+      );
+      return toSortedUniqueStrings(payload?.statuses?.map((status) => status?.context ?? "") ?? []);
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      if (/HTTP 422/.test(msg) && /No commit found/i.test(msg)) {
+        const missingBranchError = new Error(msg);
+        missingBranchError.cause = "missing-branch";
+        throw missingBranchError;
+      }
+      throw e;
+    }
+  }
+
+  private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
+    const errors: string[] = [];
+    let missingBranchError: Error | null = null;
+    let checkRuns: string[] = [];
+    let statusContexts: string[] = [];
+
+    try {
+      checkRuns = await this.fetchCheckRunNames(branch);
+    } catch (e: any) {
+      if (e?.cause === "missing-branch") {
+        missingBranchError = e;
+      } else {
+        errors.push(`check-runs: ${e?.message ?? String(e)}`);
+      }
+    }
+
+    try {
+      statusContexts = await this.fetchStatusContextNames(branch);
+    } catch (e: any) {
+      if (e?.cause === "missing-branch") {
+        missingBranchError = e;
+      } else {
+        errors.push(`status: ${e?.message ?? String(e)}`);
+      }
+    }
+
+    if (missingBranchError) throw missingBranchError;
+
+    const hasData = checkRuns.length > 0 || statusContexts.length > 0;
+    const hasAuthError = errors.some((entry) => /HTTP 401|HTTP 403|Missing GH_TOKEN/i.test(entry));
+
+    if (hasAuthError || (errors.length >= 2 && !hasData)) {
+      throw new Error(`Unable to read check contexts for ${branch}: ${errors.join(" | ")}`);
+    }
+
+    if (errors.length > 0) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to fetch some check contexts for ${branch}: ${errors.join(" | ")}`
+      );
+    }
+
+    return toSortedUniqueStrings([...checkRuns, ...statusContexts]);
   }
 
   private async fetchRepoDefaultBranch(): Promise<string | null> {
@@ -744,6 +819,87 @@ export class RepoWorker {
     );
   }
 
+  public async __testOnlyResolveRequiredChecksForMerge(): Promise<ResolvedRequiredChecks> {
+    return this.resolveRequiredChecksForMerge();
+  }
+
+  public async __testOnlyFetchAvailableCheckContexts(branch: string): Promise<string[]> {
+    return this.fetchAvailableCheckContexts(branch);
+  }
+
+  private async resolveRequiredChecksForMerge(): Promise<ResolvedRequiredChecks> {
+    if (this.requiredChecksForMergePromise) return this.requiredChecksForMergePromise;
+
+    this.requiredChecksForMergePromise = (async () => {
+      const override = getRepoRequiredChecksOverride(this.repo);
+      if (override !== null) {
+        return { checks: override, source: "config" };
+      }
+
+      const botBranch = getRepoBotBranch(this.repo);
+      const protectionErrors: Array<{ branch: string; error: unknown }> = [];
+      let fallbackBranch = botBranch;
+      const tryFetchProtection = async (branch: string): Promise<BranchProtection | null> => {
+        try {
+          return await this.fetchBranchProtection(branch);
+        } catch (e: any) {
+          protectionErrors.push({ branch, error: e });
+          return null;
+        }
+      };
+
+      const botProtection = await tryFetchProtection(botBranch);
+      if (botProtection) {
+        return { checks: getProtectionContexts(botProtection), source: "protection", branch: botBranch };
+      }
+
+      fallbackBranch = await this.resolveFallbackBranch(botBranch);
+      if (fallbackBranch !== botBranch) {
+        const fallbackProtection = await tryFetchProtection(fallbackBranch);
+        if (fallbackProtection) {
+          return { checks: getProtectionContexts(fallbackProtection), source: "protection", branch: fallbackBranch };
+        }
+      }
+
+      if (protectionErrors.length > 0) {
+        for (const entry of protectionErrors) {
+          const msg = (entry.error as any)?.message ?? String(entry.error);
+          console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${entry.branch}: ${msg}`);
+        }
+      } else {
+        const attempted = Array.from(new Set([botBranch, fallbackBranch])).join(", ");
+        console.log(
+          `[ralph:worker:${this.repo}] No branch protection found for ${attempted}; merge gating disabled.`
+        );
+      }
+
+      return { checks: [], source: "none" };
+    })();
+
+    return this.requiredChecksForMergePromise;
+  }
+
+  private async resolveFallbackBranch(botBranch: string): Promise<string> {
+    try {
+      const defaultBranch = await this.fetchRepoDefaultBranch();
+      if (defaultBranch && defaultBranch !== botBranch) return defaultBranch;
+    } catch {
+      // ignore; fallback handled below
+    }
+
+    return "main";
+  }
+
+  private async ensureBotBranchExistsBestEffort(): Promise<void> {
+    const botBranch = getRepoBotBranch(this.repo);
+    try {
+      await this.ensureRemoteBranchExists(botBranch);
+    } catch (e: any) {
+      const msg = e?.message ?? String(e);
+      console.warn(`[ralph:worker:${this.repo}] Unable to ensure bot branch ${botBranch}: ${msg}`);
+    }
+  }
+
   private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
     if (requiredChecks.length === 0) return;
 
@@ -754,11 +910,11 @@ export class RepoWorker {
 
     let availableChecks: string[] = [];
     try {
-      availableChecks = await this.fetchCheckRunNames(branch);
+      availableChecks = await this.fetchAvailableCheckContexts(branch);
     } catch (e: any) {
       if (branch === botBranch && e?.cause === "missing-branch") {
         await this.ensureRemoteBranchExists(branch);
-        availableChecks = await this.fetchCheckRunNames(branch);
+        availableChecks = await this.fetchAvailableCheckContexts(branch);
       } else {
         throw e;
       }
@@ -843,9 +999,16 @@ ${guidance}`
     this.ensureBranchProtectionPromise = (async () => {
       const botBranch = getRepoBotBranch(this.repo);
       const branches = Array.from(new Set([botBranch, "main"]));
-      const requiredChecks = getRepoRequiredChecks(this.repo);
+      const requiredChecksOverride = getRepoRequiredChecksOverride(this.repo);
+
+      if (requiredChecksOverride === null || requiredChecksOverride.length === 0) {
+        return;
+      }
+
+      await this.ensureBotBranchExistsBestEffort();
+
       for (const branch of branches) {
-        await this.ensureBranchProtectionForBranch(branch, requiredChecks);
+        await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
       }
     })();
 
@@ -1949,7 +2112,7 @@ ${guidance}`
     notifyTitle: string;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
-    const REQUIRED_CHECKS = getRepoRequiredChecks(this.repo);
+    const { checks: REQUIRED_CHECKS } = await this.resolveRequiredChecksForMerge();
     const MAX_CI_FIX_ATTEMPTS = this.resolveCiFixAttempts();
 
     let prUrl = params.prUrl;

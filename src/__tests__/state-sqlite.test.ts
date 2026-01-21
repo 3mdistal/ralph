@@ -24,13 +24,16 @@ import {
   upsertIdempotencyKey,
 } from "../state";
 import { getRalphStateDbPath } from "../paths";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
 let priorHome: string | undefined;
+let releaseLock: (() => void) | null = null;
 
 describe("State SQLite (~/.ralph/state.sqlite)", () => {
   beforeEach(async () => {
     priorHome = process.env.HOME;
+    releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
     closeStateDbForTests();
@@ -40,6 +43,8 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     closeStateDbForTests();
     process.env.HOME = priorHome;
     await rm(homeDir, { recursive: true, force: true });
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("initializes schema and supports metadata writes", () => {
