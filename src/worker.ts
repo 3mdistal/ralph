@@ -843,6 +843,14 @@ export class RepoWorker {
     );
   }
 
+  public async __testOnlyResolveRequiredChecksForMerge(): Promise<ResolvedRequiredChecks> {
+    return this.resolveRequiredChecksForMerge();
+  }
+
+  public async __testOnlyFetchAvailableCheckContexts(branch: string): Promise<string[]> {
+    return this.fetchAvailableCheckContexts(branch);
+  }
+
   private async resolveRequiredChecksForMerge(): Promise<ResolvedRequiredChecks> {
     if (this.requiredChecksForMergePromise) return this.requiredChecksForMergePromise;
 
@@ -853,13 +861,13 @@ export class RepoWorker {
       }
 
       const botBranch = getRepoBotBranch(this.repo);
-      let lastError: { branch: string; error: unknown } | null = null;
+      const protectionErrors: Array<{ branch: string; error: unknown }> = [];
       let fallbackBranch = botBranch;
       const tryFetchProtection = async (branch: string): Promise<BranchProtection | null> => {
         try {
           return await this.fetchBranchProtection(branch);
         } catch (e: any) {
-          lastError = { branch, error: e };
+          protectionErrors.push({ branch, error: e });
           return null;
         }
       };
@@ -877,9 +885,11 @@ export class RepoWorker {
         }
       }
 
-      if (lastError) {
-        const msg = (lastError.error as any)?.message ?? String(lastError.error);
-        console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${lastError.branch}: ${msg}`);
+      if (protectionErrors.length > 0) {
+        for (const entry of protectionErrors) {
+          const msg = (entry.error as any)?.message ?? String(entry.error);
+          console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${entry.branch}: ${msg}`);
+        }
       } else {
         const attempted = Array.from(new Set([botBranch, fallbackBranch])).join(", ");
         console.log(
@@ -1015,7 +1025,7 @@ ${guidance}`
       const branches = Array.from(new Set([botBranch, "main"]));
       const requiredChecksOverride = getRepoRequiredChecksOverride(this.repo);
 
-      if (!requiredChecksOverride || requiredChecksOverride.length === 0) {
+      if (requiredChecksOverride === null || requiredChecksOverride.length === 0) {
         return;
       }
 

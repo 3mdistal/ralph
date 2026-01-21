@@ -52,7 +52,7 @@ describe("required checks resolution", () => {
 
     try {
       const worker = new RepoWorker("acme/rocket", "/tmp");
-      const result = await (worker as any).resolveRequiredChecksForMerge();
+      const result = await worker.__testOnlyResolveRequiredChecksForMerge();
       expect(result).toEqual({ checks: ["ci"], source: "config" });
       expect(fetchMock).not.toHaveBeenCalled();
     } finally {
@@ -83,7 +83,7 @@ describe("required checks resolution", () => {
 
     try {
       const worker = new RepoWorker("acme/rocket", "/tmp");
-      const result = await (worker as any).resolveRequiredChecksForMerge();
+      const result = await worker.__testOnlyResolveRequiredChecksForMerge();
       expect(result).toEqual({ checks: ["Test", "Vercel"], source: "protection", branch: "bot/integration" });
     } finally {
       globalThis.fetch = originalFetch;
@@ -117,7 +117,7 @@ describe("required checks resolution", () => {
 
     try {
       const worker = new RepoWorker("acme/rocket", "/tmp");
-      const result = await (worker as any).resolveRequiredChecksForMerge();
+      const result = await worker.__testOnlyResolveRequiredChecksForMerge();
       expect(result).toEqual({ checks: ["CI"], source: "protection", branch: "master" });
     } finally {
       globalThis.fetch = originalFetch;
@@ -148,7 +148,7 @@ describe("required checks resolution", () => {
 
     try {
       const worker = new RepoWorker("acme/rocket", "/tmp");
-      const result = await (worker as any).resolveRequiredChecksForMerge();
+      const result = await worker.__testOnlyResolveRequiredChecksForMerge();
       expect(result).toEqual({ checks: [], source: "none" });
     } finally {
       globalThis.fetch = originalFetch;
@@ -172,7 +172,7 @@ describe("required checks resolution", () => {
 
     try {
       const worker = new RepoWorker("acme/rocket", "/tmp");
-      const contexts = await (worker as any).fetchAvailableCheckContexts("bot/integration");
+      const contexts = await worker.__testOnlyFetchAvailableCheckContexts("bot/integration");
       expect(contexts).toEqual(["Vercel"]);
     } finally {
       globalThis.fetch = originalFetch;
