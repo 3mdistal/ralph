@@ -175,17 +175,6 @@ function logBwrbStorageNote(action: string, error?: string): void {
   }
 }
 
-export function isBwrbQueueEnabled(): boolean {
-  const state = getQueueBackendState();
-  return state.backend === "bwrb" && state.health === "ok";
-}
-
-export function getBwrbVaultOrNull(): string | null {
-  const state = getQueueBackendState();
-  if (state.backend !== "bwrb" || state.health !== "ok") return null;
-  return state.bwrbVault ?? null;
-}
-
 export function getBwrbVaultIfValid(): string | null {
   const vault = getConfig().bwrbVault;
   const check = checkBwrbVaultLayout(vault);
@@ -198,13 +187,6 @@ export function getBwrbVaultForStorage(action: string): string | null {
   if (check.ok) return vault;
   logBwrbStorageNote(action, check.error);
   return null;
-}
-
-export function ensureBwrbQueueOrWarn(action: string): boolean {
-  const state = getQueueBackendState();
-  if (state.backend === "bwrb" && state.health === "ok") return true;
-  logQueueBackendNote(action, state);
-  return false;
 }
 
 function createDisabledDriver(state: QueueBackendState): QueueBackendDriver {
