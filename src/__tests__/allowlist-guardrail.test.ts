@@ -21,7 +21,12 @@ mock.module("../config", () => {
   return {
     loadConfig: () => ({
       config,
-      meta: { source: "json", queueBackendExplicit: false },
+      meta: {
+        source: "json",
+        queueBackendExplicit: false,
+        queueBackendRaw: undefined,
+        queueBackendValid: true,
+      },
     }),
     getConfig: () => config,
     getRepoBotBranch: () => "bot/integration",

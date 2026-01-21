@@ -237,6 +237,8 @@ type ConfigSource = "default" | "toml" | "json" | "legacy";
 export type ConfigMeta = {
   source: ConfigSource;
   queueBackendExplicit: boolean;
+  queueBackendRaw?: unknown;
+  queueBackendValid: boolean;
 };
 
 export type ConfigLoadResult = {
@@ -840,6 +842,8 @@ export function loadConfig(): ConfigLoadResult {
   let meta: ConfigMeta = {
     source: "default",
     queueBackendExplicit: false,
+    queueBackendRaw: undefined,
+    queueBackendValid: true,
   };
 
   // Try to load from file (precedence: ~/.ralph/config.toml > ~/.ralph/config.json > legacy ~/.config/opencode/ralph/ralph.json)
@@ -872,11 +876,13 @@ export function loadConfig(): ConfigLoadResult {
   };
 
   const recordConfigSource = (source: ConfigSource, fileConfig: any | null) => {
+    const hasQueueBackend = Boolean(fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend"));
+    const queueBackendRaw = hasQueueBackend ? fileConfig.queueBackend : undefined;
     meta = {
       source,
-      queueBackendExplicit: Boolean(
-        fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend")
-      ),
+      queueBackendExplicit: hasQueueBackend,
+      queueBackendRaw,
+      queueBackendValid: !hasQueueBackend || isQueueBackendValue(queueBackendRaw),
     };
   };
 
@@ -918,6 +924,10 @@ export function __resetConfigForTests(): void {
 
 export function getConfigSource(): ConfigSource {
   return loadConfig().meta.source;
+}
+
+export function getConfigMeta(): ConfigMeta {
+  return loadConfig().meta;
 }
 
 export function isQueueBackendExplicit(): boolean {

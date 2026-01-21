@@ -103,6 +103,7 @@ describe("queue backend selection", () => {
     expect(state.backend).toBe("github");
     expect(state.health).toBe("unavailable");
     expect(state.fallback).toBe(false);
+    expect(state.diagnostics ?? "").toContain("Invalid queueBackend");
   });
 
   test("invalid queueBackend is treated as explicit and unavailable", async () => {

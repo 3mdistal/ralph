@@ -1,4 +1,11 @@
-import { checkBwrbVaultLayout, getConfig, isQueueBackendExplicit, type QueueBackend, type RalphConfig } from "./config";
+import {
+  checkBwrbVaultLayout,
+  getConfig,
+  getConfigMeta,
+  isQueueBackendExplicit,
+  type QueueBackend,
+  type RalphConfig,
+} from "./config";
 import { shouldLog } from "./logging";
 import * as bwrbQueue from "./queue";
 import type { QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
@@ -65,11 +72,28 @@ export function getQueueBackendState(): QueueBackendState {
   if (cachedState) return cachedState;
 
   const config = getConfig();
+  const meta = getConfigMeta();
   const desiredBackend = config.queueBackend ?? "github";
   const explicit = isQueueBackendExplicit();
   let backend: QueueBackend = desiredBackend;
   let health: QueueBackendHealth = "ok";
   let diagnostics: string | undefined;
+
+  if (meta.queueBackendExplicit && !meta.queueBackendValid) {
+    cachedState = {
+      desiredBackend,
+      backend,
+      health: "unavailable",
+      fallback: false,
+      diagnostics:
+        `Invalid queueBackend=${JSON.stringify(meta.queueBackendRaw)}; ` +
+        `valid values are "github", "bwrb", "none".`,
+      explicit,
+      bwrbVault: config.bwrbVault,
+    };
+
+    return cachedState;
+  }
 
   if (desiredBackend === "bwrb") {
     const check = checkBwrbVaultLayout(config.bwrbVault);
