@@ -61,6 +61,8 @@ bwrb remains supported as a legacy backend during the migration:
 - GitHub remains authoritative when both are configured (no dual-write in v0.1.0)
 - GitHub queue sync/claim semantics are tracked in #61/#63; use bwrb backend for active queue processing until then
 - When GitHub queue support is unavailable, Ralph falls back to bwrb if a valid vault is configured
+- When GitHub is unavailable and no bwrb vault exists, Ralph runs in idle/no-queue mode and surfaces diagnostics
+- Escalations and agent-run records remain bwrb-only until GitHub queue support ships
 
 ### 2. Bot Branch Strategy
 
