@@ -2,7 +2,7 @@ import { $ } from "bun";
 import { existsSync } from "fs";
 import { readFile } from "fs/promises";
 import { join } from "path";
-import { ensureBwrbQueueOrWarn, getBwrbVaultOrNull } from "./queue-backend";
+import { getBwrbVaultForStorage } from "./queue-backend";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -44,9 +44,7 @@ export type EditEscalationResult =
 let warnedMissingVault = false;
 
 function resolveBwrbVault(action: string): string | null {
-  if (!ensureBwrbQueueOrWarn(action)) return null;
-
-  const vault = getBwrbVaultOrNull();
+  const vault = getBwrbVaultForStorage(action);
   if (vault && existsSync(vault)) return vault;
 
   if (!warnedMissingVault) {

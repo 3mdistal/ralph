@@ -2,7 +2,7 @@ import { $ } from "bun";
 import crypto from "crypto";
 import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
-import { createAgentTask, ensureBwrbQueueOrWarn, getBwrbVaultOrNull, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
+import { createAgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 
@@ -91,19 +91,15 @@ function getNotificationPrefix(type: NotificationType): string {
 }
 
 function resolveVaultPath(p: string): string {
-  const vault = getBwrbVaultOrNull();
+  const vault = getBwrbVaultIfValid();
   if (!vault) return p;
   return isAbsolute(p) ? p : join(vault, p);
 }
 
 async function bwrbNewIdea(json: string): Promise<{ success: boolean; path?: string; error?: string }> {
-  if (!ensureBwrbQueueOrWarn("create notification")) {
-    return { success: false, error: "Queue backend is not bwrb" };
-  }
-
-  const vault = getBwrbVaultOrNull();
+  const vault = getBwrbVaultForStorage("create notification");
   if (!vault) {
-    return { success: false, error: "Queue backend is not bwrb" };
+    return { success: false, error: "bwrbVault is missing or invalid" };
   }
   try {
     const result = await $`bwrb new idea --json ${json}`.cwd(vault).quiet();
@@ -119,13 +115,9 @@ async function bwrbNewIdea(json: string): Promise<{ success: boolean; path?: str
 }
 
 async function bwrbNewEscalation(json: string): Promise<{ success: boolean; path?: string; error?: string }> {
-  if (!ensureBwrbQueueOrWarn("create escalation")) {
-    return { success: false, error: "Queue backend is not bwrb" };
-  }
-
-  const vault = getBwrbVaultOrNull();
+  const vault = getBwrbVaultForStorage("create escalation");
   if (!vault) {
-    return { success: false, error: "Queue backend is not bwrb" };
+    return { success: false, error: "bwrbVault is missing or invalid" };
   }
   try {
     const result = await $`bwrb new agent-escalation --json ${json}`.cwd(vault).quiet();
