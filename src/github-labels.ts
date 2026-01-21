@@ -18,15 +18,15 @@ export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
 ] as const;
 
-export function normalizeLabelName(name: string): string {
+function normalizeLabelName(name: string): string {
   return name.trim().toLowerCase();
 }
 
-export function normalizeLabelColor(color: string): string {
+function normalizeLabelColor(color: string): string {
   return color.trim().replace(/^#/, "").toLowerCase();
 }
 
-export function normalizeLabelDescription(description: string | null | undefined): string {
+function normalizeLabelDescription(description: string | null | undefined): string {
   return (description ?? "").trim();
 }
 
