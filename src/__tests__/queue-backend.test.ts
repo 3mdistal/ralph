@@ -56,6 +56,27 @@ describe("queue backend selection", () => {
     expect(state.diagnostics ?? "").toContain("not yet implemented");
   });
 
+  test("falls back to bwrb when GitHub backend is missing but vault is available", async () => {
+    const vaultPath = join(homeDir, "vault");
+    await mkdir(join(vaultPath, ".bwrb"), { recursive: true });
+    await writeFile(join(vaultPath, ".bwrb", "schema.json"), "{}", "utf8");
+
+    const configPath = getRalphConfigJsonPath();
+    await writeJson(configPath, {
+      bwrbVault: vaultPath,
+      repos: [],
+    });
+
+    __resetConfigForTests();
+    __resetQueueBackendStateForTests();
+
+    const state = getQueueBackendState();
+    expect(state.desiredBackend).toBe("github");
+    expect(state.backend).toBe("bwrb");
+    expect(state.health).toBe("degraded");
+    expect(state.diagnostics ?? "").toContain("falling back to bwrb");
+  });
+
   test("explicit github is unavailable when backend not implemented", async () => {
     const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {

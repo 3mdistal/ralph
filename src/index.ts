@@ -998,7 +998,7 @@ async function main(): Promise<void> {
   if (queueState.backend === "bwrb") {
     console.log(`        Vault: ${config.bwrbVault}`);
   }
-  if (queueState.diagnostics && queueState.backend !== "bwrb") {
+  if (queueState.diagnostics) {
     console.log(`        Queue diagnostics: ${queueState.diagnostics}`);
   }
   console.log(`        Max workers: ${config.maxWorkers}`);

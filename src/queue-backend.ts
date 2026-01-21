@@ -1,6 +1,7 @@
 import { checkBwrbVaultLayout, isQueueBackendExplicit, loadConfig, type QueueBackend, type RalphConfig } from "./config";
 import { shouldLog } from "./logging";
 import * as bwrbQueue from "./queue";
+import type { QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
 
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
 
@@ -45,12 +46,19 @@ export function getQueueBackendState(): QueueBackendState {
     }
   } else if (desiredBackend === "github") {
     if (!GITHUB_QUEUE_IMPLEMENTED) {
-      diagnostics = "GitHub queue backend is not yet implemented (see #61/#63).";
-      if (explicit) {
-        health = "unavailable";
-      } else {
-        backend = "none";
+      const fallbackCheck = checkBwrbVaultLayout(config.bwrbVault);
+      if (!explicit && fallbackCheck.ok) {
+        backend = "bwrb";
         health = "degraded";
+        diagnostics = "GitHub queue backend is not yet implemented (see #61/#63); falling back to bwrb.";
+      } else {
+        diagnostics = "GitHub queue backend is not yet implemented (see #61/#63).";
+        if (explicit) {
+          health = "unavailable";
+        } else {
+          backend = "none";
+          health = "degraded";
+        }
       }
     } else if (!isGitHubAuthConfigured(config)) {
       diagnostics =
@@ -102,15 +110,15 @@ export function ensureBwrbQueueOrWarn(action: string): boolean {
   return false;
 }
 
-export type { AgentTask, QueueChangeHandler } from "./queue";
+export type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
 export { groupByRepo, normalizeBwrbNoteRef } from "./queue";
 
-export async function initialPoll(): Promise<bwrbQueue.AgentTask[]> {
+export async function initialPoll(): Promise<QueueTask[]> {
   if (!ensureBwrbQueueOrWarn("initial poll")) return [];
   return bwrbQueue.initialPoll();
 }
 
-export function startWatching(onChange: bwrbQueue.QueueChangeHandler): void {
+export function startWatching(onChange: QueueChangeHandler): void {
   if (!ensureBwrbQueueOrWarn("queue watch")) return;
   bwrbQueue.startWatching(onChange);
 }
@@ -122,26 +130,26 @@ export function stopWatching(): void {
   }
 }
 
-export async function getQueuedTasks(): Promise<bwrbQueue.AgentTask[]> {
+export async function getQueuedTasks(): Promise<QueueTask[]> {
   if (!ensureBwrbQueueOrWarn("list queued tasks")) return [];
   return bwrbQueue.getQueuedTasks();
 }
 
-export async function getTasksByStatus(status: bwrbQueue.AgentTask["status"]): Promise<bwrbQueue.AgentTask[]> {
+export async function getTasksByStatus(status: QueueTaskStatus): Promise<QueueTask[]> {
   if (!ensureBwrbQueueOrWarn(`list tasks (${status})`)) return [];
   return bwrbQueue.getTasksByStatus(status);
 }
 
-export async function getTaskByPath(taskPath: string): Promise<bwrbQueue.AgentTask | null> {
+export async function getTaskByPath(taskPath: string): Promise<QueueTask | null> {
   if (!ensureBwrbQueueOrWarn("get task by path")) return null;
   return bwrbQueue.getTaskByPath(taskPath);
 }
 
 export async function tryClaimTask(opts: {
-  task: bwrbQueue.AgentTask;
+  task: QueueTask;
   daemonId: string;
   nowMs: number;
-}): Promise<{ claimed: boolean; task: bwrbQueue.AgentTask | null; reason?: string }> {
+}): Promise<{ claimed: boolean; task: QueueTask | null; reason?: string }> {
   if (!ensureBwrbQueueOrWarn("claim task")) {
     return { claimed: false, task: null, reason: "queue backend disabled" };
   }
@@ -149,7 +157,7 @@ export async function tryClaimTask(opts: {
 }
 
 export async function heartbeatTask(opts: {
-  task: bwrbQueue.AgentTask;
+  task: QueueTask;
   daemonId: string;
   nowMs: number;
 }): Promise<boolean> {
@@ -158,8 +166,8 @@ export async function heartbeatTask(opts: {
 }
 
 export async function updateTaskStatus(
-  task: bwrbQueue.AgentTask | Pick<bwrbQueue.AgentTask, "_path" | "_name" | "name" | "issue" | "repo"> | string,
-  status: bwrbQueue.AgentTask["status"],
+  task: QueueTask | Pick<QueueTask, "_path" | "_name" | "name" | "issue" | "repo"> | string,
+  status: QueueTaskStatus,
   extraFields?: Record<string, string | number>
 ): Promise<boolean> {
   if (!ensureBwrbQueueOrWarn("update task status")) return false;
@@ -171,14 +179,14 @@ export async function createAgentTask(opts: {
   issue: string;
   repo: string;
   scope: string;
-  status: bwrbQueue.AgentTask["status"];
+  status: QueueTaskStatus;
   priority?: string;
 }): Promise<{ taskPath: string; taskFileName: string } | null> {
   if (!ensureBwrbQueueOrWarn("create agent task")) return null;
   return bwrbQueue.createAgentTask(opts);
 }
 
-export async function resolveAgentTaskByIssue(issue: string, repo?: string): Promise<bwrbQueue.AgentTask | null> {
+export async function resolveAgentTaskByIssue(issue: string, repo?: string): Promise<QueueTask | null> {
   if (!ensureBwrbQueueOrWarn("resolve agent task")) return null;
   return bwrbQueue.resolveAgentTaskByIssue(issue, repo);
 }
