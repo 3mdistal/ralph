@@ -863,7 +863,7 @@ export function loadConfig(): RalphConfig {
 
   const recordConfigSource = (source: ConfigSource, fileConfig: any | null) => {
     configSource = source;
-    queueBackendExplicit = Boolean(fileConfig && isQueueBackendValue((fileConfig as any).queueBackend));
+    queueBackendExplicit = Boolean(fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend"));
   };
 
   if (existsSync(configTomlPath)) {

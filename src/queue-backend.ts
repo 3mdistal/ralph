@@ -9,6 +9,7 @@ export type QueueBackendState = {
   desiredBackend: QueueBackend;
   backend: QueueBackend;
   health: QueueBackendHealth;
+  fallback: boolean;
   diagnostics?: string;
   explicit: boolean;
   bwrbVault?: string;
@@ -49,7 +50,7 @@ export function getQueueBackendState(): QueueBackendState {
       const fallbackCheck = checkBwrbVaultLayout(config.bwrbVault);
       if (!explicit && fallbackCheck.ok) {
         backend = "bwrb";
-        health = "degraded";
+        health = "ok";
         diagnostics = "GitHub queue backend is not yet implemented (see #61/#63); falling back to bwrb.";
       } else {
         diagnostics = "GitHub queue backend is not yet implemented (see #61/#63).";
@@ -78,6 +79,7 @@ export function getQueueBackendState(): QueueBackendState {
     desiredBackend,
     backend,
     health,
+    fallback: backend !== desiredBackend,
     diagnostics,
     explicit,
     bwrbVault: config.bwrbVault,

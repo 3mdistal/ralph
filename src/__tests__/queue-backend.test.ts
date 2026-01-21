@@ -53,6 +53,7 @@ describe("queue backend selection", () => {
     expect(state.desiredBackend).toBe("github");
     expect(state.backend).toBe("none");
     expect(state.health).toBe("degraded");
+    expect(state.fallback).toBe(true);
     expect(state.diagnostics ?? "").toContain("not yet implemented");
   });
 
@@ -73,7 +74,8 @@ describe("queue backend selection", () => {
     const state = getQueueBackendState();
     expect(state.desiredBackend).toBe("github");
     expect(state.backend).toBe("bwrb");
-    expect(state.health).toBe("degraded");
+    expect(state.health).toBe("ok");
+    expect(state.fallback).toBe(true);
     expect(state.diagnostics ?? "").toContain("falling back to bwrb");
   });
 
@@ -92,5 +94,6 @@ describe("queue backend selection", () => {
     expect(state.desiredBackend).toBe("github");
     expect(state.backend).toBe("github");
     expect(state.health).toBe("unavailable");
+    expect(state.fallback).toBe(false);
   });
 });

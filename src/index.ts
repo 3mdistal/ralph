@@ -994,7 +994,13 @@ async function main(): Promise<void> {
   );
 
   console.log("[ralph] Configuration:");
-  console.log(`        Queue backend: ${queueState.backend}${queueState.health === "degraded" ? " (degraded)" : ""}`);
+  const backendTags = [
+    queueState.health === "degraded" ? "degraded" : null,
+    queueState.fallback ? "fallback" : null,
+  ].filter(Boolean);
+  const backendSuffix = backendTags.length > 0 ? ` (${backendTags.join(", ")})` : "";
+
+  console.log(`        Queue backend: ${queueState.backend}${backendSuffix}`);
   if (queueState.backend === "bwrb") {
     console.log(`        Vault: ${config.bwrbVault}`);
   }
@@ -1416,6 +1422,7 @@ if (args[0] === "status") {
           queue: {
             backend: queueState.backend,
             health: queueState.health,
+            fallback: queueState.fallback,
             diagnostics: queueState.diagnostics ?? null,
           },
           controlProfile: controlProfile || null,
@@ -1457,7 +1464,12 @@ if (args[0] === "status") {
   }
 
   console.log(`Mode: ${mode}`);
-  console.log(`Queue backend: ${queueState.backend}${queueState.health === "degraded" ? " (degraded)" : ""}`);
+  const statusTags = [
+    queueState.health === "degraded" ? "degraded" : null,
+    queueState.fallback ? "fallback" : null,
+  ].filter(Boolean);
+  const statusSuffix = statusTags.length > 0 ? ` (${statusTags.join(", ")})` : "";
+  console.log(`Queue backend: ${queueState.backend}${statusSuffix}`);
   if (queueState.diagnostics) {
     console.log(`Queue diagnostics: ${queueState.diagnostics}`);
   }
