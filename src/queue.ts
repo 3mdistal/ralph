@@ -2,13 +2,14 @@ import { watch } from "fs";
 import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
-import { ensureBwrbVaultLayout, getRepoBotBranch, getRepoPath, loadConfig } from "./config";
+import { ensureBwrbVaultLayout, getConfig, getRepoBotBranch, getRepoPath } from "./config";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { canActOnTask, isHeartbeatStale } from "./ownership";
+import type { AgentTask, QueueChangeHandler, QueueTaskStatus } from "./queue/types";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -59,50 +60,7 @@ export function __resetBwrbRunnerForTests(): void {
   bwrb = DEFAULT_BWRB_RUNNER;
 }
 
-export interface AgentTask {
-  _path: string;
-  _name: string;
-  type: "agent-task";
-  "creation-date": string;
-  scope: string;
-  issue: string;
-  repo: string;
-  status: "queued" | "starting" | "in-progress" | "throttled" | "blocked" | "escalated" | "done";
-  priority?: string;
-  name: string;
-  run?: string;
-  "assigned-at"?: string;
-  "completed-at"?: string;
-  /** Hard throttle metadata (best-effort) */
-  "throttled-at"?: string;
-  "resume-at"?: string;
-  "usage-snapshot"?: string;
-  /** OpenCode session ID used to resume after restarts */
-  "session-id"?: string;
-  /** Daemon identifier owning this task (for rolling restart safety). */
-  "daemon-id"?: string;
-  /** Last heartbeat timestamp from owning daemon. */
-  "heartbeat-at"?: string;
-  /** OpenCode profile name used for this task (persisted for resume). */
-  "opencode-profile"?: string;
-  /** Path to restart-survivable OpenCode run output log */
-  "run-log-path"?: string;
-  /** Git worktree path for this task (for per-repo concurrency + resume) */
-  "worktree-path"?: string;
-  /** Stable worker identity (repo#taskId). */
-  "worker-id"?: string;
-  /** Per-repo concurrency slot (0..max-1). */
-  "repo-slot"?: string;
-  /** Watchdog recovery attempts (string in frontmatter) */
-  "watchdog-retries"?: string;
-  /** Last checkpoint reached by worker */
-  checkpoint?: string;
-  /** Pause requested at next checkpoint */
-  "pause-requested"?: string;
-}
-
-
-export type QueueChangeHandler = (tasks: AgentTask[]) => void;
+export type { AgentTask, QueueChangeHandler, QueueTaskStatus } from "./queue/types";
 
 let watcher: ReturnType<typeof watch> | null = null;
 let changeHandlers: QueueChangeHandler[] = [];
@@ -229,7 +187,7 @@ function recordQueueStateSnapshot(tasks: AgentTask[]): void {
   }
 }
 
-const VALID_TASK_STATUSES = new Set<AgentTask["status"]>([
+const VALID_TASK_STATUSES = new Set<QueueTaskStatus>([
   "queued",
   "starting",
   "in-progress",
@@ -240,7 +198,7 @@ const VALID_TASK_STATUSES = new Set<AgentTask["status"]>([
 ]);
 
 async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentTask[]> {
-  const config = loadConfig();
+  const config = getConfig();
 
   const where = status
     ? `type == 'agent-task' && status == '${status}'`
@@ -308,7 +266,7 @@ export async function tryClaimTask(opts: {
   daemonId: string;
   nowMs: number;
 }): Promise<{ claimed: boolean; task: AgentTask | null; reason?: string }> {
-  const config = loadConfig();
+  const config = getConfig();
   const ttlMs = config.ownershipTtlMs;
   const normalizedPath = normalizeBwrbNoteRef(opts.task._path);
 
@@ -406,7 +364,7 @@ export async function createAgentTask(opts: {
   status: AgentTask["status"];
   priority?: string;
 }): Promise<{ taskPath: string; taskFileName: string } | null> {
-  const config = loadConfig();
+  const config = getConfig();
   const today = new Date().toISOString().split("T")[0];
 
   const runNew = async (name: string): Promise<{ success: boolean; path?: string; error?: string }> => {
@@ -483,7 +441,7 @@ export async function updateTaskStatus(
     return false;
   }
 
-  const config = loadConfig();
+  const config = getConfig();
   const normalizedExtraFields = extraFields
     ? Object.fromEntries(
         Object.entries(extraFields).map(([key, value]) => {
@@ -734,7 +692,7 @@ export function startWatching(onChange: QueueChangeHandler): void {
   changeHandlers.push(onChange);
   if (watcher) return;
 
-  const config = loadConfig();
+  const config = getConfig();
   const vault = config.bwrbVault;
 
   if (!ensureBwrbVaultLayout(vault)) return;
