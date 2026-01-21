@@ -1,14 +1,32 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
+import { dirname, join } from "path";
+import { tmpdir } from "os";
+
+import { __resetConfigForTests } from "../config";
+import { getRalphConfigJsonPath } from "../paths";
+import { RepoWorker } from "../worker";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let autoUpdateEnabled = false;
 let autoUpdateLabelGate: string | null = null;
 let autoUpdateMinMinutes = 30;
 
-mock.module("../config", () => ({
-  loadConfig: () => ({
+let homeDir: string;
+let priorHome: string | undefined;
+let releaseLock: (() => void) | null = null;
+
+async function writeJson(path: string, obj: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(obj, null, 2), "utf8");
+}
+
+async function writeTestConfig(): Promise<void> {
+  await writeJson(getRalphConfigJsonPath(), {
     repos: [
       {
         name: "3mdistal/ralph",
+        requiredChecks: ["ci"],
         autoUpdateBehindPrs: autoUpdateEnabled,
         autoUpdateBehindMinMinutes: autoUpdateMinMinutes,
         autoUpdateBehindLabel: autoUpdateLabelGate,
@@ -21,19 +39,9 @@ mock.module("../config", () => ({
     owner: "3mdistal",
     allowedOwners: ["3mdistal"],
     devDir: "/tmp",
-  }),
-  getRepoBotBranch: () => "bot/integration",
-  getRepoMaxWorkers: () => 1,
-  getRepoRequiredChecks: () => ["ci"],
-  isAutoUpdateBehindEnabled: () => autoUpdateEnabled,
-  getAutoUpdateBehindLabelGate: () => autoUpdateLabelGate,
-  getAutoUpdateBehindMinMinutes: () => autoUpdateMinMinutes,
-  resolveOpencodeProfile: () => null,
-  isOpencodeProfilesEnabled: () => false,
-  getOpencodeDefaultProfileName: () => null,
-}));
-
-import { RepoWorker } from "../worker";
+  });
+  __resetConfigForTests();
+}
 
 // --- Mocks used by adapters ---
 
@@ -139,7 +147,13 @@ afterAll(() => {
 });
 
 describe("integration-ish harness: full task lifecycle", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    releaseLock = await acquireGlobalTestLock();
+    priorHome = process.env.HOME;
+    homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
+    process.env.HOME = homeDir;
+    __resetConfigForTests();
+
     updateTaskStatusMock.mockClear();
     notifyEscalationMock.mockClear();
     notifyErrorMock.mockClear();
@@ -164,6 +178,16 @@ describe("integration-ish harness: full task lifecycle", () => {
         },
       }) as any
     );
+
+    await writeTestConfig();
+  });
+
+  afterEach(async () => {
+    process.env.HOME = priorHome;
+    await rm(homeDir, { recursive: true, force: true });
+    __resetConfigForTests();
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("queued → in-progress → build → PR → merge → survey → done", async () => {
@@ -557,6 +581,7 @@ describe("integration-ish harness: full task lifecycle", () => {
 
   test("auto-update updates behind branch before merge", async () => {
     autoUpdateEnabled = true;
+    await writeTestConfig();
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
@@ -617,6 +642,7 @@ describe("integration-ish harness: full task lifecycle", () => {
   test("auto-update respects label gate", async () => {
     autoUpdateEnabled = true;
     autoUpdateLabelGate = "autoupdate";
+    await writeTestConfig();
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
@@ -676,6 +702,7 @@ describe("integration-ish harness: full task lifecycle", () => {
 
   test("auto-update escalates on conflicts", async () => {
     autoUpdateEnabled = true;
+    await writeTestConfig();
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
 
