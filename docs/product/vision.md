@@ -51,14 +51,12 @@ Task note filenames are derived from note names. Ralph sanitizes names before cr
 - If sanitization yields an empty name, use `Untitled`
 - If a note already exists, append a short UUID suffix
 
-### 1. Queue Lives in bwrb
+### 1. Queue Lives in GitHub Issues
 
-Use bwrb notes for task management:
-- `agent-task` - Work items in the queue
-- `agent-run` - Completed work records with decisions
-- `agent-escalation` - Items needing human attention
+GitHub Issues are the source of truth for queue state and dependency relationships.
+SQLite under `~/.ralph` stores operational state (session IDs, worktree paths, cursors).
 
-This provides full auditability and integrates with existing Obsidian workflows.
+See `docs/product/github-first-orchestration.md` for the canonical contract.
 
 ### 2. Bot Branch Strategy
 
@@ -72,6 +70,10 @@ Rollup automation policy:
 - Default batch size is 10 (configurable globally or per repo).
 - If there are no queued or in-flight tasks for 5 minutes, check for unrolled changes on `bot/integration`.
 - Create a rollup PR from `bot/integration` to `main` when there are unrolled changes, unless one is already open.
+
+Merge gating defaults:
+- Policy decision: when Ralph derives required checks from branch protection and protection is missing or unreadable, it should fail open (treat required checks as empty) to avoid blocking automation.
+- Policy decision: branch protection enforcement (and bot branch creation for enforcement) only runs when `repos[].requiredChecks` is explicitly configured; otherwise leave existing branch protection unchanged.
 
 Benefits:
 - Reduces interrupt frequency

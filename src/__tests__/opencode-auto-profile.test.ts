@@ -1,12 +1,20 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
+import { dirname, join } from "path";
+import { tmpdir } from "os";
 
-// --- Mocks (must be declared before importing module under test) ---
+import { __resetConfigForTests } from "../config";
+import { getRalphConfigJsonPath } from "../paths";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
-const listOpencodeProfileNamesMock = mock(() => ["apple", "google"]);
+let homeDir: string;
+let priorHome: string | undefined;
+let releaseLock: (() => void) | null = null;
 
-mock.module("../config", () => ({
-  listOpencodeProfileNames: listOpencodeProfileNamesMock,
-}));
+async function writeJson(path: string, obj: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(obj, null, 2), "utf8");
+}
 
 type GetThrottleArgs = { opencodeProfile?: string | null };
 
@@ -81,12 +89,40 @@ import {
   resolveOpencodeProfileForNewWork,
 } from "../opencode-auto-profile";
 
+afterAll(() => {
+  mock.restore();
+});
+
 describe("auto opencode profile selection", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    releaseLock = await acquireGlobalTestLock();
+    priorHome = process.env.HOME;
+    homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
+    process.env.HOME = homeDir;
+    __resetConfigForTests();
+
+    await writeJson(getRalphConfigJsonPath(), {
+      opencode: {
+        enabled: true,
+        profiles: {
+          apple: { xdgDataHome: "/tmp", xdgConfigHome: "/tmp", xdgStateHome: "/tmp" },
+          google: { xdgDataHome: "/tmp", xdgConfigHome: "/tmp", xdgStateHome: "/tmp" },
+        },
+      },
+    });
+    __resetConfigForTests();
+
     __resetAutoOpencodeProfileSelectionForTests();
-    listOpencodeProfileNamesMock.mockClear();
     getThrottleDecisionMock.mockClear();
     getThrottleDecisionMock.mockImplementation(defaultGetThrottleDecisionImpl);
+  });
+
+  afterEach(async () => {
+    process.env.HOME = priorHome;
+    await rm(homeDir, { recursive: true, force: true });
+    __resetConfigForTests();
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("prefers the profile whose reset is sooner when it has meaningful remaining", async () => {

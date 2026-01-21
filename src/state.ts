@@ -402,6 +402,14 @@ export function hasIdempotencyKey(key: string): boolean {
   return Boolean(row?.key);
 }
 
+export function getIdempotencyPayload(key: string): string | null {
+  const database = requireDb();
+  const row = database.query("SELECT payload_json FROM idempotency WHERE key = $key").get({
+    $key: key,
+  }) as { payload_json?: string | null } | undefined;
+  return typeof row?.payload_json === "string" ? row.payload_json : null;
+}
+
 export function recordIdempotencyKey(input: {
   key: string;
   scope?: string;
@@ -425,6 +433,37 @@ export function recordIdempotencyKey(input: {
     });
 
   return result.changes > 0;
+}
+
+export function upsertIdempotencyKey(input: {
+  key: string;
+  scope?: string;
+  payloadJson?: string;
+  createdAt?: string;
+}): void {
+  const database = requireDb();
+  const createdAt = input.createdAt ?? nowIso();
+
+  database
+    .query(
+      `INSERT INTO idempotency(key, scope, created_at, payload_json)
+       VALUES ($key, $scope, $created_at, $payload_json)
+       ON CONFLICT(key) DO UPDATE SET
+         scope = excluded.scope,
+         created_at = excluded.created_at,
+         payload_json = excluded.payload_json`
+    )
+    .run({
+      $key: input.key,
+      $scope: input.scope ?? null,
+      $created_at: createdAt,
+      $payload_json: input.payloadJson ?? null,
+    });
+}
+
+export function deleteIdempotencyKey(key: string): void {
+  const database = requireDb();
+  database.query("DELETE FROM idempotency WHERE key = $key").run({ $key: key });
 }
 
 export type RollupBatchStatus = "open" | "rolled-up";
