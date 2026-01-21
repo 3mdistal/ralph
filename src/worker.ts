@@ -638,34 +638,39 @@ export class RepoWorker {
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
 
     this.ensureLabelsPromise = (async () => {
-      const existing = await this.github.listLabelSpecs();
-      const { toCreate, toUpdate } = computeRalphLabelSync(existing);
-      if (toCreate.length === 0 && toUpdate.length === 0) return;
+      try {
+        const existing = await this.github.listLabelSpecs();
+        const { toCreate, toUpdate } = computeRalphLabelSync(existing);
+        if (toCreate.length === 0 && toUpdate.length === 0) return;
 
-      const created: string[] = [];
-      for (const label of toCreate) {
-        try {
-          await this.github.createLabel(label);
-          created.push(label.name);
-        } catch (e: any) {
-          if (e instanceof GitHubApiError) {
-            if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
+        const created: string[] = [];
+        for (const label of toCreate) {
+          try {
+            await this.github.createLabel(label);
+            created.push(label.name);
+          } catch (e: any) {
+            if (e instanceof GitHubApiError) {
+              if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
+            }
+            throw e;
           }
-          throw e;
         }
-      }
 
-      const updated: string[] = [];
-      for (const update of toUpdate) {
-        await this.github.updateLabel(update.currentName, update.patch);
-        updated.push(update.currentName);
-      }
+        const updated: string[] = [];
+        for (const update of toUpdate) {
+          await this.github.updateLabel(update.currentName, update.patch);
+          updated.push(update.currentName);
+        }
 
-      if (created.length > 0) {
-        console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
-      }
-      if (updated.length > 0) {
-        console.log(`[ralph:worker:${this.repo}] Updated GitHub label(s): ${updated.join(", ")}`);
+        if (created.length > 0) {
+          console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
+        }
+        if (updated.length > 0) {
+          console.log(`[ralph:worker:${this.repo}] Updated GitHub label(s): ${updated.join(", ")}`);
+        }
+      } catch (error) {
+        this.ensureLabelsPromise = null;
+        throw error;
       }
     })();
 

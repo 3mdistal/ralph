@@ -12,7 +12,7 @@ describe("computeRalphLabelSync", () => {
   test("no-ops when all workflow labels exist with correct metadata", () => {
     const existing = RALPH_WORKFLOW_LABELS.map((label) => ({
       name: label.name.toUpperCase(),
-      color: label.color.toLowerCase(),
+      color: `#${label.color.toLowerCase()}`,
       description: ` ${label.description} `,
     }));
     const { toCreate, toUpdate } = computeRalphLabelSync(existing);
