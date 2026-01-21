@@ -6,8 +6,8 @@ const queueAdapter = {
   updateTaskStatus: updateTaskStatusMock,
 };
 
-mock.module("../config", () => ({
-  loadConfig: () => ({
+mock.module("../config", () => {
+  const config = {
     repos: [],
     maxWorkers: 1,
     batchSize: 10,
@@ -16,10 +16,18 @@ mock.module("../config", () => ({
     owner: "3mdistal",
     allowedOwners: ["3mdistal"],
     devDir: "/tmp",
-  }),
-  getRepoBotBranch: () => "bot/integration",
-  getRepoMaxWorkers: () => 1,
-}));
+  };
+
+  return {
+    loadConfig: () => ({
+      config,
+      meta: { source: "json", queueBackendExplicit: false },
+    }),
+    getConfig: () => config,
+    getRepoBotBranch: () => "bot/integration",
+    getRepoMaxWorkers: () => 1,
+  };
+});
 
 import { RepoWorker } from "../worker";
 

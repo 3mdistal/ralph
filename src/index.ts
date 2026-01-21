@@ -13,10 +13,10 @@ import crypto from "crypto";
 
 import {
   ensureBwrbVaultLayout,
+  getConfig,
   getOpencodeDefaultProfileName,
   getRepoMaxWorkers,
   getRepoPath,
-  loadConfig,
   type ControlConfig,
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
@@ -199,13 +199,13 @@ const rrCursor = { value: 0 };
 function requireBwrbQueueOrExit(action: string): void {
   const state = getQueueBackendState();
   if (state.backend === "bwrb" && state.health === "ok") {
-    if (!ensureBwrbVaultLayout(loadConfig().bwrbVault)) process.exit(1);
+    if (!ensureBwrbVaultLayout(getConfig().bwrbVault)) process.exit(1);
     return;
   }
 
   if (state.backend !== "bwrb") {
     console.warn(`[ralph] ${action} requires bwrb queue backend (current: ${state.backend}).`);
-    process.exit(0);
+    process.exit(1);
   }
 
   const reason = state.diagnostics ? ` ${state.diagnostics}` : "";
@@ -215,7 +215,7 @@ function requireBwrbQueueOrExit(action: string): void {
 
 function ensureSemaphores(): void {
   if (globalSemaphore) return;
-  const config = loadConfig();
+  const config = getConfig();
   globalSemaphore = new Semaphore(config.maxWorkers);
 }
 
@@ -230,7 +230,7 @@ function getRepoSemaphore(repo: string): Semaphore {
 
 async function checkIdleRollups(): Promise<void> {
   if (isShuttingDown) return;
-  const config = loadConfig();
+  const config = getConfig();
   if (getDaemonMode(config.control) === "draining") return;
   if (inFlightTasks.size > 0) return;
 
@@ -352,13 +352,13 @@ function forgetOwnedTask(task: AgentTask): void {
 
 const schedulerController = createSchedulerController({
   getDaemonMode: () => {
-    const config = loadConfig();
+    const config = getConfig();
     return getDaemonMode(config.control);
   },
   isShuttingDown: () => isShuttingDown,
   getRunnableTasks: () => getRunnableTasks(),
   onRunnableTasks: (tasks) => {
-    const config = loadConfig();
+    const config = getConfig();
     return processNewTasks(tasks, config.control ?? {});
   },
   getPendingResumeTasks: () => Array.from(pendingResumeTasks.values()),
@@ -460,7 +460,7 @@ async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Pr
 
   const nowMs = Date.now();
   const claimable: AgentTask[] = [];
-  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  const heartbeatCutoffMs = nowMs - getConfig().ownershipTtlMs;
   for (const task of throttled) {
     const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
     if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
@@ -688,7 +688,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
 
   const nowMs = Date.now();
   const claimable: AgentTask[] = [];
-  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  const heartbeatCutoffMs = nowMs - getConfig().ownershipTtlMs;
   for (const task of tasks) {
     const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
     if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
@@ -863,7 +863,7 @@ async function resumeTasksOnStartup(opts?: {
 
   const nowMs = Date.now();
   const claimable: AgentTask[] = [];
-  const heartbeatCutoffMs = nowMs - loadConfig().ownershipTtlMs;
+  const heartbeatCutoffMs = nowMs - getConfig().ownershipTtlMs;
   for (const task of inProgress) {
     const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
     if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
@@ -900,7 +900,7 @@ async function resumeTasksOnStartup(opts?: {
   const withSession = claimable.filter((t) => t["session-id"]?.trim());
   if (withSession.length === 0) return;
 
-  const globalLimit = loadConfig().maxWorkers;
+  const globalLimit = getConfig().maxWorkers;
 
   const withSessionByRepo = groupByRepo(withSession);
   const repos = Array.from(withSessionByRepo.keys());
@@ -969,7 +969,7 @@ async function main(): Promise<void> {
   console.log("");
 
   // Load config
-  const config = loadConfig();
+  const config = getConfig();
   const queueState = getQueueBackendState();
 
   if (queueState.health === "unavailable") {
@@ -1086,7 +1086,7 @@ async function main(): Promise<void> {
     resetIdleState([]);
   }
 
-  const ownershipTtlMs = loadConfig().ownershipTtlMs;
+  const ownershipTtlMs = getConfig().ownershipTtlMs;
   const heartbeatIntervalMs = computeHeartbeatIntervalMs(ownershipTtlMs);
   let heartbeatInFlight = false;
 
@@ -1368,7 +1368,7 @@ if (args[0] === "status") {
 
   const json = args.includes("--json");
 
-  const config = loadConfig();
+  const config = getConfig();
   const queueState = getQueueBackendState();
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
   const controlProfile = control.opencodeProfile?.trim() || "";

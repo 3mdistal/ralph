@@ -24,7 +24,7 @@ import {
   getRepoMaxWorkers,
   getRepoRequiredChecks,
   isOpencodeProfilesEnabled,
-  loadConfig,
+  getConfig,
   resolveOpencodeProfile,
 } from "./config";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
@@ -2177,7 +2177,7 @@ ${guidance}`
   }
 
   private buildWatchdogOptions(task: AgentTask, stage: string) {
-    const cfg = loadConfig().watchdog;
+    const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
 
     return {
@@ -2231,7 +2231,7 @@ ${guidance}`
       };
     }
 
-    const defaults = loadConfig().control;
+    const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
     const requested = control.opencodeProfile?.trim() ?? "";
 
@@ -2299,7 +2299,7 @@ ${guidance}`
     if (pinned) {
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
-      const defaults = loadConfig().control;
+      const defaults = getConfig().control;
       const controlProfile =
         readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
 

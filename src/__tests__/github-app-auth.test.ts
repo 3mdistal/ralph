@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
-mock.module("../config", () => ({
-  loadConfig: () => ({
+mock.module("../config", () => {
+  const config = {
     repos: [],
     maxWorkers: 1,
     batchSize: 10,
@@ -15,8 +15,16 @@ mock.module("../config", () => ({
       installationId: 456,
       privateKeyPath: "/does/not/matter.pem",
     },
-  }),
-}));
+  };
+
+  return {
+    loadConfig: () => ({
+      config,
+      meta: { source: "json", queueBackendExplicit: false },
+    }),
+    getConfig: () => config,
+  };
+});
 
 import {
   __resetGitHubAuthForTests,

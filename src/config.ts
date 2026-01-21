@@ -232,11 +232,19 @@ const DEFAULT_CONFIG: RalphConfig = {
   devDir: join(homedir(), "Developer"),
 };
 
-let config: RalphConfig | null = null;
-
 type ConfigSource = "default" | "toml" | "json" | "legacy";
-let configSource: ConfigSource = "default";
-let queueBackendExplicit = false;
+
+export type ConfigMeta = {
+  source: ConfigSource;
+  queueBackendExplicit: boolean;
+};
+
+export type ConfigLoadResult = {
+  config: RalphConfig;
+  meta: ConfigMeta;
+};
+
+let configResult: ConfigLoadResult | null = null;
 
 function isQueueBackendValue(value: unknown): value is QueueBackend {
   return value === "github" || value === "bwrb" || value === "none";
@@ -824,13 +832,15 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
   return loaded;
 }
 
-export function loadConfig(): RalphConfig {
-  if (config) return config;
+export function loadConfig(): ConfigLoadResult {
+  if (configResult) return configResult;
 
   // Start with defaults
   let loaded: RalphConfig = { ...DEFAULT_CONFIG };
-  configSource = "default";
-  queueBackendExplicit = false;
+  let meta: ConfigMeta = {
+    source: "default",
+    queueBackendExplicit: false,
+  };
 
   // Try to load from file (precedence: ~/.ralph/config.toml > ~/.ralph/config.json > legacy ~/.config/opencode/ralph/ralph.json)
   const configTomlPath = getRalphConfigTomlPath();
@@ -862,8 +872,10 @@ export function loadConfig(): RalphConfig {
   };
 
   const recordConfigSource = (source: ConfigSource, fileConfig: any | null) => {
-    configSource = source;
-    queueBackendExplicit = Boolean(fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend"));
+    meta = {
+      source,
+      queueBackendExplicit: Boolean(fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend")),
+    };
   };
 
   if (existsSync(configTomlPath)) {
@@ -891,28 +903,31 @@ export function loadConfig(): RalphConfig {
     recordConfigSource("legacy", fileConfig);
   }
 
-  config = validateConfig(loaded);
-  return config;
+  configResult = {
+    config: validateConfig(loaded),
+    meta,
+  };
+  return configResult;
 }
 
 export function __resetConfigForTests(): void {
-  config = null;
-  configSource = "default";
-  queueBackendExplicit = false;
+  configResult = null;
 }
 
 export function getConfigSource(): ConfigSource {
-  loadConfig();
-  return configSource;
+  return loadConfig().meta.source;
 }
 
 export function isQueueBackendExplicit(): boolean {
-  loadConfig();
-  return queueBackendExplicit;
+  return loadConfig().meta.queueBackendExplicit;
+}
+
+export function getConfig(): RalphConfig {
+  return loadConfig().config;
 }
 
 export function getRepoPath(repoName: string): string {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   
   // Check if we have an explicit config for this repo
   const explicit = cfg.repos.find(r => r.name === repoName);
@@ -924,38 +939,38 @@ export function getRepoPath(repoName: string): string {
 }
 
 export function getRepoBotBranch(repoName: string): string {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find(r => r.name === repoName);
   return explicit?.botBranch ?? "bot/integration";
 }
 
 export function getRepoRequiredChecks(repoName: string): string[] {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const checks = toStringArrayOrNull(explicit?.requiredChecks);
   return checks ?? ["ci"];
 }
 
 export function getGlobalMaxWorkers(): number {
-  return loadConfig().maxWorkers;
+  return getConfig().maxWorkers;
 }
 
 export function getRepoMaxWorkers(repoName: string): number {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const maxWorkers = toPositiveIntOrNull(explicit?.maxWorkers);
   return maxWorkers ?? DEFAULT_REPO_MAX_WORKERS;
 }
 
 export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const rollupBatch = toPositiveIntOrNull(explicit?.rollupBatchSize);
   return rollupBatch ?? fallback ?? cfg.batchSize;
 }
 
 export function normalizeRepoName(repo: string): string {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   // If it's already full name, return as-is
   if (repo.includes("/")) return repo;
   // Otherwise, prepend owner
@@ -971,26 +986,26 @@ export type ResolvedOpencodeProfile = {
 };
 
 export function isOpencodeProfilesEnabled(): boolean {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   return cfg.opencode?.enabled ?? false;
 }
 
 export function listOpencodeProfileNames(): string[] {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const profiles = cfg.opencode?.profiles;
   if (!profiles || typeof profiles !== "object") return [];
   return Object.keys(profiles).sort();
 }
 
 export function getOpencodeDefaultProfileName(): string | null {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const raw = cfg.opencode?.defaultProfile;
   const trimmed = typeof raw === "string" ? raw.trim() : "";
   return trimmed ? trimmed : null;
 }
 
 export function resolveOpencodeProfile(name?: string | null): ResolvedOpencodeProfile | null {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const opencode = cfg.opencode;
   if (!opencode?.enabled) return null;
 

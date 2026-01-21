@@ -75,7 +75,7 @@ describe("throttle config validation", () => {
     const query: string = "throttle-config-validation";
     const cfgMod = await import(`../config?${query}`);
     cfgMod.__resetConfigForTests();
-    const cfg = cfgMod.loadConfig();
+    const cfg = cfgMod.loadConfig().config;
 
     expect(cfg.throttle?.enabled).toBe(true);
     expect(cfg.throttle?.providerID).toBe("openai");
@@ -123,7 +123,7 @@ describe("throttle config validation", () => {
     const query: string = "throttle-config-validation-invalid";
     const cfgMod = await import(`../config?${query}`);
     cfgMod.__resetConfigForTests();
-    const cfg = cfgMod.loadConfig();
+    const cfg = cfgMod.loadConfig().config;
 
     expect(cfg.throttle?.providerID).toBe("openai");
     expect(cfg.throttle?.softPct).toBe(0.65);

@@ -44,7 +44,7 @@ describe("queue backend selection", () => {
   });
 
   test("defaults queueBackend to github", () => {
-    const cfg = loadConfig();
+    const cfg = loadConfig().config;
     expect(cfg.queueBackend).toBe("github");
   });
 

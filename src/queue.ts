@@ -2,7 +2,7 @@ import { watch } from "fs";
 import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
-import { ensureBwrbVaultLayout, getRepoBotBranch, getRepoPath, loadConfig } from "./config";
+import { ensureBwrbVaultLayout, getConfig, getRepoBotBranch, getRepoPath } from "./config";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
@@ -144,7 +144,7 @@ const VALID_TASK_STATUSES = new Set<QueueTaskStatus>([
 ]);
 
 async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentTask[]> {
-  const config = loadConfig();
+  const config = getConfig();
 
   const where = status
     ? `type == 'agent-task' && status == '${status}'`
@@ -211,7 +211,7 @@ export async function tryClaimTask(opts: {
   daemonId: string;
   nowMs: number;
 }): Promise<{ claimed: boolean; task: AgentTask | null; reason?: string }> {
-  const config = loadConfig();
+  const config = getConfig();
   const ttlMs = config.ownershipTtlMs;
   const normalizedPath = normalizeBwrbNoteRef(opts.task._path);
 
@@ -309,7 +309,7 @@ export async function createAgentTask(opts: {
   status: AgentTask["status"];
   priority?: string;
 }): Promise<{ taskPath: string; taskFileName: string } | null> {
-  const config = loadConfig();
+  const config = getConfig();
   const today = new Date().toISOString().split("T")[0];
 
   const runNew = async (name: string): Promise<{ success: boolean; path?: string; error?: string }> => {
@@ -386,7 +386,7 @@ export async function updateTaskStatus(
     return false;
   }
 
-  const config = loadConfig();
+  const config = getConfig();
   const normalizedExtraFields = extraFields
     ? Object.fromEntries(
         Object.entries(extraFields).map(([key, value]) => {
@@ -637,7 +637,7 @@ export function startWatching(onChange: QueueChangeHandler): void {
   changeHandlers.push(onChange);
   if (watcher) return;
 
-  const config = loadConfig();
+  const config = getConfig();
   const vault = config.bwrbVault;
 
   if (!ensureBwrbVaultLayout(vault)) return;
