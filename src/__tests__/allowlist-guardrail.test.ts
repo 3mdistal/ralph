@@ -6,25 +6,6 @@ const queueAdapter = {
   updateTaskStatus: updateTaskStatusMock,
 };
 
-mock.module("../config", () => ({
-  loadConfig: () => ({
-    repos: [],
-    maxWorkers: 1,
-    batchSize: 10,
-    pollInterval: 30_000,
-    bwrbVault: "/tmp",
-    owner: "3mdistal",
-    allowedOwners: ["3mdistal"],
-    devDir: "/tmp",
-  }),
-  getRepoBotBranch: () => "bot/integration",
-  getRepoMaxWorkers: () => 1,
-  getRepoRequiredChecks: () => ["ci"],
-  isAutoUpdateBehindEnabled: () => false,
-  getAutoUpdateBehindLabelGate: () => null,
-  getAutoUpdateBehindMinMinutes: () => 30,
-}));
-
 import { RepoWorker } from "../worker";
 
 function createMockTask(overrides: Record<string, unknown> = {}) {

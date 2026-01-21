@@ -1,22 +1,11 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
+import { dirname, join } from "path";
+import { tmpdir } from "os";
 
-mock.module("../config", () => ({
-  loadConfig: () => ({
-    repos: [],
-    maxWorkers: 1,
-    batchSize: 10,
-    pollInterval: 30_000,
-    bwrbVault: "/tmp",
-    owner: "3mdistal",
-    allowedOwners: ["3mdistal"],
-    devDir: "/tmp",
-    githubApp: {
-      appId: 123,
-      installationId: 456,
-      privateKeyPath: "/does/not/matter.pem",
-    },
-  }),
-}));
+import { __resetConfigForTests } from "../config";
+import { getRalphConfigJsonPath } from "../paths";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 import {
   __resetGitHubAuthForTests,
@@ -25,13 +14,52 @@ import {
   listAccessibleRepos,
 } from "../github-app-auth";
 
+let homeDir: string;
+let priorHome: string | undefined;
+let releaseLock: (() => void) | null = null;
+
+async function writeJson(path: string, obj: unknown): Promise<void> {
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify(obj, null, 2), "utf8");
+}
+
 afterAll(() => {
   mock.restore();
 });
 
 describe("github app auth", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    releaseLock = await acquireGlobalTestLock();
+    priorHome = process.env.HOME;
+    homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
+    process.env.HOME = homeDir;
+    __resetConfigForTests();
+
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+      githubApp: {
+        appId: 123,
+        installationId: 456,
+        privateKeyPath: "/does/not/matter.pem",
+      },
+    });
+    __resetConfigForTests();
     __resetGitHubAuthForTests();
+  });
+
+  afterEach(async () => {
+    process.env.HOME = priorHome;
+    await rm(homeDir, { recursive: true, force: true });
+    __resetConfigForTests();
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("caches installation token in memory", async () => {
