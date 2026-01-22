@@ -18,12 +18,14 @@ The codebase is TypeScript. Compilation and typechecking use `tsc`.
 
 ## CI Checks
 
-CI runs under the GitHub workflow named `CI` and performs these steps:
+CI runs under the GitHub workflow named `CI`. The key check commands are
+listed below. For the full workflow (including checkout and Bun setup), refer
+to `.github/workflows/ci.yml`.
 
 - Install: `bun install --frozen-lockfile`
 - Test: `bun test` (test suite)
 - Typecheck: `bun run typecheck` (TypeScript typecheck)
-- Build: `bun run build` (TypeScript build + managed template copy)
+- Build: `bun run build` (TypeScript build + `scripts/copy-managed-templates.ts`)
 - Knip: `bun run knip` (unused code/dependency analysis)
 
 ## Required Checks Note
@@ -31,4 +33,4 @@ CI runs under the GitHub workflow named `CI` and performs these steps:
 When configuring `repos[].requiredChecks`, use the exact check context name
 shown in GitHub branch protection for this workflow. GitHub required checks are
 job/check-run contexts (not individual steps), and the UI often shows them in a
-`<workflow> / <job>` format.
+`<workflow> / <job>` format (typically `CI / ci` for this workflow).
