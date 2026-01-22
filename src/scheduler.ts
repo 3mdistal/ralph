@@ -14,14 +14,14 @@ export interface SchedulerDeps<Task> {
   rrCursor: { value: number };
   shouldLog: (key: string, intervalMs: number) => boolean;
   log: (message: string) => void;
-  startTask: (opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }) => void | Promise<void>;
+  startTask: (opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }) => boolean | Promise<boolean>;
   priorityTasks?: Task[];
   startPriorityTask?: (
     opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }
-  ) => void | Promise<void>;
+  ) => boolean | Promise<boolean>;
 }
 
-export function startQueuedTasks<Task extends { repo: string }>(deps: SchedulerDeps<Task>): number {
+export async function startQueuedTasks<Task extends { repo: string }>(deps: SchedulerDeps<Task>): Promise<number> {
   if (deps.gate !== "running") return 0;
 
   const tasks = deps.tasks;
@@ -83,14 +83,22 @@ export function startQueuedTasks<Task extends { repo: string }>(deps: SchedulerD
 
       deps.rrCursor.value = (idx + 1) % repos.length;
 
-      startedCount++;
-      startedThisRound = true;
       const startFn = isPriority ? deps.startPriorityTask ?? deps.startTask : deps.startTask;
-      const startResult = startFn({ repo, task, releaseGlobal, releaseRepo });
-      void Promise.resolve(startResult).catch((error) => {
+      let started = false;
+      try {
+        started = await Promise.resolve(startFn({ repo, task, releaseGlobal, releaseRepo }));
+      } catch (error: any) {
         const message = error instanceof Error ? error.message : String(error);
         deps.log(`[ralph] Error starting task for ${repo}: ${message}`);
-      });
+      }
+
+      if (!started) {
+        startedThisRound = false;
+        continue;
+      }
+
+      startedCount++;
+      startedThisRound = true;
       break;
     }
 

@@ -123,16 +123,22 @@ describe("queue backend selection", () => {
       repos: [],
     });
 
+    const priorToken = process.env.GH_TOKEN;
     process.env.GH_TOKEN = "token";
 
-    __resetConfigForTests();
-    __resetQueueBackendStateForTests();
+    try {
+      __resetConfigForTests();
+      __resetQueueBackendStateForTests();
 
-    const state = getQueueBackendState();
-    expect(state.desiredBackend).toBe("github");
-    expect(state.backend).toBe("github");
-    expect(state.health).toBe("ok");
-    expect(state.fallback).toBe(false);
+      const state = getQueueBackendState();
+      expect(state.desiredBackend).toBe("github");
+      expect(state.backend).toBe("github");
+      expect(state.health).toBe("ok");
+      expect(state.fallback).toBe(false);
+    } finally {
+      if (priorToken === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = priorToken;
+    }
   });
 
   test("invalid queueBackend is treated as explicit and unavailable", async () => {

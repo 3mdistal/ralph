@@ -15,7 +15,7 @@ function groupByRepo(tasks: TestTask[]): Map<string, TestTask[]> {
 }
 
 describe("soft throttle scheduler gate", () => {
-  test("does not start any new tasks when soft-throttled", () => {
+  test("does not start any new tasks when soft-throttled", async () => {
     const started: TestTask[] = [];
 
     const perRepo = new Map<string, Semaphore>();
@@ -28,7 +28,7 @@ describe("soft throttle scheduler gate", () => {
       return sem;
     };
 
-    const startedCount = startQueuedTasks<TestTask>({
+    const startedCount = await startQueuedTasks<TestTask>({
       gate: "soft-throttled",
       tasks: [{ repo: "a", key: "1" }, { repo: "b", key: "2" }],
       inFlightTasks: new Set<string>(),
@@ -41,6 +41,7 @@ describe("soft throttle scheduler gate", () => {
       log: () => {},
       startTask: ({ task }) => {
         started.push(task);
+        return true;
       },
     });
 
@@ -48,7 +49,7 @@ describe("soft throttle scheduler gate", () => {
     expect(started.length).toBe(0);
   });
 
-  test("starts tasks normally when running", () => {
+  test("starts tasks normally when running", async () => {
     const started: TestTask[] = [];
 
     const perRepo = new Map<string, Semaphore>();
@@ -61,7 +62,7 @@ describe("soft throttle scheduler gate", () => {
       return sem;
     };
 
-    const startedCount = startQueuedTasks<TestTask>({
+    const startedCount = await startQueuedTasks<TestTask>({
       gate: "running",
       tasks: [{ repo: "a", key: "1" }, { repo: "b", key: "2" }],
       inFlightTasks: new Set<string>(),
@@ -74,6 +75,7 @@ describe("soft throttle scheduler gate", () => {
       log: () => {},
       startTask: ({ task }) => {
         started.push(task);
+        return true;
       },
     });
 

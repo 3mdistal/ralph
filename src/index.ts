@@ -434,7 +434,7 @@ const schedulerController = createSchedulerController({
     ensureSemaphores();
     if (!globalSemaphore) return;
 
-    startQueuedTasks({
+    void startQueuedTasks({
       gate: "running",
       tasks: [],
       priorityTasks,
@@ -652,7 +652,7 @@ async function startTask(opts: {
   task: AgentTask;
   releaseGlobal: () => void;
   releaseRepo: () => void;
-}): Promise<void> {
+}): Promise<boolean> {
   const { repo, task, releaseGlobal, releaseRepo } = opts;
 
   try {
@@ -666,7 +666,7 @@ async function startTask(opts: {
       releaseGlobal();
       releaseRepo();
       if (!isShuttingDown) scheduleQueuedTasksSoon();
-      return;
+      return false;
     }
 
     const claimedTask = claim.task;
@@ -701,11 +701,13 @@ async function startTask(opts: {
           void checkIdleRollups();
         }
       });
+    return true;
   } catch (error: any) {
     console.error(`[ralph] Error claiming task ${task.name}:`, error);
     releaseGlobal();
     releaseRepo();
     if (!isShuttingDown) scheduleQueuedTasksSoon();
+    return false;
   }
 }
 
@@ -714,7 +716,7 @@ function startResumeTask(opts: {
   task: AgentTask;
   releaseGlobal: () => void;
   releaseRepo: () => void;
-}): void {
+}): boolean {
   const { repo, task, releaseGlobal, releaseRepo } = opts;
   const key = getTaskKey(task);
 
@@ -741,6 +743,8 @@ function startResumeTask(opts: {
         void checkIdleRollups();
       }
     });
+
+  return true;
 }
 
 // --- Main Logic ---
@@ -804,7 +808,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     resetIdleState(tasks);
   }
 
-  const startedCount = startQueuedTasks({
+  const startedCount = await startQueuedTasks({
     gate: "running",
     tasks: queueTasks,
     priorityTasks: Array.from(pendingResumeTasks.values()),
