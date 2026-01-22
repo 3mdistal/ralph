@@ -50,6 +50,9 @@ const TASK_FINGERPRINT_FIELDS = [
   "worker-id",
   "repo-slot",
   "watchdog-retries",
+  "blocked-source",
+  "blocked-reason",
+  "blocked-checked-at",
 ] as const;
 
 export function __setBwrbRunnerForTests(runner: BwrbRunner): void {

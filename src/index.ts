@@ -756,10 +756,27 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
   if (!gate.allowDequeue && pendingResumeTasks.size === 0) return;
   if (throttle.state === "soft") return;
 
+  const blockedTasks = await getTasksByStatus("blocked");
+  const blockedPaths = new Set<string>();
+  const tasksForSync = [...tasks, ...blockedTasks];
+  const tasksByRepoForSync = groupByRepo(tasksForSync);
+  await Promise.all(
+    Array.from(tasksByRepoForSync.entries()).map(async ([repo, repoTasks]) => {
+      const worker = getOrCreateWorker(repo);
+      try {
+        const blocked = await worker.syncBlockedStateForTasks(repoTasks);
+        blocked.forEach((path) => blockedPaths.add(path));
+      } catch (error: any) {
+        console.warn(`[ralph] Failed to sync blocked state for ${repo}: ${error?.message ?? String(error)}`);
+      }
+    })
+  );
+
   const nowMs = Date.now();
   const claimable: AgentTask[] = [];
   const heartbeatCutoffMs = nowMs - getConfig().ownershipTtlMs;
   for (const task of tasks) {
+    if (task._path && blockedPaths.has(task._path)) continue;
     const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
     if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
       console.warn(
