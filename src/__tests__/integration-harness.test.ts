@@ -468,6 +468,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(mergePullRequestMock).toHaveBeenCalled();
     expect(addIssueLabelMock).toHaveBeenCalled();
     expect(removeIssueLabelMock).toHaveBeenCalled();
+    expect(notifyErrorMock).toHaveBeenCalled();
   });
 
   test("ci-only PR blocks non-CI issue", async () => {

@@ -22,6 +22,8 @@ import {
   recordRepoGithubIssueSync,
   recordTaskSnapshot,
   recordPrSnapshot,
+  PR_STATE_MERGED,
+  PR_STATE_OPEN,
   recordRollupMerge,
   upsertIdempotencyKey,
 } from "../state";
@@ -253,7 +255,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
       prUrl: "https://github.com/3mdistal/ralph/pull/123",
-      state: "merged",
+      state: PR_STATE_MERGED,
       at: "2026-01-11T00:00:02.000Z",
     });
 
@@ -332,7 +334,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
       prUrl: "https://github.com/3mdistal/ralph/pull/123",
-      state: "open",
+      state: PR_STATE_OPEN,
       at: "2026-01-11T00:00:02.000Z",
     });
 
@@ -340,7 +342,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
       prUrl: "https://github.com/3mdistal/ralph/pull/123",
-      state: "merged",
+      state: PR_STATE_MERGED,
       at: "2026-01-11T00:00:03.000Z",
     });
 
@@ -348,7 +350,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
       prUrl: "https://github.com/3mdistal/ralph/pull/123",
-      state: "open",
+      state: PR_STATE_OPEN,
       at: "2026-01-11T00:00:03.500Z",
     });
 
@@ -356,7 +358,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
       prUrl: "https://github.com/3mdistal/ralph/pull/456",
-      state: "open",
+      state: PR_STATE_OPEN,
       at: "2026-01-11T00:00:04.000Z",
     });
 

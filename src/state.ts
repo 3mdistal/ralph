@@ -7,6 +7,10 @@ import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
 
 const SCHEMA_VERSION = 5;
 
+export type PrState = "open" | "merged";
+export const PR_STATE_OPEN: PrState = "open";
+export const PR_STATE_MERGED: PrState = "merged";
+
 let db: Database | null = null;
 
 function nowIso(): string {
@@ -506,7 +510,7 @@ export function recordPrSnapshot(input: {
   repo: string;
   issue: string;
   prUrl: string;
-  state?: string;
+  state?: PrState;
   at?: string;
 }): void {
   const database = requireDb();

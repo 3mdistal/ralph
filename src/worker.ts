@@ -76,7 +76,15 @@ import {
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
-import { getIdempotencyPayload, upsertIdempotencyKey, recordIssueSnapshot, recordPrSnapshot } from "./state";
+import {
+  getIdempotencyPayload,
+  upsertIdempotencyKey,
+  recordIssueSnapshot,
+  recordPrSnapshot,
+  PR_STATE_MERGED,
+  PR_STATE_OPEN,
+  type PrState,
+} from "./state";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -790,7 +798,7 @@ export class RepoWorker {
     return this.pickPrUrlFromOutput(result.output);
   }
 
-  private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: string }): void {
+  private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {
     const key = `${this.repo}|${input.issue}|${input.prUrl}|${input.state}`;
     if (this.recordedPrSnapshots.has(key)) return;
     try {
@@ -820,20 +828,35 @@ export class RepoWorker {
     if (!baseBranch) return;
     if (this.normalizeGitRef(baseBranch) !== this.normalizeGitRef(params.botBranch)) return;
 
+    const errors: string[] = [];
+
     try {
       await this.addIssueLabel(issueRef, RALPH_LABEL_IN_BOT);
     } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_IN_BOT} label: ${error?.message ?? String(error)}`
-      );
+      const message = error?.message ?? String(error);
+      errors.push(`add ${RALPH_LABEL_IN_BOT}: ${message}`);
+      console.warn(`[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_IN_BOT} label: ${message}`);
     }
 
     try {
       await this.removeIssueLabel(issueRef, RALPH_LABEL_IN_PROGRESS);
     } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_IN_PROGRESS} label: ${error?.message ?? String(error)}`
-      );
+      const message = error?.message ?? String(error);
+      errors.push(`remove ${RALPH_LABEL_IN_PROGRESS}: ${message}`);
+      console.warn(`[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_IN_PROGRESS} label: ${message}`);
+    }
+
+    if (errors.length > 0) {
+      const body = [
+        "Failed to update midpoint labels.",
+        "",
+        `Issue: ${params.task.issue}`,
+        `PR: ${params.prUrl}`,
+        "",
+        "Errors:",
+        errors.map((entry) => `- ${entry}`).join("\n"),
+      ].join("\n");
+      await this.notify.notifyError("Midpoint label update failed", body, params.task.name);
     }
   }
 
@@ -2568,7 +2591,7 @@ ${guidance}`
           console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
           try {
             await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-            this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: "merged" });
+            this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
             await this.applyMidpointLabelsBestEffort({ task: params.task, prUrl, botBranch: params.botBranch });
             return { ok: true, prUrl, sessionId };
           } catch (error: any) {
@@ -2730,7 +2753,7 @@ ${guidance}`
       const updatedPrUrl = this.pickPrUrlFromOutput(fixResult.output);
       if (updatedPrUrl && updatedPrUrl !== prUrl) {
         prUrl = updatedPrUrl;
-        this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: "open" });
+        this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_OPEN });
       }
     }
 
@@ -3265,7 +3288,7 @@ ${guidance}`
       }
 
       if (prUrl) {
-        this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+        this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
       }
 
       let continueAttempts = 0;
@@ -3362,7 +3385,7 @@ ${guidance}`
           lastAnomalyCount = anomalyStatus.total;
           prUrl = this.pickPrUrlFromSession(buildResult);
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
 
           continue;
@@ -3417,7 +3440,7 @@ ${guidance}`
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = recovered.prUrl ?? prUrl;
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
 
           if (!prUrl) {
@@ -3427,7 +3450,7 @@ ${guidance}`
         } else {
           prUrl = this.pickPrUrlFromSession(buildResult);
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
         }
       }
@@ -3442,7 +3465,7 @@ ${guidance}`
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
         prUrl = recovered.prUrl ?? prUrl;
         if (prUrl) {
-          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
         }
       }
 
@@ -4076,7 +4099,7 @@ ${guidance}`
           lastAnomalyCount = anomalyStatus.total;
           prUrl = this.pickPrUrlFromSession(buildResult);
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
           continue;
         }
@@ -4126,7 +4149,7 @@ ${guidance}`
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = recovered.prUrl ?? prUrl;
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
 
           if (!prUrl) {
@@ -4136,7 +4159,7 @@ ${guidance}`
         } else {
           prUrl = this.pickPrUrlFromSession(buildResult);
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
         }
       }
@@ -4151,7 +4174,7 @@ ${guidance}`
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
         prUrl = recovered.prUrl ?? prUrl;
         if (prUrl) {
-          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
         }
       }
 
