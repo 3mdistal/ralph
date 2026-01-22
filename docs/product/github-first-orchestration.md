@@ -28,6 +28,8 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 - Ralph treats `ralph:queued` as the only claimable state. Claiming means applying `ralph:in-progress` and removing `ralph:queued`.
 - Claiming is best-effort and not transactional across multiple GitHub label updates.
 - Deployment model: **single daemon per queue**. Running multiple daemons against the same GitHub queue is unsupported.
+- Stale recovery: Ralph only re-queues `ralph:in-progress` issues when the stored `heartbeat-at` exists and is stale beyond `ownershipTtlMs`.
+  Missing or invalid heartbeats do not trigger automatic recovery.
 
 ## Dependency encoding
 

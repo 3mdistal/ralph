@@ -673,32 +673,40 @@ async function startTask(opts: {
     const key = getTaskKey(claimedTask);
     inFlightTasks.add(key);
 
-    void getOrCreateWorker(repo)
-      .processTask(claimedTask)
-      .then(async (run: AgentRun) => {
-        if (run.outcome === "success" && run.pr) {
-          try {
-            recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: "merged" });
-          } catch {
-            // best-effort
-          }
+    try {
+      void getOrCreateWorker(repo)
+        .processTask(claimedTask)
+        .then(async (run: AgentRun) => {
+          if (run.outcome === "success" && run.pr) {
+            try {
+              recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: "merged" });
+            } catch {
+              // best-effort
+            }
 
-          await rollupMonitor.recordMerge(repo, run.pr);
-        }
-      })
-      .catch((e) => {
-        console.error(`[ralph] Error processing task ${claimedTask.name}:`, e);
-      })
-      .finally(() => {
-        inFlightTasks.delete(key);
-        forgetOwnedTask(claimedTask);
-        releaseGlobal();
-        releaseRepo();
-        if (!isShuttingDown) {
-          scheduleQueuedTasksSoon();
-          void checkIdleRollups();
-        }
-      });
+            await rollupMonitor.recordMerge(repo, run.pr);
+          }
+        })
+        .catch((e) => {
+          console.error(`[ralph] Error processing task ${claimedTask.name}:`, e);
+        })
+        .finally(() => {
+          inFlightTasks.delete(key);
+          forgetOwnedTask(claimedTask);
+          releaseGlobal();
+          releaseRepo();
+          if (!isShuttingDown) {
+            scheduleQueuedTasksSoon();
+            void checkIdleRollups();
+          }
+        });
+    } catch (error: any) {
+      console.error(`[ralph] Error starting task ${claimedTask.name}:`, error);
+      inFlightTasks.delete(key);
+      forgetOwnedTask(claimedTask);
+      if (!isShuttingDown) scheduleQueuedTasksSoon();
+      return false;
+    }
     return true;
   } catch (error: any) {
     console.error(`[ralph] Error claiming task ${task.name}:`, error);
