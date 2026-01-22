@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { extractPrUrl, extractPrUrls, hasProductGap, pickPrUrlForRepo } from "../routing";
+import { extractFirstPrUrl, extractLatestPrUrl, extractPrUrls, hasProductGap, pickPrUrlForRepo } from "../routing";
 
 describe("hasProductGap", () => {
   test("true only for explicit PRODUCT GAP: markers", () => {
@@ -39,14 +39,15 @@ describe("PR URL extraction", () => {
     ]);
   });
 
-  test("extracts the latest PR URL by default", () => {
+  test("extracts the latest PR URL", () => {
     const output = [
       "https://github.com/acme/tools/pull/12",
       "noise",
       "https://github.com/3mdistal/ralph/pull/67",
     ].join("\n");
 
-    expect(extractPrUrl(output)).toBe("https://github.com/3mdistal/ralph/pull/67");
+    expect(extractLatestPrUrl(output)).toBe("https://github.com/3mdistal/ralph/pull/67");
+    expect(extractFirstPrUrl(output)).toBe("https://github.com/acme/tools/pull/12");
   });
 
   test("prefers latest URL for repo when multiple present", () => {

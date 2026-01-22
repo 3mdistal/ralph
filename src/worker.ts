@@ -582,7 +582,6 @@ export class RepoWorker {
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
-  private recordedPrSnapshots = new Set<string>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -798,12 +797,15 @@ export class RepoWorker {
     return this.pickPrUrlFromOutput(result.output);
   }
 
-  private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {
+  private recordPrSnapshotBestEffort(
+    input: { issue: string; prUrl: string; state: PrState },
+    seen: Set<string>
+  ): void {
     const key = `${this.repo}|${input.issue}|${input.prUrl}|${input.state}`;
-    if (this.recordedPrSnapshots.has(key)) return;
+    if (seen.has(key)) return;
     try {
       recordPrSnapshot({ repo: this.repo, issue: input.issue, prUrl: input.prUrl, state: input.state });
-      this.recordedPrSnapshots.add(key);
+      seen.add(key);
     } catch (error: any) {
       console.warn(`[ralph:worker:${this.repo}] Failed to record PR snapshot: ${error?.message ?? String(error)}`);
     }
@@ -2407,6 +2409,7 @@ ${guidance}`
     issueMeta: IssueMetadata;
     watchdogStagePrefix: string;
     notifyTitle: string;
+    recordPrSnapshot: (input: { issue: string; prUrl: string; state: PrState }) => void;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
     const { checks: REQUIRED_CHECKS } = await this.resolveRequiredChecksForMerge();
@@ -2597,7 +2600,7 @@ ${guidance}`
           console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
           try {
             await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-            this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
+            params.recordPrSnapshot({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
             await this.applyMidpointLabelsBestEffort({ task: params.task, prUrl, botBranch: params.botBranch });
             return { ok: true, prUrl, sessionId };
           } catch (error: any) {
@@ -2759,7 +2762,7 @@ ${guidance}`
       const updatedPrUrl = this.pickPrUrlFromOutput(fixResult.output);
       if (updatedPrUrl && updatedPrUrl !== prUrl) {
         prUrl = updatedPrUrl;
-        this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_OPEN });
+        params.recordPrSnapshot({ issue: params.task.issue, prUrl, state: PR_STATE_OPEN });
       }
     }
 
@@ -3136,7 +3139,10 @@ ${guidance}`
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string }): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
-    this.recordedPrSnapshots.clear();
+    const prSnapshotSeen = new Set<string>();
+    const recordPrSnapshot = (input: { issue: string; prUrl: string; state: PrState }) => {
+      this.recordPrSnapshotBestEffort(input, prSnapshotSeen);
+    };
 
     if (!isRepoAllowed(task.repo)) {
       return await this.blockDisallowedRepo(task, startTime, "resume");
@@ -3294,7 +3300,7 @@ ${guidance}`
       }
 
       if (prUrl) {
-        this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+        recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
       }
 
       let continueAttempts = 0;
@@ -3391,7 +3397,7 @@ ${guidance}`
           lastAnomalyCount = anomalyStatus.total;
           prUrl = this.pickPrUrlFromSession(buildResult);
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+            recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
 
           continue;
@@ -3446,7 +3452,7 @@ ${guidance}`
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = recovered.prUrl ?? prUrl;
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+            recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
 
           if (!prUrl) {
@@ -3456,7 +3462,7 @@ ${guidance}`
         } else {
           prUrl = this.pickPrUrlFromSession(buildResult);
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+            recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
         }
       }
@@ -3471,7 +3477,7 @@ ${guidance}`
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
         prUrl = recovered.prUrl ?? prUrl;
         if (prUrl) {
-          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+          recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
         }
       }
 
@@ -3514,6 +3520,7 @@ ${guidance}`
         issueMeta,
         watchdogStagePrefix: "merge",
         notifyTitle: `Merging ${task.name}`,
+        recordPrSnapshot,
         opencodeXdg,
       });
 
@@ -3622,7 +3629,10 @@ ${guidance}`
   async processTask(task: AgentTask): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Starting task: ${task.name}`);
-    this.recordedPrSnapshots.clear();
+    const prSnapshotSeen = new Set<string>();
+    const recordPrSnapshot = (input: { issue: string; prUrl: string; state: PrState }) => {
+      this.recordPrSnapshotBestEffort(input, prSnapshotSeen);
+    };
 
     let workerId: string | undefined;
     let allocatedSlot: number | null = null;
@@ -4105,7 +4115,7 @@ ${guidance}`
           lastAnomalyCount = anomalyStatus.total;
           prUrl = this.pickPrUrlFromSession(buildResult);
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+            recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
           continue;
         }
@@ -4155,7 +4165,7 @@ ${guidance}`
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = recovered.prUrl ?? prUrl;
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+            recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
 
           if (!prUrl) {
@@ -4165,7 +4175,7 @@ ${guidance}`
         } else {
           prUrl = this.pickPrUrlFromSession(buildResult);
           if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+            recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
         }
       }
@@ -4180,7 +4190,7 @@ ${guidance}`
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
         prUrl = recovered.prUrl ?? prUrl;
         if (prUrl) {
-          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+          recordPrSnapshot({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
         }
       }
 
@@ -4224,6 +4234,7 @@ ${guidance}`
         issueMeta,
         watchdogStagePrefix: "merge",
         notifyTitle: `Merging ${task.name}`,
+        recordPrSnapshot,
         opencodeXdg,
       });
 

@@ -115,6 +115,16 @@ export function extractPrUrls(output: string): string[] {
   return matches ?? [];
 }
 
+export function extractFirstPrUrl(output: string): string | null {
+  const urls = extractPrUrls(output);
+  return urls[0] ?? null;
+}
+
+export function extractLatestPrUrl(output: string): string | null {
+  const urls = extractPrUrls(output);
+  return urls.length > 0 ? urls[urls.length - 1] : null;
+}
+
 export function pickPrUrlForRepo(urls: string[], repo: string): string | null {
   if (urls.length === 0) return null;
   const normalizedRepo = repo.trim().toLowerCase();
@@ -126,8 +136,7 @@ export function pickPrUrlForRepo(urls: string[], repo: string): string | null {
 }
 
 export function extractPrUrl(output: string): string | null {
-  const urls = extractPrUrls(output);
-  return urls.length > 0 ? urls[urls.length - 1] : null;
+  return extractFirstPrUrl(output);
 }
 
 /**
@@ -135,5 +144,5 @@ export function extractPrUrl(output: string): string | null {
  */
 export function extractPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
   if (result.prUrl) return result.prUrl;
-  return extractPrUrl(result.output);
+  return extractLatestPrUrl(result.output);
 }
