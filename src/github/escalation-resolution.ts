@@ -5,31 +5,43 @@ import { GitHubClient, splitRepoFullName } from "./client";
 type EscalatedIssue = { repo: string; number: number };
 
 const DEFAULT_MAX_ESCALATIONS = 10;
-const DEFAULT_MAX_COMMENT_PAGES = 3;
+const DEFAULT_MAX_RECENT_COMMENTS = 20;
 
 function issueKey(issue: EscalatedIssue): string {
   return `${issue.repo}#${issue.number}`;
 }
 
-async function listIssueComments(params: {
+async function listRecentIssueComments(params: {
   github: GitHubClient;
   repo: string;
   issueNumber: number;
-  maxPages: number;
+  limit: number;
 }): Promise<string[]> {
   const { owner, name } = splitRepoFullName(params.repo);
-  const bodies: string[] = [];
-
-  for (let page = 1; page <= params.maxPages; page += 1) {
-    const response = await params.github.request<Array<{ body?: string | null }>>(
-      `/repos/${owner}/${name}/issues/${params.issueNumber}/comments?per_page=100&page=${page}`
-    );
-    const rows = Array.isArray(response.data) ? response.data : [];
-    bodies.push(...rows.map((row) => row?.body ?? ""));
-    if (rows.length < 100) break;
+  const query = `query($owner: String!, $name: String!, $number: Int!, $last: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      comments(last: $last) {
+        nodes {
+          body
+        }
+      }
+    }
   }
+}`;
 
-  return bodies;
+  const response = await params.github.request<{
+    data?: { repository?: { issue?: { comments?: { nodes?: Array<{ body?: string | null }> } } } };
+  }>("/graphql", {
+    method: "POST",
+    body: {
+      query,
+      variables: { owner, name, number: params.issueNumber, last: params.limit },
+    },
+  });
+
+  const nodes = response.data?.data?.repository?.issue?.comments?.nodes ?? [];
+  return nodes.map((node: { body?: string | null } | undefined) => node?.body ?? "");
 }
 
 async function addIssueLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
@@ -98,11 +110,11 @@ export async function reconcileEscalationResolutions(params: {
   repo: string;
   log?: (message: string) => void;
   maxEscalations?: number;
-  maxCommentPages?: number;
+  maxRecentComments?: number;
 }): Promise<void> {
   const log = params.log ?? console.log;
   const maxEscalations = params.maxEscalations ?? DEFAULT_MAX_ESCALATIONS;
-  const maxCommentPages = params.maxCommentPages ?? DEFAULT_MAX_COMMENT_PAGES;
+  const maxRecentComments = params.maxRecentComments ?? DEFAULT_MAX_RECENT_COMMENTS;
   const github = new GitHubClient(params.repo);
 
   const queuedEscalations = listIssuesWithAllLabels({
@@ -140,11 +152,11 @@ export async function reconcileEscalationResolutions(params: {
   for (const issue of toCheck) {
     let bodies: string[] = [];
     try {
-      bodies = await listIssueComments({
+      bodies = await listRecentIssueComments({
         github,
         repo: issue.repo,
         issueNumber: issue.number,
-        maxPages: maxCommentPages,
+        limit: maxRecentComments,
       });
     } catch (error: any) {
       log(
