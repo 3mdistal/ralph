@@ -11,8 +11,8 @@ const queueAdapter = {
 
 const notifyAdapter = {
   notifyEscalation: async () => true,
-  notifyError: async () => true,
-  notifyTaskComplete: async () => true,
+  notifyError: async () => {},
+  notifyTaskComplete: async () => {},
 };
 
 const sessionAdapter = {
