@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -46,5 +46,26 @@ describe("Managed OpenCode config", () => {
     mod.ensureManagedOpencodeConfigInstalled(managedDir);
     const restored = await readFile(manifest.files[0].path, "utf8");
     expect(restored).toBe(manifest.files[0].contents);
+  });
+
+  test("refuses non-managed directories without marker", async () => {
+    const mod = await import("../opencode-managed-config?managed-config-test-guard");
+    const unsafeDir = join(homeDir, "not-managed");
+    await mkdir(unsafeDir, { recursive: true });
+    await writeFile(join(unsafeDir, "notes.txt"), "do not overwrite", "utf8");
+
+    expect(() => mod.ensureManagedOpencodeConfigInstalled(unsafeDir)).toThrow();
+  });
+
+  test("allows existing managed layout without marker", async () => {
+    const mod = await import("../opencode-managed-config?managed-config-test-marker");
+    const managedDir = join(homeDir, "existing-managed");
+    await mkdir(join(managedDir, "agent"), { recursive: true });
+    await writeFile(join(managedDir, "opencode.json"), "{}", "utf8");
+
+    mod.ensureManagedOpencodeConfigInstalled(managedDir);
+    const markerPath = join(managedDir, ".ralph-managed-opencode");
+    const marker = await readFile(markerPath, "utf8");
+    expect(marker).toContain("managed by ralph");
   });
 });

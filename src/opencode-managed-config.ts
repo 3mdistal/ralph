@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "fs";
 import { dirname, isAbsolute, join, parse, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
@@ -9,6 +9,9 @@ import { getRalphOpencodeConfigDir } from "./paths";
 const TEMPLATE_DIR = fileURLToPath(new URL("./opencode-managed-config/templates", import.meta.url));
 const MARKER_FILENAME = ".ralph-managed-opencode";
 const MARKER_CONTENTS = "managed by ralph\n";
+const LOCK_FILENAME = ".ralph-managed-opencode.lock";
+const LOCK_ATTEMPTS = 20;
+const LOCK_WAIT_MS = 50;
 
 type ManagedConfigFile = {
   path: string;
@@ -85,6 +88,48 @@ function writeFileAtomic(path: string, contents: string): void {
   renameSync(tempPath, path);
 }
 
+function sleepMs(ms: number): void {
+  const shared = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(shared, 0, 0, ms);
+}
+
+function withManagedConfigLock(dir: string, fn: () => void): void {
+  const lockPath = join(dir, LOCK_FILENAME);
+  let fd: number | null = null;
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
+    try {
+      fd = openSync(lockPath, "wx");
+      break;
+    } catch (err: any) {
+      lastError = err;
+      if (err?.code !== "EEXIST") break;
+      sleepMs(LOCK_WAIT_MS);
+    }
+  }
+
+  if (fd == null) {
+    const detail = lastError instanceof Error ? lastError.message : String(lastError ?? "unknown");
+    throw new Error(`[ralph] Failed to acquire managed OpenCode config lock ${lockPath}: ${detail}`);
+  }
+
+  try {
+    fn();
+  } finally {
+    try {
+      closeSync(fd);
+    } catch {
+      // ignore
+    }
+    try {
+      unlinkSync(lockPath);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 export function resolveManagedOpencodeConfigDir(): string {
   const envOverride = process.env.RALPH_OPENCODE_CONFIG_DIR?.trim();
   if (envOverride) {
@@ -131,9 +176,11 @@ export function ensureManagedOpencodeConfigInstalled(configDir?: string): string
   ensureDir(resolvedDir);
   ensureDir(join(resolvedDir, "agent"));
 
-  for (const file of manifest.files) {
-    writeFileAtomic(file.path, file.contents);
-  }
+  withManagedConfigLock(resolvedDir, () => {
+    for (const file of manifest.files) {
+      writeFileAtomic(file.path, file.contents);
+    }
+  });
 
   return resolvedDir;
 }
