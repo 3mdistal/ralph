@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
-import { extractFirstPrUrl, extractLatestPrUrl, extractPrUrls, hasProductGap, pickPrUrlForRepo } from "../routing";
+import {
+  extractFirstPrUrl,
+  extractLatestPrUrl,
+  extractPrUrls,
+  hasProductGap,
+  pickPrUrlForRepo,
+  selectPrUrlFromOutput,
+} from "../routing";
 
 describe("hasProductGap", () => {
   test("true only for explicit PRODUCT GAP: markers", () => {
@@ -68,5 +75,16 @@ describe("PR URL extraction", () => {
     ];
 
     expect(pickPrUrlForRepo(urls, "3mdistal/ralph")).toBe(null);
+  });
+
+  test("selects repo-matching PR URL from output", () => {
+    const output = [
+      "https://github.com/acme/tools/pull/12",
+      "https://github.com/3mdistal/ralph/pull/101",
+      "https://github.com/3mdistal/ralph/pull/202",
+    ].join("\n");
+
+    expect(selectPrUrlFromOutput(output, "3mdistal/ralph")).toBe("https://github.com/3mdistal/ralph/pull/202");
+    expect(selectPrUrlFromOutput(output, "acme/missing")).toBe(null);
   });
 });

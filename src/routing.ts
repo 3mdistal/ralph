@@ -135,6 +135,12 @@ export function pickPrUrlForRepo(urls: string[], repo: string): string | null {
   return matching[matching.length - 1] ?? null;
 }
 
+export function selectPrUrlFromOutput(output: string, repo: string): string | null {
+  const urls = extractPrUrls(output);
+  if (!repo.trim()) return extractLatestPrUrl(output);
+  return pickPrUrlForRepo(urls, repo);
+}
+
 export function extractPrUrl(output: string): string | null {
   return extractFirstPrUrl(output);
 }
@@ -145,4 +151,9 @@ export function extractPrUrl(output: string): string | null {
 export function extractPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
   if (result.prUrl) return result.prUrl;
   return extractLatestPrUrl(result.output);
+}
+
+export function selectPrUrlFromSession(result: { output: string; prUrl?: string }, repo: string): string | null {
+  if (result.prUrl) return result.prUrl;
+  return selectPrUrlFromOutput(result.output, repo);
 }

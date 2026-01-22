@@ -36,13 +36,7 @@ import { getThrottleDecision } from "./throttle";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
-import {
-  extractPrUrls,
-  pickPrUrlForRepo,
-  hasProductGap,
-  parseRoutingDecision,
-  type RoutingDecision,
-} from "./routing";
+import { hasProductGap, parseRoutingDecision, selectPrUrlFromOutput, selectPrUrlFromSession, type RoutingDecision } from "./routing";
 import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
 import {
   isExplicitBlockerReason,
@@ -252,6 +246,32 @@ function summarizeBlockedReason(text: string): string {
   if (!trimmed) return "";
   if (trimmed.length <= BLOCKED_REASON_MAX_LEN) return trimmed;
   return trimmed.slice(0, BLOCKED_REASON_MAX_LEN).trimEnd() + "…";
+}
+
+function normalizeGitRefValue(ref: string): string {
+  return ref.trim().replace(/^refs\/heads\//, "");
+}
+
+type MidpointLabelPlan = {
+  addInBot: boolean;
+  removeInProgress: boolean;
+};
+
+function computeMidpointLabelPlan(input: { baseBranch: string; botBranch: string }): MidpointLabelPlan {
+  const normalizedBase = normalizeGitRefValue(input.baseBranch);
+  const normalizedBot = normalizeGitRefValue(input.botBranch);
+  const shouldSkipInBot = normalizedBase === "main" || normalizedBot === "main";
+  if (shouldSkipInBot) {
+    return { addInBot: false, removeInProgress: true };
+  }
+  if (normalizedBase !== normalizedBot) {
+    return { addInBot: false, removeInProgress: false };
+  }
+  return { addInBot: true, removeInProgress: true };
+}
+
+export function __computeMidpointLabelPlanForTests(input: { baseBranch: string; botBranch: string }): MidpointLabelPlan {
+  return computeMidpointLabelPlan(input);
 }
 
 function resolveVaultPath(p: string): string {
@@ -788,15 +808,6 @@ export class RepoWorker {
     }
   }
 
-  private pickPrUrlFromOutput(output: string): string | null {
-    return pickPrUrlForRepo(extractPrUrls(output), this.repo);
-  }
-
-  private pickPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
-    if (result.prUrl) return result.prUrl;
-    return this.pickPrUrlFromOutput(result.output);
-  }
-
   private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {
     try {
       recordPrSnapshot({ repo: this.repo, issue: input.issue, prUrl: input.prUrl, state: input.state });
@@ -822,15 +833,12 @@ export class RepoWorker {
       return;
     }
     if (!baseBranch) return;
-    const normalizedBotBranch = this.normalizeGitRef(params.botBranch);
-    const normalizedBaseBranch = this.normalizeGitRef(baseBranch);
+    const plan = computeMidpointLabelPlan({ baseBranch, botBranch: params.botBranch });
+    if (!plan.addInBot && !plan.removeInProgress) return;
 
     const errors: string[] = [];
 
-    const shouldSkipInBot = normalizedBaseBranch === "main" || normalizedBotBranch === "main";
-    if (!shouldSkipInBot && normalizedBaseBranch !== normalizedBotBranch) return;
-
-    if (!shouldSkipInBot) {
+    if (plan.addInBot) {
       try {
         await this.addIssueLabel(issueRef, RALPH_LABEL_IN_BOT);
       } catch (error: any) {
@@ -840,12 +848,14 @@ export class RepoWorker {
       }
     }
 
-    try {
-      await this.removeIssueLabel(issueRef, RALPH_LABEL_IN_PROGRESS);
-    } catch (error: any) {
-      const message = error?.message ?? String(error);
-      errors.push(`remove ${RALPH_LABEL_IN_PROGRESS}: ${message}`);
-      console.warn(`[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_IN_PROGRESS} label: ${message}`);
+    if (plan.removeInProgress) {
+      try {
+        await this.removeIssueLabel(issueRef, RALPH_LABEL_IN_PROGRESS);
+      } catch (error: any) {
+        const message = error?.message ?? String(error);
+        errors.push(`remove ${RALPH_LABEL_IN_PROGRESS}: ${message}`);
+        console.warn(`[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_IN_PROGRESS} label: ${message}`);
+      }
     }
 
     if (errors.length > 0) {
@@ -1802,7 +1812,7 @@ ${guidance}`
         .cwd(candidate.worktreePath)
         .quiet();
 
-      const prUrl = this.pickPrUrlFromOutput(created.stdout.toString()) ?? null;
+      const prUrl = selectPrUrlFromOutput(created.stdout.toString(), this.repo) ?? null;
       diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
 
       if (prUrl) return { prUrl, diagnostics: diagnostics.join("\n") };
@@ -2396,7 +2406,7 @@ ${guidance}`
   }
 
   private normalizeGitRef(ref: string): string {
-    return ref.trim().replace(/^refs\/heads\//, "");
+    return normalizeGitRefValue(ref);
   }
 
   private async mergePrWithRequiredChecks(params: {
@@ -2758,7 +2768,7 @@ ${guidance}`
         await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
       }
 
-      const updatedPrUrl = this.pickPrUrlFromOutput(fixResult.output);
+      const updatedPrUrl = selectPrUrlFromOutput(fixResult.output, this.repo);
       if (updatedPrUrl && updatedPrUrl !== prUrl) {
         prUrl = updatedPrUrl;
         this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_OPEN });
@@ -3280,7 +3290,7 @@ ${guidance}`
 
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = this.pickPrUrlFromSession(buildResult);
+      let prUrl = selectPrUrlFromSession(buildResult, this.repo);
       let prRecoveryDiagnostics = "";
 
       if (!prUrl) {
@@ -3390,7 +3400,7 @@ ${guidance}`
           }
 
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = this.pickPrUrlFromSession(buildResult);
+          prUrl = selectPrUrlFromSession(buildResult, this.repo);
           if (prUrl) {
             this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
@@ -3455,7 +3465,7 @@ ${guidance}`
             break;
           }
         } else {
-          prUrl = this.pickPrUrlFromSession(buildResult);
+          prUrl = selectPrUrlFromSession(buildResult, this.repo);
           if (prUrl) {
             this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
@@ -3997,7 +4007,7 @@ ${guidance}`
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = this.pickPrUrlFromSession(buildResult);
+      let prUrl = selectPrUrlFromSession(buildResult, this.repo);
       let prRecoveryDiagnostics = "";
 
       if (!prUrl) {
@@ -4103,7 +4113,7 @@ ${guidance}`
 
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = this.pickPrUrlFromSession(buildResult);
+          prUrl = selectPrUrlFromSession(buildResult, this.repo);
           if (prUrl) {
             this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
@@ -4163,7 +4173,7 @@ ${guidance}`
             break;
           }
         } else {
-          prUrl = this.pickPrUrlFromSession(buildResult);
+          prUrl = selectPrUrlFromSession(buildResult, this.repo);
           if (prUrl) {
             this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
           }
