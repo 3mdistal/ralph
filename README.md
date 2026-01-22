@@ -112,6 +112,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 - `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
+- `opencode.managedConfigDir` (string, optional): absolute path for Ralph-managed OpenCode config (default: `~/.ralph/opencode`)
 - `control` (object, optional): control file defaults
   - `autoCreate` (boolean): create `control.json` on startup (default: true)
   - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
@@ -134,6 +135,7 @@ Only these env vars are currently supported (unless noted otherwise):
 |---------|---------|---------|
 | Sessions dir | `RALPH_SESSIONS_DIR` | `~/.ralph/sessions` |
 | Worktrees dir | `RALPH_WORKTREES_DIR` | `~/.ralph/worktrees` |
+| Managed OpenCode config dir | `RALPH_OPENCODE_CONFIG_DIR` | `~/.ralph/opencode` |
 | Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
 | Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
 | CI remediation attempts | `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` | `2` |
@@ -309,6 +311,10 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - Active OpenCode profile: set `opencode_profile` (affects new tasks only; tasks pin their profile on start)
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
+
+## Managed OpenCode config (daemon runs)
+
+Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `~/.ralph/opencode`. This directory is owned by Ralph and kept in sync with the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. To override the managed location, set `opencode.managedConfigDir` in `~/.ralph/config.toml` or `RALPH_OPENCODE_CONFIG_DIR` in the environment.
 
 ## OpenCode profiles (multi-account)
 

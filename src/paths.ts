@@ -28,6 +28,10 @@ export function getRalphConfigJsonPath(): string {
   return join(getRalphHomeDir(), "config.json");
 }
 
+export function getRalphOpencodeConfigDir(): string {
+  return join(getRalphHomeDir(), "opencode");
+}
+
 export function getRalphLegacyConfigPath(): string {
   return join(resolveHomeDir(), ".config", "opencode", "ralph", "ralph.json");
 }
