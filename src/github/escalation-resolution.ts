@@ -4,6 +4,13 @@ import { GitHubClient, splitRepoFullName } from "./client";
 
 type EscalatedIssue = { repo: string; number: number };
 
+export type EscalationResolutionDeps = {
+  github: GitHubClient;
+  listIssuesWithAllLabels: typeof listIssuesWithAllLabels;
+  resolveAgentTaskByIssue: typeof resolveAgentTaskByIssue;
+  updateTaskStatus: typeof updateTaskStatus;
+};
+
 const DEFAULT_MAX_ESCALATIONS = 10;
 const DEFAULT_MAX_RECENT_COMMENTS = 20;
 
@@ -60,7 +67,7 @@ async function removeIssueLabel(params: { github: GitHubClient; repo: string; is
 }
 
 async function resolveEscalation(params: {
-  github: GitHubClient;
+  deps: EscalationResolutionDeps;
   repo: string;
   issueNumber: number;
   ensureQueued: boolean;
@@ -71,7 +78,12 @@ async function resolveEscalation(params: {
 
   if (params.ensureQueued) {
     try {
-      await addIssueLabel({ github: params.github, repo: params.repo, issueNumber: params.issueNumber, label: "ralph:queued" });
+      await addIssueLabel({
+        github: params.deps.github,
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        label: "ralph:queued",
+      });
     } catch (error: any) {
       params.log(
         `${prefix} Failed to add ralph:queued while resolving #${params.issueNumber}: ${error?.message ?? String(error)}`
@@ -80,7 +92,12 @@ async function resolveEscalation(params: {
   }
 
   try {
-    await removeIssueLabel({ github: params.github, repo: params.repo, issueNumber: params.issueNumber, label: "ralph:escalated" });
+    await removeIssueLabel({
+      github: params.deps.github,
+      repo: params.repo,
+      issueNumber: params.issueNumber,
+      label: "ralph:escalated",
+    });
   } catch (error: any) {
     params.log(
       `${prefix} Failed to remove ralph:escalated while resolving #${params.issueNumber}: ${error?.message ?? String(error)}`
@@ -89,14 +106,14 @@ async function resolveEscalation(params: {
 
   try {
     const issueRef = `${params.repo}#${params.issueNumber}`;
-    const task = await resolveAgentTaskByIssue(issueRef, params.repo);
+    const task = await params.deps.resolveAgentTaskByIssue(issueRef, params.repo);
     if (!task) {
       params.log(`${prefix} No task found for ${issueRef} while resolving escalation.`);
       return;
     }
 
     if (task.status === "escalated") {
-      await updateTaskStatus(task, "queued");
+      await params.deps.updateTaskStatus(task, "queued");
       params.log(`${prefix} Re-queued task for ${issueRef} (${params.reason}).`);
     }
   } catch (error: any) {
@@ -111,17 +128,25 @@ export async function reconcileEscalationResolutions(params: {
   log?: (message: string) => void;
   maxEscalations?: number;
   maxRecentComments?: number;
+  deps?: EscalationResolutionDeps;
 }): Promise<void> {
   const log = params.log ?? console.log;
   const maxEscalations = params.maxEscalations ?? DEFAULT_MAX_ESCALATIONS;
   const maxRecentComments = params.maxRecentComments ?? DEFAULT_MAX_RECENT_COMMENTS;
-  const github = new GitHubClient(params.repo);
+  const deps =
+    params.deps ??
+    ({
+      github: new GitHubClient(params.repo),
+      listIssuesWithAllLabels,
+      resolveAgentTaskByIssue,
+      updateTaskStatus,
+    } satisfies EscalationResolutionDeps);
 
-  const queuedEscalations = listIssuesWithAllLabels({
+  const queuedEscalations = deps.listIssuesWithAllLabels({
     repo: params.repo,
     labels: ["ralph:escalated", "ralph:queued"],
   });
-  const escalatedIssues = listIssuesWithAllLabels({
+  const escalatedIssues = deps.listIssuesWithAllLabels({
     repo: params.repo,
     labels: ["ralph:escalated"],
   });
@@ -132,7 +157,7 @@ export async function reconcileEscalationResolutions(params: {
   for (const issue of queuedEscalations) {
     try {
       await resolveEscalation({
-        github,
+        deps,
         repo: issue.repo,
         issueNumber: issue.number,
         ensureQueued: false,
@@ -153,7 +178,7 @@ export async function reconcileEscalationResolutions(params: {
     let bodies: string[] = [];
     try {
       bodies = await listRecentIssueComments({
-        github,
+        github: deps.github,
         repo: issue.repo,
         issueNumber: issue.number,
         limit: maxRecentComments,
@@ -171,7 +196,7 @@ export async function reconcileEscalationResolutions(params: {
 
     try {
       await resolveEscalation({
-        github,
+        deps,
         repo: issue.repo,
         issueNumber: issue.number,
         ensureQueued: true,

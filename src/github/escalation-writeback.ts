@@ -34,6 +34,7 @@ type WritebackDeps = {
   log?: (message: string) => void;
   hasIdempotencyKey?: (key: string) => boolean;
   recordIdempotencyKey?: (input: { key: string; scope?: string; payloadJson?: string }) => boolean;
+  deleteIdempotencyKey?: (key: string) => void;
 };
 
 const DEFAULT_OWNER_HANDLE = "@3mdistal";
@@ -185,6 +186,7 @@ export async function writeEscalationToGitHub(
   const maxPages = deps.maxCommentPages ?? DEFAULT_MAX_COMMENT_PAGES;
   const hasKey = deps.hasIdempotencyKey ?? hasIdempotencyKey;
   const recordKey = deps.recordIdempotencyKey ?? recordIdempotencyKey;
+  const deleteKey = deps.deleteIdempotencyKey ?? deleteIdempotencyKey;
   const prefix = `[ralph:gh-escalation:${ctx.repo}]`;
 
   for (const label of plan.removeLabels) {
@@ -271,7 +273,7 @@ export async function writeEscalationToGitHub(
   } catch (error) {
     if (claimed) {
       try {
-        deleteIdempotencyKey(plan.idempotencyKey);
+        deleteKey(plan.idempotencyKey);
       } catch (deleteError: any) {
         log(`${prefix} Failed to release idempotency key: ${deleteError?.message ?? String(deleteError)}`);
       }
