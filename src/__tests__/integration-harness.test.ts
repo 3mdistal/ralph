@@ -201,7 +201,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).drainNudges = async () => {};
 
     // Avoid touching the real gh CLI.
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],
@@ -331,7 +331,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
 
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],
@@ -398,7 +398,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
 
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],
@@ -473,7 +473,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
 
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],
@@ -538,7 +538,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).drainNudges = async () => {};
 
 
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: ["allow-main"],
@@ -588,7 +588,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
     (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
     (worker as any).getIssueMetadata = async () => ({
@@ -649,7 +649,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
     (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
     (worker as any).getIssueMetadata = async () => ({
@@ -709,7 +709,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: undefined });
     (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
     (worker as any).getIssueMetadata = async () => ({
@@ -774,7 +774,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
     (worker as any).assertRepoRootClean = async () => {};
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],
@@ -809,7 +809,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).resolveTaskRepoPath = async () => ({ repoPath: "/tmp", worktreePath: "/tmp" });
     (worker as any).assertRepoRootClean = async () => {};
     (worker as any).drainNudges = async () => {};
-    (worker as any).ensureBaselineLabelsOnce = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
     (worker as any).ensureBranchProtectionOnce = async () => {};
     (worker as any).getIssueMetadata = async () => ({
       labels: [],

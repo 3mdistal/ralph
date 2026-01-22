@@ -2,7 +2,7 @@ import { $ } from "bun";
 import { existsSync } from "fs";
 import { readFile } from "fs/promises";
 import { join } from "path";
-import { loadConfig } from "./config";
+import { getBwrbVaultForStorage } from "./queue-backend";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -43,8 +43,9 @@ export type EditEscalationResult =
 
 let warnedMissingVault = false;
 
-function ensureVaultExists(vault: string): boolean {
-  if (vault && existsSync(vault)) return true;
+function resolveBwrbVault(action: string): string | null {
+  const vault = getBwrbVaultForStorage(action);
+  if (vault && existsSync(vault)) return vault;
 
   if (!warnedMissingVault) {
     warnedMissingVault = true;
@@ -54,7 +55,7 @@ function ensureVaultExists(vault: string): boolean {
     );
   }
 
-  return false;
+  return null;
 }
 
 function formatBwrbShellError(e: unknown): string {
@@ -73,12 +74,12 @@ function formatBwrbShellError(e: unknown): string {
 }
 
 export async function getEscalationsByStatus(status: string): Promise<AgentEscalationNote[]> {
-  const config = loadConfig();
-  if (!ensureVaultExists(config.bwrbVault)) return [];
+  const vault = resolveBwrbVault("list escalations");
+  if (!vault) return [];
 
   try {
     const result = await bwrb`bwrb list agent-escalation --where "status == '${status}'" --output json`
-      .cwd(config.bwrbVault)
+      .cwd(vault)
       .quiet();
     return JSON.parse(result.stdout.toString());
   } catch (e) {
@@ -91,19 +92,19 @@ export async function editEscalation(
   escalationPath: string,
   fields: Record<string, string>
 ): Promise<EditEscalationResult> {
-  const config = loadConfig();
-  if (!ensureVaultExists(config.bwrbVault)) {
+  const vault = resolveBwrbVault("edit escalation");
+  if (!vault) {
     return {
       ok: false,
       kind: "vault-missing",
-      error: `bwrbVault is missing or invalid: ${JSON.stringify(config.bwrbVault)}`,
+      error: `bwrbVault is missing or invalid`,
     };
   }
 
   const json = JSON.stringify(fields);
 
   try {
-    await bwrb`bwrb edit --path ${escalationPath} --json ${json}`.cwd(config.bwrbVault).quiet();
+    await bwrb`bwrb edit --path ${escalationPath} --json ${json}`.cwd(vault).quiet();
     return { ok: true };
   } catch (e) {
     const error = formatBwrbShellError(e);
@@ -151,7 +152,8 @@ export function extractResolutionSection(markdown: string): string | null {
 }
 
 export async function readResolutionMessage(notePath: string): Promise<string | null> {
-  const vault = loadConfig().bwrbVault;
+  const vault = resolveBwrbVault("read escalation");
+  if (!vault) return null;
   const abs = join(vault, notePath);
 
   try {

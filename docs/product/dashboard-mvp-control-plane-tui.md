@@ -32,7 +32,7 @@ This control plane (operator dashboard) is **operator tooling**, not a user-faci
 - **Grouped streams:** logs grouped by **workerId** (not just repo) and optionally by `sessionId`.
 - **Stepwise pause:** pause at safe checkpoints; resume on demand.
 - **Steering:** send a message into a session (queued or interrupt).
-- **Task controls:** reprioritize by editing bwrb note fields (priority), plus basic status transitions.
+- **Task controls:** reprioritize by editing bwrb note fields (priority), plus basic status transitions (bwrb-only during GitHub-first migration).
 - **Security:** token auth from day 1; bind localhost by default.
 - **Remote-ready:** no built-in TLS; BYO tunnel/proxy.
 
@@ -41,6 +41,7 @@ This control plane (operator dashboard) is **operator tooling**, not a user-faci
 - No first-party TLS / ACME / user management.
 - No perfect semantic understanding of agent intent.
 - No full-featured kanban editor for arbitrary bwrb schema (we can grow toward that later).
+- No GitHub-first task editing in the MVP (queue controls remain bwrb-only until GitHub queue support ships).
 
 ## Design Principles
 
@@ -89,7 +90,7 @@ This control plane (operator dashboard) is **operator tooling**, not a user-faci
 
 ### Data model: IDs
 
-- `taskId`: use bwrb `_path` (titles aren’t globally unique).
+- `taskId`: use bwrb `_path` (titles aren’t globally unique). GitHub tasks will need a separate identifier once the GitHub backend lands.
 - `sessionId`: OpenCode session identifier.
 - `workerId`: stable identity for one concurrent worker instance.
 

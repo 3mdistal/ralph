@@ -1,6 +1,6 @@
 import { readFile as readFileFs } from "fs/promises";
 import crypto from "crypto";
-import { loadConfig, type RalphConfig } from "./config";
+import { getConfig, type RalphConfig } from "./config";
 
 export interface GitHubRepoSummary {
   id: number;
@@ -164,7 +164,7 @@ async function mintInstallationToken(cfg: GitHubAppConfig): Promise<Installation
 }
 
 export async function getInstallationToken(): Promise<string> {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const app = getGitHubAppConfig(cfg);
   if (!app) {
     throw new GitHubAuthError("GitHub App auth not configured (missing githubApp in ralph.json)");
@@ -192,7 +192,7 @@ export async function getInstallationToken(): Promise<string> {
 
 export async function ensureGhTokenEnv(): Promise<void> {
   // Best-effort: if githubApp isn't configured, leave GH_TOKEN as-is.
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const app = getGitHubAppConfig(cfg);
   if (!app) return;
 
@@ -265,7 +265,7 @@ export async function listAccessibleRepos(): Promise<GitHubRepoSummary[]> {
 }
 
 export function getAllowedOwners(): string[] {
-  const cfg = loadConfig() as any;
+  const cfg = getConfig() as any;
   const raw = cfg.allowedOwners;
 
   const owners: string[] = Array.isArray(raw)
@@ -281,7 +281,7 @@ export function getAllowedOwners(): string[] {
 export function isRepoAllowed(repo: string): boolean {
   const allowed = new Set(getAllowedOwners().map((o) => o.toLowerCase()));
 
-  const cfgOwner = loadConfig().owner;
+  const cfgOwner = getConfig().owner;
   const owner = repo.includes("/") ? repo.split("/")[0] : cfgOwner;
 
   return allowed.has(String(owner).toLowerCase());
