@@ -828,7 +828,9 @@ export class RepoWorker {
       return;
     }
     if (!baseBranch) return;
-    if (this.normalizeGitRef(baseBranch) !== this.normalizeGitRef(params.botBranch)) return;
+    const normalizedBotBranch = this.normalizeGitRef(params.botBranch);
+    if (normalizedBotBranch === "main") return;
+    if (this.normalizeGitRef(baseBranch) !== normalizedBotBranch) return;
 
     const errors: string[] = [];
 
