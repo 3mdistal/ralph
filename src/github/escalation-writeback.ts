@@ -1,4 +1,4 @@
-import { deleteIdempotencyKey, hasIdempotencyKey, recordIdempotencyKey } from "../state";
+import { deleteIdempotencyKey, hasIdempotencyKey, initStateDb, recordIdempotencyKey } from "../state";
 import {
   RALPH_LABEL_ESCALATED,
   RALPH_LABEL_IN_PROGRESS,
@@ -199,6 +199,9 @@ export async function writeEscalationToGitHub(
   ctx: EscalationWritebackContext,
   deps: WritebackDeps
 ): Promise<EscalationWritebackResult> {
+  if (!deps.hasIdempotencyKey || !deps.recordIdempotencyKey || !deps.deleteIdempotencyKey) {
+    initStateDb();
+  }
   const plan = planEscalationWriteback(ctx);
   const log = deps.log ?? console.log;
   const maxPages = deps.maxCommentPages ?? DEFAULT_MAX_COMMENT_PAGES;
