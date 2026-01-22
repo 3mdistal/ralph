@@ -263,18 +263,19 @@ export async function writeEscalationToGitHub(
 
   let listResult: { comments: IssueComment[]; reachedMax: boolean } | null = null;
   try {
+    const limit = Math.min(maxPages * 100, 100);
     listResult = await listRecentIssueComments({
       github: deps.github,
       repo: ctx.repo,
       issueNumber: ctx.issueNumber,
-      limit: maxPages * 100,
+      limit,
     });
   } catch (error: any) {
     log(`${prefix} Failed to list issue comments: ${error?.message ?? String(error)}`);
   }
 
   if (listResult?.reachedMax) {
-    log(`${prefix} Comment scan hit cap (${maxPages * 100}); marker detection may be incomplete.`);
+    log(`${prefix} Comment scan hit cap (100); marker detection may be incomplete.`);
   }
 
   const markerFound =
@@ -301,8 +302,8 @@ export async function writeEscalationToGitHub(
   }
 
   if (hasKeyResult && !scanComplete && !markerFound) {
-    ignoreExistingKey = true;
-    log(`${prefix} Idempotency key exists but marker scan incomplete; proceeding cautiously.`);
+    log(`${prefix} Idempotency key exists but marker scan incomplete; skipping comment to avoid duplicates.`);
+    return { postedComment: false, skippedComment: true, markerFound: false };
   }
 
   if (markerFound) {
