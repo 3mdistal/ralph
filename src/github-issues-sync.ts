@@ -358,9 +358,9 @@ function startRepoPoller(params: {
   const repoName = params.repo.name;
   const repoLabel = formatRepoLabel(repoName);
 
-  const scheduleNext = (nextDelayMsValue: number) => {
+  const scheduleNext = (nextDelayMsValue: number, applyJitterValue = true) => {
     if (stopped) return;
-    const delay = applyJitter(nextDelayMsValue);
+    const delay = applyJitterValue ? applyJitter(nextDelayMsValue) : Math.max(MIN_DELAY_MS, nextDelayMsValue);
     timer = setTimeout(() => {
       void tick();
     }, delay);
@@ -392,7 +392,7 @@ function startRepoPoller(params: {
           `delayMs=${delayMs}`
       );
 
-      scheduleNext(delayMs);
+      scheduleNext(delayMs, false);
       return;
     }
 
