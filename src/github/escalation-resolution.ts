@@ -1,7 +1,12 @@
 import { resolveAgentTaskByIssue, updateTaskStatus } from "../queue-backend";
 import { initStateDb, listIssuesWithAllLabels } from "../state";
 import { GitHubClient, splitRepoFullName } from "./client";
-import { RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_RESOLVED_REGEX } from "./escalation-constants";
+import {
+  RALPH_ESCALATION_MARKER_PREFIX,
+  RALPH_LABEL_ESCALATED,
+  RALPH_LABEL_QUEUED,
+  RALPH_RESOLVED_REGEX,
+} from "./escalation-constants";
 
 type EscalatedIssue = { repo: string; number: number };
 
@@ -193,7 +198,9 @@ export async function reconcileEscalationResolutions(params: {
       );
       continue;
     }
-    const hasResolution = bodies.some((body) => RALPH_RESOLVED_REGEX.test(body));
+    const hasResolution = bodies.some(
+      (body) => RALPH_RESOLVED_REGEX.test(body) && !body.includes(RALPH_ESCALATION_MARKER_PREFIX)
+    );
     if (!hasResolution) continue;
 
     try {

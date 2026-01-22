@@ -67,10 +67,9 @@ function hashFNV1a(input: string): string {
 export function buildEscalationMarker(params: {
   repo: string;
   issueNumber: number;
-  taskPath: string;
   escalationType: string;
 }): string {
-  const base = [params.repo, params.issueNumber, params.taskPath, params.escalationType].join("|");
+  const base = [params.repo, params.issueNumber, params.escalationType].join("|");
   const hash = `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
   return `<!-- ralph-escalation:id=${hash} -->`;
 }
@@ -113,7 +112,6 @@ export function planEscalationWriteback(ctx: EscalationWritebackContext): Escala
   const marker = buildEscalationMarker({
     repo: ctx.repo,
     issueNumber: ctx.issueNumber,
-    taskPath: ctx.taskPath,
     escalationType: ctx.escalationType,
   });
 

@@ -4,3 +4,4 @@ export const RALPH_LABEL_ESCALATED = "ralph:escalated";
 
 export const RALPH_RESOLVED_TEXT = "RALPH RESOLVED:";
 export const RALPH_RESOLVED_REGEX = /\bRALPH\s+RESOLVED:/i;
+export const RALPH_ESCALATION_MARKER_PREFIX = "<!-- ralph-escalation:id=";

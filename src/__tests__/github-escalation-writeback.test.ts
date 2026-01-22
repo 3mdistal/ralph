@@ -13,19 +13,16 @@ describe("github escalation writeback", () => {
     const markerA = buildEscalationMarker({
       repo: "3mdistal/ralph",
       issueNumber: 66,
-      taskPath: "orchestration/tasks/ralph 66.md",
       escalationType: "other",
     });
     const markerB = buildEscalationMarker({
       repo: "3mdistal/ralph",
       issueNumber: 66,
-      taskPath: "orchestration/tasks/ralph 66.md",
       escalationType: "other",
     });
     const markerC = buildEscalationMarker({
       repo: "3mdistal/ralph",
-      issueNumber: 66,
-      taskPath: "orchestration/tasks/ralph 67.md",
+      issueNumber: 67,
       escalationType: "other",
     });
 

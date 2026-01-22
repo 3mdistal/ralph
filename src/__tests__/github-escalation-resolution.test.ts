@@ -89,4 +89,74 @@ describe("escalation resolution reconciliation", () => {
     const added = requests.filter((req) => req.method === "POST").map((req) => req.path);
     expect(added).toEqual(expect.arrayContaining(["/repos/3mdistal/ralph/issues/11/labels"]));
   });
+
+  test("ignores RALPH RESOLVED in escalation comment", async () => {
+    const github = {
+      request: async (path: string, opts: { method?: string; body?: any } = {}) => {
+        if (path === "/graphql") {
+          const nodes = [
+            {
+              body: "<!-- ralph-escalation:id=abc123 -->\nUse `RALPH RESOLVED: <guidance>` to resolve.",
+            },
+          ];
+          return {
+            data: {
+              data: {
+                repository: {
+                  issue: {
+                    comments: { nodes },
+                  },
+                },
+              },
+            },
+          };
+        }
+
+        return { data: {} };
+      },
+    } as any;
+
+    const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
+      if (labels.includes("ralph:queued")) return [];
+      return [{ repo: "3mdistal/ralph", number: 12 }];
+    };
+
+    const tasks = new Map([
+      [
+        "3mdistal/ralph#12",
+        {
+          _path: "orchestration/tasks/3mdistal-ralph-12.md",
+          _name: "3mdistal/ralph#12",
+          type: "agent-task" as const,
+          "creation-date": "2026-01-11",
+          scope: "builder",
+          issue: "3mdistal/ralph#12",
+          repo: "3mdistal/ralph",
+          status: "escalated" as const,
+          name: "Task 12",
+        },
+      ],
+    ]);
+
+    const updated: string[] = [];
+    const resolveAgentTaskByIssue = async (issue: string) => tasks.get(issue) ?? null;
+    const updateTaskStatus = async (task: any, status: string) => {
+      updated.push(`${task.issue}:${status}`);
+      task.status = status;
+      return true;
+    };
+
+    await reconcileEscalationResolutions({
+      repo: "3mdistal/ralph",
+      deps: {
+        github,
+        listIssuesWithAllLabels,
+        resolveAgentTaskByIssue,
+        updateTaskStatus,
+      },
+      log: () => {},
+    });
+
+    expect(updated).toEqual([]);
+  });
 });
