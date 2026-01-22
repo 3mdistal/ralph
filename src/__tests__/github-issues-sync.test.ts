@@ -45,16 +45,19 @@ describe("github issue sync", () => {
   });
 
   afterEach(async () => {
-    closeStateDbForTests();
-    process.env.HOME = priorHome;
-    await rm(homeDir, { recursive: true, force: true });
-    releaseLock?.();
-    releaseLock = null;
+    try {
+      closeStateDbForTests();
+      await rm(homeDir, { recursive: true, force: true });
+    } finally {
+      process.env.HOME = priorHome;
+      releaseLock?.();
+      releaseLock = null;
+    }
   });
 
   test("syncs non-PR issues and labels, advances cursor", async () => {
     const calls: string[] = [];
-    const fetchMock = async (input: RequestInfo | URL) => {
+    const fetchMock: typeof fetch = async (input: RequestInfo | URL) => {
       calls.push(String(input));
       return new Response(
         JSON.stringify([
@@ -70,7 +73,7 @@ describe("github issue sync", () => {
       repo,
       lastSyncAt: "2026-01-11T00:00:00.000Z",
       deps: {
-        fetch: fetchMock as any,
+        fetch: fetchMock,
         getToken: async () => "token",
         now: () => new Date("2026-01-11T00:00:10.000Z"),
       },
@@ -109,7 +112,7 @@ describe("github issue sync", () => {
       [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:02.000Z", labels: [] })],
     ];
     let idx = 0;
-    const fetchMock = async () => {
+    const fetchMock: typeof fetch = async () => {
       const body = responses[Math.min(idx, responses.length - 1)];
       idx += 1;
       return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -118,13 +121,13 @@ describe("github issue sync", () => {
     await syncRepoIssuesOnce({
       repo,
       lastSyncAt: null,
-      deps: { fetch: fetchMock as any, getToken: async () => "token" },
+      deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
     await syncRepoIssuesOnce({
       repo,
       lastSyncAt: "2026-01-11T00:00:01.000Z",
-      deps: { fetch: fetchMock as any, getToken: async () => "token" },
+      deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
     const db = new Database(getRalphStateDbPath());
@@ -137,12 +140,12 @@ describe("github issue sync", () => {
   });
 
   test("does not advance cursor on error", async () => {
-    const fetchMock = async () => new Response("nope", { status: 500 });
+    const fetchMock: typeof fetch = async () => new Response("nope", { status: 500 });
 
     const result = await syncRepoIssuesOnce({
       repo,
       lastSyncAt: "2026-01-11T00:00:00.000Z",
-      deps: { fetch: fetchMock as any, getToken: async () => "token" },
+      deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
     expect(result.ok).toBe(false);
