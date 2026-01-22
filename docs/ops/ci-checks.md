@@ -28,4 +28,6 @@ CI runs under the GitHub workflow named `CI` and performs these steps:
 ## Required Checks Note
 
 When configuring `repos[].requiredChecks`, use the exact check context name
-shown in GitHub branch protection for this workflow.
+shown in GitHub branch protection for this workflow. GitHub required checks are
+job/check-run contexts (not individual steps), and the UI often shows them in a
+`<workflow> / <job>` format (for example, `CI / ci`).
