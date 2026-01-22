@@ -75,6 +75,12 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
 - When a task PR merges to `bot/integration`, Ralph applies `ralph:in-bot` and clears `ralph:in-progress`.
 - When the rollup PR merges to `main`, Ralph closes the issue and removes `ralph:in-bot`.
 
+Direct-to-main (override / Pattern B):
+- If a task PR is merged directly to `main` (or the repo config sets `botBranch: main`), Ralph does **not** apply the
+  `ralph:in-bot` midpoint label and does not clear `ralph:in-progress` as part of the merge step.
+- Midpoint label updates are best-effort and do not block merges; failures are surfaced via non-blocking notifications
+  so operators can resolve GitHub permission/config issues without interrupting the queue.
+
 ## Escalation protocol
 
 - Ralph adds `ralph:escalated` and posts a comment containing a stable hidden marker
