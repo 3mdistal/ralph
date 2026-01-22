@@ -231,7 +231,10 @@ async function fetchIssuesSince(params: {
 
 export async function syncRepoIssuesOnce(params: {
   repo: string;
+  repoPath?: string;
+  botBranch?: string;
   lastSyncAt: string | null;
+  persistCursor?: boolean;
   deps?: SyncDeps;
 }): Promise<SyncResult> {
   const deps = params.deps ?? {};
@@ -262,6 +265,11 @@ export async function syncRepoIssuesOnce(params: {
         error: fetchResult.error,
       };
     }
+
+    const hasRows = fetchResult.fetched > 0;
+    const newLastSyncAt = hasRows
+      ? fetchResult.maxUpdatedAt ?? params.lastSyncAt ?? nowIso
+      : params.lastSyncAt ?? null;
 
     let stored = 0;
     let ralphCount = 0;
@@ -299,12 +307,16 @@ export async function syncRepoIssuesOnce(params: {
 
         stored += 1;
       }
-    });
 
-    const hasRows = fetchResult.fetched > 0;
-    const newLastSyncAt = hasRows
-      ? fetchResult.maxUpdatedAt ?? params.lastSyncAt ?? nowIso
-      : params.lastSyncAt ?? null;
+      if (params.persistCursor && newLastSyncAt && newLastSyncAt !== params.lastSyncAt) {
+        recordRepoGithubIssueSync({
+          repo: params.repo,
+          repoPath: params.repoPath,
+          botBranch: params.botBranch,
+          lastSyncAt: newLastSyncAt,
+        });
+      }
+    });
 
     return {
       ok: true,
@@ -358,18 +370,15 @@ function startRepoPoller(params: {
     if (stopped) return;
     const lastSyncAt = getRepoGithubIssueLastSyncAt(repoName);
 
-    const result = await syncRepoIssuesOnce({ repo: repoName, lastSyncAt });
+    const result = await syncRepoIssuesOnce({
+      repo: repoName,
+      repoPath: params.repo.path,
+      botBranch: params.repo.botBranch,
+      lastSyncAt,
+      persistCursor: true,
+    });
 
     if (result.ok) {
-      if (result.newLastSyncAt && result.newLastSyncAt !== lastSyncAt) {
-        recordRepoGithubIssueSync({
-          repo: repoName,
-          repoPath: params.repo.path,
-          botBranch: params.repo.botBranch,
-          lastSyncAt: result.newLastSyncAt,
-        });
-      }
-
       delayMs = nextDelayMs({
         baseMs: params.baseIntervalMs,
         previousMs: delayMs,
