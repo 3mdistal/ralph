@@ -434,7 +434,7 @@ const schedulerController = createSchedulerController({
     ensureSemaphores();
     if (!globalSemaphore) return;
 
-    startQueuedTasks({
+    void startQueuedTasks({
       gate: "running",
       tasks: [],
       priorityTasks,
@@ -647,43 +647,79 @@ async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Pr
   }
 }
 
-function startTask(opts: {
+async function startTask(opts: {
   repo: string;
   task: AgentTask;
   releaseGlobal: () => void;
   releaseRepo: () => void;
-}): void {
+}): Promise<boolean> {
   const { repo, task, releaseGlobal, releaseRepo } = opts;
-  const key = getTaskKey(task);
+  const initialKey = getTaskKey(task);
+  inFlightTasks.add(initialKey);
 
-  inFlightTasks.add(key);
+  try {
+    const nowMs = Date.now();
+    const claim = await tryClaimTask({ task, daemonId, nowMs });
 
-  void getOrCreateWorker(repo)
-    .processTask(task)
-      .then(async (run: AgentRun) => {
-        if (run.outcome === "success" && run.pr) {
-          try {
-            recordPrSnapshot({ repo, issue: task.issue, prUrl: run.pr, state: "merged" });
-          } catch {
-            // best-effort
-          }
-
-          await rollupMonitor.recordMerge(repo, run.pr);
-        }
-      })
-    .catch((e) => {
-      console.error(`[ralph] Error processing task ${task.name}:`, e);
-    })
-    .finally(() => {
-      inFlightTasks.delete(key);
-      forgetOwnedTask(task);
-      releaseGlobal();
-      releaseRepo();
-      if (!isShuttingDown) {
-        scheduleQueuedTasksSoon();
-        void checkIdleRollups();
+    if (!claim.claimed || !claim.task) {
+      if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
+        console.log(`[ralph] Skipping task ${task.name}: ${claim.reason}`);
       }
-    });
+      inFlightTasks.delete(initialKey);
+      if (!isShuttingDown) scheduleQueuedTasksSoon();
+      return false;
+    }
+
+    const claimedTask = claim.task;
+    recordOwnedTask(claimedTask);
+
+    const key = getTaskKey(claimedTask);
+    if (key !== initialKey) {
+      inFlightTasks.delete(initialKey);
+      inFlightTasks.add(key);
+    }
+
+    try {
+      void getOrCreateWorker(repo)
+        .processTask(claimedTask)
+        .then(async (run: AgentRun) => {
+          if (run.outcome === "success" && run.pr) {
+            try {
+              recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: "merged" });
+            } catch {
+              // best-effort
+            }
+
+            await rollupMonitor.recordMerge(repo, run.pr);
+          }
+        })
+        .catch((e) => {
+          console.error(`[ralph] Error processing task ${claimedTask.name}:`, e);
+        })
+        .finally(() => {
+          inFlightTasks.delete(key);
+          forgetOwnedTask(claimedTask);
+          releaseGlobal();
+          releaseRepo();
+          if (!isShuttingDown) {
+            scheduleQueuedTasksSoon();
+            void checkIdleRollups();
+          }
+        });
+    } catch (error: any) {
+      console.error(`[ralph] Error starting task ${claimedTask.name}:`, error);
+      inFlightTasks.delete(key);
+      forgetOwnedTask(claimedTask);
+      if (!isShuttingDown) scheduleQueuedTasksSoon();
+      return false;
+    }
+    return true;
+  } catch (error: any) {
+    console.error(`[ralph] Error claiming task ${task.name}:`, error);
+    inFlightTasks.delete(initialKey);
+    if (!isShuttingDown) scheduleQueuedTasksSoon();
+    return false;
+  }
 }
 
 function startResumeTask(opts: {
@@ -691,7 +727,7 @@ function startResumeTask(opts: {
   task: AgentTask;
   releaseGlobal: () => void;
   releaseRepo: () => void;
-}): void {
+}): boolean {
   const { repo, task, releaseGlobal, releaseRepo } = opts;
   const key = getTaskKey(task);
 
@@ -718,6 +754,8 @@ function startResumeTask(opts: {
         void checkIdleRollups();
       }
     });
+
+  return true;
 }
 
 // --- Main Logic ---
@@ -772,28 +810,8 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     })
   );
 
-  const nowMs = Date.now();
-  const claimable: AgentTask[] = [];
-  const heartbeatCutoffMs = nowMs - getConfig().ownershipTtlMs;
-  for (const task of tasks) {
-    if (task._path && blockedPaths.has(task._path)) continue;
-    const heartbeatMs = parseHeartbeatMs(task["heartbeat-at"]);
-    if (heartbeatMs && heartbeatMs < heartbeatCutoffMs && shouldLog(`ownership:stale:${task._path}`, 60_000)) {
-      console.warn(
-        `[ralph] Task heartbeat is stale; eligible for takeover: ${task.name} (last ${new Date(heartbeatMs).toISOString()})`
-      );
-    }
-
-    const claim = await tryClaimTask({ task, daemonId, nowMs });
-    if (claim.claimed && claim.task) {
-      recordOwnedTask(claim.task);
-      claimable.push(claim.task);
-    } else if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
-      console.log(`[ralph] Skipping task ${task.name}: ${claim.reason}`);
-    }
-  }
-
-  const queueTasks = isDraining ? [] : claimable;
+  const unblockedTasks = tasks.filter((task) => !(task._path && blockedPaths.has(task._path)));
+  const queueTasks = isDraining ? [] : unblockedTasks;
 
   if (queueTasks.length > 0) {
     resetIdleState(queueTasks);
@@ -801,7 +819,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     resetIdleState(tasks);
   }
 
-  const startedCount = startQueuedTasks({
+  const startedCount = await startQueuedTasks({
     gate: "running",
     tasks: queueTasks,
     priorityTasks: Array.from(pendingResumeTasks.values()),
@@ -1076,6 +1094,10 @@ async function main(): Promise<void> {
     repos: config.repos,
     baseIntervalMs: config.pollInterval,
     log: (message) => console.log(message),
+    onSync: ({ result }) => {
+      if (!result.hadChanges || isShuttingDown || queueState.backend !== "github") return;
+      scheduleQueuedTasksSoon();
+    },
   });
 
   ralphEventBus.publish(
@@ -1177,6 +1199,25 @@ async function main(): Promise<void> {
     } else {
       console.log(`[ralph:escalations] Escalations dir not found: ${escalationsDir}`);
     }
+  } else if (queueState.backend === "github") {
+    console.log("[ralph] Running initial poll...");
+    const initialTasks = await getRunnableTasks();
+    console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
+
+    if (initialTasks.length > 0 && getDaemonMode(config.control) !== "draining") {
+      await processNewTasks(initialTasks, config.control ?? {});
+    } else {
+      resetIdleState(initialTasks);
+    }
+
+    console.log("[ralph] Starting queue watcher...");
+    startWatching(async (tasks) => {
+      if (!isShuttingDown && getDaemonMode(config.control) !== "draining") {
+        await processNewTasks(tasks, config.control ?? {});
+      }
+    });
+
+    void resumeTasksOnStartup({ awaitCompletion: false });
   } else {
     const detail = queueState.diagnostics ? ` ${queueState.diagnostics}` : "";
     console.log(`[ralph] Queue backend disabled; running without queued tasks.${detail}`);

@@ -59,4 +59,4 @@ export interface QueueTask {
 
 export type AgentTask = QueueTask;
 
-export type QueueChangeHandler = (tasks: QueueTask[]) => void;
+export type QueueChangeHandler = (tasks: QueueTask[]) => void | Promise<void>;

@@ -18,10 +18,10 @@ function groupByRepo(tasks: TestTask[]): Map<string, TestTask[]> {
 }
 
 describe("Scheduler invariants", () => {
-  test("drain gates new queued starts", () => {
+  test("drain gates new queued starts", async () => {
     const started: TestTask[] = [];
 
-    const startedCount = startQueuedTasks<TestTask>({
+    const startedCount = await startQueuedTasks<TestTask>({
       gate: "draining",
       tasks: [{ repo: "a", _path: "t1", name: "t1" }],
       inFlightTasks: new Set<string>(),
@@ -32,14 +32,17 @@ describe("Scheduler invariants", () => {
       rrCursor: { value: 0 },
       shouldLog: () => false,
       log: () => {},
-      startTask: ({ task }) => started.push(task),
+      startTask: ({ task }) => {
+        started.push(task);
+        return true;
+      },
     });
 
     expect(startedCount).toBe(0);
     expect(started.length).toBe(0);
   });
 
-  test("drain allows resume scheduling without dequeues", () => {
+  test("drain allows resume scheduling without dequeues", async () => {
     const pendingResumes: TestTask[] = [{ repo: "a", _path: "t1", name: "resume" }];
     const expectedResumes = [...pendingResumes];
     const runnableCalls: TestTask[][] = [];
@@ -96,7 +99,7 @@ describe("Scheduler invariants", () => {
     expect(runnableCalls.length).toBe(1);
   });
 
-  test("startQueuedTasks skips in-flight tasks", () => {
+  test("startQueuedTasks skips in-flight tasks", async () => {
     const inFlightTasks = new Set<string>();
     const started: TestTask[] = [];
 
@@ -117,11 +120,12 @@ describe("Scheduler invariants", () => {
     const startTask = ({ repo, task }: { repo: string; task: TestTask }) => {
       inFlightTasks.add(task._path || task.name);
       started.push({ ...task, repo });
+      return true;
     };
 
     const tasks = [{ repo: "a", _path: "orchestration/tasks/t1.md", name: "t1" }];
 
-    const first = startQueuedTasks<TestTask>({
+    const first = await startQueuedTasks<TestTask>({
       gate: "running",
       tasks,
       inFlightTasks,
@@ -135,7 +139,7 @@ describe("Scheduler invariants", () => {
       startTask: startTask as any,
     });
 
-    const second = startQueuedTasks<TestTask>({
+    const second = await startQueuedTasks<TestTask>({
       gate: "running",
       tasks,
       inFlightTasks,
@@ -154,7 +158,7 @@ describe("Scheduler invariants", () => {
     expect(started.length).toBe(1);
   });
 
-  test("no duplicate scheduling when watcher double-fires", () => {
+  test("no duplicate scheduling when watcher double-fires", async () => {
     const inFlightTasks = new Set<string>();
     const started: TestTask[] = [];
 
@@ -175,11 +179,12 @@ describe("Scheduler invariants", () => {
     const startTask = ({ repo, task }: { repo: string; task: TestTask }) => {
       inFlightTasks.add(task._path || task.name);
       started.push({ ...task, repo });
+      return true;
     };
 
     const tasks = [{ repo: "a", _path: "orchestration/tasks/t1.md", name: "t1" }];
 
-    const first = startQueuedTasks<TestTask>({
+    const first = await startQueuedTasks<TestTask>({
       gate: "running",
       tasks,
       inFlightTasks,
@@ -193,7 +198,7 @@ describe("Scheduler invariants", () => {
       startTask: startTask as any,
     });
 
-    const second = startQueuedTasks<TestTask>({
+    const second = await startQueuedTasks<TestTask>({
       gate: "running",
       tasks,
       inFlightTasks,
@@ -212,7 +217,7 @@ describe("Scheduler invariants", () => {
     expect(started.length).toBe(1);
   });
 
-  test("priority resumes do not block queued starts", () => {
+  test("priority resumes do not block queued starts", async () => {
     const inFlightTasks = new Set<string>();
     const started: string[] = [];
 
@@ -230,13 +235,15 @@ describe("Scheduler invariants", () => {
 
     const startPriorityTask = mock(({ task }: { task: TestTask }) => {
       started.push(`resume:${task._path}`);
+      return true;
     });
 
     const startTask = mock(({ task }: { task: TestTask }) => {
       started.push(`queued:${task._path}`);
+      return true;
     });
 
-    const startedCount = startQueuedTasks<TestTask>({
+    const startedCount = await startQueuedTasks<TestTask>({
       gate: "running",
       tasks: [{ repo: "a", _path: "t2", name: "queued" }],
       priorityTasks: [{ repo: "a", _path: "t1", name: "resume" }],
@@ -258,7 +265,7 @@ describe("Scheduler invariants", () => {
     expect(started[0]).toBe("resume:t1");
   });
 
-  test("resume scheduling does not block queued tasks", () => {
+  test("resume scheduling does not block queued tasks", async () => {
     const inFlightTasks = new Set<string>();
     const started: string[] = [];
 
@@ -276,13 +283,15 @@ describe("Scheduler invariants", () => {
 
     const startPriorityTask = ({ task }: { task: TestTask }) => {
       started.push(`resume:${task._path}`);
+      return true;
     };
 
     const startTask = ({ task }: { task: TestTask }) => {
       started.push(`queued:${task._path}`);
+      return true;
     };
 
-    const startedCount = startQueuedTasks<TestTask>({
+    const startedCount = await startQueuedTasks<TestTask>({
       gate: "running",
       tasks: [{ repo: "repo-a", _path: "queued-1", name: "queued" }],
       priorityTasks: [{ repo: "repo-a", _path: "resume-1", name: "resume" }],
@@ -327,8 +336,8 @@ describe("Scheduler invariants", () => {
       getDaemonMode: () => "running",
       isShuttingDown: () => false,
       getRunnableTasks: async () => queuedTasks,
-      onRunnableTasks: (tasks) => {
-        const startedCount = startQueuedTasks<ControllerTask>({
+      onRunnableTasks: async (tasks) => {
+        const startedCount = await startQueuedTasks<ControllerTask>({
           gate: "running",
           tasks,
           priorityTasks: pendingResumes,
@@ -340,8 +349,14 @@ describe("Scheduler invariants", () => {
           rrCursor,
           shouldLog: () => false,
           log: (message) => log.push(message),
-          startTask: ({ task }) => started.push(`queued:${task._path}`),
-          startPriorityTask: ({ task }) => started.push(`resume:${task._path}`),
+          startTask: ({ task }) => {
+            started.push(`queued:${task._path}`);
+            return true;
+          },
+          startPriorityTask: ({ task }) => {
+            started.push(`resume:${task._path}`);
+            return true;
+          },
         });
 
         log.push(`started:${startedCount}`);
