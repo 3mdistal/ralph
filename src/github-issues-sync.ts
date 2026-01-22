@@ -393,14 +393,12 @@ function startRepoPoller(params: {
           `delayMs=${delayMs}`
       );
 
-      if (result.hadChanges) {
-        try {
-          await reconcileEscalationResolutions({ repo: repoName, log: params.log });
-        } catch (error: any) {
-          params.log(
-            `[ralph:gh-sync:${repoLabel}] escalation resolution reconcile failed: ${error?.message ?? String(error)}`
-          );
-        }
+      try {
+        await reconcileEscalationResolutions({ repo: repoName, log: params.log });
+      } catch (error: any) {
+        params.log(
+          `[ralph:gh-sync:${repoLabel}] escalation resolution reconcile failed: ${error?.message ?? String(error)}`
+        );
       }
 
       scheduleNext(delayMs, false);
