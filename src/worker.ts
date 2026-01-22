@@ -17,7 +17,7 @@ const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 
 const gh: GhRunner = DEFAULT_GH_RUNNER;
 
-import { type AgentTask, updateTaskStatus } from "./queue";
+import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "./queue-backend";
 import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
@@ -27,7 +27,7 @@ import {
   getRepoRequiredChecksOverride,
   isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
-  loadConfig,
+  getConfig,
   resolveOpencodeProfile,
 } from "./config";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
@@ -47,8 +47,21 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { computeMissingBaselineLabels, computeMissingRalphLabels } from "./github-labels";
+import { computeRalphLabelSync } from "./github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
+import {
+  computeBlockedDecision,
+  formatIssueRef,
+  parseIssueRef,
+  type IssueRef,
+  type RelationshipSignal,
+} from "./github/issue-blocking-core";
+import {
+  GitHubRelationshipProvider,
+  type IssueRelationshipProvider,
+  type IssueRelationshipSnapshot,
+} from "./github/issue-relationships";
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
@@ -132,6 +145,9 @@ const RALPH_WORKTREES_DIR = getRalphWorktreesDir();
 // Anomaly detection thresholds
 const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
 const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
+const BLOCKED_SYNC_INTERVAL_MS = 30_000;
+const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
+const BLOCKED_REASON_MAX_LEN = 200;
 
 interface IntrospectionSummary {
   sessionId: string;
@@ -212,8 +228,16 @@ function summarizeForNote(text: string, maxChars = 900): string {
   return trimmed.slice(0, maxChars).trimEnd() + "…";
 }
 
+function summarizeBlockedReason(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  if (trimmed.length <= BLOCKED_REASON_MAX_LEN) return trimmed;
+  return trimmed.slice(0, BLOCKED_REASON_MAX_LEN).trimEnd() + "…";
+}
+
 function resolveVaultPath(p: string): string {
-  const vault = loadConfig().bwrbVault;
+  const vault = getBwrbVaultIfValid();
+  if (!vault) return p;
   return isAbsolute(p) ? p : join(vault, p);
 }
 
@@ -520,6 +544,7 @@ export class RepoWorker {
       queue?: QueueAdapter;
       notify?: NotifyAdapter;
       throttle?: ThrottleAdapter;
+      relationships?: IssueRelationshipProvider;
     }
   ) {
     this.session = opts?.session ?? DEFAULT_SESSION_ADAPTER;
@@ -527,12 +552,17 @@ export class RepoWorker {
     this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
     this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
     this.github = new GitHubClient(this.repo);
+    this.relationships = opts?.relationships ?? new GitHubRelationshipProvider(this.repo, this.github);
   }
 
   private ensureLabelsPromise: Promise<void> | null = null;
   private ensureBranchProtectionPromise: Promise<void> | null = null;
   private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
   private repoSlotsInUse: Set<number> | null = null;
+  private relationships: IssueRelationshipProvider;
+  private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
+  private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
+  private lastBlockedSyncAt = 0;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -557,13 +587,16 @@ export class RepoWorker {
       ].join("\n"),
     });
 
-    await this.queue.updateTaskStatus(task, "blocked", {
-      "completed-at": completedAt,
-      "session-id": "",
-      "watchdog-retries": "",
-      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
-      ...(task["worker-id"] ? { "worker-id": "" } : {}),
-      ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
+    await this.markTaskBlocked(task, "allowlist", {
+      reason,
+      extraFields: {
+        "completed-at": completedAt,
+        "session-id": "",
+        "watchdog-retries": "",
+        ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+        ...(task["worker-id"] ? { "worker-id": "" } : {}),
+        ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
+      },
     });
 
     return {
@@ -604,11 +637,14 @@ export class RepoWorker {
     const reason = `Repo root has uncommitted changes; refusing to run to protect main checkout (${phase}).`;
     const message = [reason, "", "Status:", status].join("\n");
 
-    await this.queue.updateTaskStatus(task, "blocked", {
-      "completed-at": new Date().toISOString().split("T")[0],
-      "session-id": "",
-      "watchdog-retries": "",
-      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+    await this.markTaskBlocked(task, "dirty-repo", {
+      reason,
+      extraFields: {
+        "completed-at": new Date().toISOString().split("T")[0],
+        "session-id": "",
+        "watchdog-retries": "",
+        ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+      },
     });
 
     await this.createAgentRun(task, {
@@ -634,17 +670,44 @@ export class RepoWorker {
     throw error;
   }
 
-  private async ensureBaselineLabelsOnce(): Promise<void> {
+  private async markTaskBlocked(
+    task: AgentTask,
+    source: BlockedSource,
+    opts?: { reason?: string; extraFields?: Record<string, string | number> }
+  ): Promise<boolean> {
+    if (!BLOCKED_SOURCES.includes(source)) {
+      console.warn(`[ralph:worker:${this.repo}] Unknown blocked-source '${source}'; defaulting to runtime-error`);
+      source = "runtime-error";
+    }
+    const now = new Date().toISOString();
+    const reason = opts?.reason ? summarizeBlockedReason(opts.reason) : "";
+    return await this.queue.updateTaskStatus(task, "blocked", {
+      "blocked-source": source,
+      "blocked-reason": reason,
+      "blocked-checked-at": now,
+      ...(opts?.extraFields ?? {}),
+    });
+  }
+
+  private async markTaskUnblocked(task: AgentTask): Promise<boolean> {
+    return await this.queue.updateTaskStatus(task, "queued", {
+      "blocked-source": "",
+      "blocked-reason": "",
+      "blocked-checked-at": "",
+    });
+  }
+
+  private async ensureRalphWorkflowLabelsOnce(): Promise<void> {
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
 
     this.ensureLabelsPromise = (async () => {
       try {
-        const existing = await this.github.listLabels();
-        const missing = [...computeMissingBaselineLabels(existing), ...computeMissingRalphLabels(existing)];
-        if (missing.length === 0) return;
+        const existing = await this.github.listLabelSpecs();
+        const { toCreate, toUpdate } = computeRalphLabelSync(existing);
+        if (toCreate.length === 0 && toUpdate.length === 0) return;
 
         const created: string[] = [];
-        for (const label of missing) {
+        for (const label of toCreate) {
           try {
             await this.github.createLabel(label);
             created.push(label.name);
@@ -652,19 +715,25 @@ export class RepoWorker {
             if (e instanceof GitHubApiError) {
               if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
             }
-            const msg = e?.message ?? String(e);
-            if (/already exists/i.test(msg)) continue;
             throw e;
           }
+        }
+
+        const updated: string[] = [];
+        for (const update of toUpdate) {
+          await this.github.updateLabel(update.currentName, update.patch);
+          updated.push(update.currentName);
         }
 
         if (created.length > 0) {
           console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
         }
-      } catch (e: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to ensure baseline GitHub labels (continuing): ${e?.message ?? String(e)}`
-        );
+        if (updated.length > 0) {
+          console.log(`[ralph:worker:${this.repo}] Updated GitHub label(s): ${updated.join(", ")}`);
+        }
+      } catch (error) {
+        this.ensureLabelsPromise = null;
+        throw error;
       }
     })();
 
@@ -677,6 +746,27 @@ export class RepoWorker {
   ): Promise<T | null> {
     const response = await this.github.request<T>(path, opts);
     return response.data;
+  }
+
+  private async addIssueLabel(issue: IssueRef, label: string): Promise<void> {
+    const { owner, name } = splitRepoFullName(issue.repo);
+    await this.githubApiRequest(`/repos/${owner}/${name}/issues/${issue.number}/labels`, {
+      method: "POST",
+      body: { labels: [label] },
+    });
+  }
+
+  private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
+    const { owner, name } = splitRepoFullName(issue.repo);
+    try {
+      await this.githubApiRequest(`/repos/${owner}/${name}/issues/${issue.number}/labels/${encodeURIComponent(label)}`, {
+        method: "DELETE",
+        allowNotFound: true,
+      });
+    } catch (error) {
+      if (error instanceof GitHubApiError && error.status === 404) return;
+      throw error;
+    }
   }
 
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
@@ -1013,6 +1103,114 @@ ${guidance}`
     })();
 
     return this.ensureBranchProtectionPromise;
+  }
+
+  public async syncBlockedStateForTasks(tasks: AgentTask[]): Promise<Set<string>> {
+    const blockedPaths = new Set<string>();
+    if (tasks.length === 0) return blockedPaths;
+
+    const now = Date.now();
+    const allowRefresh = now - this.lastBlockedSyncAt >= BLOCKED_SYNC_INTERVAL_MS;
+    if (allowRefresh) {
+      this.lastBlockedSyncAt = now;
+    }
+
+    await ensureGhTokenEnv();
+
+    const byIssue = new Map<string, { issue: IssueRef; tasks: AgentTask[] }>();
+    for (const task of tasks) {
+      const issueRef = parseIssueRef(task.issue, task.repo);
+      if (!issueRef) continue;
+      const key = `${issueRef.repo}#${issueRef.number}`;
+      const entry = byIssue.get(key) ?? { issue: issueRef, tasks: [] };
+      entry.tasks.push(task);
+      byIssue.set(key, entry);
+    }
+
+    for (const entry of byIssue.values()) {
+      const snapshot = await this.getRelationshipSnapshot(entry.issue, allowRefresh);
+      if (!snapshot) continue;
+
+      const signals = this.buildRelationshipSignals(snapshot);
+      const decision = computeBlockedDecision(signals);
+
+      if (decision.blocked && decision.confidence === "certain") {
+        for (const task of entry.tasks) {
+          if (task.status !== "blocked" && task._path) blockedPaths.add(task._path);
+          const isBlockedForOtherReason =
+            task.status === "blocked" && task["blocked-source"] && task["blocked-source"] !== "deps";
+          if (isBlockedForOtherReason) continue;
+          await this.markTaskBlocked(task, "deps", { reason: decision.reasons.join("; ") || "blocked by dependencies" });
+        }
+
+        try {
+          await this.addIssueLabel(entry.issue, "ralph:blocked");
+        } catch (error: any) {
+          console.warn(`[ralph:worker:${this.repo}] Failed to add ralph:blocked label: ${error?.message ?? String(error)}`);
+        }
+        continue;
+      }
+
+      if (!decision.blocked && decision.confidence === "certain") {
+        for (const task of entry.tasks) {
+          if (task.status === "blocked" && task["blocked-source"] === "deps") {
+            await this.markTaskUnblocked(task);
+          }
+        }
+
+        try {
+          await this.removeIssueLabel(entry.issue, "ralph:blocked");
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to remove ralph:blocked label: ${error?.message ?? String(error)}`
+          );
+        }
+      }
+    }
+
+    return blockedPaths;
+  }
+
+  private async getRelationshipSnapshot(issue: IssueRef, allowRefresh: boolean): Promise<IssueRelationshipSnapshot | null> {
+    const key = `${issue.repo}#${issue.number}`;
+    const now = Date.now();
+    const cached = this.relationshipCache.get(key);
+    if (cached && (!allowRefresh || now - cached.ts < ISSUE_RELATIONSHIP_TTL_MS)) {
+      return cached.snapshot;
+    }
+
+    const inFlight = this.relationshipInFlight.get(key);
+    if (inFlight) return await inFlight;
+
+    const promise = this.relationships
+      .getSnapshot(issue)
+      .then((snapshot) => {
+        this.relationshipCache.set(key, { ts: Date.now(), snapshot });
+        return snapshot;
+      })
+      .catch((error) => {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to fetch relationship snapshot for ${formatIssueRef(issue)}: ${error?.message ?? String(error)}`
+        );
+        return null;
+      })
+      .finally(() => {
+        this.relationshipInFlight.delete(key);
+      });
+
+    this.relationshipInFlight.set(key, promise);
+    return await promise;
+  }
+
+  private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
+    const signals = [...snapshot.signals];
+    if (!snapshot.coverage.githubDeps && !snapshot.coverage.bodyDeps) {
+      signals.push({ source: "github", kind: "blocked_by", state: "unknown" });
+    }
+    if (!snapshot.coverage.githubSubIssues) {
+      signals.push({ source: "github", kind: "sub_issue", state: "unknown" });
+    }
+    return signals;
   }
 
   private async resolveWorktreeRef(): Promise<string> {
@@ -2145,11 +2343,14 @@ ${guidance}`
         ].join("\n"),
       });
 
-      await this.queue.updateTaskStatus(params.task, "blocked", {
-        "completed-at": completedAt,
-        "session-id": "",
-        "watchdog-retries": "",
-        ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+      await this.markTaskBlocked(params.task, "merge-target", {
+        reason,
+        extraFields: {
+          "completed-at": completedAt,
+          "session-id": "",
+          "watchdog-retries": "",
+          ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+        },
       });
 
       await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
@@ -2186,11 +2387,14 @@ ${guidance}`
         ].join("\n"),
       });
 
-      await this.queue.updateTaskStatus(params.task, "blocked", {
-        "completed-at": completedAt,
-        "session-id": "",
-        "watchdog-retries": "",
-        ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+      await this.markTaskBlocked(params.task, "ci-only", {
+        reason,
+        extraFields: {
+          "completed-at": completedAt,
+          "session-id": "",
+          "watchdog-retries": "",
+          ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+        },
       });
 
       await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
@@ -2221,7 +2425,7 @@ ${guidance}`
             const reason = `PR has merge conflicts; refusing auto-update ${prUrl}`;
             console.warn(`[ralph:worker:${this.repo}] ${reason}`);
             this.recordAutoUpdateFailure(prState, minMinutes);
-            await this.queue.updateTaskStatus(params.task, "blocked");
+            await this.markTaskBlocked(params.task, "merge-conflict", { reason });
             await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
             return {
@@ -2264,7 +2468,7 @@ ${guidance}`
           } catch {
             // best-effort
           }
-          await this.queue.updateTaskStatus(params.task, "blocked");
+          await this.markTaskBlocked(params.task, "auto-update", { reason });
           await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
           return {
@@ -2305,7 +2509,7 @@ ${guidance}`
             } catch (updateError: any) {
               const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
               console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-              await this.queue.updateTaskStatus(params.task, "blocked");
+              await this.markTaskBlocked(params.task, "auto-update", { reason });
               await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
               return {
@@ -2329,7 +2533,7 @@ ${guidance}`
       if (failureSignature !== "none" && failureSignature === lastFailureSignature) {
         const reason = `CI failed repeatedly with identical failures; stopping remediation for ${prUrl}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.queue.updateTaskStatus(params.task, "blocked");
+        await this.markTaskBlocked(params.task, "ci-failure", { reason });
         await this.notify.notifyError(
           params.notifyTitle,
           [reason, this.formatRemediationFailureContext(baseFailureContext)].filter(Boolean).join("\n\n"),
@@ -2352,7 +2556,7 @@ ${guidance}`
       if (!this.isActionableFailureContext(actionCheckContext)) {
         const reason = `CI failed with non-actionable status; refusing to remediate ${prUrl}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.queue.updateTaskStatus(params.task, "blocked");
+        await this.markTaskBlocked(params.task, "ci-failure", { reason });
         await this.notify.notifyError(
           params.notifyTitle,
           [reason, this.formatRemediationFailureContext(actionCheckContext)].filter(Boolean).join("\n\n"),
@@ -2432,7 +2636,7 @@ ${guidance}`
 
         const reason = `Failed while fixing CI before merge: ${fixResult.output}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.queue.updateTaskStatus(params.task, "blocked");
+        await this.markTaskBlocked(params.task, "ci-failure", { reason });
         await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
         return {
@@ -2459,7 +2663,7 @@ ${guidance}`
     const reason = `Required checks not passing after ${MAX_CI_FIX_ATTEMPTS} attempt(s); refusing to merge ${prUrl}`;
     console.warn(`[ralph:worker:${this.repo}] ${reason}`);
 
-    await this.queue.updateTaskStatus(params.task, "blocked");
+    await this.markTaskBlocked(params.task, "ci-failure", { reason });
     await this.notify.notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
 
     return {
@@ -2537,7 +2741,7 @@ ${guidance}`
   }
 
   private buildWatchdogOptions(task: AgentTask, stage: string) {
-    const cfg = loadConfig().watchdog;
+    const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
 
     return {
@@ -2591,7 +2795,7 @@ ${guidance}`
       };
     }
 
-    const defaults = loadConfig().control;
+    const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
     const requested = control.opencodeProfile?.trim() ?? "";
 
@@ -2659,7 +2863,7 @@ ${guidance}`
     if (pinned) {
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
-      const defaults = loadConfig().control;
+      const defaults = getConfig().control;
       const controlProfile =
         readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
 
@@ -2840,7 +3044,7 @@ ${guidance}`
       return await this.skipClosedIssue(task, issueMeta, startTime);
     }
 
-    await this.ensureBaselineLabelsOnce();
+    await this.ensureRalphWorkflowLabelsOnce();
     await this.ensureBranchProtectionOnce();
 
     const issueMatch = task.issue.match(/#(\d+)$/);
@@ -3277,7 +3481,7 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
       if (!error?.ralphRootDirty) {
-        await this.queue.updateTaskStatus(task, "blocked");
+        await this.markTaskBlocked(task, "runtime-error", { reason: error?.message ?? String(error) });
         await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
       }
 
@@ -3346,7 +3550,7 @@ ${guidance}`
         throw new Error("Failed to mark task starting (bwrb edit failed)");
       }
 
-      await this.ensureBaselineLabelsOnce();
+      await this.ensureRalphWorkflowLabelsOnce();
       await this.ensureBranchProtectionOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
@@ -3977,7 +4181,7 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
       if (!error?.ralphRootDirty) {
-        await this.queue.updateTaskStatus(task, "blocked");
+        await this.markTaskBlocked(task, "runtime-error", { reason: error?.message ?? String(error) });
         await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
       }
 
@@ -4008,7 +4212,10 @@ ${guidance}`
       bodyPrefix?: string;
     }
   ): Promise<void> {
-    const vault = loadConfig().bwrbVault;
+    const vault = getBwrbVaultForStorage("create agent-run note");
+    if (!vault) {
+      return;
+    }
     const today = data.completed.toISOString().split("T")[0];
     const shortIssue = task.issue.split("/").pop() || task.issue;
 

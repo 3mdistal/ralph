@@ -3,7 +3,7 @@ import { readdir, readFile } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 
-import { loadConfig, resolveOpencodeProfile } from "./config";
+import { getConfig, resolveOpencodeProfile } from "./config";
 import { shouldLog } from "./logging";
 
 export type ThrottleState = "ok" | "soft" | "hard";
@@ -560,7 +560,7 @@ export async function getThrottleDecision(
   now: number = Date.now(),
   opts?: { opencodeProfile?: string | null }
 ): Promise<ThrottleDecision> {
-  const cfg = loadConfig().throttle;
+  const cfg = getConfig().throttle;
 
   const { effectiveProfile, xdgDataHome, messagesRootDir } = resolveOpencodeMessagesRootDir(opts?.opencodeProfile);
   const perProfileCfg = effectiveProfile ? cfg?.perProfile?.[effectiveProfile] : undefined;
@@ -803,4 +803,3 @@ export function __computeWeeklyResetBoundariesForTests(
 ): { lastResetTs: number; nextResetTs: number } {
   return computeWeeklyResetBoundaries(nowMs, schedule);
 }
-

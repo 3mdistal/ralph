@@ -51,12 +51,20 @@ Task note filenames are derived from note names. Ralph sanitizes names before cr
 - If sanitization yields an empty name, use `Untitled`
 - If a note already exists, append a short UUID suffix
 
-### 1. Queue Lives in GitHub Issues
+### 1. Queue Lives in GitHub Issues (migration: bwrb optional)
 
 GitHub Issues are the source of truth for queue state and dependency relationships.
 SQLite under `~/.ralph` stores operational state (session IDs, worktree paths, cursors).
 
 See `docs/product/github-first-orchestration.md` for the canonical contract.
+
+bwrb remains supported as a legacy backend during the migration:
+- Enable via `queueBackend = "bwrb"` in `~/.ralph/config.toml` or `~/.ralph/config.json`
+- GitHub remains authoritative when both are configured (no dual-write in v0.1.0)
+- GitHub queue sync/claim semantics are tracked in #61/#63; use bwrb backend for active queue processing until then
+- When GitHub queue support is unavailable, Ralph falls back to bwrb if a valid vault is configured
+- When GitHub is unavailable and no bwrb vault exists, Ralph runs in idle/no-queue mode and surfaces diagnostics
+- Escalations and agent-run records remain bwrb-only until GitHub queue support ships
 
 ### 2. Bot Branch Strategy
 
@@ -108,6 +116,17 @@ Log tool calls and detect when agents get stuck (tool-result-as-text loops). Aut
 **Diagnostics policy:** When OpenCode crashes and prints a log file path, Ralph may attach a redacted tail of that log to the error note to preserve debugging context before logs rotate. Redact obvious tokens (GitHub tokens, Bearer tokens, etc.), redact the local home directory in paths and attached excerpts (replace with `~`), and keep the attachment bounded (e.g. ~200 lines / 20k chars). These logs are local diagnostics artifacts and should not be posted externally (issues/PRs) without manual review.
 
 **Stability policy:** To support safe parallelism, Ralph should avoid shared mutable tool caches between concurrent OpenCode runs (e.g. isolate `XDG_CACHE_HOME` per repo/task).
+
+### 6. Managed OpenCode Config Contract
+
+For daemon runs, Ralph owns the OpenCode agent configuration to keep behavior deterministic across repos and machines.
+
+- Ralph sets `OPENCODE_CONFIG_DIR` to a Ralph-managed directory (default: `$HOME/.ralph/opencode`).
+- Repo-local OpenCode config and pre-set `OPENCODE_CONFIG_DIR` are ignored for daemon runs.
+- The managed directory is overwritten on daemon startup to match the version shipped with Ralph.
+- Overrides are allowed only via explicit Ralph configuration (`opencode.managedConfigDir`) or `RALPH_OPENCODE_CONFIG_DIR`.
+- Operators should not edit the managed directory directly; changes must come from Ralph template updates.
+- Running multiple daemons on the same machine is unsupported; the managed config is a shared resource and the latest daemon startup wins.
 
 ## Success Metrics
 

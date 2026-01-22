@@ -46,6 +46,10 @@ Not fully implemented today (this doc defines the intended behavior):
 - deterministic review-agent output format for Product/DevEx gate completion
 - CI failure triage that decides resume vs spawn vs quarantine
 
+## OpenCode Config Determinism
+
+Ralph daemon runs must be deterministic and repo-agnostic. For all daemon runs, Ralph sets `OPENCODE_CONFIG_DIR` to a Ralph-managed config directory (default: `$HOME/.ralph/opencode`) and ignores any repo-local OpenCode configuration. The managed directory is overwritten to match the version shipped with Ralph. Overrides are allowed only via an explicit Ralph configuration value or environment variable to avoid ambient drift.
+
 ## Required Gate Fields
 
 Persist gate metadata on an authoritative run record so Ralph can be strict and deterministic.

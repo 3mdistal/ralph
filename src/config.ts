@@ -112,6 +112,8 @@ export interface OpencodeConfig {
   defaultProfile?: string;
   /** Named profiles keyed by their identifier (e.g. "apple", "google"). */
   profiles?: Record<string, OpencodeProfileConfig>;
+  /** Optional managed OpenCode config dir for daemon runs (absolute path). */
+  managedConfigDir?: string;
 }
 
 export interface ControlConfig {
@@ -121,6 +123,8 @@ export interface ControlConfig {
   suppressMissingWarnings?: boolean;
 }
 
+export type QueueBackend = "github" | "bwrb" | "none";
+
 export interface RalphConfig {
   repos: RepoConfig[];
   /** Global max concurrent tasks across all repos (default: 6) */
@@ -129,6 +133,8 @@ export interface RalphConfig {
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
   /** Ownership TTL in ms for task heartbeats (default: 60000). */
   ownershipTtlMs: number;
+  /** Queue backend selection (default: "github"). */
+  queueBackend?: QueueBackend;
   bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // default GitHub owner (default: "3mdistal")
 
@@ -177,21 +183,33 @@ function detectDefaultBwrbVault(): string {
   }
 }
 
-export function ensureBwrbVaultLayout(vault: string): boolean {
+export function checkBwrbVaultLayout(vault: string): { ok: boolean; error?: string } {
   if (!vault || !existsSync(vault)) {
-    console.error(
-      `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
-        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`
-    );
-    return false;
+    return {
+      ok: false,
+      error:
+        `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
+        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`,
+    };
   }
 
   const schemaPath = join(vault, ".bwrb", "schema.json");
   if (!existsSync(schemaPath)) {
-    console.error(
-      `[ralph] bwrbVault does not contain a bwrb schema: ${JSON.stringify(vault)} (missing ${schemaPath}). ` +
-        `Point bwrbVault at a directory that contains .bwrb/schema.json.`
-    );
+    return {
+      ok: false,
+      error:
+        `[ralph] bwrbVault does not contain a bwrb schema: ${JSON.stringify(vault)} (missing ${schemaPath}). ` +
+        `Point bwrbVault at a directory that contains .bwrb/schema.json.`,
+    };
+  }
+
+  return { ok: true };
+}
+
+export function ensureBwrbVaultLayout(vault: string): boolean {
+  const check = checkBwrbVaultLayout(vault);
+  if (!check.ok) {
+    console.error(check.error ?? `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}.`);
     return false;
   }
 
@@ -219,12 +237,31 @@ const DEFAULT_CONFIG: RalphConfig = {
   batchSize: 10,
   pollInterval: 30000,
   ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
+  queueBackend: "github",
   bwrbVault: detectDefaultBwrbVault(),
   owner: "3mdistal",
   devDir: join(homedir(), "Developer"),
 };
 
-let config: RalphConfig | null = null;
+type ConfigSource = "default" | "toml" | "json" | "legacy";
+
+export type ConfigMeta = {
+  source: ConfigSource;
+  queueBackendExplicit: boolean;
+  queueBackendRaw?: unknown;
+  queueBackendValid: boolean;
+};
+
+export type ConfigLoadResult = {
+  config: RalphConfig;
+  meta: ConfigMeta;
+};
+
+let configResult: ConfigLoadResult | null = null;
+
+function isQueueBackendValue(value: unknown): value is QueueBackend {
+  return value === "github" || value === "bwrb" || value === "none";
+}
 
 function toPositiveIntOrNull(value: unknown): number | null {
   if (typeof value !== "number") return null;
@@ -284,6 +321,20 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       );
     }
     loaded.ownershipTtlMs = DEFAULT_OWNERSHIP_TTL_MS;
+  }
+
+  const rawQueueBackend = (loaded as any).queueBackend;
+  if (rawQueueBackend !== undefined) {
+    if (isQueueBackendValue(rawQueueBackend)) {
+      loaded.queueBackend = rawQueueBackend;
+    } else {
+      console.warn(
+        `[ralph] Invalid config queueBackend=${JSON.stringify(rawQueueBackend)}; falling back to "github"`
+      );
+      loaded.queueBackend = "github";
+    }
+  } else if (!loaded.queueBackend) {
+    loaded.queueBackend = "github";
   }
 
   // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
@@ -421,6 +472,23 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       }
     }
 
+    const rawManagedConfigDir = (rawOpencode as any).managedConfigDir;
+    let managedConfigDir: string | undefined;
+    if (rawManagedConfigDir !== undefined) {
+      if (typeof rawManagedConfigDir === "string" && rawManagedConfigDir.trim()) {
+        const trimmed = rawManagedConfigDir.trim();
+        if (!isAbsolute(trimmed)) {
+          console.warn(
+            `[ralph] Invalid config opencode.managedConfigDir=${JSON.stringify(trimmed)}; must be an absolute path. Ignoring.`
+          );
+        } else {
+          managedConfigDir = trimmed;
+        }
+      } else {
+        console.warn(`[ralph] Invalid config opencode.managedConfigDir=${JSON.stringify(rawManagedConfigDir)}; ignoring`);
+      }
+    }
+
     const rawProfiles = (rawOpencode as any).profiles;
     const profiles: Record<string, OpencodeProfileConfig> = {};
 
@@ -478,13 +546,16 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     const rawDefaultProfile = (rawOpencode as any).defaultProfile;
     const defaultProfile = typeof rawDefaultProfile === "string" ? rawDefaultProfile.trim() : "";
 
+    const attachManaged = (opencode: OpencodeConfig): OpencodeConfig =>
+      managedConfigDir ? { ...opencode, managedConfigDir } : opencode;
+
     if (enabled && profileNames.length === 0) {
       console.warn("[ralph] OpenCode profiles enabled but no valid profiles were configured; falling back to ambient XDG dirs");
-      loaded.opencode = { enabled: false };
+      loaded.opencode = attachManaged({ enabled: false });
     } else if (!enabled) {
-      loaded.opencode = { enabled: false };
+      loaded.opencode = attachManaged({ enabled: false });
     } else if (defaultProfile && profiles[defaultProfile]) {
-      loaded.opencode = { enabled: true, defaultProfile, profiles };
+      loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
     } else {
       const fallback = profileNames[0] ?? "";
       if (fallback) {
@@ -493,9 +564,9 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
             `[ralph] Invalid config opencode.defaultProfile=${JSON.stringify(defaultProfile)}; falling back to ${JSON.stringify(fallback)}`
           );
         }
-        loaded.opencode = { enabled: true, defaultProfile: fallback, profiles };
+        loaded.opencode = attachManaged({ enabled: true, defaultProfile: fallback, profiles });
       } else {
-        loaded.opencode = { enabled: false };
+        loaded.opencode = attachManaged({ enabled: false });
       }
     }
   }
@@ -825,11 +896,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
   return loaded;
 }
 
-export function loadConfig(): RalphConfig {
-  if (config) return config;
+export function loadConfig(): ConfigLoadResult {
+  if (configResult) return configResult;
 
   // Start with defaults
   let loaded: RalphConfig = { ...DEFAULT_CONFIG };
+  let meta: ConfigMeta = {
+    source: "default",
+    queueBackendExplicit: false,
+    queueBackendRaw: undefined,
+    queueBackendValid: true,
+  };
 
   // Try to load from file (precedence: ~/.ralph/config.toml > ~/.ralph/config.json > legacy ~/.config/opencode/ralph/ralph.json)
   const configTomlPath = getRalphConfigTomlPath();
@@ -860,12 +937,29 @@ export function loadConfig(): RalphConfig {
     }
   };
 
+  const recordConfigSource = (source: ConfigSource, fileConfig: any | null) => {
+    const hasQueueBackend = Boolean(fileConfig && Object.prototype.hasOwnProperty.call(fileConfig, "queueBackend"));
+    const queueBackendRaw = hasQueueBackend ? fileConfig.queueBackend : undefined;
+    meta = {
+      source,
+      queueBackendExplicit: hasQueueBackend,
+      queueBackendRaw,
+      queueBackendValid: !hasQueueBackend || isQueueBackendValue(queueBackendRaw),
+    };
+  };
+
   if (existsSync(configTomlPath)) {
     const fileConfig = tryLoadToml(configTomlPath);
-    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+    if (fileConfig) {
+      loaded = { ...loaded, ...fileConfig };
+      recordConfigSource("toml", fileConfig);
+    }
   } else if (existsSync(configJsonPath)) {
     const fileConfig = tryLoadJson(configJsonPath);
-    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+    if (fileConfig) {
+      loaded = { ...loaded, ...fileConfig };
+      recordConfigSource("json", fileConfig);
+    }
   } else if (existsSync(legacyConfigPath)) {
     console.warn(
       `[ralph] Using legacy config path ${legacyConfigPath}. ` +
@@ -873,19 +967,41 @@ export function loadConfig(): RalphConfig {
     );
 
     const fileConfig = tryLoadJson(legacyConfigPath);
-    if (fileConfig) loaded = { ...loaded, ...fileConfig };
+    if (fileConfig) {
+      loaded = { ...loaded, ...fileConfig };
+      recordConfigSource("legacy", fileConfig);
+    }
   }
 
-  config = validateConfig(loaded);
-  return config;
+  configResult = {
+    config: validateConfig(loaded),
+    meta,
+  };
+  return configResult;
 }
 
 export function __resetConfigForTests(): void {
-  config = null;
+  configResult = null;
+}
+
+export function getConfigSource(): ConfigSource {
+  return loadConfig().meta.source;
+}
+
+export function getConfigMeta(): ConfigMeta {
+  return loadConfig().meta;
+}
+
+export function isQueueBackendExplicit(): boolean {
+  return loadConfig().meta.queueBackendExplicit;
+}
+
+export function getConfig(): RalphConfig {
+  return loadConfig().config;
 }
 
 export function getRepoPath(repoName: string): string {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   
   // Check if we have an explicit config for this repo
   const explicit = cfg.repos.find(r => r.name === repoName);
@@ -897,57 +1013,57 @@ export function getRepoPath(repoName: string): string {
 }
 
 export function getRepoBotBranch(repoName: string): string {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find(r => r.name === repoName);
   return explicit?.botBranch ?? "bot/integration";
 }
 
 export function getRepoRequiredChecksOverride(repoName: string): string[] | null {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   return toStringArrayOrNull(explicit?.requiredChecks);
 }
 
 export function getGlobalMaxWorkers(): number {
-  return loadConfig().maxWorkers;
+  return getConfig().maxWorkers;
 }
 
 export function getRepoMaxWorkers(repoName: string): number {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const maxWorkers = toPositiveIntOrNull(explicit?.maxWorkers);
   return maxWorkers ?? DEFAULT_REPO_MAX_WORKERS;
 }
 
 export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const rollupBatch = toPositiveIntOrNull(explicit?.rollupBatchSize);
   return rollupBatch ?? fallback ?? cfg.batchSize;
 }
 
 export function isAutoUpdateBehindEnabled(repoName: string): boolean {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   return explicit?.autoUpdateBehindPrs ?? false;
 }
 
 export function getAutoUpdateBehindLabelGate(repoName: string): string | null {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const label = explicit?.autoUpdateBehindLabel;
   return typeof label === "string" && label.trim() ? label.trim() : null;
 }
 
 export function getAutoUpdateBehindMinMinutes(repoName: string): number {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const parsed = toPositiveIntOrNull(explicit?.autoUpdateBehindMinMinutes);
   return parsed ?? DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES;
 }
 
 export function normalizeRepoName(repo: string): string {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   // If it's already full name, return as-is
   if (repo.includes("/")) return repo;
   // Otherwise, prepend owner
@@ -963,26 +1079,26 @@ export type ResolvedOpencodeProfile = {
 };
 
 export function isOpencodeProfilesEnabled(): boolean {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   return cfg.opencode?.enabled ?? false;
 }
 
 export function listOpencodeProfileNames(): string[] {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const profiles = cfg.opencode?.profiles;
   if (!profiles || typeof profiles !== "object") return [];
   return Object.keys(profiles).sort();
 }
 
 export function getOpencodeDefaultProfileName(): string | null {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const raw = cfg.opencode?.defaultProfile;
   const trimmed = typeof raw === "string" ? raw.trim() : "";
   return trimmed ? trimmed : null;
 }
 
 export function resolveOpencodeProfile(name?: string | null): ResolvedOpencodeProfile | null {
-  const cfg = loadConfig();
+  const cfg = getConfig();
   const opencode = cfg.opencode;
   if (!opencode?.enabled) return null;
 

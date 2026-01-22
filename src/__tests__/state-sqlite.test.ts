@@ -18,6 +18,8 @@ import {
   hasIdempotencyKey,
   recordRepoSync,
   recordIssueSnapshot,
+  recordIssueLabelsSnapshot,
+  recordRepoGithubIssueSync,
   recordTaskSnapshot,
   recordPrSnapshot,
   recordRollupMerge,
@@ -27,24 +29,164 @@ import { getRalphStateDbPath } from "../paths";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
-let priorHome: string | undefined;
+let priorStateDbPath: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 describe("State SQLite (~/.ralph/state.sqlite)", () => {
+  test("migrates schema from v3", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '3')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS repos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          local_path TEXT,
+          bot_branch TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS issues (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          number INTEGER NOT NULL,
+          title TEXT,
+          state TEXT,
+          url TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, number),
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT NOT NULL,
+          task_name TEXT,
+          status TEXT,
+          session_id TEXT,
+          worktree_path TEXT,
+          worker_id TEXT,
+          repo_slot TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, task_path),
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS prs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          pr_number INTEGER,
+          url TEXT,
+          state TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, url),
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS repo_sync (
+          repo_id INTEGER PRIMARY KEY,
+          last_sync_at TEXT NOT NULL,
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS idempotency (
+          key TEXT PRIMARY KEY,
+          scope TEXT,
+          created_at TEXT NOT NULL,
+          payload_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS rollup_batches (
+          id TEXT PRIMARY KEY,
+          repo_id INTEGER NOT NULL,
+          bot_branch TEXT NOT NULL,
+          batch_size INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          rollup_pr_url TEXT,
+          rollup_pr_number INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          rollup_created_at TEXT,
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+          UNIQUE(repo_id, bot_branch, status)
+        );
+
+        CREATE TABLE IF NOT EXISTS rollup_batch_prs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id TEXT NOT NULL,
+          pr_url TEXT NOT NULL,
+          pr_number INTEGER,
+          issue_refs_json TEXT,
+          merged_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(batch_id) REFERENCES rollup_batches(id) ON DELETE CASCADE,
+          UNIQUE(batch_id, pr_url)
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const migrated = new Database(dbPath);
+    try {
+      const meta = migrated
+        .query("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get() as { value?: string };
+      expect(meta.value).toBe("5");
+
+      const columns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
+      const columnNames = columns.map((column) => column.name);
+      expect(columnNames).toContain("github_node_id");
+      expect(columnNames).toContain("github_updated_at");
+
+      const issueLabelsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'issue_labels'")
+        .get() as { name?: string } | undefined;
+      expect(issueLabelsTable?.name).toBe("issue_labels");
+
+      const cursorTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_issue_sync'")
+        .get() as { name?: string } | undefined;
+      expect(cursorTable?.name).toBe("repo_github_issue_sync");
+    } finally {
+      migrated.close();
+    }
+  });
+
   beforeEach(async () => {
-    priorHome = process.env.HOME;
+    priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
     releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
-    process.env.HOME = homeDir;
+    process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
     closeStateDbForTests();
   });
 
   afterEach(async () => {
-    closeStateDbForTests();
-    process.env.HOME = priorHome;
-    await rm(homeDir, { recursive: true, force: true });
-    releaseLock?.();
-    releaseLock = null;
+    try {
+      closeStateDbForTests();
+      await rm(homeDir, { recursive: true, force: true });
+    } finally {
+      if (priorStateDbPath === undefined) {
+        delete process.env.RALPH_STATE_DB_PATH;
+      } else {
+        process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
+      }
+      releaseLock?.();
+      releaseLock = null;
+    }
   });
 
   test("initializes schema and supports metadata writes", () => {
@@ -57,13 +199,29 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       lastSyncAt: "2026-01-11T00:00:00.000Z",
     });
 
+    recordRepoGithubIssueSync({
+      repo: "3mdistal/ralph",
+      repoPath: "/tmp/ralph",
+      botBranch: "bot/integration",
+      lastSyncAt: "2026-01-11T00:00:00.250Z",
+    });
+
     recordIssueSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
       title: "Local state + config",
       state: "OPEN",
       url: "https://github.com/3mdistal/ralph/issues/59",
+      githubNodeId: "MDU6SXNzdWUxMjM0NTY=",
+      githubUpdatedAt: "2026-01-11T00:00:00.250Z",
       at: "2026-01-11T00:00:00.500Z",
+    });
+
+    recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      labels: ["ralph:queued", "dx"],
+      at: "2026-01-11T00:00:00.750Z",
     });
 
     recordTaskSnapshot({
@@ -115,19 +273,30 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("3");
+      expect(meta.value).toBe("5");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
 
-      const issueRow = db.query("SELECT title, state, url FROM issues").get() as {
+      const issueRow = db
+        .query("SELECT title, state, url, github_node_id, github_updated_at FROM issues")
+        .get() as {
         title?: string;
         state?: string;
         url?: string;
+        github_node_id?: string;
+        github_updated_at?: string;
       };
       expect(issueRow.title).toBe("Local state + config");
       expect(issueRow.state).toBe("OPEN");
       expect(issueRow.url).toBe("https://github.com/3mdistal/ralph/issues/59");
+      expect(issueRow.github_node_id).toBe("MDU6SXNzdWUxMjM0NTY=");
+      expect(issueRow.github_updated_at).toBe("2026-01-11T00:00:00.250Z");
+
+      const labelRows = db
+        .query("SELECT name FROM issue_labels ORDER BY name")
+        .all() as Array<{ name: string }>;
+      expect(labelRows).toEqual([{ name: "dx" }, { name: "ralph:queued" }]);
 
       const taskRows = db.query("SELECT worker_id, repo_slot FROM tasks ORDER BY task_path").all() as Array<{
         worker_id?: string;
@@ -146,6 +315,11 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
       const sync = db.query("SELECT last_sync_at FROM repo_sync").get() as { last_sync_at?: string };
       expect(sync.last_sync_at).toBe("2026-01-11T00:00:00.000Z");
+
+      const githubSync = db
+        .query("SELECT last_sync_at FROM repo_github_issue_sync")
+        .get() as { last_sync_at?: string };
+      expect(githubSync.last_sync_at).toBe("2026-01-11T00:00:00.250Z");
     } finally {
       db.close();
     }

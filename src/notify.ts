@@ -2,8 +2,7 @@ import { $ } from "bun";
 import crypto from "crypto";
 import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
-import { loadConfig } from "./config";
-import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue";
+import { createAgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 
@@ -92,12 +91,16 @@ function getNotificationPrefix(type: NotificationType): string {
 }
 
 function resolveVaultPath(p: string): string {
-  const vault = loadConfig().bwrbVault;
+  const vault = getBwrbVaultIfValid();
+  if (!vault) return p;
   return isAbsolute(p) ? p : join(vault, p);
 }
 
 async function bwrbNewIdea(json: string): Promise<{ success: boolean; path?: string; error?: string }> {
-  const vault = loadConfig().bwrbVault;
+  const vault = getBwrbVaultForStorage("create notification");
+  if (!vault) {
+    return { success: false, error: "bwrbVault is missing or invalid" };
+  }
   try {
     const result = await $`bwrb new idea --json ${json}`.cwd(vault).quiet();
     return JSON.parse(result.stdout.toString());
@@ -112,7 +115,10 @@ async function bwrbNewIdea(json: string): Promise<{ success: boolean; path?: str
 }
 
 async function bwrbNewEscalation(json: string): Promise<{ success: boolean; path?: string; error?: string }> {
-  const vault = loadConfig().bwrbVault;
+  const vault = getBwrbVaultForStorage("create escalation");
+  if (!vault) {
+    return { success: false, error: "bwrbVault is missing or invalid" };
+  }
   try {
     const result = await $`bwrb new agent-escalation --json ${json}`.cwd(vault).quiet();
     return JSON.parse(result.stdout.toString());
