@@ -53,6 +53,7 @@ import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import { startGitHubIssuePollers } from "./github-issues-sync";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -77,6 +78,7 @@ let drainRequestedAt: number | null = null;
 let drainTimeoutMs: number | null = null;
 let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
+let githubIssuePollers: { stop: () => void } | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
 
@@ -1053,6 +1055,12 @@ async function main(): Promise<void> {
   // Initialize durable local state (SQLite)
   initStateDb();
 
+  githubIssuePollers = startGitHubIssuePollers({
+    repos: config.repos,
+    baseIntervalMs: config.pollInterval,
+    log: (message) => console.log(message),
+  });
+
   ralphEventBus.publish(
     buildRalphEvent({
       type: "daemon.started",
@@ -1229,6 +1237,8 @@ async function main(): Promise<void> {
     
     // Stop accepting new tasks
     stopWatching();
+    githubIssuePollers?.stop();
+    githubIssuePollers = null;
     if (escalationWatcher) {
       escalationWatcher.close();
       escalationWatcher = null;
