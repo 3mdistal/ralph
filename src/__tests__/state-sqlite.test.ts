@@ -325,6 +325,47 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     }
   });
 
+  test("updates PR snapshot state and stores multiple PRs", () => {
+    initStateDb();
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/123",
+      state: "open",
+      at: "2026-01-11T00:00:02.000Z",
+    });
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/123",
+      state: "merged",
+      at: "2026-01-11T00:00:03.000Z",
+    });
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/456",
+      state: "open",
+      at: "2026-01-11T00:00:04.000Z",
+    });
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      const rows = db
+        .query("SELECT url, state FROM prs ORDER BY url")
+        .all() as Array<{ url: string; state: string }>;
+      expect(rows).toEqual([
+        { url: "https://github.com/3mdistal/ralph/pull/123", state: "merged" },
+        { url: "https://github.com/3mdistal/ralph/pull/456", state: "open" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
   test("records rollup batches and merges", () => {
     initStateDb();
 

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasProductGap } from "../routing";
+import { extractPrUrls, hasProductGap, pickPrUrlForRepo } from "../routing";
 
 describe("hasProductGap", () => {
   test("true only for explicit PRODUCT GAP: markers", () => {
@@ -21,5 +21,41 @@ describe("hasProductGap", () => {
     expect(hasProductGap("this is not documented anywhere")).toBe(false);
     expect(hasProductGap("PRODUCT GAP")).toBe(false);
     expect(hasProductGap("Here is the marker: PRODUCT GAP: missing policy")).toBe(false);
+  });
+});
+
+describe("PR URL extraction", () => {
+  test("extracts all PR URLs in output", () => {
+    const output = [
+      "Starting work...",
+      "https://github.com/acme/tools/pull/12",
+      "other text",
+      "https://github.com/3mdistal/ralph/pull/67",
+    ].join("\n");
+
+    expect(extractPrUrls(output)).toEqual([
+      "https://github.com/acme/tools/pull/12",
+      "https://github.com/3mdistal/ralph/pull/67",
+    ]);
+  });
+
+  test("prefers latest URL for repo when multiple present", () => {
+    const urls = [
+      "https://github.com/acme/tools/pull/12",
+      "https://github.com/3mdistal/ralph/pull/45",
+      "https://github.com/3mdistal/ralph/pull/67",
+      "https://github.com/acme/tools/pull/99",
+    ];
+
+    expect(pickPrUrlForRepo(urls, "3mdistal/ralph")).toBe("https://github.com/3mdistal/ralph/pull/67");
+  });
+
+  test("falls back to last URL when repo does not match", () => {
+    const urls = [
+      "https://github.com/acme/tools/pull/12",
+      "https://github.com/another/repo/pull/99",
+    ];
+
+    expect(pickPrUrlForRepo(urls, "3mdistal/ralph")).toBe("https://github.com/another/repo/pull/99");
   });
 });

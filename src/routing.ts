@@ -110,10 +110,23 @@ export function hasProductGap(output: string): boolean {
 /**
  * Extract PR URL from session output
  */
+export function extractPrUrls(output: string): string[] {
+  const matches = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/g);
+  return matches ?? [];
+}
+
+export function pickPrUrlForRepo(urls: string[], repo: string): string | null {
+  if (urls.length === 0) return null;
+  const normalizedRepo = repo.trim().toLowerCase();
+  if (!normalizedRepo) return urls[urls.length - 1] ?? null;
+  const repoSuffix = `/${normalizedRepo}/pull/`;
+  const matching = urls.filter((url) => url.toLowerCase().includes(repoSuffix));
+  const picked = matching.length > 0 ? matching[matching.length - 1] : urls[urls.length - 1];
+  return picked ?? null;
+}
+
 export function extractPrUrl(output: string): string | null {
-  // Look for GitHub PR URLs
-  const prMatch = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/);
-  return prMatch ? prMatch[0] : null;
+  return pickPrUrlForRepo(extractPrUrls(output), "");
 }
 
 /**

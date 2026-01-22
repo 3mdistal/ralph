@@ -36,7 +36,13 @@ import { getThrottleDecision } from "./throttle";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
-import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
+import {
+  extractPrUrls,
+  pickPrUrlForRepo,
+  hasProductGap,
+  parseRoutingDecision,
+  type RoutingDecision,
+} from "./routing";
 import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
 import {
   isExplicitBlockerReason,
@@ -65,7 +71,7 @@ import {
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
-import { getIdempotencyPayload, upsertIdempotencyKey, recordIssueSnapshot } from "./state";
+import { getIdempotencyPayload, upsertIdempotencyKey, recordIssueSnapshot, recordPrSnapshot } from "./state";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -563,6 +569,7 @@ export class RepoWorker {
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
+  private recordedPrSnapshots = new Set<string>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -766,6 +773,60 @@ export class RepoWorker {
     } catch (error) {
       if (error instanceof GitHubApiError && error.status === 404) return;
       throw error;
+    }
+  }
+
+  private pickPrUrlFromOutput(output: string): string | null {
+    return pickPrUrlForRepo(extractPrUrls(output), this.repo);
+  }
+
+  private pickPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
+    if (result.prUrl) return result.prUrl;
+    return this.pickPrUrlFromOutput(result.output);
+  }
+
+  private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: string }): void {
+    const key = `${this.repo}|${input.issue}|${input.prUrl}|${input.state}`;
+    if (this.recordedPrSnapshots.has(key)) return;
+    this.recordedPrSnapshots.add(key);
+    try {
+      recordPrSnapshot({ repo: this.repo, issue: input.issue, prUrl: input.prUrl, state: input.state });
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to record PR snapshot: ${error?.message ?? String(error)}`);
+    }
+  }
+
+  private async applyMidpointLabelsBestEffort(params: {
+    task: AgentTask;
+    prUrl: string;
+    botBranch: string;
+  }): Promise<void> {
+    const issueRef = parseIssueRef(params.task.issue, this.repo);
+    if (!issueRef) return;
+    let baseBranch: string | null = null;
+    try {
+      baseBranch = await this.getPullRequestBaseBranch(params.prUrl);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to re-check PR base before midpoint labeling: ${error?.message ?? String(error)}`
+      );
+      return;
+    }
+    if (!baseBranch) return;
+    if (this.normalizeGitRef(baseBranch) !== this.normalizeGitRef(params.botBranch)) return;
+
+    try {
+      await this.addIssueLabel(issueRef, "ralph:in-bot");
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to add ralph:in-bot label: ${error?.message ?? String(error)}`);
+    }
+
+    try {
+      await this.removeIssueLabel(issueRef, "ralph:in-progress");
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to remove ralph:in-progress label: ${error?.message ?? String(error)}`
+      );
     }
   }
 
@@ -1701,7 +1762,7 @@ ${guidance}`
         .cwd(candidate.worktreePath)
         .quiet();
 
-      const prUrl = extractPrUrl(created.stdout.toString()) ?? null;
+      const prUrl = this.pickPrUrlFromOutput(created.stdout.toString()) ?? null;
       diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
 
       if (prUrl) return { prUrl, diagnostics: diagnostics.join("\n") };
@@ -2494,12 +2555,14 @@ ${guidance}`
       const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
       if (throttled) return { ok: false, run: throttled };
 
-      if (checkResult.summary.status === "success") {
-        console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
-        try {
-          await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-          return { ok: true, prUrl, sessionId };
-        } catch (error: any) {
+        if (checkResult.summary.status === "success") {
+          console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+          try {
+            await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+            this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: "merged" });
+            await this.applyMidpointLabelsBestEffort({ task: params.task, prUrl, botBranch: params.botBranch });
+            return { ok: true, prUrl, sessionId };
+          } catch (error: any) {
           if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
             console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
             didUpdateBranch = true;
@@ -2655,8 +2718,11 @@ ${guidance}`
         await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
       }
 
-      const updatedPrUrl = extractPrUrl(fixResult.output);
-      if (updatedPrUrl) prUrl = updatedPrUrl;
+      const updatedPrUrl = this.pickPrUrlFromOutput(fixResult.output);
+      if (updatedPrUrl && updatedPrUrl !== prUrl) {
+        prUrl = updatedPrUrl;
+        this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: "open" });
+      }
     }
 
     const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
@@ -3174,7 +3240,7 @@ ${guidance}`
 
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = extractPrUrlFromSession(buildResult);
+      let prUrl = this.pickPrUrlFromSession(buildResult);
       let prRecoveryDiagnostics = "";
 
       if (!prUrl) {
@@ -3186,6 +3252,14 @@ ${guidance}`
         });
         prRecoveryDiagnostics = recovered.diagnostics;
         prUrl = recovered.prUrl ?? prUrl;
+      }
+
+      if (prUrl) {
+        this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+      }
+
+      if (prUrl) {
+        this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
       }
 
       let continueAttempts = 0;
@@ -3280,7 +3354,10 @@ ${guidance}`
           }
 
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = extractPrUrlFromSession(buildResult);
+          prUrl = this.pickPrUrlFromSession(buildResult);
+          if (prUrl) {
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+          }
 
           continue;
         }
@@ -3333,13 +3410,19 @@ ${guidance}`
           });
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = recovered.prUrl ?? prUrl;
+          if (prUrl) {
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+          }
 
           if (!prUrl) {
             console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
             break;
           }
         } else {
-          prUrl = extractPrUrlFromSession(buildResult);
+          prUrl = this.pickPrUrlFromSession(buildResult);
+          if (prUrl) {
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+          }
         }
       }
 
@@ -3352,6 +3435,9 @@ ${guidance}`
         });
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
         prUrl = recovered.prUrl ?? prUrl;
+        if (prUrl) {
+          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+        }
       }
 
       if (!prUrl) {
@@ -3875,7 +3961,7 @@ ${guidance}`
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = extractPrUrlFromSession(buildResult);
+      let prUrl = this.pickPrUrlFromSession(buildResult);
       let prRecoveryDiagnostics = "";
 
       if (!prUrl) {
@@ -3981,7 +4067,10 @@ ${guidance}`
 
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = extractPrUrlFromSession(buildResult);
+          prUrl = this.pickPrUrlFromSession(buildResult);
+          if (prUrl) {
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+          }
           continue;
         }
 
@@ -4029,13 +4118,19 @@ ${guidance}`
           });
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = recovered.prUrl ?? prUrl;
+          if (prUrl) {
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+          }
 
           if (!prUrl) {
             console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
             break;
           }
         } else {
-          prUrl = extractPrUrlFromSession(buildResult);
+          prUrl = this.pickPrUrlFromSession(buildResult);
+          if (prUrl) {
+            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+          }
         }
       }
 
@@ -4048,6 +4143,9 @@ ${guidance}`
         });
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
         prUrl = recovered.prUrl ?? prUrl;
+        if (prUrl) {
+          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
+        }
       }
 
       if (!prUrl) {
