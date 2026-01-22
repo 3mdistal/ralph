@@ -1,6 +1,12 @@
 import { type RepoConfig } from "./config";
 import { getInstallationToken, isRepoAllowed } from "./github-app-auth";
-import { getRepoLastSyncAt, recordIssueLabelsSnapshot, recordIssueSnapshot, recordRepoSync } from "./state";
+import {
+  getRepoLastSyncAt,
+  hasIssueSnapshot,
+  recordIssueLabelsSnapshot,
+  recordIssueSnapshot,
+  recordRepoSync,
+} from "./state";
 
 type IssueLabel = { name?: string } | string;
 
@@ -157,23 +163,18 @@ function resolveRateLimitDelayMs(resetAtMs: number, nowMs: number): number {
   return Math.max(MIN_DELAY_MS, resetAtMs - nowMs);
 }
 
-export async function syncRepoIssuesOnce(params: {
+async function fetchIssuesSince(params: {
   repo: string;
-  lastSyncAt: string | null;
-  deps?: SyncDeps;
-}): Promise<SyncResult> {
-  const deps = params.deps ?? {};
-  const fetchImpl = deps.fetch ?? fetch;
-  const getToken = deps.getToken ?? getInstallationToken;
-  const now = deps.now ? deps.now() : new Date();
-  const nowIso = now.toISOString();
-  const nowMs = now.getTime();
-  const since = computeSince(params.lastSyncAt, nowMs);
-
-  const token = await getToken();
+  since: string;
+  token: string;
+  fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+}): Promise<
+  | { ok: true; issues: IssuePayload[]; fetched: number; maxUpdatedAt: string | null }
+  | { ok: false; fetched: number; maxUpdatedAt: string | null; rateLimitResetMs?: number; error: string }
+> {
   let url = new URL(`https://api.github.com/repos/${params.repo}/issues`);
   url.searchParams.set("state", "all");
-  url.searchParams.set("since", since);
+  url.searchParams.set("since", params.since);
   url.searchParams.set("sort", "updated");
   url.searchParams.set("direction", "desc");
   url.searchParams.set("per_page", "100");
@@ -181,15 +182,13 @@ export async function syncRepoIssuesOnce(params: {
   const issues: IssuePayload[] = [];
   let maxUpdatedAt: string | null = null;
   let fetched = 0;
-  let stored = 0;
-  let ralphCount = 0;
 
   while (url) {
-    const result = await fetchJson<IssuePayload[]>(fetchImpl, url.toString(), {
+    const result = await fetchJson<IssuePayload[]>(params.fetchImpl, url.toString(), {
       method: "GET",
       headers: {
         Accept: "application/vnd.github+json",
-        Authorization: `token ${token}`,
+        Authorization: `token ${params.token}`,
         "User-Agent": "ralph-loop",
       },
     });
@@ -199,10 +198,7 @@ export async function syncRepoIssuesOnce(params: {
       return {
         ok: false,
         fetched,
-        stored,
-        ralphCount,
-        newLastSyncAt: null,
-        hadChanges: false,
+        maxUpdatedAt,
         rateLimitResetMs: resetAt ?? undefined,
         error: `HTTP ${result.status}: ${result.body.slice(0, 400)}`,
       };
@@ -224,51 +220,106 @@ export async function syncRepoIssuesOnce(params: {
     if (rows.length > 0) {
       const last = rows[rows.length - 1];
       const lastUpdatedMs = parseIsoMs(last.updated_at);
-      const sinceMs = parseIsoMs(since);
+      const sinceMs = parseIsoMs(params.since);
       if (lastUpdatedMs !== null && sinceMs !== null && lastUpdatedMs < sinceMs) {
         url = null;
       }
     }
   }
 
-  for (const issue of issues) {
-    const number = issue.number ? String(issue.number) : "";
-    if (!number) continue;
+  return { ok: true, issues, fetched, maxUpdatedAt };
+}
 
-    const labels = extractLabelNames(issue.labels);
-    if (hasRalphLabel(labels)) ralphCount += 1;
+export async function syncRepoIssuesOnce(params: {
+  repo: string;
+  lastSyncAt: string | null;
+  deps?: SyncDeps;
+}): Promise<SyncResult> {
+  const deps = params.deps ?? {};
+  const fetchImpl = deps.fetch ?? fetch;
+  const getToken = deps.getToken ?? getInstallationToken;
+  const now = deps.now ? deps.now() : new Date();
+  const nowIso = now.toISOString();
+  const nowMs = now.getTime();
+  const since = computeSince(params.lastSyncAt, nowMs);
 
-    recordIssueSnapshot({
+  try {
+    const token = await getToken();
+    const fetchResult = await fetchIssuesSince({
       repo: params.repo,
-      issue: `${params.repo}#${number}`,
-      title: issue.title ?? undefined,
-      state: issue.state ?? undefined,
-      url: issue.html_url ?? undefined,
-      githubNodeId: issue.node_id ?? undefined,
-      githubUpdatedAt: issue.updated_at ?? undefined,
-      at: nowIso,
+      since,
+      token,
+      fetchImpl,
     });
 
-    recordIssueLabelsSnapshot({
-      repo: params.repo,
-      issue: `${params.repo}#${number}`,
-      labels,
-      at: nowIso,
-    });
+    if (!fetchResult.ok) {
+      return {
+        ok: false,
+        fetched: fetchResult.fetched,
+        stored: 0,
+        ralphCount: 0,
+        newLastSyncAt: null,
+        hadChanges: false,
+        rateLimitResetMs: fetchResult.rateLimitResetMs,
+        error: fetchResult.error,
+      };
+    }
 
-    stored += 1;
+    let stored = 0;
+    let ralphCount = 0;
+    for (const issue of fetchResult.issues) {
+      const number = issue.number ? String(issue.number) : "";
+      if (!number) continue;
+
+      const labels = extractLabelNames(issue.labels);
+      const issueRef = `${params.repo}#${number}`;
+      const hasRalph = hasRalphLabel(labels);
+      if (hasRalph) ralphCount += 1;
+
+      if (!hasRalph && !hasIssueSnapshot(params.repo, issueRef)) continue;
+
+      recordIssueSnapshot({
+        repo: params.repo,
+        issue: issueRef,
+        title: issue.title ?? undefined,
+        state: issue.state ?? undefined,
+        url: issue.html_url ?? undefined,
+        githubNodeId: issue.node_id ?? undefined,
+        githubUpdatedAt: issue.updated_at ?? undefined,
+        at: nowIso,
+      });
+
+      recordIssueLabelsSnapshot({
+        repo: params.repo,
+        issue: issueRef,
+        labels,
+        at: nowIso,
+      });
+
+      stored += 1;
+    }
+
+    const newLastSyncAt = fetchResult.maxUpdatedAt ?? nowIso;
+
+    return {
+      ok: true,
+      fetched: fetchResult.fetched,
+      stored,
+      ralphCount,
+      newLastSyncAt,
+      hadChanges: fetchResult.issues.length > 0,
+    };
+  } catch (error: any) {
+    return {
+      ok: false,
+      fetched: 0,
+      stored: 0,
+      ralphCount: 0,
+      newLastSyncAt: null,
+      hadChanges: false,
+      error: error?.message ?? String(error),
+    };
   }
-
-  const newLastSyncAt = maxUpdatedAt ?? nowIso;
-
-  return {
-    ok: true,
-    fetched,
-    stored,
-    ralphCount,
-    newLastSyncAt,
-    hadChanges: issues.length > 0,
-  };
 }
 
 function formatRepoLabel(repo: string): string {

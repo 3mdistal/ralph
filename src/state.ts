@@ -291,6 +291,24 @@ export function getRepoLastSyncAt(repo: string): string | null {
   return typeof row?.last_sync_at === "string" ? row.last_sync_at : null;
 }
 
+export function hasIssueSnapshot(repo: string, issue: string): boolean {
+  const database = requireDb();
+  const issueNumber = parseIssueNumber(issue);
+  if (issueNumber === null) return false;
+
+  const repoRow = database
+    .query("SELECT id FROM repos WHERE name = $name")
+    .get({ $name: repo }) as { id?: number } | undefined;
+
+  if (!repoRow?.id) return false;
+
+  const issueRow = database
+    .query("SELECT id FROM issues WHERE repo_id = $repo_id AND number = $number")
+    .get({ $repo_id: repoRow.id, $number: issueNumber }) as { id?: number } | undefined;
+
+  return Boolean(issueRow?.id);
+}
+
 export function recordIssueSnapshot(input: {
   repo: string;
   issue: string;
