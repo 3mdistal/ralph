@@ -303,7 +303,10 @@ export async function syncRepoIssuesOnce(params: {
       }
     });
 
-    const newLastSyncAt = fetchResult.maxUpdatedAt ?? nowIso;
+    const hasIssues = fetchResult.issues.length > 0;
+    const newLastSyncAt = hasIssues
+      ? fetchResult.maxUpdatedAt ?? params.lastSyncAt ?? nowIso
+      : params.lastSyncAt ?? null;
 
     return {
       ok: true,
