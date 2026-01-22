@@ -126,7 +126,8 @@ export function pickPrUrlForRepo(urls: string[], repo: string): string | null {
 }
 
 export function extractPrUrl(output: string): string | null {
-  return pickPrUrlForRepo(extractPrUrls(output), "");
+  const urls = extractPrUrls(output);
+  return urls[0] ?? null;
 }
 
 /**

@@ -788,9 +788,9 @@ export class RepoWorker {
   private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: string }): void {
     const key = `${this.repo}|${input.issue}|${input.prUrl}|${input.state}`;
     if (this.recordedPrSnapshots.has(key)) return;
-    this.recordedPrSnapshots.add(key);
     try {
       recordPrSnapshot({ repo: this.repo, issue: input.issue, prUrl: input.prUrl, state: input.state });
+      this.recordedPrSnapshots.add(key);
     } catch (error: any) {
       console.warn(`[ralph:worker:${this.repo}] Failed to record PR snapshot: ${error?.message ?? String(error)}`);
     }
@@ -3098,6 +3098,7 @@ ${guidance}`
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string }): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
+    this.recordedPrSnapshots.clear();
 
     if (!isRepoAllowed(task.repo)) {
       return await this.blockDisallowedRepo(task, startTime, "resume");
@@ -3252,10 +3253,6 @@ ${guidance}`
         });
         prRecoveryDiagnostics = recovered.diagnostics;
         prUrl = recovered.prUrl ?? prUrl;
-      }
-
-      if (prUrl) {
-        this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: "open" });
       }
 
       if (prUrl) {
@@ -3587,6 +3584,7 @@ ${guidance}`
   async processTask(task: AgentTask): Promise<AgentRun> {
     const startTime = new Date();
     console.log(`[ralph:worker:${this.repo}] Starting task: ${task.name}`);
+    this.recordedPrSnapshots.clear();
 
     let workerId: string | undefined;
     let allocatedSlot: number | null = null;
