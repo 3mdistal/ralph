@@ -856,7 +856,13 @@ export class RepoWorker {
         "Errors:",
         errors.map((entry) => `- ${entry}`).join("\n"),
       ].join("\n");
-      await this.notify.notifyError("Midpoint label update failed", body, params.task.name);
+      try {
+        await this.notify.notifyError("Midpoint label update failed", body, params.task.name);
+      } catch (error: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to notify midpoint label error: ${error?.message ?? String(error)}`
+        );
+      }
     }
   }
 
