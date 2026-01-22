@@ -37,14 +37,14 @@ type IssueComment = { body?: string | null };
 
 type WritebackDeps = {
   github: GitHubClient;
-  maxCommentPages?: number;
+  commentScanLimit?: number;
   log?: (message: string) => void;
   hasIdempotencyKey?: (key: string) => boolean;
   recordIdempotencyKey?: (input: { key: string; scope?: string; payloadJson?: string }) => boolean;
   deleteIdempotencyKey?: (key: string) => void;
 };
 
-const DEFAULT_MAX_COMMENT_PAGES = 5;
+const DEFAULT_COMMENT_SCAN_LIMIT = 100;
 const MAX_REASON_CHARS = 500;
 const FNV_OFFSET = 2166136261;
 const FNV_PRIME = 16777619;
@@ -231,7 +231,7 @@ export async function writeEscalationToGitHub(
   }
   const plan = planEscalationWriteback(ctx);
   const log = deps.log ?? console.log;
-  const maxPages = deps.maxCommentPages ?? DEFAULT_MAX_COMMENT_PAGES;
+  const commentLimit = Math.min(Math.max(1, deps.commentScanLimit ?? DEFAULT_COMMENT_SCAN_LIMIT), 100);
   const hasKey = deps.hasIdempotencyKey ?? hasIdempotencyKey;
   const recordKey = deps.recordIdempotencyKey ?? recordIdempotencyKey;
   const deleteKey = deps.deleteIdempotencyKey ?? deleteIdempotencyKey;
@@ -263,19 +263,18 @@ export async function writeEscalationToGitHub(
 
   let listResult: { comments: IssueComment[]; reachedMax: boolean } | null = null;
   try {
-    const limit = Math.min(maxPages * 100, 100);
     listResult = await listRecentIssueComments({
       github: deps.github,
       repo: ctx.repo,
       issueNumber: ctx.issueNumber,
-      limit,
+      limit: commentLimit,
     });
   } catch (error: any) {
     log(`${prefix} Failed to list issue comments: ${error?.message ?? String(error)}`);
   }
 
   if (listResult?.reachedMax) {
-    log(`${prefix} Comment scan hit cap (100); marker detection may be incomplete.`);
+    log(`${prefix} Comment scan hit cap (${commentLimit}); marker detection may be incomplete.`);
   }
 
   const markerFound =
@@ -302,8 +301,8 @@ export async function writeEscalationToGitHub(
   }
 
   if (hasKeyResult && !scanComplete && !markerFound) {
-    log(`${prefix} Idempotency key exists but marker scan incomplete; skipping comment to avoid duplicates.`);
-    return { postedComment: false, skippedComment: true, markerFound: false };
+    ignoreExistingKey = true;
+    log(`${prefix} Idempotency key exists but marker scan incomplete; proceeding cautiously.`);
   }
 
   if (markerFound) {

@@ -29,7 +29,7 @@ async function listRecentIssueComments(params: {
   repo: string;
   issueNumber: number;
   limit: number;
-}): Promise<Array<{ body: string; authorLogin: string | null }>> {
+}): Promise<Array<{ body: string; authorLogin: string | null; authorAssociation: string | null }>> {
   const { owner, name } = splitRepoFullName(params.repo);
   const query = `query($owner: String!, $name: String!, $number: Int!, $last: Int!) {
   repository(owner: $owner, name: $name) {
@@ -40,6 +40,7 @@ async function listRecentIssueComments(params: {
           author {
             login
           }
+          authorAssociation
         }
       }
     }
@@ -57,10 +58,13 @@ async function listRecentIssueComments(params: {
   });
 
   const nodes = response.data?.data?.repository?.issue?.comments?.nodes ?? [];
-  return nodes.map((node: { body?: string | null; author?: { login?: string | null } } | undefined) => ({
-    body: node?.body ?? "",
-    authorLogin: node?.author?.login ?? null,
-  }));
+  return nodes.map(
+    (node: { body?: string | null; author?: { login?: string | null }; authorAssociation?: string | null } | undefined) => ({
+      body: node?.body ?? "",
+      authorLogin: node?.author?.login ?? null,
+      authorAssociation: node?.authorAssociation ?? null,
+    })
+  );
 }
 
 async function addIssueLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
@@ -191,7 +195,7 @@ export async function reconcileEscalationResolutions(params: {
 
   const toCheck = pendingCommentChecks.slice(0, maxEscalations);
   for (const issue of toCheck) {
-    let bodies: Array<{ body: string; authorLogin: string | null }> = [];
+    let bodies: Array<{ body: string; authorLogin: string | null; authorAssociation: string | null }> = [];
     try {
       bodies = await listRecentIssueComments({
         github: deps.github,
@@ -209,7 +213,10 @@ export async function reconcileEscalationResolutions(params: {
     }
     const hasResolution = bodies.some((entry) => {
       const author = entry.authorLogin?.toLowerCase() ?? "";
-      if (repoOwner && author !== repoOwner) return false;
+      const association = entry.authorAssociation?.toUpperCase() ?? "";
+      const authorizedAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+      const isAuthorized = (repoOwner && author === repoOwner) || authorizedAssociations.has(association);
+      if (!isAuthorized) return false;
       return RALPH_RESOLVED_REGEX.test(entry.body) && !entry.body.includes(RALPH_ESCALATION_MARKER_PREFIX);
     });
     if (!hasResolution) continue;

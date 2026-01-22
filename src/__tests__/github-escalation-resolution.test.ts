@@ -14,7 +14,13 @@ describe("escalation resolution reconciliation", () => {
           const number = opts.body?.variables?.number;
           const nodes =
             number === 11
-              ? [{ body: "RALPH RESOLVED: proceed", author: { login: "3mdistal" } }]
+              ? [
+                  {
+                    body: "RALPH RESOLVED: proceed",
+                    author: { login: "3mdistal" },
+                    authorAssociation: "OWNER",
+                  },
+                ]
               : [];
           return {
             data: {
@@ -101,6 +107,7 @@ describe("escalation resolution reconciliation", () => {
             {
               body: "RALPH RESOLVED: attempt without operator",
               author: { login: "someone" },
+              authorAssociation: "CONTRIBUTOR",
             },
           ];
           return {
