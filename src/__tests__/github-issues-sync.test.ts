@@ -14,6 +14,7 @@ let priorStateDbPath: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 const repo = "3mdistal/ralph";
+type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 function buildIssue(params: {
   number: number;
@@ -61,7 +62,7 @@ describe("github issue sync", () => {
 
   test("syncs non-PR issues and labels, advances cursor", async () => {
     const calls: string[] = [];
-    const fetchMock: typeof fetch = async (input: RequestInfo | URL) => {
+    const fetchMock: FetchLike = async (input: RequestInfo | URL) => {
       calls.push(String(input));
       return new Response(
         JSON.stringify([
@@ -117,7 +118,7 @@ describe("github issue sync", () => {
       [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:02.000Z", labels: [] })],
     ];
     let idx = 0;
-    const fetchMock: typeof fetch = async () => {
+    const fetchMock: FetchLike = async () => {
       const body = responses[Math.min(idx, responses.length - 1)];
       idx += 1;
       return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
@@ -146,7 +147,7 @@ describe("github issue sync", () => {
 
   test("paginates issues and advances cursor", async () => {
     const calls: string[] = [];
-    const fetchMock: typeof fetch = async (input: RequestInfo | URL) => {
+    const fetchMock: FetchLike = async (input: RequestInfo | URL) => {
       const url = String(input);
       calls.push(url);
       if (url.includes("page=2")) {
@@ -185,7 +186,7 @@ describe("github issue sync", () => {
   });
 
   test("does not advance cursor on error", async () => {
-    const fetchMock: typeof fetch = async () => new Response("nope", { status: 500 });
+    const fetchMock: FetchLike = async () => new Response("nope", { status: 500 });
 
     const result = await syncRepoIssuesOnce({
       repo,
