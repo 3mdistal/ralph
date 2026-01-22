@@ -120,26 +120,31 @@ async function applyLabelOps(params: {
 }): Promise<{ add: string[]; remove: string[]; ok: boolean }> {
   const added: string[] = [];
   const removed: string[] = [];
+  const applied: LabelOp[] = [];
 
   for (const step of params.steps) {
     try {
       if (step.action === "add") {
         await addIssueLabel(params.repo, params.issueNumber, step.label);
         added.push(step.label);
+        applied.push(step);
       } else {
         const result = await removeIssueLabel(params.repo, params.issueNumber, step.label);
-        if (result.removed) removed.push(step.label);
+        if (result.removed) {
+          removed.push(step.label);
+          applied.push(step);
+        }
       }
     } catch (error: any) {
       console.warn(
         `[ralph:queue:github] Failed to ${step.action} ${step.label} for ${params.logLabel}: ${error?.message ?? String(error)}`
       );
-      for (const rollback of params.rollback) {
+      for (const rollback of [...applied].reverse()) {
         try {
           if (rollback.action === "add") {
-            await addIssueLabel(params.repo, params.issueNumber, rollback.label);
-          } else {
             await removeIssueLabel(params.repo, params.issueNumber, rollback.label);
+          } else {
+            await addIssueLabel(params.repo, params.issueNumber, rollback.label);
           }
         } catch {
           // best-effort rollback
@@ -269,7 +274,15 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         watchInFlight = true;
         try {
           const tasks = await listTasksByStatus("queued");
-          onChange(tasks);
+          try {
+            onChange(tasks);
+          } catch (error: any) {
+            console.warn(
+              `[ralph:queue:github] Queue watcher handler failed: ${error?.message ?? String(error)}`
+            );
+          }
+        } catch (error: any) {
+          console.warn(`[ralph:queue:github] Queue watcher failed: ${error?.message ?? String(error)}`);
         } finally {
           watchInFlight = false;
           if (!stopRequested) {
