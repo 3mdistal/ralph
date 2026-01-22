@@ -93,6 +93,8 @@ export async function startQueuedTasks<Task extends { repo: string }>(deps: Sche
       }
 
       if (!started) {
+        releaseRepo();
+        releaseGlobal();
         startedThisRound = false;
         continue;
       }

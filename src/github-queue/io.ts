@@ -272,7 +272,9 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           onChange(tasks);
         } finally {
           watchInFlight = false;
-          watchTimer = setTimeout(tick, intervalMs);
+          if (!stopRequested) {
+            watchTimer = setTimeout(tick, intervalMs);
+          }
         }
       };
 

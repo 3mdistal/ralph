@@ -663,8 +663,6 @@ async function startTask(opts: {
       if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
         console.log(`[ralph] Skipping task ${task.name}: ${claim.reason}`);
       }
-      releaseGlobal();
-      releaseRepo();
       if (!isShuttingDown) scheduleQueuedTasksSoon();
       return false;
     }
@@ -704,8 +702,6 @@ async function startTask(opts: {
     return true;
   } catch (error: any) {
     console.error(`[ralph] Error claiming task ${task.name}:`, error);
-    releaseGlobal();
-    releaseRepo();
     if (!isShuttingDown) scheduleQueuedTasksSoon();
     return false;
   }

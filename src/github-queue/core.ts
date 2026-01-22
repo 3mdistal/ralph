@@ -83,9 +83,9 @@ export function shouldRecoverStaleInProgress(params: {
 }): boolean {
   if (!params.labels.includes("ralph:in-progress")) return false;
   const heartbeat = params.opState?.heartbeatAt?.trim() ?? "";
-  if (!heartbeat) return true;
+  if (!heartbeat) return false;
   const heartbeatMs = Date.parse(heartbeat);
-  if (!Number.isFinite(heartbeatMs)) return true;
+  if (!Number.isFinite(heartbeatMs)) return false;
   return params.nowMs - heartbeatMs > params.ttlMs;
 }
 
