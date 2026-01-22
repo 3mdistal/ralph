@@ -823,17 +823,21 @@ export class RepoWorker {
     }
     if (!baseBranch) return;
     const normalizedBotBranch = this.normalizeGitRef(params.botBranch);
-    if (normalizedBotBranch === "main") return;
-    if (this.normalizeGitRef(baseBranch) !== normalizedBotBranch) return;
+    const normalizedBaseBranch = this.normalizeGitRef(baseBranch);
 
     const errors: string[] = [];
 
-    try {
-      await this.addIssueLabel(issueRef, RALPH_LABEL_IN_BOT);
-    } catch (error: any) {
-      const message = error?.message ?? String(error);
-      errors.push(`add ${RALPH_LABEL_IN_BOT}: ${message}`);
-      console.warn(`[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_IN_BOT} label: ${message}`);
+    const shouldSkipInBot = normalizedBaseBranch === "main" || normalizedBotBranch === "main";
+    if (!shouldSkipInBot && normalizedBaseBranch !== normalizedBotBranch) return;
+
+    if (!shouldSkipInBot) {
+      try {
+        await this.addIssueLabel(issueRef, RALPH_LABEL_IN_BOT);
+      } catch (error: any) {
+        const message = error?.message ?? String(error);
+        errors.push(`add ${RALPH_LABEL_IN_BOT}: ${message}`);
+        console.warn(`[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_IN_BOT} label: ${message}`);
+      }
     }
 
     try {

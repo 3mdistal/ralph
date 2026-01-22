@@ -402,7 +402,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("success");
     expect(mergePullRequestMock).toHaveBeenCalled();
     expect(addIssueLabelMock).not.toHaveBeenCalled();
-    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).toHaveBeenCalled();
   });
 
   test("botBranch main skips midpoint labels", async () => {
@@ -469,7 +469,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("success");
     expect(mergePullRequestMock).toHaveBeenCalled();
     expect(addIssueLabelMock).not.toHaveBeenCalled();
-    expect(removeIssueLabelMock).not.toHaveBeenCalled();
+    expect(removeIssueLabelMock).toHaveBeenCalled();
   });
 
   test("midpoint label failures do not block merge", async () => {
