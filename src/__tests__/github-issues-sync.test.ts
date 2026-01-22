@@ -144,6 +144,46 @@ describe("github issue sync", () => {
     }
   });
 
+  test("paginates issues and advances cursor", async () => {
+    const calls: string[] = [];
+    const fetchMock: typeof fetch = async (input: RequestInfo | URL) => {
+      const url = String(input);
+      calls.push(url);
+      if (url.includes("page=2")) {
+        return new Response(
+          JSON.stringify([buildIssue({ number: 4, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:queued"] })]),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify([
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["ralph:queued"] }),
+        ]),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            Link: '<https://api.github.com/repos/3mdistal/ralph/issues?page=2>; rel="next"',
+          },
+        }
+      );
+    };
+
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: "2026-01-11T00:00:00.000Z",
+      deps: { fetch: fetchMock, getToken: async () => "token" },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.fetched).toBe(3);
+    expect(result.stored).toBe(3);
+    expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
+    expect(calls).toHaveLength(2);
+  });
+
   test("does not advance cursor on error", async () => {
     const fetchMock: typeof fetch = async () => new Response("nope", { status: 500 });
 
