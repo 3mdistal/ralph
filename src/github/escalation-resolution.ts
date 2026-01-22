@@ -19,6 +19,17 @@ export type EscalationResolutionDeps = {
 
 const DEFAULT_MAX_ESCALATIONS = 10;
 const DEFAULT_MAX_RECENT_COMMENTS = 20;
+const AUTHORIZED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
+type IssueCommentNode = {
+  body?: string | null;
+  author?: { login?: string | null } | null;
+  authorAssociation?: string | null;
+};
+
+type IssueCommentsResponse = {
+  data?: { repository?: { issue?: { comments?: { nodes?: IssueCommentNode[] } } } };
+};
 
 function issueKey(issue: EscalatedIssue): string {
   return `${issue.repo}#${issue.number}`;
@@ -47,9 +58,7 @@ async function listRecentIssueComments(params: {
   }
 }`;
 
-  const response = await params.github.request<{
-    data?: { repository?: { issue?: { comments?: { nodes?: Array<{ body?: string | null }> } } } };
-  }>("/graphql", {
+  const response = await params.github.request<IssueCommentsResponse>("/graphql", {
     method: "POST",
     body: {
       query,
@@ -58,13 +67,11 @@ async function listRecentIssueComments(params: {
   });
 
   const nodes = response.data?.data?.repository?.issue?.comments?.nodes ?? [];
-  return nodes.map(
-    (node: { body?: string | null; author?: { login?: string | null }; authorAssociation?: string | null } | undefined) => ({
-      body: node?.body ?? "",
-      authorLogin: node?.author?.login ?? null,
-      authorAssociation: node?.authorAssociation ?? null,
-    })
-  );
+  return nodes.map((node) => ({
+    body: node?.body ?? "",
+    authorLogin: node?.author?.login ?? null,
+    authorAssociation: node?.authorAssociation ?? null,
+  }));
 }
 
 async function addIssueLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
@@ -214,8 +221,7 @@ export async function reconcileEscalationResolutions(params: {
     const hasResolution = bodies.some((entry) => {
       const author = entry.authorLogin?.toLowerCase() ?? "";
       const association = entry.authorAssociation?.toUpperCase() ?? "";
-      const authorizedAssociations = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-      const isAuthorized = (repoOwner && author === repoOwner) || authorizedAssociations.has(association);
+      const isAuthorized = (repoOwner && author === repoOwner) || AUTHORIZED_ASSOCIATIONS.has(association);
       if (!isAuthorized) return false;
       return RALPH_RESOLVED_REGEX.test(entry.body) && !entry.body.includes(RALPH_ESCALATION_MARKER_PREFIX);
     });
