@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { dirname, isAbsolute, join } from "path";
+import { dirname, isAbsolute, join, parse, resolve } from "path";
 import { fileURLToPath } from "url";
+import { homedir } from "os";
 
 import { loadConfig } from "./config";
 import { getRalphOpencodeConfigDir } from "./paths";
@@ -35,6 +36,25 @@ function ensureDir(path: string): void {
   }
 
   mkdirSync(path, { recursive: true });
+}
+
+function assertSafeManagedConfigDir(path: string): void {
+  const resolved = resolve(path);
+  const root = parse(resolved).root;
+  const home = homedir();
+  const ralphHome = resolve(getRalphOpencodeConfigDir(), "..");
+
+  if (resolved === root) {
+    throw new Error(`[ralph] Refusing to manage OpenCode config at root directory: ${resolved}`);
+  }
+
+  if (home && resolve(home) === resolved) {
+    throw new Error(`[ralph] Refusing to manage OpenCode config at HOME: ${resolved}`);
+  }
+
+  if (resolve(ralphHome) === resolved) {
+    throw new Error(`[ralph] Refusing to manage OpenCode config at Ralph home dir: ${resolved}`);
+  }
 }
 
 function writeFileAtomic(path: string, contents: string): void {
@@ -84,6 +104,8 @@ export function ensureManagedOpencodeConfigInstalled(configDir?: string): string
   if (!isAbsolute(resolvedDir)) {
     throw new Error(`[ralph] Managed OpenCode config dir must be absolute (got ${JSON.stringify(resolvedDir)})`);
   }
+
+  assertSafeManagedConfigDir(resolvedDir);
 
   ensureDir(resolvedDir);
   ensureDir(join(resolvedDir, "agent"));
