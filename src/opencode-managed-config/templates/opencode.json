@@ -1,0 +1,37 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agent": {
+    "build": {
+      "description": "Implementation agent for Ralph daemon runs",
+      "model": "openai/gpt-5.2-codex",
+      "prompt": "agent/build.md"
+    },
+    "ralph-plan": {
+      "description": "Non-interactive planning agent for Ralph daemon runs",
+      "model": "openai/gpt-5.2",
+      "prompt": "agent/ralph-plan.md",
+      "permission": {
+        "question": "deny"
+      }
+    },
+    "product": {
+      "description": "Product voice agent",
+      "model": "openai/gpt-5.2",
+      "prompt": "agent/product.md",
+      "mode": "subagent"
+    },
+    "devex": {
+      "description": "Developer experience advisor",
+      "model": "openai/gpt-5.2",
+      "prompt": "agent/devex.md",
+      "mode": "subagent"
+    }
+  },
+  "command": {
+    "next-task": {
+      "description": "Get product context for a task and create a detailed implementation plan. Usage: /next-task <issue-number>",
+      "agent": "ralph-plan",
+      "template": "I need to work on task #$1.\n\nIMPORTANT: This runs in a non-interactive daemon. Do NOT ask the user questions. If you would normally ask a question, make a reasonable default choice and proceed, clearly stating any assumptions.\n\nFirst, gather context from the GitHub issue itself:\n- Read the issue body\n- Read the issue comments (use `gh issue view $1 --comments` to fetch the full thread; prioritize latest maintainer/owner comments)\n- Treat explicit decisions/policies in comments as authoritative product guidance\n\nThen, consult @product to get context on this task. Product should review the GitHub Issue (including comments) and relevant product docs, understand how it fits into the product vision, and explain:\n- Why this task matters\n- What success looks like from a product perspective\n- Any product considerations or constraints\n\nOnce you have the product context, create a detailed implementation plan for the task.\n\nThen, consult @devex **with the full plan you wrote**. Devex should review the plan for maintainability and execution risks, and suggest concrete improvements (especially around boundaries, testing strategy, and functional-core/imperative-shell separation).\n\nIf devex feedback suggests changes, revise the plan accordingly.\n\n---\n\n**IMPORTANT: After creating the plan, you MUST output a routing decision as a JSON code block:**\n\n```json\n{\n  \"decision\": \"proceed\" | \"escalate\",\n  \"confidence\": \"high\" | \"medium\" | \"low\",\n  \"escalation_reason\": null | \"<reason if escalating>\"\n}\n```\n\nRouting rules:\n- Only identify a **PRODUCT GAP** if neither product docs nor issue comments contain the needed guidance\n- If @product identified a **PRODUCT GAP**, you MUST set decision to \"escalate\"\n- If confidence is \"low\" due to ambiguous requirements, set decision to \"escalate\"\n- If @devex identifies major maintainability risks or missing validation strategy, reduce confidence; if confidence becomes \"low\", set decision to \"escalate\"\n- If the plan is clear and @product approved (and @devex has no Must-fix concerns), set decision to \"proceed\" with confidence \"high\"\n- The orchestrator will parse this JSON to determine next steps"
+    }
+  }
+}
