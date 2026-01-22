@@ -64,7 +64,7 @@ function hashFNV1a(input: string): string {
   return hash.toString(16).padStart(8, "0");
 }
 
-function sanitizeReason(input: string): string {
+export function sanitizeEscalationReason(input: string): string {
   let out = input.replace(/\x1b\[[0-9;]*m/g, "");
   const patterns: Array<{ re: RegExp; replacement: string }> = [
     { re: /ghp_[A-Za-z0-9]{20,}/g, replacement: "ghp_[REDACTED]" },
@@ -115,7 +115,8 @@ export function buildEscalationComment(params: {
 }): string {
   const owner = params.ownerHandle.trim();
   const mention = owner ? `${owner} ` : "";
-  const reason = sanitizeReason(truncateText(params.reason, MAX_REASON_CHARS)) || "(no reason provided)";
+  const sanitized = sanitizeEscalationReason(params.reason);
+  const reason = truncateText(sanitized, MAX_REASON_CHARS) || "(no reason provided)";
 
   return [
     params.marker,

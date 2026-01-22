@@ -8,6 +8,7 @@ import {
   buildEscalationMarker,
   extractExistingMarker,
   planEscalationWriteback,
+  sanitizeEscalationReason,
   writeEscalationToGitHub,
 } from "../github/escalation-writeback";
 import { closeStateDbForTests } from "../state";
@@ -47,6 +48,18 @@ describe("github escalation writeback", () => {
 
     expect(comment.split("\n")[0]).toBe(marker);
     expect(comment).toContain("@3mdistal");
+  });
+
+  test("sanitizeEscalationReason redacts tokens and paths", () => {
+    const input =
+      "ghp_abcdefghijklmnopqrstuv Authorization: Bearer secret-token /home/alice/project \x1b[31mred\x1b[0m";
+    const output = sanitizeEscalationReason(input);
+
+    expect(output).toContain("ghp_[REDACTED]");
+    expect(output).toContain("Bearer [REDACTED]");
+    expect(output).toContain("~/");
+    expect(output).not.toContain("ghp_abcdefghijklmnopqrstuv");
+    expect(output).not.toContain("secret-token");
   });
 
   test("extractExistingMarker parses marker id", () => {
