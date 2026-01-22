@@ -77,6 +77,10 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
 
 ## Escalation protocol
 
-- Ralph adds `ralph:escalated` and posts a comment containing a stable hidden marker
-  (e.g. `<!-- ralph-escalation:id=... -->`) and resolution instructions.
-- Resolution is detected when a new operator comment contains `RALPH RESOLVED:`.
+- Ralph removes `ralph:in-progress` and `ralph:queued`, then adds `ralph:escalated`.
+- Ralph posts a comment containing a stable hidden marker (e.g. `<!-- ralph-escalation:id=... -->`),
+  the operator @mention, and resolution instructions.
+- Resolution signals (either is sufficient):
+  - A new operator comment contains `RALPH RESOLVED:`.
+  - The operator re-adds `ralph:queued`.
+- When resolved, Ralph removes `ralph:escalated` (and keeps `ralph:queued` if it was added).
