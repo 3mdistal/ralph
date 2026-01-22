@@ -44,6 +44,7 @@ Rules:
 ## Relationship precedence + blocked semantics
 
 Ralph treats GitHub-native issue relationships as the source of truth when available, with a conservative fallback to body parsing.
+This section supersedes the v0.1.0 body-only dependency encoding; body parsing remains the fallback when relationships are unavailable.
 
 Rules:
 - Relationship sources: GitHub dependencies (`blocked_by` / `blocking`) and sub-issues (`parent` / `sub_issues`).
