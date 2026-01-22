@@ -51,7 +51,7 @@ function looksLikeManagedConfig(path: string): boolean {
 function assertSafeManagedConfigDir(path: string): void {
   const resolved = resolve(path);
   const root = parse(resolved).root;
-  const home = homedir();
+  const home = process.env.HOME?.trim() || homedir();
   const ralphHome = resolve(getRalphOpencodeConfigDir(), "..");
   const markerPath = join(resolved, MARKER_FILENAME);
   const inHome = home ? !relative(resolve(home), resolved).startsWith("..") : false;

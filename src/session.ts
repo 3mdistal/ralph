@@ -605,10 +605,11 @@ async function runSession(
 
   args.push("--format", "json");
 
+  const opencodeXdg = options?.opencodeXdg;
   const { env } = buildOpencodeSpawnEnvironment({
     repo: options?.repo,
     cacheKey: options?.cacheKey,
-    opencodeXdg: options?.opencodeXdg,
+    opencodeXdg,
   });
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const processKill = options?.__testOverrides?.processKill ?? process.kill;
