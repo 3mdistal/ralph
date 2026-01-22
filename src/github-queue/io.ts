@@ -19,6 +19,7 @@ import type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "
 import { deriveTaskView, planClaim, statusToRalphLabelDelta, shouldRecoverStaleInProgress, type LabelOp } from "./core";
 
 const SWEEP_INTERVAL_MS = 5 * 60_000;
+const WATCH_MIN_INTERVAL_MS = 1000;
 
 type GitHubQueueDeps = {
   now?: () => Date;
@@ -26,6 +27,10 @@ type GitHubQueueDeps = {
 
 function getNowIso(deps?: GitHubQueueDeps): string {
   return (deps?.now ? deps.now() : new Date()).toISOString();
+}
+
+function getNowMs(deps?: GitHubQueueDeps): number {
+  return deps?.now ? deps.now().valueOf() : Date.now();
 }
 
 async function createGitHubClient(repo: string): Promise<GitHubClient> {
@@ -170,9 +175,10 @@ function resolveIssueSnapshot(repo: string, issueNumber: number): IssueSnapshot 
 export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   let lastSweepAt = 0;
   let stopRequested = false;
+  let watchTimer: ReturnType<typeof setTimeout> | null = null;
 
   const maybeSweepStaleInProgress = async (): Promise<void> => {
-    const nowMs = Date.now();
+    const nowMs = getNowMs(deps);
     if (nowMs - lastSweepAt < SWEEP_INTERVAL_MS) return;
     lastSweepAt = nowMs;
 
@@ -210,10 +216,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             issue: `${repo}#${issue.number}`,
             taskPath: `github:${repo}#${issue.number}`,
             status: "queued",
-            sessionId: "",
-            worktreePath: "",
-            daemonId: "",
-            heartbeatAt: "",
             at: nowIso,
           });
           console.warn(
@@ -255,10 +257,20 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       return await listTasksByStatus("queued");
     },
     startWatching: (onChange: QueueChangeHandler): void => {
-      void listTasksByStatus("queued").then((tasks) => onChange(tasks));
+      const intervalMs = Math.max(getConfig().pollInterval, WATCH_MIN_INTERVAL_MS);
+
+      const tick = () => {
+        if (stopRequested) return;
+        void listTasksByStatus("queued").then((tasks) => onChange(tasks));
+        watchTimer = setTimeout(tick, intervalMs);
+      };
+
+      tick();
     },
     stopWatching: (): void => {
       stopRequested = true;
+      if (watchTimer) clearTimeout(watchTimer);
+      watchTimer = null;
     },
     getQueuedTasks: async (): Promise<QueueTask[]> => {
       return await listTasksByStatus("queued");

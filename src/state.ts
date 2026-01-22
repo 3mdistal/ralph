@@ -74,6 +74,11 @@ function ensureSchema(database: Database): void {
       if (existingVersion < 6) {
         database.exec("ALTER TABLE tasks ADD COLUMN daemon_id TEXT");
         database.exec("ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT");
+        database.exec(
+          "DELETE FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL AND rowid NOT IN (" +
+            "SELECT MAX(rowid) FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL GROUP BY repo_id, issue_number" +
+            ")"
+        );
       }
     })();
   }
@@ -555,7 +560,7 @@ export function listIssueSnapshotsWithRalphLabels(repo: string): IssueSnapshot[]
        JOIN repos r ON r.id = i.repo_id
        LEFT JOIN issue_labels l ON l.issue_id = i.id
        WHERE r.name = $name
-         AND (i.state IS NULL OR i.state != 'CLOSED')
+         AND (i.state IS NULL OR UPPER(i.state) != 'CLOSED')
          AND EXISTS (
            SELECT 1 FROM issue_labels l2 WHERE l2.issue_id = i.id AND l2.name LIKE 'ralph:%'
          )
