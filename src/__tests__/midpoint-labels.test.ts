@@ -35,6 +35,17 @@ describe("midpoint label plan", () => {
     });
   });
 
+  test("treats unknown default branch as bot-only midpoint", () => {
+    expect(computePlan({ baseBranch: "bot/integration", botBranch: "bot/integration", defaultBranch: "" })).toEqual({
+      addInBot: true,
+      removeInProgress: true,
+    });
+    expect(computePlan({ baseBranch: "release", botBranch: "bot/integration", defaultBranch: "" })).toEqual({
+      addInBot: false,
+      removeInProgress: true,
+    });
+  });
+
   test("no label changes when base differs from bot branch", () => {
     expect(
       computePlan({ baseBranch: "feature", botBranch: "bot/integration", defaultBranch: "main" })

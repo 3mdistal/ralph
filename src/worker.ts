@@ -810,7 +810,7 @@ export class RepoWorker {
       );
     }
 
-    const resolvedDefaultBranch = defaultBranch ?? "main";
+    const resolvedDefaultBranch = defaultBranch ?? "";
 
     if (!baseBranch) {
       try {

@@ -15,6 +15,11 @@ export function computeMidpointLabelPlan(input: {
   if (!input.baseBranch.trim()) {
     return { addInBot: false, removeInProgress: true };
   }
+  if (!input.defaultBranch.trim()) {
+    const normalizedBase = normalizeGitRef(input.baseBranch);
+    const normalizedBot = normalizeGitRef(input.botBranch);
+    return { addInBot: normalizedBase === normalizedBot, removeInProgress: true };
+  }
   const normalizedBase = normalizeGitRef(input.baseBranch);
   const normalizedBot = normalizeGitRef(input.botBranch);
   const normalizedDefault = normalizeGitRef(input.defaultBranch);
