@@ -35,6 +35,9 @@ function getNowMs(deps?: GitHubQueueDeps): number {
 
 async function createGitHubClient(repo: string): Promise<GitHubClient> {
   const token = await resolveGitHubToken();
+  if (!token) {
+    throw new Error("GitHub auth is not configured");
+  }
   return new GitHubClient(repo, token ? { token } : undefined);
 }
 
@@ -54,8 +57,8 @@ async function removeIssueLabel(repo: string, issueNumber: number, label: string
     const response = await client.request(
       `/repos/${owner}/${name}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`,
       {
-      method: "DELETE",
-      allowNotFound: true,
+        method: "DELETE",
+        allowNotFound: true,
       }
     );
     return { removed: response.status !== 404 };

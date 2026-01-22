@@ -75,6 +75,10 @@ function ensureSchema(database: Database): void {
         database.exec("ALTER TABLE tasks ADD COLUMN daemon_id TEXT");
         database.exec("ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT");
         database.exec(
+          "UPDATE tasks SET task_path = 'github:' || (SELECT name FROM repos r WHERE r.id = tasks.repo_id) || '#' || tasks.issue_number " +
+            "WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL"
+        );
+        database.exec(
           "DELETE FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL AND rowid NOT IN (" +
             "SELECT MAX(rowid) FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL GROUP BY repo_id, issue_number" +
             ")"
