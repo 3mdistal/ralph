@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 let db: Database | null = null;
 
@@ -81,6 +81,15 @@ function ensureSchema(database: Database): void {
         // ignore if already present
       }
     }
+    if (existingVersion && existingVersion < 5) {
+      try {
+        database.exec(
+          "CREATE TABLE IF NOT EXISTS repo_github_issue_sync (repo_id INTEGER PRIMARY KEY, last_sync_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
+        );
+      } catch {
+        // ignore if already present
+      }
+    }
   }
 
   database.exec(
@@ -152,6 +161,12 @@ function ensureSchema(database: Database): void {
     );
 
     CREATE TABLE IF NOT EXISTS repo_sync (
+      repo_id INTEGER PRIMARY KEY,
+      last_sync_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS repo_github_issue_sync (
       repo_id INTEGER PRIMARY KEY,
       last_sync_at TEXT NOT NULL,
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
@@ -277,12 +292,31 @@ export function recordRepoSync(params: {
     .run({ $repo_id: repoId, $last_sync_at: at });
 }
 
-export function getRepoLastSyncAt(repo: string): string | null {
+export function recordRepoGithubIssueSync(params: {
+  repo: string;
+  repoPath?: string;
+  botBranch?: string;
+  lastSyncAt?: string;
+}): void {
+  const database = requireDb();
+  const at = params.lastSyncAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, repoPath: params.repoPath, botBranch: params.botBranch, at });
+
+  database
+    .query(
+      `INSERT INTO repo_github_issue_sync(repo_id, last_sync_at)
+       VALUES ($repo_id, $last_sync_at)
+       ON CONFLICT(repo_id) DO UPDATE SET last_sync_at = excluded.last_sync_at`
+    )
+    .run({ $repo_id: repoId, $last_sync_at: at });
+}
+
+export function getRepoGithubIssueLastSyncAt(repo: string): string | null {
   const database = requireDb();
   const row = database
     .query(
       `SELECT rs.last_sync_at as last_sync_at
-       FROM repo_sync rs
+       FROM repo_github_issue_sync rs
        JOIN repos r ON r.id = rs.repo_id
        WHERE r.name = $name`
     )

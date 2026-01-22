@@ -1,11 +1,11 @@
 import { type RepoConfig } from "./config";
 import { getInstallationToken, isRepoAllowed } from "./github-app-auth";
 import {
-  getRepoLastSyncAt,
+  getRepoGithubIssueLastSyncAt,
   hasIssueSnapshot,
   recordIssueLabelsSnapshot,
   recordIssueSnapshot,
-  recordRepoSync,
+  recordRepoGithubIssueSync,
   runInStateTransaction,
 } from "./state";
 
@@ -356,13 +356,13 @@ function startRepoPoller(params: {
 
   const tick = async () => {
     if (stopped) return;
-    const lastSyncAt = getRepoLastSyncAt(repoName);
+    const lastSyncAt = getRepoGithubIssueLastSyncAt(repoName);
 
     const result = await syncRepoIssuesOnce({ repo: repoName, lastSyncAt });
 
     if (result.ok) {
       if (result.newLastSyncAt && result.newLastSyncAt !== lastSyncAt) {
-        recordRepoSync({
+        recordRepoGithubIssueSync({
           repo: repoName,
           repoPath: params.repo.path,
           botBranch: params.repo.botBranch,

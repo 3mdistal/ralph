@@ -19,6 +19,7 @@ import {
   recordRepoSync,
   recordIssueSnapshot,
   recordIssueLabelsSnapshot,
+  recordRepoGithubIssueSync,
   recordTaskSnapshot,
   recordPrSnapshot,
   recordRollupMerge,
@@ -56,6 +57,13 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repoPath: "/tmp/ralph",
       botBranch: "bot/integration",
       lastSyncAt: "2026-01-11T00:00:00.000Z",
+    });
+
+    recordRepoGithubIssueSync({
+      repo: "3mdistal/ralph",
+      repoPath: "/tmp/ralph",
+      botBranch: "bot/integration",
+      lastSyncAt: "2026-01-11T00:00:00.250Z",
     });
 
     recordIssueSnapshot({
@@ -125,7 +133,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("4");
+      expect(meta.value).toBe("5");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -167,6 +175,11 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
       const sync = db.query("SELECT last_sync_at FROM repo_sync").get() as { last_sync_at?: string };
       expect(sync.last_sync_at).toBe("2026-01-11T00:00:00.000Z");
+
+      const githubSync = db
+        .query("SELECT last_sync_at FROM repo_github_issue_sync")
+        .get() as { last_sync_at?: string };
+      expect(githubSync.last_sync_at).toBe("2026-01-11T00:00:00.250Z");
     } finally {
       db.close();
     }
