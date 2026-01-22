@@ -347,6 +347,14 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     recordPrSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/123",
+      state: "open",
+      at: "2026-01-11T00:00:03.500Z",
+    });
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
       prUrl: "https://github.com/3mdistal/ralph/pull/456",
       state: "open",
       at: "2026-01-11T00:00:04.000Z",

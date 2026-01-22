@@ -53,7 +53,12 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { computeRalphLabelSync } from "./github-labels";
+import {
+  computeRalphLabelSync,
+  RALPH_LABEL_BLOCKED,
+  RALPH_LABEL_IN_BOT,
+  RALPH_LABEL_IN_PROGRESS,
+} from "./github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import {
@@ -816,16 +821,18 @@ export class RepoWorker {
     if (this.normalizeGitRef(baseBranch) !== this.normalizeGitRef(params.botBranch)) return;
 
     try {
-      await this.addIssueLabel(issueRef, "ralph:in-bot");
+      await this.addIssueLabel(issueRef, RALPH_LABEL_IN_BOT);
     } catch (error: any) {
-      console.warn(`[ralph:worker:${this.repo}] Failed to add ralph:in-bot label: ${error?.message ?? String(error)}`);
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_IN_BOT} label: ${error?.message ?? String(error)}`
+      );
     }
 
     try {
-      await this.removeIssueLabel(issueRef, "ralph:in-progress");
+      await this.removeIssueLabel(issueRef, RALPH_LABEL_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ralph:in-progress label: ${error?.message ?? String(error)}`
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_IN_PROGRESS} label: ${error?.message ?? String(error)}`
       );
     }
   }
@@ -1205,9 +1212,11 @@ ${guidance}`
         }
 
         try {
-          await this.addIssueLabel(entry.issue, "ralph:blocked");
+          await this.addIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
         } catch (error: any) {
-          console.warn(`[ralph:worker:${this.repo}] Failed to add ralph:blocked label: ${error?.message ?? String(error)}`);
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
+          );
         }
         continue;
       }
@@ -1220,10 +1229,10 @@ ${guidance}`
         }
 
         try {
-          await this.removeIssueLabel(entry.issue, "ralph:blocked");
+          await this.removeIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
         } catch (error: any) {
           console.warn(
-            `[ralph:worker:${this.repo}] Failed to remove ralph:blocked label: ${error?.message ?? String(error)}`
+            `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
           );
         }
       }
