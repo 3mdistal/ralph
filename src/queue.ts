@@ -729,7 +729,13 @@ export function startWatching(onChange: QueueChangeHandler): void {
 
       if (!hasNonHeartbeatChange) return;
 
-      for (const handler of changeHandlers) handler(tasks);
+      for (const handler of changeHandlers) {
+        try {
+          await Promise.resolve(handler(tasks));
+        } catch (error: any) {
+          console.warn(`[ralph:queue] Change handler failed: ${error?.message ?? String(error)}`);
+        }
+      }
     }, 500);
   });
 }

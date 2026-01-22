@@ -115,7 +115,6 @@ async function applyLabelOps(params: {
   repo: string;
   issueNumber: number;
   steps: LabelOp[];
-  rollback: LabelOp[];
   logLabel: string;
 }): Promise<{ add: string[]; remove: string[]; ok: boolean }> {
   const added: string[] = [];
@@ -275,7 +274,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         try {
           const tasks = await listTasksByStatus("queued");
           try {
-            onChange(tasks);
+            await Promise.resolve(onChange(tasks));
           } catch (error: any) {
             console.warn(
               `[ralph:queue:github] Queue watcher handler failed: ${error?.message ?? String(error)}`
@@ -356,7 +355,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           repo: issueRef.repo,
           issueNumber: issueRef.number,
           steps: plan.steps,
-          rollback: plan.rollback,
           logLabel: `${issueRef.repo}#${issueRef.number}`,
         });
         if (!labelOps.ok) {
@@ -470,15 +468,10 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         ...delta.add.map((label) => ({ action: "add" as const, label })),
         ...delta.remove.map((label) => ({ action: "remove" as const, label })),
       ];
-      const rollback: LabelOp[] = [
-        ...delta.remove.map((label) => ({ action: "add" as const, label })),
-        ...delta.add.map((label) => ({ action: "remove" as const, label })),
-      ];
       const labelOps = await applyLabelOps({
         repo: issueRef.repo,
         issueNumber: issueRef.number,
         steps,
-        rollback,
         logLabel: `${issueRef.repo}#${issueRef.number}`,
       });
       if (!labelOps.ok) return false;
