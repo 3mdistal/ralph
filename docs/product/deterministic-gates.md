@@ -48,7 +48,7 @@ Not fully implemented today (this doc defines the intended behavior):
 
 ## OpenCode Config Determinism
 
-Ralph daemon runs must be deterministic and repo-agnostic. For all daemon runs, Ralph sets `OPENCODE_CONFIG_DIR` to a Ralph-managed config directory (default: `~/.ralph/opencode`) and ignores any repo-local OpenCode configuration. Overrides are allowed only via an explicit Ralph configuration value or environment variable to avoid ambient drift.
+Ralph daemon runs must be deterministic and repo-agnostic. For all daemon runs, Ralph sets `OPENCODE_CONFIG_DIR` to a Ralph-managed config directory (default: `$HOME/.ralph/opencode`) and ignores any repo-local OpenCode configuration. The managed directory is overwritten to match the version shipped with Ralph. Overrides are allowed only via an explicit Ralph configuration value or environment variable to avoid ambient drift.
 
 ## Required Gate Fields
 
