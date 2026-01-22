@@ -79,7 +79,7 @@ describe("github issue sync", () => {
     expect(result.ok).toBe(true);
     expect(result.stored).toBe(1);
     expect(result.ralphCount).toBe(1);
-    expect(result.newLastSyncAt).toBe("2026-01-11T00:00:02.000Z");
+    expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
     expect(calls.length).toBe(1);
     expect(calls[0]).toContain("since=2026-01-10T23%3A59%3A55.000Z");
 

@@ -209,8 +209,8 @@ async function fetchIssuesSince(params: {
     const nonPrRows = rows.filter((row) => !isPullRequest(row));
     issues.push(...nonPrRows);
 
-    for (const issue of nonPrRows) {
-      maxUpdatedAt = computeMaxUpdatedAt(maxUpdatedAt, issue.updated_at);
+    for (const row of rows) {
+      maxUpdatedAt = computeMaxUpdatedAt(maxUpdatedAt, row.updated_at);
     }
 
     const links = parseLinkHeader(result.headers.get("link"));
@@ -296,7 +296,6 @@ export async function syncRepoIssuesOnce(params: {
           issue: issueRef,
           labels,
           at: nowIso,
-          useTransaction: false,
         });
 
         stored += 1;

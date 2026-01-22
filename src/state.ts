@@ -365,7 +365,6 @@ export function recordIssueLabelsSnapshot(input: {
   issue: string;
   labels: string[];
   at?: string;
-  useTransaction?: boolean;
 }): void {
   const database = requireDb();
   const at = input.at ?? nowIso();
@@ -374,51 +373,42 @@ export function recordIssueLabelsSnapshot(input: {
 
   if (issueNumber === null) return;
 
-  const run = () => {
-    database
-      .query(
-        `INSERT INTO issues(repo_id, number, created_at, updated_at)
-         VALUES ($repo_id, $number, $created_at, $updated_at)
-         ON CONFLICT(repo_id, number) DO UPDATE SET updated_at = excluded.updated_at`
-      )
-      .run({
-        $repo_id: repoId,
-        $number: issueNumber,
-        $created_at: at,
-        $updated_at: at,
-      });
+  database
+    .query(
+      `INSERT INTO issues(repo_id, number, created_at, updated_at)
+       VALUES ($repo_id, $number, $created_at, $updated_at)
+       ON CONFLICT(repo_id, number) DO UPDATE SET updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $number: issueNumber,
+      $created_at: at,
+      $updated_at: at,
+    });
 
-    const issueRow = database
-      .query("SELECT id FROM issues WHERE repo_id = $repo_id AND number = $number")
-      .get({ $repo_id: repoId, $number: issueNumber }) as { id?: number } | undefined;
+  const issueRow = database
+    .query("SELECT id FROM issues WHERE repo_id = $repo_id AND number = $number")
+    .get({ $repo_id: repoId, $number: issueNumber }) as { id?: number } | undefined;
 
-    if (!issueRow?.id) {
-      throw new Error(`Failed to resolve issue id for ${input.repo}#${issueNumber}`);
-    }
-
-    database.query("DELETE FROM issue_labels WHERE issue_id = $issue_id").run({ $issue_id: issueRow.id });
-
-    for (const label of input.labels) {
-      database
-        .query(
-          `INSERT INTO issue_labels(issue_id, name, created_at)
-           VALUES ($issue_id, $name, $created_at)
-           ON CONFLICT(issue_id, name) DO NOTHING`
-        )
-        .run({
-          $issue_id: issueRow.id,
-          $name: label,
-          $created_at: at,
-        });
-    }
-  };
-
-  if (input.useTransaction === false) {
-    run();
-    return;
+  if (!issueRow?.id) {
+    throw new Error(`Failed to resolve issue id for ${input.repo}#${issueNumber}`);
   }
 
-  database.transaction(run)();
+  database.query("DELETE FROM issue_labels WHERE issue_id = $issue_id").run({ $issue_id: issueRow.id });
+
+  for (const label of input.labels) {
+    database
+      .query(
+        `INSERT INTO issue_labels(issue_id, name, created_at)
+         VALUES ($issue_id, $name, $created_at)
+         ON CONFLICT(issue_id, name) DO NOTHING`
+      )
+      .run({
+        $issue_id: issueRow.id,
+        $name: label,
+        $created_at: at,
+      });
+  }
 }
 
 export function recordTaskSnapshot(input: {
