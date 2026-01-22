@@ -15,4 +15,4 @@ To override the managed config directory for daemon runs, set one of:
 - `RALPH_OPENCODE_CONFIG_DIR` (environment variable)
 - `opencode.managedConfigDir` in `~/.ralph/config.toml`
 
-Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. The override must be an absolute path (no `~` expansion). Ralph overwrites managed files on startup to keep them in sync with the version shipped in this repo.
+Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. The override must be an absolute path (no `~` expansion). Ralph refuses to manage directories without the `.ralph-managed-opencode` marker (to avoid accidental overwrite). Ralph overwrites managed files on startup to keep them in sync with the version shipped in this repo.

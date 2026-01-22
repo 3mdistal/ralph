@@ -1,5 +1,5 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { dirname, isAbsolute, join, parse, resolve } from "path";
+import { dirname, isAbsolute, join, parse, relative, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
 
@@ -7,6 +7,8 @@ import { loadConfig } from "./config";
 import { getRalphOpencodeConfigDir } from "./paths";
 
 const TEMPLATE_DIR = fileURLToPath(new URL("./opencode-managed-config/templates", import.meta.url));
+const MARKER_FILENAME = ".ralph-managed-opencode";
+const MARKER_CONTENTS = "managed by ralph\n";
 
 type ManagedConfigFile = {
   path: string;
@@ -38,11 +40,17 @@ function ensureDir(path: string): void {
   mkdirSync(path, { recursive: true });
 }
 
+function looksLikeManagedConfig(path: string): boolean {
+  return existsSync(join(path, "opencode.json")) && existsSync(join(path, "agent"));
+}
+
 function assertSafeManagedConfigDir(path: string): void {
   const resolved = resolve(path);
   const root = parse(resolved).root;
   const home = homedir();
   const ralphHome = resolve(getRalphOpencodeConfigDir(), "..");
+  const markerPath = join(resolved, MARKER_FILENAME);
+  const inHome = home ? !relative(resolve(home), resolved).startsWith("..") : false;
 
   if (resolved === root) {
     throw new Error(`[ralph] Refusing to manage OpenCode config at root directory: ${resolved}`);
@@ -55,12 +63,24 @@ function assertSafeManagedConfigDir(path: string): void {
   if (resolve(ralphHome) === resolved) {
     throw new Error(`[ralph] Refusing to manage OpenCode config at Ralph home dir: ${resolved}`);
   }
+
+  if (!inHome && !existsSync(markerPath)) {
+    throw new Error(
+      `[ralph] Refusing to manage OpenCode config outside HOME without marker file ${MARKER_FILENAME}: ${resolved}`
+    );
+  }
+
+  if (existsSync(resolved) && !existsSync(markerPath) && !looksLikeManagedConfig(resolved)) {
+    throw new Error(
+      `[ralph] Refusing to manage OpenCode config without marker file ${MARKER_FILENAME}: ${resolved}`
+    );
+  }
 }
 
 function writeFileAtomic(path: string, contents: string): void {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
-  const tempPath = `${path}.tmp`;
+  const tempPath = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   writeFileSync(tempPath, contents, "utf8");
   renameSync(tempPath, path);
 }
@@ -92,6 +112,7 @@ export function getManagedOpencodeConfigManifest(configDir?: string): ManagedCon
     { path: join(resolvedDir, "agent", "ralph-plan.md"), contents: readTemplate("agent/ralph-plan.md") },
     { path: join(resolvedDir, "agent", "product.md"), contents: readTemplate("agent/product.md") },
     { path: join(resolvedDir, "agent", "devex.md"), contents: readTemplate("agent/devex.md") },
+    { path: join(resolvedDir, MARKER_FILENAME), contents: MARKER_CONTENTS },
   ];
 
   return { configDir: resolvedDir, files };
