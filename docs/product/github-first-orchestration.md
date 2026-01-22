@@ -82,6 +82,6 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
   the operator @mention, and resolution instructions.
 - Operator @mention defaults to the repo owner handle (e.g. `@owner`); if no owner can be parsed, omit the mention.
 - Resolution signals (either is sufficient):
-- A new operator comment contains `RALPH RESOLVED:` (only honored when authored by the repo owner or an `OWNER`/`MEMBER`/`COLLABORATOR`).
+  - A new operator comment contains `RALPH RESOLVED:` (only honored when authored by the repo owner or an `OWNER`/`MEMBER`/`COLLABORATOR`).
   - The operator re-adds `ralph:queued`.
 - When resolved, Ralph removes `ralph:escalated` (and keeps `ralph:queued` if it was added).
