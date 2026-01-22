@@ -1,5 +1,5 @@
 import { getConfig } from "../config";
-import { getInstallationToken } from "../github-app-auth";
+import { resolveGitHubToken } from "../github-auth";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "../github/client";
 import { parseIssueRef, type IssueRef } from "../github/issue-blocking-core";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
@@ -26,14 +26,6 @@ type GitHubQueueDeps = {
 
 function getNowIso(deps?: GitHubQueueDeps): string {
   return (deps?.now ? deps.now() : new Date()).toISOString();
-}
-
-async function resolveGitHubToken(): Promise<string | null> {
-  const cfg = getConfig();
-  if ((cfg as any).githubApp) {
-    return await getInstallationToken();
-  }
-  return process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? null;
 }
 
 async function createGitHubClient(repo: string): Promise<GitHubClient> {

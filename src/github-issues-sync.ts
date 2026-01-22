@@ -1,5 +1,6 @@
 import { type RepoConfig } from "./config";
-import { getInstallationToken, isRepoAllowed } from "./github-app-auth";
+import { isRepoAllowed } from "./github-app-auth";
+import { resolveGitHubToken } from "./github-auth";
 import {
   getRepoGithubIssueLastSyncAt,
   hasIssueSnapshot,
@@ -28,7 +29,7 @@ type FetchResult<T> =
 
 type SyncDeps = {
   fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-  getToken?: () => Promise<string>;
+  getToken?: () => Promise<string | null>;
   now?: () => Date;
 };
 
@@ -51,12 +52,6 @@ const DEFAULT_BACKOFF_MULTIPLIER = 1.5;
 const DEFAULT_ERROR_MULTIPLIER = 2;
 const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
-
-async function resolveGitHubToken(): Promise<string> {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
-  if (token && token.trim()) return token;
-  return await getInstallationToken();
-}
 
 function applyJitter(valueMs: number, pct = DEFAULT_JITTER_PCT): number {
   const clamped = Math.max(valueMs, MIN_DELAY_MS);
@@ -252,6 +247,16 @@ export async function syncRepoIssuesOnce(params: {
 
   try {
     const token = await getToken();
+    if (!token) {
+      return {
+        ok: true,
+        fetched: 0,
+        stored: 0,
+        ralphCount: 0,
+        newLastSyncAt: params.lastSyncAt ?? null,
+        hadChanges: false,
+      };
+    }
     const fetchResult = await fetchIssuesSince({
       repo: params.repo,
       since,
