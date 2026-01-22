@@ -10,9 +10,9 @@ const queueAdapter = {
 };
 
 const notifyAdapter = {
-  notifyEscalation: async () => {},
-  notifyError: async () => {},
-  notifyTaskComplete: async () => {},
+  notifyEscalation: async () => true,
+  notifyError: async () => true,
+  notifyTaskComplete: async () => true,
 };
 
 const sessionAdapter = {
@@ -72,9 +72,9 @@ describe("syncBlockedStateForTasks", () => {
 
     expect(blocked.has("orchestration/tasks/issue-10.md")).toBe(true);
     expect(updateTaskStatusMock).toHaveBeenCalled();
-    const call = updateTaskStatusMock.mock.calls[0];
-    expect(call[1]).toBe("blocked");
-    expect(call[2]["blocked-source"]).toBe("deps");
+    const call = updateTaskStatusMock.mock.calls[0] as any;
+    expect(call?.[1]).toBe("blocked");
+    expect(call?.[2]?.["blocked-source"]).toBe("deps");
   });
 
   test("does not unblock tasks blocked for other reasons", async () => {
