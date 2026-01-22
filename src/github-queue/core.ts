@@ -42,24 +42,23 @@ export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: 
 export function planClaim(currentLabels: string[]): {
   claimable: boolean;
   steps: LabelOp[];
-  rollback: LabelOp[];
   reason?: string;
 } {
   const labelSet = new Set(currentLabels);
   if (labelSet.has("ralph:escalated")) {
-    return { claimable: false, steps: [], rollback: [], reason: "Issue is escalated" };
+    return { claimable: false, steps: [], reason: "Issue is escalated" };
   }
   if (labelSet.has("ralph:blocked")) {
-    return { claimable: false, steps: [], rollback: [], reason: "Issue is blocked" };
+    return { claimable: false, steps: [], reason: "Issue is blocked" };
   }
   if (labelSet.has("ralph:in-bot")) {
-    return { claimable: false, steps: [], rollback: [], reason: "Issue already in bot" };
+    return { claimable: false, steps: [], reason: "Issue already in bot" };
   }
   if (labelSet.has("ralph:in-progress")) {
-    return { claimable: false, steps: [], rollback: [], reason: "Issue already in progress" };
+    return { claimable: false, steps: [], reason: "Issue already in progress" };
   }
   if (!labelSet.has("ralph:queued")) {
-    return { claimable: false, steps: [], rollback: [], reason: "Missing ralph:queued label" };
+    return { claimable: false, steps: [], reason: "Missing ralph:queued label" };
   }
 
   return {
@@ -67,10 +66,6 @@ export function planClaim(currentLabels: string[]): {
     steps: [
       { action: "add", label: "ralph:in-progress" },
       { action: "remove", label: "ralph:queued" },
-    ],
-    rollback: [
-      { action: "remove", label: "ralph:in-progress" },
-      { action: "add", label: "ralph:queued" },
     ],
   };
 }

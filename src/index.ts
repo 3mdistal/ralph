@@ -654,6 +654,8 @@ async function startTask(opts: {
   releaseRepo: () => void;
 }): Promise<boolean> {
   const { repo, task, releaseGlobal, releaseRepo } = opts;
+  const initialKey = getTaskKey(task);
+  inFlightTasks.add(initialKey);
 
   try {
     const nowMs = Date.now();
@@ -663,6 +665,7 @@ async function startTask(opts: {
       if (claim.reason && shouldLog(`ownership:skip:${task._path}`, 60_000)) {
         console.log(`[ralph] Skipping task ${task.name}: ${claim.reason}`);
       }
+      inFlightTasks.delete(initialKey);
       if (!isShuttingDown) scheduleQueuedTasksSoon();
       return false;
     }
@@ -671,7 +674,10 @@ async function startTask(opts: {
     recordOwnedTask(claimedTask);
 
     const key = getTaskKey(claimedTask);
-    inFlightTasks.add(key);
+    if (key !== initialKey) {
+      inFlightTasks.delete(initialKey);
+      inFlightTasks.add(key);
+    }
 
     try {
       void getOrCreateWorker(repo)
@@ -710,6 +716,7 @@ async function startTask(opts: {
     return true;
   } catch (error: any) {
     console.error(`[ralph] Error claiming task ${task.name}:`, error);
+    inFlightTasks.delete(initialKey);
     if (!isShuttingDown) scheduleQueuedTasksSoon();
     return false;
   }
