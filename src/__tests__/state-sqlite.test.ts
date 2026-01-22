@@ -33,6 +33,139 @@ let priorStateDbPath: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 describe("State SQLite (~/.ralph/state.sqlite)", () => {
+  test("migrates schema from v3", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '3')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS repos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          local_path TEXT,
+          bot_branch TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS issues (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          number INTEGER NOT NULL,
+          title TEXT,
+          state TEXT,
+          url TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, number),
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT NOT NULL,
+          task_name TEXT,
+          status TEXT,
+          session_id TEXT,
+          worktree_path TEXT,
+          worker_id TEXT,
+          repo_slot TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, task_path),
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS prs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          pr_number INTEGER,
+          url TEXT,
+          state TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, url),
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS repo_sync (
+          repo_id INTEGER PRIMARY KEY,
+          last_sync_at TEXT NOT NULL,
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS idempotency (
+          key TEXT PRIMARY KEY,
+          scope TEXT,
+          created_at TEXT NOT NULL,
+          payload_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS rollup_batches (
+          id TEXT PRIMARY KEY,
+          repo_id INTEGER NOT NULL,
+          bot_branch TEXT NOT NULL,
+          batch_size INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          rollup_pr_url TEXT,
+          rollup_pr_number INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          rollup_created_at TEXT,
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+          UNIQUE(repo_id, bot_branch, status)
+        );
+
+        CREATE TABLE IF NOT EXISTS rollup_batch_prs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id TEXT NOT NULL,
+          pr_url TEXT NOT NULL,
+          pr_number INTEGER,
+          issue_refs_json TEXT,
+          merged_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(batch_id) REFERENCES rollup_batches(id) ON DELETE CASCADE,
+          UNIQUE(batch_id, pr_url)
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const migrated = new Database(dbPath);
+    try {
+      const meta = migrated
+        .query("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get() as { value?: string };
+      expect(meta.value).toBe("5");
+
+      const columns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
+      const columnNames = columns.map((column) => column.name);
+      expect(columnNames).toContain("github_node_id");
+      expect(columnNames).toContain("github_updated_at");
+
+      const issueLabelsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'issue_labels'")
+        .get() as { name?: string } | undefined;
+      expect(issueLabelsTable?.name).toBe("issue_labels");
+
+      const cursorTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_issue_sync'")
+        .get() as { name?: string } | undefined;
+      expect(cursorTable?.name).toBe("repo_github_issue_sync");
+    } finally {
+      migrated.close();
+    }
+  });
+
   beforeEach(async () => {
     priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
     releaseLock = await acquireGlobalTestLock();
@@ -42,15 +175,18 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
   });
 
   afterEach(async () => {
-    closeStateDbForTests();
-    if (priorStateDbPath === undefined) {
-      delete process.env.RALPH_STATE_DB_PATH;
-    } else {
-      process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
+    try {
+      closeStateDbForTests();
+      await rm(homeDir, { recursive: true, force: true });
+    } finally {
+      if (priorStateDbPath === undefined) {
+        delete process.env.RALPH_STATE_DB_PATH;
+      } else {
+        process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
+      }
+      releaseLock?.();
+      releaseLock = null;
     }
-    await rm(homeDir, { recursive: true, force: true });
-    releaseLock?.();
-    releaseLock = null;
   });
 
   test("initializes schema and supports metadata writes", () => {
