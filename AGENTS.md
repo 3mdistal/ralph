@@ -7,6 +7,7 @@ This repo is designed to be worked on by autonomous coding agents.
 - Escalation & routing policy (single source of truth): `docs/escalation-policy.md`
 - Product vision and operating principles: `docs/product/vision.md`
 - Deterministic orchestration gates (tests, review, CI triage): `docs/product/deterministic-gates.md`
+- CI checks reference (derived from workflow + scripts): `docs/ops/ci-checks.md`
 
 ## PR / branch strategy
 
