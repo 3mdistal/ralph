@@ -139,7 +139,9 @@ export async function reconcileEscalationResolutions(params: {
   const log = params.log ?? console.log;
   const maxEscalations = params.maxEscalations ?? DEFAULT_MAX_ESCALATIONS;
   const maxRecentComments = params.maxRecentComments ?? DEFAULT_MAX_RECENT_COMMENTS;
-  initStateDb();
+  if (!params.deps) {
+    initStateDb();
+  }
   const deps =
     params.deps ??
     ({

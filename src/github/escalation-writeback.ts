@@ -224,12 +224,10 @@ export async function writeEscalationToGitHub(
   }
 
   let hasKeyResult = false;
-  let idempotencyAvailable = true;
   let ignoreExistingKey = false;
   try {
     hasKeyResult = hasKey(plan.idempotencyKey);
   } catch (error: any) {
-    idempotencyAvailable = false;
     log(`${prefix} Failed to check idempotency: ${error?.message ?? String(error)}`);
   }
 
@@ -292,7 +290,6 @@ export async function writeEscalationToGitHub(
   try {
     claimed = recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
   } catch (error: any) {
-    idempotencyAvailable = false;
     log(`${prefix} Failed to record idempotency before posting comment: ${error?.message ?? String(error)}`);
   }
 
@@ -301,7 +298,6 @@ export async function writeEscalationToGitHub(
     try {
       alreadyClaimed = hasKey(plan.idempotencyKey);
     } catch (error: any) {
-      idempotencyAvailable = false;
       log(`${prefix} Failed to re-check idempotency: ${error?.message ?? String(error)}`);
     }
     if (alreadyClaimed) {
