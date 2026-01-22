@@ -140,7 +140,7 @@ export function extractPrUrl(output: string): string | null {
 }
 
 /**
- * Prefer best-effort structured PR URL if available; otherwise parse from text output.
+ * Prefer best-effort structured PR URL if available; otherwise return the latest PR URL in output.
  */
 export function extractPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
   if (result.prUrl) return result.prUrl;
