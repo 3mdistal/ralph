@@ -65,12 +65,12 @@ export function planClaim(currentLabels: string[]): {
   return {
     claimable: true,
     steps: [
-      { action: "remove", label: "ralph:queued" },
       { action: "add", label: "ralph:in-progress" },
+      { action: "remove", label: "ralph:queued" },
     ],
     rollback: [
-      { action: "add", label: "ralph:queued" },
       { action: "remove", label: "ralph:in-progress" },
+      { action: "add", label: "ralph:queued" },
     ],
   };
 }

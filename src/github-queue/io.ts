@@ -16,7 +16,7 @@ import {
   type TaskOpState,
 } from "../state";
 import type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "../queue/types";
-import { deriveTaskView, planClaim, statusToRalphLabelDelta, shouldRecoverStaleInProgress } from "./core";
+import { deriveTaskView, planClaim, statusToRalphLabelDelta, shouldRecoverStaleInProgress, type LabelOp } from "./core";
 
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 
@@ -106,10 +106,51 @@ function applyLabelDelta(params: {
   });
 }
 
+async function applyLabelOps(params: {
+  repo: string;
+  issueNumber: number;
+  steps: LabelOp[];
+  rollback: LabelOp[];
+  logLabel: string;
+}): Promise<{ add: string[]; remove: string[]; ok: boolean }> {
+  const added: string[] = [];
+  const removed: string[] = [];
+
+  for (const step of params.steps) {
+    try {
+      if (step.action === "add") {
+        await addIssueLabel(params.repo, params.issueNumber, step.label);
+        added.push(step.label);
+      } else {
+        const result = await removeIssueLabel(params.repo, params.issueNumber, step.label);
+        if (result.removed) removed.push(step.label);
+      }
+    } catch (error: any) {
+      console.warn(
+        `[ralph:queue:github] Failed to ${step.action} ${step.label} for ${params.logLabel}: ${error?.message ?? String(error)}`
+      );
+      for (const rollback of params.rollback) {
+        try {
+          if (rollback.action === "add") {
+            await addIssueLabel(params.repo, params.issueNumber, rollback.label);
+          } else {
+            await removeIssueLabel(params.repo, params.issueNumber, rollback.label);
+          }
+        } catch {
+          // best-effort rollback
+        }
+      }
+      return { add: added, remove: removed, ok: false };
+    }
+  }
+
+  return { add: added, remove: removed, ok: true };
+}
+
 function normalizeOptionalString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const trimmed = value.trim();
-  return trimmed ? trimmed : "";
+  return trimmed ? trimmed : undefined;
 }
 
 function buildOwnershipSkipReason(state: TaskOpState, daemonId: string, nowMs: number, ttlMs: number): string {
@@ -273,38 +314,22 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         const nowIso = new Date(opts.nowMs).toISOString();
         const taskPath = opState.taskPath || `github:${issueRef.repo}#${issueRef.number}`;
 
-        try {
-          await addIssueLabel(issueRef.repo, issueRef.number, "ralph:in-progress");
-        } catch (error: any) {
-          for (const step of plan.rollback) {
-            try {
-              if (step.action === "add") {
-                await addIssueLabel(issueRef.repo, issueRef.number, step.label);
-              } else {
-                await removeIssueLabel(issueRef.repo, issueRef.number, step.label);
-              }
-            } catch {
-              // best-effort rollback
-            }
-          }
-          return { claimed: false, task: opts.task, reason: error?.message ?? String(error) };
-        }
-
-        let removedQueued = false;
-        try {
-          const removeResult = await removeIssueLabel(issueRef.repo, issueRef.number, "ralph:queued");
-          removedQueued = removeResult.removed;
-        } catch (error: any) {
-          console.warn(
-            `[ralph:queue:github] Failed to remove queued label for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
-          );
+        const labelOps = await applyLabelOps({
+          repo: issueRef.repo,
+          issueNumber: issueRef.number,
+          steps: plan.steps,
+          rollback: plan.rollback,
+          logLabel: `${issueRef.repo}#${issueRef.number}`,
+        });
+        if (!labelOps.ok) {
+          return { claimed: false, task: opts.task, reason: "Failed to update claim labels" };
         }
 
         applyLabelDelta({
           repo: issueRef.repo,
           issueNumber: issueRef.number,
-          add: ["ralph:in-progress"],
-          remove: removedQueued ? ["ralph:queued"] : [],
+          add: labelOps.add,
+          remove: labelOps.remove,
           nowIso,
         });
 

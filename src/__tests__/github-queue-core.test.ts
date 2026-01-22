@@ -12,8 +12,8 @@ describe("github queue core", () => {
     const plan = planClaim(["ralph:queued"]);
     expect(plan.claimable).toBe(true);
     expect(plan.steps).toEqual([
-      { action: "remove", label: "ralph:queued" },
       { action: "add", label: "ralph:in-progress" },
+      { action: "remove", label: "ralph:queued" },
     ]);
   });
 
