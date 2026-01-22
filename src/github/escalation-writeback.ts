@@ -215,16 +215,12 @@ export async function writeEscalationToGitHub(
 
   let hasKeyResult = false;
   let idempotencyAvailable = true;
+  let ignoreExistingKey = false;
   try {
     hasKeyResult = hasKey(plan.idempotencyKey);
   } catch (error: any) {
     idempotencyAvailable = false;
     log(`${prefix} Failed to check idempotency: ${error?.message ?? String(error)}`);
-  }
-
-  if (hasKeyResult) {
-    log(`${prefix} Escalation comment already recorded (idempotency); skipping.`);
-    return { postedComment: false, skippedComment: true, markerFound: true };
   }
 
   let listResult: { comments: IssueComment[]; reachedMax: boolean } | null = null;
@@ -250,6 +246,20 @@ export async function writeEscalationToGitHub(
       return found ? found === plan.markerId : body.includes(plan.marker);
     }) ?? false;
 
+  if (hasKeyResult && markerFound) {
+    log(`${prefix} Escalation comment already recorded (idempotency + marker); skipping.`);
+    return { postedComment: false, skippedComment: true, markerFound: true };
+  }
+
+  if (hasKeyResult && !markerFound) {
+    ignoreExistingKey = true;
+    try {
+      deleteKey(plan.idempotencyKey);
+    } catch (error: any) {
+      log(`${prefix} Failed to clear stale idempotency key: ${error?.message ?? String(error)}`);
+    }
+  }
+
   if (markerFound) {
     try {
       recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
@@ -273,7 +283,7 @@ export async function writeEscalationToGitHub(
     log(`${prefix} Failed to record idempotency before posting comment: ${error?.message ?? String(error)}`);
   }
 
-  if (!claimed) {
+  if (!claimed && !ignoreExistingKey) {
     let alreadyClaimed = false;
     try {
       alreadyClaimed = hasKey(plan.idempotencyKey);
