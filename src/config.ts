@@ -112,6 +112,8 @@ export interface OpencodeConfig {
   defaultProfile?: string;
   /** Named profiles keyed by their identifier (e.g. "apple", "google"). */
   profiles?: Record<string, OpencodeProfileConfig>;
+  /** Optional managed OpenCode config dir for daemon runs (absolute path). */
+  managedConfigDir?: string;
 }
 
 export interface ControlConfig {
@@ -470,6 +472,23 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       }
     }
 
+    const rawManagedConfigDir = (rawOpencode as any).managedConfigDir;
+    let managedConfigDir: string | undefined;
+    if (rawManagedConfigDir !== undefined) {
+      if (typeof rawManagedConfigDir === "string" && rawManagedConfigDir.trim()) {
+        const trimmed = rawManagedConfigDir.trim();
+        if (!isAbsolute(trimmed)) {
+          console.warn(
+            `[ralph] Invalid config opencode.managedConfigDir=${JSON.stringify(trimmed)}; must be an absolute path. Ignoring.`
+          );
+        } else {
+          managedConfigDir = trimmed;
+        }
+      } else {
+        console.warn(`[ralph] Invalid config opencode.managedConfigDir=${JSON.stringify(rawManagedConfigDir)}; ignoring`);
+      }
+    }
+
     const rawProfiles = (rawOpencode as any).profiles;
     const profiles: Record<string, OpencodeProfileConfig> = {};
 
@@ -527,13 +546,16 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     const rawDefaultProfile = (rawOpencode as any).defaultProfile;
     const defaultProfile = typeof rawDefaultProfile === "string" ? rawDefaultProfile.trim() : "";
 
+    const attachManaged = (opencode: OpencodeConfig): OpencodeConfig =>
+      managedConfigDir ? { ...opencode, managedConfigDir } : opencode;
+
     if (enabled && profileNames.length === 0) {
       console.warn("[ralph] OpenCode profiles enabled but no valid profiles were configured; falling back to ambient XDG dirs");
-      loaded.opencode = { enabled: false };
+      loaded.opencode = attachManaged({ enabled: false });
     } else if (!enabled) {
-      loaded.opencode = { enabled: false };
+      loaded.opencode = attachManaged({ enabled: false });
     } else if (defaultProfile && profiles[defaultProfile]) {
-      loaded.opencode = { enabled: true, defaultProfile, profiles };
+      loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
     } else {
       const fallback = profileNames[0] ?? "";
       if (fallback) {
@@ -542,9 +564,9 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
             `[ralph] Invalid config opencode.defaultProfile=${JSON.stringify(defaultProfile)}; falling back to ${JSON.stringify(fallback)}`
           );
         }
-        loaded.opencode = { enabled: true, defaultProfile: fallback, profiles };
+        loaded.opencode = attachManaged({ enabled: true, defaultProfile: fallback, profiles });
       } else {
-        loaded.opencode = { enabled: false };
+        loaded.opencode = attachManaged({ enabled: false });
       }
     }
   }

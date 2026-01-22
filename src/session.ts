@@ -27,6 +27,7 @@ import { dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
+import { ensureManagedOpencodeConfigInstalled } from "./opencode-managed-config";
 import { registerOpencodeRun, unregisterOpencodeRun, updateOpencodeRun } from "./opencode-process-registry";
 import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
 
@@ -67,11 +68,12 @@ export interface SessionResult {
 async function spawnServer(repoPath: string): Promise<ServerHandle> {
   return new Promise((resolve, reject) => {
     const port = 4000 + Math.floor(Math.random() * 1000);
+    const { env } = buildOpencodeSpawnEnvironment({ repo: repoPath, cacheKey: "server" });
 
     const proc = spawnFn("opencode", ["serve", "--port", String(port)], {
       cwd: repoPath,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env },
+      env,
     });
 
     let started = false;
@@ -152,6 +154,45 @@ function getIsolatedXdgCacheHome(opts?: {
   const cacheHome = rawCacheHome ? rawCacheHome : join(homeDir, ".cache");
 
   return join(cacheHome, "ralph-opencode", repo, key);
+}
+
+type OpencodeSpawnOptions = {
+  repo?: string;
+  cacheKey?: string;
+  opencodeXdg?: {
+    dataHome?: string;
+    configHome?: string;
+    stateHome?: string;
+    cacheHome?: string;
+  };
+};
+
+function buildOpencodeSpawnEnvironment(opts?: OpencodeSpawnOptions): { env: Record<string, string | undefined>; xdgCacheHome: string } {
+  const opencodeXdg = opts?.opencodeXdg;
+  const xdgCacheHome = getIsolatedXdgCacheHome({
+    repo: opts?.repo,
+    cacheKey: opts?.cacheKey,
+    xdgCacheHome: opencodeXdg?.cacheHome,
+  });
+  mkdirSync(xdgCacheHome, { recursive: true });
+
+  const opencodeConfigDir = ensureManagedOpencodeConfigInstalled();
+
+  return {
+    xdgCacheHome,
+    env: {
+      ...process.env,
+      OPENCODE_CONFIG_DIR: opencodeConfigDir,
+      ...(opencodeXdg?.dataHome ? { XDG_DATA_HOME: opencodeXdg.dataHome } : {}),
+      ...(opencodeXdg?.configHome ? { XDG_CONFIG_HOME: opencodeXdg.configHome } : {}),
+      ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
+      XDG_CACHE_HOME: xdgCacheHome,
+    },
+  };
+}
+
+export function __buildOpencodeEnvForTests(opts?: OpencodeSpawnOptions): Record<string, string | undefined> {
+  return buildOpencodeSpawnEnvironment(opts).env;
 }
 
 function extractOpencodeLogPath(text: string): string | null {
@@ -565,25 +606,11 @@ async function runSession(
   args.push("--format", "json");
 
   const opencodeXdg = options?.opencodeXdg;
-
-  // IMPORTANT: OpenCode installs plugins/deps under its cache dir (XDG_CACHE_HOME/opencode).
-  // If multiple OpenCode runs share the same cache concurrently, we can get transient ENOENTs
-  // due to node_modules being mutated mid-import. To keep Ralph stable under concurrency,
-  // isolate XDG_CACHE_HOME per repo/task key.
-  const xdgCacheHome = getIsolatedXdgCacheHome({
+  const { env } = buildOpencodeSpawnEnvironment({
     repo: options?.repo,
     cacheKey: options?.cacheKey,
-    xdgCacheHome: opencodeXdg?.cacheHome,
+    opencodeXdg,
   });
-  mkdirSync(xdgCacheHome, { recursive: true });
-
-  const env = {
-    ...process.env,
-    ...(opencodeXdg?.dataHome ? { XDG_DATA_HOME: opencodeXdg.dataHome } : {}),
-    ...(opencodeXdg?.configHome ? { XDG_CONFIG_HOME: opencodeXdg.configHome } : {}),
-    ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
-    XDG_CACHE_HOME: xdgCacheHome,
-  };
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const processKill = options?.__testOverrides?.processKill ?? process.kill;
   const useProcessGroup = process.platform !== "win32";
@@ -1408,14 +1435,11 @@ async function* streamSession(
 
   args.push("--format", "json");
 
-  const opencodeXdg = options?.opencodeXdg;
-
-  const xdgCacheHome = getIsolatedXdgCacheHome({
+  const { env } = buildOpencodeSpawnEnvironment({
     repo: options?.repo,
     cacheKey: options?.cacheKey,
-    xdgCacheHome: opencodeXdg?.cacheHome,
+    opencodeXdg: options?.opencodeXdg,
   });
-  mkdirSync(xdgCacheHome, { recursive: true });
 
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const useProcessGroup = process.platform !== "win32";
@@ -1423,13 +1447,7 @@ async function* streamSession(
   const proc = spawn("opencode", args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
-    env: {
-      ...process.env,
-      ...(opencodeXdg?.dataHome ? { XDG_DATA_HOME: opencodeXdg.dataHome } : {}),
-      ...(opencodeXdg?.configHome ? { XDG_CONFIG_HOME: opencodeXdg.configHome } : {}),
-      ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
-      XDG_CACHE_HOME: xdgCacheHome,
-    },
+    env,
     ...(useProcessGroup ? { detached: true } : {}),
   });
 

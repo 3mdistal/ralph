@@ -112,6 +112,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 - `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
+  - `managedConfigDir` (string, optional): absolute path for Ralph-managed OpenCode config (default: `$HOME/.ralph/opencode`)
 - `control` (object, optional): control file defaults
   - `autoCreate` (boolean): create `control.json` on startup (default: true)
   - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
@@ -134,6 +135,7 @@ Only these env vars are currently supported (unless noted otherwise):
 |---------|---------|---------|
 | Sessions dir | `RALPH_SESSIONS_DIR` | `~/.ralph/sessions` |
 | Worktrees dir | `RALPH_WORKTREES_DIR` | `~/.ralph/worktrees` |
+| Managed OpenCode config dir | `RALPH_OPENCODE_CONFIG_DIR` | `$HOME/.ralph/opencode` |
 | Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
 | Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
 | CI remediation attempts | `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` | `2` |
@@ -309,6 +311,10 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - Active OpenCode profile: set `opencode_profile` (affects new tasks only; tasks pin their profile on start)
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
+
+## Managed OpenCode config (daemon runs)
+
+Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `$HOME/.ralph/opencode`. This directory is owned by Ralph and overwritten on startup to match the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Override precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. Overrides must be absolute paths (no `~` expansion). For safety, Ralph refuses to manage non-managed directories unless they already contain the `.ralph-managed-opencode` marker file. This does not change OpenCode profile storage; profiles still control XDG roots for auth/storage/usage logs.
 
 ## OpenCode profiles (multi-account)
 
