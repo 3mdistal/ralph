@@ -12,6 +12,7 @@ const MARKER_CONTENTS = "managed by ralph\n";
 const LOCK_FILENAME = ".ralph-managed-opencode.lock";
 const LOCK_ATTEMPTS = 20;
 const LOCK_WAIT_MS = 50;
+const LOCK_STALE_MS = 5 * 60_000;
 
 type ManagedConfigFile = {
   path: string;
@@ -93,6 +94,27 @@ function sleepMs(ms: number): void {
   Atomics.wait(shared, 0, 0, ms);
 }
 
+function readLockInfo(path: string): { pid?: number; createdAt?: number } | null {
+  try {
+    const raw = readFileSync(path, "utf8");
+    const parsed = JSON.parse(raw) as { pid?: number; createdAt?: number };
+    return parsed ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function isLockStale(info: { pid?: number; createdAt?: number } | null): boolean {
+  if (!info?.pid || !info?.createdAt) return true;
+  if (Date.now() - info.createdAt > LOCK_STALE_MS) return true;
+  try {
+    process.kill(info.pid, 0);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 function withManagedConfigLock(dir: string, fn: () => void): void {
   const lockPath = join(dir, LOCK_FILENAME);
   let fd: number | null = null;
@@ -101,17 +123,31 @@ function withManagedConfigLock(dir: string, fn: () => void): void {
   for (let attempt = 0; attempt < LOCK_ATTEMPTS; attempt++) {
     try {
       fd = openSync(lockPath, "wx");
+      const payload = JSON.stringify({ pid: process.pid, createdAt: Date.now() });
+      writeFileSync(fd, payload, "utf8");
       break;
     } catch (err: any) {
       lastError = err;
       if (err?.code !== "EEXIST") break;
+      const info = readLockInfo(lockPath);
+      if (isLockStale(info)) {
+        try {
+          unlinkSync(lockPath);
+        } catch {
+          // ignore
+        }
+        continue;
+      }
       sleepMs(LOCK_WAIT_MS);
     }
   }
 
   if (fd == null) {
     const detail = lastError instanceof Error ? lastError.message : String(lastError ?? "unknown");
-    throw new Error(`[ralph] Failed to acquire managed OpenCode config lock ${lockPath}: ${detail}`);
+    throw new Error(
+      `[ralph] Failed to acquire managed OpenCode config lock ${lockPath}: ${detail}. ` +
+        `If this is stale, delete the lock file and retry.`
+    );
   }
 
   try {
@@ -178,6 +214,10 @@ export function ensureManagedOpencodeConfigInstalled(configDir?: string): string
 
   withManagedConfigLock(resolvedDir, () => {
     for (const file of manifest.files) {
+      const rel = relative(resolvedDir, file.path);
+      if (rel.startsWith("..") || isAbsolute(rel)) {
+        throw new Error(`[ralph] Refusing to write managed file outside config dir: ${file.path}`);
+      }
       writeFileAtomic(file.path, file.contents);
     }
   });
