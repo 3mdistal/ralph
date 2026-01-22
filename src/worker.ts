@@ -801,14 +801,33 @@ export class RepoWorker {
     if (!issueRef) return;
     let baseBranch = params.baseBranch ?? null;
     let plan: MidpointLabelPlan | null = null;
+    let defaultBranch: string | null = null;
+
+    try {
+      defaultBranch = await this.fetchRepoDefaultBranch();
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to fetch default branch for midpoint labels: ${error?.message ?? String(error)}`
+      );
+    }
+
+    const resolvedDefaultBranch = defaultBranch ?? "main";
 
     if (baseBranch) {
-      plan = computeMidpointLabelPlan({ baseBranch, botBranch: params.botBranch });
+      plan = computeMidpointLabelPlan({
+        baseBranch,
+        botBranch: params.botBranch,
+        defaultBranch: resolvedDefaultBranch,
+      });
     } else {
       try {
         baseBranch = await this.getPullRequestBaseBranch(params.prUrl);
         if (baseBranch) {
-          plan = computeMidpointLabelPlan({ baseBranch, botBranch: params.botBranch });
+          plan = computeMidpointLabelPlan({
+            baseBranch,
+            botBranch: params.botBranch,
+            defaultBranch: resolvedDefaultBranch,
+          });
         }
       } catch (error: any) {
         console.warn(

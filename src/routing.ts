@@ -115,11 +115,6 @@ function extractPrUrls(output: string): string[] {
   return matches ?? [];
 }
 
-function extractFirstPrUrl(output: string): string | null {
-  const urls = extractPrUrls(output);
-  return urls[0] ?? null;
-}
-
 function extractLatestPrUrl(output: string): string | null {
   const urls = extractPrUrls(output);
   return urls.length > 0 ? urls[urls.length - 1] : null;
