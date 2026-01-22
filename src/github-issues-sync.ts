@@ -172,7 +172,7 @@ async function fetchIssuesSince(params: {
   | { ok: true; issues: IssuePayload[]; fetched: number; maxUpdatedAt: string | null }
   | { ok: false; fetched: number; maxUpdatedAt: string | null; rateLimitResetMs?: number; error: string }
 > {
-  let url = new URL(`https://api.github.com/repos/${params.repo}/issues`);
+  let url: URL | null = new URL(`https://api.github.com/repos/${params.repo}/issues`);
   url.searchParams.set("state", "all");
   if (params.since) url.searchParams.set("since", params.since);
   url.searchParams.set("sort", "updated");
@@ -214,8 +214,7 @@ async function fetchIssuesSince(params: {
     }
 
     const links = parseLinkHeader(result.headers.get("link"));
-    const nextUrl = links.next ? new URL(links.next) : null;
-    url = nextUrl;
+    url = links.next ? new URL(links.next) : null;
 
     if (rows.length > 0) {
       const last = rows[rows.length - 1];
@@ -302,8 +301,8 @@ export async function syncRepoIssuesOnce(params: {
       }
     });
 
-    const hasIssues = fetchResult.issues.length > 0;
-    const newLastSyncAt = hasIssues
+    const hasRows = fetchResult.fetched > 0;
+    const newLastSyncAt = hasRows
       ? fetchResult.maxUpdatedAt ?? params.lastSyncAt ?? nowIso
       : params.lastSyncAt ?? null;
 
@@ -313,7 +312,7 @@ export async function syncRepoIssuesOnce(params: {
       stored,
       ralphCount,
       newLastSyncAt,
-      hadChanges: fetchResult.issues.length > 0,
+      hadChanges: stored > 0,
     };
   } catch (error: any) {
     return {
