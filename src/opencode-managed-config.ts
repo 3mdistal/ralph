@@ -166,7 +166,7 @@ function withManagedConfigLock(dir: string, fn: () => void): void {
   }
 }
 
-export function resolveManagedOpencodeConfigDir(): string {
+function resolveManagedOpencodeConfigDir(): string {
   const envOverride = process.env.RALPH_OPENCODE_CONFIG_DIR?.trim();
   if (envOverride) {
     if (!isAbsolute(envOverride)) {
