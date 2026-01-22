@@ -29,7 +29,7 @@ async function listRecentIssueComments(params: {
   repo: string;
   issueNumber: number;
   limit: number;
-}): Promise<string[]> {
+}): Promise<Array<{ body: string; authorLogin: string | null }>> {
   const { owner, name } = splitRepoFullName(params.repo);
   const query = `query($owner: String!, $name: String!, $number: Int!, $last: Int!) {
   repository(owner: $owner, name: $name) {
@@ -37,6 +37,9 @@ async function listRecentIssueComments(params: {
       comments(last: $last) {
         nodes {
           body
+          author {
+            login
+          }
         }
       }
     }
@@ -54,7 +57,10 @@ async function listRecentIssueComments(params: {
   });
 
   const nodes = response.data?.data?.repository?.issue?.comments?.nodes ?? [];
-  return nodes.map((node: { body?: string | null } | undefined) => node?.body ?? "");
+  return nodes.map((node: { body?: string | null; author?: { login?: string | null } } | undefined) => ({
+    body: node?.body ?? "",
+    authorLogin: node?.author?.login ?? null,
+  }));
 }
 
 async function addIssueLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
@@ -139,6 +145,7 @@ export async function reconcileEscalationResolutions(params: {
   const log = params.log ?? console.log;
   const maxEscalations = params.maxEscalations ?? DEFAULT_MAX_ESCALATIONS;
   const maxRecentComments = params.maxRecentComments ?? DEFAULT_MAX_RECENT_COMMENTS;
+  const repoOwner = params.repo.split("/")[0]?.toLowerCase() ?? "";
   if (!params.deps) {
     initStateDb();
   }
@@ -184,7 +191,7 @@ export async function reconcileEscalationResolutions(params: {
 
   const toCheck = pendingCommentChecks.slice(0, maxEscalations);
   for (const issue of toCheck) {
-    let bodies: string[] = [];
+    let bodies: Array<{ body: string; authorLogin: string | null }> = [];
     try {
       bodies = await listRecentIssueComments({
         github: deps.github,
@@ -200,9 +207,11 @@ export async function reconcileEscalationResolutions(params: {
       );
       continue;
     }
-    const hasResolution = bodies.some(
-      (body) => RALPH_RESOLVED_REGEX.test(body) && !body.includes(RALPH_ESCALATION_MARKER_PREFIX)
-    );
+    const hasResolution = bodies.some((entry) => {
+      const author = entry.authorLogin?.toLowerCase() ?? "";
+      if (repoOwner && author !== repoOwner) return false;
+      return RALPH_RESOLVED_REGEX.test(entry.body) && !entry.body.includes(RALPH_ESCALATION_MARKER_PREFIX);
+    });
     if (!hasResolution) continue;
 
     try {

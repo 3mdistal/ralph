@@ -12,7 +12,10 @@ describe("escalation resolution reconciliation", () => {
 
         if (path === "/graphql") {
           const number = opts.body?.variables?.number;
-          const nodes = number === 11 ? [{ body: "RALPH RESOLVED: proceed" }] : [];
+          const nodes =
+            number === 11
+              ? [{ body: "RALPH RESOLVED: proceed", author: { login: "3mdistal" } }]
+              : [];
           return {
             data: {
               data: {
@@ -90,13 +93,14 @@ describe("escalation resolution reconciliation", () => {
     expect(added).toEqual(expect.arrayContaining(["/repos/3mdistal/ralph/issues/11/labels"]));
   });
 
-  test("ignores RALPH RESOLVED in escalation comment", async () => {
+  test("ignores RALPH RESOLVED from non-operator", async () => {
     const github = {
       request: async (path: string, opts: { method?: string; body?: any } = {}) => {
         if (path === "/graphql") {
           const nodes = [
             {
-              body: "<!-- ralph-escalation:id=abc123 -->\nUse `RALPH RESOLVED: <guidance>` to resolve.",
+              body: "RALPH RESOLVED: attempt without operator",
+              author: { login: "someone" },
             },
           ];
           return {

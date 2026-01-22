@@ -3,6 +3,7 @@ import {
   RALPH_LABEL_ESCALATED,
   RALPH_LABEL_IN_PROGRESS,
   RALPH_LABEL_QUEUED,
+  RALPH_ESCALATION_MARKER_REGEX,
   RALPH_RESOLVED_TEXT,
 } from "./escalation-constants";
 import { GitHubClient, splitRepoFullName } from "./client";
@@ -82,7 +83,7 @@ export function buildEscalationMarker(params: {
 }
 
 export function extractExistingMarker(body: string): string | null {
-  const match = body.match(/<!--\s*ralph-escalation:id=([a-f0-9]+)\s*-->/i);
+  const match = body.match(RALPH_ESCALATION_MARKER_REGEX);
   return match?.[1] ?? null;
 }
 
@@ -149,25 +150,45 @@ export function planEscalationWriteback(ctx: EscalationWritebackContext): Escala
   };
 }
 
-async function listIssueComments(params: {
+async function listRecentIssueComments(params: {
   github: GitHubClient;
   repo: string;
   issueNumber: number;
-  maxPages: number;
+  limit: number;
 }): Promise<{ comments: IssueComment[]; reachedMax: boolean }> {
   const { owner, name } = splitRepoFullName(params.repo);
-  const comments: IssueComment[] = [];
-  let reachedMax = false;
-
-  for (let page = 1; page <= params.maxPages; page += 1) {
-    const response = await params.github.request<IssueComment[]>(
-      `/repos/${owner}/${name}/issues/${params.issueNumber}/comments?per_page=100&page=${page}`
-    );
-    const rows = Array.isArray(response.data) ? response.data : [];
-    comments.push(...rows);
-    if (rows.length < 100) break;
-    if (page === params.maxPages) reachedMax = true;
+  const query = `query($owner: String!, $name: String!, $number: Int!, $last: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      comments(last: $last) {
+        nodes {
+          body
+        }
+        pageInfo {
+          hasPreviousPage
+        }
+      }
+    }
   }
+}`;
+
+  const response = await params.github.request<{
+    data?: {
+      repository?: {
+        issue?: { comments?: { nodes?: Array<{ body?: string | null }>; pageInfo?: { hasPreviousPage?: boolean } } };
+      };
+    };
+  }>("/graphql", {
+    method: "POST",
+    body: {
+      query,
+      variables: { owner, name, number: params.issueNumber, last: params.limit },
+    },
+  });
+
+  const nodes = response.data?.data?.repository?.issue?.comments?.nodes ?? [];
+  const comments = nodes.map((node) => ({ body: node?.body ?? "" }));
+  const reachedMax = Boolean(response.data?.data?.repository?.issue?.comments?.pageInfo?.hasPreviousPage);
 
   return { comments, reachedMax };
 }
@@ -242,18 +263,18 @@ export async function writeEscalationToGitHub(
 
   let listResult: { comments: IssueComment[]; reachedMax: boolean } | null = null;
   try {
-    listResult = await listIssueComments({
+    listResult = await listRecentIssueComments({
       github: deps.github,
       repo: ctx.repo,
       issueNumber: ctx.issueNumber,
-      maxPages,
+      limit: maxPages * 100,
     });
   } catch (error: any) {
     log(`${prefix} Failed to list issue comments: ${error?.message ?? String(error)}`);
   }
 
   if (listResult?.reachedMax) {
-    log(`${prefix} Comment scan hit page cap (${maxPages}); marker detection may be incomplete.`);
+    log(`${prefix} Comment scan hit cap (${maxPages * 100}); marker detection may be incomplete.`);
   }
 
   const markerFound =

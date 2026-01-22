@@ -68,8 +68,18 @@ describe("github escalation writeback", () => {
 
     const github = {
       request: async (path: string, opts: { method?: string; body?: { body?: string } } = {}) => {
-        if (path.includes("/comments") && (opts.method ?? "GET") === "GET") {
-          return { data: [] };
+        if (path === "/graphql") {
+          return {
+            data: {
+              data: {
+                repository: {
+                  issue: {
+                    comments: { nodes: [], pageInfo: { hasPreviousPage: false } },
+                  },
+                },
+              },
+            },
+          };
         }
         if (path.includes("/comments") && opts.method === "POST") {
           postedBodies.push(opts.body?.body ?? "");
@@ -119,8 +129,21 @@ describe("github escalation writeback", () => {
 
     const github = {
       request: async (path: string, opts: { method?: string; body?: { body?: string } } = {}) => {
-        if (path.includes("/comments") && (opts.method ?? "GET") === "GET") {
-          return { data: [{ body: `prior\n${plan.marker}` }] };
+        if (path === "/graphql") {
+          return {
+            data: {
+              data: {
+                repository: {
+                  issue: {
+                    comments: {
+                      nodes: [{ body: `prior\n${plan.marker}` }],
+                      pageInfo: { hasPreviousPage: false },
+                    },
+                  },
+                },
+              },
+            },
+          };
         }
         if (path.includes("/comments") && opts.method === "POST") {
           postedBodies.push(opts.body?.body ?? "");
@@ -166,8 +189,21 @@ describe("github escalation writeback", () => {
 
       const github = {
         request: async (path: string, opts: { method?: string } = {}) => {
-          if (path.includes("/comments") && (opts.method ?? "GET") === "GET") {
-            return { data: [] };
+          if (path === "/graphql") {
+            return {
+              data: {
+                data: {
+                  repository: {
+                    issue: {
+                      comments: { nodes: [], pageInfo: { hasPreviousPage: false } },
+                    },
+                  },
+                },
+              },
+            };
+          }
+          if (path.includes("/comments") && opts.method === "POST") {
+            return { data: {} };
           }
           return { data: {} };
         },
