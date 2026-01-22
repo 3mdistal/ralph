@@ -1,4 +1,4 @@
-import { hasIdempotencyKey, recordIdempotencyKey } from "../state";
+import { deleteIdempotencyKey, hasIdempotencyKey, recordIdempotencyKey } from "../state";
 import { GitHubClient, splitRepoFullName } from "./client";
 
 export type EscalationWritebackContext = {
@@ -78,9 +78,9 @@ export function buildEscalationComment(params: {
   taskName: string;
   issueUrl: string;
   reason: string;
-  ownerHandle?: string;
+  ownerHandle: string;
 }): string {
-  const owner = params.ownerHandle?.trim() ? params.ownerHandle.trim() : DEFAULT_OWNER_HANDLE;
+  const owner = params.ownerHandle.trim() || DEFAULT_OWNER_HANDLE;
   const reason = truncateText(params.reason, MAX_REASON_CHARS) || "(no reason provided)";
 
   return [
@@ -99,6 +99,8 @@ export function buildEscalationComment(params: {
 }
 
 export function planEscalationWriteback(ctx: EscalationWritebackContext): EscalationWritebackPlan {
+  const repoOwner = ctx.repo.split("/")[0] ?? "";
+  const ownerHandle = ctx.ownerHandle?.trim() || (repoOwner ? `@${repoOwner}` : DEFAULT_OWNER_HANDLE);
   const marker = buildEscalationMarker({
     repo: ctx.repo,
     issueNumber: ctx.issueNumber,
@@ -112,7 +114,7 @@ export function planEscalationWriteback(ctx: EscalationWritebackContext): Escala
     taskName: ctx.taskName,
     issueUrl,
     reason: ctx.reason,
-    ownerHandle: ctx.ownerHandle,
+    ownerHandle,
   });
 
   const markerId = extractExistingMarker(marker) ?? marker;
@@ -201,7 +203,14 @@ export async function writeEscalationToGitHub(
     }
   }
 
-  if (hasKey(plan.idempotencyKey)) {
+  let hasKeyResult = false;
+  try {
+    hasKeyResult = hasKey(plan.idempotencyKey);
+  } catch (error: any) {
+    log(`${prefix} Failed to check idempotency: ${error?.message ?? String(error)}`);
+  }
+
+  if (hasKeyResult) {
     log(`${prefix} Escalation comment already recorded (idempotency); skipping.`);
     return { postedComment: false, skippedComment: true, markerFound: true };
   }
@@ -223,18 +232,61 @@ export async function writeEscalationToGitHub(
     return found ? found === plan.markerId : body.includes(plan.marker);
   });
   if (markerFound) {
-    recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
+    try {
+      recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
+    } catch (error: any) {
+      log(`${prefix} Failed to record idempotency after marker match: ${error?.message ?? String(error)}`);
+    }
     log(`${prefix} Existing escalation marker found for #${ctx.issueNumber}; skipping comment.`);
     return { postedComment: false, skippedComment: true, markerFound: true };
   }
 
-  await createIssueComment({
-    github: deps.github,
-    repo: ctx.repo,
-    issueNumber: ctx.issueNumber,
-    body: plan.commentBody,
-  });
-  recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
+  let claimed = false;
+  try {
+    claimed = recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
+  } catch (error: any) {
+    log(`${prefix} Failed to record idempotency before posting comment: ${error?.message ?? String(error)}`);
+  }
+
+  if (!claimed) {
+    let alreadyClaimed = false;
+    try {
+      alreadyClaimed = hasKey(plan.idempotencyKey);
+    } catch (error: any) {
+      log(`${prefix} Failed to re-check idempotency: ${error?.message ?? String(error)}`);
+    }
+    if (alreadyClaimed) {
+      log(`${prefix} Escalation comment already claimed; skipping comment.`);
+      return { postedComment: false, skippedComment: true, markerFound: false };
+    }
+  }
+
+  try {
+    await createIssueComment({
+      github: deps.github,
+      repo: ctx.repo,
+      issueNumber: ctx.issueNumber,
+      body: plan.commentBody,
+    });
+  } catch (error) {
+    if (claimed) {
+      try {
+        deleteIdempotencyKey(plan.idempotencyKey);
+      } catch (deleteError: any) {
+        log(`${prefix} Failed to release idempotency key: ${deleteError?.message ?? String(deleteError)}`);
+      }
+    }
+    throw error;
+  }
+
+  if (!claimed) {
+    try {
+      recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
+    } catch (error: any) {
+      log(`${prefix} Failed to record idempotency after posting comment: ${error?.message ?? String(error)}`);
+    }
+  }
+
   log(`${prefix} Posted escalation comment for #${ctx.issueNumber}.`);
 
   return { postedComment: true, skippedComment: false, markerFound: false };

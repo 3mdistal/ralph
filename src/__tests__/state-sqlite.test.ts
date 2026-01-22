@@ -11,6 +11,7 @@ import {
   getIdempotencyPayload,
   getOrCreateRollupBatch,
   initStateDb,
+  listIssuesWithAllLabels,
   listOpenRollupBatches,
   listRollupBatchEntries,
   markRollupBatchRolledUp,
@@ -323,6 +324,31 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("lists issues with all labels", () => {
+    initStateDb();
+
+    recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#10",
+      labels: ["ralph:escalated", "ralph:queued"],
+      at: "2026-01-11T00:00:00.000Z",
+    });
+
+    recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#11",
+      labels: ["ralph:escalated"],
+      at: "2026-01-11T00:00:01.000Z",
+    });
+
+    const matches = listIssuesWithAllLabels({
+      repo: "3mdistal/ralph",
+      labels: ["ralph:escalated", "ralph:queued"],
+    });
+
+    expect(matches).toEqual([{ repo: "3mdistal/ralph", number: 10 }]);
   });
 
   test("records rollup batches and merges", () => {

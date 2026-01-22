@@ -431,6 +431,44 @@ export function recordIssueLabelsSnapshot(input: {
   })();
 }
 
+export function listIssuesWithAllLabels(params: {
+  repo: string;
+  labels: string[];
+}): Array<{ repo: string; number: number }> {
+  if (!params.labels.length) return [];
+
+  const database = requireDb();
+  const repoRow = database
+    .query("SELECT id FROM repos WHERE name = $name")
+    .get({ $name: params.repo }) as { id?: number } | undefined;
+  if (!repoRow?.id) return [];
+
+  const labelParams = params.labels.map((_, idx) => `$label_${idx}`);
+  const labelChecks = params.labels
+    .map((_, idx) => `SUM(CASE WHEN l.name = $label_${idx} THEN 1 ELSE 0 END) > 0`)
+    .join(" AND ");
+
+  const rows = database
+    .query(
+      `SELECT i.number as number
+       FROM issues i
+       JOIN issue_labels l ON l.issue_id = i.id
+       WHERE i.repo_id = $repo_id AND l.name IN (${labelParams.join(", ")})
+       GROUP BY i.id
+       HAVING ${labelChecks}
+       ORDER BY i.number`
+    )
+    .all({
+      $repo_id: repoRow.id,
+      ...Object.fromEntries(params.labels.map((label, idx) => [`$label_${idx}`, label])),
+    }) as Array<{ number?: number }>;
+
+  return rows
+    .map((row) => row?.number)
+    .filter((number): number is number => Number.isFinite(number))
+    .map((number) => ({ repo: params.repo, number }));
+}
+
 export function recordTaskSnapshot(input: {
   repo: string;
   issue: string;

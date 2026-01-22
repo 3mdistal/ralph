@@ -40,6 +40,7 @@ describe("github escalation writeback", () => {
       taskName: "Escalation task",
       issueUrl: "https://github.com/3mdistal/ralph/issues/66",
       reason: "Need guidance",
+      ownerHandle: "@3mdistal",
     });
 
     expect(comment.split("\n")[0]).toBe(marker);
