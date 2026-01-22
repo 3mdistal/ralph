@@ -43,7 +43,6 @@ type WritebackDeps = {
   deleteIdempotencyKey?: (key: string) => void;
 };
 
-const DEFAULT_OWNER_HANDLE = "@3mdistal";
 const DEFAULT_MAX_COMMENT_PAGES = 5;
 const MAX_REASON_CHARS = 500;
 const FNV_OFFSET = 2166136261;
@@ -94,12 +93,13 @@ export function buildEscalationComment(params: {
   reason: string;
   ownerHandle: string;
 }): string {
-  const owner = params.ownerHandle.trim() || DEFAULT_OWNER_HANDLE;
+  const owner = params.ownerHandle.trim();
+  const mention = owner ? `${owner} ` : "";
   const reason = truncateText(params.reason, MAX_REASON_CHARS) || "(no reason provided)";
 
   return [
     params.marker,
-    `${owner} Ralph needs a decision to proceed on **${params.taskName}**.`,
+    `${mention}Ralph needs a decision to proceed on **${params.taskName}**.`,
     "",
     `Issue: ${params.issueUrl}`,
     "",
@@ -116,7 +116,7 @@ export function buildEscalationComment(params: {
 
 export function planEscalationWriteback(ctx: EscalationWritebackContext): EscalationWritebackPlan {
   const repoOwner = ctx.repo.split("/")[0] ?? "";
-  const ownerHandle = ctx.ownerHandle?.trim() || (repoOwner ? `@${repoOwner}` : DEFAULT_OWNER_HANDLE);
+  const ownerHandle = ctx.ownerHandle?.trim() || (repoOwner ? `@${repoOwner}` : "");
   const marker = buildEscalationMarker({
     repo: ctx.repo,
     issueNumber: ctx.issueNumber,
@@ -199,7 +199,13 @@ export async function writeEscalationToGitHub(
   ctx: EscalationWritebackContext,
   deps: WritebackDeps
 ): Promise<EscalationWritebackResult> {
-  if (!deps.hasIdempotencyKey || !deps.recordIdempotencyKey || !deps.deleteIdempotencyKey) {
+  const overrideCount = [deps.hasIdempotencyKey, deps.recordIdempotencyKey, deps.deleteIdempotencyKey].filter(
+    Boolean
+  ).length;
+  if (overrideCount > 0 && overrideCount < 3) {
+    throw new Error("writeEscalationToGitHub requires all idempotency overrides when any are provided");
+  }
+  if (overrideCount === 0) {
     initStateDb();
   }
   const plan = planEscalationWriteback(ctx);

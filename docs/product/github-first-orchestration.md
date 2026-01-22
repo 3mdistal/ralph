@@ -80,6 +80,7 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
 - Ralph removes `ralph:in-progress` and `ralph:queued`, then adds `ralph:escalated`.
 - Ralph posts a comment containing a stable hidden marker (e.g. `<!-- ralph-escalation:id=... -->`),
   the operator @mention, and resolution instructions.
+- Operator @mention defaults to the repo owner handle (e.g. `@owner`); if no owner can be parsed, omit the mention.
 - Resolution signals (either is sufficient):
   - A new operator comment contains `RALPH RESOLVED:`.
   - The operator re-adds `ralph:queued`.

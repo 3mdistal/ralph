@@ -11,6 +11,7 @@ import {
   writeEscalationToGitHub,
 } from "../github/escalation-writeback";
 import { closeStateDbForTests } from "../state";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 describe("github escalation writeback", () => {
   test("buildEscalationMarker is deterministic", () => {
@@ -155,40 +156,45 @@ describe("github escalation writeback", () => {
   });
 
   test("writeEscalationToGitHub initializes state when using defaults", async () => {
+    const releaseLock = await acquireGlobalTestLock();
     const priorPath = process.env.RALPH_STATE_DB_PATH;
     const tempDir = await mkdtemp(join(tmpdir(), "ralph-state-"));
-    process.env.RALPH_STATE_DB_PATH = join(tempDir, "state.sqlite");
-    closeStateDbForTests();
 
-    const github = {
-      request: async (path: string, opts: { method?: string } = {}) => {
-        if (path.includes("/comments") && (opts.method ?? "GET") === "GET") {
-          return { data: [] };
+    try {
+      process.env.RALPH_STATE_DB_PATH = join(tempDir, "state.sqlite");
+      closeStateDbForTests();
+
+      const github = {
+        request: async (path: string, opts: { method?: string } = {}) => {
+          if (path.includes("/comments") && (opts.method ?? "GET") === "GET") {
+            return { data: [] };
+          }
+          return { data: {} };
+        },
+      } as any;
+
+      await writeEscalationToGitHub(
+        {
+          repo: "3mdistal/ralph",
+          issueNumber: 66,
+          taskName: "Escalation task",
+          taskPath: "orchestration/tasks/ralph 66.md",
+          reason: "Need guidance",
+          escalationType: "other",
+        },
+        {
+          github,
         }
-        return { data: {} };
-      },
-    } as any;
-
-    await writeEscalationToGitHub(
-      {
-        repo: "3mdistal/ralph",
-        issueNumber: 66,
-        taskName: "Escalation task",
-        taskPath: "orchestration/tasks/ralph 66.md",
-        reason: "Need guidance",
-        escalationType: "other",
-      },
-      {
-        github,
+      );
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+      closeStateDbForTests();
+      if (priorPath === undefined) {
+        delete process.env.RALPH_STATE_DB_PATH;
+      } else {
+        process.env.RALPH_STATE_DB_PATH = priorPath;
       }
-    );
-
-    await rm(tempDir, { recursive: true, force: true });
-    closeStateDbForTests();
-    if (priorPath === undefined) {
-      delete process.env.RALPH_STATE_DB_PATH;
-    } else {
-      process.env.RALPH_STATE_DB_PATH = priorPath;
+      releaseLock?.();
     }
   });
 });
