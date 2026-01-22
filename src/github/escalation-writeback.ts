@@ -1,4 +1,10 @@
 import { deleteIdempotencyKey, hasIdempotencyKey, recordIdempotencyKey } from "../state";
+import {
+  RALPH_LABEL_ESCALATED,
+  RALPH_LABEL_IN_PROGRESS,
+  RALPH_LABEL_QUEUED,
+  RALPH_RESOLVED_TEXT,
+} from "./escalation-constants";
 import { GitHubClient, splitRepoFullName } from "./client";
 
 export type EscalationWritebackContext = {
@@ -94,8 +100,10 @@ export function buildEscalationComment(params: {
     reason,
     "",
     "To resolve:",
-    "1. Comment with `RALPH RESOLVED: <guidance>` to resume with guidance.",
-    "2. Or re-add the `ralph:queued` label to resume without extra guidance. Ralph will remove `ralph:escalated`.",
+    `1. Comment with \`${RALPH_RESOLVED_TEXT} <guidance>\` to resume with guidance.`,
+    `2. Or re-add the \`${RALPH_LABEL_QUEUED}\` label to resume without extra guidance. Ralph will remove \`${
+      RALPH_LABEL_ESCALATED
+    }\`.`,
   ].join("\n");
 }
 
@@ -125,8 +133,8 @@ export function planEscalationWriteback(ctx: EscalationWritebackContext): Escala
     marker,
     markerId,
     commentBody,
-    addLabels: ["ralph:escalated"],
-    removeLabels: ["ralph:in-progress", "ralph:queued"],
+    addLabels: [RALPH_LABEL_ESCALATED],
+    removeLabels: [RALPH_LABEL_IN_PROGRESS, RALPH_LABEL_QUEUED],
     idempotencyKey,
   };
 }
@@ -206,9 +214,11 @@ export async function writeEscalationToGitHub(
   }
 
   let hasKeyResult = false;
+  let idempotencyAvailable = true;
   try {
     hasKeyResult = hasKey(plan.idempotencyKey);
   } catch (error: any) {
+    idempotencyAvailable = false;
     log(`${prefix} Failed to check idempotency: ${error?.message ?? String(error)}`);
   }
 
@@ -217,22 +227,29 @@ export async function writeEscalationToGitHub(
     return { postedComment: false, skippedComment: true, markerFound: true };
   }
 
-  const listResult = await listIssueComments({
-    github: deps.github,
-    repo: ctx.repo,
-    issueNumber: ctx.issueNumber,
-    maxPages,
-  });
+  let listResult: { comments: IssueComment[]; reachedMax: boolean } | null = null;
+  try {
+    listResult = await listIssueComments({
+      github: deps.github,
+      repo: ctx.repo,
+      issueNumber: ctx.issueNumber,
+      maxPages,
+    });
+  } catch (error: any) {
+    log(`${prefix} Failed to list issue comments: ${error?.message ?? String(error)}`);
+  }
 
-  if (listResult.reachedMax) {
+  if (listResult?.reachedMax) {
     log(`${prefix} Comment scan hit page cap (${maxPages}); marker detection may be incomplete.`);
   }
 
-  const markerFound = listResult.comments.some((comment) => {
-    const body = comment.body ?? "";
-    const found = extractExistingMarker(body);
-    return found ? found === plan.markerId : body.includes(plan.marker);
-  });
+  const markerFound =
+    listResult?.comments.some((comment) => {
+      const body = comment.body ?? "";
+      const found = extractExistingMarker(body);
+      return found ? found === plan.markerId : body.includes(plan.marker);
+    }) ?? false;
+
   if (markerFound) {
     try {
       recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
@@ -243,10 +260,16 @@ export async function writeEscalationToGitHub(
     return { postedComment: false, skippedComment: true, markerFound: true };
   }
 
+  if (!listResult && !idempotencyAvailable) {
+    log(`${prefix} Idempotency unavailable and comment scan failed; skipping comment to avoid duplicates.`);
+    return { postedComment: false, skippedComment: true, markerFound: false };
+  }
+
   let claimed = false;
   try {
     claimed = recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
   } catch (error: any) {
+    idempotencyAvailable = false;
     log(`${prefix} Failed to record idempotency before posting comment: ${error?.message ?? String(error)}`);
   }
 
@@ -255,12 +278,18 @@ export async function writeEscalationToGitHub(
     try {
       alreadyClaimed = hasKey(plan.idempotencyKey);
     } catch (error: any) {
+      idempotencyAvailable = false;
       log(`${prefix} Failed to re-check idempotency: ${error?.message ?? String(error)}`);
     }
     if (alreadyClaimed) {
       log(`${prefix} Escalation comment already claimed; skipping comment.`);
       return { postedComment: false, skippedComment: true, markerFound: false };
     }
+  }
+
+  if (!claimed && !idempotencyAvailable) {
+    log(`${prefix} Idempotency unavailable; skipping comment to avoid duplicates.`);
+    return { postedComment: false, skippedComment: true, markerFound: false };
   }
 
   try {

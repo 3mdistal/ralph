@@ -1,6 +1,7 @@
 import { resolveAgentTaskByIssue, updateTaskStatus } from "../queue-backend";
-import { listIssuesWithAllLabels } from "../state";
+import { initStateDb, listIssuesWithAllLabels } from "../state";
 import { GitHubClient, splitRepoFullName } from "./client";
+import { RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_RESOLVED_REGEX } from "./escalation-constants";
 
 type EscalatedIssue = { repo: string; number: number };
 
@@ -82,7 +83,7 @@ async function resolveEscalation(params: {
         github: params.deps.github,
         repo: params.repo,
         issueNumber: params.issueNumber,
-        label: "ralph:queued",
+        label: RALPH_LABEL_QUEUED,
       });
     } catch (error: any) {
       params.log(
@@ -96,7 +97,7 @@ async function resolveEscalation(params: {
       github: params.deps.github,
       repo: params.repo,
       issueNumber: params.issueNumber,
-      label: "ralph:escalated",
+      label: RALPH_LABEL_ESCALATED,
     });
   } catch (error: any) {
     params.log(
@@ -133,6 +134,7 @@ export async function reconcileEscalationResolutions(params: {
   const log = params.log ?? console.log;
   const maxEscalations = params.maxEscalations ?? DEFAULT_MAX_ESCALATIONS;
   const maxRecentComments = params.maxRecentComments ?? DEFAULT_MAX_RECENT_COMMENTS;
+  initStateDb();
   const deps =
     params.deps ??
     ({
@@ -144,11 +146,11 @@ export async function reconcileEscalationResolutions(params: {
 
   const queuedEscalations = deps.listIssuesWithAllLabels({
     repo: params.repo,
-    labels: ["ralph:escalated", "ralph:queued"],
+    labels: [RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED],
   });
   const escalatedIssues = deps.listIssuesWithAllLabels({
     repo: params.repo,
-    labels: ["ralph:escalated"],
+    labels: [RALPH_LABEL_ESCALATED],
   });
 
   const queuedKeys = new Set(queuedEscalations.map((issue) => issueKey(issue)));
@@ -191,7 +193,7 @@ export async function reconcileEscalationResolutions(params: {
       );
       continue;
     }
-    const hasResolution = bodies.some((body) => /\bRALPH\s+RESOLVED:/i.test(body));
+    const hasResolution = bodies.some((body) => RALPH_RESOLVED_REGEX.test(body));
     if (!hasResolution) continue;
 
     try {
