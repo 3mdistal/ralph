@@ -2,11 +2,11 @@
 
 Autonomous coding task orchestrator for OpenCode.
 
-Ralph watches for `agent-task` notes in a bwrb vault and dispatches them to OpenCode agents. It handles the full lifecycle: planning, implementation, PR creation, and merge.
+Ralph watches for GitHub issues labeled with `ralph:*` workflow labels (with optional bwrb fallback) and dispatches them to OpenCode agents. It handles the full lifecycle: planning, implementation, PR creation, and merge.
 
 ## Features
 
-- **Queue-based task management** via bwrb notes
+- **Queue-based task management** via GitHub issues (`ralph:*` labels) with optional bwrb fallback
 - **Parallel processing** across repos, sequential within each repo
 - **Smart escalation** when agents need human guidance (policy: `docs/escalation-policy.md`)
 - **Anomaly detection** catches agents stuck in loops
@@ -51,7 +51,7 @@ bun install
 
 Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
-By default, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
+When using the GitHub queue backend, `bwrbVault` is optional. When `queueBackend = "bwrb"`, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
 
 Note: `orchestration/` is gitignored in this repo, but bwrb still needs to traverse it for queue operations. `.bwrbignore` re-includes `orchestration/**` for bwrb even when `.gitignore` excludes it; if your queue appears empty, check `bwrb --version` and upgrade to >= 0.1.3.
 
@@ -59,10 +59,9 @@ Config is loaded once at startup, so restart the daemon after editing.
 
 ### Minimal example
 
-`~/.ralph/config.toml`:
+`~/.ralph/config.toml` (GitHub queue backend):
 
 ```toml
-bwrbVault = "/absolute/path/to/your/ralph"
 devDir = "/absolute/path/to/your/dev-directory"
 repos = [
   { name = "3mdistal/ralph", path = "/absolute/path/to/your/ralph", botBranch = "bot/integration" }
@@ -73,7 +72,6 @@ Or JSON (`~/.ralph/config.json`):
 
 ```json
 {
-  "bwrbVault": "/absolute/path/to/your/ralph",
   "devDir": "/absolute/path/to/your/dev-directory",
   "repos": [
     {
@@ -90,7 +88,8 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 
 ### Supported settings
 
-- `bwrbVault` (string): bwrb vault path for the task queue
+- `queueBackend` (string): `github` (default), `bwrb`, or `none`
+- `bwrbVault` (string): bwrb vault path for the task queue (required when `queueBackend = "bwrb"`)
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)

@@ -52,6 +52,12 @@ const DEFAULT_ERROR_MULTIPLIER = 2;
 const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
 
+async function resolveGitHubToken(): Promise<string> {
+  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+  if (token && token.trim()) return token;
+  return await getInstallationToken();
+}
+
 function applyJitter(valueMs: number, pct = DEFAULT_JITTER_PCT): number {
   const clamped = Math.max(valueMs, MIN_DELAY_MS);
   const variance = clamped * pct;
@@ -239,7 +245,7 @@ export async function syncRepoIssuesOnce(params: {
 }): Promise<SyncResult> {
   const deps = params.deps ?? {};
   const fetchImpl = deps.fetch ?? fetch;
-  const getToken = deps.getToken ?? getInstallationToken;
+  const getToken = deps.getToken ?? resolveGitHubToken;
   const now = deps.now ? deps.now() : new Date();
   const nowIso = now.toISOString();
   const since = computeSince(params.lastSyncAt);
@@ -351,6 +357,7 @@ function startRepoPoller(params: {
   repo: RepoConfig;
   baseIntervalMs: number;
   log: (msg: string) => void;
+  onSync?: (payload: { repo: string; result: SyncResult }) => void;
 }): PollerHandle {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -391,6 +398,10 @@ function startRepoPoller(params: {
           `ralph=${result.ralphCount} cursor=${lastSyncAt ?? "none"}->${result.newLastSyncAt ?? "none"} ` +
           `delayMs=${delayMs}`
       );
+
+      if (params.onSync) {
+        params.onSync({ repo: repoName, result });
+      }
 
       scheduleNext(delayMs, false);
       return;
@@ -434,6 +445,7 @@ export function startGitHubIssuePollers(params: {
   repos: RepoConfig[];
   baseIntervalMs: number;
   log?: (msg: string) => void;
+  onSync?: (payload: { repo: string; result: SyncResult }) => void;
 }): PollerHandle {
   const log = params.log ?? ((msg: string) => console.log(msg));
   const handles: PollerHandle[] = [];
@@ -454,6 +466,7 @@ export function startGitHubIssuePollers(params: {
         repo,
         baseIntervalMs: params.baseIntervalMs,
         log,
+        onSync: params.onSync,
       })
     );
   }

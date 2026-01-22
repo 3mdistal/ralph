@@ -182,6 +182,8 @@ function recordQueueStateSnapshot(tasks: AgentTask[]): void {
         worktreePath: task["worktree-path"],
         workerId: task["worker-id"],
         repoSlot: task["repo-slot"],
+        daemonId: task["daemon-id"],
+        heartbeatAt: task["heartbeat-at"],
         at,
       });
     } catch {
@@ -498,6 +500,8 @@ export async function updateTaskStatus(
         worktreePath: getOptionalField(normalizedExtraFields, taskObj, "worktree-path"),
         workerId: getOptionalField(normalizedExtraFields, taskObj, "worker-id"),
         repoSlot: getOptionalField(normalizedExtraFields, taskObj, "repo-slot"),
+        daemonId: getOptionalField(normalizedExtraFields, taskObj, "daemon-id"),
+        heartbeatAt: getOptionalField(normalizedExtraFields, taskObj, "heartbeat-at"),
       });
     } catch {
       // best-effort

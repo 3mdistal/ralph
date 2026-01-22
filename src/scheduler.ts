@@ -14,9 +14,11 @@ export interface SchedulerDeps<Task> {
   rrCursor: { value: number };
   shouldLog: (key: string, intervalMs: number) => boolean;
   log: (message: string) => void;
-  startTask: (opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }) => void;
+  startTask: (opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }) => void | Promise<void>;
   priorityTasks?: Task[];
-  startPriorityTask?: (opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }) => void;
+  startPriorityTask?: (
+    opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }
+  ) => void | Promise<void>;
 }
 
 export function startQueuedTasks<Task extends { repo: string }>(deps: SchedulerDeps<Task>): number {
