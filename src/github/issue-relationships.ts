@@ -64,6 +64,8 @@ const REST_DEPENDENCIES_PATH = (owner: string, repo: string, number: number) =>
 const REST_SUB_ISSUES_PATH = (owner: string, repo: string, number: number) =>
   `/repos/${owner}/${repo}/issues/${number}/sub_issues`;
 
+const RELATIONSHIP_PAGE_SIZE = 100;
+
 const GRAPH_BLOCKED_BY_QUERY = `
   query($owner: String!, $name: String!, $number: Int!) {
     repository(owner: $owner, name: $name) {
@@ -193,14 +195,16 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
 
     const blockedBy = await this.fetchBlockedBy(issue);
     if (blockedBy !== null) {
+      const truncated = blockedBy.length >= RELATIONSHIP_PAGE_SIZE;
       signals.push(...mapIssueStatesToSignals(blockedBy, "blocked_by", "github"));
-      coverage.githubDeps = true;
+      coverage.githubDeps = !truncated;
     }
 
     const subIssues = await this.fetchSubIssues(issue);
     if (subIssues !== null) {
+      const truncated = subIssues.length >= RELATIONSHIP_PAGE_SIZE;
       signals.push(...mapIssueStatesToSignals(subIssues, "sub_issue", "github"));
-      coverage.githubSubIssues = true;
+      coverage.githubSubIssues = !truncated;
     }
 
     return { issue, signals, coverage };

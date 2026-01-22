@@ -101,4 +101,27 @@ describe("syncBlockedStateForTasks", () => {
 
     expect(updateTaskStatusMock).not.toHaveBeenCalled();
   });
+
+  test("skips changes when relationship coverage is unknown", async () => {
+    updateTaskStatusMock.mockClear();
+    const provider: IssueRelationshipProvider = {
+      getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
+        issue,
+        signals: [],
+        coverage: { githubDeps: false, githubSubIssues: false, bodyDeps: false },
+      }),
+    };
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+      relationships: provider,
+    });
+
+    await worker.syncBlockedStateForTasks([createTask({})]);
+
+    expect(updateTaskStatusMock).not.toHaveBeenCalled();
+  });
 });
