@@ -1,5 +1,4 @@
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./client";
-import { GitHubApiError, GitHubClient, splitRepoFullName } from "./client";
 import {
   type IssueRef,
   type RelationshipSignal,
