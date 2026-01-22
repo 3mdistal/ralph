@@ -51,7 +51,7 @@ const notifyEscalationMock = mock(async () => true);
 const notifyErrorMock = mock(async () => {});
 const notifyTaskCompleteMock = mock(async () => {});
 
-const runCommandMock = mock(async () => ({
+const runAgentMock = mock(async () => ({
   sessionId: "ses_plan",
   success: true,
   output: [
@@ -92,7 +92,7 @@ const continueCommandMock = mock(async () => ({
 }));
 
 const sessionAdapter = {
-  runCommand: runCommandMock,
+  runAgent: runAgentMock,
   continueSession: continueSessionMock,
   continueCommand: continueCommandMock,
   getRalphXdgCacheHome: () => "/tmp/ralph-opencode-cache-test",
@@ -158,7 +158,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     notifyEscalationMock.mockClear();
     notifyErrorMock.mockClear();
     notifyTaskCompleteMock.mockClear();
-    runCommandMock.mockClear();
+    runAgentMock.mockClear();
     continueSessionMock.mockClear();
     continueCommandMock.mockClear();
     getThrottleDecisionMock.mockClear();
@@ -272,7 +272,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.pr).toBe("https://github.com/3mdistal/ralph/pull/999");
 
     // Next-task + build + CI-gated merge + survey happened.
-    expect(runCommandMock).toHaveBeenCalled();
+    expect(runAgentMock).toHaveBeenCalled();
     expect(continueSessionMock).toHaveBeenCalledTimes(1);
     expect(mergePullRequestMock).toHaveBeenCalled();
     expect(continueCommandMock).toHaveBeenCalled();
@@ -791,7 +791,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     const result = await worker.processTask(createMockTask());
 
     expect(result.outcome).toBe("throttled");
-    expect(runCommandMock).not.toHaveBeenCalled();
+    expect(runAgentMock).not.toHaveBeenCalled();
     expect(continueSessionMock).not.toHaveBeenCalled();
 
     const statuses = updateTaskStatusMock.mock.calls.map((call: any[]) => call[1]);
@@ -799,7 +799,7 @@ describe("integration-ish harness: full task lifecycle", () => {
   });
 
   test("missing opencode/PATH mismatch fails without crashing", async () => {
-    runCommandMock.mockImplementationOnce(async () => ({
+    runAgentMock.mockImplementationOnce(async () => ({
       sessionId: "ses_plan",
       success: false,
       output: "spawn opencode ENOENT (is opencode installed and on PATH?)",

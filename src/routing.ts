@@ -1,5 +1,5 @@
 /**
- * Routing decision parser for /next-task output
+ * Routing decision parser for planning output
  */
 
 export interface RoutingDecision {
@@ -10,7 +10,7 @@ export interface RoutingDecision {
 }
 
 /**
- * Parse the routing decision JSON from /next-task output.
+ * Parse the routing decision JSON from planning output.
  * Handles loose JSON (unquoted keys) that the model sometimes outputs.
  */
 export function parseRoutingDecision(output: string): RoutingDecision | null {

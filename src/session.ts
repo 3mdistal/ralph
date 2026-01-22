@@ -1266,46 +1266,50 @@ async function runSession(
   return { sessionId, output: textOutput || raw, success: true, exitCode, prUrl: prUrlFromEvents ?? undefined };
 }
 
+export type RunSessionOptionsBase = {
+  repo?: string;
+  cacheKey?: string;
+  opencodeXdg?: {
+    dataHome?: string;
+    configHome?: string;
+    stateHome?: string;
+    cacheHome?: string;
+  };
+  runLogPath?: string;
+  timeoutMs?: number;
+  introspection?: {
+    repo?: string;
+    issue?: string;
+    taskName?: string;
+    step?: number;
+    stepTitle?: string;
+  };
+  watchdog?: {
+    enabled?: boolean;
+    thresholdsMs?: Partial<WatchdogThresholdsMs>;
+    softLogIntervalMs?: number;
+    recentEventLimit?: number;
+    context?: string;
+  };
+};
+
+export type RunSessionTestOverrides = {
+  spawn?: SpawnFn;
+  scheduler?: Scheduler;
+  sessionsDir?: string;
+  processKill?: typeof process.kill;
+};
+
 /**
  * Run a configured command in a new session.
- * `command` should be the command name WITHOUT a leading slash (e.g. `next-task`).
+ * `command` should be the command name WITHOUT a leading slash (e.g. `plan`).
  */
 export async function runCommand(
   repoPath: string,
   command: string,
   args: string[] = [],
-  options?: {
-    repo?: string;
-    cacheKey?: string;
-    opencodeXdg?: {
-      dataHome?: string;
-      configHome?: string;
-      stateHome?: string;
-      cacheHome?: string;
-    };
-    runLogPath?: string;
-    timeoutMs?: number;
-    introspection?: {
-      repo?: string;
-      issue?: string;
-      taskName?: string;
-      step?: number;
-      stepTitle?: string;
-    };
-    watchdog?: {
-      enabled?: boolean;
-      thresholdsMs?: Partial<WatchdogThresholdsMs>;
-      softLogIntervalMs?: number;
-      recentEventLimit?: number;
-      context?: string;
-    };
-  },
-  testOverrides?: {
-    spawn?: SpawnFn;
-    scheduler?: Scheduler;
-    sessionsDir?: string;
-    processKill?: typeof process.kill;
-  }
+  options?: RunSessionOptionsBase,
+  testOverrides?: RunSessionTestOverrides
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");
@@ -1323,36 +1327,25 @@ export async function continueSession(
   repoPath: string,
   sessionId: string,
   message: string,
-  options?: {
-    repo?: string;
-    cacheKey?: string;
-    opencodeXdg?: {
-      dataHome?: string;
-      configHome?: string;
-      stateHome?: string;
-      cacheHome?: string;
-    };
-    runLogPath?: string;
-    timeoutMs?: number;
-    introspection?: {
-      repo?: string;
-      issue?: string;
-      taskName?: string;
-      step?: number;
-      stepTitle?: string;
-    };
-    watchdog?: {
-      enabled?: boolean;
-      thresholdsMs?: Partial<WatchdogThresholdsMs>;
-      softLogIntervalMs?: number;
-      recentEventLimit?: number;
-      context?: string;
-    };
-    agent?: string;
-  }
+  options?: RunSessionOptionsBase & { agent?: string }
 ): Promise<SessionResult> {
   const { agent, ...rest } = options ?? {};
   return runSession(repoPath, message, { continueSession: sessionId, agent, ...rest });
+}
+
+/**
+ * Run an agent with a normal message.
+ */
+export async function runAgent(
+  repoPath: string,
+  agent: string,
+  message: string,
+  options?: RunSessionOptionsBase,
+  testOverrides?: RunSessionTestOverrides
+): Promise<SessionResult> {
+  const merged: any = { agent, ...(options ?? {}) };
+  if (testOverrides) merged.__testOverrides = testOverrides;
+  return runSession(repoPath, message, merged);
 }
 
 /**
@@ -1363,32 +1356,7 @@ export async function continueCommand(
   sessionId: string,
   command: string,
   args: string[] = [],
-  options?: {
-    repo?: string;
-    cacheKey?: string;
-    opencodeXdg?: {
-      dataHome?: string;
-      configHome?: string;
-      stateHome?: string;
-      cacheHome?: string;
-    };
-    runLogPath?: string;
-    timeoutMs?: number;
-    introspection?: {
-      repo?: string;
-      issue?: string;
-      taskName?: string;
-      step?: number;
-      stepTitle?: string;
-    };
-    watchdog?: {
-      enabled?: boolean;
-      thresholdsMs?: Partial<WatchdogThresholdsMs>;
-      softLogIntervalMs?: number;
-      recentEventLimit?: number;
-      context?: string;
-    };
-  }
+  options?: RunSessionOptionsBase
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");

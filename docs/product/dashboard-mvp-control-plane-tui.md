@@ -187,7 +187,7 @@ A **checkpoint** is a safe boundary where Ralph can pause without corrupting sta
 
 ### MVP checkpoint list
 
-- `planned` — `/next-task` completed
+- `planned` — planner prompt completed
 - `routed` — routing decision parsed
 - `implementation_step_complete` — a `continueSession` call returned
 - `pr_ready` — PR URL detected

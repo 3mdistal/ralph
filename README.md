@@ -245,7 +245,7 @@ orchestration/
 ## How it works
 
 1. **Watch** - Ralph watches `orchestration/tasks/**` for queued (and restart-orphaned starting) tasks
-2. **Dispatch** - Runs `/next-task <issue>` to plan the work
+2. **Dispatch** - Runs the planner prompt with `--agent ralph-plan`
 3. **Route** - Parses agent's decision (policy: `docs/escalation-policy.md`): proceed or escalate
 4. **Build** - If proceeding, tells agent to implement
 5. **Monitor** - Watches for anomalies (stuck loops)

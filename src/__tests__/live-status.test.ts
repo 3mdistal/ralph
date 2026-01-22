@@ -39,7 +39,7 @@ describe("live status", () => {
     const now = Date.now();
 
     const lines = [
-      JSON.stringify({ type: "step-start", ts: now - 10_000, step: 1, title: "next-task" }),
+      JSON.stringify({ type: "step-start", ts: now - 10_000, step: 1, title: "plan" }),
       JSON.stringify({ type: "tool-start", ts: now - 5_000, toolName: "bash", callId: "call_2" }),
       JSON.stringify({ type: "tool-end", ts: now - 1_000, toolName: "bash", callId: "call_2" }),
     ];

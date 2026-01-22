@@ -33,7 +33,7 @@ Keep this doc focused on product intent; update routing/escalation policy in one
 
 The manual workflow is effective but repetitive:
 1. Spin up OpenCode session
-2. Run `/next-task <issue>` - plan agent consults @product, asks questions
+2. Run planner prompt with `--agent ralph-plan` - plan agent consults @product, asks questions
 3. Agent builds (worktree, commits, tests)
 4. Agent presents PR - human says "looks good, merge and clean up"
 5. Run `/survey` - @devex recommends issues

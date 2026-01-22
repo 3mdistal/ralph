@@ -66,7 +66,7 @@ Hard throttle is enforced at safe checkpoints (control boundaries), not by inter
 ## Integration requirements
 
 - Gate model sends at all major send points:
-  - before `/next-task`
+  - before the planner prompt
   - before each `continueSession(...)`
   - before merge/survey steps
 - Store a durable throttle snapshot when entering throttled states (reason, window(s), used %, caps, reset times).

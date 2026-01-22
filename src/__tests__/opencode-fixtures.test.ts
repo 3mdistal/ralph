@@ -178,7 +178,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     const promise = runCommand(
       "/tmp",
-      "next-task",
+      "plan",
       [],
       {
         watchdog: {
@@ -214,7 +214,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 
-    const promise = runCommand("/tmp", "next-task", [], {}, testOverrides);
+    const promise = runCommand("/tmp", "plan", [], {}, testOverrides);
 
     scheduler.advanceBy(0);
     const result = await promise;
@@ -234,7 +234,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 
-    const promise = runCommand("/tmp", "next-task", [], {}, testOverrides);
+    const promise = runCommand("/tmp", "plan", [], {}, testOverrides);
 
     scheduler.advanceBy(0);
     await promise;
@@ -257,7 +257,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 
-    const promise = runCommand("/tmp", "next-task", [], {}, testOverrides);
+    const promise = runCommand("/tmp", "plan", [], {}, testOverrides);
 
     scheduler.advanceBy(0);
     await promise;
