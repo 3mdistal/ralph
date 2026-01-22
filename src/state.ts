@@ -196,7 +196,9 @@ function ensureSchema(database: Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique ON tasks(repo_id, issue_number) WHERE issue_number IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
+      ON tasks(repo_id, issue_number)
+      WHERE issue_number IS NOT NULL AND task_path LIKE 'github:%';
     CREATE INDEX IF NOT EXISTS idx_issues_repo_github_updated_at ON issues(repo_id, github_updated_at);
     CREATE INDEX IF NOT EXISTS idx_issue_labels_issue_id ON issue_labels(issue_id);
     CREATE INDEX IF NOT EXISTS idx_rollup_batches_repo_status ON rollup_batches(repo_id, bot_branch, status);
@@ -648,7 +650,8 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
               t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
-       WHERE r.name = $name AND t.issue_number IS NOT NULL`
+       WHERE r.name = $name AND t.issue_number IS NOT NULL AND t.task_path LIKE 'github:%'
+       ORDER BY t.updated_at DESC`
     )
     .all({ $name: repo }) as Array<{
     task_path: string;

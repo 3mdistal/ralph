@@ -86,7 +86,11 @@ export function startQueuedTasks<Task extends { repo: string }>(deps: SchedulerD
       startedCount++;
       startedThisRound = true;
       const startFn = isPriority ? deps.startPriorityTask ?? deps.startTask : deps.startTask;
-      startFn({ repo, task, releaseGlobal, releaseRepo });
+      const startResult = startFn({ repo, task, releaseGlobal, releaseRepo });
+      void Promise.resolve(startResult).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        deps.log(`[ralph] Error starting task for ${repo}: ${message}`);
+      });
       break;
     }
 

@@ -87,7 +87,9 @@ function buildTaskOpStateMap(repo: string): Map<number, TaskOpState> {
   const map = new Map<number, TaskOpState>();
   for (const state of listTaskOpStatesByRepo(repo)) {
     if (typeof state.issueNumber !== "number") continue;
-    map.set(state.issueNumber, state);
+    if (!map.has(state.issueNumber)) {
+      map.set(state.issueNumber, state);
+    }
   }
   return map;
 }
@@ -152,7 +154,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         if (stopRequested) return;
         if (!issue.labels.includes("ralph:in-progress")) continue;
         const opState = opStateByIssue.get(issue.number) ?? null;
-        if (!opState) continue;
         const shouldRecover = shouldRecoverStaleInProgress({
           labels: issue.labels,
           opState,
@@ -163,11 +164,11 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
 
         try {
           const delta = statusToRalphLabelDelta("queued", issue.labels);
-          for (const label of delta.remove) {
-            await removeIssueLabel(repo, issue.number, label);
-          }
           for (const label of delta.add) {
             await addIssueLabel(repo, issue.number, label);
+          }
+          for (const label of delta.remove) {
+            await removeIssueLabel(repo, issue.number, label);
           }
 
           applyLabelDelta({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
@@ -266,25 +267,19 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       };
 
       if (opts.task.status === "queued") {
-        const plan = planClaim(issue.labels);
-        if (!plan.claimable) {
-          return { claimed: false, task: opts.task, reason: plan.reason ?? "Task not claimable" };
-        }
-
-        const nowIso = new Date(opts.nowMs).toISOString();
-        const taskPath = opState.taskPath || `github:${issueRef.repo}#${issueRef.number}`;
-
-        const removeResult = await removeIssueLabel(issueRef.repo, issueRef.number, "ralph:queued");
-        if (!removeResult.removed) {
+        let plan = planClaim(issue.labels);
         try {
-          const labels = await listIssueLabelsFromGitHub(issueRef.repo, issueRef.number);
-          if (!labels.includes("ralph:queued")) {
-            return { claimed: false, task: opts.task, reason: "Queued label already removed" };
+          const liveLabels = await listIssueLabelsFromGitHub(issueRef.repo, issueRef.number);
+          plan = planClaim(liveLabels);
+          if (!plan.claimable) {
+            return { claimed: false, task: opts.task, reason: plan.reason ?? "Task not claimable" };
           }
         } catch (error: any) {
           return { claimed: false, task: opts.task, reason: error?.message ?? String(error) };
         }
-      }
+
+        const nowIso = new Date(opts.nowMs).toISOString();
+        const taskPath = opState.taskPath || `github:${issueRef.repo}#${issueRef.number}`;
 
         try {
           await addIssueLabel(issueRef.repo, issueRef.number, "ralph:in-progress");
@@ -303,11 +298,21 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           return { claimed: false, task: opts.task, reason: error?.message ?? String(error) };
         }
 
+        let removedQueued = false;
+        try {
+          const removeResult = await removeIssueLabel(issueRef.repo, issueRef.number, "ralph:queued");
+          removedQueued = removeResult.removed;
+        } catch (error: any) {
+          console.warn(
+            `[ralph:queue:github] Failed to remove queued label for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
+          );
+        }
+
         applyLabelDelta({
           repo: issueRef.repo,
           issueNumber: issueRef.number,
           add: ["ralph:in-progress"],
-          remove: ["ralph:queued"],
+          remove: removedQueued ? ["ralph:queued"] : [],
           nowIso,
         });
 
@@ -407,12 +412,12 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       }
       const delta = statusToRalphLabelDelta(status, issue.labels);
 
+      const added: string[] = [];
+      const removed: string[] = [];
       try {
-        for (const label of delta.remove) {
-          await removeIssueLabel(issueRef.repo, issueRef.number, label);
-        }
         for (const label of delta.add) {
           await addIssueLabel(issueRef.repo, issueRef.number, label);
+          added.push(label);
         }
       } catch (error: any) {
         console.warn(
@@ -421,7 +426,20 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         return false;
       }
 
-      applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: delta.add, remove: delta.remove, nowIso });
+      for (const label of delta.remove) {
+        try {
+          const result = await removeIssueLabel(issueRef.repo, issueRef.number, label);
+          if (result.removed) removed.push(label);
+        } catch (error: any) {
+          console.warn(
+            `[ralph:queue:github] Failed to remove label ${label} for ${issueRef.repo}#${issueRef.number}: ${
+              error?.message ?? String(error)
+            }`
+          );
+        }
+      }
+
+      applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: added, remove: removed, nowIso });
 
       const normalizedExtra: Record<string, string> = {};
       if (extraFields) {
