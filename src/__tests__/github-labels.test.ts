@@ -1,46 +1,114 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  BASELINE_LABELS,
-  RALPH_WORKFLOW_LABELS,
-  computeMissingBaselineLabels,
-  computeMissingRalphLabels,
-} from "../github-labels";
+import { computeRalphLabelSync, RALPH_WORKFLOW_LABELS } from "../github-labels";
 
-describe("computeMissingBaselineLabels", () => {
-  test("returns all baseline labels when none exist", () => {
-    const missing = computeMissingBaselineLabels([]);
-    expect(missing.map((l) => l.name)).toEqual(BASELINE_LABELS.map((l) => l.name));
+describe("computeRalphLabelSync", () => {
+  test("creates all workflow labels when none exist", () => {
+    const { toCreate, toUpdate } = computeRalphLabelSync([]);
+    expect(toCreate.map((l) => l.name)).toEqual(RALPH_WORKFLOW_LABELS.map((l) => l.name));
+    expect(toUpdate).toEqual([]);
   });
 
-  test("returns empty when all baseline labels exist (case-insensitive)", () => {
-    const existing = ["DX", "Refactor", " bug ", "Chore", "TEST", "ALLOW-MAIN"];
-    const missing = computeMissingBaselineLabels(existing);
-    expect(missing).toEqual([]);
+  test("no-ops when all workflow labels exist with correct metadata", () => {
+    const existing = RALPH_WORKFLOW_LABELS.map((label) => ({
+      name: label.name.toUpperCase(),
+      color: `#${label.color.toLowerCase()}`,
+      description: ` ${label.description} `,
+    }));
+    const { toCreate, toUpdate } = computeRalphLabelSync(existing);
+    expect(toCreate).toEqual([]);
+    expect(toUpdate).toEqual([]);
   });
 
-  test("returns only missing baseline labels", () => {
-    const existing = ["bug", "dx"];
-    const missing = computeMissingBaselineLabels(existing);
-    expect(missing.map((l) => l.name)).toEqual(["refactor", "chore", "test", "allow-main"]);
+  test("creates missing labels and updates mismatched metadata", () => {
+    const existing = [
+      { name: "ralph:queued", color: "FFFFFF", description: "Queued" },
+      { name: "ralph:in-progress", color: "FBCA04", description: "Ralph is actively working" },
+    ];
+    const { toCreate, toUpdate } = computeRalphLabelSync(existing);
+    expect(toCreate.map((l) => l.name)).toEqual(["ralph:in-bot", "ralph:blocked", "ralph:escalated"]);
+    expect(toUpdate).toEqual([
+      {
+        currentName: "ralph:queued",
+        patch: {
+          color: "0366D6",
+          description: "Ready to be claimed by Ralph",
+        },
+      },
+    ]);
   });
-});
 
-describe("computeMissingRalphLabels", () => {
-  test("returns all workflow labels when none exist", () => {
-    const missing = computeMissingRalphLabels([]);
-    expect(missing.map((l) => l.name)).toEqual(RALPH_WORKFLOW_LABELS.map((l) => l.name));
+  test("updates color without changing matching descriptions", () => {
+    const existing = [
+      { name: "ralph:queued", color: "0366D6", description: "Ready to be claimed by Ralph" },
+      { name: "ralph:in-progress", color: "FBCA04", description: "Ralph is actively working" },
+      { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
+      { name: "ralph:blocked", color: "000000", description: "Blocked by dependencies" },
+      { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
+    ];
+    const { toUpdate } = computeRalphLabelSync(existing);
+    expect(toUpdate).toEqual([
+      {
+        currentName: "ralph:blocked",
+        patch: { color: "D73A4A" },
+      },
+    ]);
   });
 
-  test("returns empty when all workflow labels exist", () => {
-    const existing = ["RALPH:QUEUED", "ralph:in-progress", "ralph:in-bot", "RALPH:BLOCKED", "ralph:escalated"];
-    const missing = computeMissingRalphLabels(existing);
-    expect(missing).toEqual([]);
+  test("uses current label casing when updating", () => {
+    const existing = [
+      { name: "Ralph:Queued", color: "0366D6", description: "Queued" },
+      { name: "ralph:in-progress", color: "FBCA04", description: "Ralph is actively working" },
+      { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
+      { name: "ralph:blocked", color: "D73A4A", description: "Blocked by dependencies" },
+      { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
+    ];
+    const { toUpdate } = computeRalphLabelSync(existing);
+    expect(toUpdate).toEqual([
+      {
+        currentName: "Ralph:Queued",
+        patch: { description: "Ready to be claimed by Ralph" },
+      },
+    ]);
   });
 
-  test("returns missing workflow labels", () => {
-    const existing = ["ralph:queued", "ralph:blocked"];
-    const missing = computeMissingRalphLabels(existing);
-    expect(missing.map((l) => l.name)).toEqual(["ralph:in-progress", "ralph:in-bot", "ralph:escalated"]);
+  test("ignores non-ralph labels and unknown ralph labels", () => {
+    const existing = [
+      { name: "dx", color: "1D76DB", description: "Developer experience" },
+      { name: "ralph:unknown", color: "FFFFFF", description: "Extra" },
+    ];
+    const { toCreate, toUpdate } = computeRalphLabelSync(existing);
+    expect(toUpdate).toEqual([]);
+    expect(toCreate.map((l) => l.name)).toEqual(RALPH_WORKFLOW_LABELS.map((l) => l.name));
+  });
+
+  test("prefers the canonical-cased label when duplicates exist", () => {
+    const existing = [
+      { name: "Ralph:Queued", color: "0366D6", description: "Queued" },
+      { name: "ralph:queued", color: "0366D6", description: "Ready to be claimed by Ralph" },
+      { name: "ralph:in-progress", color: "FBCA04", description: "Ralph is actively working" },
+      { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
+      { name: "ralph:blocked", color: "D73A4A", description: "Blocked by dependencies" },
+      { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
+    ];
+    const { toUpdate } = computeRalphLabelSync(existing);
+    expect(toUpdate).toEqual([]);
+  });
+
+  test("treats null description as empty string", () => {
+    const existing = [
+      { name: "ralph:queued", color: "0366D6", description: null },
+      { name: "ralph:in-progress", color: "FBCA04", description: "Ralph is actively working" },
+      { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
+      { name: "ralph:blocked", color: "D73A4A", description: "Blocked by dependencies" },
+      { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
+    ];
+    const { toUpdate } = computeRalphLabelSync(existing);
+    expect(toUpdate).toEqual([
+      {
+        currentName: "ralph:queued",
+        patch: { description: "Ready to be claimed by Ralph" },
+      },
+    ]);
   });
 });

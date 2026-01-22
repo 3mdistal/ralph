@@ -51,12 +51,20 @@ Task note filenames are derived from note names. Ralph sanitizes names before cr
 - If sanitization yields an empty name, use `Untitled`
 - If a note already exists, append a short UUID suffix
 
-### 1. Queue Lives in GitHub Issues
+### 1. Queue Lives in GitHub Issues (migration: bwrb optional)
 
 GitHub Issues are the source of truth for queue state and dependency relationships.
 SQLite under `~/.ralph` stores operational state (session IDs, worktree paths, cursors).
 
 See `docs/product/github-first-orchestration.md` for the canonical contract.
+
+bwrb remains supported as a legacy backend during the migration:
+- Enable via `queueBackend = "bwrb"` in `~/.ralph/config.toml` or `~/.ralph/config.json`
+- GitHub remains authoritative when both are configured (no dual-write in v0.1.0)
+- GitHub queue sync/claim semantics are tracked in #61/#63; use bwrb backend for active queue processing until then
+- When GitHub queue support is unavailable, Ralph falls back to bwrb if a valid vault is configured
+- When GitHub is unavailable and no bwrb vault exists, Ralph runs in idle/no-queue mode and surfaces diagnostics
+- Escalations and agent-run records remain bwrb-only until GitHub queue support ships
 
 ### 2. Bot Branch Strategy
 

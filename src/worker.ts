@@ -17,7 +17,7 @@ const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
 
 const gh: GhRunner = DEFAULT_GH_RUNNER;
 
-import { type AgentTask, updateTaskStatus } from "./queue";
+import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "./queue-backend";
 import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
@@ -27,7 +27,7 @@ import {
   getRepoRequiredChecksOverride,
   isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
-  loadConfig,
+  getConfig,
   resolveOpencodeProfile,
 } from "./config";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
@@ -47,7 +47,7 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { computeMissingBaselineLabels, computeMissingRalphLabels } from "./github-labels";
+import { computeRalphLabelSync } from "./github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
@@ -213,7 +213,8 @@ function summarizeForNote(text: string, maxChars = 900): string {
 }
 
 function resolveVaultPath(p: string): string {
-  const vault = loadConfig().bwrbVault;
+  const vault = getBwrbVaultIfValid();
+  if (!vault) return p;
   return isAbsolute(p) ? p : join(vault, p);
 }
 
@@ -634,17 +635,17 @@ export class RepoWorker {
     throw error;
   }
 
-  private async ensureBaselineLabelsOnce(): Promise<void> {
+  private async ensureRalphWorkflowLabelsOnce(): Promise<void> {
     if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
 
     this.ensureLabelsPromise = (async () => {
       try {
-        const existing = await this.github.listLabels();
-        const missing = [...computeMissingBaselineLabels(existing), ...computeMissingRalphLabels(existing)];
-        if (missing.length === 0) return;
+        const existing = await this.github.listLabelSpecs();
+        const { toCreate, toUpdate } = computeRalphLabelSync(existing);
+        if (toCreate.length === 0 && toUpdate.length === 0) return;
 
         const created: string[] = [];
-        for (const label of missing) {
+        for (const label of toCreate) {
           try {
             await this.github.createLabel(label);
             created.push(label.name);
@@ -652,19 +653,25 @@ export class RepoWorker {
             if (e instanceof GitHubApiError) {
               if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
             }
-            const msg = e?.message ?? String(e);
-            if (/already exists/i.test(msg)) continue;
             throw e;
           }
+        }
+
+        const updated: string[] = [];
+        for (const update of toUpdate) {
+          await this.github.updateLabel(update.currentName, update.patch);
+          updated.push(update.currentName);
         }
 
         if (created.length > 0) {
           console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
         }
-      } catch (e: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to ensure baseline GitHub labels (continuing): ${e?.message ?? String(e)}`
-        );
+        if (updated.length > 0) {
+          console.log(`[ralph:worker:${this.repo}] Updated GitHub label(s): ${updated.join(", ")}`);
+        }
+      } catch (error) {
+        this.ensureLabelsPromise = null;
+        throw error;
       }
     })();
 
@@ -2537,7 +2544,7 @@ ${guidance}`
   }
 
   private buildWatchdogOptions(task: AgentTask, stage: string) {
-    const cfg = loadConfig().watchdog;
+    const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
 
     return {
@@ -2591,7 +2598,7 @@ ${guidance}`
       };
     }
 
-    const defaults = loadConfig().control;
+    const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
     const requested = control.opencodeProfile?.trim() ?? "";
 
@@ -2659,7 +2666,7 @@ ${guidance}`
     if (pinned) {
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
-      const defaults = loadConfig().control;
+      const defaults = getConfig().control;
       const controlProfile =
         readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
 
@@ -2840,7 +2847,7 @@ ${guidance}`
       return await this.skipClosedIssue(task, issueMeta, startTime);
     }
 
-    await this.ensureBaselineLabelsOnce();
+    await this.ensureRalphWorkflowLabelsOnce();
     await this.ensureBranchProtectionOnce();
 
     const issueMatch = task.issue.match(/#(\d+)$/);
@@ -3346,7 +3353,7 @@ ${guidance}`
         throw new Error("Failed to mark task starting (bwrb edit failed)");
       }
 
-      await this.ensureBaselineLabelsOnce();
+      await this.ensureRalphWorkflowLabelsOnce();
       await this.ensureBranchProtectionOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
@@ -4008,7 +4015,10 @@ ${guidance}`
       bodyPrefix?: string;
     }
   ): Promise<void> {
-    const vault = loadConfig().bwrbVault;
+    const vault = getBwrbVaultForStorage("create agent-run note");
+    if (!vault) {
+      return;
+    }
     const today = data.completed.toISOString().split("T")[0];
     const shortIssue = task.issue.split("/").pop() || task.issue;
 

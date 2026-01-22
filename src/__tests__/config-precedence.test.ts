@@ -39,6 +39,7 @@ describe("Config precedence (~/.ralph)", () => {
       configTomlPath,
       [
         'bwrbVault = "toml-vault"',
+        'queueBackend = "bwrb"',
         "maxWorkers = 3",
         "batchSize = 11",
         "pollInterval = 12345",
@@ -53,6 +54,7 @@ describe("Config precedence (~/.ralph)", () => {
 
     await writeJson(configJsonPath, {
       bwrbVault: "json-vault",
+      queueBackend: "none",
       maxWorkers: 2,
       batchSize: 99,
       ownershipTtlMs: 33000,
@@ -61,9 +63,10 @@ describe("Config precedence (~/.ralph)", () => {
 
     const cfgMod = await import("../config?config-precedence");
     cfgMod.__resetConfigForTests();
-    const cfg = cfgMod.loadConfig();
+    const cfg = cfgMod.loadConfig().config;
 
     expect(cfg.bwrbVault).toBe("toml-vault");
+    expect(cfg.queueBackend).toBe("bwrb");
     expect(cfg.maxWorkers).toBe(3);
     expect(cfg.batchSize).toBe(11);
     expect(cfg.owner).toBe("toml-owner");
@@ -83,7 +86,7 @@ describe("Config precedence (~/.ralph)", () => {
 
     const cfgMod = await import("../config?config-precedence");
     cfgMod.__resetConfigForTests();
-    const cfg = cfgMod.loadConfig();
+    const cfg = cfgMod.loadConfig().config;
 
     expect(cfg.bwrbVault).toBe("json-vault");
     expect(cfg.maxWorkers).toBe(4);
@@ -106,7 +109,7 @@ describe("Config precedence (~/.ralph)", () => {
     try {
       const cfgMod = await import("../config?config-precedence");
       cfgMod.__resetConfigForTests();
-      const cfg = cfgMod.loadConfig();
+      const cfg = cfgMod.loadConfig().config;
 
       expect(cfg.bwrbVault).toBe("legacy-vault");
       expect(cfg.maxWorkers).toBe(5);
