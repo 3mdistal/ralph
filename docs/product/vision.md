@@ -109,6 +109,17 @@ Log tool calls and detect when agents get stuck (tool-result-as-text loops). Aut
 
 **Stability policy:** To support safe parallelism, Ralph should avoid shared mutable tool caches between concurrent OpenCode runs (e.g. isolate `XDG_CACHE_HOME` per repo/task).
 
+### 6. Managed OpenCode Config Contract
+
+For daemon runs, Ralph owns the OpenCode agent configuration to keep behavior deterministic across repos and machines.
+
+- Ralph sets `OPENCODE_CONFIG_DIR` to a Ralph-managed directory (default: `$HOME/.ralph/opencode`).
+- Repo-local OpenCode config and pre-set `OPENCODE_CONFIG_DIR` are ignored for daemon runs.
+- The managed directory is overwritten on daemon startup to match the version shipped with Ralph.
+- Overrides are allowed only via explicit Ralph configuration (`opencode.managedConfigDir`) or `RALPH_OPENCODE_CONFIG_DIR`.
+- Operators should not edit the managed directory directly; changes must come from Ralph template updates.
+- Running multiple daemons on the same machine is unsupported; the managed config is a shared resource and the latest daemon startup wins.
+
 ## Success Metrics
 
 - **Escalation rate**: Should be <10% of tasks
