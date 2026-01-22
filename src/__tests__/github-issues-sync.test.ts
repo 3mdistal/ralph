@@ -84,7 +84,8 @@ describe("github issue sync", () => {
     expect(result.ralphCount).toBe(1);
     expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
     expect(calls.length).toBe(1);
-    expect(calls[0]).toContain("since=2026-01-10T23%3A59%3A55.000Z");
+    const requestUrl = new URL(calls[0]);
+    expect(requestUrl.searchParams.get("since")).toBe("2026-01-10T23:59:55.000Z");
 
     const db = new Database(getRalphStateDbPath());
     try {

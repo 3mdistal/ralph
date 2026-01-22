@@ -56,40 +56,22 @@ function ensureSchema(database: Database): void {
     );
   }
 
-  if (!existingVersion || existingVersion < SCHEMA_VERSION) {
-    if (existingVersion && existingVersion < 3) {
-      try {
+  if (existingVersion && existingVersion < SCHEMA_VERSION) {
+    database.transaction(() => {
+      if (existingVersion < 3) {
         database.exec("ALTER TABLE tasks ADD COLUMN worker_id TEXT");
-      } catch {
-        // ignore if already present
-      }
-      try {
         database.exec("ALTER TABLE tasks ADD COLUMN repo_slot TEXT");
-      } catch {
-        // ignore if already present
       }
-    }
-    if (existingVersion && existingVersion < 4) {
-      try {
+      if (existingVersion < 4) {
         database.exec("ALTER TABLE issues ADD COLUMN github_node_id TEXT");
-      } catch {
-        // ignore if already present
-      }
-      try {
         database.exec("ALTER TABLE issues ADD COLUMN github_updated_at TEXT");
-      } catch {
-        // ignore if already present
       }
-    }
-    if (existingVersion && existingVersion < 5) {
-      try {
+      if (existingVersion < 5) {
         database.exec(
           "CREATE TABLE IF NOT EXISTS repo_github_issue_sync (repo_id INTEGER PRIMARY KEY, last_sync_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
         );
-      } catch {
-        // ignore if already present
       }
-    }
+    })();
   }
 
   database.exec(
@@ -407,42 +389,44 @@ export function recordIssueLabelsSnapshot(input: {
 
   if (issueNumber === null) return;
 
-  database
-    .query(
-      `INSERT INTO issues(repo_id, number, created_at, updated_at)
-       VALUES ($repo_id, $number, $created_at, $updated_at)
-       ON CONFLICT(repo_id, number) DO UPDATE SET updated_at = excluded.updated_at`
-    )
-    .run({
-      $repo_id: repoId,
-      $number: issueNumber,
-      $created_at: at,
-      $updated_at: at,
-    });
-
-  const issueRow = database
-    .query("SELECT id FROM issues WHERE repo_id = $repo_id AND number = $number")
-    .get({ $repo_id: repoId, $number: issueNumber }) as { id?: number } | undefined;
-
-  if (!issueRow?.id) {
-    throw new Error(`Failed to resolve issue id for ${input.repo}#${issueNumber}`);
-  }
-
-  database.query("DELETE FROM issue_labels WHERE issue_id = $issue_id").run({ $issue_id: issueRow.id });
-
-  for (const label of input.labels) {
+  database.transaction(() => {
     database
       .query(
-        `INSERT INTO issue_labels(issue_id, name, created_at)
-         VALUES ($issue_id, $name, $created_at)
-         ON CONFLICT(issue_id, name) DO NOTHING`
+        `INSERT INTO issues(repo_id, number, created_at, updated_at)
+         VALUES ($repo_id, $number, $created_at, $updated_at)
+         ON CONFLICT(repo_id, number) DO UPDATE SET updated_at = excluded.updated_at`
       )
       .run({
-        $issue_id: issueRow.id,
-        $name: label,
+        $repo_id: repoId,
+        $number: issueNumber,
         $created_at: at,
+        $updated_at: at,
       });
-  }
+
+    const issueRow = database
+      .query("SELECT id FROM issues WHERE repo_id = $repo_id AND number = $number")
+      .get({ $repo_id: repoId, $number: issueNumber }) as { id?: number } | undefined;
+
+    if (!issueRow?.id) {
+      throw new Error(`Failed to resolve issue id for ${input.repo}#${issueNumber}`);
+    }
+
+    database.query("DELETE FROM issue_labels WHERE issue_id = $issue_id").run({ $issue_id: issueRow.id });
+
+    for (const label of input.labels) {
+      database
+        .query(
+          `INSERT INTO issue_labels(issue_id, name, created_at)
+           VALUES ($issue_id, $name, $created_at)
+           ON CONFLICT(issue_id, name) DO NOTHING`
+        )
+        .run({
+          $issue_id: issueRow.id,
+          $name: label,
+          $created_at: at,
+        });
+    }
+  })();
 }
 
 export function recordTaskSnapshot(input: {
