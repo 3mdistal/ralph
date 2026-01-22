@@ -28,6 +28,13 @@ describe("midpoint label plan", () => {
     });
   });
 
+  test("clears in-progress when base branch is unknown", () => {
+    expect(computePlan({ baseBranch: "", botBranch: "bot/integration", defaultBranch: "main" })).toEqual({
+      addInBot: false,
+      removeInProgress: true,
+    });
+  });
+
   test("no label changes when base differs from bot branch", () => {
     expect(
       computePlan({ baseBranch: "feature", botBranch: "bot/integration", defaultBranch: "main" })

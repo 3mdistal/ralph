@@ -799,8 +799,7 @@ export class RepoWorker {
   }): Promise<void> {
     const issueRef = parseIssueRef(params.task.issue, this.repo);
     if (!issueRef) return;
-    let baseBranch = params.baseBranch ?? null;
-    let plan: MidpointLabelPlan | null = null;
+    let baseBranch = params.baseBranch ?? "";
     let defaultBranch: string | null = null;
 
     try {
@@ -813,22 +812,9 @@ export class RepoWorker {
 
     const resolvedDefaultBranch = defaultBranch ?? "main";
 
-    if (baseBranch) {
-      plan = computeMidpointLabelPlan({
-        baseBranch,
-        botBranch: params.botBranch,
-        defaultBranch: resolvedDefaultBranch,
-      });
-    } else {
+    if (!baseBranch) {
       try {
-        baseBranch = await this.getPullRequestBaseBranch(params.prUrl);
-        if (baseBranch) {
-          plan = computeMidpointLabelPlan({
-            baseBranch,
-            botBranch: params.botBranch,
-            defaultBranch: resolvedDefaultBranch,
-          });
-        }
+        baseBranch = (await this.getPullRequestBaseBranch(params.prUrl)) ?? "";
       } catch (error: any) {
         console.warn(
           `[ralph:worker:${this.repo}] Failed to re-check PR base before midpoint labeling: ${error?.message ?? String(error)}`
@@ -836,9 +822,11 @@ export class RepoWorker {
       }
     }
 
-    if (!plan) {
-      plan = { addInBot: false, removeInProgress: true };
-    }
+    const plan = computeMidpointLabelPlan({
+      baseBranch,
+      botBranch: params.botBranch,
+      defaultBranch: resolvedDefaultBranch,
+    });
     if (!plan.addInBot && !plan.removeInProgress) return;
 
     const errors: string[] = [];
