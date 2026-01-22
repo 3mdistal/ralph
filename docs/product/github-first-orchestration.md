@@ -43,12 +43,12 @@ Rules:
 
 ## Relationship precedence + blocked semantics
 
-Ralph treats GitHub-native issue relationships as the source of truth when available, with a conservative fallback to body parsing.
+Ralph treats GitHub-native issue relationships as the primary source of truth while still honoring body-encoded blockers.
 This section supersedes the v0.1.0 body-only dependency encoding; body parsing remains the fallback when relationships are unavailable.
 
 Rules:
 - Relationship sources: GitHub dependencies (`blocked_by` / `blocking`) and sub-issues (`parent` / `sub_issues`).
-- If GitHub-native relationships are available, they are authoritative.
+- GitHub-native relationships are authoritative, but body-parsed blockers are still honored.
 - If GitHub-native relationships are unavailable, Ralph falls back to `## Blocked by` body parsing.
 - Precedence uses a union: **blocked wins**. If any authoritative source reports an unresolved blocker, the issue is blocked.
 - Unknown coverage: if neither GitHub-native relationships nor body sections yield evidence, Ralph does not change blocked state.
