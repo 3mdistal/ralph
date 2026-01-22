@@ -1,13 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-  extractFirstPrUrl,
-  extractLatestPrUrl,
-  extractPrUrls,
-  hasProductGap,
-  pickPrUrlForRepo,
-  selectPrUrlFromOutput,
-} from "../routing";
+import { hasProductGap, selectPrUrl } from "../routing";
 
 describe("hasProductGap", () => {
   test("true only for explicit PRODUCT GAP: markers", () => {
@@ -31,60 +24,44 @@ describe("hasProductGap", () => {
   });
 });
 
-describe("PR URL extraction", () => {
-  test("extracts all PR URLs in output", () => {
-    const output = [
-      "Starting work...",
-      "https://github.com/acme/tools/pull/12",
-      "other text",
-      "https://github.com/3mdistal/ralph/pull/67",
-    ].join("\n");
-
-    expect(extractPrUrls(output)).toEqual([
-      "https://github.com/acme/tools/pull/12",
-      "https://github.com/3mdistal/ralph/pull/67",
-    ]);
+describe("PR URL selection", () => {
+  test("prefers structured PR URL", () => {
+    expect(
+      selectPrUrl({
+        output: "https://github.com/acme/tools/pull/12",
+        repo: "3mdistal/ralph",
+        prUrl: "https://github.com/3mdistal/ralph/pull/101",
+      })
+    ).toBe("https://github.com/3mdistal/ralph/pull/101");
   });
 
-  test("extracts the latest PR URL", () => {
+  test("selects latest PR URL when repo is not provided", () => {
     const output = [
       "https://github.com/acme/tools/pull/12",
       "noise",
       "https://github.com/3mdistal/ralph/pull/67",
     ].join("\n");
 
-    expect(extractLatestPrUrl(output)).toBe("https://github.com/3mdistal/ralph/pull/67");
-    expect(extractFirstPrUrl(output)).toBe("https://github.com/acme/tools/pull/12");
+    expect(selectPrUrl({ output })).toBe("https://github.com/3mdistal/ralph/pull/67");
   });
 
-  test("prefers latest URL for repo when multiple present", () => {
-    const urls = [
+  test("selects latest PR URL for repo", () => {
+    const output = [
       "https://github.com/acme/tools/pull/12",
       "https://github.com/3mdistal/ralph/pull/45",
       "https://github.com/3mdistal/ralph/pull/67",
       "https://github.com/acme/tools/pull/99",
-    ];
+    ].join("\n");
 
-    expect(pickPrUrlForRepo(urls, "3mdistal/ralph")).toBe("https://github.com/3mdistal/ralph/pull/67");
+    expect(selectPrUrl({ output, repo: "3mdistal/ralph" })).toBe("https://github.com/3mdistal/ralph/pull/67");
   });
 
   test("returns null when repo does not match", () => {
-    const urls = [
-      "https://github.com/acme/tools/pull/12",
-      "https://github.com/another/repo/pull/99",
-    ];
-
-    expect(pickPrUrlForRepo(urls, "3mdistal/ralph")).toBe(null);
-  });
-
-  test("selects repo-matching PR URL from output", () => {
     const output = [
       "https://github.com/acme/tools/pull/12",
-      "https://github.com/3mdistal/ralph/pull/101",
-      "https://github.com/3mdistal/ralph/pull/202",
+      "https://github.com/another/repo/pull/99",
     ].join("\n");
 
-    expect(selectPrUrlFromOutput(output, "3mdistal/ralph")).toBe("https://github.com/3mdistal/ralph/pull/202");
-    expect(selectPrUrlFromOutput(output, "acme/missing")).toBe(null);
+    expect(selectPrUrl({ output, repo: "3mdistal/ralph" })).toBe(null);
   });
 });

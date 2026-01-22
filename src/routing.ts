@@ -110,22 +110,22 @@ export function hasProductGap(output: string): boolean {
 /**
  * Extract PR URL from session output
  */
-export function extractPrUrls(output: string): string[] {
+function extractPrUrls(output: string): string[] {
   const matches = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/g);
   return matches ?? [];
 }
 
-export function extractFirstPrUrl(output: string): string | null {
+function extractFirstPrUrl(output: string): string | null {
   const urls = extractPrUrls(output);
   return urls[0] ?? null;
 }
 
-export function extractLatestPrUrl(output: string): string | null {
+function extractLatestPrUrl(output: string): string | null {
   const urls = extractPrUrls(output);
   return urls.length > 0 ? urls[urls.length - 1] : null;
 }
 
-export function pickPrUrlForRepo(urls: string[], repo: string): string | null {
+function pickPrUrlForRepo(urls: string[], repo: string): string | null {
   if (urls.length === 0) return null;
   const normalizedRepo = repo.trim().toLowerCase();
   if (!normalizedRepo) return urls[urls.length - 1] ?? null;
@@ -135,25 +135,23 @@ export function pickPrUrlForRepo(urls: string[], repo: string): string | null {
   return matching[matching.length - 1] ?? null;
 }
 
-export function selectPrUrlFromOutput(output: string, repo: string): string | null {
-  const urls = extractPrUrls(output);
-  if (!repo.trim()) return extractLatestPrUrl(output);
+export type PrUrlSelectionInput = {
+  output: string;
+  repo?: string;
+  prUrl?: string;
+};
+
+export function selectPrUrl(input: PrUrlSelectionInput): string | null {
+  if (input.prUrl) return input.prUrl;
+  const repo = input.repo ?? "";
+  if (!repo.trim()) return extractLatestPrUrl(input.output);
+  const urls = extractPrUrls(input.output);
   return pickPrUrlForRepo(urls, repo);
 }
 
-export function extractPrUrl(output: string): string | null {
-  return extractFirstPrUrl(output);
-}
-
 /**
- * Prefer best-effort structured PR URL if available; otherwise return the latest PR URL in output.
+ * Legacy helper: prefer structured PR URL if available; otherwise return latest PR URL in output.
  */
 export function extractPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
-  if (result.prUrl) return result.prUrl;
-  return extractLatestPrUrl(result.output);
-}
-
-export function selectPrUrlFromSession(result: { output: string; prUrl?: string }, repo: string): string | null {
-  if (result.prUrl) return result.prUrl;
-  return selectPrUrlFromOutput(result.output, repo);
+  return selectPrUrl({ output: result.output, prUrl: result.prUrl });
 }

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { __computeMidpointLabelPlanForTests as computePlan } from "../worker";
+import { computeMidpointLabelPlan as computePlan } from "../midpoint-labels";
 
 describe("midpoint label plan", () => {
   test("adds in-bot and clears in-progress for bot branch merge", () => {
