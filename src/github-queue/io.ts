@@ -176,6 +176,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   let lastSweepAt = 0;
   let stopRequested = false;
   let watchTimer: ReturnType<typeof setTimeout> | null = null;
+  let watchInFlight = false;
 
   const maybeSweepStaleInProgress = async (): Promise<void> => {
     const nowMs = getNowMs(deps);
@@ -259,13 +260,23 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     startWatching: (onChange: QueueChangeHandler): void => {
       const intervalMs = Math.max(getConfig().pollInterval, WATCH_MIN_INTERVAL_MS);
 
-      const tick = () => {
+      const tick = async () => {
         if (stopRequested) return;
-        void listTasksByStatus("queued").then((tasks) => onChange(tasks));
-        watchTimer = setTimeout(tick, intervalMs);
+        if (watchInFlight) {
+          watchTimer = setTimeout(tick, intervalMs);
+          return;
+        }
+        watchInFlight = true;
+        try {
+          const tasks = await listTasksByStatus("queued");
+          onChange(tasks);
+        } finally {
+          watchInFlight = false;
+          watchTimer = setTimeout(tick, intervalMs);
+        }
       };
 
-      tick();
+      void tick();
     },
     stopWatching: (): void => {
       stopRequested = true;

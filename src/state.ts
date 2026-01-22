@@ -463,6 +463,10 @@ export function recordTaskSnapshot(input: {
   const at = input.at ?? nowIso();
   const repoId = upsertRepo({ repo: input.repo, at });
   const issueNumber = parseIssueNumber(input.issue);
+  const taskPath =
+    issueNumber !== null && input.taskPath.startsWith("github:")
+      ? `github:${input.repo}#${issueNumber}`
+      : input.taskPath;
 
   if (issueNumber !== null) {
     database
@@ -501,7 +505,7 @@ export function recordTaskSnapshot(input: {
     .run({
       $repo_id: repoId,
       $issue_number: issueNumber,
-      $task_path: input.taskPath,
+      $task_path: taskPath,
       $task_name: input.taskName ?? null,
       $status: input.status ?? null,
       $session_id: input.sessionId ?? null,

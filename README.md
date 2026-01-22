@@ -88,7 +88,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 
 ### Supported settings
 
-- `queueBackend` (string): `github` (default), `bwrb`, or `none`
+- `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
 - `bwrbVault` (string): bwrb vault path for the task queue (required when `queueBackend = "bwrb"`)
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
