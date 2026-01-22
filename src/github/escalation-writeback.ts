@@ -64,14 +64,22 @@ function hashFNV1a(input: string): string {
   return hash.toString(16).padStart(8, "0");
 }
 
-export function buildEscalationMarker(params: {
+export function buildEscalationMarkerId(params: {
   repo: string;
   issueNumber: number;
   escalationType: string;
 }): string {
   const base = [params.repo, params.issueNumber, params.escalationType].join("|");
-  const hash = `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
-  return `<!-- ralph-escalation:id=${hash} -->`;
+  return `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
+}
+
+export function buildEscalationMarker(params: {
+  repo: string;
+  issueNumber: number;
+  escalationType: string;
+}): string {
+  const markerId = buildEscalationMarkerId(params);
+  return `<!-- ralph-escalation:id=${markerId} -->`;
 }
 
 export function extractExistingMarker(body: string): string | null {
@@ -124,7 +132,11 @@ export function planEscalationWriteback(ctx: EscalationWritebackContext): Escala
     ownerHandle,
   });
 
-  const markerId = extractExistingMarker(marker) ?? marker;
+  const markerId = buildEscalationMarkerId({
+    repo: ctx.repo,
+    issueNumber: ctx.issueNumber,
+    escalationType: ctx.escalationType,
+  });
   const idempotencyKey = `gh-escalation:${ctx.repo}#${ctx.issueNumber}:${markerId}`;
 
   return {
@@ -249,13 +261,20 @@ export async function writeEscalationToGitHub(
     return { postedComment: false, skippedComment: true, markerFound: true };
   }
 
-  if (hasKeyResult && !markerFound) {
+  const scanComplete = Boolean(listResult && !listResult.reachedMax);
+
+  if (hasKeyResult && scanComplete && !markerFound) {
     ignoreExistingKey = true;
     try {
       deleteKey(plan.idempotencyKey);
     } catch (error: any) {
       log(`${prefix} Failed to clear stale idempotency key: ${error?.message ?? String(error)}`);
     }
+  }
+
+  if (hasKeyResult && !scanComplete && !markerFound) {
+    ignoreExistingKey = true;
+    log(`${prefix} Idempotency key exists but marker scan incomplete; proceeding cautiously.`);
   }
 
   if (markerFound) {
@@ -268,10 +287,6 @@ export async function writeEscalationToGitHub(
     return { postedComment: false, skippedComment: true, markerFound: true };
   }
 
-  if (!listResult && !idempotencyAvailable) {
-    log(`${prefix} Idempotency unavailable and comment scan failed; skipping comment to avoid duplicates.`);
-    return { postedComment: false, skippedComment: true, markerFound: false };
-  }
 
   let claimed = false;
   try {
@@ -295,10 +310,6 @@ export async function writeEscalationToGitHub(
     }
   }
 
-  if (!claimed && !idempotencyAvailable) {
-    log(`${prefix} Idempotency unavailable; skipping comment to avoid duplicates.`);
-    return { postedComment: false, skippedComment: true, markerFound: false };
-  }
 
   try {
     await createIssueComment({
