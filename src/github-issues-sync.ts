@@ -6,6 +6,7 @@ import {
   recordIssueLabelsSnapshot,
   recordIssueSnapshot,
   recordRepoSync,
+  runInStateTransaction,
 } from "./state";
 
 type IssueLabel = { name?: string } | string;
@@ -44,7 +45,6 @@ export type SyncResult = {
 
 type PollerHandle = { stop: () => void };
 
-const DEFAULT_INITIAL_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_SKEW_SECONDS = 5;
 const DEFAULT_JITTER_PCT = 0.2;
 const DEFAULT_BACKOFF_MULTIPLIER = 1.5;
@@ -73,14 +73,14 @@ function nextDelayMs(params: {
   return Math.min(next, params.baseMs * maxMultiplier);
 }
 
-function computeSince(lastSyncAt: string | null, nowMs: number, skewSeconds = DEFAULT_SKEW_SECONDS): string {
+function computeSince(lastSyncAt: string | null, skewSeconds = DEFAULT_SKEW_SECONDS): string | null {
   if (!lastSyncAt) {
-    return new Date(nowMs - DEFAULT_INITIAL_LOOKBACK_MS).toISOString();
+    return null;
   }
 
   const parsed = Date.parse(lastSyncAt);
   if (!Number.isFinite(parsed)) {
-    return new Date(nowMs - DEFAULT_INITIAL_LOOKBACK_MS).toISOString();
+    return null;
   }
 
   return new Date(parsed - skewSeconds * 1000).toISOString();
@@ -165,7 +165,7 @@ function resolveRateLimitDelayMs(resetAtMs: number, nowMs: number): number {
 
 async function fetchIssuesSince(params: {
   repo: string;
-  since: string;
+  since: string | null;
   token: string;
   fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 }): Promise<
@@ -174,7 +174,7 @@ async function fetchIssuesSince(params: {
 > {
   let url = new URL(`https://api.github.com/repos/${params.repo}/issues`);
   url.searchParams.set("state", "all");
-  url.searchParams.set("since", params.since);
+  if (params.since) url.searchParams.set("since", params.since);
   url.searchParams.set("sort", "updated");
   url.searchParams.set("direction", "desc");
   url.searchParams.set("per_page", "100");
@@ -220,7 +220,7 @@ async function fetchIssuesSince(params: {
     if (rows.length > 0) {
       const last = rows[rows.length - 1];
       const lastUpdatedMs = parseIsoMs(last.updated_at);
-      const sinceMs = parseIsoMs(params.since);
+      const sinceMs = parseIsoMs(params.since ?? undefined);
       if (lastUpdatedMs !== null && sinceMs !== null && lastUpdatedMs < sinceMs) {
         url = null;
       }
@@ -240,8 +240,7 @@ export async function syncRepoIssuesOnce(params: {
   const getToken = deps.getToken ?? getInstallationToken;
   const now = deps.now ? deps.now() : new Date();
   const nowIso = now.toISOString();
-  const nowMs = now.getTime();
-  const since = computeSince(params.lastSyncAt, nowMs);
+  const since = computeSince(params.lastSyncAt);
 
   try {
     const token = await getToken();
@@ -267,37 +266,42 @@ export async function syncRepoIssuesOnce(params: {
 
     let stored = 0;
     let ralphCount = 0;
-    for (const issue of fetchResult.issues) {
-      const number = issue.number ? String(issue.number) : "";
-      if (!number) continue;
+    runInStateTransaction(() => {
+      for (const issue of fetchResult.issues) {
+        const number = issue.number ? String(issue.number) : "";
+        if (!number) continue;
 
-      const labels = extractLabelNames(issue.labels);
-      const issueRef = `${params.repo}#${number}`;
-      const hasRalph = hasRalphLabel(labels);
-      if (hasRalph) ralphCount += 1;
+        const labels = extractLabelNames(issue.labels);
+        const issueRef = `${params.repo}#${number}`;
+        const hasRalph = hasRalphLabel(labels);
+        if (hasRalph) ralphCount += 1;
 
-      if (!hasRalph && !hasIssueSnapshot(params.repo, issueRef)) continue;
+        if (!hasRalph && !hasIssueSnapshot(params.repo, issueRef)) continue;
 
-      recordIssueSnapshot({
-        repo: params.repo,
-        issue: issueRef,
-        title: issue.title ?? undefined,
-        state: issue.state ?? undefined,
-        url: issue.html_url ?? undefined,
-        githubNodeId: issue.node_id ?? undefined,
-        githubUpdatedAt: issue.updated_at ?? undefined,
-        at: nowIso,
-      });
+        const normalizedState = issue.state ? issue.state.toUpperCase() : undefined;
 
-      recordIssueLabelsSnapshot({
-        repo: params.repo,
-        issue: issueRef,
-        labels,
-        at: nowIso,
-      });
+        recordIssueSnapshot({
+          repo: params.repo,
+          issue: issueRef,
+          title: issue.title ?? undefined,
+          state: normalizedState,
+          url: issue.html_url ?? undefined,
+          githubNodeId: issue.node_id ?? undefined,
+          githubUpdatedAt: issue.updated_at ?? undefined,
+          at: nowIso,
+        });
 
-      stored += 1;
-    }
+        recordIssueLabelsSnapshot({
+          repo: params.repo,
+          issue: issueRef,
+          labels,
+          at: nowIso,
+          useTransaction: false,
+        });
+
+        stored += 1;
+      }
+    });
 
     const newLastSyncAt = fetchResult.maxUpdatedAt ?? nowIso;
 

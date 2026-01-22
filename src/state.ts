@@ -309,6 +309,11 @@ export function hasIssueSnapshot(repo: string, issue: string): boolean {
   return Boolean(issueRow?.id);
 }
 
+export function runInStateTransaction(run: () => void): void {
+  const database = requireDb();
+  database.transaction(run)();
+}
+
 export function recordIssueSnapshot(input: {
   repo: string;
   issue: string;
@@ -360,6 +365,7 @@ export function recordIssueLabelsSnapshot(input: {
   issue: string;
   labels: string[];
   at?: string;
+  useTransaction?: boolean;
 }): void {
   const database = requireDb();
   const at = input.at ?? nowIso();
@@ -368,7 +374,7 @@ export function recordIssueLabelsSnapshot(input: {
 
   if (issueNumber === null) return;
 
-  database.transaction(() => {
+  const run = () => {
     database
       .query(
         `INSERT INTO issues(repo_id, number, created_at, updated_at)
@@ -405,7 +411,14 @@ export function recordIssueLabelsSnapshot(input: {
           $created_at: at,
         });
     }
-  })();
+  };
+
+  if (input.useTransaction === false) {
+    run();
+    return;
+  }
+
+  database.transaction(run)();
 }
 
 export function recordTaskSnapshot(input: {
