@@ -29,21 +29,25 @@ import { getRalphStateDbPath } from "../paths";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
-let priorHome: string | undefined;
+let priorStateDbPath: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 describe("State SQLite (~/.ralph/state.sqlite)", () => {
   beforeEach(async () => {
-    priorHome = process.env.HOME;
+    priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
     releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
-    process.env.HOME = homeDir;
+    process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
     closeStateDbForTests();
   });
 
   afterEach(async () => {
     closeStateDbForTests();
-    process.env.HOME = priorHome;
+    if (priorStateDbPath === undefined) {
+      delete process.env.RALPH_STATE_DB_PATH;
+    } else {
+      process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
+    }
     await rm(homeDir, { recursive: true, force: true });
     releaseLock?.();
     releaseLock = null;

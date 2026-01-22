@@ -10,7 +10,7 @@ import { syncRepoIssuesOnce } from "../github-issues-sync";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
-let priorHome: string | undefined;
+let priorStateDbPath: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 const repo = "3mdistal/ralph";
@@ -36,10 +36,10 @@ function buildIssue(params: {
 
 describe("github issue sync", () => {
   beforeEach(async () => {
-    priorHome = process.env.HOME;
+    priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
     releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
-    process.env.HOME = homeDir;
+    process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
     closeStateDbForTests();
     initStateDb();
   });
@@ -49,7 +49,11 @@ describe("github issue sync", () => {
       closeStateDbForTests();
       await rm(homeDir, { recursive: true, force: true });
     } finally {
-      process.env.HOME = priorHome;
+      if (priorStateDbPath === undefined) {
+        delete process.env.RALPH_STATE_DB_PATH;
+      } else {
+        process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
+      }
       releaseLock?.();
       releaseLock = null;
     }

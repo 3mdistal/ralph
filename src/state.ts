@@ -201,7 +201,9 @@ export function initStateDb(): void {
   if (db) return;
 
   const stateDbPath = getRalphStateDbPath();
-  mkdirSync(getRalphHomeDir(), { recursive: true });
+  if (!process.env.RALPH_STATE_DB_PATH?.trim()) {
+    mkdirSync(getRalphHomeDir(), { recursive: true });
+  }
   mkdirSync(dirname(stateDbPath), { recursive: true });
 
   const database = new Database(stateDbPath);

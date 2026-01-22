@@ -33,6 +33,8 @@ export function getRalphLegacyConfigPath(): string {
 }
 
 export function getRalphStateDbPath(): string {
+  const raw = process.env.RALPH_STATE_DB_PATH?.trim();
+  if (raw) return isAbsolute(raw) ? raw : join(process.cwd(), raw);
   return join(getRalphHomeDir(), "state.sqlite");
 }
 
