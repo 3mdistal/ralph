@@ -78,6 +78,8 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
 Direct-to-main (override / Pattern B):
 - If a task PR is merged directly to `main` (or the repo config sets `botBranch: main`), Ralph does **not** apply the
   `ralph:in-bot` midpoint label, but **does** clear `ralph:in-progress` as part of the merge step.
+- Direct-to-main merges leave the issue open; closing behavior is handled by a separate policy (manual or future
+  automation) and is not part of the midpoint transition.
 - Midpoint label updates are best-effort and do not block merges; failures are surfaced via non-blocking notifications
   so operators can resolve GitHub permission/config issues without interrupting the queue.
 
