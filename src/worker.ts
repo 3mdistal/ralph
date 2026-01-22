@@ -820,20 +820,31 @@ export class RepoWorker {
     task: AgentTask;
     prUrl: string;
     botBranch: string;
+    baseBranch?: string | null;
   }): Promise<void> {
     const issueRef = parseIssueRef(params.task.issue, this.repo);
     if (!issueRef) return;
-    let baseBranch: string | null = null;
-    try {
-      baseBranch = await this.getPullRequestBaseBranch(params.prUrl);
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to re-check PR base before midpoint labeling: ${error?.message ?? String(error)}`
-      );
-      return;
+    let baseBranch = params.baseBranch ?? null;
+    let plan: MidpointLabelPlan | null = null;
+
+    if (baseBranch) {
+      plan = computeMidpointLabelPlan({ baseBranch, botBranch: params.botBranch });
+    } else {
+      try {
+        baseBranch = await this.getPullRequestBaseBranch(params.prUrl);
+        if (baseBranch) {
+          plan = computeMidpointLabelPlan({ baseBranch, botBranch: params.botBranch });
+        }
+      } catch (error: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to re-check PR base before midpoint labeling: ${error?.message ?? String(error)}`
+        );
+      }
     }
-    if (!baseBranch) return;
-    const plan = computeMidpointLabelPlan({ baseBranch, botBranch: params.botBranch });
+
+    if (!plan) {
+      plan = { addInBot: false, removeInProgress: true };
+    }
     if (!plan.addInBot && !plan.removeInProgress) return;
 
     const errors: string[] = [];
@@ -2610,7 +2621,12 @@ ${guidance}`
           try {
             await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
             this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
-            await this.applyMidpointLabelsBestEffort({ task: params.task, prUrl, botBranch: params.botBranch });
+            await this.applyMidpointLabelsBestEffort({
+              task: params.task,
+              prUrl,
+              botBranch: params.botBranch,
+              baseBranch,
+            });
             return { ok: true, prUrl, sessionId };
           } catch (error: any) {
           if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
