@@ -177,7 +177,7 @@ export function resolveManagedOpencodeConfigDir(): string {
     return envOverride;
   }
 
-  const cfg = loadConfig();
+  const cfg = loadConfig().config;
   const configOverride = cfg.opencode?.managedConfigDir?.trim();
   if (configOverride) return configOverride;
 
