@@ -1,3 +1,5 @@
+import type { BlockedSource } from "../blocked-sources";
+
 export type QueueTaskStatus =
   | "queued"
   | "starting"
@@ -43,6 +45,12 @@ export interface QueueTask {
   "repo-slot"?: string;
   /** Watchdog recovery attempts (string in frontmatter) */
   "watchdog-retries"?: string;
+  /** Blocked reason category */
+  "blocked-source"?: BlockedSource;
+  /** Short explanation of block reason */
+  "blocked-reason"?: string;
+  /** Last time blocking was checked */
+  "blocked-checked-at"?: string;
   /** Last checkpoint reached by worker */
   checkpoint?: string;
   /** Pause requested at next checkpoint */

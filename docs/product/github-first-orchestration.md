@@ -41,6 +41,33 @@ Rules:
 - Checked items (`[x]`) are treated as resolved blockers.
 - Ralph treats these sections as read-only in v0.1.0 (no auto-editing).
 
+## Relationship precedence + blocked semantics
+
+Ralph treats GitHub-native issue relationships as the source of truth when available, with a conservative fallback to body parsing.
+
+Rules:
+- Relationship sources: GitHub dependencies (`blocked_by` / `blocking`) and sub-issues (`parent` / `sub_issues`).
+- If GitHub-native relationships are available, they are authoritative.
+- If GitHub-native relationships are unavailable, Ralph falls back to `## Blocked by` body parsing.
+- Precedence uses a union: **blocked wins**. If any authoritative source reports an unresolved blocker, the issue is blocked.
+- Unknown coverage: if neither GitHub-native relationships nor body sections yield evidence, Ralph does not change blocked state.
+- Sub-issues: a parent issue is blocked while any sub-issue is open; sub-issues are not blocked by their parent.
+
+Blocked enforcement:
+- Blocked issues get the `ralph:blocked` label and their agent-task status is set to `blocked`.
+- When unblocked, Ralph removes `ralph:blocked` and re-queues only tasks that were blocked due to dependencies.
+
+Blocked attribution (`blocked-source` in agent-task frontmatter):
+- `deps` - blocked by issue dependencies or sub-issues
+- `allowlist` - repo owner not in allowlist
+- `dirty-repo` - repo root has uncommitted changes
+- `merge-target` - PR targets protected base (e.g. main without override)
+- `ci-only` - CI-only PR for non-CI issue
+- `merge-conflict` - PR has merge conflicts
+- `auto-update` - failure while auto-updating PR branch
+- `ci-failure` - required checks failed or non-actionable
+- `runtime-error` - unexpected runtime failure while processing/resuming a task
+
 ## Done semantics (Pattern A)
 
 - Issue remains open until the rollup PR merges to `main`.

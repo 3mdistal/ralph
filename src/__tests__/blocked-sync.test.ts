@@ -1,0 +1,104 @@
+import { afterAll, describe, expect, mock, test } from "bun:test";
+
+import { RepoWorker } from "../worker";
+import type { IssueRelationshipProvider, IssueRelationshipSnapshot } from "../github/issue-relationships";
+
+const updateTaskStatusMock = mock(async () => true);
+
+const queueAdapter = {
+  updateTaskStatus: updateTaskStatusMock,
+};
+
+const notifyAdapter = {
+  notifyEscalation: async () => {},
+  notifyError: async () => {},
+  notifyTaskComplete: async () => {},
+};
+
+const sessionAdapter = {
+  runCommand: async () => ({ sessionId: "", success: true, output: "" }),
+  continueSession: async () => ({ sessionId: "", success: true, output: "" }),
+  continueCommand: async () => ({ sessionId: "", success: true, output: "" }),
+  getRalphXdgCacheHome: () => "/tmp",
+};
+
+const throttleAdapter = {
+  getThrottleDecision: async () => ({ state: "ok", snapshot: { resumeAt: null } }),
+} as any;
+
+function createTask(overrides: Record<string, unknown>) {
+  return {
+    _path: "orchestration/tasks/issue-10.md",
+    _name: "issue-10",
+    type: "agent-task",
+    "creation-date": "2026-01-22",
+    scope: "builder",
+    issue: "3mdistal/ralph#10",
+    repo: "3mdistal/ralph",
+    status: "queued",
+    priority: "p2-medium",
+    name: "Issue 10",
+    ...overrides,
+  } as any;
+}
+
+describe("syncBlockedStateForTasks", () => {
+  afterAll(() => {
+    mock.restore();
+  });
+
+  test("blocks queued tasks when dependencies are open", async () => {
+    updateTaskStatusMock.mockClear();
+    const provider: IssueRelationshipProvider = {
+      getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
+        issue,
+        signals: [
+          { source: "github", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 11 } },
+        ],
+        coverage: { githubDeps: true, githubSubIssues: true, bodyDeps: false },
+      }),
+    };
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+      relationships: provider,
+    });
+
+    (worker as any).addIssueLabel = async () => {};
+    const blocked = await worker.syncBlockedStateForTasks([createTask({})]);
+
+    expect(blocked.has("orchestration/tasks/issue-10.md")).toBe(true);
+    expect(updateTaskStatusMock).toHaveBeenCalled();
+    const call = updateTaskStatusMock.mock.calls[0];
+    expect(call[1]).toBe("blocked");
+    expect(call[2]["blocked-source"]).toBe("deps");
+  });
+
+  test("does not unblock tasks blocked for other reasons", async () => {
+    updateTaskStatusMock.mockClear();
+    const provider: IssueRelationshipProvider = {
+      getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
+        issue,
+        signals: [],
+        coverage: { githubDeps: true, githubSubIssues: true, bodyDeps: true },
+      }),
+    };
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+      relationships: provider,
+    });
+
+    (worker as any).removeIssueLabel = async () => {};
+    const task = createTask({ status: "blocked", "blocked-source": "allowlist" });
+    await worker.syncBlockedStateForTasks([task]);
+
+    expect(updateTaskStatusMock).not.toHaveBeenCalled();
+  });
+});
