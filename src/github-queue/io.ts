@@ -451,35 +451,24 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         return true;
       }
       const delta = statusToRalphLabelDelta(status, issue.labels);
+      const steps: LabelOp[] = [
+        ...delta.add.map((label) => ({ action: "add" as const, label })),
+        ...delta.remove.map((label) => ({ action: "remove" as const, label })),
+      ];
+      const rollback: LabelOp[] = [
+        ...delta.remove.map((label) => ({ action: "add" as const, label })),
+        ...delta.add.map((label) => ({ action: "remove" as const, label })),
+      ];
+      const labelOps = await applyLabelOps({
+        repo: issueRef.repo,
+        issueNumber: issueRef.number,
+        steps,
+        rollback,
+        logLabel: `${issueRef.repo}#${issueRef.number}`,
+      });
+      if (!labelOps.ok) return false;
 
-      const added: string[] = [];
-      const removed: string[] = [];
-      try {
-        for (const label of delta.add) {
-          await addIssueLabel(issueRef.repo, issueRef.number, label);
-          added.push(label);
-        }
-      } catch (error: any) {
-        console.warn(
-          `[ralph:queue:github] Failed to update labels for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
-        );
-        return false;
-      }
-
-      for (const label of delta.remove) {
-        try {
-          const result = await removeIssueLabel(issueRef.repo, issueRef.number, label);
-          if (result.removed) removed.push(label);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:queue:github] Failed to remove label ${label} for ${issueRef.repo}#${issueRef.number}: ${
-              error?.message ?? String(error)
-            }`
-          );
-        }
-      }
-
-      applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: added, remove: removed, nowIso });
+      applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: labelOps.add, remove: labelOps.remove, nowIso });
 
       const normalizedExtra: Record<string, string> = {};
       if (extraFields) {

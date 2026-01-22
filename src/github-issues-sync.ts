@@ -1,6 +1,7 @@
 import { type RepoConfig } from "./config";
 import { isRepoAllowed } from "./github-app-auth";
 import { resolveGitHubToken } from "./github-auth";
+import { shouldLog } from "./logging";
 import {
   getRepoGithubIssueLastSyncAt,
   hasIssueSnapshot,
@@ -248,6 +249,9 @@ export async function syncRepoIssuesOnce(params: {
   try {
     const token = await getToken();
     if (!token) {
+      if (shouldLog(`github-sync:auth-missing:${params.repo}`, 60_000)) {
+        console.warn(`[ralph:gh-sync] GitHub auth is not configured; skipping issue sync for ${params.repo}`);
+      }
       return {
         ok: true,
         fetched: 0,
