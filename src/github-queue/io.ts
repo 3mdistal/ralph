@@ -393,7 +393,17 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       }
 
       const ttlMs = getConfig().ownershipTtlMs;
-      if (!canActOnTask({ "daemon-id": opState.daemonId, "heartbeat-at": opState.heartbeatAt }, opts.daemonId, opts.nowMs, ttlMs)) {
+      if (
+        !canActOnTask(
+          {
+            "daemon-id": opState.daemonId ?? undefined,
+            "heartbeat-at": opState.heartbeatAt ?? undefined,
+          },
+          opts.daemonId,
+          opts.nowMs,
+          ttlMs
+        )
+      ) {
         return { claimed: false, task: opts.task, reason: buildOwnershipSkipReason(opState, opts.daemonId, opts.nowMs, ttlMs) };
       }
 
