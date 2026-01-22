@@ -131,8 +131,8 @@ export function pickPrUrlForRepo(urls: string[], repo: string): string | null {
   if (!normalizedRepo) return urls[urls.length - 1] ?? null;
   const repoSuffix = `/${normalizedRepo}/pull/`;
   const matching = urls.filter((url) => url.toLowerCase().includes(repoSuffix));
-  const picked = matching.length > 0 ? matching[matching.length - 1] : urls[urls.length - 1];
-  return picked ?? null;
+  if (matching.length === 0) return null;
+  return matching[matching.length - 1] ?? null;
 }
 
 export function extractPrUrl(output: string): string | null {

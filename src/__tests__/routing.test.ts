@@ -61,12 +61,12 @@ describe("PR URL extraction", () => {
     expect(pickPrUrlForRepo(urls, "3mdistal/ralph")).toBe("https://github.com/3mdistal/ralph/pull/67");
   });
 
-  test("falls back to last URL when repo does not match", () => {
+  test("returns null when repo does not match", () => {
     const urls = [
       "https://github.com/acme/tools/pull/12",
       "https://github.com/another/repo/pull/99",
     ];
 
-    expect(pickPrUrlForRepo(urls, "3mdistal/ralph")).toBe("https://github.com/another/repo/pull/99");
+    expect(pickPrUrlForRepo(urls, "3mdistal/ralph")).toBe(null);
   });
 });

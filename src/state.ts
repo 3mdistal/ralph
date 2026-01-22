@@ -500,7 +500,7 @@ export function recordTaskSnapshot(input: {
 }
 
 function parsePrNumber(prUrl: string): number | null {
-  const match = prUrl.match(/\/pull\/(\d+)(?:$|\?)/);
+  const match = prUrl.match(/\/pull\/(\d+)(?:$|[/?#])/);
   if (!match) return null;
   const num = Number(match[1]);
   return Number.isFinite(num) ? num : null;
