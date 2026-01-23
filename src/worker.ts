@@ -1308,10 +1308,10 @@ ${guidance}`
       this.logIgnoredBodyBlockers(snapshot.issue, resolved.ignoredBodyBlockers, resolved.ignoreReason);
     }
 
-    if (!snapshot.coverage.githubDeps && !resolved.hasBodyDepsCoverage) {
+    if (!snapshot.coverage.githubDepsComplete && !resolved.hasBodyDepsCoverage) {
       resolved.signals.push({ source: "github", kind: "blocked_by", state: "unknown" });
     }
-    if (!snapshot.coverage.githubSubIssues) {
+    if (!snapshot.coverage.githubSubIssuesComplete) {
       resolved.signals.push({ source: "github", kind: "sub_issue", state: "unknown" });
     }
     return resolved.signals;
@@ -1327,7 +1327,7 @@ ${guidance}`
     const githubDepsSignals = signals.filter((signal) => signal.source === "github" && signal.kind === "blocked_by");
     const bodyDepsSignals = signals.filter((signal) => signal.source === "body" && signal.kind === "blocked_by");
     const hasGithubDepsSignals = githubDepsSignals.length > 0;
-    const hasGithubDepsCoverage = snapshot.coverage.githubDeps;
+    const hasGithubDepsCoverage = snapshot.coverage.githubDepsComplete;
     const shouldIgnoreBodyDeps = hasGithubDepsCoverage || (!hasGithubDepsCoverage && hasGithubDepsSignals);
     const filteredSignals = shouldIgnoreBodyDeps
       ? signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))

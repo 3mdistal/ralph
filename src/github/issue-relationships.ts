@@ -9,8 +9,8 @@ export type IssueRelationshipSnapshot = {
   issue: IssueRef;
   signals: RelationshipSignal[];
   coverage: {
-    githubDeps: boolean;
-    githubSubIssues: boolean;
+    githubDepsComplete: boolean;
+    githubSubIssuesComplete: boolean;
     bodyDeps: boolean;
   };
 };
@@ -187,7 +187,7 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
   async getSnapshot(issue: IssueRef): Promise<IssueRelationshipSnapshot> {
     const basics = await this.fetchIssueBasics(issue);
     const signals: RelationshipSignal[] = [];
-    const coverage = { githubDeps: false, githubSubIssues: false, bodyDeps: false };
+    const coverage = { githubDepsComplete: false, githubSubIssuesComplete: false, bodyDeps: false };
 
     const parsed = parseIssueBodyDependencies(basics.body, issue.repo);
     signals.push(...parsed.blockedBy);
@@ -197,14 +197,14 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
     if (blockedBy !== null) {
       const truncated = blockedBy.length >= RELATIONSHIP_PAGE_SIZE;
       signals.push(...mapIssueStatesToSignals(blockedBy, "blocked_by", "github"));
-      coverage.githubDeps = !truncated;
+      coverage.githubDepsComplete = !truncated;
     }
 
     const subIssues = await this.fetchSubIssues(issue);
     if (subIssues !== null) {
       const truncated = subIssues.length >= RELATIONSHIP_PAGE_SIZE;
       signals.push(...mapIssueStatesToSignals(subIssues, "sub_issue", "github"));
-      coverage.githubSubIssues = !truncated;
+      coverage.githubSubIssuesComplete = !truncated;
     }
 
     return { issue, signals, coverage };

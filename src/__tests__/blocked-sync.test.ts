@@ -55,7 +55,7 @@ describe("syncBlockedStateForTasks", () => {
         signals: [
           { source: "github", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 11 } },
         ],
-        coverage: { githubDeps: true, githubSubIssues: true, bodyDeps: false },
+        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: false },
       }),
     };
 
@@ -83,7 +83,7 @@ describe("syncBlockedStateForTasks", () => {
       getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
         issue,
         signals: [],
-        coverage: { githubDeps: true, githubSubIssues: true, bodyDeps: true },
+        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
       }),
     };
 
@@ -110,7 +110,7 @@ describe("syncBlockedStateForTasks", () => {
         signals: [
           { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 12 } },
         ],
-        coverage: { githubDeps: true, githubSubIssues: true, bodyDeps: true },
+        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
       }),
     };
 
@@ -140,7 +140,7 @@ describe("syncBlockedStateForTasks", () => {
         signals: [
           { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 12 } },
         ],
-        coverage: { githubDeps: false, githubSubIssues: true, bodyDeps: true },
+        coverage: { githubDepsComplete: false, githubSubIssuesComplete: true, bodyDeps: true },
       }),
     };
 
@@ -170,7 +170,7 @@ describe("syncBlockedStateForTasks", () => {
           { source: "github", kind: "blocked_by", state: "closed", ref: { repo: issue.repo, number: 12 } },
           { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 13 } },
         ],
-        coverage: { githubDeps: false, githubSubIssues: true, bodyDeps: true },
+        coverage: { githubDepsComplete: false, githubSubIssuesComplete: true, bodyDeps: true },
       }),
     };
 
@@ -197,7 +197,7 @@ describe("syncBlockedStateForTasks", () => {
           { source: "github", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 12 } },
           { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 13 } },
         ],
-        coverage: { githubDeps: false, githubSubIssues: true, bodyDeps: true },
+        coverage: { githubDepsComplete: false, githubSubIssuesComplete: true, bodyDeps: true },
       }),
     };
 
@@ -224,7 +224,7 @@ describe("syncBlockedStateForTasks", () => {
       getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
         issue,
         signals: [],
-        coverage: { githubDeps: false, githubSubIssues: false, bodyDeps: false },
+        coverage: { githubDepsComplete: false, githubSubIssuesComplete: false, bodyDeps: false },
       }),
     };
 
