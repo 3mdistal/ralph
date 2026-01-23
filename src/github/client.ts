@@ -39,6 +39,7 @@ type RequestOptions = {
 };
 
 type ClientOptions = {
+  /** Explicit token override; bypasses refresh (use for non-expiring tokens only). */
   token?: string;
   userAgent?: string;
   getToken?: () => Promise<string | null>;

@@ -38,7 +38,7 @@ async function createGitHubClient(repo: string): Promise<GitHubClient> {
   if (!token) {
     throw new Error("GitHub auth is not configured");
   }
-  return new GitHubClient(repo, token ? { token } : undefined);
+  return new GitHubClient(repo, { getToken: resolveGitHubToken });
 }
 
 async function addIssueLabel(repo: string, issueNumber: number, label: string): Promise<void> {
