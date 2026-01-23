@@ -17,7 +17,7 @@ export const RALPH_LABEL_BLOCKED = "ralph:blocked";
 const RALPH_LABEL_ESCALATED = "ralph:escalated";
 
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
-  { name: RALPH_LABEL_QUEUED, color: "0366D6", description: "Ready to be claimed by Ralph" },
+  { name: RALPH_LABEL_QUEUED, color: "0366D6", description: "In queue; claimable when not blocked or escalated" },
   { name: RALPH_LABEL_IN_PROGRESS, color: "FBCA04", description: "Ralph is actively working" },
   { name: RALPH_LABEL_IN_BOT, color: "0E8A16", description: "Task PR merged to bot/integration" },
   { name: RALPH_LABEL_BLOCKED, color: "D73A4A", description: "Blocked by dependencies" },
