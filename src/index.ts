@@ -48,7 +48,7 @@ import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from
 import { formatNowDoingLine, getSessionNowDoing } from "./live-status";
 import { getRalphSessionLockPath } from "./paths";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
-import { initStateDb, recordPrSnapshot } from "./state";
+import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
@@ -506,7 +506,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
     getOrCreateWorker,
     recordMerge: async (repo, prUrl) => {
       try {
-        recordPrSnapshot({ repo, issue: "", prUrl, state: "merged" });
+        recordPrSnapshot({ repo, issue: "", prUrl, state: PR_STATE_MERGED });
       } catch {
         // best-effort
       }
@@ -622,7 +622,7 @@ async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Pr
        .then(async (run) => {
          if (run.outcome === "success" && run.pr) {
            try {
-             recordPrSnapshot({ repo: task.repo, issue: task.issue, prUrl: run.pr, state: "merged" });
+             recordPrSnapshot({ repo: task.repo, issue: task.issue, prUrl: run.pr, state: PR_STATE_MERGED });
            } catch {
              // best-effort
            }
@@ -685,7 +685,7 @@ async function startTask(opts: {
         .then(async (run: AgentRun) => {
           if (run.outcome === "success" && run.pr) {
             try {
-              recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: "merged" });
+              recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: PR_STATE_MERGED });
             } catch {
               // best-effort
             }

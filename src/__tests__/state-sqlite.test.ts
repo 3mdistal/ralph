@@ -23,6 +23,8 @@ import {
   recordRepoGithubIssueSync,
   recordTaskSnapshot,
   recordPrSnapshot,
+  PR_STATE_MERGED,
+  PR_STATE_OPEN,
   recordRollupMerge,
   upsertIdempotencyKey,
 } from "../state";
@@ -256,7 +258,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
       prUrl: "https://github.com/3mdistal/ralph/pull/123",
-      state: "merged",
+      state: PR_STATE_MERGED,
       at: "2026-01-11T00:00:02.000Z",
     });
 
@@ -332,6 +334,55 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT last_sync_at FROM repo_github_issue_sync")
         .get() as { last_sync_at?: string };
       expect(githubSync.last_sync_at).toBe("2026-01-11T00:00:00.250Z");
+    } finally {
+      db.close();
+    }
+  });
+
+  test("updates PR snapshot state and stores multiple PRs", () => {
+    initStateDb();
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/123",
+      state: PR_STATE_OPEN,
+      at: "2026-01-11T00:00:02.000Z",
+    });
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/123",
+      state: PR_STATE_MERGED,
+      at: "2026-01-11T00:00:03.000Z",
+    });
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/123",
+      state: PR_STATE_OPEN,
+      at: "2026-01-11T00:00:03.500Z",
+    });
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/456",
+      state: PR_STATE_OPEN,
+      at: "2026-01-11T00:00:04.000Z",
+    });
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      const rows = db
+        .query("SELECT url, state FROM prs ORDER BY url")
+        .all() as Array<{ url: string; state: string }>;
+      expect(rows).toEqual([
+        { url: "https://github.com/3mdistal/ralph/pull/123", state: "merged" },
+        { url: "https://github.com/3mdistal/ralph/pull/456", state: "open" },
+      ]);
     } finally {
       db.close();
     }

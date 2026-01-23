@@ -110,16 +110,43 @@ export function hasProductGap(output: string): boolean {
 /**
  * Extract PR URL from session output
  */
-export function extractPrUrl(output: string): string | null {
-  // Look for GitHub PR URLs
-  const prMatch = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/);
-  return prMatch ? prMatch[0] : null;
+function extractPrUrls(output: string): string[] {
+  const matches = output.match(/https:\/\/github\.com\/[^\/]+\/[^\/]+\/pull\/\d+/g);
+  return matches ?? [];
+}
+
+function extractLatestPrUrl(output: string): string | null {
+  const urls = extractPrUrls(output);
+  return urls.length > 0 ? urls[urls.length - 1] : null;
+}
+
+function pickPrUrlForRepo(urls: string[], repo: string): string | null {
+  if (urls.length === 0) return null;
+  const normalizedRepo = repo.trim().toLowerCase();
+  if (!normalizedRepo) return urls[urls.length - 1] ?? null;
+  const repoSuffix = `/${normalizedRepo}/pull/`;
+  const matching = urls.filter((url) => url.toLowerCase().includes(repoSuffix));
+  if (matching.length === 0) return null;
+  return matching[matching.length - 1] ?? null;
+}
+
+export type PrUrlSelectionInput = {
+  output: string;
+  repo?: string;
+  prUrl?: string;
+};
+
+export function selectPrUrl(input: PrUrlSelectionInput): string | null {
+  if (input.prUrl) return input.prUrl;
+  const repo = input.repo ?? "";
+  if (!repo.trim()) return extractLatestPrUrl(input.output);
+  const urls = extractPrUrls(input.output);
+  return pickPrUrlForRepo(urls, repo);
 }
 
 /**
- * Prefer best-effort structured PR URL if available; otherwise parse from text output.
+ * Legacy helper: prefer structured PR URL if available; otherwise return latest PR URL in output.
  */
-export function extractPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
-  if (result.prUrl) return result.prUrl;
-  return extractPrUrl(result.output);
+export function extractPrUrlFromSession(result: { output: string; prUrl?: string }, repo?: string): string | null {
+  return selectPrUrl({ output: result.output, prUrl: result.prUrl, repo });
 }

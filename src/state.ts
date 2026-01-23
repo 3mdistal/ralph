@@ -7,6 +7,10 @@ import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
 
 const SCHEMA_VERSION = 6;
 
+export type PrState = "open" | "merged";
+export const PR_STATE_OPEN: PrState = "open";
+export const PR_STATE_MERGED: PrState = "merged";
+
 let db: Database | null = null;
 
 function nowIso(): string {
@@ -771,7 +775,7 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
 }
 
 function parsePrNumber(prUrl: string): number | null {
-  const match = prUrl.match(/\/pull\/(\d+)(?:$|\?)/);
+  const match = prUrl.match(/\/pull\/(\d+)(?:$|[/?#])/);
   if (!match) return null;
   const num = Number(match[1]);
   return Number.isFinite(num) ? num : null;
@@ -781,7 +785,7 @@ export function recordPrSnapshot(input: {
   repo: string;
   issue: string;
   prUrl: string;
-  state?: string;
+  state?: PrState;
   at?: string;
 }): void {
   const database = requireDb();
@@ -795,10 +799,13 @@ export function recordPrSnapshot(input: {
       `INSERT INTO prs(repo_id, issue_number, pr_number, url, state, created_at, updated_at)
        VALUES ($repo_id, $issue_number, $pr_number, $url, $state, $created_at, $updated_at)
        ON CONFLICT(repo_id, url) DO UPDATE SET
-         issue_number = COALESCE(excluded.issue_number, prs.issue_number),
-         pr_number = COALESCE(excluded.pr_number, prs.pr_number),
-         state = COALESCE(excluded.state, prs.state),
-         updated_at = excluded.updated_at`
+          issue_number = COALESCE(excluded.issue_number, prs.issue_number),
+          pr_number = COALESCE(excluded.pr_number, prs.pr_number),
+          state = CASE
+            WHEN prs.state = 'merged' AND (excluded.state IS NULL OR excluded.state != 'merged') THEN prs.state
+            ELSE COALESCE(excluded.state, prs.state)
+          END,
+          updated_at = excluded.updated_at`
     )
     .run({
       $repo_id: repoId,
