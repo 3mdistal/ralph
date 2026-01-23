@@ -834,6 +834,23 @@ export function getIdempotencyPayload(key: string): string | null {
   return typeof row?.payload_json === "string" ? row.payload_json : null;
 }
 
+export function getIdempotencyRecord(
+  key: string
+): { key: string; scope: string | null; createdAt: string; payloadJson: string | null } | null {
+  const database = requireDb();
+  const row = database
+    .query("SELECT key, scope, created_at, payload_json FROM idempotency WHERE key = $key")
+    .get({ $key: key }) as { key?: string; scope?: string | null; created_at?: string; payload_json?: string | null } | undefined;
+
+  if (!row?.key || !row.created_at) return null;
+  return {
+    key: row.key,
+    scope: row.scope ?? null,
+    createdAt: row.created_at,
+    payloadJson: row.payload_json ?? null,
+  };
+}
+
 export function recordIdempotencyKey(input: {
   key: string;
   scope?: string;
@@ -1056,6 +1073,35 @@ export function listRollupBatchEntries(batchId: string): RollupBatchEntry[] {
     issueRefs: parseJsonArray(row.issue_refs_json),
     mergedAt: row.merged_at,
   }));
+}
+
+export function updateRollupBatchEntryIssueRefs(params: {
+  batchId: string;
+  prUrl: string;
+  issueRefs: string[];
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+
+  database.transaction(() => {
+    database
+      .query(
+        `UPDATE rollup_batch_prs
+         SET issue_refs_json = $issue_refs_json
+         WHERE batch_id = $batch_id AND pr_url = $pr_url`
+      )
+      .run({
+        $batch_id: params.batchId,
+        $pr_url: params.prUrl,
+        $issue_refs_json: toJson(params.issueRefs),
+      });
+
+    database.query("UPDATE rollup_batches SET updated_at = $updated_at WHERE id = $id").run({
+      $updated_at: at,
+      $id: params.batchId,
+    });
+  })();
 }
 
 
