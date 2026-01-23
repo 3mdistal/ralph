@@ -120,6 +120,9 @@ describe("github escalation writeback", () => {
           keys.add(input.key);
           return true;
         },
+        deleteIdempotencyKey: (key) => {
+          keys.delete(key);
+        },
       }
     );
 
@@ -183,6 +186,9 @@ describe("github escalation writeback", () => {
         recordIdempotencyKey: (input) => {
           keys.add(input.key);
           return true;
+        },
+        deleteIdempotencyKey: (key) => {
+          keys.delete(key);
         },
       }
     );
