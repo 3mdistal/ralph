@@ -97,7 +97,7 @@ describe("github client auth", () => {
       });
     });
 
-    globalThis.fetch = fetchMock as typeof fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
     const result = await client.request<{ ok: boolean; auth: string | null }>("/rate_limit");
 
     expect(fetchMock).toHaveBeenCalled();
@@ -156,7 +156,7 @@ describe("github client auth", () => {
       });
     });
 
-    globalThis.fetch = fetchMock as typeof fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
 
     const client = new GitHubClient("3mdistal/ralph");
     await client.request("/rate_limit");
