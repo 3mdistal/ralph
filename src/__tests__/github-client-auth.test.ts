@@ -139,7 +139,7 @@ describe("github client auth", () => {
           return new Response(
             JSON.stringify({
               token: `tok_${tokenCalls}`,
-              expires_at: new Date(Date.now() + 30_000).toISOString(),
+              expires_at: new Date(Date.now() - 60_000).toISOString(),
             }),
             { status: 201, headers: { "Content-Type": "application/json" } }
           );
