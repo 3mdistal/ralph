@@ -29,13 +29,15 @@ describe("runAgent", () => {
 
     await runAgent("/tmp", "ralph-plan", "hello", {}, { spawn: spawn as any });
 
-    if (!spawnedArgs) {
-      throw new Error("spawn was not called");
-    }
+    const argsList = spawnedArgs ?? [];
+    const first = argsList[0] ?? "";
+    const argsText = argsList.join(" ");
 
-    expect(spawnedArgs[0]).toBe("run");
-    expect(spawnedArgs).toContain("--agent");
-    expect(spawnedArgs).toContain("ralph-plan");
-    expect(spawnedArgs).not.toContain("--command");
+    expect(argsList.length).toBeGreaterThan(0);
+
+    expect(first).toBe("run");
+    expect(argsText).toContain("--agent");
+    expect(argsText).toContain("ralph-plan");
+    expect(argsText).not.toContain("--command");
   });
 });
