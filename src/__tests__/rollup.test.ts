@@ -46,6 +46,7 @@ describe("rollup closing issues", () => {
     expect(body).toContain("Closes acme/widgets#2");
     expect(body).toContain("Closes acme/widgets#9");
     expect(body).toContain("Ralph-Rollup-Batch: batch-123");
+    expect(body).toContain("ralph-rollup-batch-id=batch-123");
     expect(body).toContain("<!-- ralph-rollup-batch-id=batch-123 -->");
   });
 

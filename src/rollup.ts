@@ -161,6 +161,7 @@ function buildRollupBody(options: ClosingIssueOptions): string {
     "",
     "---",
     marker.visibleLine,
+    marker.token,
     marker.hiddenLine,
     "",
     "---",
