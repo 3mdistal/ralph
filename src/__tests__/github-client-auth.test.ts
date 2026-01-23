@@ -121,6 +121,7 @@ describe("github client auth", () => {
       },
     });
     __resetConfigForTests();
+    process.env.GH_TOKEN = "stale-token";
 
     let tokenCalls = 0;
     const auths: Array<string | null> = [];
