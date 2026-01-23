@@ -17,7 +17,7 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 
 | Label | Meaning | Color |
 | --- | --- | --- |
-| `ralph:queued` | Ready to be claimed by Ralph | `0366D6` |
+| `ralph:queued` | In queue; claimable when not blocked or escalated | `0366D6` |
 | `ralph:in-progress` | Ralph is actively working | `FBCA04` |
 | `ralph:in-bot` | Task PR merged to `bot/integration` | `0E8A16` |
 | `ralph:blocked` | Blocked by dependencies | `D73A4A` |
@@ -25,7 +25,7 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 
 ## Claim semantics + daemon model
 
-- Ralph treats `ralph:queued` as the only claimable state. Claiming means applying `ralph:in-progress` and removing `ralph:queued`.
+- Ralph treats `ralph:queued` as the only claimable state once it is not blocked or escalated. Claiming means applying `ralph:in-progress` and removing `ralph:queued`.
 - Claiming is best-effort and not transactional across multiple GitHub label updates.
 - Deployment model: **single daemon per queue**. Running multiple daemons against the same GitHub queue is unsupported.
 - Stale recovery: Ralph only re-queues `ralph:in-progress` issues when the stored `heartbeat-at` exists and is stale beyond `ownershipTtlMs`.

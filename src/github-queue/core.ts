@@ -14,6 +14,11 @@ const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
 };
 
 const KNOWN_RALPH_LABELS = Array.from(new Set(Object.values(RALPH_STATUS_LABELS).filter(Boolean))) as string[];
+const RALPH_LABEL_QUEUED = RALPH_STATUS_LABELS.queued ?? "ralph:queued";
+// Preserve queued intent while blocked; blocked remains non-claimable.
+const PRESERVE_LABELS_BY_STATUS: Partial<Record<QueueTaskStatus, readonly string[]>> = {
+  blocked: [RALPH_LABEL_QUEUED],
+};
 
 export function deriveRalphStatus(labels: string[], issueState?: string | null): QueueTaskStatus | null {
   const normalizedState = issueState?.toUpperCase();
@@ -35,7 +40,10 @@ export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: 
 
   const labelSet = new Set(currentLabels);
   const add = labelSet.has(target) ? [] : [target];
-  const remove = KNOWN_RALPH_LABELS.filter((label) => label !== target && labelSet.has(label));
+  const preserved = new Set(PRESERVE_LABELS_BY_STATUS[status] ?? []);
+  const remove = KNOWN_RALPH_LABELS.filter(
+    (label) => label !== target && labelSet.has(label) && !preserved.has(label)
+  );
   return { add, remove };
 }
 
