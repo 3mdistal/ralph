@@ -1303,13 +1303,32 @@ ${guidance}`
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
     const signals = [...snapshot.signals];
-    if (!snapshot.coverage.githubDeps && !snapshot.coverage.bodyDeps) {
-      signals.push({ source: "github", kind: "blocked_by", state: "unknown" });
+    const githubDepsSignals = signals.filter((signal) => signal.source === "github" && signal.kind === "blocked_by");
+    const bodyDepsSignals = signals.filter((signal) => signal.source === "body" && signal.kind === "blocked_by");
+    const hasGithubDepsSignals = githubDepsSignals.length > 0;
+    const hasBodyDepsSignals = bodyDepsSignals.length > 0;
+    const hasGithubDepsCoverage = snapshot.coverage.githubDeps;
+    const shouldIgnoreBodyDeps = hasGithubDepsCoverage || (!hasGithubDepsCoverage && hasGithubDepsSignals);
+
+    if (shouldIgnoreBodyDeps && hasBodyDepsSignals) {
+      console.log(
+        `[ralph:worker:${this.repo}] Ignoring ${bodyDepsSignals.length} body blocker(s) for ${formatIssueRef(snapshot.issue)} ` +
+          `because GitHub dependency relationships are available or partial.`
+      );
+    }
+
+    const filteredSignals = shouldIgnoreBodyDeps
+      ? signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
+      : signals;
+    const hasBodyDepsCoverage = snapshot.coverage.bodyDeps && !shouldIgnoreBodyDeps;
+
+    if (!snapshot.coverage.githubDeps && !hasBodyDepsCoverage) {
+      filteredSignals.push({ source: "github", kind: "blocked_by", state: "unknown" });
     }
     if (!snapshot.coverage.githubSubIssues) {
-      signals.push({ source: "github", kind: "sub_issue", state: "unknown" });
+      filteredSignals.push({ source: "github", kind: "sub_issue", state: "unknown" });
     }
-    return signals;
+    return filteredSignals;
   }
 
   private async resolveWorktreeRef(): Promise<string> {
