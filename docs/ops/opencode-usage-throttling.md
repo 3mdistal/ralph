@@ -125,7 +125,7 @@ Add a throttle config section to Ralph:
 - Ensure in-flight tasks can be paused safely and resumed later.
 
 4) Gate OpenCode sends
-- Before `/next-task`, before each “Continue.”, and before merge/survey steps: check throttle.
+- Before planning, before each “Continue.”, and before merge/survey steps: check throttle.
 
 5) Add observability
 - Log a structured snapshot when entering/leaving throttled state.

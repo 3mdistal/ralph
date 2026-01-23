@@ -33,7 +33,8 @@ import {
 import { normalizeGitRef } from "./midpoint-labels";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
-import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
+import { continueCommand, continueSession, getRalphXdgCacheHome, runAgent, type SessionResult } from "./session";
+import { buildPlannerPrompt } from "./planner-prompt";
 import { getThrottleDecision } from "./throttle";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
@@ -89,7 +90,7 @@ import {
 } from "./git-worktree";
 
 type SessionAdapter = {
-  runCommand: typeof runCommand;
+  runAgent: typeof runAgent;
   continueSession: typeof continueSession;
   continueCommand: typeof continueCommand;
   getRalphXdgCacheHome: typeof getRalphXdgCacheHome;
@@ -116,7 +117,7 @@ type PullRequestMergeState = {
 };
 
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
-  runCommand,
+  runAgent,
   continueSession,
   continueCommand,
   getRalphXdgCacheHome,
@@ -3700,8 +3701,8 @@ ${guidance}`
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
 
-      // 4. Run configured command: next-task
-      console.log(`[ralph:worker:${this.repo}] Running /next-task ${issueNumber}`);
+      // 4. Run planner prompt with ralph-plan agent
+      console.log(`[ralph:worker:${this.repo}] Running planner prompt for issue ${issueNumber}`);
 
       // Transient OpenCode cache races can cause ENOENT during module imports (e.g. zod locales).
       // With per-run cache isolation this should be rare, but we still retry once for robustness.
@@ -3709,62 +3710,63 @@ ${guidance}`
         /ENOENT\s+reading\s+"[^"]*\/opencode\/node_modules\//.test(output) ||
         /ENOENT\s+reading\s+"[^"]*zod\/v4\/locales\//.test(output);
 
-      const pausedNextTask = await this.pauseIfHardThrottled(task, "next-task");
-      if (pausedNextTask) return pausedNextTask;
+      const pausedPlan = await this.pauseIfHardThrottled(task, "plan");
+      if (pausedPlan) return pausedPlan;
 
-      const nextTaskRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task", "starting");
+      const plannerPrompt = buildPlannerPrompt({ repo: this.repo, issueNumber });
+      const planRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan", "starting");
 
-      let planResult = await this.session.runCommand(taskRepoPath, "next-task", [issueNumber], {
+      let planResult = await this.session.runAgent(taskRepoPath, "ralph-plan", plannerPrompt, {
         repo: this.repo,
         cacheKey,
-        runLogPath: nextTaskRunLogPath,
+        runLogPath: planRunLogPath,
         introspection: {
           repo: this.repo,
           issue: task.issue,
           taskName: task.name,
           step: 1,
-          stepTitle: "next-task",
+          stepTitle: "plan",
         },
-        ...this.buildWatchdogOptions(task, "next-task"),
+        ...this.buildWatchdogOptions(task, "plan"),
         ...opencodeSessionOptions,
       });
 
-      const pausedAfterNextTask = await this.pauseIfHardThrottled(task, "next-task (post)", planResult.sessionId);
-      if (pausedAfterNextTask) return pausedAfterNextTask;
+      const pausedAfterPlan = await this.pauseIfHardThrottled(task, "plan (post)", planResult.sessionId);
+      if (pausedAfterPlan) return pausedAfterPlan;
 
       if (!planResult.success && planResult.watchdogTimeout) {
-        return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult, opencodeXdg);
+        return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
       }
 
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
-        console.warn(`[ralph:worker:${this.repo}] /next-task hit transient cache ENOENT; retrying once...`);
+        console.warn(`[ralph:worker:${this.repo}] planner hit transient cache ENOENT; retrying once...`);
         await new Promise((r) => setTimeout(r, 750));
-        const nextTaskRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "next-task-retry", "starting");
+        const planRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan-retry", "starting");
 
-        planResult = await this.session.runCommand(taskRepoPath, "next-task", [issueNumber], {
+        planResult = await this.session.runAgent(taskRepoPath, "ralph-plan", plannerPrompt, {
           repo: this.repo,
           cacheKey,
-          runLogPath: nextTaskRetryRunLogPath,
+          runLogPath: planRetryRunLogPath,
           introspection: {
             repo: this.repo,
             issue: task.issue,
             taskName: task.name,
             step: 1,
-            stepTitle: "next-task (retry)",
+            stepTitle: "plan (retry)",
           },
-          ...this.buildWatchdogOptions(task, "next-task-retry"),
+          ...this.buildWatchdogOptions(task, "plan-retry"),
           ...opencodeSessionOptions,
         });
       }
 
-      const pausedAfterNextTaskRetry = await this.pauseIfHardThrottled(task, "next-task (post retry)", planResult.sessionId);
-      if (pausedAfterNextTaskRetry) return pausedAfterNextTaskRetry;
+      const pausedAfterPlanRetry = await this.pauseIfHardThrottled(task, "plan (post retry)", planResult.sessionId);
+      if (pausedAfterPlanRetry) return pausedAfterPlanRetry;
 
       if (!planResult.success) {
         if (planResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "next-task", planResult, opencodeXdg);
+          return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
         }
-        throw new Error(`/next-task failed: ${planResult.output}`);
+        throw new Error(`planner failed: ${planResult.output}`);
       }
 
       // Persist OpenCode session ID for crash recovery

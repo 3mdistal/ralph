@@ -409,53 +409,7 @@ function argsFromMessage(message: string): string[] {
 async function runSession(
   repoPath: string,
   message: string,
-  options?: {
-    command?: string;
-    continueSession?: string;
-    agent?: string;
-    /** Used for per-run cache isolation */
-    repo?: string;
-    /** Used for per-run cache isolation */
-    cacheKey?: string;
-    /** OpenCode XDG roots for this run (multi-account profiles). */
-    opencodeXdg?: {
-      dataHome?: string;
-      configHome?: string;
-      stateHome?: string;
-      cacheHome?: string;
-    };
-    /** Restart-survivable run output log file path (stdout+stderr). */
-    runLogPath?: string;
-    /** Fallback hard timeout for the entire OpenCode process */
-    timeoutMs?: number;
-    /**
-     * Optional introspection metadata written to ~/.ralph/sessions/<session>/events.jsonl
-     * so the daemon can render deterministic status without model calls.
-     */
-    introspection?: {
-      repo?: string;
-      issue?: string;
-      taskName?: string;
-      step?: number;
-      stepTitle?: string;
-    };
-    watchdog?: {
-      enabled?: boolean;
-      thresholdsMs?: Partial<WatchdogThresholdsMs>;
-      /** Throttle for soft-timeout logs (default: 30s) */
-      softLogIntervalMs?: number;
-      /** Max number of recent JSON lines to attach (default: 50) */
-      recentEventLimit?: number;
-      /** Included in soft/hard timeout logs */
-      context?: string;
-    };
-    __testOverrides?: {
-      scheduler?: Scheduler;
-      sessionsDir?: string;
-      spawn?: SpawnFn;
-      processKill?: typeof process.kill;
-    };
-  }
+  options?: RunSessionInternalOptions
 ): Promise<SessionResult> {
   const scheduler = options?.__testOverrides?.scheduler ?? defaultScheduler;
   const truncate = (value: string, max: number) => (value.length > max ? value.slice(0, max) + "…" : value);
@@ -1266,51 +1220,62 @@ async function runSession(
   return { sessionId, output: textOutput || raw, success: true, exitCode, prUrl: prUrlFromEvents ?? undefined };
 }
 
+export type RunSessionOptionsBase = {
+  repo?: string;
+  cacheKey?: string;
+  opencodeXdg?: {
+    dataHome?: string;
+    configHome?: string;
+    stateHome?: string;
+    cacheHome?: string;
+  };
+  runLogPath?: string;
+  timeoutMs?: number;
+  introspection?: {
+    repo?: string;
+    issue?: string;
+    taskName?: string;
+    step?: number;
+    stepTitle?: string;
+  };
+  watchdog?: {
+    enabled?: boolean;
+    thresholdsMs?: Partial<WatchdogThresholdsMs>;
+    softLogIntervalMs?: number;
+    recentEventLimit?: number;
+    context?: string;
+  };
+};
+
+export type RunSessionTestOverrides = {
+  spawn?: SpawnFn;
+  scheduler?: Scheduler;
+  sessionsDir?: string;
+  processKill?: typeof process.kill;
+};
+
+type RunSessionInternalOptions = RunSessionOptionsBase & {
+  command?: string;
+  continueSession?: string;
+  agent?: string;
+  __testOverrides?: RunSessionTestOverrides;
+};
+
 /**
  * Run a configured command in a new session.
- * `command` should be the command name WITHOUT a leading slash (e.g. `next-task`).
+ * `command` should be the command name WITHOUT a leading slash (e.g. `plan`).
  */
 export async function runCommand(
   repoPath: string,
   command: string,
   args: string[] = [],
-  options?: {
-    repo?: string;
-    cacheKey?: string;
-    opencodeXdg?: {
-      dataHome?: string;
-      configHome?: string;
-      stateHome?: string;
-      cacheHome?: string;
-    };
-    runLogPath?: string;
-    timeoutMs?: number;
-    introspection?: {
-      repo?: string;
-      issue?: string;
-      taskName?: string;
-      step?: number;
-      stepTitle?: string;
-    };
-    watchdog?: {
-      enabled?: boolean;
-      thresholdsMs?: Partial<WatchdogThresholdsMs>;
-      softLogIntervalMs?: number;
-      recentEventLimit?: number;
-      context?: string;
-    };
-  },
-  testOverrides?: {
-    spawn?: SpawnFn;
-    scheduler?: Scheduler;
-    sessionsDir?: string;
-    processKill?: typeof process.kill;
-  }
+  options?: RunSessionOptionsBase,
+  testOverrides?: RunSessionTestOverrides
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");
 
-  const merged: any = { command: normalized, ...(options ?? {}) };
+  const merged: RunSessionInternalOptions = { command: normalized, ...(options ?? {}) };
   if (testOverrides) merged.__testOverrides = testOverrides;
 
   return runSession(repoPath, message, merged);
@@ -1323,36 +1288,25 @@ export async function continueSession(
   repoPath: string,
   sessionId: string,
   message: string,
-  options?: {
-    repo?: string;
-    cacheKey?: string;
-    opencodeXdg?: {
-      dataHome?: string;
-      configHome?: string;
-      stateHome?: string;
-      cacheHome?: string;
-    };
-    runLogPath?: string;
-    timeoutMs?: number;
-    introspection?: {
-      repo?: string;
-      issue?: string;
-      taskName?: string;
-      step?: number;
-      stepTitle?: string;
-    };
-    watchdog?: {
-      enabled?: boolean;
-      thresholdsMs?: Partial<WatchdogThresholdsMs>;
-      softLogIntervalMs?: number;
-      recentEventLimit?: number;
-      context?: string;
-    };
-    agent?: string;
-  }
+  options?: RunSessionOptionsBase & { agent?: string }
 ): Promise<SessionResult> {
   const { agent, ...rest } = options ?? {};
   return runSession(repoPath, message, { continueSession: sessionId, agent, ...rest });
+}
+
+/**
+ * Run an agent with a normal message.
+ */
+export async function runAgent(
+  repoPath: string,
+  agent: string,
+  message: string,
+  options?: RunSessionOptionsBase,
+  testOverrides?: RunSessionTestOverrides
+): Promise<SessionResult> {
+  const merged: RunSessionInternalOptions = { agent, ...(options ?? {}) };
+  if (testOverrides) merged.__testOverrides = testOverrides;
+  return runSession(repoPath, message, merged);
 }
 
 /**
@@ -1363,32 +1317,7 @@ export async function continueCommand(
   sessionId: string,
   command: string,
   args: string[] = [],
-  options?: {
-    repo?: string;
-    cacheKey?: string;
-    opencodeXdg?: {
-      dataHome?: string;
-      configHome?: string;
-      stateHome?: string;
-      cacheHome?: string;
-    };
-    runLogPath?: string;
-    timeoutMs?: number;
-    introspection?: {
-      repo?: string;
-      issue?: string;
-      taskName?: string;
-      step?: number;
-      stepTitle?: string;
-    };
-    watchdog?: {
-      enabled?: boolean;
-      thresholdsMs?: Partial<WatchdogThresholdsMs>;
-      softLogIntervalMs?: number;
-      recentEventLimit?: number;
-      context?: string;
-    };
-  }
+  options?: RunSessionOptionsBase
 ): Promise<SessionResult> {
   const normalized = normalizeCommand(command)!;
   const message = ["/" + normalized, ...args].join(" ");
@@ -1401,25 +1330,7 @@ export async function continueCommand(
 async function* streamSession(
   repoPath: string,
   message: string,
-  options?: {
-    command?: string;
-    agent?: string;
-    continueSession?: string;
-    repo?: string;
-    cacheKey?: string;
-    opencodeXdg?: {
-      dataHome?: string;
-      configHome?: string;
-      stateHome?: string;
-      cacheHome?: string;
-    };
-    __testOverrides?: {
-      scheduler?: Scheduler;
-      sessionsDir?: string;
-      spawn?: SpawnFn;
-      processKill?: typeof process.kill;
-    };
-  }
+  options?: RunSessionInternalOptions
 ): AsyncGenerator<any, void, unknown> {
   const args: string[] = ["run"];
 

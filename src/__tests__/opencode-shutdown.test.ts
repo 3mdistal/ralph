@@ -48,7 +48,7 @@ describe("OpenCode shutdown handling", () => {
       return proc as any;
     };
 
-    await runCommand("/tmp", "next-task", [], {}, { spawn: ((cmd: string, args: string[], options: any) => {
+    await runCommand("/tmp", "plan", [], {}, { spawn: ((cmd: string, args: string[], options: any) => {
       spawnOptions = options;
       return spawn();
     }) as any });
