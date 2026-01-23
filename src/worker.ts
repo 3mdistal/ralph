@@ -578,6 +578,7 @@ export class RepoWorker {
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
+  private ignoredBodyDepsLog = new Set<string>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -1302,33 +1303,51 @@ ${guidance}`
   }
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
+    const resolved = this.resolveDependencySignals(snapshot);
+    if (resolved.ignoredBodyBlockers > 0) {
+      this.logIgnoredBodyBlockers(snapshot.issue, resolved.ignoredBodyBlockers, resolved.ignoreReason);
+    }
+
+    if (!snapshot.coverage.githubDeps && !resolved.hasBodyDepsCoverage) {
+      resolved.signals.push({ source: "github", kind: "blocked_by", state: "unknown" });
+    }
+    if (!snapshot.coverage.githubSubIssues) {
+      resolved.signals.push({ source: "github", kind: "sub_issue", state: "unknown" });
+    }
+    return resolved.signals;
+  }
+
+  private resolveDependencySignals(snapshot: IssueRelationshipSnapshot): {
+    signals: RelationshipSignal[];
+    hasBodyDepsCoverage: boolean;
+    ignoredBodyBlockers: number;
+    ignoreReason: "complete" | "partial";
+  } {
     const signals = [...snapshot.signals];
     const githubDepsSignals = signals.filter((signal) => signal.source === "github" && signal.kind === "blocked_by");
     const bodyDepsSignals = signals.filter((signal) => signal.source === "body" && signal.kind === "blocked_by");
     const hasGithubDepsSignals = githubDepsSignals.length > 0;
-    const hasBodyDepsSignals = bodyDepsSignals.length > 0;
     const hasGithubDepsCoverage = snapshot.coverage.githubDeps;
     const shouldIgnoreBodyDeps = hasGithubDepsCoverage || (!hasGithubDepsCoverage && hasGithubDepsSignals);
-
-    if (shouldIgnoreBodyDeps && hasBodyDepsSignals) {
-      console.log(
-        `[ralph:worker:${this.repo}] Ignoring ${bodyDepsSignals.length} body blocker(s) for ${formatIssueRef(snapshot.issue)} ` +
-          `because GitHub dependency relationships are available or partial.`
-      );
-    }
-
     const filteredSignals = shouldIgnoreBodyDeps
       ? signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
       : signals;
     const hasBodyDepsCoverage = snapshot.coverage.bodyDeps && !shouldIgnoreBodyDeps;
+    const ignoredBodyBlockers = shouldIgnoreBodyDeps ? bodyDepsSignals.length : 0;
+    const ignoreReason = hasGithubDepsCoverage ? "complete" : "partial";
 
-    if (!snapshot.coverage.githubDeps && !hasBodyDepsCoverage) {
-      filteredSignals.push({ source: "github", kind: "blocked_by", state: "unknown" });
-    }
-    if (!snapshot.coverage.githubSubIssues) {
-      filteredSignals.push({ source: "github", kind: "sub_issue", state: "unknown" });
-    }
-    return filteredSignals;
+    return { signals: filteredSignals, hasBodyDepsCoverage, ignoredBodyBlockers, ignoreReason };
+  }
+
+  private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {
+    const key = `${issue.repo}#${issue.number}`;
+    if (this.ignoredBodyDepsLog.has(key)) return;
+    this.ignoredBodyDepsLog.add(key);
+    const reasonLabel = reason === "complete" ? "complete" : "partial";
+    console.log(
+      `[ralph:worker:${this.repo}] Ignoring ${ignoredCount} body blocker(s) for ${formatIssueRef(issue)} due to ${reasonLabel} ` +
+        `GitHub dependency coverage.`
+    );
   }
 
   private async resolveWorktreeRef(): Promise<string> {
