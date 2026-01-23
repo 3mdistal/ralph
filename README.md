@@ -126,6 +126,10 @@ Ralph refuses to auto-merge PRs targeting `main` unless the issue has the `allow
 
 If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names.
 
+### GitHub auth precedence
+
+Ralph uses the GitHub App installation token when `githubApp` is configured. If no `githubApp` is configured, it falls back to `GH_TOKEN` or `GITHUB_TOKEN` from the environment. Env tokens are ignored when `githubApp` is configured to avoid using stale installation tokens that were minted earlier for `gh` CLI calls.
+
 ### Environment variables
 
 Only these env vars are currently supported (unless noted otherwise):
