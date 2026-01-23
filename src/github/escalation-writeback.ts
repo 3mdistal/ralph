@@ -73,7 +73,8 @@ export function sanitizeEscalationReason(input: string): string {
     { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "xox-[REDACTED]" },
     { re: /(Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
     { re: /(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
-    { re: /\/home\/[A-Za-z0-9._-]+/g, replacement: "~/" },
+    { re: /\/home\/[A-Za-z0-9._-]+\//g, replacement: "~/" },
+    { re: /\/Users\/[A-Za-z0-9._-]+\//g, replacement: "~/" },
   ];
 
   for (const { re, replacement } of patterns) {

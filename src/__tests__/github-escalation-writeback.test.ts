@@ -52,12 +52,14 @@ describe("github escalation writeback", () => {
 
   test("sanitizeEscalationReason redacts tokens and paths", () => {
     const input =
-      "ghp_abcdefghijklmnopqrstuv Authorization: Bearer secret-token /home/alice/project \x1b[31mred\x1b[0m";
+      "ghp_abcdefghijklmnopqrstuv Authorization: Bearer secret-token /home/alice/project /Users/bob/app \x1b[31mred\x1b[0m";
     const output = sanitizeEscalationReason(input);
 
     expect(output).toContain("ghp_[REDACTED]");
     expect(output).toContain("Bearer [REDACTED]");
-    expect(output).toContain("~/");
+    expect(output).toContain("~/project");
+    expect(output).toContain("~/app");
+    expect(output).not.toContain("~//");
     expect(output).not.toContain("ghp_abcdefghijklmnopqrstuv");
     expect(output).not.toContain("secret-token");
   });
