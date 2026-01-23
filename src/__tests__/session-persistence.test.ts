@@ -252,7 +252,7 @@ describe("run-log-path (XDG state)", () => {
 
   test("uses XDG_STATE_HOME when set", () => {
     process.env.XDG_STATE_HOME = "/tmp/xdg-state";
-    const path = getRalphRunLogPath({ repo: "3mdistal/ralph", issueNumber: "51", stepTitle: "next-task", ts: 123 });
+    const path = getRalphRunLogPath({ repo: "3mdistal/ralph", issueNumber: "51", stepTitle: "plan", ts: 123 });
     expect(path.startsWith("/tmp/xdg-state/ralph/run-logs/")).toBe(true);
   });
 });

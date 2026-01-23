@@ -178,7 +178,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     const promise = runCommand(
       "/tmp",
-      "next-task",
+      "plan",
       [],
       {
         watchdog: {
@@ -214,14 +214,14 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 
-    const promise = runCommand("/tmp", "next-task", [], {}, testOverrides);
+    const promise = runCommand("/tmp", "plan", [], {}, testOverrides);
 
     scheduler.advanceBy(0);
     const result = await promise;
 
     expect(result.success).toBe(true);
     expect(result.prUrl).toBe("https://github.com/owner/repo/pull/123");
-    expect(extractPrUrlFromSession(result as any)).toBe("https://github.com/owner/repo/pull/123");
+    expect(extractPrUrlFromSession(result as any, "owner/repo")).toBe("https://github.com/owner/repo/pull/123");
   });
 
   fixtureTest("anomaly-burst-recent.jsonl: 20 anomalies in 10s triggers recentBurst", async () => {
@@ -234,7 +234,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 
-    const promise = runCommand("/tmp", "next-task", [], {}, testOverrides);
+    const promise = runCommand("/tmp", "plan", [], {}, testOverrides);
 
     scheduler.advanceBy(0);
     await promise;
@@ -257,7 +257,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
       spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
     };
 
-    const promise = runCommand("/tmp", "next-task", [], {}, testOverrides);
+    const promise = runCommand("/tmp", "plan", [], {}, testOverrides);
 
     scheduler.advanceBy(0);
     await promise;

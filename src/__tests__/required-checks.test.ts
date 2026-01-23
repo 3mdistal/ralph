@@ -99,7 +99,7 @@ describe("requiredChecks semantics", () => {
 
     const worker = new RepoWorker("acme/rocket", "/tmp", {
       session: {
-        runCommand: mock(async () => ({ stdout: "", stderr: "", exitCode: 0 })) as any,
+        runAgent: mock(async () => ({ sessionId: "", success: true, output: "" })) as any,
         continueSession: mock(async () => ({ sessionId: "" })) as any,
         continueCommand: mock(async () => ({ stdout: "" })) as any,
         getRalphXdgCacheHome: mock(() => "/tmp") as any,
