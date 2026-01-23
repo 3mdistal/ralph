@@ -10,11 +10,11 @@ export interface ExistingLabelSpec {
   description?: string | null;
 }
 
-export const RALPH_LABEL_QUEUED = "ralph:queued";
+const RALPH_LABEL_QUEUED = "ralph:queued";
 export const RALPH_LABEL_IN_PROGRESS = "ralph:in-progress";
 export const RALPH_LABEL_IN_BOT = "ralph:in-bot";
 export const RALPH_LABEL_BLOCKED = "ralph:blocked";
-export const RALPH_LABEL_ESCALATED = "ralph:escalated";
+const RALPH_LABEL_ESCALATED = "ralph:escalated";
 
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   { name: RALPH_LABEL_QUEUED, color: "0366D6", description: "Ready to be claimed by Ralph" },
