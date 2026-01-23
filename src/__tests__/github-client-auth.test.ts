@@ -4,6 +4,7 @@ import { dirname, join } from "path";
 import { tmpdir } from "os";
 
 import { __resetConfigForTests } from "../config";
+import { __resetGitHubAuthForTests, __setGitHubAuthDepsForTests } from "../github-app-auth";
 import { getRalphConfigJsonPath } from "../paths";
 import { GitHubClient } from "../github/client";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
@@ -67,6 +68,7 @@ describe("github client auth", () => {
       devDir: "/tmp",
     });
     __resetConfigForTests();
+    __resetGitHubAuthForTests();
   });
 
   afterEach(async () => {
@@ -78,6 +80,7 @@ describe("github client auth", () => {
     process.env.HOME = priorHome;
     await rm(homeDir, { recursive: true, force: true });
     __resetConfigForTests();
+    __resetGitHubAuthForTests();
     releaseLock?.();
     releaseLock = null;
   });
@@ -99,5 +102,66 @@ describe("github client auth", () => {
 
     expect(fetchMock).toHaveBeenCalled();
     expect(result.data?.auth).toBe("token late-token");
+  });
+
+  test("refreshes GitHub App tokens between requests", async () => {
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+      githubApp: {
+        appId: 123,
+        installationId: 456,
+        privateKeyPath: "/does/not/matter.pem",
+      },
+    });
+    __resetConfigForTests();
+
+    let tokenCalls = 0;
+    const auths: Array<string | null> = [];
+
+    __setGitHubAuthDepsForTests({
+      readFile: mock(async () => "PEM") as any,
+      createSign: (() => ({
+        update: () => {},
+        end: () => {},
+        sign: () => new Uint8Array([1, 2, 3]),
+      })) as any,
+      fetch: mock(async (url: string) => {
+        if (url.includes("/access_tokens")) {
+          tokenCalls += 1;
+          return new Response(
+            JSON.stringify({
+              token: `tok_${tokenCalls}`,
+              expires_at: new Date(Date.now() + 30_000).toISOString(),
+            }),
+            { status: 201, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      }) as any,
+    });
+
+    const fetchMock = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      auths.push(getHeader(init?.headers, "Authorization"));
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const client = new GitHubClient("3mdistal/ralph");
+    await client.request("/rate_limit");
+    await client.request("/rate_limit");
+
+    expect(tokenCalls).toBe(2);
+    expect(auths).toEqual(["token tok_1", "token tok_2"]);
   });
 });
