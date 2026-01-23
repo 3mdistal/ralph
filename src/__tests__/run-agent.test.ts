@@ -29,8 +29,11 @@ describe("runAgent", () => {
 
     await runAgent("/tmp", "ralph-plan", "hello", {}, { spawn: spawn as any });
 
-    expect(spawnedArgs).not.toBeNull();
-    expect(spawnedArgs?.[0]).toBe("run");
+    if (!spawnedArgs) {
+      throw new Error("spawn was not called");
+    }
+
+    expect(spawnedArgs[0]).toBe("run");
     expect(spawnedArgs).toContain("--agent");
     expect(spawnedArgs).toContain("ralph-plan");
     expect(spawnedArgs).not.toContain("--command");
