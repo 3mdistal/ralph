@@ -9,6 +9,7 @@ import {
 import { shouldLog } from "./logging";
 import * as bwrbQueue from "./queue";
 import type { QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
+import { createGitHubQueueDriver } from "./github-queue";
 
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
 
@@ -55,7 +56,7 @@ export type QueueBackendState = {
 let cachedState: QueueBackendState | null = null;
 let cachedDriver: QueueBackendDriver | null = null;
 
-const GITHUB_QUEUE_IMPLEMENTED = false;
+const GITHUB_QUEUE_IMPLEMENTED = true;
 
 function isGitHubAuthConfigured(config: RalphConfig): boolean {
   if (config.githubApp) return true;
@@ -258,6 +259,8 @@ function getQueueBackendDriver(): QueueBackendDriver {
       createAgentTask: bwrbQueue.createAgentTask,
       resolveAgentTaskByIssue: bwrbQueue.resolveAgentTaskByIssue,
     };
+  } else if (state.backend === "github" && state.health === "ok") {
+    cachedDriver = createGitHubQueueDriver();
   } else {
     cachedDriver = createDisabledDriver(state);
   }

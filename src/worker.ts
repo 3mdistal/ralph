@@ -30,6 +30,8 @@ import {
   getConfig,
   resolveOpencodeProfile,
 } from "./config";
+import { normalizeGitRef } from "./midpoint-labels";
+import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runAgent, type SessionResult } from "./session";
 import { buildPlannerPrompt } from "./planner-prompt";
@@ -37,7 +39,7 @@ import { getThrottleDecision } from "./throttle";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
-import { extractPrUrl, extractPrUrlFromSession, hasProductGap, parseRoutingDecision, type RoutingDecision } from "./routing";
+import { hasProductGap, parseRoutingDecision, selectPrUrl, type RoutingDecision } from "./routing";
 import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
 import {
   isExplicitBlockerReason,
@@ -48,8 +50,12 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { computeRalphLabelSync } from "./github-labels";
+import {
+  computeRalphLabelSync,
+  RALPH_LABEL_BLOCKED,
+} from "./github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import {
   computeBlockedDecision,
@@ -66,7 +72,15 @@ import {
 import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
-import { getIdempotencyPayload, upsertIdempotencyKey, recordIssueSnapshot } from "./state";
+import {
+  getIdempotencyPayload,
+  upsertIdempotencyKey,
+  recordIssueSnapshot,
+  recordPrSnapshot,
+  PR_STATE_MERGED,
+  PR_STATE_OPEN,
+  type PrState,
+} from "./state";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -770,6 +784,88 @@ export class RepoWorker {
     }
   }
 
+  private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {
+    try {
+      recordPrSnapshot({ repo: this.repo, issue: input.issue, prUrl: input.prUrl, state: input.state });
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to record PR snapshot: ${error?.message ?? String(error)}`);
+    }
+  }
+
+  private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string, nextPrUrl: string | null): string;
+  private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string | null, nextPrUrl: string | null): string | null;
+  private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string | null, nextPrUrl: string | null): string | null {
+    if (!nextPrUrl) return currentPrUrl;
+    if (nextPrUrl === currentPrUrl) return currentPrUrl;
+    this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl: nextPrUrl, state: PR_STATE_OPEN });
+    return nextPrUrl;
+  }
+
+  private async applyMidpointLabelsBestEffort(params: {
+    task: AgentTask;
+    prUrl: string;
+    botBranch: string;
+    baseBranch?: string | null;
+  }): Promise<void> {
+    const issueRef = parseIssueRef(params.task.issue, this.repo);
+    if (!issueRef) return;
+    await applyMidpointLabelsBestEffortCore({
+      issueRef,
+      issue: params.task.issue,
+      taskName: params.task.name,
+      prUrl: params.prUrl,
+      botBranch: params.botBranch,
+      baseBranch: params.baseBranch ?? "",
+      fetchDefaultBranch: async () => this.fetchRepoDefaultBranch(),
+      fetchBaseBranch: async (prUrl) => this.getPullRequestBaseBranch(prUrl),
+      addIssueLabel: async (issue, label) => this.addIssueLabel(issue, label),
+      removeIssueLabel: async (issue, label) => this.removeIssueLabel(issue, label),
+      notifyError: async (title, body, taskName) => this.notify.notifyError(title, body, taskName ?? undefined),
+      warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
+    });
+  }
+
+  private async writeEscalationWriteback(
+    task: AgentTask,
+    params: { reason: string; escalationType: EscalationContext["escalationType"] }
+  ): Promise<void> {
+    const escalationIssueRef = parseIssueRef(task.issue, task.repo);
+    if (!escalationIssueRef) {
+      console.warn(`[ralph:worker:${this.repo}] Cannot parse issue ref for escalation writeback: ${task.issue}`);
+      return;
+    }
+
+    try {
+      await this.ensureRalphWorkflowLabelsOnce();
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to ensure ralph workflow labels before escalation writeback: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+
+    try {
+      await writeEscalationToGitHub(
+        {
+          repo: escalationIssueRef.repo,
+          issueNumber: escalationIssueRef.number,
+          taskName: task.name,
+          taskPath: task._path ?? task.name,
+          reason: params.reason,
+          escalationType: params.escalationType,
+        },
+        {
+          github: this.github,
+          log: (message) => console.log(message),
+        }
+      );
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Escalation writeback failed for ${task.issue}: ${error?.message ?? String(error)}`
+      );
+    }
+  }
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
     const { owner, name } = splitRepoFullName(this.repo);
     const encodedBranch = encodeURIComponent(branch);
@@ -1145,9 +1241,11 @@ ${guidance}`
         }
 
         try {
-          await this.addIssueLabel(entry.issue, "ralph:blocked");
+          await this.addIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
         } catch (error: any) {
-          console.warn(`[ralph:worker:${this.repo}] Failed to add ralph:blocked label: ${error?.message ?? String(error)}`);
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
+          );
         }
         continue;
       }
@@ -1160,10 +1258,10 @@ ${guidance}`
         }
 
         try {
-          await this.removeIssueLabel(entry.issue, "ralph:blocked");
+          await this.removeIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
         } catch (error: any) {
           console.warn(
-            `[ralph:worker:${this.repo}] Failed to remove ralph:blocked label: ${error?.message ?? String(error)}`
+            `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
           );
         }
       }
@@ -1702,7 +1800,7 @@ ${guidance}`
         .cwd(candidate.worktreePath)
         .quiet();
 
-      const prUrl = extractPrUrl(created.stdout.toString()) ?? null;
+      const prUrl = selectPrUrl({ output: created.stdout.toString(), repo: this.repo }) ?? null;
       diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
 
       if (prUrl) return { prUrl, diagnostics: diagnostics.join("\n") };
@@ -2296,7 +2394,7 @@ ${guidance}`
   }
 
   private normalizeGitRef(ref: string): string {
-    return ref.trim().replace(/^refs\/heads\//, "");
+    return normalizeGitRef(ref);
   }
 
   private async mergePrWithRequiredChecks(params: {
@@ -2495,12 +2593,19 @@ ${guidance}`
       const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
       if (throttled) return { ok: false, run: throttled };
 
-      if (checkResult.summary.status === "success") {
-        console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
-        try {
-          await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-          return { ok: true, prUrl, sessionId };
-        } catch (error: any) {
+        if (checkResult.summary.status === "success") {
+          console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+          try {
+            await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+            this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
+            await this.applyMidpointLabelsBestEffort({
+              task: params.task,
+              prUrl,
+              botBranch: params.botBranch,
+              baseBranch,
+            });
+            return { ok: true, prUrl, sessionId };
+          } catch (error: any) {
           if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
             console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
             didUpdateBranch = true;
@@ -2656,8 +2761,8 @@ ${guidance}`
         await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
       }
 
-      const updatedPrUrl = extractPrUrl(fixResult.output);
-      if (updatedPrUrl) prUrl = updatedPrUrl;
+      const updatedPrUrl = selectPrUrl({ output: fixResult.output, repo: this.repo });
+      prUrl = this.updateOpenPrSnapshot(params.task, prUrl, updatedPrUrl);
     }
 
     const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
@@ -3007,6 +3112,7 @@ ${guidance}`
 
     await this.queue.updateTaskStatus(task, "escalated", escalationFields);
 
+    await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
     await this.notify.notifyEscalation({
       taskName: task.name,
       taskFileName: task._name,
@@ -3175,7 +3281,11 @@ ${guidance}`
 
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = extractPrUrlFromSession(buildResult);
+      let prUrl = this.updateOpenPrSnapshot(
+        task,
+        null,
+        selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+      );
       let prRecoveryDiagnostics = "";
 
       if (!prUrl) {
@@ -3186,7 +3296,7 @@ ${guidance}`
           botBranch,
         });
         prRecoveryDiagnostics = recovered.diagnostics;
-        prUrl = recovered.prUrl ?? prUrl;
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
       }
 
       let continueAttempts = 0;
@@ -3212,6 +3322,7 @@ ${guidance}`
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
             await this.queue.updateTaskStatus(task, "escalated");
+            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -3281,7 +3392,11 @@ ${guidance}`
           }
 
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = extractPrUrlFromSession(buildResult);
+          prUrl = this.updateOpenPrSnapshot(
+            task,
+            prUrl,
+            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+          );
 
           continue;
         }
@@ -3333,14 +3448,18 @@ ${guidance}`
             botBranch,
           });
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-          prUrl = recovered.prUrl ?? prUrl;
+          prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
 
           if (!prUrl) {
             console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
             break;
           }
         } else {
-          prUrl = extractPrUrlFromSession(buildResult);
+          prUrl = this.updateOpenPrSnapshot(
+            task,
+            prUrl,
+            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+          );
         }
       }
 
@@ -3352,7 +3471,7 @@ ${guidance}`
           botBranch,
         });
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-        prUrl = recovered.prUrl ?? prUrl;
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
       }
 
       if (!prUrl) {
@@ -3360,6 +3479,7 @@ ${guidance}`
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
         await this.queue.updateTaskStatus(task, "escalated");
+        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
@@ -3802,6 +3922,7 @@ ${guidance}`
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
         await this.queue.updateTaskStatus(task, "escalated");
+        await this.writeEscalationWriteback(task, { reason, escalationType });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
@@ -3877,7 +3998,11 @@ ${guidance}`
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = extractPrUrlFromSession(buildResult);
+      let prUrl = this.updateOpenPrSnapshot(
+        task,
+        null,
+        selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+      );
       let prRecoveryDiagnostics = "";
 
       if (!prUrl) {
@@ -3888,7 +4013,7 @@ ${guidance}`
           botBranch,
         });
         prRecoveryDiagnostics = recovered.diagnostics;
-        prUrl = recovered.prUrl ?? prUrl;
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
       }
 
       let continueAttempts = 0;
@@ -3916,6 +4041,7 @@ ${guidance}`
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
             await this.queue.updateTaskStatus(task, "escalated");
+            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -3983,7 +4109,11 @@ ${guidance}`
 
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = extractPrUrlFromSession(buildResult);
+          prUrl = this.updateOpenPrSnapshot(
+            task,
+            prUrl,
+            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+          );
           continue;
         }
 
@@ -4030,14 +4160,18 @@ ${guidance}`
             botBranch,
           });
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-          prUrl = recovered.prUrl ?? prUrl;
+          prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
 
           if (!prUrl) {
             console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
             break;
           }
         } else {
-          prUrl = extractPrUrlFromSession(buildResult);
+          prUrl = this.updateOpenPrSnapshot(
+            task,
+            prUrl,
+            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+          );
         }
       }
 
@@ -4049,7 +4183,7 @@ ${guidance}`
           botBranch,
         });
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-        prUrl = recovered.prUrl ?? prUrl;
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
       }
 
       if (!prUrl) {
@@ -4058,6 +4192,7 @@ ${guidance}`
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
         await this.queue.updateTaskStatus(task, "escalated");
+        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
