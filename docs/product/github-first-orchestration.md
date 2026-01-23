@@ -33,7 +33,8 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 
 ## Dependency encoding
 
-Dependencies are encoded in issue bodies with deterministic section headers and task lists.
+Dependencies can be encoded in issue bodies with deterministic section headers and task lists.
+Body checklists are a fallback when GitHub-native relationships are unavailable.
 
 ```
 ## Blocked by
@@ -56,9 +57,10 @@ This section supersedes the v0.1.0 body-only dependency encoding; body parsing r
 
 Rules:
 - Relationship sources: GitHub dependencies (`blocked_by` / `blocking`) and sub-issues (`parent` / `sub_issues`).
-- GitHub-native relationships are authoritative, but body-parsed blockers are still honored.
-- If GitHub-native relationships are unavailable, Ralph falls back to `## Blocked by` body parsing.
-- Precedence uses a union: **blocked wins**. If any authoritative source reports an unresolved blocker, the issue is blocked.
+- GitHub-native relationships are authoritative when dependency coverage is complete; body-parsed blockers are ignored in that case.
+- If GitHub dependency data is unavailable, Ralph falls back to `## Blocked by` body parsing.
+- If GitHub dependency data is partial (relationships returned but coverage is incomplete, such as page-size truncation), Ralph treats the dependency status as unknown and does not change blocked state unless an explicit open GitHub blocker exists.
+- Precedence uses a union across GitHub sources: **blocked wins**. If any GitHub relationship reports an unresolved blocker, the issue is blocked.
 - Unknown coverage: if neither GitHub-native relationships nor body sections yield evidence, Ralph does not change blocked state.
 - Sub-issues: a parent issue is blocked while any sub-issue is open; sub-issues are not blocked by their parent.
 

@@ -1,4 +1,5 @@
 import type { ExistingLabelSpec, LabelSpec } from "../github-labels";
+import { resolveGitHubToken } from "../github-auth";
 
 export type GitHubErrorCode = "rate_limit" | "not_found" | "conflict" | "auth" | "unknown";
 
@@ -38,8 +39,10 @@ type RequestOptions = {
 };
 
 type ClientOptions = {
+  /** Explicit token override; bypasses refresh (use for non-expiring tokens only). */
   token?: string;
   userAgent?: string;
+  getToken?: () => Promise<string | null>;
 };
 
 function classifyStatus(status: number): GitHubErrorCode {
@@ -61,27 +64,24 @@ function safeJsonParse<T>(text: string): T | null {
 
 export class GitHubClient {
   private readonly repo: string;
-  private readonly token: string | null;
   private readonly userAgent: string;
+  private readonly tokenOverride: string | null;
+  private readonly getToken: () => Promise<string | null>;
 
   constructor(repo: string, opts?: ClientOptions) {
     this.repo = repo;
-    this.token = opts?.token ?? this.resolveToken();
     this.userAgent = opts?.userAgent ?? "ralph-loop";
+    this.tokenOverride = opts?.token ?? null;
+    this.getToken = opts?.getToken ?? resolveGitHubToken;
   }
 
-  private resolveToken(): string | null {
-    const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
-    return token ?? null;
-  }
-
-  private buildHeaders(opts: RequestOptions): Record<string, string> {
+  private buildHeaders(opts: RequestOptions, token: string | null): Record<string, string> {
     const headers: Record<string, string> = {
       Accept: "application/vnd.github+json",
       "User-Agent": this.userAgent,
     };
 
-    if (this.token) headers.Authorization = `token ${this.token}`;
+    if (token) headers.Authorization = `token ${token}`;
 
     if (opts.etag) headers["If-Match"] = opts.etag;
     if (opts.body !== undefined) headers["Content-Type"] = "application/json";
@@ -89,10 +89,11 @@ export class GitHubClient {
   }
 
   async request<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T>> {
+    const token = this.tokenOverride ?? (await this.getToken());
     const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
     const init: RequestInit = {
       method: opts.method ?? "GET",
-      headers: this.buildHeaders(opts),
+      headers: this.buildHeaders(opts, token),
     };
 
     if (opts.body !== undefined) {
@@ -108,9 +109,7 @@ export class GitHubClient {
     if (!res.ok) {
       const code = classifyStatus(res.status);
       const missingTokenHint =
-        code === "auth" && !this.token
-          ? "Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests. "
-          : "";
+        code === "auth" && !token ? "Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests. " : "";
 
       throw new GitHubApiError({
         message: `${missingTokenHint}GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}`.trim(),
