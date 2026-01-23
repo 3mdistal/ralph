@@ -46,12 +46,12 @@ describe("midpoint label plan", () => {
     });
   });
 
-  test("no label changes when base differs from bot branch", () => {
+  test("clears in-progress when base differs from bot branch", () => {
     expect(
       computePlan({ baseBranch: "feature", botBranch: "bot/integration", defaultBranch: "main" })
     ).toEqual({
       addInBot: false,
-      removeInProgress: false,
+      removeInProgress: true,
     });
   });
 

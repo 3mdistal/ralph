@@ -28,7 +28,7 @@ export function computeMidpointLabelPlan(input: {
     return { addInBot: false, removeInProgress: true };
   }
   if (normalizedBase !== normalizedBot) {
-    return { addInBot: false, removeInProgress: false };
+    return { addInBot: false, removeInProgress: true };
   }
   return { addInBot: true, removeInProgress: true };
 }

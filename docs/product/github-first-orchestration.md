@@ -80,6 +80,8 @@ Direct-to-main (override / Pattern B):
   `ralph:in-bot` midpoint label, but **does** clear `ralph:in-progress` as part of the merge step.
 - Direct-to-main merges leave the issue open; closing behavior is handled by a separate policy (manual or future
   automation) and is not part of the midpoint transition.
+- If a task PR merges to a non-default branch (for example, a release branch), Ralph clears `ralph:in-progress` but does
+  not apply `ralph:in-bot`.
 - Midpoint label updates are best-effort and do not block merges; failures are surfaced via non-blocking notifications
   so operators can resolve GitHub permission/config issues without interrupting the queue.
 

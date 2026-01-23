@@ -30,7 +30,8 @@ import {
   getConfig,
   resolveOpencodeProfile,
 } from "./config";
-import { computeMidpointLabelPlan, normalizeGitRef, type MidpointLabelPlan } from "./midpoint-labels";
+import { normalizeGitRef } from "./midpoint-labels";
+import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runCommand, type SessionResult } from "./session";
 import { getThrottleDecision } from "./throttle";
@@ -51,8 +52,6 @@ import { drainQueuedNudges } from "./nudge";
 import {
   computeRalphLabelSync,
   RALPH_LABEL_BLOCKED,
-  RALPH_LABEL_IN_BOT,
-  RALPH_LABEL_IN_PROGRESS,
 } from "./github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
@@ -799,76 +798,20 @@ export class RepoWorker {
   }): Promise<void> {
     const issueRef = parseIssueRef(params.task.issue, this.repo);
     if (!issueRef) return;
-    let baseBranch = params.baseBranch ?? "";
-    let defaultBranch: string | null = null;
-
-    try {
-      defaultBranch = await this.fetchRepoDefaultBranch();
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to fetch default branch for midpoint labels: ${error?.message ?? String(error)}`
-      );
-    }
-
-    const resolvedDefaultBranch = defaultBranch ?? "";
-
-    if (!baseBranch) {
-      try {
-        baseBranch = (await this.getPullRequestBaseBranch(params.prUrl)) ?? "";
-      } catch (error: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to re-check PR base before midpoint labeling: ${error?.message ?? String(error)}`
-        );
-      }
-    }
-
-    const plan = computeMidpointLabelPlan({
-      baseBranch,
+    await applyMidpointLabelsBestEffortCore({
+      issueRef,
+      issue: params.task.issue,
+      taskName: params.task.name,
+      prUrl: params.prUrl,
       botBranch: params.botBranch,
-      defaultBranch: resolvedDefaultBranch,
+      baseBranch: params.baseBranch ?? "",
+      fetchDefaultBranch: async () => this.fetchRepoDefaultBranch(),
+      fetchBaseBranch: async (prUrl) => this.getPullRequestBaseBranch(prUrl),
+      addIssueLabel: async (issue, label) => this.addIssueLabel(issue, label),
+      removeIssueLabel: async (issue, label) => this.removeIssueLabel(issue, label),
+      notifyError: async (title, body, taskName) => this.notify.notifyError(title, body, taskName ?? undefined),
+      warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
     });
-    if (!plan.addInBot && !plan.removeInProgress) return;
-
-    const errors: string[] = [];
-
-    if (plan.addInBot) {
-      try {
-        await this.addIssueLabel(issueRef, RALPH_LABEL_IN_BOT);
-      } catch (error: any) {
-        const message = error?.message ?? String(error);
-        errors.push(`add ${RALPH_LABEL_IN_BOT}: ${message}`);
-        console.warn(`[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_IN_BOT} label: ${message}`);
-      }
-    }
-
-    if (plan.removeInProgress) {
-      try {
-        await this.removeIssueLabel(issueRef, RALPH_LABEL_IN_PROGRESS);
-      } catch (error: any) {
-        const message = error?.message ?? String(error);
-        errors.push(`remove ${RALPH_LABEL_IN_PROGRESS}: ${message}`);
-        console.warn(`[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_IN_PROGRESS} label: ${message}`);
-      }
-    }
-
-    if (errors.length > 0) {
-      const body = [
-        "Failed to update midpoint labels.",
-        "",
-        `Issue: ${params.task.issue}`,
-        `PR: ${params.prUrl}`,
-        "",
-        "Errors:",
-        errors.map((entry) => `- ${entry}`).join("\n"),
-      ].join("\n");
-      try {
-        await this.notify.notifyError("Midpoint label update failed", body, params.task.name);
-      } catch (error: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to notify midpoint label error: ${error?.message ?? String(error)}`
-        );
-      }
-    }
   }
 
   private async fetchCheckRunNames(branch: string): Promise<string[]> {

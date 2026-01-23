@@ -221,7 +221,7 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
 
     expect(result.success).toBe(true);
     expect(result.prUrl).toBe("https://github.com/owner/repo/pull/123");
-    expect(extractPrUrlFromSession(result as any)).toBe("https://github.com/owner/repo/pull/123");
+    expect(extractPrUrlFromSession(result as any, "owner/repo")).toBe("https://github.com/owner/repo/pull/123");
   });
 
   fixtureTest("anomaly-burst-recent.jsonl: 20 anomalies in 10s triggers recentBurst", async () => {

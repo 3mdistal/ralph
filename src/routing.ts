@@ -147,6 +147,6 @@ export function selectPrUrl(input: PrUrlSelectionInput): string | null {
 /**
  * Legacy helper: prefer structured PR URL if available; otherwise return latest PR URL in output.
  */
-export function extractPrUrlFromSession(result: { output: string; prUrl?: string }): string | null {
-  return selectPrUrl({ output: result.output, prUrl: result.prUrl });
+export function extractPrUrlFromSession(result: { output: string; prUrl?: string }, repo?: string): string | null {
+  return selectPrUrl({ output: result.output, prUrl: result.prUrl, repo });
 }
