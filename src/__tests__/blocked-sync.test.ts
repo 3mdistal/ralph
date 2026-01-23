@@ -161,6 +161,33 @@ describe("syncBlockedStateForTasks", () => {
     expect(call?.[2]?.["blocked-source"]).toBe("deps");
   });
 
+  test("treats partial GitHub deps coverage as unknown", async () => {
+    updateTaskStatusMock.mockClear();
+    const provider: IssueRelationshipProvider = {
+      getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
+        issue,
+        signals: [
+          { source: "github", kind: "blocked_by", state: "closed", ref: { repo: issue.repo, number: 12 } },
+          { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 13 } },
+        ],
+        coverage: { githubDeps: false, githubSubIssues: true, bodyDeps: true },
+      }),
+    };
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+      relationships: provider,
+    });
+
+    const task = createTask({ status: "blocked", "blocked-source": "deps" });
+    await worker.syncBlockedStateForTasks([task]);
+
+    expect(updateTaskStatusMock).not.toHaveBeenCalled();
+  });
+
   test("skips changes when relationship coverage is unknown", async () => {
     updateTaskStatusMock.mockClear();
     const provider: IssueRelationshipProvider = {
