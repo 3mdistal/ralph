@@ -46,6 +46,17 @@ describe("midpoint label plan", () => {
     });
   });
 
+  test("does not apply midpoint label when default branch is unknown and botBranch is not bot/*", () => {
+    expect(computePlan({ baseBranch: "main", botBranch: "main", defaultBranch: "" })).toEqual({
+      addInBot: false,
+      removeInProgress: true,
+    });
+    expect(computePlan({ baseBranch: "develop", botBranch: "develop", defaultBranch: "" })).toEqual({
+      addInBot: false,
+      removeInProgress: true,
+    });
+  });
+
   test("clears in-progress when base differs from bot branch", () => {
     expect(
       computePlan({ baseBranch: "feature", botBranch: "bot/integration", defaultBranch: "main" })

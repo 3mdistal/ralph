@@ -93,6 +93,11 @@ Direct-to-main (override / Pattern B):
 - Midpoint label updates are best-effort and do not block merges; failures are surfaced via non-blocking notifications
   so operators can resolve GitHub permission/config issues without interrupting the queue.
 
+Default-branch unknown fallback:
+- If Ralph cannot determine the repo default branch (e.g. GitHub API auth failure), it applies the midpoint
+  `ralph:in-bot` label only when the configured bot branch name is clearly a bot branch (currently `bot/integration`
+  or any `bot/*` branch). In all other cases it avoids applying `ralph:in-bot`.
+
 ## Escalation protocol
 
 - Ralph removes `ralph:in-progress` and `ralph:queued`, then adds `ralph:escalated`.
