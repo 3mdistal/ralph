@@ -1510,6 +1510,12 @@ if (args[0] === "status") {
 
   const config = getConfig();
   const queueState = getQueueBackendState();
+
+  // Status reads from the durable SQLite state DB (GitHub issue snapshots, task op
+  // state, idempotency). The daemon initializes this during startup, but CLI
+  // subcommands need to do it explicitly.
+  initStateDb();
+
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
   const controlProfile = control.opencodeProfile?.trim() || "";
 
