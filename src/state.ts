@@ -776,6 +776,35 @@ export function listRollupBatchEntries(batchId: string): RollupBatchEntry[] {
   }));
 }
 
+export function updateRollupBatchEntryIssueRefs(params: {
+  batchId: string;
+  prUrl: string;
+  issueRefs: string[];
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+
+  database.transaction(() => {
+    database
+      .query(
+        `UPDATE rollup_batch_prs
+         SET issue_refs_json = $issue_refs_json
+         WHERE batch_id = $batch_id AND pr_url = $pr_url`
+      )
+      .run({
+        $batch_id: params.batchId,
+        $pr_url: params.prUrl,
+        $issue_refs_json: toJson(params.issueRefs),
+      });
+
+    database.query("UPDATE rollup_batches SET updated_at = $updated_at WHERE id = $id").run({
+      $updated_at: at,
+      $id: params.batchId,
+    });
+  })();
+}
+
 
 export function recordRollupMerge(params: {
   repo: string;
