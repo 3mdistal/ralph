@@ -49,6 +49,7 @@ import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationConte
 import { drainQueuedNudges } from "./nudge";
 import { computeRalphLabelSync } from "./github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import {
   computeBlockedDecision,
@@ -766,6 +767,48 @@ export class RepoWorker {
     } catch (error) {
       if (error instanceof GitHubApiError && error.status === 404) return;
       throw error;
+    }
+  }
+
+  private async writeEscalationWriteback(
+    task: AgentTask,
+    params: { reason: string; escalationType: EscalationContext["escalationType"] }
+  ): Promise<void> {
+    const escalationIssueRef = parseIssueRef(task.issue, task.repo);
+    if (!escalationIssueRef) {
+      console.warn(`[ralph:worker:${this.repo}] Cannot parse issue ref for escalation writeback: ${task.issue}`);
+      return;
+    }
+
+    try {
+      await this.ensureRalphWorkflowLabelsOnce();
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to ensure ralph workflow labels before escalation writeback: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+
+    try {
+      await writeEscalationToGitHub(
+        {
+          repo: escalationIssueRef.repo,
+          issueNumber: escalationIssueRef.number,
+          taskName: task.name,
+          taskPath: task._path ?? task.name,
+          reason: params.reason,
+          escalationType: params.escalationType,
+        },
+        {
+          github: this.github,
+          log: (message) => console.log(message),
+        }
+      );
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Escalation writeback failed for ${task.issue}: ${error?.message ?? String(error)}`
+      );
     }
   }
 
@@ -3006,6 +3049,7 @@ ${guidance}`
 
     await this.queue.updateTaskStatus(task, "escalated", escalationFields);
 
+    await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
     await this.notify.notifyEscalation({
       taskName: task.name,
       taskFileName: task._name,
@@ -3211,6 +3255,7 @@ ${guidance}`
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
             await this.queue.updateTaskStatus(task, "escalated");
+            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -3359,6 +3404,7 @@ ${guidance}`
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
         await this.queue.updateTaskStatus(task, "escalated");
+        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
@@ -3800,6 +3846,7 @@ ${guidance}`
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
         await this.queue.updateTaskStatus(task, "escalated");
+        await this.writeEscalationWriteback(task, { reason, escalationType });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
@@ -3914,6 +3961,7 @@ ${guidance}`
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
             await this.queue.updateTaskStatus(task, "escalated");
+            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -4056,6 +4104,7 @@ ${guidance}`
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
         await this.queue.updateTaskStatus(task, "escalated");
+        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,

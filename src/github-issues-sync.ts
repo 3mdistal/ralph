@@ -10,6 +10,7 @@ import {
   recordRepoGithubIssueSync,
   runInStateTransaction,
 } from "./state";
+import { reconcileEscalationResolutions } from "./github/escalation-resolution";
 
 type IssueLabel = { name?: string } | string;
 
@@ -407,6 +408,14 @@ function startRepoPoller(params: {
           `ralph=${result.ralphCount} cursor=${lastSyncAt ?? "none"}->${result.newLastSyncAt ?? "none"} ` +
           `delayMs=${delayMs}`
       );
+
+      try {
+        await reconcileEscalationResolutions({ repo: repoName, log: params.log });
+      } catch (error: any) {
+        params.log(
+          `[ralph:gh-sync:${repoLabel}] escalation resolution reconcile failed: ${error?.message ?? String(error)}`
+        );
+      }
 
       if (params.onSync) {
         params.onSync({ repo: repoName, result });
