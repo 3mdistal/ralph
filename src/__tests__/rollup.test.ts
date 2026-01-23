@@ -13,6 +13,7 @@ describe("rollup closing issues", () => {
       "closes #90 and more",
       "Fixes other/repo#99",
       "Fixes: (#101)",
+      "Fixed #102",
     ].join("\n");
 
     expect(__extractClosingIssuesFromBodyForTests(body)).toEqual([
@@ -21,6 +22,7 @@ describe("rollup closing issues", () => {
       "acme/widgets#56",
       "acme/widgets#90",
       "acme/widgets#101",
+      "acme/widgets#102",
     ]);
   });
 
@@ -44,7 +46,7 @@ describe("rollup closing issues", () => {
     expect(body).toContain("Closes acme/widgets#2");
     expect(body).toContain("Closes acme/widgets#9");
     expect(body).toContain("Ralph-Rollup-Batch: batch-123");
-    expect(body).toContain("<!-- ralph-rollup:batch-id=batch-123 -->");
+    expect(body).toContain("<!-- ralph-rollup-batch-id=batch-123 -->");
   });
 
   test("omits closes section when none found", () => {

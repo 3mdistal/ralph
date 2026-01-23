@@ -552,6 +552,23 @@ export function getIdempotencyPayload(key: string): string | null {
   return typeof row?.payload_json === "string" ? row.payload_json : null;
 }
 
+export function getIdempotencyRecord(
+  key: string
+): { key: string; scope: string | null; createdAt: string; payloadJson: string | null } | null {
+  const database = requireDb();
+  const row = database
+    .query("SELECT key, scope, created_at, payload_json FROM idempotency WHERE key = $key")
+    .get({ $key: key }) as { key?: string; scope?: string | null; created_at?: string; payload_json?: string | null } | undefined;
+
+  if (!row?.key || !row.created_at) return null;
+  return {
+    key: row.key,
+    scope: row.scope ?? null,
+    createdAt: row.created_at,
+    payloadJson: row.payload_json ?? null,
+  };
+}
+
 export function recordIdempotencyKey(input: {
   key: string;
   scope?: string;

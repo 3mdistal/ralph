@@ -10,6 +10,8 @@ import {
   listRollupBatchEntries,
   loadRollupBatchById,
   markRollupBatchRolledUp,
+  deleteIdempotencyKey,
+  getIdempotencyRecord,
   recordIdempotencyKey,
   recordRollupMerge,
   updateRollupBatchEntryIssueRefs,
@@ -37,7 +39,19 @@ type ClosingIssueOptions = {
   generatedAt: string;
 };
 
-const CLOSING_KEYWORDS = ["fixes", "closes", "resolves"];
+const CLOSING_KEYWORDS = [
+  "fix",
+  "fixes",
+  "fixed",
+  "close",
+  "closes",
+  "closed",
+  "resolve",
+  "resolves",
+  "resolved",
+];
+
+const ROLLUP_CREATE_LEASE_TTL_MS = 10 * 60 * 1000;
 
 function parseRepoFullName(repo: string): { owner: string; repo: string } | null {
   const parts = repo.split("/").filter(Boolean);
@@ -52,10 +66,18 @@ function parseIssueNumberFromRef(issueRef: string): number | null {
   return Number.isFinite(num) ? num : null;
 }
 
-function makeRollupBatchMarker(batchId: string): { searchLine: string; hiddenLine: string } {
+function makeRollupBatchMarker(batchId: string): {
+  visibleLine: string;
+  token: string;
+  hiddenLine: string;
+  searchQuery: string;
+} {
+  const token = `ralph-rollup-batch-id=${batchId}`;
   return {
-    searchLine: `Ralph-Rollup-Batch: ${batchId}`,
-    hiddenLine: `<!-- ralph-rollup:batch-id=${batchId} -->`,
+    visibleLine: `Ralph-Rollup-Batch: ${batchId}`,
+    token,
+    hiddenLine: `<!-- ${token} -->`,
+    searchQuery: `in:body ${token}`,
   };
 }
 
@@ -138,7 +160,7 @@ function buildRollupBody(options: ClosingIssueOptions): string {
     `This is an automated rollup created by Ralph Loop. Each individual PR was reviewed by @product and @devex agents before merging to \`${options.botBranch}\`.`,
     "",
     "---",
-    marker.searchLine,
+    marker.visibleLine,
     marker.hiddenLine,
     "",
     "---",
@@ -160,6 +182,22 @@ type RollupRecordedResult =
   | { kind: "exists"; prUrl: string; prNumber?: number | null }
   | { kind: "missing" }
   | { kind: "unknown"; error: string };
+
+function tryAcquireRollupCreateLease(lockKey: string): boolean {
+  const inserted = recordIdempotencyKey({ key: lockKey, scope: "rollup:create" });
+  if (inserted) return true;
+
+  const record = getIdempotencyRecord(lockKey);
+  if (!record?.createdAt) return false;
+  const createdAtMs = Date.parse(record.createdAt);
+  if (!Number.isFinite(createdAtMs)) return false;
+
+  const ageMs = Date.now() - createdAtMs;
+  if (ageMs <= ROLLUP_CREATE_LEASE_TTL_MS) return false;
+
+  deleteIdempotencyKey(lockKey);
+  return recordIdempotencyKey({ key: lockKey, scope: "rollup:create" });
+}
 
 export class RollupMonitor {
   private mergeCount: Map<string, number> = new Map();
@@ -251,7 +289,7 @@ export class RollupMonitor {
 
     await ensureGhTokenEnv();
     const marker = makeRollupBatchMarker(params.batchId);
-    const search = marker.searchLine;
+    const search = marker.searchQuery;
 
     try {
       const result = await $`gh pr list --repo ${params.repo} --base main --search ${search} --state all --json url,number`.quiet();
@@ -267,7 +305,7 @@ export class RollupMonitor {
       }
 
       const open = await this.findExistingRollupPR(params.repo, params.botBranch, params.repoPath, params.logPrefix);
-      if (open && isLikelyRalphRollupBody(open.body)) {
+      if (open && open.body.includes(marker.token)) {
         const prNumber = open.url.match(/\/pull\/(\d+)(?:$|\?)/)?.[1];
         markRollupBatchRolledUp({
           batchId: params.batchId,
@@ -275,6 +313,13 @@ export class RollupMonitor {
           rollupPrNumber: prNumber ? Number(prNumber) : null,
         });
         return { kind: "exists", prUrl: open.url, prNumber: prNumber ? Number(prNumber) : null };
+      }
+
+      if (open && isLikelyRalphRollupBody(open.body)) {
+        return {
+          kind: "unknown",
+          error: `Open rollup PR exists without batch marker; refusing to associate batch ${params.batchId} to ${open.url}`,
+        };
       }
     } catch (e: any) {
       console.error(`[ralph:rollup] Failed to query existing rollup for ${params.repo} (${params.batchId}):`, e);
@@ -334,11 +379,14 @@ export class RollupMonitor {
 
     console.log(`[ralph:rollup] Creating rollup PR for ${repo} (${batch.id})...`);
 
+    const lockKey = `rollup:create:${repo}:${batch.id}`;
+    let leaseAcquired = false;
+
     try {
       await ensureGhTokenEnv();
 
-      const lockKey = `rollup:create:${repo}:${batch.id}`;
-      if (!recordIdempotencyKey({ key: lockKey, scope: "rollup:create" })) {
+      leaseAcquired = tryAcquireRollupCreateLease(lockKey);
+      if (!leaseAcquired) {
         console.warn(`[ralph:rollup] Rollup creation already in progress for ${repo} (${batch.id}); skipping duplicate.`);
         const check = await this.ensureRollupPrRecorded({
           repo,
@@ -392,6 +440,13 @@ export class RollupMonitor {
       console.error(`[ralph:rollup] Failed to create rollup PR for ${repo} (${batch.id}):`, e);
       await notifyError(`Creating rollup PR for ${repo} (${batch.id})`, e.message);
       return null;
+    }
+    finally {
+      // If we created a rollup PR, the lock can remain; it is batch-scoped.
+      // If we failed, clear so a retry is possible without manual DB cleanup.
+      if (leaseAcquired && !loadRollupBatchById(batch.id)?.rollupPrUrl) {
+        deleteIdempotencyKey(lockKey);
+      }
     }
   }
 
