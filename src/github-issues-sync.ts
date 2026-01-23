@@ -1,5 +1,7 @@
 import { type RepoConfig } from "./config";
-import { getInstallationToken, isRepoAllowed } from "./github-app-auth";
+import { isRepoAllowed } from "./github-app-auth";
+import { resolveGitHubToken } from "./github-auth";
+import { shouldLog } from "./logging";
 import {
   getRepoGithubIssueLastSyncAt,
   hasIssueSnapshot,
@@ -29,7 +31,7 @@ type FetchResult<T> =
 
 type SyncDeps = {
   fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-  getToken?: () => Promise<string>;
+  getToken?: () => Promise<string | null>;
   now?: () => Date;
 };
 
@@ -240,13 +242,26 @@ export async function syncRepoIssuesOnce(params: {
 }): Promise<SyncResult> {
   const deps = params.deps ?? {};
   const fetchImpl = deps.fetch ?? fetch;
-  const getToken = deps.getToken ?? getInstallationToken;
+  const getToken = deps.getToken ?? resolveGitHubToken;
   const now = deps.now ? deps.now() : new Date();
   const nowIso = now.toISOString();
   const since = computeSince(params.lastSyncAt);
 
   try {
     const token = await getToken();
+    if (!token) {
+      if (shouldLog(`github-sync:auth-missing:${params.repo}`, 60_000)) {
+        console.warn(`[ralph:gh-sync] GitHub auth is not configured; skipping issue sync for ${params.repo}`);
+      }
+      return {
+        ok: true,
+        fetched: 0,
+        stored: 0,
+        ralphCount: 0,
+        newLastSyncAt: params.lastSyncAt ?? null,
+        hadChanges: false,
+      };
+    }
     const fetchResult = await fetchIssuesSince({
       repo: params.repo,
       since,
@@ -352,6 +367,7 @@ function startRepoPoller(params: {
   repo: RepoConfig;
   baseIntervalMs: number;
   log: (msg: string) => void;
+  onSync?: (payload: { repo: string; result: SyncResult }) => void;
 }): PollerHandle {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -401,6 +417,10 @@ function startRepoPoller(params: {
         );
       }
 
+      if (params.onSync) {
+        params.onSync({ repo: repoName, result });
+      }
+
       scheduleNext(delayMs, false);
       return;
     }
@@ -443,6 +463,7 @@ export function startGitHubIssuePollers(params: {
   repos: RepoConfig[];
   baseIntervalMs: number;
   log?: (msg: string) => void;
+  onSync?: (payload: { repo: string; result: SyncResult }) => void;
 }): PollerHandle {
   const log = params.log ?? ((msg: string) => console.log(msg));
   const handles: PollerHandle[] = [];
@@ -463,6 +484,7 @@ export function startGitHubIssuePollers(params: {
         repo,
         baseIntervalMs: params.baseIntervalMs,
         log,
+        onSync: params.onSync,
       })
     );
   }

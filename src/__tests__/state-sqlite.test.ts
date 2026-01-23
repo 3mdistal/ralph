@@ -146,7 +146,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("5");
+      expect(meta.value).toBe("6");
 
       const columns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -235,6 +235,8 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       worktreePath: "/tmp/worktree",
       workerId: "3mdistal/ralph#orchestration/tasks/test.md",
       repoSlot: "1",
+      daemonId: "daemon-1",
+      heartbeatAt: "2026-01-11T00:00:01.250Z",
       at: "2026-01-11T00:00:01.000Z",
     });
 
@@ -274,7 +276,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("5");
+      expect(meta.value).toBe("6");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -299,13 +301,22 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .all() as Array<{ name: string }>;
       expect(labelRows).toEqual([{ name: "dx" }, { name: "ralph:queued" }]);
 
-      const taskRows = db.query("SELECT worker_id, repo_slot FROM tasks ORDER BY task_path").all() as Array<{
+      const taskRows = db
+        .query("SELECT worker_id, repo_slot, daemon_id, heartbeat_at FROM tasks ORDER BY task_path")
+        .all() as Array<{
         worker_id?: string;
         repo_slot?: string | null;
+        daemon_id?: string | null;
+        heartbeat_at?: string | null;
       }>;
       expect(taskRows).toEqual([
-        { worker_id: "w_123", repo_slot: null },
-        { worker_id: "3mdistal/ralph#orchestration/tasks/test.md", repo_slot: "1" },
+        { worker_id: "w_123", repo_slot: null, daemon_id: null, heartbeat_at: null },
+        {
+          worker_id: "3mdistal/ralph#orchestration/tasks/test.md",
+          repo_slot: "1",
+          daemon_id: "daemon-1",
+          heartbeat_at: "2026-01-11T00:00:01.250Z",
+        },
       ]);
 
       const taskCount = db.query("SELECT COUNT(*) as n FROM tasks").get() as { n: number };
