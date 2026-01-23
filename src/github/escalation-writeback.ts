@@ -84,7 +84,7 @@ export function sanitizeEscalationReason(input: string): string {
   return out;
 }
 
-export function buildEscalationMarkerId(params: {
+function buildEscalationMarkerId(params: {
   repo: string;
   issueNumber: number;
   escalationType: string;
