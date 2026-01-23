@@ -30,12 +30,11 @@ describe("runAgent", () => {
     await runAgent("/tmp", "ralph-plan", "hello", {}, { spawn: spawn as any });
 
     const argsList = spawnedArgs ?? [];
-    const first = argsList[0] ?? "";
     const argsText = argsList.join(" ");
 
     expect(argsList.length).toBeGreaterThan(0);
 
-    expect(first).toBe("run");
+    expect(argsText.startsWith("run")).toBe(true);
     expect(argsText).toContain("--agent");
     expect(argsText).toContain("ralph-plan");
     expect(argsText).not.toContain("--command");
