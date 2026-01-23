@@ -33,7 +33,7 @@ Keep this doc focused on product intent; update routing/escalation policy in one
 
 The manual workflow is effective but repetitive:
 1. Spin up OpenCode session
-2. Run `/next-task <issue>` - plan agent consults @product, asks questions
+2. Run planner prompt with `--agent ralph-plan` - plan agent consults @product, asks questions
 3. Agent builds (worktree, commits, tests)
 4. Agent presents PR - human says "looks good, merge and clean up"
 5. Run `/survey` - @devex recommends issues
@@ -61,10 +61,11 @@ See `docs/product/github-first-orchestration.md` for the canonical contract.
 bwrb remains supported as a legacy backend during the migration:
 - Enable via `queueBackend = "bwrb"` in `~/.ralph/config.toml` or `~/.ralph/config.json`
 - GitHub remains authoritative when both are configured (no dual-write in v0.1.0)
-- GitHub queue sync/claim semantics are tracked in #61/#63; use bwrb backend for active queue processing until then
+- GitHub queue sync/claim semantics are supported in v0.1.x; use bwrb as an optional fallback
+- GitHub queue claim is best-effort and requires a single daemon per queue in v0.1.x
 - When GitHub queue support is unavailable, Ralph falls back to bwrb if a valid vault is configured
 - When GitHub is unavailable and no bwrb vault exists, Ralph runs in idle/no-queue mode and surfaces diagnostics
-- Escalations and agent-run records remain bwrb-only until GitHub queue support ships
+- Escalation notes and agent-run records remain bwrb-only in v0.1.x; GitHub issue writeback (labels/comments) is supported in the meantime
 
 ### 2. Bot Branch Strategy
 

@@ -16,7 +16,7 @@ const notifyAdapter = {
 };
 
 const sessionAdapter = {
-  runCommand: async () => ({ sessionId: "", success: true, output: "" }),
+  runAgent: async () => ({ sessionId: "", success: true, output: "" }),
   continueSession: async () => ({ sessionId: "", success: true, output: "" }),
   continueCommand: async () => ({ sessionId: "", success: true, output: "" }),
   getRalphXdgCacheHome: () => "/tmp",

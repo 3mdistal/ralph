@@ -6,7 +6,7 @@ Ralph daemon runs use a Ralph-managed OpenCode config directory instead of any u
 
 - Config dir: `$HOME/.ralph/opencode`
 - Agents: `agent/build.md`, `agent/ralph-plan.md`, `agent/product.md`, `agent/devex.md`
-- Minimal `opencode.json` containing `next-task` and the required agent IDs
+- Minimal `opencode.json` containing the required agent IDs
 
 ## Overrides
 
