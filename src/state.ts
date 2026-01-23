@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 export type PrState = "open" | "merged";
 export const PR_STATE_OPEN: PrState = "open";
@@ -75,6 +75,19 @@ function ensureSchema(database: Database): void {
           "CREATE TABLE IF NOT EXISTS repo_github_issue_sync (repo_id INTEGER PRIMARY KEY, last_sync_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
         );
       }
+      if (existingVersion < 6) {
+        database.exec("ALTER TABLE tasks ADD COLUMN daemon_id TEXT");
+        database.exec("ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT");
+        database.exec(
+          "UPDATE tasks SET task_path = 'github:' || (SELECT name FROM repos r WHERE r.id = tasks.repo_id) || '#' || tasks.issue_number " +
+            "WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL"
+        );
+        database.exec(
+          "DELETE FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL AND rowid NOT IN (" +
+            "SELECT MAX(rowid) FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL GROUP BY repo_id, issue_number" +
+            ")"
+        );
+      }
     })();
   }
 
@@ -127,6 +140,8 @@ function ensureSchema(database: Database): void {
       worktree_path TEXT,
       worker_id TEXT,
       repo_slot TEXT,
+      daemon_id TEXT,
+      heartbeat_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(repo_id, task_path),
@@ -194,6 +209,9 @@ function ensureSchema(database: Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
+      ON tasks(repo_id, issue_number)
+      WHERE issue_number IS NOT NULL AND task_path LIKE 'github:%';
     CREATE INDEX IF NOT EXISTS idx_issues_repo_github_updated_at ON issues(repo_id, github_updated_at);
     CREATE INDEX IF NOT EXISTS idx_issue_labels_issue_id ON issue_labels(issue_id);
     CREATE INDEX IF NOT EXISTS idx_rollup_batches_repo_status ON rollup_batches(repo_id, bot_branch, status);
@@ -435,6 +453,44 @@ export function recordIssueLabelsSnapshot(input: {
   })();
 }
 
+export function listIssuesWithAllLabels(params: {
+  repo: string;
+  labels: string[];
+}): Array<{ repo: string; number: number }> {
+  if (!params.labels.length) return [];
+
+  const database = requireDb();
+  const repoRow = database
+    .query("SELECT id FROM repos WHERE name = $name")
+    .get({ $name: params.repo }) as { id?: number } | undefined;
+  if (!repoRow?.id) return [];
+
+  const labelParams = params.labels.map((_, idx) => `$label_${idx}`);
+  const labelChecks = params.labels
+    .map((_, idx) => `SUM(CASE WHEN l.name = $label_${idx} THEN 1 ELSE 0 END) > 0`)
+    .join(" AND ");
+
+  const rows = database
+    .query(
+      `SELECT i.number as number
+       FROM issues i
+       JOIN issue_labels l ON l.issue_id = i.id
+       WHERE i.repo_id = $repo_id AND l.name IN (${labelParams.join(", ")})
+       GROUP BY i.id
+       HAVING ${labelChecks}
+       ORDER BY i.number`
+    )
+    .all({
+      $repo_id: repoRow.id,
+      ...Object.fromEntries(params.labels.map((label, idx) => [`$label_${idx}`, label])),
+    }) as Array<{ number?: number }>;
+
+  return rows
+    .map((row) => row?.number)
+    .filter((number): number is number => Number.isFinite(number))
+    .map((number) => ({ repo: params.repo, number }));
+}
+
 export function recordTaskSnapshot(input: {
   repo: string;
   issue: string;
@@ -445,12 +501,18 @@ export function recordTaskSnapshot(input: {
   worktreePath?: string;
   workerId?: string;
   repoSlot?: string;
+  daemonId?: string;
+  heartbeatAt?: string;
   at?: string;
 }): void {
   const database = requireDb();
   const at = input.at ?? nowIso();
   const repoId = upsertRepo({ repo: input.repo, at });
   const issueNumber = parseIssueNumber(input.issue);
+  const taskPath =
+    issueNumber !== null && input.taskPath.startsWith("github:")
+      ? `github:${input.repo}#${issueNumber}`
+      : input.taskPath;
 
   if (issueNumber !== null) {
     database
@@ -470,33 +532,246 @@ export function recordTaskSnapshot(input: {
   database
     .query(
       `INSERT INTO tasks(
-         repo_id, issue_number, task_path, task_name, status, session_id, worktree_path, worker_id, repo_slot, created_at, updated_at
+         repo_id, issue_number, task_path, task_name, status, session_id, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, created_at, updated_at
        ) VALUES (
-         $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $worktree_path, $worker_id, $repo_slot, $created_at, $updated_at
+          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $created_at, $updated_at
        )
        ON CONFLICT(repo_id, task_path) DO UPDATE SET
-         issue_number = COALESCE(excluded.issue_number, tasks.issue_number),
-         task_name = COALESCE(excluded.task_name, tasks.task_name),
-         status = COALESCE(excluded.status, tasks.status),
-         session_id = COALESCE(excluded.session_id, tasks.session_id),
-         worktree_path = COALESCE(excluded.worktree_path, tasks.worktree_path),
-         worker_id = COALESCE(excluded.worker_id, tasks.worker_id),
-         repo_slot = COALESCE(excluded.repo_slot, tasks.repo_slot),
-         updated_at = excluded.updated_at`
+          issue_number = COALESCE(excluded.issue_number, tasks.issue_number),
+          task_name = COALESCE(excluded.task_name, tasks.task_name),
+          status = COALESCE(excluded.status, tasks.status),
+          session_id = COALESCE(excluded.session_id, tasks.session_id),
+          worktree_path = COALESCE(excluded.worktree_path, tasks.worktree_path),
+          worker_id = COALESCE(excluded.worker_id, tasks.worker_id),
+          repo_slot = COALESCE(excluded.repo_slot, tasks.repo_slot),
+          daemon_id = COALESCE(excluded.daemon_id, tasks.daemon_id),
+          heartbeat_at = COALESCE(excluded.heartbeat_at, tasks.heartbeat_at),
+          updated_at = excluded.updated_at`
     )
     .run({
       $repo_id: repoId,
       $issue_number: issueNumber,
-      $task_path: input.taskPath,
+      $task_path: taskPath,
       $task_name: input.taskName ?? null,
       $status: input.status ?? null,
       $session_id: input.sessionId ?? null,
       $worktree_path: input.worktreePath ?? null,
       $worker_id: input.workerId ?? null,
       $repo_slot: input.repoSlot ?? null,
+      $daemon_id: input.daemonId ?? null,
+      $heartbeat_at: input.heartbeatAt ?? null,
       $created_at: at,
       $updated_at: at,
     });
+}
+
+const LABEL_SEPARATOR = "\u0001";
+
+function parseLabelList(value?: string | null): string[] {
+  if (!value) return [];
+  return value
+    .split(LABEL_SEPARATOR)
+    .map((label) => label.trim())
+    .filter(Boolean);
+}
+
+export type IssueSnapshot = {
+  repo: string;
+  number: number;
+  title?: string | null;
+  state?: string | null;
+  url?: string | null;
+  githubNodeId?: string | null;
+  githubUpdatedAt?: string | null;
+  labels: string[];
+};
+
+export type TaskOpState = {
+  repo: string;
+  issueNumber: number | null;
+  taskPath: string;
+  status?: string | null;
+  sessionId?: string | null;
+  worktreePath?: string | null;
+  workerId?: string | null;
+  repoSlot?: string | null;
+  daemonId?: string | null;
+  heartbeatAt?: string | null;
+};
+
+export function listIssueSnapshotsWithRalphLabels(repo: string): IssueSnapshot[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT i.id as id, i.number as number, i.title as title, i.state as state, i.url as url,
+              i.github_node_id as github_node_id, i.github_updated_at as github_updated_at,
+              GROUP_CONCAT(l.name, '${LABEL_SEPARATOR}') as labels
+       FROM issues i
+       JOIN repos r ON r.id = i.repo_id
+       LEFT JOIN issue_labels l ON l.issue_id = i.id
+       WHERE r.name = $name
+         AND (i.state IS NULL OR UPPER(i.state) != 'CLOSED')
+         AND EXISTS (
+           SELECT 1 FROM issue_labels l2 WHERE l2.issue_id = i.id AND l2.name LIKE 'ralph:%'
+         )
+       GROUP BY i.id
+       ORDER BY i.number ASC`
+    )
+    .all({ $name: repo }) as Array<{
+    number: number;
+    title?: string | null;
+    state?: string | null;
+    url?: string | null;
+    github_node_id?: string | null;
+    github_updated_at?: string | null;
+    labels?: string | null;
+  }>;
+
+  return rows.map((row) => ({
+    repo,
+    number: row.number,
+    title: row.title ?? null,
+    state: row.state ?? null,
+    url: row.url ?? null,
+    githubNodeId: row.github_node_id ?? null,
+    githubUpdatedAt: row.github_updated_at ?? null,
+    labels: parseLabelList(row.labels),
+  }));
+}
+
+export function getIssueSnapshotByNumber(repo: string, issueNumber: number): IssueSnapshot | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT i.id as id, i.number as number, i.title as title, i.state as state, i.url as url,
+              i.github_node_id as github_node_id, i.github_updated_at as github_updated_at,
+              GROUP_CONCAT(l.name, '${LABEL_SEPARATOR}') as labels
+       FROM issues i
+       JOIN repos r ON r.id = i.repo_id
+       LEFT JOIN issue_labels l ON l.issue_id = i.id
+       WHERE r.name = $name AND i.number = $number
+       GROUP BY i.id`
+    )
+    .get({ $name: repo, $number: issueNumber }) as
+    | {
+        number?: number;
+        title?: string | null;
+        state?: string | null;
+        url?: string | null;
+        github_node_id?: string | null;
+        github_updated_at?: string | null;
+        labels?: string | null;
+      }
+    | undefined;
+
+  if (!row?.number) return null;
+  return {
+    repo,
+    number: row.number,
+    title: row.title ?? null,
+    state: row.state ?? null,
+    url: row.url ?? null,
+    githubNodeId: row.github_node_id ?? null,
+    githubUpdatedAt: row.github_updated_at ?? null,
+    labels: parseLabelList(row.labels),
+  };
+}
+
+export function getIssueLabels(repo: string, issueNumber: number): string[] {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT i.id as id
+       FROM issues i
+       JOIN repos r ON r.id = i.repo_id
+       WHERE r.name = $name AND i.number = $number`
+    )
+    .get({ $name: repo, $number: issueNumber }) as { id?: number } | undefined;
+
+  if (!row?.id) return [];
+  const labels = database
+    .query("SELECT name FROM issue_labels WHERE issue_id = $id ORDER BY name")
+    .all({ $id: row.id }) as Array<{ name: string }>;
+
+  return labels.map((label) => label.name);
+}
+
+export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
+              t.worktree_path as worktree_path, t.worker_id as worker_id, t.repo_slot as repo_slot,
+              t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
+       FROM tasks t
+       JOIN repos r ON r.id = t.repo_id
+       WHERE r.name = $name AND t.issue_number IS NOT NULL AND t.task_path LIKE 'github:%'
+       ORDER BY t.updated_at DESC`
+    )
+    .all({ $name: repo }) as Array<{
+    task_path: string;
+    issue_number: number | null;
+    status?: string | null;
+    session_id?: string | null;
+    worktree_path?: string | null;
+    worker_id?: string | null;
+    repo_slot?: string | null;
+    daemon_id?: string | null;
+    heartbeat_at?: string | null;
+  }>;
+
+  return rows.map((row) => ({
+    repo,
+    issueNumber: row.issue_number ?? null,
+    taskPath: row.task_path,
+    status: row.status ?? null,
+    sessionId: row.session_id ?? null,
+    worktreePath: row.worktree_path ?? null,
+    workerId: row.worker_id ?? null,
+    repoSlot: row.repo_slot ?? null,
+    daemonId: row.daemon_id ?? null,
+    heartbeatAt: row.heartbeat_at ?? null,
+  }));
+}
+
+export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpState | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
+              t.worktree_path as worktree_path, t.worker_id as worker_id, t.repo_slot as repo_slot,
+              t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
+       FROM tasks t
+       JOIN repos r ON r.id = t.repo_id
+       WHERE r.name = $name AND t.task_path = $task_path`
+    )
+    .get({ $name: repo, $task_path: taskPath }) as
+    | {
+        task_path?: string;
+        issue_number?: number | null;
+        status?: string | null;
+        session_id?: string | null;
+        worktree_path?: string | null;
+        worker_id?: string | null;
+        repo_slot?: string | null;
+        daemon_id?: string | null;
+        heartbeat_at?: string | null;
+      }
+    | undefined;
+
+  if (!row?.task_path) return null;
+  return {
+    repo,
+    issueNumber: row.issue_number ?? null,
+    taskPath: row.task_path,
+    status: row.status ?? null,
+    sessionId: row.session_id ?? null,
+    worktreePath: row.worktree_path ?? null,
+    workerId: row.worker_id ?? null,
+    repoSlot: row.repo_slot ?? null,
+    daemonId: row.daemon_id ?? null,
+    heartbeatAt: row.heartbeat_at ?? null,
+  };
 }
 
 function parsePrNumber(prUrl: string): number | null {

@@ -23,6 +23,14 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 | `ralph:blocked` | Blocked by dependencies | `D73A4A` |
 | `ralph:escalated` | Waiting on human input | `B60205` |
 
+## Claim semantics + daemon model
+
+- Ralph treats `ralph:queued` as the only claimable state. Claiming means applying `ralph:in-progress` and removing `ralph:queued`.
+- Claiming is best-effort and not transactional across multiple GitHub label updates.
+- Deployment model: **single daemon per queue**. Running multiple daemons against the same GitHub queue is unsupported.
+- Stale recovery: Ralph only re-queues `ralph:in-progress` issues when the stored `heartbeat-at` exists and is stale beyond `ownershipTtlMs`.
+  Missing or invalid heartbeats do not trigger automatic recovery.
+
 ## Dependency encoding
 
 Dependencies are encoded in issue bodies with deterministic section headers and task lists.
@@ -87,6 +95,11 @@ Direct-to-main (override / Pattern B):
 
 ## Escalation protocol
 
-- Ralph adds `ralph:escalated` and posts a comment containing a stable hidden marker
-  (e.g. `<!-- ralph-escalation:id=... -->`) and resolution instructions.
-- Resolution is detected when a new operator comment contains `RALPH RESOLVED:`.
+- Ralph removes `ralph:in-progress` and `ralph:queued`, then adds `ralph:escalated`.
+- Ralph posts a comment containing a stable hidden marker (e.g. `<!-- ralph-escalation:id=... -->`),
+  the operator @mention, and resolution instructions.
+- Operator @mention defaults to the repo owner handle (e.g. `@owner`); if no owner can be parsed, omit the mention.
+- Resolution signals (either is sufficient):
+  - A new operator comment contains `RALPH RESOLVED:` (only honored when authored by the repo owner or an `OWNER`/`MEMBER`/`COLLABORATOR`).
+  - The operator re-adds `ralph:queued`.
+- When resolved, Ralph removes `ralph:escalated` (and keeps `ralph:queued` if it was added).

@@ -9,6 +9,9 @@
 
 Make Ralph restarts/upgrades low-disruption and platform-agnostic by introducing a **drain mode**, **checkpoint-based pausing**, and a **deterministic handoff/resume protocol**.
 
+Note: for the GitHub queue backend in v0.1.x, **single daemon per queue** is required. Rolling restarts must be sequential
+(drain, stop old daemon, then start new). Overlapping daemons are out of scope until GitHub claim semantics are transactional.
+
 This is designed to work on **macOS today** and **NixOS/Linux later** using POSIX + XDG conventions.
 
 ## Why now

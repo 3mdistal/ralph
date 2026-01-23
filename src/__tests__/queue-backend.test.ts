@@ -56,7 +56,7 @@ describe("queue backend selection", () => {
     expect(cfg.queueBackend).toBe("github");
   });
 
-  test("falls back to none when GitHub backend is not implemented", async () => {
+  test("falls back to none when GitHub auth is missing", async () => {
     const configPath = getRalphConfigJsonPath();
     const missingVault = join(homeDir, "missing-vault");
     await writeJson(configPath, {
@@ -72,10 +72,10 @@ describe("queue backend selection", () => {
     expect(state.backend).toBe("none");
     expect(state.health).toBe("degraded");
     expect(state.fallback).toBe(true);
-    expect(state.diagnostics ?? "").toContain("not yet implemented");
+    expect(state.diagnostics ?? "").toContain("auth is not configured");
   });
 
-  test("falls back to bwrb when GitHub backend is missing but vault is available", async () => {
+  test("falls back to bwrb when GitHub auth is missing but vault is available", async () => {
     const vaultPath = join(homeDir, "vault");
     await mkdir(join(vaultPath, ".bwrb"), { recursive: true });
     await writeFile(join(vaultPath, ".bwrb", "schema.json"), "{}", "utf8");
@@ -94,10 +94,10 @@ describe("queue backend selection", () => {
     expect(state.backend).toBe("bwrb");
     expect(state.health).toBe("ok");
     expect(state.fallback).toBe(true);
-    expect(state.diagnostics ?? "").toContain("falling back to bwrb");
+    expect(state.diagnostics ?? "").toContain("auth is not configured");
   });
 
-  test("explicit github is unavailable when backend not implemented", async () => {
+  test("explicit github is unavailable when auth is missing", async () => {
     const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {
       queueBackend: "github",
@@ -113,7 +113,32 @@ describe("queue backend selection", () => {
     expect(state.backend).toBe("github");
     expect(state.health).toBe("unavailable");
     expect(state.fallback).toBe(false);
-    expect(state.diagnostics ?? "").toContain("not yet implemented");
+    expect(state.diagnostics ?? "").toContain("auth is not configured");
+  });
+
+  test("uses github backend when auth is configured", async () => {
+    const configPath = getRalphConfigJsonPath();
+    await writeJson(configPath, {
+      queueBackend: "github",
+      repos: [],
+    });
+
+    const priorToken = process.env.GH_TOKEN;
+    process.env.GH_TOKEN = "token";
+
+    try {
+      __resetConfigForTests();
+      __resetQueueBackendStateForTests();
+
+      const state = getQueueBackendState();
+      expect(state.desiredBackend).toBe("github");
+      expect(state.backend).toBe("github");
+      expect(state.health).toBe("ok");
+      expect(state.fallback).toBe(false);
+    } finally {
+      if (priorToken === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = priorToken;
+    }
   });
 
   test("invalid queueBackend is treated as explicit and unavailable", async () => {
