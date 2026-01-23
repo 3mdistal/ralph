@@ -790,6 +790,15 @@ export class RepoWorker {
     }
   }
 
+  private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string, nextPrUrl: string | null): string;
+  private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string | null, nextPrUrl: string | null): string | null;
+  private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string | null, nextPrUrl: string | null): string | null {
+    if (!nextPrUrl) return currentPrUrl;
+    if (nextPrUrl === currentPrUrl) return currentPrUrl;
+    this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl: nextPrUrl, state: PR_STATE_OPEN });
+    return nextPrUrl;
+  }
+
   private async applyMidpointLabelsBestEffort(params: {
     task: AgentTask;
     prUrl: string;
@@ -2710,10 +2719,7 @@ ${guidance}`
       }
 
       const updatedPrUrl = selectPrUrl({ output: fixResult.output, repo: this.repo });
-      if (updatedPrUrl && updatedPrUrl !== prUrl) {
-        prUrl = updatedPrUrl;
-        this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_OPEN });
-      }
+      prUrl = this.updateOpenPrSnapshot(params.task, prUrl, updatedPrUrl);
     }
 
     const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
@@ -3231,7 +3237,11 @@ ${guidance}`
 
       // Extract PR URL (with retry loop if agent stopped without creating PR)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl });
+      let prUrl = this.updateOpenPrSnapshot(
+        task,
+        null,
+        selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+      );
       let prRecoveryDiagnostics = "";
 
       if (!prUrl) {
@@ -3242,11 +3252,7 @@ ${guidance}`
           botBranch,
         });
         prRecoveryDiagnostics = recovered.diagnostics;
-        prUrl = recovered.prUrl ?? prUrl;
-      }
-
-      if (prUrl) {
-        this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
       }
 
       let continueAttempts = 0;
@@ -3341,10 +3347,11 @@ ${guidance}`
           }
 
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl });
-          if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
-          }
+          prUrl = this.updateOpenPrSnapshot(
+            task,
+            prUrl,
+            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+          );
 
           continue;
         }
@@ -3396,20 +3403,18 @@ ${guidance}`
             botBranch,
           });
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-          prUrl = recovered.prUrl ?? prUrl;
-          if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
-          }
+          prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
 
           if (!prUrl) {
             console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
             break;
           }
         } else {
-          prUrl = selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl });
-          if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
-          }
+          prUrl = this.updateOpenPrSnapshot(
+            task,
+            prUrl,
+            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+          );
         }
       }
 
@@ -3421,10 +3426,7 @@ ${guidance}`
           botBranch,
         });
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-        prUrl = recovered.prUrl ?? prUrl;
-        if (prUrl) {
-          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
-        }
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
       }
 
       if (!prUrl) {
@@ -3948,7 +3950,11 @@ ${guidance}`
       // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
       // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
       const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl });
+      let prUrl = this.updateOpenPrSnapshot(
+        task,
+        null,
+        selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+      );
       let prRecoveryDiagnostics = "";
 
       if (!prUrl) {
@@ -3959,7 +3965,7 @@ ${guidance}`
           botBranch,
         });
         prRecoveryDiagnostics = recovered.diagnostics;
-        prUrl = recovered.prUrl ?? prUrl;
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
       }
 
       let continueAttempts = 0;
@@ -4054,10 +4060,11 @@ ${guidance}`
 
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
-          prUrl = selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl });
-          if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
-          }
+          prUrl = this.updateOpenPrSnapshot(
+            task,
+            prUrl,
+            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+          );
           continue;
         }
 
@@ -4104,20 +4111,18 @@ ${guidance}`
             botBranch,
           });
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-          prUrl = recovered.prUrl ?? prUrl;
-          if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
-          }
+          prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
 
           if (!prUrl) {
             console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
             break;
           }
         } else {
-          prUrl = selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl });
-          if (prUrl) {
-            this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
-          }
+          prUrl = this.updateOpenPrSnapshot(
+            task,
+            prUrl,
+            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
+          );
         }
       }
 
@@ -4129,10 +4134,7 @@ ${guidance}`
           botBranch,
         });
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-        prUrl = recovered.prUrl ?? prUrl;
-        if (prUrl) {
-          this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl, state: PR_STATE_OPEN });
-        }
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
       }
 
       if (!prUrl) {
