@@ -22,7 +22,7 @@ export class LogLimiter {
   private evict(): void {
     while (this.lastLogAt.size > this.maxKeys) {
       const oldestKey = this.lastLogAt.keys().next().value as string | undefined;
-      if (!oldestKey) return;
+      if (oldestKey === undefined) return;
       this.lastLogAt.delete(oldestKey);
     }
   }
