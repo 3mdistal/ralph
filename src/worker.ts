@@ -1546,18 +1546,27 @@ ${guidance}`
       }
 
       if (!decision.blocked && decision.confidence === "certain") {
+        let shouldRemoveBlockedLabel = true;
         for (const task of entry.tasks) {
-          if (task.status === "blocked" && task["blocked-source"] === "deps") {
-            await this.markTaskUnblocked(task);
+          if (task.status !== "blocked") continue;
+          if (task["blocked-source"] !== "deps") {
+            shouldRemoveBlockedLabel = false;
+            continue;
+          }
+          const unblocked = await this.markTaskUnblocked(task);
+          if (!unblocked) {
+            shouldRemoveBlockedLabel = false;
           }
         }
 
-        try {
-          await this.removeIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
-          );
+        if (shouldRemoveBlockedLabel) {
+          try {
+            await this.removeIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
+          } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
+            );
+          }
         }
       }
     }
