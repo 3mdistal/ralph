@@ -800,6 +800,14 @@ export class RepoWorker {
     const status = await this.getRepoRootStatusPorcelain();
     if (!status) return;
 
+    const worktreePath = task["worktree-path"]?.trim();
+    if (worktreePath && !this.isSameRepoRootPath(worktreePath)) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Repo root dirty but task is isolated in worktree (${phase}); continuing.`
+      );
+      return;
+    }
+
     const reason = `Repo root has uncommitted changes; refusing to run to protect main checkout (${phase}).`;
     const message = [reason, "", "Status:", status].join("\n");
 
@@ -2644,6 +2652,321 @@ ${guidance}`
     return [message, stderr].filter(Boolean).join("\n");
   }
 
+  private buildMergeConflictPrompt(prUrl: string, baseRefName: string | null, botBranch: string): string {
+    const baseName = baseRefName || botBranch;
+    return [
+      `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
+      `Resolve merge conflicts by rebasing/merging '${baseName}' into the PR branch.`,
+      "Do NOT create a new PR.",
+      "After resolving conflicts, push updates and keep working on this PR until required checks pass.",
+    ].join("\n");
+  }
+
+  private buildCiFailurePrompt(prUrl: string, summary: RequiredChecksSummary): string {
+    const statusLine = summary.status === "pending" ? "Required checks are pending." : "Required checks are failing.";
+    return [
+      `An open PR already exists for this issue: ${prUrl}.`,
+      "Do NOT create a new PR.",
+      statusLine,
+      "Fix failing CI checks or re-run stalled workflows on the existing PR branch.",
+      "After checks pass, continue with the existing PR only.",
+      "",
+      formatRequiredChecksForHumans(summary),
+    ].join("\n");
+  }
+
+  private isGitHubQueueTask(task: AgentTask): boolean {
+    return Boolean(task._path?.startsWith("github:"));
+  }
+
+  private async maybeHandleQueuedMergeConflict(params: {
+    task: AgentTask;
+    issueNumber: string;
+    taskRepoPath: string;
+    cacheKey: string;
+    botBranch: string;
+    issueMeta: IssueMetadata;
+    startTime: Date;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+  }): Promise<AgentRun | null> {
+    const { task, issueNumber, taskRepoPath, cacheKey, botBranch, issueMeta, startTime, opencodeXdg, opencodeSessionOptions } = params;
+
+    if (!this.isGitHubQueueTask(task)) return null;
+
+    const existingPr = await this.getIssuePrResolution(issueNumber);
+    if (!existingPr.selectedUrl) return null;
+
+    const prState = await this.getPullRequestMergeState(existingPr.selectedUrl);
+    if (prState.mergeStateStatus !== "DIRTY") return null;
+
+    console.warn(
+      `[ralph:worker:${this.repo}] Existing PR has merge conflicts; skipping planner for ${task.issue}.`
+    );
+
+    this.updateOpenPrSnapshot(task, null, existingPr.selectedUrl);
+
+    const pausedBefore = await this.pauseIfHardThrottled(task, "merge-conflict", task["session-id"]?.trim());
+    if (pausedBefore) return pausedBefore;
+
+    const mergeConflictPrompt = this.buildMergeConflictPrompt(
+      existingPr.selectedUrl,
+      prState.baseRefName ?? null,
+      botBranch
+    );
+    const mergeConflictRunLogPath = await this.recordRunLogPath(task, issueNumber, "merge-conflict", "in-progress");
+
+    const conflictResult = await this.session.runAgent(taskRepoPath, "general", mergeConflictPrompt, {
+      repo: this.repo,
+      cacheKey,
+      runLogPath: mergeConflictRunLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: task.issue,
+        taskName: task.name,
+        step: 2,
+        stepTitle: "merge-conflict",
+      },
+      ...this.buildWatchdogOptions(task, "merge-conflict"),
+      ...opencodeSessionOptions,
+    });
+
+    const pausedAfter = await this.pauseIfHardThrottled(task, "merge-conflict (post)", conflictResult.sessionId);
+    if (pausedAfter) return pausedAfter;
+
+    if (!conflictResult.success) {
+      if (conflictResult.watchdogTimeout) {
+        return await this.handleWatchdogTimeout(task, cacheKey, "merge-conflict", conflictResult, opencodeXdg);
+      }
+      throw new Error(`Merge conflict recovery failed: ${conflictResult.output}`);
+    }
+
+    if (conflictResult.sessionId) {
+      await this.queue.updateTaskStatus(task, "in-progress", { "session-id": conflictResult.sessionId });
+    }
+
+    await this.drainNudges(task, taskRepoPath, conflictResult.sessionId, cacheKey, "merge-conflict", opencodeXdg);
+
+    const mergeGate = await this.mergePrWithRequiredChecks({
+      task,
+      repoPath: taskRepoPath,
+      cacheKey,
+      botBranch,
+      prUrl: existingPr.selectedUrl,
+      sessionId: conflictResult.sessionId,
+      issueMeta,
+      watchdogStagePrefix: "merge-conflict",
+      notifyTitle: `Merging ${task.name}`,
+      opencodeXdg,
+    });
+
+    if (!mergeGate.ok) return mergeGate.run;
+
+    const pausedSurvey = await this.pauseIfHardThrottled(task, "survey", mergeGate.sessionId || conflictResult.sessionId);
+    if (pausedSurvey) return pausedSurvey;
+
+    const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+    const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
+
+    const surveyResult = await this.session.continueCommand(surveyRepoPath, mergeGate.sessionId, "survey", [], {
+      repo: this.repo,
+      cacheKey,
+      runLogPath: surveyRunLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: task.issue,
+        taskName: task.name,
+        step: 3,
+        stepTitle: "survey",
+      },
+      ...this.buildWatchdogOptions(task, "survey"),
+      ...opencodeSessionOptions,
+    });
+
+    const pausedSurveyAfter = await this.pauseIfHardThrottled(
+      task,
+      "survey (post)",
+      surveyResult.sessionId || mergeGate.sessionId
+    );
+    if (pausedSurveyAfter) return pausedSurveyAfter;
+
+    if (!surveyResult.success && surveyResult.watchdogTimeout) {
+      return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    const endTime = new Date();
+    const completedAt = endTime.toISOString().split("T")[0];
+    await this.createAgentRun(task, {
+      sessionId: mergeGate.sessionId,
+      pr: mergeGate.prUrl,
+      outcome: "success",
+      started: startTime,
+      completed: endTime,
+      surveyResults: surveyResult.output,
+    });
+
+    await this.queue.updateTaskStatus(task, "done", {
+      "completed-at": completedAt,
+      "session-id": "",
+      "watchdog-retries": "",
+      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+      ...(task["worker-id"] ? { "worker-id": "" } : {}),
+      ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
+    });
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+      sessionId: mergeGate.sessionId,
+      pr: mergeGate.prUrl,
+    };
+  }
+
+  private async maybeHandleQueuedCiFailure(params: {
+    task: AgentTask;
+    issueNumber: string;
+    taskRepoPath: string;
+    cacheKey: string;
+    botBranch: string;
+    issueMeta: IssueMetadata;
+    startTime: Date;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+  }): Promise<AgentRun | null> {
+    const { task, issueNumber, taskRepoPath, cacheKey, botBranch, issueMeta, startTime, opencodeXdg, opencodeSessionOptions } = params;
+
+    if (!this.isGitHubQueueTask(task)) return null;
+
+    const existingPr = await this.getIssuePrResolution(issueNumber);
+    if (!existingPr.selectedUrl) return null;
+
+    const { checks: requiredChecks } = await this.resolveRequiredChecksForMerge();
+    const prStatus = await this.getPullRequestChecks(existingPr.selectedUrl);
+    if (prStatus.mergeStateStatus === "DIRTY") return null;
+
+    const summary = summarizeRequiredChecks(prStatus.checks, requiredChecks);
+    if (summary.status === "success") return null;
+
+    console.warn(
+      `[ralph:worker:${this.repo}] Existing PR has non-green checks; skipping planner for ${task.issue}.`
+    );
+
+    this.updateOpenPrSnapshot(task, null, existingPr.selectedUrl);
+
+    const pausedBefore = await this.pauseIfHardThrottled(task, "ci-failure", task["session-id"]?.trim());
+    if (pausedBefore) return pausedBefore;
+
+    const ciPrompt = this.buildCiFailurePrompt(existingPr.selectedUrl, summary);
+    const ciRunLogPath = await this.recordRunLogPath(task, issueNumber, "ci-failure", "in-progress");
+
+    const ciResult = await this.session.runAgent(taskRepoPath, "general", ciPrompt, {
+      repo: this.repo,
+      cacheKey,
+      runLogPath: ciRunLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: task.issue,
+        taskName: task.name,
+        step: 2,
+        stepTitle: "ci-failure",
+      },
+      ...this.buildWatchdogOptions(task, "ci-failure"),
+      ...opencodeSessionOptions,
+    });
+
+    const pausedAfter = await this.pauseIfHardThrottled(task, "ci-failure (post)", ciResult.sessionId);
+    if (pausedAfter) return pausedAfter;
+
+    if (!ciResult.success) {
+      if (ciResult.watchdogTimeout) {
+        return await this.handleWatchdogTimeout(task, cacheKey, "ci-failure", ciResult, opencodeXdg);
+      }
+      throw new Error(`CI recovery failed: ${ciResult.output}`);
+    }
+
+    if (ciResult.sessionId) {
+      await this.queue.updateTaskStatus(task, "in-progress", { "session-id": ciResult.sessionId });
+    }
+
+    await this.drainNudges(task, taskRepoPath, ciResult.sessionId, cacheKey, "ci-failure", opencodeXdg);
+
+    const mergeGate = await this.mergePrWithRequiredChecks({
+      task,
+      repoPath: taskRepoPath,
+      cacheKey,
+      botBranch,
+      prUrl: existingPr.selectedUrl,
+      sessionId: ciResult.sessionId,
+      issueMeta,
+      watchdogStagePrefix: "ci-failure",
+      notifyTitle: `Merging ${task.name}`,
+      opencodeXdg,
+    });
+
+    if (!mergeGate.ok) return mergeGate.run;
+
+    const pausedSurvey = await this.pauseIfHardThrottled(task, "survey", mergeGate.sessionId || ciResult.sessionId);
+    if (pausedSurvey) return pausedSurvey;
+
+    const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+    const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
+
+    const surveyResult = await this.session.continueCommand(surveyRepoPath, mergeGate.sessionId, "survey", [], {
+      repo: this.repo,
+      cacheKey,
+      runLogPath: surveyRunLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: task.issue,
+        taskName: task.name,
+        step: 3,
+        stepTitle: "survey",
+      },
+      ...this.buildWatchdogOptions(task, "survey"),
+      ...opencodeSessionOptions,
+    });
+
+    const pausedSurveyAfter = await this.pauseIfHardThrottled(
+      task,
+      "survey (post)",
+      surveyResult.sessionId || mergeGate.sessionId
+    );
+    if (pausedSurveyAfter) return pausedSurveyAfter;
+
+    if (!surveyResult.success && surveyResult.watchdogTimeout) {
+      return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    const endTime = new Date();
+    const completedAt = endTime.toISOString().split("T")[0];
+    await this.createAgentRun(task, {
+      sessionId: mergeGate.sessionId,
+      pr: mergeGate.prUrl,
+      outcome: "success",
+      started: startTime,
+      completed: endTime,
+      surveyResults: surveyResult.output,
+    });
+
+    await this.queue.updateTaskStatus(task, "done", {
+      "completed-at": completedAt,
+      "session-id": "",
+      "watchdog-retries": "",
+      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
+      ...(task["worker-id"] ? { "worker-id": "" } : {}),
+      ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
+    });
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+      sessionId: mergeGate.sessionId,
+      pr: mergeGate.prUrl,
+    };
+  }
+
   private async updatePullRequestBranchViaWorktree(prUrl: string): Promise<void> {
     const pr = await this.getPullRequestMergeState(prUrl);
     const botBranch = this.normalizeGitRef(getRepoBotBranch(this.repo));
@@ -3821,6 +4144,7 @@ ${guidance}`
       }
 
       const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
+      if (worktreePath) task["worktree-path"] = worktreePath;
 
       const workerIdChanged = task["worker-id"]?.trim() !== workerId;
       const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
@@ -3872,16 +4196,20 @@ ${guidance}`
         "If you already created a PR, paste the PR URL. " +
         `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
 
-      const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
+      const resumeMessage = opts?.resumeMessage?.trim();
+      const baseResumeMessage = resumeMessage || defaultResumeMessage;
       const existingPr = await this.getIssuePrResolution(issueNumber);
       const finalResumeMessage = existingPr.selectedUrl
         ? [
             `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
             "Do NOT create a new PR.",
             "Continue work on the existing PR branch and push updates as needed.",
+            resumeMessage ?? "",
             "Only paste a PR URL if it changes.",
-          ].join(" ")
-        : resumeMessage;
+          ]
+            .filter(Boolean)
+            .join(" ")
+        : baseResumeMessage;
 
       if (existingPr.selectedUrl) {
         console.log(
@@ -4420,6 +4748,33 @@ ${guidance}`
 
       await this.assertRepoRootClean(task, "start");
 
+      const botBranch = getRepoBotBranch(this.repo);
+      const mergeConflictRun = await this.maybeHandleQueuedMergeConflict({
+        task,
+        issueNumber,
+        taskRepoPath,
+        cacheKey,
+        botBranch,
+        issueMeta,
+        startTime,
+        opencodeXdg,
+        opencodeSessionOptions,
+      });
+      if (mergeConflictRun) return mergeConflictRun;
+
+      const ciFailureRun = await this.maybeHandleQueuedCiFailure({
+        task,
+        issueNumber,
+        taskRepoPath,
+        cacheKey,
+        botBranch,
+        issueMeta,
+        startTime,
+        opencodeXdg,
+        opencodeSessionOptions,
+      });
+      if (ciFailureRun) return ciFailureRun;
+
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
 
@@ -4689,7 +5044,6 @@ ${guidance}`
 
       // 6. Proceed with build
       console.log(`[ralph:worker:${this.repo}] Proceeding with build...`);
-      const botBranch = getRepoBotBranch(this.repo);
       const existingPr = await this.getIssuePrResolution(issueNumber);
       const proceedMessage = existingPr.selectedUrl
         ? [
