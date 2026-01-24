@@ -27,6 +27,7 @@ import { dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
+import { isSafeSessionId } from "./session-id";
 import { ensureManagedOpencodeConfigInstalled } from "./opencode-managed-config";
 import { registerOpencodeRun, unregisterOpencodeRun, updateOpencodeRun } from "./opencode-process-registry";
 import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
@@ -58,6 +59,7 @@ export interface SessionResult {
   watchdogTimeout?: WatchdogTimeoutInfo;
   /** Best-effort PR URL discovered from structured JSON events. */
   prUrl?: string;
+  errorCode?: "context_length_exceeded";
 }
 
 
@@ -121,6 +123,36 @@ function normalizeCacheSegment(value: string): string {
     .replace(/-+/g, "-")
     .replace(/^[-_.]+|[-_.]+$/g, "")
     .slice(0, 80);
+}
+
+const CONTEXT_LENGTH_PATTERNS = [
+  /"code"\s*:\s*"context_length_exceeded"/i,
+  /context_length_exceeded/i,
+  /input exceeds the context window/i,
+];
+
+function detectContextLengthExceeded(input: string): boolean {
+  if (!input) return false;
+  return CONTEXT_LENGTH_PATTERNS.some((pattern) => pattern.test(input));
+}
+
+function detectOpencodeErrorCode(params: {
+  stderr: string;
+  stdout: string;
+  textOutput: string;
+  recentEvents: string[];
+}): "context_length_exceeded" | undefined {
+  const tail = (value: string, max: number) => (value.length > max ? value.slice(-max) : value);
+  const recent = params.recentEvents.slice(-50).join("\n");
+  const samples = [params.stderr, params.textOutput, params.stdout, recent]
+    .filter(Boolean)
+    .map((value) => tail(value, 4000));
+
+  if (samples.some((value) => detectContextLengthExceeded(value))) {
+    return "context_length_exceeded";
+  }
+
+  return undefined;
 }
 
 function resolveOpencodeBin(): string {
@@ -766,7 +798,11 @@ async function runSession(
 
   // If continuing an existing session, mark it as active for `ralph nudge`.
   const continueSessionId = options?.continueSession;
-  const lockPath = continueSessionId ? getSessionLockPathForRun(continueSessionId) : null;
+  const safeContinueSessionId = continueSessionId && isSafeSessionId(continueSessionId) ? continueSessionId : null;
+  if (continueSessionId && !safeContinueSessionId) {
+    console.warn(`[ralph] Refusing to write session lock for unsafe session id: ${continueSessionId}`);
+  }
+  const lockPath = safeContinueSessionId ? getSessionLockPathForRun(safeContinueSessionId) : null;
   const cleanupLock = () => {
     if (!lockPath) return;
     try {
@@ -884,6 +920,10 @@ async function runSession(
 
   const ensureEventStream = (id: string): void => {
     if (eventStream) return;
+    if (!isSafeSessionId(id)) {
+      console.warn(`[ralph] Refusing to write session events for unsafe session id: ${id}`);
+      return;
+    }
 
     try {
       mkdirSync(getSessionDirForRun(id), { recursive: true });
@@ -1171,6 +1211,7 @@ async function runSession(
 
     const err = stderr.trim() ? sanitizeOpencodeLog(truncateTail(stderr.trim(), 8000)) : "";
     const text = textOutput.trim() ? sanitizeOpencodeLog(truncateTail(textOutput.trim(), 8000)) : "";
+    const errorCode = detectOpencodeErrorCode({ stderr, stdout, textOutput, recentEvents });
 
     const recent = recentEvents.length
       ? ["Recent OpenCode events (bounded):", ...recentEvents.map((l) => `- ${l}`)].join("\n")
@@ -1198,7 +1239,7 @@ async function runSession(
       await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
     }
 
-    return { sessionId, output: enriched, success: false, exitCode, prUrl: prUrlFromEvents ?? undefined };
+    return { sessionId, output: enriched, success: false, exitCode, prUrl: prUrlFromEvents ?? undefined, errorCode };
   }
 
   const raw = stdout.toString();

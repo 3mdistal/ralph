@@ -34,9 +34,19 @@ import { normalizeGitRef } from "./midpoint-labels";
 import { computeHeadBranchDeletionDecision } from "./pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
-import { continueCommand, continueSession, getRalphXdgCacheHome, runAgent, type SessionResult } from "./session";
+import {
+  continueCommand,
+  continueSession,
+  getRalphXdgCacheHome,
+  runAgent,
+  type RunSessionOptionsBase,
+  type SessionResult,
+} from "./session";
 import { buildPlannerPrompt } from "./planner-prompt";
 import { getThrottleDecision } from "./throttle";
+import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
+import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
+import { LogLimiter } from "./logging";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
@@ -64,9 +74,12 @@ import {
   type IssueRelationshipProvider,
   type IssueRelationshipSnapshot,
 } from "./github/issue-relationships";
-import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
+import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import { cleanupSessionArtifacts } from "./introspection-traces";
+import { redactHomePathForDisplay } from "./redaction";
+import { isSafeSessionId } from "./session-id";
 import {
   getIdempotencyPayload,
   upsertIdempotencyKey,
@@ -162,9 +175,6 @@ const DEFAULT_THROTTLE_ADAPTER: ThrottleAdapter = {
   getThrottleDecision,
 };
 
-// Ralph introspection logs location
-const RALPH_SESSIONS_DIR = getRalphSessionsDir();
-
 // Git worktrees for per-task repo isolation
 const RALPH_WORKTREES_DIR = getRalphWorktreesDir();
 
@@ -173,6 +183,8 @@ const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
 const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
+const IGNORED_BODY_DEPS_LOG_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const IGNORED_BODY_DEPS_LOG_MAX_KEYS = 2000;
 const BLOCKED_REASON_MAX_LEN = 200;
 const BLOCKED_DETAILS_MAX_LEN = 2000;
 
@@ -192,7 +204,8 @@ interface LiveAnomalyCount {
 }
 
 async function readIntrospectionSummary(sessionId: string): Promise<IntrospectionSummary | null> {
-  const summaryPath = join(RALPH_SESSIONS_DIR, sessionId, "summary.json");
+  if (!isSafeSessionId(sessionId)) return null;
+  const summaryPath = join(getRalphSessionDir(sessionId), "summary.json");
   if (!existsSync(summaryPath)) return null;
   
   try {
@@ -208,6 +221,7 @@ async function readIntrospectionSummary(sessionId: string): Promise<Introspectio
  * Returns total count and whether there's been a recent burst.
  */
 async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount> {
+  if (!isSafeSessionId(sessionId)) return { total: 0, recentBurst: false };
   const eventsPath = getSessionEventsPath(sessionId);
   if (!existsSync(eventsPath)) return { total: 0, recentBurst: false };
 
@@ -220,13 +234,10 @@ async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount
 }
 
 async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
-  const sessionDir = join(RALPH_SESSIONS_DIR, sessionId);
-  if (existsSync(sessionDir)) {
-    try {
-      await rm(sessionDir, { recursive: true });
-    } catch (e) {
-      console.warn(`[ralph:worker] Failed to cleanup introspection logs: ${e}`);
-    }
+  try {
+    await cleanupSessionArtifacts(sessionId);
+  } catch (e) {
+    console.warn(`[ralph:worker] Failed to cleanup introspection logs: ${e}`);
   }
 }
 
@@ -362,7 +373,13 @@ function buildAgentRunBodyPrefix(params: {
   const lines: string[] = [params.headline];
   lines.push("", `Issue: ${params.task.issue}`, `Repo: ${params.task.repo}`);
   if (params.sessionId) lines.push(`Session: ${params.sessionId}`);
-  if (params.runLogPath) lines.push(`Run log: ${params.runLogPath}`);
+  if (params.runLogPath) lines.push(`Run log: ${redactHomePathForDisplay(params.runLogPath)}`);
+  if (params.sessionId && isSafeSessionId(params.sessionId)) {
+    const eventsPath = getSessionEventsPath(params.sessionId);
+    if (existsSync(eventsPath)) {
+      lines.push(`Trace: ${redactHomePathForDisplay(eventsPath)}`);
+    }
+  }
 
   const sanitizedReason = params.reason ? sanitizeDiagnosticsText(params.reason) : "";
   const reasonSummary = sanitizedReason ? summarizeForNote(sanitizedReason, 800) : "";
@@ -691,11 +708,14 @@ export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuid
 
 export class RepoWorker {
   private session: SessionAdapter;
+  private baseSession: SessionAdapter;
   private queue: QueueAdapter;
   private notify: NotifyAdapter;
   private throttle: ThrottleAdapter;
   private github: GitHubClient;
   private labelEnsurer: ReturnType<typeof createRalphWorkflowLabelsEnsurer>;
+  private contextRecoveryContext: { task: AgentTask; repoPath: string; planPath: string } | null = null;
+  private contextCompactAttempts = new Map<string, number>();
 
   constructor(
     public readonly repo: string,
@@ -708,7 +728,8 @@ export class RepoWorker {
       relationships?: IssueRelationshipProvider;
     }
   ) {
-    this.session = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+    this.baseSession = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+    this.session = this.createContextRecoveryAdapter(this.baseSession);
     this.queue = opts?.queue ?? DEFAULT_QUEUE_ADAPTER;
     this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
     this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
@@ -726,7 +747,7 @@ export class RepoWorker {
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
-  private ignoredBodyDepsLog = new Set<string>();
+  private ignoredBodyDepsLogLimiter = new LogLimiter({ maxKeys: IGNORED_BODY_DEPS_LOG_MAX_KEYS });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -785,6 +806,150 @@ export class RepoWorker {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
     }
     return runLogPath;
+  }
+
+  private createContextRecoveryAdapter(base: SessionAdapter): SessionAdapter {
+    return {
+      runAgent: async (repoPath, agent, message, options, testOverrides) => {
+        const result = await base.runAgent(repoPath, agent, message, options, testOverrides);
+        return this.maybeRecoverFromContextLengthExceeded({
+          repoPath,
+          sessionId: result.sessionId,
+          stepKey: options?.introspection?.stepTitle ?? `agent:${agent}`,
+          result,
+          options,
+        });
+      },
+      continueSession: async (repoPath, sessionId, message, options) => {
+        const result = await base.continueSession(repoPath, sessionId, message, options);
+        return this.maybeRecoverFromContextLengthExceeded({
+          repoPath,
+          sessionId,
+          stepKey: options?.introspection?.stepTitle ?? `session:${sessionId}`,
+          result,
+          options,
+        });
+      },
+      continueCommand: async (repoPath, sessionId, command, args, options) => {
+        const result = await base.continueCommand(repoPath, sessionId, command, args, options);
+        return this.maybeRecoverFromContextLengthExceeded({
+          repoPath,
+          sessionId,
+          stepKey: options?.introspection?.stepTitle ?? `command:${command}`,
+          result,
+          options,
+          command,
+        });
+      },
+      getRalphXdgCacheHome: base.getRalphXdgCacheHome,
+    };
+  }
+
+  private recordContextCompactAttempt(task: AgentTask, stepKey: string): { allowed: boolean; attempt: number } {
+    const key = `${task._path}:${stepKey}`;
+    const next = (this.contextCompactAttempts.get(key) ?? 0) + 1;
+    this.contextCompactAttempts.set(key, next);
+    return { allowed: next <= 1, attempt: next };
+  }
+
+  private buildContextRecoveryOptions(
+    options: RunSessionOptionsBase | undefined,
+    stepTitle: string
+  ): RunSessionOptionsBase {
+    const introspection = {
+      ...(options?.introspection ?? {}),
+      stepTitle,
+    };
+    return { ...(options ?? {}), introspection };
+  }
+
+  private async getWorktreeStatusPorcelain(worktreePath: string): Promise<string> {
+    try {
+      const status = await $`git status --porcelain`.cwd(worktreePath).quiet();
+      return status.stdout.toString().trim();
+    } catch (e: any) {
+      return `ERROR: ${e?.message ?? String(e)}`;
+    }
+  }
+
+  private async maybeRecoverFromContextLengthExceeded(params: {
+    repoPath: string;
+    sessionId?: string;
+    stepKey: string;
+    result: SessionResult;
+    options?: RunSessionOptionsBase;
+    command?: string;
+  }): Promise<SessionResult> {
+    if (params.result.success || params.result.errorCode !== "context_length_exceeded") return params.result;
+    if (params.command === "compact") return params.result;
+
+    const context = this.contextRecoveryContext;
+    if (!context) return params.result;
+
+    const sessionId = params.result.sessionId?.trim() || params.sessionId?.trim();
+    if (!sessionId) return params.result;
+
+    const attempt = this.recordContextCompactAttempt(context.task, params.stepKey);
+    if (!attempt.allowed) return params.result;
+
+    const compactOptions = this.buildContextRecoveryOptions(
+      params.options,
+      `context compact (${params.stepKey})`
+    );
+    const resumeOptions = this.buildContextRecoveryOptions(
+      params.options,
+      `context resume (${params.stepKey})`
+    );
+
+    const gitStatus = await this.getWorktreeStatusPorcelain(params.repoPath);
+    const resumeMessage = buildContextResumePrompt({
+      planPath: context.planPath,
+      gitStatus,
+    });
+
+    const recovered = await retryContextCompactOnce({
+      session: this.baseSession,
+      repoPath: params.repoPath,
+      sessionId,
+      stepKey: params.stepKey,
+      attempt,
+      resumeMessage,
+      compactOptions,
+      resumeOptions,
+      onEvent: (event) => {
+        ralphEventBus.publish(
+          buildRalphEvent({
+            type: "worker.context_compact.triggered",
+            level: "info",
+            repo: this.repo,
+            taskId: context.task._path,
+            sessionId: event.sessionId,
+            data: {
+              stepTitle: event.stepKey,
+              attempt: event.attempt,
+            },
+          })
+        );
+      },
+    });
+
+    return recovered ?? params.result;
+  }
+
+  private async prepareContextRecovery(task: AgentTask, worktreePath: string): Promise<void> {
+    try {
+      await ensureRalphWorktreeArtifacts(worktreePath);
+    } catch (e: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to ensure worktree artifacts at ${worktreePath}: ${e?.message ?? String(e)}`
+      );
+    }
+
+    this.contextRecoveryContext = {
+      task,
+      repoPath: worktreePath,
+      planPath: RALPH_PLAN_RELATIVE_PATH,
+    };
   }
 
   private async getRepoRootStatusPorcelain(): Promise<string> {
@@ -1689,8 +1854,7 @@ ${guidance}`
 
   private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {
     const key = `${issue.repo}#${issue.number}`;
-    if (this.ignoredBodyDepsLog.has(key)) return;
-    this.ignoredBodyDepsLog.add(key);
+    if (!this.ignoredBodyDepsLogLimiter.shouldLog(key, IGNORED_BODY_DEPS_LOG_INTERVAL_MS)) return;
     const reasonLabel = reason === "complete" ? "complete" : "partial";
     console.log(
       `[ralph:worker:${this.repo}] Ignoring ${ignoredCount} body blocker(s) for ${formatIssueRef(issue)} due to ${reasonLabel} ` +
@@ -4272,6 +4436,8 @@ ${guidance}`
       const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
       if (worktreePath) task["worktree-path"] = worktreePath;
 
+      await this.prepareContextRecovery(task, taskRepoPath);
+
       const workerIdChanged = task["worker-id"]?.trim() !== workerId;
       const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
 
@@ -4845,6 +5011,8 @@ ${guidance}`
       }
       const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
       if (worktreePath) task["worktree-path"] = worktreePath;
+
+      await this.prepareContextRecovery(task, taskRepoPath);
 
       ralphEventBus.publish(
         buildRalphEvent({
