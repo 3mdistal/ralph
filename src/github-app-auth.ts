@@ -1,6 +1,7 @@
 import { readFile as readFileFs } from "fs/promises";
 import crypto from "crypto";
 import { getConfig, type RalphConfig } from "./config";
+import { fetchJson, parseLinkHeader } from "./github/http";
 
 export interface GitHubRepoSummary {
   id: number;
@@ -119,25 +120,12 @@ const EXPIRY_SKEW_MS = 60_000;
 let tokenCache: InstallationTokenCache | null = null;
 let inFlightToken: Promise<InstallationTokenCache> | null = null;
 
-async function fetchJson(
-  url: string,
-  init: RequestInit
-): Promise<{ ok: true; data: any; headers: Headers } | { ok: false; status: number; body: string }> {
-  const res = await deps.fetch(url, init);
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    return { ok: false, status: res.status, body: text };
-  }
-
-  const data = await res.json();
-  return { ok: true, data, headers: res.headers };
-}
 
 async function mintInstallationToken(cfg: GitHubAppConfig): Promise<InstallationTokenCache> {
   const jwt = await mintAppJwt({ appId: cfg.appId, privateKeyPath: cfg.privateKeyPath });
 
   const url = `https://api.github.com/app/installations/${cfg.installationId}/access_tokens`;
-  const result = await fetchJson(url, {
+  const result = await fetchJson<{ token?: string; expires_at?: string }>(deps.fetch, url, {
     method: "POST",
     headers: {
       Accept: "application/vnd.github+json",
@@ -202,18 +190,6 @@ export async function ensureGhTokenEnv(): Promise<void> {
   process.env.GITHUB_TOKEN = token;
 }
 
-function parseLinkHeader(link: string | null): Record<string, string> {
-  if (!link) return {};
-
-  const out: Record<string, string> = {};
-  for (const part of link.split(",")) {
-    const match = part.match(/<([^>]+)>\s*;\s*rel="([^"]+)"/);
-    if (!match) continue;
-    const [, url, rel] = match;
-    out[rel] = url;
-  }
-  return out;
-}
 
 export async function listAccessibleRepos(): Promise<GitHubRepoSummary[]> {
   const token = await getInstallationToken();
@@ -222,7 +198,7 @@ export async function listAccessibleRepos(): Promise<GitHubRepoSummary[]> {
   let url: string | null = "https://api.github.com/installation/repositories?per_page=100";
 
   while (url) {
-    const result = await fetchJson(url, {
+    const result = await fetchJson<{ repositories?: any[] }>(deps.fetch, url, {
       method: "GET",
       headers: {
         Accept: "application/vnd.github+json",

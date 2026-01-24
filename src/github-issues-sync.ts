@@ -1,6 +1,7 @@
 import { type RepoConfig } from "./config";
 import { isRepoAllowed } from "./github-app-auth";
 import { resolveGitHubToken } from "./github-auth";
+import { fetchJson, parseLinkHeader } from "./github/http";
 import { shouldLog } from "./logging";
 import {
   getRepoGithubIssueLastSyncAt,
@@ -25,9 +26,6 @@ type IssuePayload = {
   pull_request?: unknown;
 };
 
-type FetchResult<T> =
-  | { ok: true; data: T; headers: Headers }
-  | { ok: false; status: number; body: string; headers: Headers };
 
 type SyncDeps = {
   fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -89,17 +87,6 @@ function computeSince(lastSyncAt: string | null, skewSeconds = DEFAULT_SKEW_SECO
   return new Date(parsed - skewSeconds * 1000).toISOString();
 }
 
-function parseLinkHeader(link: string | null): Record<string, string> {
-  if (!link) return {};
-  const out: Record<string, string> = {};
-  for (const part of link.split(",")) {
-    const match = part.match(/<([^>]+)>\s*;\s*rel=\"([^\"]+)\"/);
-    if (!match) continue;
-    const [, url, rel] = match;
-    out[rel] = url;
-  }
-  return out;
-}
 
 function isPullRequest(issue: IssuePayload): boolean {
   return Boolean(issue.pull_request);
@@ -124,20 +111,6 @@ function hasRalphLabel(labels: string[]): boolean {
   return labels.some((label) => label.toLowerCase().startsWith("ralph:"));
 }
 
-async function fetchJson<T>(
-  fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>,
-  url: string,
-  init: RequestInit
-): Promise<FetchResult<T>> {
-  const res = await fetchImpl(url, init);
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    return { ok: false, status: res.status, body: text, headers: res.headers };
-  }
-
-  const data = (await res.json()) as T;
-  return { ok: true, data, headers: res.headers };
-}
 
 function parseIsoMs(value?: string): number | null {
   if (!value) return null;
@@ -207,7 +180,7 @@ async function fetchIssuesSince(params: {
       };
     }
 
-    const rows = Array.isArray(result.data) ? result.data : [];
+    const rows: IssuePayload[] = Array.isArray(result.data) ? result.data : [];
     fetched += rows.length;
     const nonPrRows = rows.filter((row) => !isPullRequest(row));
     issues.push(...nonPrRows);
