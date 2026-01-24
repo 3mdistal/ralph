@@ -72,10 +72,12 @@ import {
   upsertIdempotencyKey,
   recordIssueSnapshot,
   recordPrSnapshot,
+  listOpenPrCandidatesForIssue,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
   type PrState,
 } from "./state";
+import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -83,6 +85,12 @@ import {
   stripHeadsRef,
   type GitWorktreeEntry,
 } from "./git-worktree";
+import {
+  normalizePrUrl,
+  searchOpenPullRequestsByIssueLink,
+  viewPullRequest,
+  type PullRequestSearchResult,
+} from "./github/pr";
 
 type SessionAdapter = {
   runAgent: typeof runAgent;
@@ -109,6 +117,13 @@ type PullRequestMergeState = {
   headRepoFullName: string;
   baseRefName: string;
   labels: string[];
+};
+
+type ResolvedIssuePr = {
+  selectedUrl: string | null;
+  duplicates: string[];
+  source: "db" | "gh-search" | null;
+  diagnostics: string[];
 };
 
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
@@ -596,6 +611,7 @@ export class RepoWorker {
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
   private ignoredBodyDepsLog = new Set<string>();
+  private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -771,6 +787,151 @@ export class RepoWorker {
     if (nextPrUrl === currentPrUrl) return currentPrUrl;
     this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl: nextPrUrl, state: PR_STATE_OPEN });
     return nextPrUrl;
+  }
+
+  private getIssuePrResolution(issueNumber: string): Promise<ResolvedIssuePr> {
+    const cacheKey = `${this.repo}#${issueNumber}`;
+    const cached = this.prResolutionCache.get(cacheKey);
+    if (cached) return cached;
+    const promise = this.findExistingOpenPrForIssue(issueNumber).catch((error) => {
+      this.prResolutionCache.delete(cacheKey);
+      throw error;
+    });
+    this.prResolutionCache.set(cacheKey, promise);
+    return promise;
+  }
+
+  private async findExistingOpenPrForIssue(issueNumber: string): Promise<ResolvedIssuePr> {
+    const diagnostics: string[] = [];
+    const parsedIssue = Number(issueNumber);
+    if (!Number.isFinite(parsedIssue)) {
+      diagnostics.push("- Invalid issue number; skipping PR reuse");
+      return { selectedUrl: null, duplicates: [], source: null, diagnostics };
+    }
+
+    await ensureGhTokenEnv();
+
+    const dbCandidates = await this.resolveDbPrCandidates(parsedIssue, diagnostics);
+    if (dbCandidates.length > 0) {
+      const resolved = selectCanonicalPr(dbCandidates);
+      const result = this.buildResolvedIssuePr(issueNumber, resolved, "db", diagnostics);
+      this.recordResolvedPrSnapshots(issueNumber, resolved);
+      return result;
+    }
+
+    const searchCandidates = await this.resolveSearchPrCandidates(issueNumber, diagnostics);
+    if (searchCandidates.length > 0) {
+      const resolved = selectCanonicalPr(searchCandidates);
+      const result = this.buildResolvedIssuePr(issueNumber, resolved, "gh-search", diagnostics);
+      this.recordResolvedPrSnapshots(issueNumber, resolved);
+      return result;
+    }
+
+    return { selectedUrl: null, duplicates: [], source: null, diagnostics };
+  }
+
+  private buildResolvedIssuePr(
+    issueNumber: string,
+    resolved: { selected: ResolvedPrCandidate | null; duplicates: ResolvedPrCandidate[] },
+    source: "db" | "gh-search",
+    diagnostics: string[]
+  ): ResolvedIssuePr {
+    if (resolved.selected) {
+      diagnostics.push(`- Reusing PR: ${resolved.selected.url} (source=${source})`);
+      if (resolved.duplicates.length > 0) {
+        diagnostics.push(`- Duplicate PRs detected: ${resolved.duplicates.map((dup) => dup.url).join(", ")}`);
+      }
+    }
+
+    return {
+      selectedUrl: resolved.selected?.url ?? null,
+      duplicates: resolved.duplicates.map((dup) => dup.url),
+      source,
+      diagnostics,
+    };
+  }
+
+  private recordResolvedPrSnapshots(
+    issueNumber: string,
+    resolved: { selected: ResolvedPrCandidate | null; duplicates: ResolvedPrCandidate[] }
+  ): void {
+    const issueRef = `${this.repo}#${issueNumber}`;
+    if (resolved.selected) {
+      this.recordPrSnapshotBestEffort({ issue: issueRef, prUrl: resolved.selected.url, state: PR_STATE_OPEN });
+    }
+    for (const duplicate of resolved.duplicates) {
+      this.recordPrSnapshotBestEffort({ issue: issueRef, prUrl: duplicate.url, state: PR_STATE_OPEN });
+    }
+  }
+
+  private async resolveDbPrCandidates(issueNumber: number, diagnostics: string[]): Promise<ResolvedPrCandidate[]> {
+    const rows = listOpenPrCandidatesForIssue(this.repo, issueNumber);
+    if (rows.length === 0) return [];
+    diagnostics.push(`- DB PR candidates: ${rows.length}`);
+
+    const results: ResolvedPrCandidate[] = [];
+    const seen = new Set<string>();
+
+    for (const row of rows) {
+      const normalized = normalizePrUrl(row.url);
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+
+      try {
+        const view = await viewPullRequest(this.repo, row.url);
+        if (!view) continue;
+        const state = String(view.state ?? "").toUpperCase();
+        if (state !== "OPEN") continue;
+        results.push({
+          url: view.url,
+          source: "db",
+          ghCreatedAt: view.createdAt,
+          ghUpdatedAt: view.updatedAt,
+          dbUpdatedAt: row.updatedAt,
+        });
+        if (view.isDraft) {
+          diagnostics.push(`- Existing PR is draft: ${view.url}`);
+        }
+      } catch (error: any) {
+        diagnostics.push(`- Failed to validate PR ${row.url}: ${this.formatGhError(error)}`);
+      }
+    }
+
+    return results;
+  }
+
+  private async resolveSearchPrCandidates(issueNumber: string, diagnostics: string[]): Promise<ResolvedPrCandidate[]> {
+    let searchResults: PullRequestSearchResult[] = [];
+    try {
+      searchResults = await searchOpenPullRequestsByIssueLink(this.repo, issueNumber);
+    } catch (error: any) {
+      diagnostics.push(`- GitHub PR search failed: ${this.formatGhError(error)}`);
+      return [];
+    }
+
+    if (searchResults.length === 0) return [];
+    diagnostics.push(`- GitHub PR search candidates: ${searchResults.length}`);
+
+    const results: ResolvedPrCandidate[] = [];
+    const seen = new Set<string>();
+    for (const result of searchResults) {
+      const normalized = normalizePrUrl(result.url);
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      results.push({
+        url: result.url,
+        source: "gh-search",
+        ghCreatedAt: result.createdAt,
+        ghUpdatedAt: result.updatedAt,
+      });
+    }
+
+    return results;
+  }
+
+  private isSamePrUrl(left: string | null | undefined, right: string | null | undefined): boolean {
+    if (!left || !right) return false;
+    return normalizePrUrl(left) === normalizePrUrl(right);
   }
 
   private async applyMidpointLabelsBestEffort(params: {
@@ -1756,6 +1917,14 @@ ${guidance}`
     if (!issueNumber) {
       diagnostics.push("- No issue number detected; skipping auto PR recovery");
       return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const existingPr = await this.getIssuePrResolution(issueNumber);
+    if (existingPr.diagnostics.length > 0) {
+      diagnostics.push(...existingPr.diagnostics);
+    }
+    if (existingPr.selectedUrl) {
+      return { prUrl: existingPr.selectedUrl, diagnostics: diagnostics.join("\n") };
     }
 
     const entries = await this.getGitWorktrees();
@@ -3415,13 +3584,35 @@ ${guidance}`
         `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
 
       const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
+      const existingPr = await this.getIssuePrResolution(issueNumber);
+      const finalResumeMessage = existingPr.selectedUrl
+        ? [
+            `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
+            "Do NOT create a new PR.",
+            "Continue work on the existing PR branch and push updates as needed.",
+            "Only paste a PR URL if it changes.",
+          ].join(" ")
+        : resumeMessage;
+
+      if (existingPr.selectedUrl) {
+        console.log(
+          `[ralph:worker:${this.repo}] Reusing existing PR for resume: ${existingPr.selectedUrl} (source=${
+            existingPr.source ?? "unknown"
+          })`
+        );
+        if (existingPr.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
+          );
+        }
+      }
 
       const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
       if (pausedBefore) return pausedBefore;
 
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
-      let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, resumeMessage, {
+      let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
         repo: this.repo,
         cacheKey,
         runLogPath: resumeRunLogPath,
@@ -3587,6 +3778,23 @@ ${guidance}`
           continue;
         }
 
+        const canonical = await this.getIssuePrResolution(issueNumber);
+        if (canonical.selectedUrl) {
+          console.log(
+            `[ralph:worker:${this.repo}] Reusing existing PR during resume: ${canonical.selectedUrl} (source=${
+              canonical.source ?? "unknown"
+            })`
+          );
+          if (canonical.duplicates.length > 0) {
+            console.log(
+              `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
+            );
+          }
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, canonical.diagnostics.join("\n")].filter(Boolean).join("\n\n");
+          prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
+          break;
+        }
+
         continueAttempts++;
         console.log(
           `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
@@ -3685,6 +3893,19 @@ ${guidance}`
           sessionId: buildResult.sessionId,
           escalationReason: reason,
         };
+      }
+
+      const canonical = await this.getIssuePrResolution(issueNumber);
+      if (canonical.selectedUrl && !this.isSamePrUrl(prUrl, canonical.selectedUrl)) {
+        console.log(
+          `[ralph:worker:${this.repo}] Detected duplicate PR; using existing ${canonical.selectedUrl} instead of ${prUrl}`
+        );
+        if (canonical.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
+          );
+        }
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
       }
 
       const pausedMerge = await this.pauseIfHardThrottled(task, "resume merge", buildResult.sessionId || existingSessionId);
@@ -4142,7 +4363,28 @@ ${guidance}`
       // 6. Proceed with build
       console.log(`[ralph:worker:${this.repo}] Proceeding with build...`);
       const botBranch = getRepoBotBranch(this.repo);
-      const proceedMessage = `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
+      const existingPr = await this.getIssuePrResolution(issueNumber);
+      const proceedMessage = existingPr.selectedUrl
+        ? [
+            `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
+            "Do NOT create a new PR.",
+            "Fix any failing checks and push updates to the existing PR branch.",
+            "Only paste a PR URL if it changes.",
+          ].join(" ")
+        : `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
+
+      if (existingPr.selectedUrl) {
+        console.log(
+          `[ralph:worker:${this.repo}] Reusing existing PR for build: ${existingPr.selectedUrl} (source=${
+            existingPr.source ?? "unknown"
+          })`
+        );
+        if (existingPr.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
+          );
+        }
+      }
 
       const pausedBuild = await this.pauseIfHardThrottled(task, "build", planResult.sessionId);
       if (pausedBuild) return pausedBuild;
@@ -4303,6 +4545,23 @@ ${guidance}`
           continue;
         }
 
+        const canonical = await this.getIssuePrResolution(issueNumber);
+        if (canonical.selectedUrl) {
+          console.log(
+            `[ralph:worker:${this.repo}] Reusing existing PR during build: ${canonical.selectedUrl} (source=${
+              canonical.source ?? "unknown"
+            })`
+          );
+          if (canonical.duplicates.length > 0) {
+            console.log(
+              `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
+            );
+          }
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, canonical.diagnostics.join("\n")].filter(Boolean).join("\n\n");
+          prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
+          break;
+        }
+
         continueAttempts++;
         console.log(
           `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
@@ -4398,6 +4657,19 @@ ${guidance}`
           sessionId: buildResult.sessionId,
           escalationReason: reason,
         };
+      }
+
+      const canonical = await this.getIssuePrResolution(issueNumber);
+      if (canonical.selectedUrl && !this.isSamePrUrl(prUrl, canonical.selectedUrl)) {
+        console.log(
+          `[ralph:worker:${this.repo}] Detected duplicate PR; using existing ${canonical.selectedUrl} instead of ${prUrl}`
+        );
+        if (canonical.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
+          );
+        }
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
       }
 
       const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);

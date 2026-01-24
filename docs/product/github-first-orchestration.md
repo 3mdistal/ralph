@@ -118,6 +118,12 @@ Default-branch unknown fallback:
   `ralph:in-bot` label only when the configured bot branch name is clearly a bot branch (currently `bot/integration`
   or any `bot/*` branch). In all other cases it avoids applying `ralph:in-bot`.
 
+## Duplicate PR handling
+
+- When multiple open PRs are detected for the same issue, Ralph selects a canonical PR deterministically and continues.
+- Ralph does not auto-close or comment on duplicates by default.
+- Duplicates are surfaced via logs/run notes for operator awareness.
+
 ## Escalation protocol
 
 - Ralph removes `ralph:in-progress` and `ralph:queued`, then adds `ralph:escalated`.
