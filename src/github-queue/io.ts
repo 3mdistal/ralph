@@ -366,7 +366,18 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             try {
               const relationships = new GitHubRelationshipProvider(issueRef.repo);
               const snapshot = await relationships.getSnapshot(issueRef);
-              const decision = computeBlockedDecision(snapshot.signals);
+              if (!snapshot.coverage.githubDepsComplete || !snapshot.coverage.githubSubIssuesComplete) {
+                return {
+                  claimed: false,
+                  task: opts.task,
+                  reason: "Dependency coverage unknown; treating issue as blocked",
+                };
+              }
+              const ignoreBodyDeps = snapshot.coverage.githubDepsComplete && snapshot.coverage.githubSubIssuesComplete;
+              const signals = ignoreBodyDeps
+                ? snapshot.signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
+                : snapshot.signals;
+              const decision = computeBlockedDecision(signals);
               if (decision.blocked || decision.confidence === "unknown") {
                 const reason =
                   decision.blocked && decision.reasons.length > 0
