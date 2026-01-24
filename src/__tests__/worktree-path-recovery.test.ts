@@ -9,7 +9,7 @@ const queueAdapter = {
   updateTaskStatus: updateTaskStatusMock,
 };
 
-const repoKey = "3mdistal - ralph";
+const repoSlug = "ralph";
 
 function createMockTask(overrides: Record<string, unknown> = {}) {
   return {
@@ -37,7 +37,7 @@ describe("worktree-path recovery", () => {
     (worker as any).ensureGitWorktree = mock(async () => {});
     (worker as any).safeRemoveWorktree = mock(async () => {});
 
-    const stalePath = join(getRalphWorktreesDir(), repoKey, "slot-0", "277", "stale-worktree");
+    const stalePath = join(getRalphWorktreesDir(), repoSlug, "slot-0", "277", "stale-worktree");
     const task = createMockTask({
       status: "starting",
       "worktree-path": stalePath,
@@ -58,7 +58,7 @@ describe("worktree-path recovery", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { queue: queueAdapter });
     (worker as any).safeRemoveWorktree = mock(async () => {});
 
-    const stalePath = join(getRalphWorktreesDir(), repoKey, "slot-0", "277", "missing-worktree");
+    const stalePath = join(getRalphWorktreesDir(), repoSlug, "slot-0", "277", "missing-worktree");
     const task = createMockTask({
       status: "in-progress",
       "session-id": "ses_123",
