@@ -106,6 +106,7 @@ type PullRequestMergeStateStatus =
   | "DIRTY"
   | "DRAFT"
   | "HAS_HOOKS"
+  | "UNSTABLE"
   | "UNKNOWN";
 
 type PullRequestMergeState = {
@@ -263,6 +264,42 @@ function summarizeBlockedReason(text: string): string {
   if (!trimmed) return "";
   if (trimmed.length <= BLOCKED_REASON_MAX_LEN) return trimmed;
   return trimmed.slice(0, BLOCKED_REASON_MAX_LEN).trimEnd() + "…";
+}
+
+function normalizeMergeStateStatus(value: unknown): PullRequestMergeStateStatus | null {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return null;
+  const upper = trimmed.toUpperCase();
+  switch (upper) {
+    case "BEHIND":
+    case "BLOCKED":
+    case "CLEAN":
+    case "DIRTY":
+    case "DRAFT":
+    case "HAS_HOOKS":
+    case "UNSTABLE":
+    case "UNKNOWN":
+      return upper as PullRequestMergeStateStatus;
+    default:
+      return "UNKNOWN";
+  }
+}
+
+function formatMergeConflictMessage(params: {
+  prUrl: string;
+  baseRefName?: string | null;
+}): { blockedReasonShort: string; notifyBody: string } {
+  const baseRefName = params.baseRefName?.trim() || "";
+  const blockedReasonShort = `PR has merge conflicts; CI will not start until conflicts are resolved. PR: ${params.prUrl}`;
+  const notifyBody = [
+    "PR has merge conflicts; GitHub will not start CI until conflicts are resolved.",
+    "Resolve conflicts by rebasing/merging the base branch into the PR branch, then push updates.",
+    `PR: ${params.prUrl}`,
+    baseRefName ? `Base: ${baseRefName}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return { blockedReasonShort, notifyBody };
 }
 
 function summarizeBlockedDetails(text: string): string {
@@ -2193,7 +2230,12 @@ ${guidance}`
 
   private async getPullRequestChecks(
     prUrl: string
-  ): Promise<{ headSha: string; mergeStateStatus: string | null; baseRefName: string; checks: PrCheck[] }> {
+  ): Promise<{
+    headSha: string;
+    mergeStateStatus: PullRequestMergeStateStatus | null;
+    baseRefName: string;
+    checks: PrCheck[];
+  }> {
     const prNumber = extractPullRequestNumber(prUrl);
     if (!prNumber) {
       throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
@@ -2225,7 +2267,7 @@ ${guidance}`
       throw new Error(`Failed to read pull request head SHA for ${prUrl}`);
     }
 
-    const mergeStateStatus = String(pr?.mergeStateStatus ?? "").trim() || null;
+    const mergeStateStatus = normalizeMergeStateStatus(pr?.mergeStateStatus);
     const baseRefName = String(pr?.baseRefName ?? "").trim();
     if (!baseRefName) {
       throw new Error(`Failed to read pull request base branch for ${prUrl}`);
@@ -2327,19 +2369,30 @@ ${guidance}`
     opts: { timeoutMs: number; pollIntervalMs: number }
   ): Promise<{
     headSha: string;
-    mergeStateStatus: string | null;
+    mergeStateStatus: PullRequestMergeStateStatus | null;
     baseRefName: string;
     summary: RequiredChecksSummary;
     checks: PrCheck[];
     timedOut: boolean;
+    stopReason?: "merge-conflict";
   }> {
     const startedAt = Date.now();
-    let last: { headSha: string; mergeStateStatus: string | null; baseRefName: string; summary: RequiredChecksSummary; checks: PrCheck[] } | null = null;
+    let last: {
+      headSha: string;
+      mergeStateStatus: PullRequestMergeStateStatus | null;
+      baseRefName: string;
+      summary: RequiredChecksSummary;
+      checks: PrCheck[];
+    } | null = null;
 
     while (Date.now() - startedAt < opts.timeoutMs) {
       const { headSha, mergeStateStatus, baseRefName, checks } = await this.getPullRequestChecks(prUrl);
       const summary = summarizeRequiredChecks(checks, requiredChecks);
       last = { headSha, mergeStateStatus, baseRefName, summary, checks };
+
+      if (mergeStateStatus === "DIRTY") {
+        return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false, stopReason: "merge-conflict" };
+      }
 
       if (summary.status === "success" || summary.status === "failure") {
         return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
@@ -2686,7 +2739,7 @@ ${guidance}`
     return {
       number: Number(pr?.number ?? prNumber),
       url: String(pr?.url ?? prUrl),
-      mergeStateStatus: (pr?.mergeStateStatus ?? null) as PullRequestMergeStateStatus | null,
+      mergeStateStatus: normalizeMergeStateStatus(pr?.mergeStateStatus),
       isCrossRepository: Boolean(pr?.isCrossRepository),
       headRefName: String(pr?.headRefName ?? ""),
       headRepoFullName: String(pr?.headRepository?.nameWithOwner ?? ""),
@@ -3014,11 +3067,19 @@ ${guidance}`
           const rateLimited = this.shouldRateLimitAutoUpdate(prState, minMinutes);
 
           if (prState.mergeStateStatus === "DIRTY") {
+            const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+              prUrl,
+              baseRefName: prState.baseRefName,
+            });
             const reason = `PR has merge conflicts; refusing auto-update ${prUrl}`;
             console.warn(`[ralph:worker:${this.repo}] ${reason}`);
             this.recordAutoUpdateFailure(prState, minMinutes);
-            await this.markTaskBlocked(params.task, "merge-conflict", { reason, details: reason, sessionId });
-            await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+            await this.markTaskBlocked(params.task, "merge-conflict", {
+              reason: blockedReasonShort,
+              details: notifyBody,
+              sessionId,
+            });
+            await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
 
             return {
               ok: false,
@@ -3027,7 +3088,7 @@ ${guidance}`
                 repo: this.repo,
                 outcome: "failed",
                 sessionId,
-                escalationReason: reason,
+                escalationReason: blockedReasonShort,
               },
             };
           }
@@ -3082,6 +3143,27 @@ ${guidance}`
       });
 
       lastSummary = checkResult.summary;
+
+      if (checkResult.stopReason === "merge-conflict") {
+        const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+          prUrl,
+          baseRefName: checkResult.baseRefName,
+        });
+        console.warn(`[ralph:worker:${this.repo}] ${blockedReasonShort}`);
+        await this.markTaskBlocked(params.task, "merge-conflict", { reason: blockedReasonShort });
+        await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
+
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: blockedReasonShort,
+          },
+        };
+      }
 
       const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
       if (throttled) return { ok: false, run: throttled };
