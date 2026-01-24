@@ -54,6 +54,7 @@ import {
   computeRalphLabelSync,
   RALPH_LABEL_BLOCKED,
 } from "./github-labels";
+import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
@@ -765,24 +766,17 @@ export class RepoWorker {
   }
 
   private async addIssueLabel(issue: IssueRef, label: string): Promise<void> {
-    const { owner, name } = splitRepoFullName(issue.repo);
-    await this.githubApiRequest(`/repos/${owner}/${name}/issues/${issue.number}/labels`, {
-      method: "POST",
-      body: { labels: [label] },
-    });
+    await addIssueLabelIo({ github: this.github, repo: issue.repo, issueNumber: issue.number, label });
   }
 
   private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
-    const { owner, name } = splitRepoFullName(issue.repo);
-    try {
-      await this.githubApiRequest(`/repos/${owner}/${name}/issues/${issue.number}/labels/${encodeURIComponent(label)}`, {
-        method: "DELETE",
-        allowNotFound: true,
-      });
-    } catch (error) {
-      if (error instanceof GitHubApiError && error.status === 404) return;
-      throw error;
-    }
+    await removeIssueLabelIo({
+      github: this.github,
+      repo: issue.repo,
+      issueNumber: issue.number,
+      label,
+      allowNotFound: true,
+    });
   }
 
   private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {

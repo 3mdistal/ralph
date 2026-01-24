@@ -62,6 +62,10 @@ function safeJsonParse<T>(text: string): T | null {
   }
 }
 
+function isIssueLabelsCollectionPath(path: string): boolean {
+  return /^\/repos\/[^/]+\/[^/]+\/issues\/\d+\/labels(?:\?.*)?$/.test(path);
+}
+
 export class GitHubClient {
   private readonly repo: string;
   private readonly userAgent: string;
@@ -91,8 +95,12 @@ export class GitHubClient {
   async request<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T>> {
     const token = this.tokenOverride ?? (await this.getToken());
     const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
+    const method = (opts.method ?? "GET").toUpperCase();
+    if (method === "PUT" && isIssueLabelsCollectionPath(path)) {
+      throw new Error(`Refusing to replace issue labels via PUT ${path}`);
+    }
     const init: RequestInit = {
-      method: opts.method ?? "GET",
+      method,
       headers: this.buildHeaders(opts, token),
     };
 

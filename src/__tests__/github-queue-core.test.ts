@@ -29,6 +29,11 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:blocked"], remove: ["ralph:in-progress"] });
   });
 
+  test("statusToRalphLabelDelta preserves non-ralph labels when blocked", () => {
+    const delta = statusToRalphLabelDelta("blocked", ["bug", "ralph:queued", "p1-high", "ralph:in-progress"]);
+    expect(delta).toEqual({ add: ["ralph:blocked"], remove: ["ralph:in-progress"] });
+  });
+
   test("statusToRalphLabelDelta still removes queued when escalated", () => {
     const delta = statusToRalphLabelDelta("escalated", ["ralph:queued"]);
     expect(delta).toEqual({ add: ["ralph:escalated"], remove: ["ralph:queued"] });

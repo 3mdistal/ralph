@@ -7,6 +7,7 @@ import {
   RALPH_RESOLVED_TEXT,
 } from "./escalation-constants";
 import { GitHubClient, splitRepoFullName } from "./client";
+import { addIssueLabel, removeIssueLabel } from "./issue-label-io";
 
 export type EscalationWritebackContext = {
   repo: string;
@@ -222,19 +223,12 @@ async function createIssueComment(params: { github: GitHubClient; repo: string; 
   });
 }
 
-async function addIssueLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  const { owner, name } = splitRepoFullName(params.repo);
-  await params.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/labels`, {
-    method: "POST",
-    body: { labels: [params.label] },
-  });
+async function addEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
+  await addIssueLabel(params);
 }
 
-async function removeIssueLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  const { owner, name } = splitRepoFullName(params.repo);
-  await params.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/labels/${encodeURIComponent(params.label)}`,
-    { method: "DELETE", allowNotFound: true }
-  );
+async function removeEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
+  await removeIssueLabel({ ...params, allowNotFound: true });
 }
 
 export async function writeEscalationToGitHub(
@@ -260,7 +254,7 @@ export async function writeEscalationToGitHub(
 
   for (const label of plan.removeLabels) {
     try {
-      await removeIssueLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
+      await removeEscalationLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
     } catch (error: any) {
       log(`${prefix} Failed to remove label '${label}' on #${ctx.issueNumber}: ${error?.message ?? String(error)}`);
     }
@@ -268,7 +262,7 @@ export async function writeEscalationToGitHub(
 
   for (const label of plan.addLabels) {
     try {
-      await addIssueLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
+      await addEscalationLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
     } catch (error: any) {
       log(`${prefix} Failed to add label '${label}' on #${ctx.issueNumber}: ${error?.message ?? String(error)}`);
     }

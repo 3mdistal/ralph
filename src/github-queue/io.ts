@@ -1,9 +1,15 @@
 import { getConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
-import { GitHubApiError, GitHubClient, splitRepoFullName } from "../github/client";
+import { GitHubClient, splitRepoFullName } from "../github/client";
 import { parseIssueRef, type IssueRef } from "../github/issue-blocking-core";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
+import {
+  addIssueLabel as addIssueLabelIo,
+  executeIssueLabelOps,
+  planIssueLabelOps,
+  removeIssueLabel as removeIssueLabelIo,
+} from "../github/issue-label-io";
 import {
   getIssueLabels,
   getIssueSnapshotByNumber,
@@ -42,32 +48,13 @@ async function createGitHubClient(repo: string): Promise<GitHubClient> {
 }
 
 async function addIssueLabel(repo: string, issueNumber: number, label: string): Promise<void> {
-  const { owner, name } = splitRepoFullName(repo);
   const client = await createGitHubClient(repo);
-  await client.request(`/repos/${owner}/${name}/issues/${issueNumber}/labels`, {
-    method: "POST",
-    body: { labels: [label] },
-  });
+  await addIssueLabelIo({ github: client, repo, issueNumber, label });
 }
 
 async function removeIssueLabel(repo: string, issueNumber: number, label: string): Promise<{ removed: boolean }> {
-  const { owner, name } = splitRepoFullName(repo);
   const client = await createGitHubClient(repo);
-  try {
-    const response = await client.request(
-      `/repos/${owner}/${name}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`,
-      {
-        method: "DELETE",
-        allowNotFound: true,
-      }
-    );
-    return { removed: response.status !== 404 };
-  } catch (error) {
-    if (error instanceof GitHubApiError && error.status === 404) {
-      return { removed: false };
-    }
-    throw error;
-  }
+  return await removeIssueLabelIo({ github: client, repo, issueNumber, label, allowNotFound: true });
 }
 
 async function listIssueLabelsFromGitHub(repo: string, issueNumber: number): Promise<string[]> {
@@ -120,43 +107,18 @@ async function applyLabelOps(params: {
   steps: LabelOp[];
   logLabel: string;
 }): Promise<{ add: string[]; remove: string[]; ok: boolean }> {
-  const added: string[] = [];
-  const removed: string[] = [];
-  const applied: LabelOp[] = [];
-
-  for (const step of params.steps) {
-    try {
-      if (step.action === "add") {
-        await addIssueLabel(params.repo, params.issueNumber, step.label);
-        added.push(step.label);
-        applied.push(step);
-      } else {
-        const result = await removeIssueLabel(params.repo, params.issueNumber, step.label);
-        if (result.removed) {
-          removed.push(step.label);
-          applied.push(step);
-        }
-      }
-    } catch (error: any) {
-      console.warn(
-        `[ralph:queue:github] Failed to ${step.action} ${step.label} for ${params.logLabel}: ${error?.message ?? String(error)}`
-      );
-      for (const rollback of [...applied].reverse()) {
-        try {
-          if (rollback.action === "add") {
-            await removeIssueLabel(params.repo, params.issueNumber, rollback.label);
-          } else {
-            await addIssueLabel(params.repo, params.issueNumber, rollback.label);
-          }
-        } catch {
-          // best-effort rollback
-        }
-      }
-      return { add: added, remove: removed, ok: false };
-    }
-  }
-
-  return { add: added, remove: removed, ok: true };
+  const client = await createGitHubClient(params.repo);
+  const add = params.steps.filter((step) => step.action === "add").map((step) => step.label);
+  const remove = params.steps.filter((step) => step.action === "remove").map((step) => step.label);
+  const ops = planIssueLabelOps({ add, remove });
+  return await executeIssueLabelOps({
+    github: client,
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    ops,
+    log: console.warn,
+    logLabel: params.logLabel,
+  });
 }
 
 function normalizeOptionalString(value: unknown): string | undefined {
