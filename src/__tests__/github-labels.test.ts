@@ -32,7 +32,7 @@ describe("computeRalphLabelSync", () => {
         currentName: "ralph:queued",
         patch: {
           color: "0366D6",
-          description: "Ready to be claimed by Ralph",
+          description: "In queue; claimable when not blocked or escalated",
         },
       },
     ]);
@@ -40,7 +40,7 @@ describe("computeRalphLabelSync", () => {
 
   test("updates color without changing matching descriptions", () => {
     const existing = [
-      { name: "ralph:queued", color: "0366D6", description: "Ready to be claimed by Ralph" },
+      { name: "ralph:queued", color: "0366D6", description: "In queue; claimable when not blocked or escalated" },
       { name: "ralph:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:blocked", color: "000000", description: "Blocked by dependencies" },
@@ -67,7 +67,7 @@ describe("computeRalphLabelSync", () => {
     expect(toUpdate).toEqual([
       {
         currentName: "Ralph:Queued",
-        patch: { description: "Ready to be claimed by Ralph" },
+        patch: { description: "In queue; claimable when not blocked or escalated" },
       },
     ]);
   });
@@ -85,7 +85,7 @@ describe("computeRalphLabelSync", () => {
   test("prefers the canonical-cased label when duplicates exist", () => {
     const existing = [
       { name: "Ralph:Queued", color: "0366D6", description: "Queued" },
-      { name: "ralph:queued", color: "0366D6", description: "Ready to be claimed by Ralph" },
+      { name: "ralph:queued", color: "0366D6", description: "In queue; claimable when not blocked or escalated" },
       { name: "ralph:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:blocked", color: "D73A4A", description: "Blocked by dependencies" },
@@ -107,7 +107,7 @@ describe("computeRalphLabelSync", () => {
     expect(toUpdate).toEqual([
       {
         currentName: "ralph:queued",
-        patch: { description: "Ready to be claimed by Ralph" },
+        patch: { description: "In queue; claimable when not blocked or escalated" },
       },
     ]);
   });
