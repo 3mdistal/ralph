@@ -113,21 +113,6 @@ async function listSessionMessageFiles(sessionDir: string): Promise<string[]> {
     .map((entry) => join(sessionDir, entry.name));
 }
 
-export function sumOpencodeSessionTokens(
-  messages: Iterable<OpencodeMessage>,
-  opts?: { providerID?: string; includeCache?: boolean }
-): OpencodeSessionTokenTotals {
-  const includeCache = opts?.includeCache === true;
-  const providerID = normalizeProviderID(opts?.providerID);
-  const acc = createTokenAccumulator();
-
-  for (const msg of messages) {
-    applyMessageTokens(acc, msg, { providerID, includeCache });
-  }
-
-  return finalizeTokenTotals(acc, includeCache);
-}
-
 export async function readOpencodeSessionTokenTotals(opts: {
   sessionId: string;
   messagesRootDir?: string;
