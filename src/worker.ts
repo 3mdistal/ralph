@@ -31,6 +31,7 @@ import {
   resolveOpencodeProfile,
 } from "./config";
 import { normalizeGitRef } from "./midpoint-labels";
+import { computeHeadBranchDeletionDecision } from "./pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runAgent, type SessionResult } from "./session";
@@ -50,20 +51,14 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import {
-  computeRalphLabelSync,
-  RALPH_LABEL_BLOCKED,
-} from "./github-labels";
+import { RALPH_LABEL_BLOCKED } from "./github-labels";
+import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
-import {
-  computeBlockedDecision,
-  formatIssueRef,
-  parseIssueRef,
-  type IssueRef,
-  type RelationshipSignal,
-} from "./github/issue-blocking-core";
+import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
+import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
 import {
   GitHubRelationshipProvider,
   type IssueRelationshipProvider,
@@ -77,10 +72,12 @@ import {
   upsertIdempotencyKey,
   recordIssueSnapshot,
   recordPrSnapshot,
+  listOpenPrCandidatesForIssue,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
   type PrState,
 } from "./state";
+import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -88,6 +85,12 @@ import {
   stripHeadsRef,
   type GitWorktreeEntry,
 } from "./git-worktree";
+import {
+  normalizePrUrl,
+  searchOpenPullRequestsByIssueLink,
+  viewPullRequest,
+  type PullRequestSearchResult,
+} from "./github/pr";
 
 type SessionAdapter = {
   runAgent: typeof runAgent;
@@ -114,6 +117,13 @@ type PullRequestMergeState = {
   headRepoFullName: string;
   baseRefName: string;
   labels: string[];
+};
+
+type ResolvedIssuePr = {
+  selectedUrl: string | null;
+  duplicates: string[];
+  source: "db" | "gh-search" | null;
+  diagnostics: string[];
 };
 
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
@@ -336,6 +346,25 @@ type RepoDetails = {
   default_branch?: string | null;
 };
 
+type PullRequestDetails = {
+  number?: number | null;
+  url?: string | null;
+  merged?: boolean | null;
+  merged_at?: string | null;
+  base?: { ref?: string | null } | null;
+  head?: { ref?: string | null; sha?: string | null; repo?: { full_name?: string | null } | null } | null;
+};
+
+type PullRequestDetailsNormalized = {
+  number: number;
+  url: string;
+  merged: boolean;
+  baseRefName: string;
+  headRefName: string;
+  headRepoFullName: string;
+  headSha: string;
+};
+
 type GitRef = {
   object?: { sha?: string | null } | null;
 };
@@ -550,6 +579,7 @@ export class RepoWorker {
   private notify: NotifyAdapter;
   private throttle: ThrottleAdapter;
   private github: GitHubClient;
+  private labelEnsurer: ReturnType<typeof createRalphWorkflowLabelsEnsurer>;
 
   constructor(
     public readonly repo: string,
@@ -568,9 +598,11 @@ export class RepoWorker {
     this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
     this.github = new GitHubClient(this.repo);
     this.relationships = opts?.relationships ?? new GitHubRelationshipProvider(this.repo, this.github);
+    this.labelEnsurer = createRalphWorkflowLabelsEnsurer({
+      githubFactory: () => this.github,
+    });
   }
 
-  private ensureLabelsPromise: Promise<void> | null = null;
   private ensureBranchProtectionPromise: Promise<void> | null = null;
   private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
   private repoSlotsInUse: Set<number> | null = null;
@@ -579,6 +611,7 @@ export class RepoWorker {
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
   private ignoredBodyDepsLog = new Set<string>();
+  private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -714,46 +747,7 @@ export class RepoWorker {
   }
 
   private async ensureRalphWorkflowLabelsOnce(): Promise<void> {
-    if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
-
-    this.ensureLabelsPromise = (async () => {
-      try {
-        const existing = await this.github.listLabelSpecs();
-        const { toCreate, toUpdate } = computeRalphLabelSync(existing);
-        if (toCreate.length === 0 && toUpdate.length === 0) return;
-
-        const created: string[] = [];
-        for (const label of toCreate) {
-          try {
-            await this.github.createLabel(label);
-            created.push(label.name);
-          } catch (e: any) {
-            if (e instanceof GitHubApiError) {
-              if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
-            }
-            throw e;
-          }
-        }
-
-        const updated: string[] = [];
-        for (const update of toUpdate) {
-          await this.github.updateLabel(update.currentName, update.patch);
-          updated.push(update.currentName);
-        }
-
-        if (created.length > 0) {
-          console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
-        }
-        if (updated.length > 0) {
-          console.log(`[ralph:worker:${this.repo}] Updated GitHub label(s): ${updated.join(", ")}`);
-        }
-      } catch (error) {
-        this.ensureLabelsPromise = null;
-        throw error;
-      }
-    })();
-
-    return this.ensureLabelsPromise;
+    await this.labelEnsurer.ensure(this.repo);
   }
 
   private async githubApiRequest<T>(
@@ -765,24 +759,17 @@ export class RepoWorker {
   }
 
   private async addIssueLabel(issue: IssueRef, label: string): Promise<void> {
-    const { owner, name } = splitRepoFullName(issue.repo);
-    await this.githubApiRequest(`/repos/${owner}/${name}/issues/${issue.number}/labels`, {
-      method: "POST",
-      body: { labels: [label] },
-    });
+    await addIssueLabelIo({ github: this.github, repo: issue.repo, issueNumber: issue.number, label });
   }
 
   private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
-    const { owner, name } = splitRepoFullName(issue.repo);
-    try {
-      await this.githubApiRequest(`/repos/${owner}/${name}/issues/${issue.number}/labels/${encodeURIComponent(label)}`, {
-        method: "DELETE",
-        allowNotFound: true,
-      });
-    } catch (error) {
-      if (error instanceof GitHubApiError && error.status === 404) return;
-      throw error;
-    }
+    await removeIssueLabelIo({
+      github: this.github,
+      repo: issue.repo,
+      issueNumber: issue.number,
+      label,
+      allowNotFound: true,
+    });
   }
 
   private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {
@@ -800,6 +787,151 @@ export class RepoWorker {
     if (nextPrUrl === currentPrUrl) return currentPrUrl;
     this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl: nextPrUrl, state: PR_STATE_OPEN });
     return nextPrUrl;
+  }
+
+  private getIssuePrResolution(issueNumber: string): Promise<ResolvedIssuePr> {
+    const cacheKey = `${this.repo}#${issueNumber}`;
+    const cached = this.prResolutionCache.get(cacheKey);
+    if (cached) return cached;
+    const promise = this.findExistingOpenPrForIssue(issueNumber).catch((error) => {
+      this.prResolutionCache.delete(cacheKey);
+      throw error;
+    });
+    this.prResolutionCache.set(cacheKey, promise);
+    return promise;
+  }
+
+  private async findExistingOpenPrForIssue(issueNumber: string): Promise<ResolvedIssuePr> {
+    const diagnostics: string[] = [];
+    const parsedIssue = Number(issueNumber);
+    if (!Number.isFinite(parsedIssue)) {
+      diagnostics.push("- Invalid issue number; skipping PR reuse");
+      return { selectedUrl: null, duplicates: [], source: null, diagnostics };
+    }
+
+    await ensureGhTokenEnv();
+
+    const dbCandidates = await this.resolveDbPrCandidates(parsedIssue, diagnostics);
+    if (dbCandidates.length > 0) {
+      const resolved = selectCanonicalPr(dbCandidates);
+      const result = this.buildResolvedIssuePr(issueNumber, resolved, "db", diagnostics);
+      this.recordResolvedPrSnapshots(issueNumber, resolved);
+      return result;
+    }
+
+    const searchCandidates = await this.resolveSearchPrCandidates(issueNumber, diagnostics);
+    if (searchCandidates.length > 0) {
+      const resolved = selectCanonicalPr(searchCandidates);
+      const result = this.buildResolvedIssuePr(issueNumber, resolved, "gh-search", diagnostics);
+      this.recordResolvedPrSnapshots(issueNumber, resolved);
+      return result;
+    }
+
+    return { selectedUrl: null, duplicates: [], source: null, diagnostics };
+  }
+
+  private buildResolvedIssuePr(
+    issueNumber: string,
+    resolved: { selected: ResolvedPrCandidate | null; duplicates: ResolvedPrCandidate[] },
+    source: "db" | "gh-search",
+    diagnostics: string[]
+  ): ResolvedIssuePr {
+    if (resolved.selected) {
+      diagnostics.push(`- Reusing PR: ${resolved.selected.url} (source=${source})`);
+      if (resolved.duplicates.length > 0) {
+        diagnostics.push(`- Duplicate PRs detected: ${resolved.duplicates.map((dup) => dup.url).join(", ")}`);
+      }
+    }
+
+    return {
+      selectedUrl: resolved.selected?.url ?? null,
+      duplicates: resolved.duplicates.map((dup) => dup.url),
+      source,
+      diagnostics,
+    };
+  }
+
+  private recordResolvedPrSnapshots(
+    issueNumber: string,
+    resolved: { selected: ResolvedPrCandidate | null; duplicates: ResolvedPrCandidate[] }
+  ): void {
+    const issueRef = `${this.repo}#${issueNumber}`;
+    if (resolved.selected) {
+      this.recordPrSnapshotBestEffort({ issue: issueRef, prUrl: resolved.selected.url, state: PR_STATE_OPEN });
+    }
+    for (const duplicate of resolved.duplicates) {
+      this.recordPrSnapshotBestEffort({ issue: issueRef, prUrl: duplicate.url, state: PR_STATE_OPEN });
+    }
+  }
+
+  private async resolveDbPrCandidates(issueNumber: number, diagnostics: string[]): Promise<ResolvedPrCandidate[]> {
+    const rows = listOpenPrCandidatesForIssue(this.repo, issueNumber);
+    if (rows.length === 0) return [];
+    diagnostics.push(`- DB PR candidates: ${rows.length}`);
+
+    const results: ResolvedPrCandidate[] = [];
+    const seen = new Set<string>();
+
+    for (const row of rows) {
+      const normalized = normalizePrUrl(row.url);
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+
+      try {
+        const view = await viewPullRequest(this.repo, row.url);
+        if (!view) continue;
+        const state = String(view.state ?? "").toUpperCase();
+        if (state !== "OPEN") continue;
+        results.push({
+          url: view.url,
+          source: "db",
+          ghCreatedAt: view.createdAt,
+          ghUpdatedAt: view.updatedAt,
+          dbUpdatedAt: row.updatedAt,
+        });
+        if (view.isDraft) {
+          diagnostics.push(`- Existing PR is draft: ${view.url}`);
+        }
+      } catch (error: any) {
+        diagnostics.push(`- Failed to validate PR ${row.url}: ${this.formatGhError(error)}`);
+      }
+    }
+
+    return results;
+  }
+
+  private async resolveSearchPrCandidates(issueNumber: string, diagnostics: string[]): Promise<ResolvedPrCandidate[]> {
+    let searchResults: PullRequestSearchResult[] = [];
+    try {
+      searchResults = await searchOpenPullRequestsByIssueLink(this.repo, issueNumber);
+    } catch (error: any) {
+      diagnostics.push(`- GitHub PR search failed: ${this.formatGhError(error)}`);
+      return [];
+    }
+
+    if (searchResults.length === 0) return [];
+    diagnostics.push(`- GitHub PR search candidates: ${searchResults.length}`);
+
+    const results: ResolvedPrCandidate[] = [];
+    const seen = new Set<string>();
+    for (const result of searchResults) {
+      const normalized = normalizePrUrl(result.url);
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      results.push({
+        url: result.url,
+        source: "gh-search",
+        ghCreatedAt: result.createdAt,
+        ghUpdatedAt: result.updatedAt,
+      });
+    }
+
+    return results;
+  }
+
+  private isSamePrUrl(left: string | null | undefined, right: string | null | undefined): boolean {
+    if (!left || !right) return false;
+    return normalizePrUrl(left) === normalizePrUrl(right);
   }
 
   private async applyMidpointLabelsBestEffort(params: {
@@ -867,6 +999,25 @@ export class RepoWorker {
       );
     }
   }
+
+  private isNoCommitFoundError(error: unknown): boolean {
+    if (!(error instanceof GitHubApiError)) return false;
+    if (error.status !== 422) return false;
+    return /No commit found for SHA/i.test(error.responseText);
+  }
+
+  private isRefAlreadyExistsError(error: unknown): boolean {
+    if (!(error instanceof GitHubApiError)) return false;
+    if (error.status !== 422) return false;
+    return /Reference already exists/i.test(error.responseText);
+  }
+
+  private buildMissingBranchError(error: GitHubApiError): Error {
+    const message = error.message || error.responseText || "Missing branch";
+    const missingBranchError = new Error(message);
+    missingBranchError.cause = "missing-branch";
+    return missingBranchError;
+  }
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
     const { owner, name } = splitRepoFullName(this.repo);
     const encodedBranch = encodeURIComponent(branch);
@@ -876,11 +1027,8 @@ export class RepoWorker {
       );
       return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
     } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      if (/HTTP 422/.test(msg) && /No commit found/i.test(msg)) {
-        const missingBranchError = new Error(msg);
-        missingBranchError.cause = "missing-branch";
-        throw missingBranchError;
+      if (this.isNoCommitFoundError(e)) {
+        throw this.buildMissingBranchError(e);
       }
       throw e;
     }
@@ -895,11 +1043,8 @@ export class RepoWorker {
       );
       return toSortedUniqueStrings(payload?.statuses?.map((status) => status?.context ?? "") ?? []);
     } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      if (/HTTP 422/.test(msg) && /No commit found/i.test(msg)) {
-        const missingBranchError = new Error(msg);
-        missingBranchError.cause = "missing-branch";
-        throw missingBranchError;
+      if (this.isNoCommitFoundError(e)) {
+        throw this.buildMissingBranchError(e);
       }
       throw e;
     }
@@ -992,9 +1137,7 @@ export class RepoWorker {
       );
       return true;
     } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      if (/Reference already exists/i.test(msg)) return false;
-      if (/HTTP 422/.test(msg) && /already exists/i.test(msg)) return false;
+      if (this.isRefAlreadyExistsError(e)) return false;
       throw e;
     }
   }
@@ -1076,16 +1219,6 @@ export class RepoWorker {
     }
 
     return "main";
-  }
-
-  private async ensureBotBranchExistsBestEffort(): Promise<void> {
-    const botBranch = getRepoBotBranch(this.repo);
-    try {
-      await this.ensureRemoteBranchExists(botBranch);
-    } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      console.warn(`[ralph:worker:${this.repo}] Unable to ensure bot branch ${botBranch}: ${msg}`);
-    }
   }
 
   private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
@@ -1186,14 +1319,14 @@ ${guidance}`
 
     this.ensureBranchProtectionPromise = (async () => {
       const botBranch = getRepoBotBranch(this.repo);
-      const branches = Array.from(new Set([botBranch, "main"]));
       const requiredChecksOverride = getRepoRequiredChecksOverride(this.repo);
 
       if (requiredChecksOverride === null || requiredChecksOverride.length === 0) {
         return;
       }
 
-      await this.ensureBotBranchExistsBestEffort();
+      const fallbackBranch = await this.resolveFallbackBranch(botBranch);
+      const branches = Array.from(new Set([botBranch, fallbackBranch]));
 
       for (const branch of branches) {
         await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
@@ -1527,7 +1660,7 @@ ${guidance}`
     issueNumber: string,
     mode: "start" | "resume",
     repoSlot?: number | null
-  ): Promise<{ repoPath: string; worktreePath?: string }> {
+  ): Promise<{ kind: "ok"; repoPath: string; worktreePath?: string } | { kind: "reset"; reason: string }> {
     const recorded = task["worktree-path"]?.trim();
     if (recorded) {
       if (this.isSameRepoRootPath(recorded)) {
@@ -1537,14 +1670,32 @@ ${guidance}`
         throw new Error(`Recorded worktree-path is outside managed worktrees dir: ${recorded}`);
       }
       if (this.isHealthyWorktreePath(recorded)) {
-        return { repoPath: recorded, worktreePath: recorded };
+        return { kind: "ok", repoPath: recorded, worktreePath: recorded };
+      }
+      const reason = !existsSync(recorded)
+        ? `Recorded worktree-path does not exist: ${recorded}`
+        : `Recorded worktree-path is not a valid git worktree: ${recorded}`;
+
+      if (mode === "resume") {
+        console.warn(`[ralph:worker:${this.repo}] ${reason} (resetting task for retry)`);
+        const updated = await this.queue.updateTaskStatus(task, "queued", {
+          "session-id": "",
+          "worktree-path": "",
+          "worker-id": "",
+          "repo-slot": "",
+          "daemon-id": "",
+          "heartbeat-at": "",
+          "watchdog-retries": "",
+        });
+        if (!updated) {
+          throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
+        }
+        await this.safeRemoveWorktree(recorded, { allowDiskCleanup: true });
+        return { kind: "reset", reason: `${reason} (task reset to queued)` };
       }
 
-      if (!existsSync(recorded)) {
-        throw new Error(`Recorded worktree-path does not exist: ${recorded}`);
-      }
-
-      throw new Error(`Recorded worktree-path is not a valid git worktree: ${recorded}`);
+      console.warn(`[ralph:worker:${this.repo}] ${reason} (recreating worktree)`);
+      await this.safeRemoveWorktree(recorded, { allowDiskCleanup: true });
     }
 
     if (mode === "resume") {
@@ -1561,7 +1712,7 @@ ${guidance}`
       "worktree-path": worktreePath,
     });
 
-    return { repoPath: worktreePath, worktreePath };
+    return { kind: "ok", repoPath: worktreePath, worktreePath };
   }
 
   /**
@@ -1766,6 +1917,14 @@ ${guidance}`
     if (!issueNumber) {
       diagnostics.push("- No issue number detected; skipping auto PR recovery");
       return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const existingPr = await this.getIssuePrResolution(issueNumber);
+    if (existingPr.diagnostics.length > 0) {
+      diagnostics.push(...existingPr.diagnostics);
+    }
+    if (existingPr.selectedUrl) {
+      return { prUrl: existingPr.selectedUrl, diagnostics: diagnostics.join("\n") };
     }
 
     const entries = await this.getGitWorktrees();
@@ -2036,7 +2195,7 @@ ${guidance}`
   }
 
   private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
-    // Never pass --admin or -d (delete branch). The orchestrator should not bypass checks or clean up git branches.
+    // Never pass --admin or -d (delete branch). Branch cleanup is handled separately with guardrails.
     await gh`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
   }
 
@@ -2366,6 +2525,130 @@ ${guidance}`
     };
   }
 
+  private async fetchPullRequestDetails(prUrl: string): Promise<PullRequestDetailsNormalized> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+    const payload = await this.githubApiRequest<PullRequestDetails>(`/repos/${owner}/${name}/pulls/${prNumber}`);
+
+    const mergedFlag = payload?.merged ?? null;
+    const mergedAt = payload?.merged_at ?? null;
+    const merged = mergedFlag === true || Boolean(mergedAt);
+
+    return {
+      number: Number(payload?.number ?? prNumber),
+      url: String(payload?.url ?? prUrl),
+      merged,
+      baseRefName: String(payload?.base?.ref ?? ""),
+      headRefName: String(payload?.head?.ref ?? ""),
+      headRepoFullName: String(payload?.head?.repo?.full_name ?? ""),
+      headSha: String(payload?.head?.sha ?? ""),
+    };
+  }
+
+  private async fetchMergedPullRequestDetails(
+    prUrl: string,
+    attempts: number,
+    delayMs: number
+  ): Promise<PullRequestDetailsNormalized> {
+    let last = await this.fetchPullRequestDetails(prUrl);
+    for (let attempt = 1; attempt < attempts; attempt += 1) {
+      if (last.merged) return last;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      last = await this.fetchPullRequestDetails(prUrl);
+    }
+    return last;
+  }
+
+  private async deleteMergedPrHeadBranchBestEffort(params: {
+    prUrl: string;
+    botBranch: string;
+    mergedHeadSha: string;
+  }): Promise<void> {
+    const { prUrl } = params;
+    let details: PullRequestDetailsNormalized;
+    try {
+      details = await this.fetchMergedPullRequestDetails(prUrl, 3, 1000);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to read PR details for head branch cleanup: ${this.formatGhError(error)}`
+      );
+      return;
+    }
+
+    if (!details.merged) {
+      console.log(`[ralph:worker:${this.repo}] Skipped PR head branch deletion (not merged): ${prUrl}`);
+      return;
+    }
+
+    let defaultBranch: string | null = null;
+    try {
+      defaultBranch = await this.fetchRepoDefaultBranch();
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to fetch default branch for cleanup: ${this.formatGhError(error)}`
+      );
+    }
+
+    let currentHeadSha: string | null = null;
+    if (details.headRefName) {
+      const headRef = await this.fetchGitRef(`heads/${details.headRefName}`);
+      currentHeadSha = headRef?.object?.sha ? String(headRef.object.sha) : null;
+    }
+
+    const sameRepo = details.headRepoFullName.trim().toLowerCase() === this.repo.toLowerCase();
+    const decision = computeHeadBranchDeletionDecision({
+      merged: details.merged,
+      isCrossRepository: !sameRepo,
+      headRepoFullName: details.headRepoFullName,
+      headRefName: details.headRefName,
+      baseRefName: details.baseRefName,
+      botBranch: params.botBranch,
+      defaultBranch,
+      mergedHeadSha: params.mergedHeadSha,
+      currentHeadSha,
+    });
+
+    if (decision.action === "skip") {
+      console.log(
+        `[ralph:worker:${this.repo}] Skipped PR head branch deletion (${decision.reason}): ${prUrl}`
+      );
+      return;
+    }
+
+    try {
+      const result = await this.deletePrHeadBranch(decision.branch);
+      if (result === "missing") {
+        console.log(
+          `[ralph:worker:${this.repo}] PR head branch already missing (${decision.branch}): ${prUrl}`
+        );
+        return;
+      }
+      console.log(`[ralph:worker:${this.repo}] Deleted PR head branch ${decision.branch}: ${prUrl}`);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to delete PR head branch ${decision.branch}: ${this.formatGhError(error)}`
+      );
+    }
+  }
+
+  private async deletePrHeadBranch(branch: string): Promise<"deleted" | "missing"> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const encoded = branch
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+    const response = await this.github.request(`/repos/${owner}/${name}/git/refs/heads/${encoded}`, {
+      method: "DELETE",
+      allowNotFound: true,
+    });
+    if (response.status === 404) return "missing";
+    return "deleted";
+  }
+
   private shouldAttemptProactiveUpdate(pr: PullRequestMergeState): { ok: boolean; reason?: string } {
     if (pr.mergeStateStatus !== "BEHIND") {
       return { ok: false, reason: `Merge state is ${pr.mergeStateStatus ?? "unknown"}` };
@@ -2631,19 +2914,40 @@ ${guidance}`
       const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
       if (throttled) return { ok: false, run: throttled };
 
-        if (checkResult.summary.status === "success") {
-          console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+      if (checkResult.summary.status === "success") {
+        console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+        try {
+          await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+          this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
           try {
-            await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-            this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
             await this.applyMidpointLabelsBestEffort({
               task: params.task,
               prUrl,
               botBranch: params.botBranch,
               baseBranch,
             });
-            return { ok: true, prUrl, sessionId };
           } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to apply midpoint labels: ${this.formatGhError(error)}`
+            );
+          }
+          try {
+            const normalizedBase = baseBranch ? this.normalizeGitRef(baseBranch) : "";
+            const normalizedBot = this.normalizeGitRef(params.botBranch);
+            if (normalizedBase && normalizedBase === normalizedBot) {
+              await this.deleteMergedPrHeadBranchBestEffort({
+                prUrl,
+                botBranch: params.botBranch,
+                mergedHeadSha: checkResult.headSha,
+              });
+            }
+          } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to delete PR head branch: ${this.formatGhError(error)}`
+            );
+          }
+          return { ok: true, prUrl, sessionId };
+        } catch (error: any) {
           if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
             console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
             didUpdateBranch = true;
@@ -3204,47 +3508,60 @@ ${guidance}`
       return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
     }
 
-    await this.assertRepoRootClean(task, "resume");
-
     const workerId = await this.formatWorkerId(task, task._path);
     const allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot());
-    const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
-      task,
-      issueNumber || cacheKey,
-      "resume",
-      allocatedSlot
-    );
-
-    const workerIdChanged = task["worker-id"]?.trim() !== workerId;
-    const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
-
-    if (workerIdChanged || repoSlotChanged) {
-      await this.queue.updateTaskStatus(task, "in-progress", {
-        ...(workerIdChanged ? { "worker-id": workerId } : {}),
-        ...(repoSlotChanged ? { "repo-slot": String(allocatedSlot) } : {}),
-      });
-      task["worker-id"] = workerId;
-      task["repo-slot"] = String(allocatedSlot);
-    }
-
-    const eventWorkerId = task["worker-id"]?.trim();
-
-    ralphEventBus.publish(
-      buildRalphEvent({
-        type: "worker.created",
-        level: "info",
-        ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
-        repo: this.repo,
-        taskId: task._path,
-        sessionId: existingSessionId,
-        data: {
-          ...(worktreePath ? { worktreePath } : {}),
-          ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
-        },
-      })
-    );
 
     try {
+      await this.assertRepoRootClean(task, "resume");
+
+      const resolvedRepoPath = await this.resolveTaskRepoPath(
+        task,
+        issueNumber || cacheKey,
+        "resume",
+        allocatedSlot
+      );
+
+      if (resolvedRepoPath.kind === "reset") {
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: existingSessionId,
+          escalationReason: resolvedRepoPath.reason,
+        };
+      }
+
+      const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
+
+      const workerIdChanged = task["worker-id"]?.trim() !== workerId;
+      const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
+
+      if (workerIdChanged || repoSlotChanged) {
+        await this.queue.updateTaskStatus(task, "in-progress", {
+          ...(workerIdChanged ? { "worker-id": workerId } : {}),
+          ...(repoSlotChanged ? { "repo-slot": String(allocatedSlot) } : {}),
+        });
+        task["worker-id"] = workerId;
+        task["repo-slot"] = String(allocatedSlot);
+      }
+
+      const eventWorkerId = task["worker-id"]?.trim();
+
+      ralphEventBus.publish(
+        buildRalphEvent({
+          type: "worker.created",
+          level: "info",
+          ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
+          repo: this.repo,
+          taskId: task._path,
+          sessionId: existingSessionId,
+          data: {
+            ...(worktreePath ? { worktreePath } : {}),
+            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
+          },
+        })
+      );
+
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
 
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
@@ -3267,13 +3584,35 @@ ${guidance}`
         `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
 
       const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
+      const existingPr = await this.getIssuePrResolution(issueNumber);
+      const finalResumeMessage = existingPr.selectedUrl
+        ? [
+            `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
+            "Do NOT create a new PR.",
+            "Continue work on the existing PR branch and push updates as needed.",
+            "Only paste a PR URL if it changes.",
+          ].join(" ")
+        : resumeMessage;
+
+      if (existingPr.selectedUrl) {
+        console.log(
+          `[ralph:worker:${this.repo}] Reusing existing PR for resume: ${existingPr.selectedUrl} (source=${
+            existingPr.source ?? "unknown"
+          })`
+        );
+        if (existingPr.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
+          );
+        }
+      }
 
       const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
       if (pausedBefore) return pausedBefore;
 
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
-      let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, resumeMessage, {
+      let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
         repo: this.repo,
         cacheKey,
         runLogPath: resumeRunLogPath,
@@ -3439,6 +3778,23 @@ ${guidance}`
           continue;
         }
 
+        const canonical = await this.getIssuePrResolution(issueNumber);
+        if (canonical.selectedUrl) {
+          console.log(
+            `[ralph:worker:${this.repo}] Reusing existing PR during resume: ${canonical.selectedUrl} (source=${
+              canonical.source ?? "unknown"
+            })`
+          );
+          if (canonical.duplicates.length > 0) {
+            console.log(
+              `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
+            );
+          }
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, canonical.diagnostics.join("\n")].filter(Boolean).join("\n\n");
+          prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
+          break;
+        }
+
         continueAttempts++;
         console.log(
           `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
@@ -3537,6 +3893,19 @@ ${guidance}`
           sessionId: buildResult.sessionId,
           escalationReason: reason,
         };
+      }
+
+      const canonical = await this.getIssuePrResolution(issueNumber);
+      if (canonical.selectedUrl && !this.isSamePrUrl(prUrl, canonical.selectedUrl)) {
+        console.log(
+          `[ralph:worker:${this.repo}] Detected duplicate PR; using existing ${canonical.selectedUrl} instead of ${prUrl}`
+        );
+        if (canonical.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
+          );
+        }
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
       }
 
       const pausedMerge = await this.pauseIfHardThrottled(task, "resume merge", buildResult.sessionId || existingSessionId);
@@ -3696,6 +4065,8 @@ ${guidance}`
       const opencodeXdg = resolvedOpencode.opencodeXdg;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
+      await this.ensureRalphWorkflowLabelsOnce();
+
       // 3. Mark task starting (restart-safe pre-session state)
       const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
@@ -3709,15 +4080,13 @@ ${guidance}`
         throw new Error("Failed to mark task starting (bwrb edit failed)");
       }
 
-      await this.ensureRalphWorkflowLabelsOnce();
       await this.ensureBranchProtectionOnce();
 
-      const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
-        task,
-        issueNumber,
-        "start",
-        allocatedSlot
-      );
+      const resolvedRepoPath = await this.resolveTaskRepoPath(task, issueNumber, "start", allocatedSlot);
+      if (resolvedRepoPath.kind !== "ok") {
+        throw new Error(resolvedRepoPath.reason);
+      }
+      const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
 
       ralphEventBus.publish(
         buildRalphEvent({
@@ -3994,7 +4363,28 @@ ${guidance}`
       // 6. Proceed with build
       console.log(`[ralph:worker:${this.repo}] Proceeding with build...`);
       const botBranch = getRepoBotBranch(this.repo);
-      const proceedMessage = `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
+      const existingPr = await this.getIssuePrResolution(issueNumber);
+      const proceedMessage = existingPr.selectedUrl
+        ? [
+            `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
+            "Do NOT create a new PR.",
+            "Fix any failing checks and push updates to the existing PR branch.",
+            "Only paste a PR URL if it changes.",
+          ].join(" ")
+        : `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
+
+      if (existingPr.selectedUrl) {
+        console.log(
+          `[ralph:worker:${this.repo}] Reusing existing PR for build: ${existingPr.selectedUrl} (source=${
+            existingPr.source ?? "unknown"
+          })`
+        );
+        if (existingPr.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
+          );
+        }
+      }
 
       const pausedBuild = await this.pauseIfHardThrottled(task, "build", planResult.sessionId);
       if (pausedBuild) return pausedBuild;
@@ -4155,6 +4545,23 @@ ${guidance}`
           continue;
         }
 
+        const canonical = await this.getIssuePrResolution(issueNumber);
+        if (canonical.selectedUrl) {
+          console.log(
+            `[ralph:worker:${this.repo}] Reusing existing PR during build: ${canonical.selectedUrl} (source=${
+              canonical.source ?? "unknown"
+            })`
+          );
+          if (canonical.duplicates.length > 0) {
+            console.log(
+              `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
+            );
+          }
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, canonical.diagnostics.join("\n")].filter(Boolean).join("\n\n");
+          prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
+          break;
+        }
+
         continueAttempts++;
         console.log(
           `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
@@ -4250,6 +4657,19 @@ ${guidance}`
           sessionId: buildResult.sessionId,
           escalationReason: reason,
         };
+      }
+
+      const canonical = await this.getIssuePrResolution(issueNumber);
+      if (canonical.selectedUrl && !this.isSamePrUrl(prUrl, canonical.selectedUrl)) {
+        console.log(
+          `[ralph:worker:${this.repo}] Detected duplicate PR; using existing ${canonical.selectedUrl} instead of ${prUrl}`
+        );
+        if (canonical.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
+          );
+        }
+        prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
       }
 
       const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);

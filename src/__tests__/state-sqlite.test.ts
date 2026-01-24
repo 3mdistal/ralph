@@ -12,6 +12,7 @@ import {
   getOrCreateRollupBatch,
   initStateDb,
   listIssuesWithAllLabels,
+  listOpenPrCandidatesForIssue,
   listOpenRollupBatches,
   listRollupBatchEntries,
   markRollupBatchRolledUp,
@@ -386,6 +387,39 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("lists open PR candidates for an issue", () => {
+    initStateDb();
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/100",
+      state: PR_STATE_OPEN,
+      at: "2026-01-11T00:00:00.000Z",
+    });
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/101",
+      at: "2026-01-11T00:00:01.000Z",
+    });
+
+    recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#59",
+      prUrl: "https://github.com/3mdistal/ralph/pull/102",
+      state: PR_STATE_MERGED,
+      at: "2026-01-11T00:00:02.000Z",
+    });
+
+    const candidates = listOpenPrCandidatesForIssue("3mdistal/ralph", 59);
+    expect(candidates.map((candidate) => candidate.url)).toEqual([
+      "https://github.com/3mdistal/ralph/pull/101",
+      "https://github.com/3mdistal/ralph/pull/100",
+    ]);
   });
 
   test("lists issues with all labels", () => {

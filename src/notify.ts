@@ -3,6 +3,7 @@ import crypto from "crypto";
 import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import { createAgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
+import type { TaskPriority } from "./queue/priority";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 
@@ -201,7 +202,7 @@ export interface EscalationContext {
   /** The original task scope (if known) */
   scope?: string;
   /** The original task priority (if known) */
-  priority?: string;
+  priority?: TaskPriority;
   /** OpenCode session ID (for resuming after resolution) */
   sessionId?: string;
   reason: string;

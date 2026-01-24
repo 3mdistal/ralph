@@ -1,7 +1,4 @@
-export type IssueRef = {
-  repo: string;
-  number: number;
-};
+import { formatIssueRef, parseIssueRef, type IssueRef } from "./issue-ref";
 
 export type RelationshipSignal = {
   source: "github" | "body";
@@ -25,21 +22,6 @@ export type ParsedIssueBodyDependencies = {
 
 const BLOCKED_BY_HEADER = /^##\s+blocked by\s*$/i;
 const BLOCKS_HEADER = /^##\s+blocks\s*$/i;
-
-export function parseIssueRef(raw: string, baseRepo: string): IssueRef | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  const match = trimmed.match(/^(?:([\w.-]+\/[\w.-]+))?#(\d+)$/);
-  if (!match) return null;
-  const repo = match[1] ? match[1] : baseRepo;
-  const number = Number.parseInt(match[2], 10);
-  if (!repo || !Number.isFinite(number)) return null;
-  return { repo, number };
-}
-
-export function formatIssueRef(ref: IssueRef): string {
-  return `${ref.repo}#${ref.number}`;
-}
 
 export function parseIssueBodyDependencies(body: string, baseRepo: string): ParsedIssueBodyDependencies {
   const lines = body.split(/\r?\n/);

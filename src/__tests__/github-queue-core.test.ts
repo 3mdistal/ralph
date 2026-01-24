@@ -1,6 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
-import { deriveRalphStatus, planClaim, shouldRecoverStaleInProgress, statusToRalphLabelDelta } from "../github-queue/core";
+import { executeIssueLabelOps, planIssueLabelOps } from "../github/issue-label-io";
+
+import {
+  deriveRalphStatus,
+  deriveTaskView,
+  planClaim,
+  shouldRecoverStaleInProgress,
+  statusToRalphLabelDelta,
+} from "../github-queue/core";
 
 function applyDelta(labels: string[], delta: { add: string[]; remove: string[] }): string[] {
   const set = new Set(labels);
@@ -14,6 +22,76 @@ function applyDelta(labels: string[], delta: { add: string[]; remove: string[] }
 }
 
 describe("github queue core", () => {
+  test("deriveTaskView infers priority from labels", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 285,
+        title: "Priority labels",
+        labels: ["p0-critical", "ralph:queued"],
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.priority).toBe("p0-critical");
+  });
+
+  test("deriveTaskView prefers highest priority label", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 286,
+        title: "Priority labels",
+        labels: ["p3-low", "p1-high"],
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.priority).toBe("p1-high");
+  });
+
+  test("deriveTaskView defaults to p2-medium when no priority labels", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 287,
+        title: "Priority labels",
+        labels: ["bug", "ralph:queued"],
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.priority).toBe("p2-medium");
+  });
+
+  test("deriveTaskView matches case-insensitive priority prefixes", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 288,
+        title: "Priority labels",
+        labels: ["P2", "p4 backlog"],
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.priority).toBe("p2-medium");
+  });
+
+  test("deriveTaskView accepts priority prefixes with suffixes", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 289,
+        title: "Priority labels",
+        labels: ["p3:low"],
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.priority).toBe("p3-low");
+  });
+
   test("statusToRalphLabelDelta only mutates ralph labels", () => {
     const delta = statusToRalphLabelDelta("in-progress", ["bug", "ralph:queued", "dx"]);
     expect(delta).toEqual({ add: ["ralph:in-progress"], remove: ["ralph:queued"] });
@@ -26,6 +104,11 @@ describe("github queue core", () => {
 
   test("statusToRalphLabelDelta removes other status labels when blocked", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:queued", "ralph:in-progress"]);
+    expect(delta).toEqual({ add: ["ralph:blocked"], remove: ["ralph:in-progress"] });
+  });
+
+  test("statusToRalphLabelDelta preserves non-ralph labels when blocked", () => {
+    const delta = statusToRalphLabelDelta("blocked", ["bug", "ralph:queued", "p1-high", "ralph:in-progress"]);
     expect(delta).toEqual({ add: ["ralph:blocked"], remove: ["ralph:in-progress"] });
   });
 
@@ -84,5 +167,51 @@ describe("github queue core", () => {
     });
 
     expect(recover).toBe(true);
+  });
+});
+
+describe("issue label io", () => {
+  test("executeIssueLabelOps preserves non-ralph labels", async () => {
+    const labels = new Set(["bug", "p1-high", "ralph:in-progress"]);
+    const calls: Array<{ method: string; path: string }> = [];
+    const request = async (path: string, opts: { method?: string; body?: unknown; allowNotFound?: boolean } = {}) => {
+      const method = (opts.method ?? "GET").toUpperCase();
+      calls.push({ method, path });
+      if (method === "POST" && /\/issues\/\d+\/labels$/.test(path)) {
+        const body = opts.body as { labels?: string[] } | undefined;
+        for (const label of body?.labels ?? []) {
+          labels.add(label);
+        }
+        return { data: null, etag: null, status: 200 };
+      }
+      if (method === "DELETE") {
+        const match = path.match(/\/labels\/([^/]+)$/);
+        const label = match ? decodeURIComponent(match[1]) : "";
+        const removed = labels.delete(label);
+        return { data: null, etag: null, status: removed ? 204 : 404 };
+      }
+      return { data: null, etag: null, status: 200 };
+    };
+
+    const ops = planIssueLabelOps({ add: ["ralph:blocked"], remove: ["ralph:in-progress"] });
+    const result = await executeIssueLabelOps({
+      github: { request },
+      repo: "3mdistal/ralph",
+      issueNumber: 286,
+      ops,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(labels.has("bug")).toBe(true);
+    expect(labels.has("p1-high")).toBe(true);
+    expect(labels.has("ralph:blocked")).toBe(true);
+    expect(labels.has("ralph:in-progress")).toBe(false);
+    expect(calls.map((call) => call.method)).toEqual(["POST", "DELETE"]);
+  });
+
+  test("planIssueLabelOps refuses non-ralph labels", () => {
+    expect(() => planIssueLabelOps({ add: ["bug"], remove: [] })).toThrow(
+      "Refusing to mutate non-Ralph label"
+    );
   });
 });
