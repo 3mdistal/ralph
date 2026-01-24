@@ -2791,9 +2791,6 @@ ${guidance}`
 
     if (!this.isGitHubQueueTask(task)) return null;
 
-    const existingSessionId = task["session-id"]?.trim();
-    if (!existingSessionId) return null;
-
     let existingPr: ResolvedIssuePr;
     try {
       existingPr = await this.getIssuePrResolution(issueNumber);
@@ -2889,21 +2886,37 @@ ${guidance}`
     if (pausedBefore) return pausedBefore;
 
     const runLogPath = await this.recordRunLogPath(task, issueNumber, stage, "in-progress");
+    const resumeSessionId = task["session-id"]?.trim();
 
-    const recoveryResult = await this.session.runAgent(taskRepoPath, "general", prompt, {
-      repo: this.repo,
-      cacheKey,
-      runLogPath,
-      introspection: {
-        repo: this.repo,
-        issue: task.issue,
-        taskName: task.name,
-        step: 2,
-        stepTitle: stage,
-      },
-      ...this.buildWatchdogOptions(task, stage),
-      ...opencodeSessionOptions,
-    });
+    const recoveryResult = resumeSessionId
+      ? await this.session.continueSession(taskRepoPath, resumeSessionId, prompt, {
+          repo: this.repo,
+          cacheKey,
+          runLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 2,
+            stepTitle: stage,
+          },
+          ...this.buildWatchdogOptions(task, stage),
+          ...opencodeSessionOptions,
+        })
+      : await this.session.runAgent(taskRepoPath, "general", prompt, {
+          repo: this.repo,
+          cacheKey,
+          runLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 2,
+            stepTitle: stage,
+          },
+          ...this.buildWatchdogOptions(task, stage),
+          ...opencodeSessionOptions,
+        });
 
     const pausedAfter = await this.pauseIfHardThrottled(task, `${stage} (post)`, recoveryResult.sessionId);
     if (pausedAfter) return pausedAfter;
@@ -2936,7 +2949,7 @@ ${guidance}`
 
     await this.drainNudges(task, taskRepoPath, recoveryResult.sessionId, cacheKey, stage, opencodeXdg);
 
-    const recoverySessionId = recoveryResult.sessionId || task["session-id"]?.trim() || "";
+    const recoverySessionId = recoveryResult.sessionId || resumeSessionId || "";
     const mergeGate = await this.mergePrWithRequiredChecks({
       task,
       repoPath: taskRepoPath,
