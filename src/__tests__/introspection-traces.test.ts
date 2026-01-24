@@ -47,11 +47,13 @@ describe("introspection trace cleanup", () => {
   });
 
   test("skips cleanup for unsafe session ids", async () => {
-    const unsafeId = "../unsafe";
     const sentinel = join(sessionsDir, "sentinel.txt");
     await writeFile(sentinel, "keep");
 
-    await cleanupSessionArtifacts(unsafeId);
+    const unsafeIds = ["../unsafe", ".", "..", "ses bad"];
+    for (const unsafeId of unsafeIds) {
+      await cleanupSessionArtifacts(unsafeId);
+    }
 
     expect(existsSync(sentinel)).toBe(true);
   });

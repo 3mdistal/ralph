@@ -153,11 +153,14 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .get() as { value?: string };
       expect(meta.value).toBe("8");
 
-      const columns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
-      const columnNames = columns.map((column) => column.name);
-      expect(columnNames).toContain("github_node_id");
-      expect(columnNames).toContain("github_updated_at");
-      expect(columnNames).toContain("session_events_path");
+      const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
+      const issueColumnNames = issueColumns.map((column) => column.name);
+      expect(issueColumnNames).toContain("github_node_id");
+      expect(issueColumnNames).toContain("github_updated_at");
+
+      const taskColumns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+      const taskColumnNames = taskColumns.map((column) => column.name);
+      expect(taskColumnNames).toContain("session_events_path");
 
       const issueLabelsTable = migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'issue_labels'")
