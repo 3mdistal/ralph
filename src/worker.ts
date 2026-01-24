@@ -31,6 +31,7 @@ import {
   resolveOpencodeProfile,
 } from "./config";
 import { normalizeGitRef } from "./midpoint-labels";
+import { computeHeadBranchDeletionDecision } from "./pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import { continueCommand, continueSession, getRalphXdgCacheHome, runAgent, type SessionResult } from "./session";
@@ -334,6 +335,25 @@ type CommitStatusResponse = {
 
 type RepoDetails = {
   default_branch?: string | null;
+};
+
+type PullRequestDetails = {
+  number?: number | null;
+  url?: string | null;
+  merged?: boolean | null;
+  merged_at?: string | null;
+  base?: { ref?: string | null } | null;
+  head?: { ref?: string | null; sha?: string | null; repo?: { full_name?: string | null } | null } | null;
+};
+
+type PullRequestDetailsNormalized = {
+  number: number;
+  url: string;
+  merged: boolean;
+  baseRefName: string;
+  headRefName: string;
+  headRepoFullName: string;
+  headSha: string;
 };
 
 type GitRef = {
@@ -2037,7 +2057,7 @@ ${guidance}`
   }
 
   private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
-    // Never pass --admin or -d (delete branch). The orchestrator should not bypass checks or clean up git branches.
+    // Never pass --admin or -d (delete branch). Branch cleanup is handled separately with guardrails.
     await gh`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
   }
 
@@ -2367,6 +2387,130 @@ ${guidance}`
     };
   }
 
+  private async fetchPullRequestDetails(prUrl: string): Promise<PullRequestDetailsNormalized> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+    const payload = await this.githubApiRequest<PullRequestDetails>(`/repos/${owner}/${name}/pulls/${prNumber}`);
+
+    const mergedFlag = payload?.merged ?? null;
+    const mergedAt = payload?.merged_at ?? null;
+    const merged = mergedFlag === true || Boolean(mergedAt);
+
+    return {
+      number: Number(payload?.number ?? prNumber),
+      url: String(payload?.url ?? prUrl),
+      merged,
+      baseRefName: String(payload?.base?.ref ?? ""),
+      headRefName: String(payload?.head?.ref ?? ""),
+      headRepoFullName: String(payload?.head?.repo?.full_name ?? ""),
+      headSha: String(payload?.head?.sha ?? ""),
+    };
+  }
+
+  private async fetchMergedPullRequestDetails(
+    prUrl: string,
+    attempts: number,
+    delayMs: number
+  ): Promise<PullRequestDetailsNormalized> {
+    let last = await this.fetchPullRequestDetails(prUrl);
+    for (let attempt = 1; attempt < attempts; attempt += 1) {
+      if (last.merged) return last;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      last = await this.fetchPullRequestDetails(prUrl);
+    }
+    return last;
+  }
+
+  private async deleteMergedPrHeadBranchBestEffort(params: {
+    prUrl: string;
+    botBranch: string;
+    mergedHeadSha: string;
+  }): Promise<void> {
+    const { prUrl } = params;
+    let details: PullRequestDetailsNormalized;
+    try {
+      details = await this.fetchMergedPullRequestDetails(prUrl, 3, 1000);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to read PR details for head branch cleanup: ${this.formatGhError(error)}`
+      );
+      return;
+    }
+
+    if (!details.merged) {
+      console.log(`[ralph:worker:${this.repo}] Skipped PR head branch deletion (not merged): ${prUrl}`);
+      return;
+    }
+
+    let defaultBranch: string | null = null;
+    try {
+      defaultBranch = await this.fetchRepoDefaultBranch();
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to fetch default branch for cleanup: ${this.formatGhError(error)}`
+      );
+    }
+
+    let currentHeadSha: string | null = null;
+    if (details.headRefName) {
+      const headRef = await this.fetchGitRef(`heads/${details.headRefName}`);
+      currentHeadSha = headRef?.object?.sha ? String(headRef.object.sha) : null;
+    }
+
+    const sameRepo = details.headRepoFullName.trim().toLowerCase() === this.repo.toLowerCase();
+    const decision = computeHeadBranchDeletionDecision({
+      merged: details.merged,
+      isCrossRepository: !sameRepo,
+      headRepoFullName: details.headRepoFullName,
+      headRefName: details.headRefName,
+      baseRefName: details.baseRefName,
+      botBranch: params.botBranch,
+      defaultBranch,
+      mergedHeadSha: params.mergedHeadSha,
+      currentHeadSha,
+    });
+
+    if (decision.action === "skip") {
+      console.log(
+        `[ralph:worker:${this.repo}] Skipped PR head branch deletion (${decision.reason}): ${prUrl}`
+      );
+      return;
+    }
+
+    try {
+      const result = await this.deletePrHeadBranch(decision.branch);
+      if (result === "missing") {
+        console.log(
+          `[ralph:worker:${this.repo}] PR head branch already missing (${decision.branch}): ${prUrl}`
+        );
+        return;
+      }
+      console.log(`[ralph:worker:${this.repo}] Deleted PR head branch ${decision.branch}: ${prUrl}`);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to delete PR head branch ${decision.branch}: ${this.formatGhError(error)}`
+      );
+    }
+  }
+
+  private async deletePrHeadBranch(branch: string): Promise<"deleted" | "missing"> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const encoded = branch
+      .split("/")
+      .map((segment) => encodeURIComponent(segment))
+      .join("/");
+    const response = await this.github.request(`/repos/${owner}/${name}/git/refs/heads/${encoded}`, {
+      method: "DELETE",
+      allowNotFound: true,
+    });
+    if (response.status === 404) return "missing";
+    return "deleted";
+  }
+
   private shouldAttemptProactiveUpdate(pr: PullRequestMergeState): { ok: boolean; reason?: string } {
     if (pr.mergeStateStatus !== "BEHIND") {
       return { ok: false, reason: `Merge state is ${pr.mergeStateStatus ?? "unknown"}` };
@@ -2632,19 +2776,40 @@ ${guidance}`
       const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
       if (throttled) return { ok: false, run: throttled };
 
-        if (checkResult.summary.status === "success") {
-          console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+      if (checkResult.summary.status === "success") {
+        console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+        try {
+          await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
+          this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
           try {
-            await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-            this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
             await this.applyMidpointLabelsBestEffort({
               task: params.task,
               prUrl,
               botBranch: params.botBranch,
               baseBranch,
             });
-            return { ok: true, prUrl, sessionId };
           } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to apply midpoint labels: ${this.formatGhError(error)}`
+            );
+          }
+          try {
+            const normalizedBase = baseBranch ? this.normalizeGitRef(baseBranch) : "";
+            const normalizedBot = this.normalizeGitRef(params.botBranch);
+            if (normalizedBase && normalizedBase === normalizedBot) {
+              await this.deleteMergedPrHeadBranchBestEffort({
+                prUrl,
+                botBranch: params.botBranch,
+                mergedHeadSha: checkResult.headSha,
+              });
+            }
+          } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to delete PR head branch: ${this.formatGhError(error)}`
+            );
+          }
+          return { ok: true, prUrl, sessionId };
+        } catch (error: any) {
           if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
             console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
             didUpdateBranch = true;
