@@ -64,9 +64,6 @@ export function planClaim(currentLabels: string[]): {
   if (labelSet.has("ralph:escalated")) {
     return { claimable: false, steps: [], reason: "Issue is escalated" };
   }
-  if (labelSet.has("ralph:blocked")) {
-    return { claimable: false, steps: [], reason: "Issue is blocked" };
-  }
   if (labelSet.has("ralph:in-bot")) {
     return { claimable: false, steps: [], reason: "Issue already in bot" };
   }
@@ -75,6 +72,17 @@ export function planClaim(currentLabels: string[]): {
   }
   if (!labelSet.has("ralph:queued")) {
     return { claimable: false, steps: [], reason: "Missing ralph:queued label" };
+  }
+
+  if (labelSet.has("ralph:blocked")) {
+    return {
+      claimable: true,
+      steps: [
+        { action: "add", label: "ralph:in-progress" },
+        { action: "remove", label: "ralph:queued" },
+        { action: "remove", label: "ralph:blocked" },
+      ],
+    };
   }
 
   return {

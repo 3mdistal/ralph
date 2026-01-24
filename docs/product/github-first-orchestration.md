@@ -106,6 +106,7 @@ Blocked metadata (agent-task frontmatter):
 
 Requeue resolution (non-dependency blocked tasks):
 - Operators requeue by re-adding `ralph:queued` on the issue.
+- Ralph removes the `ralph:blocked` label when it claims the issue again.
 - When Ralph claims the task again, it clears all `blocked-*` metadata and resumes work.
 - If a `session-id` exists, Ralph resumes the prior OpenCode session; otherwise it starts a fresh session.
 
