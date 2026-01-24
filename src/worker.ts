@@ -1141,7 +1141,7 @@ export class RepoWorker {
 
   private async applyMidpointLabelsBestEffort(params: {
     task: AgentTask;
-    prUrl: string;
+    prUrl: string | null;
     botBranch: string;
     baseBranch?: string | null;
   }): Promise<void> {
@@ -2701,10 +2701,28 @@ ${guidance}`
 
     if (!this.isGitHubQueueTask(task)) return null;
 
-    const existingPr = await this.getIssuePrResolution(issueNumber);
+    let existingPr: ResolvedIssuePr;
+    try {
+      existingPr = await this.getIssuePrResolution(issueNumber);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Merge conflict preflight failed for ${task.issue}: ${this.formatGhError(error)}`
+      );
+      return null;
+    }
     if (!existingPr.selectedUrl) return null;
 
-    const prState = await this.getPullRequestMergeState(existingPr.selectedUrl);
+    let prState: PullRequestMergeState;
+    try {
+      prState = await this.getPullRequestMergeState(existingPr.selectedUrl);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Merge conflict preflight failed for ${existingPr.selectedUrl}: ${this.formatGhError(
+          error
+        )}`
+      );
+      return null;
+    }
     if (prState.mergeStateStatus !== "DIRTY") return null;
 
     console.warn(
@@ -2762,11 +2780,30 @@ ${guidance}`
     const existingSessionId = task["session-id"]?.trim();
     if (!existingSessionId) return null;
 
-    const existingPr = await this.getIssuePrResolution(issueNumber);
+    let existingPr: ResolvedIssuePr;
+    try {
+      existingPr = await this.getIssuePrResolution(issueNumber);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] CI recovery preflight failed for ${task.issue}: ${this.formatGhError(error)}`
+      );
+      return null;
+    }
     if (!existingPr.selectedUrl) return null;
 
-    const { checks: requiredChecks } = await this.resolveRequiredChecksForMerge();
-    const prStatus = await this.getPullRequestChecks(existingPr.selectedUrl);
+    let requiredChecks: string[] = [];
+    let prStatus: Awaited<ReturnType<RepoWorker["getPullRequestChecks"]>>;
+    try {
+      ({ checks: requiredChecks } = await this.resolveRequiredChecksForMerge());
+      prStatus = await this.getPullRequestChecks(existingPr.selectedUrl);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] CI recovery preflight failed for ${existingPr.selectedUrl}: ${this.formatGhError(
+          error
+        )}`
+      );
+      return null;
+    }
     if (prStatus.mergeStateStatus === "DIRTY") return null;
 
     const summary = summarizeRequiredChecks(prStatus.checks, requiredChecks);
@@ -2933,7 +2970,7 @@ ${guidance}`
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
 
-    return await this.finalizeRecoverySuccess({
+    return await this.finalizeTaskSuccess({
       task,
       prUrl: mergeGate.prUrl,
       sessionId: mergeGate.sessionId,
@@ -2941,10 +2978,12 @@ ${guidance}`
       surveyResults: surveyResult.output,
       cacheKey,
       opencodeXdg,
+      notify: true,
+      logMessage: `Task completed (recovery): ${task.name}`,
     });
   }
 
-  private async finalizeRecoverySuccess(params: {
+  private async finalizeTaskSuccess(params: {
     task: AgentTask;
     prUrl: string;
     sessionId: string;
@@ -2952,11 +2991,31 @@ ${guidance}`
     surveyResults?: string;
     cacheKey: string;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    worktreePath?: string;
+    workerId?: string;
+    repoSlot?: string | number | null;
+    devex?: EscalationContext["devex"];
+    notify?: boolean;
+    logMessage?: string;
   }): Promise<AgentRun> {
-    const { task, prUrl, sessionId, startTime, surveyResults, cacheKey, opencodeXdg } = params;
-    const worktreePath = task["worktree-path"]?.trim();
-    const workerId = task["worker-id"]?.trim();
-    const repoSlot = task["repo-slot"]?.trim();
+    const {
+      task,
+      prUrl,
+      sessionId,
+      startTime,
+      surveyResults,
+      cacheKey,
+      opencodeXdg,
+      worktreePath,
+      workerId,
+      repoSlot,
+      devex,
+      notify,
+      logMessage,
+    } = params;
+    const resolvedWorktreePath = worktreePath ?? task["worktree-path"]?.trim();
+    const resolvedWorkerId = workerId ?? task["worker-id"]?.trim();
+    const resolvedRepoSlot = repoSlot ?? task["repo-slot"]?.trim();
 
     const endTime = new Date();
     await this.createAgentRun(task, {
@@ -2966,27 +3025,32 @@ ${guidance}`
       started: startTime,
       completed: endTime,
       surveyResults,
+      devex,
     });
 
     await this.queue.updateTaskStatus(task, "done", {
       "completed-at": endTime.toISOString().split("T")[0],
       "session-id": "",
       "watchdog-retries": "",
-      ...(worktreePath ? { "worktree-path": "" } : {}),
-      ...(workerId ? { "worker-id": "" } : {}),
-      ...(repoSlot ? { "repo-slot": "" } : {}),
+      ...(resolvedWorktreePath ? { "worktree-path": "" } : {}),
+      ...(resolvedWorkerId ? { "worker-id": "" } : {}),
+      ...(resolvedRepoSlot ? { "repo-slot": "" } : {}),
     });
 
     await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
 
-    if (worktreePath) {
-      await this.cleanupGitWorktree(worktreePath);
+    if (resolvedWorktreePath) {
+      await this.cleanupGitWorktree(resolvedWorktreePath);
     }
 
     await this.assertRepoRootClean(task, "post-run");
-    await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
 
-    console.log(`[ralph:worker:${this.repo}] Task completed (recovery): ${task.name}`);
+    if (notify ?? true) {
+      await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
+    }
+    if (logMessage) {
+      console.log(`[ralph:worker:${this.repo}] ${logMessage}`);
+    }
 
     return {
       taskName: task.name,
@@ -4638,44 +4702,20 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
-      const endTime = new Date();
-      const completedAt = endTime.toISOString().split("T")[0];
-      await this.createAgentRun(task, {
+      return await this.finalizeTaskSuccess({
+        task,
+        prUrl,
         sessionId: buildResult.sessionId,
-        pr: prUrl,
-        outcome: "success",
-        started: startTime,
-        completed: endTime,
+        startTime,
         surveyResults: surveyResult.output,
+        cacheKey,
+        opencodeXdg,
+        worktreePath,
+        workerId,
+        repoSlot: typeof allocatedSlot === "number" ? String(allocatedSlot) : undefined,
+        notify: false,
+        logMessage: `Task resumed to completion: ${task.name}`,
       });
-
-      await this.queue.updateTaskStatus(task, "done", {
-        "completed-at": completedAt,
-        "session-id": "",
-        "watchdog-retries": "",
-        ...(worktreePath ? { "worktree-path": "" } : {}),
-        ...(workerId ? { "worker-id": "" } : {}),
-        ...(typeof allocatedSlot === "number" ? { "repo-slot": "" } : {}),
-      });
-
-      // Cleanup per-task OpenCode cache on success
-      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
-
-      if (worktreePath) {
-        await this.cleanupGitWorktree(worktreePath);
-      }
-
-      await this.assertRepoRootClean(task, "post-run");
-
-      console.log(`[ralph:worker:${this.repo}] Task resumed to completion: ${task.name}`);
-
-      return {
-        taskName: task.name,
-        repo: this.repo,
-        outcome: "success",
-        pr: prUrl ?? undefined,
-        sessionId: buildResult.sessionId,
-      };
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
@@ -5465,49 +5505,21 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
-      // 10. Create agent-run note
-      const endTime = new Date();
-      await this.createAgentRun(task, {
+      return await this.finalizeTaskSuccess({
+        task,
+        prUrl,
         sessionId: buildResult.sessionId,
-        pr: prUrl,
-        outcome: "success",
-        started: startTime,
-        completed: endTime,
+        startTime,
         surveyResults: surveyResult.output,
+        cacheKey,
+        opencodeXdg,
+        worktreePath,
+        workerId,
+        repoSlot: typeof allocatedSlot === "number" ? String(allocatedSlot) : undefined,
         devex: devexContext,
+        notify: true,
+        logMessage: `Task completed: ${task.name}`,
       });
-
-      // 11. Mark task done
-      await this.queue.updateTaskStatus(task, "done", {
-        "completed-at": endTime.toISOString().split("T")[0],
-        "session-id": "",
-        "watchdog-retries": "",
-        ...(worktreePath ? { "worktree-path": "" } : {}),
-        ...(workerId ? { "worker-id": "" } : {}),
-        ...(typeof allocatedSlot === "number" ? { "repo-slot": "" } : {}),
-      });
-
-      // 12. Cleanup per-task OpenCode cache on success
-      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
-
-      if (worktreePath) {
-        await this.cleanupGitWorktree(worktreePath);
-      }
-
-      await this.assertRepoRootClean(task, "post-run");
-
-      // 13. Send desktop notification for completion
-      await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
-
-      console.log(`[ralph:worker:${this.repo}] Task completed: ${task.name}`);
-
-      return {
-        taskName: task.name,
-        repo: this.repo,
-        outcome: "success",
-        pr: prUrl ?? undefined,
-        sessionId: buildResult.sessionId,
-      };
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
