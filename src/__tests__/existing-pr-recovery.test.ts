@@ -18,7 +18,7 @@ describe("existing PR recovery", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
     const task = { ...baseTask };
 
-    let observedStage: string | null = null;
+    let observedStage: "merge-conflict" | "ci-failure" | null = null;
     (worker as any).getIssuePrResolution = async () => ({
       selectedUrl: "https://github.com/3mdistal/ralph/pull/123",
       duplicates: [],
@@ -51,7 +51,7 @@ describe("existing PR recovery", () => {
       opencodeSessionOptions: {},
     });
 
-    expect(observedStage).toBe("merge-conflict");
+    expect(observedStage as NonNullable<typeof observedStage>).toBe("merge-conflict");
     expect(result?.outcome).toBe("success");
   });
 
@@ -59,7 +59,7 @@ describe("existing PR recovery", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
     const task = { ...baseTask, "session-id": "ses_123" };
 
-    let observedStage: string | null = null;
+    let observedStage: "merge-conflict" | "ci-failure" | null = null;
     (worker as any).getIssuePrResolution = async () => ({
       selectedUrl: "https://github.com/3mdistal/ralph/pull/456",
       duplicates: [],
@@ -99,7 +99,7 @@ describe("existing PR recovery", () => {
       opencodeSessionOptions: {},
     });
 
-    expect(observedStage).toBe("ci-failure");
+    expect(observedStage as NonNullable<typeof observedStage>).toBe("ci-failure");
     expect(result?.outcome).toBe("success");
   });
 });

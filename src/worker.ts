@@ -1312,6 +1312,7 @@ export class RepoWorker {
   }): Promise<void> {
     const issueRef = parseIssueRef(params.task.issue, this.repo);
     if (!issueRef) return;
+    if (!params.prUrl) return;
     await applyMidpointLabelsBestEffortCore({
       issueRef,
       issue: params.task.issue,
