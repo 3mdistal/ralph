@@ -992,6 +992,93 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
   });
 
+  test("waitForRequiredChecks short-circuits on merge conflicts", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    const getPullRequestChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      mergeStateStatus: "DIRTY",
+      baseRefName: "bot/integration",
+      checks: [],
+    }));
+
+    (worker as any).getPullRequestChecks = getPullRequestChecksMock;
+
+    const result = await (worker as any).waitForRequiredChecks(
+      "https://github.com/3mdistal/ralph/pull/999",
+      ["ci"],
+      { timeoutMs: 1_000, pollIntervalMs: 10 }
+    );
+
+    expect(result.stopReason).toBe("merge-conflict");
+    expect(result.timedOut).toBe(false);
+    expect(getPullRequestChecksMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("merge conflicts during required checks block task", async () => {
+    await writeTestConfig();
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ kind: "ok", repoPath: "/tmp", worktreePath: undefined });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+
+    const getPullRequestMergeStateMock = mock(async () => ({
+      number: 999,
+      url: "https://github.com/3mdistal/ralph/pull/999",
+      mergeStateStatus: "CLEAN",
+      isCrossRepository: false,
+      headRefName: "feature-branch",
+      headRepoFullName: "3mdistal/ralph",
+      baseRefName: "bot/integration",
+      labels: [],
+    }));
+
+    const waitForRequiredChecksMock = mock(async () => ({
+      headSha: "deadbeef",
+      mergeStateStatus: "DIRTY",
+      baseRefName: "bot/integration",
+      summary: {
+        status: "pending",
+        required: [{ name: "ci", state: "PENDING", rawState: "PENDING" }],
+        available: [],
+      },
+      checks: [],
+      timedOut: false,
+      stopReason: "merge-conflict",
+    }));
+
+    (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).createAgentRun = async () => {};
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("failed");
+    expect(waitForRequiredChecksMock).toHaveBeenCalled();
+    expect(notifyErrorMock).toHaveBeenCalled();
+    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
+
+    const messages = continueSessionMock.mock.calls.map((call: any[]) => String(call?.[2] ?? ""));
+    const askedForCiFix = messages.some((message: string) =>
+      message.includes("Timed out waiting for required checks") || message.includes("Fix the CI failure")
+    );
+    expect(askedForCiFix).toBe(false);
+  });
+
   test("hard throttle pauses before any model send", async () => {
     const resumeAtTs = Date.now() + 60_000;
 

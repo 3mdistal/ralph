@@ -136,6 +136,11 @@ describe("github queue core", () => {
     expect(plan.claimable).toBe(false);
   });
 
+  test("planClaim rejects done issues", () => {
+    const plan = planClaim(["ralph:queued", "ralph:done"]);
+    expect(plan.claimable).toBe(false);
+  });
+
   test("unblocked issues remain queued and claimable", () => {
     const blockedLabels = ["ralph:queued", "ralph:blocked"];
     const delta = statusToRalphLabelDelta("queued", blockedLabels);
@@ -147,6 +152,11 @@ describe("github queue core", () => {
   test("deriveRalphStatus honors blocked precedence", () => {
     const status = deriveRalphStatus(["ralph:queued", "ralph:blocked"], "OPEN");
     expect(status).toBe("blocked");
+  });
+
+  test("deriveRalphStatus treats ralph:done as done", () => {
+    const status = deriveRalphStatus(["ralph:done", "ralph:queued"], "OPEN");
+    expect(status).toBe("done");
   });
 
   test("shouldRecoverStaleInProgress requires stale heartbeat", () => {
