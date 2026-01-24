@@ -2738,7 +2738,26 @@ ${guidance}`
       if (conflictResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, "merge-conflict", conflictResult, opencodeXdg);
       }
-      throw new Error(`Merge conflict recovery failed: ${conflictResult.output}`);
+
+      const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+        prUrl: existingPr.selectedUrl,
+        baseRefName: prState.baseRefName,
+      });
+      const details = summarizeBlockedDetails(conflictResult.output);
+      await this.markTaskBlocked(task, "merge-conflict", {
+        reason: blockedReasonShort,
+        details,
+        sessionId: conflictResult.sessionId ?? task["session-id"]?.trim(),
+      });
+      await this.notify.notifyError(`Merge conflicts ${task.name}`, notifyBody, task.name);
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: conflictResult.sessionId,
+        escalationReason: blockedReasonShort,
+      };
     }
 
     if (conflictResult.sessionId) {
@@ -2794,33 +2813,15 @@ ${guidance}`
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
 
-    const endTime = new Date();
-    const completedAt = endTime.toISOString().split("T")[0];
-    await this.createAgentRun(task, {
+    return await this.finalizeRecoverySuccess({
+      task,
+      prUrl: mergeGate.prUrl,
       sessionId: mergeGate.sessionId,
-      pr: mergeGate.prUrl,
-      outcome: "success",
-      started: startTime,
-      completed: endTime,
+      startTime,
       surveyResults: surveyResult.output,
+      cacheKey,
+      opencodeXdg,
     });
-
-    await this.queue.updateTaskStatus(task, "done", {
-      "completed-at": completedAt,
-      "session-id": "",
-      "watchdog-retries": "",
-      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
-      ...(task["worker-id"] ? { "worker-id": "" } : {}),
-      ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
-    });
-
-    return {
-      taskName: task.name,
-      repo: this.repo,
-      outcome: "success",
-      sessionId: mergeGate.sessionId,
-      pr: mergeGate.prUrl,
-    };
   }
 
   private async maybeHandleQueuedCiFailure(params: {
@@ -2849,7 +2850,7 @@ ${guidance}`
     if (prStatus.mergeStateStatus === "DIRTY") return null;
 
     const summary = summarizeRequiredChecks(prStatus.checks, requiredChecks);
-    if (summary.status === "success") return null;
+    if (summary.status !== "failure") return null;
 
     console.warn(
       `[ralph:worker:${this.repo}] Existing PR has non-green checks; skipping planner for ${task.issue}.`
@@ -2885,7 +2886,23 @@ ${guidance}`
       if (ciResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, "ci-failure", ciResult, opencodeXdg);
       }
-      throw new Error(`CI recovery failed: ${ciResult.output}`);
+
+      const reason = summarizeBlockedReason(`CI recovery failed for ${existingPr.selectedUrl}`);
+      const details = summarizeBlockedDetails(ciResult.output);
+      await this.markTaskBlocked(task, "ci-failure", {
+        reason,
+        details,
+        sessionId: ciResult.sessionId ?? task["session-id"]?.trim(),
+      });
+      await this.notify.notifyError(`CI recovery ${task.name}`, reason, task.name);
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: ciResult.sessionId,
+        escalationReason: reason,
+      };
     }
 
     if (ciResult.sessionId) {
@@ -2941,32 +2958,67 @@ ${guidance}`
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
 
-    const endTime = new Date();
-    const completedAt = endTime.toISOString().split("T")[0];
-    await this.createAgentRun(task, {
+    return await this.finalizeRecoverySuccess({
+      task,
+      prUrl: mergeGate.prUrl,
       sessionId: mergeGate.sessionId,
-      pr: mergeGate.prUrl,
+      startTime,
+      surveyResults: surveyResult.output,
+      cacheKey,
+      opencodeXdg,
+    });
+  }
+
+  private async finalizeRecoverySuccess(params: {
+    task: AgentTask;
+    prUrl: string;
+    sessionId: string;
+    startTime: Date;
+    surveyResults?: string;
+    cacheKey: string;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+  }): Promise<AgentRun> {
+    const { task, prUrl, sessionId, startTime, surveyResults, cacheKey, opencodeXdg } = params;
+    const worktreePath = task["worktree-path"]?.trim();
+    const workerId = task["worker-id"]?.trim();
+    const repoSlot = task["repo-slot"]?.trim();
+
+    const endTime = new Date();
+    await this.createAgentRun(task, {
+      sessionId,
+      pr: prUrl,
       outcome: "success",
       started: startTime,
       completed: endTime,
-      surveyResults: surveyResult.output,
+      surveyResults,
     });
 
     await this.queue.updateTaskStatus(task, "done", {
-      "completed-at": completedAt,
+      "completed-at": endTime.toISOString().split("T")[0],
       "session-id": "",
       "watchdog-retries": "",
-      ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
-      ...(task["worker-id"] ? { "worker-id": "" } : {}),
-      ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
+      ...(worktreePath ? { "worktree-path": "" } : {}),
+      ...(workerId ? { "worker-id": "" } : {}),
+      ...(repoSlot ? { "repo-slot": "" } : {}),
     });
+
+    await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
+
+    if (worktreePath) {
+      await this.cleanupGitWorktree(worktreePath);
+    }
+
+    await this.assertRepoRootClean(task, "post-run");
+    await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
+
+    console.log(`[ralph:worker:${this.repo}] Task completed (recovery): ${task.name}`);
 
     return {
       taskName: task.name,
       repo: this.repo,
       outcome: "success",
-      sessionId: mergeGate.sessionId,
-      pr: mergeGate.prUrl,
+      sessionId,
+      pr: prUrl ?? undefined,
     };
   }
 
