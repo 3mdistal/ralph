@@ -3,9 +3,10 @@ import { dirname } from "path";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 
-import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
+import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
+import { isSafeSessionId } from "./session-id";
 
-const SCHEMA_VERSION = 7;
+const SCHEMA_VERSION = 8;
 
 export type PrState = "open" | "merged";
 export const PR_STATE_OPEN: PrState = "open";
@@ -93,6 +94,9 @@ function ensureSchema(database: Database): void {
           "CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (repo_id INTEGER PRIMARY KEY, last_merged_at TEXT NOT NULL, last_pr_number INTEGER NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
         );
       }
+      if (existingVersion < 8) {
+        database.exec("ALTER TABLE tasks ADD COLUMN session_events_path TEXT");
+      }
     })();
   }
 
@@ -142,6 +146,7 @@ function ensureSchema(database: Database): void {
       task_name TEXT,
       status TEXT,
       session_id TEXT,
+      session_events_path TEXT,
       worktree_path TEXT,
       worker_id TEXT,
       repo_slot TEXT,
@@ -557,6 +562,7 @@ export function recordTaskSnapshot(input: {
   taskName?: string;
   status?: string;
   sessionId?: string;
+  sessionEventsPath?: string;
   worktreePath?: string;
   workerId?: string;
   repoSlot?: string;
@@ -572,6 +578,9 @@ export function recordTaskSnapshot(input: {
     issueNumber !== null && input.taskPath.startsWith("github:")
       ? `github:${input.repo}#${issueNumber}`
       : input.taskPath;
+  const sessionEventsPath =
+    input.sessionEventsPath ??
+    (input.sessionId && isSafeSessionId(input.sessionId) ? getSessionEventsPath(input.sessionId) : null);
 
   if (issueNumber !== null) {
     database
@@ -591,15 +600,16 @@ export function recordTaskSnapshot(input: {
   database
     .query(
       `INSERT INTO tasks(
-         repo_id, issue_number, task_path, task_name, status, session_id, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, created_at, updated_at
+         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, created_at, updated_at
        ) VALUES (
-          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $created_at, $updated_at
+          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $created_at, $updated_at
        )
        ON CONFLICT(repo_id, task_path) DO UPDATE SET
           issue_number = COALESCE(excluded.issue_number, tasks.issue_number),
           task_name = COALESCE(excluded.task_name, tasks.task_name),
           status = COALESCE(excluded.status, tasks.status),
           session_id = COALESCE(excluded.session_id, tasks.session_id),
+          session_events_path = COALESCE(excluded.session_events_path, tasks.session_events_path),
           worktree_path = COALESCE(excluded.worktree_path, tasks.worktree_path),
           worker_id = COALESCE(excluded.worker_id, tasks.worker_id),
           repo_slot = COALESCE(excluded.repo_slot, tasks.repo_slot),
@@ -614,6 +624,7 @@ export function recordTaskSnapshot(input: {
       $task_name: input.taskName ?? null,
       $status: input.status ?? null,
       $session_id: input.sessionId ?? null,
+      $session_events_path: sessionEventsPath,
       $worktree_path: input.worktreePath ?? null,
       $worker_id: input.workerId ?? null,
       $repo_slot: input.repoSlot ?? null,
@@ -651,6 +662,7 @@ export type TaskOpState = {
   taskPath: string;
   status?: string | null;
   sessionId?: string | null;
+  sessionEventsPath?: string | null;
   worktreePath?: string | null;
   workerId?: string | null;
   repoSlot?: string | null;
@@ -760,8 +772,8 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
   const rows = database
     .query(
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
-              t.worktree_path as worktree_path, t.worker_id as worker_id, t.repo_slot as repo_slot,
-              t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
+              t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
+              t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
        WHERE r.name = $name AND t.issue_number IS NOT NULL AND t.task_path LIKE 'github:%'
@@ -772,6 +784,7 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     issue_number: number | null;
     status?: string | null;
     session_id?: string | null;
+    session_events_path?: string | null;
     worktree_path?: string | null;
     worker_id?: string | null;
     repo_slot?: string | null;
@@ -785,6 +798,7 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     taskPath: row.task_path,
     status: row.status ?? null,
     sessionId: row.session_id ?? null,
+    sessionEventsPath: row.session_events_path ?? null,
     worktreePath: row.worktree_path ?? null,
     workerId: row.worker_id ?? null,
     repoSlot: row.repo_slot ?? null,
@@ -798,8 +812,8 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
   const row = database
     .query(
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
-              t.worktree_path as worktree_path, t.worker_id as worker_id, t.repo_slot as repo_slot,
-              t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
+              t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
+              t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
        WHERE r.name = $name AND t.task_path = $task_path`
@@ -810,6 +824,7 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
         issue_number?: number | null;
         status?: string | null;
         session_id?: string | null;
+        session_events_path?: string | null;
         worktree_path?: string | null;
         worker_id?: string | null;
         repo_slot?: string | null;
@@ -825,6 +840,7 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     taskPath: row.task_path,
     status: row.status ?? null,
     sessionId: row.session_id ?? null,
+    sessionEventsPath: row.session_events_path ?? null,
     worktreePath: row.worktree_path ?? null,
     workerId: row.worker_id ?? null,
     repoSlot: row.repo_slot ?? null,
