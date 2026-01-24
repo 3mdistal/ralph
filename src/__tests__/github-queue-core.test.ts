@@ -154,9 +154,9 @@ describe("github queue core", () => {
     expect(planClaim(updated).claimable).toBe(true);
   });
 
-  test("deriveRalphStatus honors blocked precedence", () => {
+  test("deriveRalphStatus treats queued+blocked as queued", () => {
     const status = deriveRalphStatus(["ralph:queued", "ralph:blocked"], "OPEN");
-    expect(status).toBe("blocked");
+    expect(status).toBe("queued");
   });
 
   test("deriveRalphStatus treats ralph:done as done", () => {

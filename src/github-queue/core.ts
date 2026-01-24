@@ -30,6 +30,7 @@ export function deriveRalphStatus(labels: string[], issueState?: string | null):
   if (labels.includes(RALPH_LABEL_DONE)) return "done";
   if (labels.includes("ralph:in-bot")) return "done";
   if (labels.includes("ralph:escalated")) return "escalated";
+  if (labels.includes("ralph:blocked") && labels.includes("ralph:queued")) return "queued";
   if (labels.includes("ralph:blocked")) return "blocked";
   if (labels.includes("ralph:in-progress")) return "in-progress";
   if (labels.includes("ralph:queued")) return "queued";
