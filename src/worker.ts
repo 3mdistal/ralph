@@ -1510,7 +1510,7 @@ ${guidance}`
     issueNumber: string,
     mode: "start" | "resume",
     repoSlot?: number | null
-  ): Promise<{ repoPath: string; worktreePath?: string }> {
+  ): Promise<{ kind: "ok"; repoPath: string; worktreePath?: string } | { kind: "reset"; reason: string }> {
     const recorded = task["worktree-path"]?.trim();
     if (recorded) {
       if (this.isSameRepoRootPath(recorded)) {
@@ -1520,14 +1520,32 @@ ${guidance}`
         throw new Error(`Recorded worktree-path is outside managed worktrees dir: ${recorded}`);
       }
       if (this.isHealthyWorktreePath(recorded)) {
-        return { repoPath: recorded, worktreePath: recorded };
+        return { kind: "ok", repoPath: recorded, worktreePath: recorded };
+      }
+      const reason = !existsSync(recorded)
+        ? `Recorded worktree-path does not exist: ${recorded}`
+        : `Recorded worktree-path is not a valid git worktree: ${recorded}`;
+
+      if (mode === "resume") {
+        console.warn(`[ralph:worker:${this.repo}] ${reason} (resetting task for retry)`);
+        const updated = await this.queue.updateTaskStatus(task, "queued", {
+          "session-id": "",
+          "worktree-path": "",
+          "worker-id": "",
+          "repo-slot": "",
+          "daemon-id": "",
+          "heartbeat-at": "",
+          "watchdog-retries": "",
+        });
+        if (!updated) {
+          throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
+        }
+        await this.safeRemoveWorktree(recorded, { allowDiskCleanup: true });
+        return { kind: "reset", reason: `${reason} (task reset to queued)` };
       }
 
-      if (!existsSync(recorded)) {
-        throw new Error(`Recorded worktree-path does not exist: ${recorded}`);
-      }
-
-      throw new Error(`Recorded worktree-path is not a valid git worktree: ${recorded}`);
+      console.warn(`[ralph:worker:${this.repo}] ${reason} (recreating worktree)`);
+      await this.safeRemoveWorktree(recorded, { allowDiskCleanup: true });
     }
 
     if (mode === "resume") {
@@ -1544,7 +1562,7 @@ ${guidance}`
       "worktree-path": worktreePath,
     });
 
-    return { repoPath: worktreePath, worktreePath };
+    return { kind: "ok", repoPath: worktreePath, worktreePath };
   }
 
   /**
@@ -3332,47 +3350,60 @@ ${guidance}`
       return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
     }
 
-    await this.assertRepoRootClean(task, "resume");
-
     const workerId = await this.formatWorkerId(task, task._path);
     const allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot());
-    const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
-      task,
-      issueNumber || cacheKey,
-      "resume",
-      allocatedSlot
-    );
-
-    const workerIdChanged = task["worker-id"]?.trim() !== workerId;
-    const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
-
-    if (workerIdChanged || repoSlotChanged) {
-      await this.queue.updateTaskStatus(task, "in-progress", {
-        ...(workerIdChanged ? { "worker-id": workerId } : {}),
-        ...(repoSlotChanged ? { "repo-slot": String(allocatedSlot) } : {}),
-      });
-      task["worker-id"] = workerId;
-      task["repo-slot"] = String(allocatedSlot);
-    }
-
-    const eventWorkerId = task["worker-id"]?.trim();
-
-    ralphEventBus.publish(
-      buildRalphEvent({
-        type: "worker.created",
-        level: "info",
-        ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
-        repo: this.repo,
-        taskId: task._path,
-        sessionId: existingSessionId,
-        data: {
-          ...(worktreePath ? { worktreePath } : {}),
-          ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
-        },
-      })
-    );
 
     try {
+      await this.assertRepoRootClean(task, "resume");
+
+      const resolvedRepoPath = await this.resolveTaskRepoPath(
+        task,
+        issueNumber || cacheKey,
+        "resume",
+        allocatedSlot
+      );
+
+      if (resolvedRepoPath.kind === "reset") {
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: existingSessionId,
+          escalationReason: resolvedRepoPath.reason,
+        };
+      }
+
+      const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
+
+      const workerIdChanged = task["worker-id"]?.trim() !== workerId;
+      const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
+
+      if (workerIdChanged || repoSlotChanged) {
+        await this.queue.updateTaskStatus(task, "in-progress", {
+          ...(workerIdChanged ? { "worker-id": workerId } : {}),
+          ...(repoSlotChanged ? { "repo-slot": String(allocatedSlot) } : {}),
+        });
+        task["worker-id"] = workerId;
+        task["repo-slot"] = String(allocatedSlot);
+      }
+
+      const eventWorkerId = task["worker-id"]?.trim();
+
+      ralphEventBus.publish(
+        buildRalphEvent({
+          type: "worker.created",
+          level: "info",
+          ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
+          repo: this.repo,
+          taskId: task._path,
+          sessionId: existingSessionId,
+          data: {
+            ...(worktreePath ? { worktreePath } : {}),
+            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
+          },
+        })
+      );
+
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
 
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
@@ -3841,12 +3872,11 @@ ${guidance}`
 
       await this.ensureBranchProtectionOnce();
 
-      const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
-        task,
-        issueNumber,
-        "start",
-        allocatedSlot
-      );
+      const resolvedRepoPath = await this.resolveTaskRepoPath(task, issueNumber, "start", allocatedSlot);
+      if (resolvedRepoPath.kind !== "ok") {
+        throw new Error(resolvedRepoPath.reason);
+      }
+      const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
 
       ralphEventBus.publish(
         buildRalphEvent({
