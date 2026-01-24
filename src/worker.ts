@@ -37,6 +37,7 @@ import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-
 import { continueCommand, continueSession, getRalphXdgCacheHome, runAgent, type SessionResult } from "./session";
 import { buildPlannerPrompt } from "./planner-prompt";
 import { getThrottleDecision } from "./throttle";
+import { LogLimiter } from "./logging";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
@@ -173,6 +174,8 @@ const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
 const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
+const IGNORED_BODY_DEPS_LOG_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const IGNORED_BODY_DEPS_LOG_MAX_KEYS = 2000;
 const BLOCKED_REASON_MAX_LEN = 200;
 const BLOCKED_DETAILS_MAX_LEN = 2000;
 
@@ -726,7 +729,7 @@ export class RepoWorker {
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
-  private ignoredBodyDepsLog = new Set<string>();
+  private ignoredBodyDepsLogLimiter = new LogLimiter({ maxKeys: IGNORED_BODY_DEPS_LOG_MAX_KEYS });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -1681,8 +1684,7 @@ ${guidance}`
 
   private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {
     const key = `${issue.repo}#${issue.number}`;
-    if (this.ignoredBodyDepsLog.has(key)) return;
-    this.ignoredBodyDepsLog.add(key);
+    if (!this.ignoredBodyDepsLogLimiter.shouldLog(key, IGNORED_BODY_DEPS_LOG_INTERVAL_MS)) return;
     const reasonLabel = reason === "complete" ? "complete" : "partial";
     console.log(
       `[ralph:worker:${this.repo}] Ignoring ${ignoredCount} body blocker(s) for ${formatIssueRef(issue)} due to ${reasonLabel} ` +
