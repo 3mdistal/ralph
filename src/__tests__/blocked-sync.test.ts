@@ -160,6 +160,33 @@ describe("syncBlockedStateForTasks", () => {
     expect(removeIssueLabelMock).not.toHaveBeenCalled();
   });
 
+  test("removes blocked label when deps unblock succeeds", async () => {
+    updateTaskStatusMock.mockClear();
+    const removeIssueLabelMock = mock(async () => {});
+    const provider: IssueRelationshipProvider = {
+      getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
+        issue,
+        signals: [],
+        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
+      }),
+    };
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+      relationships: provider,
+    });
+
+    (worker as any).removeIssueLabel = removeIssueLabelMock;
+    const task = createTask({ status: "blocked", "blocked-source": "deps" });
+    await worker.syncBlockedStateForTasks([task]);
+
+    expect(updateTaskStatusMock).toHaveBeenCalledTimes(1);
+    expect(removeIssueLabelMock).toHaveBeenCalledTimes(1);
+  });
+
   test("ignores body blockers when GitHub deps coverage is present", async () => {
     updateTaskStatusMock.mockClear();
     const provider: IssueRelationshipProvider = {
