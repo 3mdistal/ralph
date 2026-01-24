@@ -9,8 +9,8 @@ async function writeMessage(opts: {
   root: string;
   session: string;
   file: string;
-  providerID: string;
-  role: string;
+  providerID?: string;
+  role?: string;
   tokens?: {
     input?: number;
     output?: number;
@@ -22,21 +22,20 @@ async function writeMessage(opts: {
   const dir = join(opts.root, opts.session);
   await mkdir(dir, { recursive: true });
 
-  const msg = {
-    providerID: opts.providerID,
-    role: opts.role,
-    tokens: opts.tokens
-      ? {
-          input: opts.tokens.input,
-          output: opts.tokens.output,
-          reasoning: opts.tokens.reasoning,
-          cache: {
-            read: opts.tokens.cacheRead,
-            write: opts.tokens.cacheWrite,
-          },
-        }
-      : undefined,
-  };
+  const msg: Record<string, unknown> = {};
+  if (opts.providerID !== undefined) msg.providerID = opts.providerID;
+  if (opts.role !== undefined) msg.role = opts.role;
+  if (opts.tokens) {
+    msg.tokens = {
+      input: opts.tokens.input,
+      output: opts.tokens.output,
+      reasoning: opts.tokens.reasoning,
+      cache: {
+        read: opts.tokens.cacheRead,
+        write: opts.tokens.cacheWrite,
+      },
+    };
+  }
 
   await writeFile(join(dir, opts.file), JSON.stringify(msg), "utf8");
 }
@@ -73,6 +72,14 @@ describe("opencode session token totals", () => {
         tokens: { input: 999, output: 999, reasoning: 999 },
       });
 
+      await writeMessage({
+        root,
+        session: "ses_a",
+        file: "msg_4.json",
+        role: "assistant",
+        tokens: { input: 2, output: 2, reasoning: 2 },
+      });
+
       const totals = await readOpencodeSessionTokenTotals({
         sessionId: "ses_a",
         messagesRootDir: root,
@@ -80,7 +87,7 @@ describe("opencode session token totals", () => {
         includeCache: true,
       });
 
-      expect(totals).toEqual({ input: 10, output: 20, reasoning: 30, total: 60, cacheRead: 5, cacheWrite: 7 });
+      expect(totals).toEqual({ input: 12, output: 22, reasoning: 32, total: 66, cacheRead: 5, cacheWrite: 7 });
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -109,9 +116,17 @@ describe("opencode session token totals", () => {
         role: "assistant",
       });
 
+      await writeMessage({
+        root,
+        session: "ses_b",
+        file: "msg_4.json",
+        providerID: "openai",
+        tokens: { input: 1, output: 1, reasoning: 1 },
+      });
+
       const totals = await readOpencodeSessionTokenTotals({ sessionId: "ses_b", messagesRootDir: root });
 
-      expect(totals).toEqual({ input: 3, output: 1, reasoning: 1, total: 5 });
+      expect(totals).toEqual({ input: 4, output: 2, reasoning: 2, total: 8 });
     } finally {
       await rm(root, { recursive: true, force: true });
     }

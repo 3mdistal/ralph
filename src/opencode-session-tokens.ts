@@ -3,6 +3,8 @@ import { readFile, readdir } from "fs/promises";
 import { homedir } from "os";
 import { join } from "path";
 
+import { extractProviderId, extractRole } from "./opencode-message-utils";
+
 type OpencodeMessage = {
   providerID?: unknown;
   role?: unknown;
@@ -50,8 +52,11 @@ function applyMessageTokens(
   msg: OpencodeMessage,
   opts: { providerID?: string; includeCache: boolean }
 ): void {
-  if (msg?.role !== "assistant") return;
-  if (opts.providerID && msg?.providerID !== opts.providerID) return;
+  const role = extractRole(msg);
+  if (role && role !== "assistant") return;
+
+  const msgProvider = extractProviderId(msg);
+  if (opts.providerID && msgProvider && msgProvider !== opts.providerID) return;
 
   acc.input += toFiniteNumber(msg?.tokens?.input);
   acc.output += toFiniteNumber(msg?.tokens?.output);
@@ -126,6 +131,7 @@ export function sumOpencodeSessionTokens(
 export async function readOpencodeSessionTokenTotals(opts: {
   sessionId: string;
   messagesRootDir?: string;
+  /** Optional provider filter; if unset, counts all providers. */
   providerID?: string;
   includeCache?: boolean;
 }): Promise<OpencodeSessionTokenTotals> {
