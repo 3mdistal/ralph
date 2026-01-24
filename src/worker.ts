@@ -2663,11 +2663,10 @@ ${guidance}`
   }
 
   private buildCiFailurePrompt(prUrl: string, summary: RequiredChecksSummary): string {
-    const statusLine = summary.status === "pending" ? "Required checks are pending." : "Required checks are failing.";
     return [
       `An open PR already exists for this issue: ${prUrl}.`,
       "Do NOT create a new PR.",
-      statusLine,
+      "Required checks are failing.",
       "Fix failing CI checks or re-run stalled workflows on the existing PR branch.",
       "After checks pass, continue with the existing PR only.",
       "",
@@ -4785,6 +4784,7 @@ ${guidance}`
         throw new Error(resolvedRepoPath.reason);
       }
       const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
+      if (worktreePath) task["worktree-path"] = worktreePath;
 
       ralphEventBus.publish(
         buildRalphEvent({
