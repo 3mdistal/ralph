@@ -55,7 +55,7 @@ import { RALPH_LABEL_BLOCKED } from "./github-labels";
 import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
-import { writeEscalationToGitHub } from "./github/escalation-writeback";
+import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
@@ -174,6 +174,7 @@ const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
 const BLOCKED_REASON_MAX_LEN = 200;
+const BLOCKED_DETAILS_MAX_LEN = 2000;
 
 interface IntrospectionSummary {
   sessionId: string;
@@ -254,8 +255,12 @@ function summarizeForNote(text: string, maxChars = 900): string {
   return trimmed.slice(0, maxChars).trimEnd() + "…";
 }
 
+function sanitizeDiagnosticsText(text: string): string {
+  return sanitizeEscalationReason(text);
+}
+
 function summarizeBlockedReason(text: string): string {
-  const trimmed = text.trim();
+  const trimmed = sanitizeDiagnosticsText(text).trim();
   if (!trimmed) return "";
   if (trimmed.length <= BLOCKED_REASON_MAX_LEN) return trimmed;
   return trimmed.slice(0, BLOCKED_REASON_MAX_LEN).trimEnd() + "…";
@@ -295,6 +300,80 @@ function formatMergeConflictMessage(params: {
     .filter(Boolean)
     .join("\n");
   return { blockedReasonShort, notifyBody };
+}
+
+function summarizeBlockedDetails(text: string): string {
+  const trimmed = sanitizeDiagnosticsText(text).trim();
+  if (!trimmed) return "";
+  if (trimmed.length <= BLOCKED_DETAILS_MAX_LEN) return trimmed;
+  return trimmed.slice(0, BLOCKED_DETAILS_MAX_LEN).trimEnd() + "…";
+}
+
+function buildBlockedSignature(source?: BlockedSource, reason?: string): string {
+  return `${source ?? ""}::${reason ?? ""}`;
+}
+
+function computeBlockedPatch(
+  task: AgentTask,
+  opts: { source: BlockedSource; reason?: string; details?: string; nowIso: string }
+): {
+  patch: Record<string, string>;
+  didEnterBlocked: boolean;
+  reasonSummary: string;
+  detailsSummary: string;
+} {
+  const reasonSummary = opts.reason ? summarizeBlockedReason(opts.reason) : "";
+  const detailsSource = opts.details ?? opts.reason ?? "";
+  const detailsSummary = detailsSource ? summarizeBlockedDetails(detailsSource) : "";
+  const previousSignature = buildBlockedSignature(task["blocked-source"], task["blocked-reason"]);
+  const nextSignature = buildBlockedSignature(opts.source, reasonSummary);
+  const didChangeSignature = previousSignature !== nextSignature;
+  const didEnterBlocked = task.status !== "blocked" || didChangeSignature;
+
+  const patch: Record<string, string> = {
+    "blocked-source": opts.source,
+    "blocked-reason": reasonSummary,
+    "blocked-details": detailsSummary,
+    "blocked-checked-at": opts.nowIso,
+  };
+
+  if (didEnterBlocked) {
+    patch["blocked-at"] = opts.nowIso;
+  }
+
+  return { patch, didEnterBlocked, reasonSummary, detailsSummary };
+}
+
+function applyTaskPatch(task: AgentTask, status: AgentTask["status"], patch: Record<string, string | number>): void {
+  task.status = status;
+  for (const [key, value] of Object.entries(patch)) {
+    (task as unknown as Record<string, unknown>)[key] = typeof value === "number" ? String(value) : value;
+  }
+}
+
+function buildAgentRunBodyPrefix(params: {
+  task: AgentTask;
+  headline: string;
+  reason?: string;
+  details?: string;
+  sessionId?: string;
+  runLogPath?: string;
+}): string {
+  const lines: string[] = [params.headline];
+  lines.push("", `Issue: ${params.task.issue}`, `Repo: ${params.task.repo}`);
+  if (params.sessionId) lines.push(`Session: ${params.sessionId}`);
+  if (params.runLogPath) lines.push(`Run log: ${params.runLogPath}`);
+
+  const sanitizedReason = params.reason ? sanitizeDiagnosticsText(params.reason) : "";
+  const reasonSummary = sanitizedReason ? summarizeForNote(sanitizedReason, 800) : "";
+  if (reasonSummary) lines.push("", `Reason: ${reasonSummary}`);
+
+  const sanitizedDetails = params.details ? sanitizeDiagnosticsText(params.details) : "";
+  const detailText =
+    sanitizedDetails && sanitizedDetails !== sanitizedReason ? summarizeForNote(sanitizedDetails, 1400) : "";
+  if (detailText) lines.push("", "Details:", detailText);
+
+  return lines.join("\n").trim();
 }
 
 function resolveVaultPath(p: string): string {
@@ -675,6 +754,7 @@ export class RepoWorker {
 
     await this.markTaskBlocked(task, "allowlist", {
       reason,
+      skipRunNote: true,
       extraFields: {
         "completed-at": completedAt,
         "session-id": "",
@@ -725,6 +805,7 @@ export class RepoWorker {
 
     await this.markTaskBlocked(task, "dirty-repo", {
       reason,
+      skipRunNote: true,
       extraFields: {
         "completed-at": new Date().toISOString().split("T")[0],
         "session-id": "",
@@ -759,27 +840,106 @@ export class RepoWorker {
   private async markTaskBlocked(
     task: AgentTask,
     source: BlockedSource,
-    opts?: { reason?: string; extraFields?: Record<string, string | number> }
+    opts?: {
+      reason?: string;
+      details?: string;
+      sessionId?: string;
+      runLogPath?: string;
+      extraFields?: Record<string, string | number>;
+      skipRunNote?: boolean;
+    }
   ): Promise<boolean> {
     if (!BLOCKED_SOURCES.includes(source)) {
       console.warn(`[ralph:worker:${this.repo}] Unknown blocked-source '${source}'; defaulting to runtime-error`);
       source = "runtime-error";
     }
-    const now = new Date().toISOString();
-    const reason = opts?.reason ? summarizeBlockedReason(opts.reason) : "";
-    return await this.queue.updateTaskStatus(task, "blocked", {
-      "blocked-source": source,
-      "blocked-reason": reason,
-      "blocked-checked-at": now,
-      ...(opts?.extraFields ?? {}),
+    const nowIso = new Date().toISOString();
+    const { patch, didEnterBlocked, reasonSummary } = computeBlockedPatch(task, {
+      source,
+      reason: opts?.reason,
+      details: opts?.details,
+      nowIso,
     });
+    const extraFields = opts?.extraFields ?? {};
+    const reservedBlockedFields = new Set([
+      "blocked-source",
+      "blocked-reason",
+      "blocked-at",
+      "blocked-details",
+      "blocked-checked-at",
+    ]);
+    const sanitizedExtraFields = Object.fromEntries(
+      Object.entries(extraFields).filter(([key]) => {
+        if (!reservedBlockedFields.has(key)) return true;
+        console.warn(`[ralph:worker:${this.repo}] Ignoring blocked override field '${key}' in markTaskBlocked`);
+        return false;
+      })
+    );
+    const updatePatch = { ...sanitizedExtraFields, ...patch };
+    const updated = await this.queue.updateTaskStatus(task, "blocked", updatePatch);
+
+    if (updated) {
+      applyTaskPatch(task, "blocked", updatePatch);
+    }
+
+    if (updated && didEnterBlocked && !opts?.skipRunNote) {
+      const sessionId = (opts?.sessionId ?? task["session-id"]?.trim()) || undefined;
+      const runLogPath = (opts?.runLogPath ?? task["run-log-path"]?.trim()) || undefined;
+      const details = opts?.details ?? opts?.reason ?? "";
+      const bodyPrefix = buildAgentRunBodyPrefix({
+        task,
+        headline: `Blocked: ${source}`,
+        reason: reasonSummary,
+        details,
+        sessionId,
+        runLogPath,
+      });
+      const runTime = new Date();
+      await this.createAgentRun(task, {
+        outcome: "failed",
+        sessionId,
+        started: runTime,
+        completed: runTime,
+        bodyPrefix,
+      });
+    }
+
+    return updated;
   }
 
   private async markTaskUnblocked(task: AgentTask): Promise<boolean> {
-    return await this.queue.updateTaskStatus(task, "queued", {
+    const updatePatch = {
       "blocked-source": "",
       "blocked-reason": "",
+      "blocked-at": "",
+      "blocked-details": "",
       "blocked-checked-at": "",
+    };
+    const updated = await this.queue.updateTaskStatus(task, "queued", updatePatch);
+    if (updated) {
+      applyTaskPatch(task, "queued", updatePatch);
+    }
+    return updated;
+  }
+
+  private async recordEscalatedRunNote(task: AgentTask, params: { reason: string; sessionId?: string; details?: string }) {
+    const sessionId = (params.sessionId ?? task["session-id"]?.trim()) || undefined;
+    const runLogPath = task["run-log-path"]?.trim() || undefined;
+    const bodyPrefix = buildAgentRunBodyPrefix({
+      task,
+      headline: "Escalated",
+      reason: params.reason,
+      details: params.details,
+      sessionId,
+      runLogPath,
+    });
+    const runTime = new Date();
+    await this.createAgentRun(task, {
+      outcome: "escalated",
+      sessionId,
+      started: runTime,
+      completed: runTime,
+      bodyPrefix,
     });
   }
 
@@ -1408,7 +1568,8 @@ ${guidance}`
           const isBlockedForOtherReason =
             task.status === "blocked" && task["blocked-source"] && task["blocked-source"] !== "deps";
           if (isBlockedForOtherReason) continue;
-          await this.markTaskBlocked(task, "deps", { reason: decision.reasons.join("; ") || "blocked by dependencies" });
+          const reason = decision.reasons.join("; ") || "blocked by dependencies";
+          await this.markTaskBlocked(task, "deps", { reason, details: reason });
         }
 
         try {
@@ -1422,18 +1583,27 @@ ${guidance}`
       }
 
       if (!decision.blocked && decision.confidence === "certain") {
+        let shouldRemoveBlockedLabel = true;
         for (const task of entry.tasks) {
-          if (task.status === "blocked" && task["blocked-source"] === "deps") {
-            await this.markTaskUnblocked(task);
+          if (task.status !== "blocked") continue;
+          if (task["blocked-source"] !== "deps") {
+            shouldRemoveBlockedLabel = false;
+            continue;
+          }
+          const unblocked = await this.markTaskUnblocked(task);
+          if (!unblocked) {
+            shouldRemoveBlockedLabel = false;
           }
         }
 
-        try {
-          await this.removeIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
-          );
+        if (shouldRemoveBlockedLabel) {
+          try {
+            await this.removeIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
+          } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
+            );
+          }
         }
       }
     }
@@ -2818,6 +2988,7 @@ ${guidance}`
 
       await this.markTaskBlocked(params.task, "merge-target", {
         reason,
+        skipRunNote: true,
         extraFields: {
           "completed-at": completedAt,
           "session-id": "",
@@ -2862,6 +3033,7 @@ ${guidance}`
 
       await this.markTaskBlocked(params.task, "ci-only", {
         reason,
+        skipRunNote: true,
         extraFields: {
           "completed-at": completedAt,
           "session-id": "",
@@ -2902,7 +3074,11 @@ ${guidance}`
             const reason = `PR has merge conflicts; refusing auto-update ${prUrl}`;
             console.warn(`[ralph:worker:${this.repo}] ${reason}`);
             this.recordAutoUpdateFailure(prState, minMinutes);
-            await this.markTaskBlocked(params.task, "merge-conflict", { reason: blockedReasonShort });
+            await this.markTaskBlocked(params.task, "merge-conflict", {
+              reason: blockedReasonShort,
+              details: notifyBody,
+              sessionId,
+            });
             await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
 
             return {
@@ -2945,7 +3121,7 @@ ${guidance}`
           } catch {
             // best-effort
           }
-          await this.markTaskBlocked(params.task, "auto-update", { reason });
+          await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
           await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
           return {
@@ -3035,7 +3211,7 @@ ${guidance}`
             } catch (updateError: any) {
               const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
               console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-              await this.markTaskBlocked(params.task, "auto-update", { reason });
+              await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
               await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
               return {
@@ -3059,7 +3235,7 @@ ${guidance}`
       if (failureSignature !== "none" && failureSignature === lastFailureSignature) {
         const reason = `CI failed repeatedly with identical failures; stopping remediation for ${prUrl}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.markTaskBlocked(params.task, "ci-failure", { reason });
+        await this.markTaskBlocked(params.task, "ci-failure", { reason, details: reason, sessionId });
         await this.notify.notifyError(
           params.notifyTitle,
           [reason, this.formatRemediationFailureContext(baseFailureContext)].filter(Boolean).join("\n\n"),
@@ -3082,7 +3258,7 @@ ${guidance}`
       if (!this.isActionableFailureContext(actionCheckContext)) {
         const reason = `CI failed with non-actionable status; refusing to remediate ${prUrl}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.markTaskBlocked(params.task, "ci-failure", { reason });
+        await this.markTaskBlocked(params.task, "ci-failure", { reason, details: reason, sessionId });
         await this.notify.notifyError(
           params.notifyTitle,
           [reason, this.formatRemediationFailureContext(actionCheckContext)].filter(Boolean).join("\n\n"),
@@ -3162,7 +3338,7 @@ ${guidance}`
 
         const reason = `Failed while fixing CI before merge: ${fixResult.output}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.markTaskBlocked(params.task, "ci-failure", { reason });
+        await this.markTaskBlocked(params.task, "ci-failure", { reason, details: reason, sessionId });
         await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
         return {
@@ -3189,7 +3365,7 @@ ${guidance}`
     const reason = `Required checks not passing after ${MAX_CI_FIX_ATTEMPTS} attempt(s); refusing to merge ${prUrl}`;
     console.warn(`[ralph:worker:${this.repo}] ${reason}`);
 
-    await this.markTaskBlocked(params.task, "ci-failure", { reason });
+    await this.markTaskBlocked(params.task, "ci-failure", { reason, details: reason, sessionId });
     await this.notify.notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
 
     return {
@@ -3427,7 +3603,30 @@ ${guidance}`
 
     if (sid) extraFields["session-id"] = sid;
 
-    await this.queue.updateTaskStatus(task, "throttled", extraFields);
+    const enteringThrottled = task.status !== "throttled";
+    const updated = await this.queue.updateTaskStatus(task, "throttled", extraFields);
+    if (updated) {
+      applyTaskPatch(task, "throttled", extraFields);
+    }
+
+    if (updated && enteringThrottled) {
+      const bodyPrefix = buildAgentRunBodyPrefix({
+        task,
+        headline: `Throttled: hard limit (${stage})`,
+        reason: `Resume at: ${resumeAt || "unknown"}`,
+        details: JSON.stringify(decision.snapshot),
+        sessionId: sid || undefined,
+        runLogPath: task["run-log-path"]?.trim() || undefined,
+      });
+      const runTime = new Date();
+      await this.createAgentRun(task, {
+        outcome: "throttled",
+        sessionId: sid || undefined,
+        started: runTime,
+        completed: runTime,
+        bodyPrefix,
+      });
+    }
 
     console.log(
       `[ralph:worker:${this.repo}] Hard throttle active; pausing at checkpoint stage=${stage} resumeAt=${resumeAt || "unknown"}`
@@ -3530,7 +3729,11 @@ ${guidance}`
     };
     if (result.sessionId) escalationFields["session-id"] = result.sessionId;
 
-    await this.queue.updateTaskStatus(task, "escalated", escalationFields);
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
+    if (escalated) {
+      applyTaskPatch(task, "escalated", escalationFields);
+    }
 
     await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
     await this.notify.notifyEscalation({
@@ -3546,6 +3749,14 @@ ${guidance}`
       escalationType: "other",
       planOutput: result.output,
     });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
+        details: result.output,
+      });
+    }
 
     return {
       taskName: task.name,
@@ -3776,7 +3987,11 @@ ${guidance}`
             const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
-            await this.queue.updateTaskStatus(task, "escalated");
+            const wasEscalated = task.status === "escalated";
+            const escalated = await this.queue.updateTaskStatus(task, "escalated");
+            if (escalated) {
+              applyTaskPatch(task, "escalated", {});
+            }
             await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
             await this.notify.notifyEscalation({
               taskName: task.name,
@@ -3789,6 +4004,14 @@ ${guidance}`
               escalationType: "other",
               planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
+
+            if (escalated && !wasEscalated) {
+              await this.recordEscalatedRunNote(task, {
+                reason,
+                sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
+                details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+              });
+            }
 
             return {
               taskName: task.name,
@@ -3950,7 +4173,11 @@ ${guidance}`
         const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await this.queue.updateTaskStatus(task, "escalated");
+        const wasEscalated = task.status === "escalated";
+        const escalated = await this.queue.updateTaskStatus(task, "escalated");
+        if (escalated) {
+          applyTaskPatch(task, "escalated", {});
+        }
         await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
         await this.notify.notifyEscalation({
           taskName: task.name,
@@ -3963,6 +4190,14 @@ ${guidance}`
           escalationType: "other",
           planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
         });
+
+        if (escalated && !wasEscalated) {
+          await this.recordEscalatedRunNote(task, {
+            reason,
+            sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
+            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+          });
+        }
 
         return {
           taskName: task.name,
@@ -4087,7 +4322,9 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
       if (!error?.ralphRootDirty) {
-        await this.markTaskBlocked(task, "runtime-error", { reason: error?.message ?? String(error) });
+        const reason = error?.message ?? String(error);
+        const details = error?.stack ?? reason;
+        await this.markTaskBlocked(task, "runtime-error", { reason, details });
         await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
       }
 
@@ -4406,7 +4643,11 @@ ${guidance}`
 
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await this.queue.updateTaskStatus(task, "escalated");
+        const wasEscalated = task.status === "escalated";
+        const escalated = await this.queue.updateTaskStatus(task, "escalated");
+        if (escalated) {
+          applyTaskPatch(task, "escalated", {});
+        }
         await this.writeEscalationWriteback(task, { reason, escalationType });
         await this.notify.notifyEscalation({
           taskName: task.name,
@@ -4428,6 +4669,14 @@ ${guidance}`
             : undefined,
           devex: devexContext,
         });
+
+        if (escalated && !wasEscalated) {
+          await this.recordEscalatedRunNote(task, {
+            reason,
+            sessionId: planResult.sessionId,
+            details: planResult.output,
+          });
+        }
 
         return {
           taskName: task.name,
@@ -4546,7 +4795,11 @@ ${guidance}`
             const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
             console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
 
-            await this.queue.updateTaskStatus(task, "escalated");
+            const wasEscalated = task.status === "escalated";
+            const escalated = await this.queue.updateTaskStatus(task, "escalated");
+            if (escalated) {
+              applyTaskPatch(task, "escalated", {});
+            }
             await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
             await this.notify.notifyEscalation({
               taskName: task.name,
@@ -4559,6 +4812,14 @@ ${guidance}`
               escalationType: "other",
               planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
+
+            if (escalated && !wasEscalated) {
+              await this.recordEscalatedRunNote(task, {
+                reason,
+                sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
+                details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+              });
+            }
 
             return {
               taskName: task.name,
@@ -4714,7 +4975,11 @@ ${guidance}`
         const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
-        await this.queue.updateTaskStatus(task, "escalated");
+        const wasEscalated = task.status === "escalated";
+        const escalated = await this.queue.updateTaskStatus(task, "escalated");
+        if (escalated) {
+          applyTaskPatch(task, "escalated", {});
+        }
         await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
         await this.notify.notifyEscalation({
           taskName: task.name,
@@ -4727,6 +4992,14 @@ ${guidance}`
           escalationType: "other",
           planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
         });
+
+        if (escalated && !wasEscalated) {
+          await this.recordEscalatedRunNote(task, {
+            reason,
+            sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
+            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+          });
+        }
 
         return {
           taskName: task.name,
@@ -4854,7 +5127,9 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
       if (!error?.ralphRootDirty) {
-        await this.markTaskBlocked(task, "runtime-error", { reason: error?.message ?? String(error) });
+        const reason = error?.message ?? String(error);
+        const details = error?.stack ?? reason;
+        await this.markTaskBlocked(task, "runtime-error", { reason, details });
         await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
       }
 
@@ -4887,6 +5162,14 @@ ${guidance}`
   ): Promise<void> {
     const vault = getBwrbVaultForStorage("create agent-run note");
     if (!vault) {
+      return;
+    }
+    const taskPath = typeof task._path === "string" ? task._path : "";
+    const resolvedTaskPath = taskPath.endsWith(".md") ? resolveVaultPath(taskPath) : "";
+    if (!resolvedTaskPath || !existsSync(resolvedTaskPath)) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Skipping agent-run note; task note missing at ${taskPath || "(unknown)"}`
+      );
       return;
     }
     const today = data.completed.toISOString().split("T")[0];
