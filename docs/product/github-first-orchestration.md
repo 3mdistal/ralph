@@ -110,6 +110,7 @@ Requeue resolution (non-dependency blocked tasks):
 - When Ralph claims the task again, it clears all `blocked-*` metadata and resumes work.
 - If a `session-id` exists, Ralph resumes the prior OpenCode session; otherwise it starts a fresh session.
 - Requeue does not override dependency blockers; if dependencies are still open, Ralph keeps the issue blocked.
+- In that case Ralph leaves `ralph:queued` in place and rechecks when dependencies change.
 
 ## Done semantics (Pattern A)
 
