@@ -12,6 +12,7 @@ let autoUpdateEnabled = false;
 let autoUpdateLabelGate: string | null = null;
 let autoUpdateMinMinutes = 30;
 let botBranchOverride: string | null = null;
+let originalGetIssuePrResolution: ((issueNumber: string) => Promise<any>) | null = null;
 
 let homeDir: string;
 let priorHome: string | undefined;
@@ -183,12 +184,24 @@ describe("integration-ish harness: full task lifecycle", () => {
     );
 
     await writeTestConfig();
+    if (!originalGetIssuePrResolution) {
+      originalGetIssuePrResolution = (RepoWorker as any).prototype.getIssuePrResolution;
+    }
+    (RepoWorker as any).prototype.getIssuePrResolution = async () => ({
+      selectedUrl: null,
+      duplicates: [],
+      source: null,
+      diagnostics: [],
+    });
   });
 
   afterEach(async () => {
     process.env.HOME = priorHome;
     await rm(homeDir, { recursive: true, force: true });
     __resetConfigForTests();
+    if (originalGetIssuePrResolution) {
+      (RepoWorker as any).prototype.getIssuePrResolution = originalGetIssuePrResolution;
+    }
     releaseLock?.();
     releaseLock = null;
   });
