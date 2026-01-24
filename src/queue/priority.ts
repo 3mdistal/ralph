@@ -10,9 +10,10 @@ const PRIORITY_BY_INDEX: TaskPriority[] = [
   "p4-backlog",
 ];
 
-export function inferPriorityFromLabels(labels: string[]): TaskPriority {
+export function inferPriorityFromLabels(labels?: readonly string[] | null): TaskPriority {
   let bestIndex: number | null = null;
-  for (const label of labels) {
+  const entries = labels ?? [];
+  for (const label of entries) {
     const match = label.match(/^p([0-4])/i);
     if (!match) continue;
     const index = Number.parseInt(match[1], 10);
