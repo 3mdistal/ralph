@@ -50,11 +50,9 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import {
-  computeRalphLabelSync,
-  RALPH_LABEL_BLOCKED,
-} from "./github-labels";
+import { RALPH_LABEL_BLOCKED } from "./github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import {
@@ -550,6 +548,7 @@ export class RepoWorker {
   private notify: NotifyAdapter;
   private throttle: ThrottleAdapter;
   private github: GitHubClient;
+  private labelEnsurer: ReturnType<typeof createRalphWorkflowLabelsEnsurer>;
 
   constructor(
     public readonly repo: string,
@@ -568,9 +567,11 @@ export class RepoWorker {
     this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
     this.github = new GitHubClient(this.repo);
     this.relationships = opts?.relationships ?? new GitHubRelationshipProvider(this.repo, this.github);
+    this.labelEnsurer = createRalphWorkflowLabelsEnsurer({
+      githubFactory: () => this.github,
+    });
   }
 
-  private ensureLabelsPromise: Promise<void> | null = null;
   private ensureBranchProtectionPromise: Promise<void> | null = null;
   private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
   private repoSlotsInUse: Set<number> | null = null;
@@ -714,46 +715,7 @@ export class RepoWorker {
   }
 
   private async ensureRalphWorkflowLabelsOnce(): Promise<void> {
-    if (this.ensureLabelsPromise) return this.ensureLabelsPromise;
-
-    this.ensureLabelsPromise = (async () => {
-      try {
-        const existing = await this.github.listLabelSpecs();
-        const { toCreate, toUpdate } = computeRalphLabelSync(existing);
-        if (toCreate.length === 0 && toUpdate.length === 0) return;
-
-        const created: string[] = [];
-        for (const label of toCreate) {
-          try {
-            await this.github.createLabel(label);
-            created.push(label.name);
-          } catch (e: any) {
-            if (e instanceof GitHubApiError) {
-              if (e.status === 422 && /already exists/i.test(e.responseText)) continue;
-            }
-            throw e;
-          }
-        }
-
-        const updated: string[] = [];
-        for (const update of toUpdate) {
-          await this.github.updateLabel(update.currentName, update.patch);
-          updated.push(update.currentName);
-        }
-
-        if (created.length > 0) {
-          console.log(`[ralph:worker:${this.repo}] Created GitHub label(s): ${created.join(", ")}`);
-        }
-        if (updated.length > 0) {
-          console.log(`[ralph:worker:${this.repo}] Updated GitHub label(s): ${updated.join(", ")}`);
-        }
-      } catch (error) {
-        this.ensureLabelsPromise = null;
-        throw error;
-      }
-    })();
-
-    return this.ensureLabelsPromise;
+    await this.labelEnsurer.ensure(this.repo);
   }
 
   private async githubApiRequest<T>(
@@ -3696,6 +3658,8 @@ ${guidance}`
       const opencodeXdg = resolvedOpencode.opencodeXdg;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
+      await this.ensureRalphWorkflowLabelsOnce();
+
       // 3. Mark task starting (restart-safe pre-session state)
       const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
@@ -3709,7 +3673,6 @@ ${guidance}`
         throw new Error("Failed to mark task starting (bwrb edit failed)");
       }
 
-      await this.ensureRalphWorkflowLabelsOnce();
       await this.ensureBranchProtectionOnce();
 
       const { repoPath: taskRepoPath, worktreePath } = await this.resolveTaskRepoPath(
