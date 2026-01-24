@@ -1,3 +1,5 @@
+import { describe, expect, test } from "bun:test";
+
 import { fetchJson, parseLinkHeader } from "../github/http";
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
