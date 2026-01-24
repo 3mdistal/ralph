@@ -11,8 +11,8 @@ export class LogLimiter {
   }
 
   shouldLog(key: string, intervalMs: number, nowMs = Date.now()): boolean {
-    const last = this.lastLogAt.get(key) ?? 0;
-    if (nowMs - last < intervalMs) return false;
+    const last = this.lastLogAt.get(key);
+    if (last !== undefined && nowMs - last < intervalMs) return false;
     this.lastLogAt.delete(key);
     this.lastLogAt.set(key, nowMs);
     this.evict();
