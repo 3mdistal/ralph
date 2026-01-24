@@ -39,8 +39,6 @@ export function normalizeTaskPriority(value: unknown): TaskPriority {
 }
 
 export function priorityRank(priority: unknown): number {
-  if (typeof priority !== "string") return PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY);
-  const normalized = priority.trim().toLowerCase();
-  const index = PRIORITY_BY_INDEX.indexOf(normalized as TaskPriority);
-  return index === -1 ? PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY) : index;
+  const normalized = normalizeTaskPriority(priority);
+  return PRIORITY_BY_INDEX.indexOf(normalized);
 }
