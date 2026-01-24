@@ -1,7 +1,7 @@
 import { getConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "../github/client";
-import { parseIssueRef, type IssueRef } from "../github/issue-blocking-core";
+import { parseIssueRef, type IssueRef } from "../github/issue-ref";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {

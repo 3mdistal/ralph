@@ -3,14 +3,14 @@ import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
 import { ensureBwrbVaultLayout, getConfig, getRepoBotBranch, getRepoPath } from "./config";
-import { parseIssueRef } from "./github/issue-blocking-core";
+import { parseIssueRef } from "./github/issue-ref";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { canActOnTask, isHeartbeatStale } from "./ownership";
-import { priorityRank } from "./queue/priority";
+import { normalizeTaskPriority, priorityRank } from "./queue/priority";
 import type { AgentTask, QueueChangeHandler, QueueTaskStatus } from "./queue/types";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
@@ -219,7 +219,7 @@ async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentT
     const parsed = JSON.parse(result.stdout.toString());
     const rows = Array.isArray(parsed) ? parsed : [];
 
-    const tasks = rows.filter((row): row is AgentTask => {
+  const tasks = rows.filter((row): row is AgentTask => {
       return (
         typeof row === "object" &&
         row !== null &&
@@ -229,7 +229,10 @@ async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentT
       );
     });
 
-    const normalized = tasks.map((t) => normalizeAgentTaskIdentity(t));
+    const normalized = tasks.map((t) => ({
+      ...normalizeAgentTaskIdentity(t),
+      priority: normalizeTaskPriority((t as { priority?: unknown }).priority),
+    }));
     warnIfNestedTaskPaths(normalized);
     recordQueueStateSnapshot(normalized);
     refreshTaskFingerprints(normalized);
@@ -369,7 +372,7 @@ export async function createAgentTask(opts: {
   repo: string;
   scope: string;
   status: AgentTask["status"];
-  priority?: string;
+  priority?: AgentTask["priority"];
 }): Promise<{ taskPath: string; taskFileName: string } | null> {
   const config = getConfig();
   const today = new Date().toISOString().split("T")[0];

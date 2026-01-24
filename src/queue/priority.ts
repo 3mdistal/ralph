@@ -1,5 +1,7 @@
 export type TaskPriority = "p0-critical" | "p1-high" | "p2-medium" | "p3-low" | "p4-backlog";
 
+export const DEFAULT_PRIORITY: TaskPriority = "p2-medium";
+
 const PRIORITY_BY_INDEX: TaskPriority[] = [
   "p0-critical",
   "p1-high",
@@ -18,12 +20,27 @@ export function inferPriorityFromLabels(labels: string[]): TaskPriority {
     if (bestIndex === null || index < bestIndex) bestIndex = index;
   }
 
-  return PRIORITY_BY_INDEX[bestIndex ?? 2];
+  return PRIORITY_BY_INDEX[bestIndex ?? PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY)];
+}
+
+export function normalizeTaskPriority(value: unknown): TaskPriority {
+  if (typeof value !== "string") return DEFAULT_PRIORITY;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return DEFAULT_PRIORITY;
+  if (PRIORITY_BY_INDEX.includes(normalized as TaskPriority)) {
+    return normalized as TaskPriority;
+  }
+
+  const match = normalized.match(/^p([0-4])/);
+  if (!match) return DEFAULT_PRIORITY;
+  const index = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(index)) return DEFAULT_PRIORITY;
+  return PRIORITY_BY_INDEX[index] ?? DEFAULT_PRIORITY;
 }
 
 export function priorityRank(priority: unknown): number {
-  if (typeof priority !== "string") return 2;
+  if (typeof priority !== "string") return PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY);
   const normalized = priority.trim().toLowerCase();
   const index = PRIORITY_BY_INDEX.indexOf(normalized as TaskPriority);
-  return index === -1 ? 2 : index;
+  return index === -1 ? PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY) : index;
 }
