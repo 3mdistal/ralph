@@ -54,6 +54,7 @@ import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { startGitHubIssuePollers } from "./github-issues-sync";
+import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -79,6 +80,7 @@ let drainTimeoutMs: number | null = null;
 let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
+let githubDoneReconciler: { stop: () => void } | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
 
@@ -1100,6 +1102,13 @@ async function main(): Promise<void> {
     },
   });
 
+  githubDoneReconciler = startGitHubDoneReconciler({
+    repos: config.repos,
+    baseIntervalMs: config.pollInterval,
+    log: (message) => console.log(message),
+    warn: (message) => console.warn(message),
+  });
+
   ralphEventBus.publish(
     buildRalphEvent({
       type: "daemon.started",
@@ -1297,6 +1306,8 @@ async function main(): Promise<void> {
     stopWatching();
     githubIssuePollers?.stop();
     githubIssuePollers = null;
+    githubDoneReconciler?.stop();
+    githubDoneReconciler = null;
     if (escalationWatcher) {
       escalationWatcher.close();
       escalationWatcher = null;

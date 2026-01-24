@@ -14,7 +14,10 @@ const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   throttled: null,
 };
 
-const KNOWN_RALPH_LABELS = Array.from(new Set(Object.values(RALPH_STATUS_LABELS).filter(Boolean))) as string[];
+const RALPH_LABEL_DONE = "ralph:done";
+const KNOWN_RALPH_LABELS = Array.from(
+  new Set([...Object.values(RALPH_STATUS_LABELS).filter(Boolean), RALPH_LABEL_DONE])
+) as string[];
 const RALPH_LABEL_QUEUED = RALPH_STATUS_LABELS.queued ?? "ralph:queued";
 // Preserve queued intent while blocked; blocked remains non-claimable.
 const PRESERVE_LABELS_BY_STATUS: Partial<Record<QueueTaskStatus, readonly string[]>> = {
@@ -24,6 +27,7 @@ const PRESERVE_LABELS_BY_STATUS: Partial<Record<QueueTaskStatus, readonly string
 export function deriveRalphStatus(labels: string[], issueState?: string | null): QueueTaskStatus | null {
   const normalizedState = issueState?.toUpperCase();
   if (normalizedState === "CLOSED") return "done";
+  if (labels.includes(RALPH_LABEL_DONE)) return "done";
   if (labels.includes("ralph:in-bot")) return "done";
   if (labels.includes("ralph:escalated")) return "escalated";
   if (labels.includes("ralph:blocked")) return "blocked";
@@ -54,6 +58,9 @@ export function planClaim(currentLabels: string[]): {
   reason?: string;
 } {
   const labelSet = new Set(currentLabels);
+  if (labelSet.has(RALPH_LABEL_DONE)) {
+    return { claimable: false, steps: [], reason: "Issue already done" };
+  }
   if (labelSet.has("ralph:escalated")) {
     return { claimable: false, steps: [], reason: "Issue is escalated" };
   }
