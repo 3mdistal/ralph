@@ -6,6 +6,10 @@ import { parseIssueRef, type IssueRef } from "../github/issue-ref";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {
+  addIssueLabel as addIssueLabelIo,
+  removeIssueLabel as removeIssueLabelIo,
+} from "../github/issue-label-io";
+import {
   getIssueLabels,
   getIssueSnapshotByNumber,
   getTaskOpStateByPath,
@@ -66,31 +70,12 @@ function createGitHubQueueIo(): GitHubQueueIO {
       return (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
     },
     addIssueLabel: async (repo, issueNumber, label) => {
-      const { owner, name } = splitRepoFullName(repo);
       const client = await createGitHubClient(repo);
-      await client.request(`/repos/${owner}/${name}/issues/${issueNumber}/labels`, {
-        method: "POST",
-        body: { labels: [label] },
-      });
+      await addIssueLabelIo({ github: client, repo, issueNumber, label });
     },
     removeIssueLabel: async (repo, issueNumber, label) => {
-      const { owner, name } = splitRepoFullName(repo);
       const client = await createGitHubClient(repo);
-      try {
-        const response = await client.request(
-          `/repos/${owner}/${name}/issues/${issueNumber}/labels/${encodeURIComponent(label)}`,
-          {
-            method: "DELETE",
-            allowNotFound: true,
-          }
-        );
-        return { removed: response.status !== 404 };
-      } catch (error) {
-        if (error instanceof GitHubApiError && error.status === 404) {
-          return { removed: false };
-        }
-        throw error;
-      }
+      return await removeIssueLabelIo({ github: client, repo, issueNumber, label, allowNotFound: true });
     },
   };
 }

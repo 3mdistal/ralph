@@ -1,6 +1,7 @@
 import { resolveAgentTaskByIssue, updateTaskStatus } from "../queue-backend";
 import { initStateDb, listIssuesWithAllLabels } from "../state";
 import { GitHubClient, splitRepoFullName } from "./client";
+import { addIssueLabel, removeIssueLabel } from "./issue-label-io";
 import {
   RALPH_ESCALATION_MARKER_PREFIX,
   RALPH_LABEL_ESCALATED,
@@ -74,19 +75,12 @@ async function listRecentIssueComments(params: {
   }));
 }
 
-async function addIssueLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  const { owner, name } = splitRepoFullName(params.repo);
-  await params.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/labels`, {
-    method: "POST",
-    body: { labels: [params.label] },
-  });
+async function addEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
+  await addIssueLabel(params);
 }
 
-async function removeIssueLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  const { owner, name } = splitRepoFullName(params.repo);
-  await params.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/labels/${encodeURIComponent(params.label)}`,
-    { method: "DELETE", allowNotFound: true }
-  );
+async function removeEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
+  await removeIssueLabel({ ...params, allowNotFound: true });
 }
 
 async function resolveEscalation(params: {
@@ -101,7 +95,7 @@ async function resolveEscalation(params: {
 
   if (params.ensureQueued) {
     try {
-      await addIssueLabel({
+      await addEscalationLabel({
         github: params.deps.github,
         repo: params.repo,
         issueNumber: params.issueNumber,
@@ -115,7 +109,7 @@ async function resolveEscalation(params: {
   }
 
   try {
-    await removeIssueLabel({
+    await removeEscalationLabel({
       github: params.deps.github,
       repo: params.repo,
       issueNumber: params.issueNumber,
