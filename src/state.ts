@@ -850,34 +850,6 @@ function formatPrSnapshotRows(rows: Array<{
     .filter((row): row is PrSnapshotRow => Boolean(row));
 }
 
-export function listPrSnapshotsForIssue(repo: string, issueNumber: number): PrSnapshotRow[] {
-  const database = requireDb();
-  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
-    $name: repo,
-  }) as { id?: number } | undefined;
-  if (!repoRow?.id) return [];
-
-  const rows = database
-    .query(
-      `SELECT url, pr_number, state, created_at, updated_at
-       FROM prs
-       WHERE repo_id = $repo_id AND issue_number = $issue_number
-       ORDER BY updated_at DESC, created_at DESC`
-    )
-    .all({
-      $repo_id: repoRow.id,
-      $issue_number: issueNumber,
-    }) as Array<{
-    url?: string | null;
-    pr_number?: number | null;
-    state?: string | null;
-    created_at?: string | null;
-    updated_at?: string | null;
-  }>;
-
-  return formatPrSnapshotRows(rows);
-}
-
 export function listOpenPrCandidatesForIssue(repo: string, issueNumber: number): PrSnapshotRow[] {
   const database = requireDb();
   const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
