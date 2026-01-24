@@ -1,11 +1,38 @@
-const lastLogAt = new Map<string, number>();
+type LogLimiterOptions = {
+  maxKeys: number;
+};
+
+export class LogLimiter {
+  private lastLogAt = new Map<string, number>();
+  private maxKeys: number;
+
+  constructor(options: LogLimiterOptions) {
+    this.maxKeys = Math.max(1, options.maxKeys);
+  }
+
+  shouldLog(key: string, intervalMs: number, nowMs = Date.now()): boolean {
+    const last = this.lastLogAt.get(key);
+    if (last !== undefined && nowMs - last < intervalMs) return false;
+    this.lastLogAt.delete(key);
+    this.lastLogAt.set(key, nowMs);
+    this.evict();
+    return true;
+  }
+
+  private evict(): void {
+    while (this.lastLogAt.size > this.maxKeys) {
+      const oldestKey = this.lastLogAt.keys().next().value as string | undefined;
+      if (oldestKey === undefined) return;
+      this.lastLogAt.delete(oldestKey);
+    }
+  }
+}
+
+const DEFAULT_LOG_LIMITER_MAX_KEYS = 2000;
+const defaultLimiter = new LogLimiter({ maxKeys: DEFAULT_LOG_LIMITER_MAX_KEYS });
 
 export function shouldLog(key: string, intervalMs: number): boolean {
-  const now = Date.now();
-  const last = lastLogAt.get(key) ?? 0;
-  if (now - last < intervalMs) return false;
-  lastLogAt.set(key, now);
-  return true;
+  return defaultLimiter.shouldLog(key, intervalMs);
 }
 
 export function formatDuration(ms: number): string {
