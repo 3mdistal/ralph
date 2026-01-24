@@ -2793,11 +2793,15 @@ ${guidance}`
             );
           }
           try {
-            await this.deleteMergedPrHeadBranchBestEffort({
-              prUrl,
-              botBranch: params.botBranch,
-              mergedHeadSha: checkResult.headSha,
-            });
+            const normalizedBase = baseBranch ? this.normalizeGitRef(baseBranch) : "";
+            const normalizedBot = this.normalizeGitRef(params.botBranch);
+            if (normalizedBase && normalizedBase === normalizedBot) {
+              await this.deleteMergedPrHeadBranchBestEffort({
+                prUrl,
+                botBranch: params.botBranch,
+                mergedHeadSha: checkResult.headSha,
+              });
+            }
           } catch (error: any) {
             console.warn(
               `[ralph:worker:${this.repo}] Failed to delete PR head branch: ${this.formatGhError(error)}`
