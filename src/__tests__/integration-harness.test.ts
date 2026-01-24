@@ -262,10 +262,12 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     const mergePullRequestMock = mock(async () => {});
     const isPrBehindMock = mock(async () => false);
+    const deleteMergedPrHeadBranchMock = mock(async () => {});
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).isPrBehind = isPrBehindMock;
+    (worker as any).deleteMergedPrHeadBranchBestEffort = deleteMergedPrHeadBranchMock;
 
     let agentRunData: any = null;
     (worker as any).createAgentRun = async (_task: any, data: any) => {
@@ -283,6 +285,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(runAgentMock).toHaveBeenCalled();
     expect(continueSessionMock).toHaveBeenCalledTimes(1);
     expect(mergePullRequestMock).toHaveBeenCalled();
+    expect(deleteMergedPrHeadBranchMock).toHaveBeenCalled();
     expect(continueCommandMock).toHaveBeenCalled();
 
     // Task status transitions are explicit and deterministic.
@@ -387,10 +390,12 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     const mergePullRequestMock = mock(async () => {});
     const isPrBehindMock = mock(async () => false);
+    const deleteMergedPrHeadBranchMock = mock(async () => {});
 
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).isPrBehind = isPrBehindMock;
+    (worker as any).deleteMergedPrHeadBranchBestEffort = deleteMergedPrHeadBranchMock;
 
     const addIssueLabelMock = mock(async () => {});
     const removeIssueLabelMock = mock(async () => {});
@@ -401,6 +406,7 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     expect(result.outcome).toBe("success");
     expect(mergePullRequestMock).toHaveBeenCalled();
+    expect(deleteMergedPrHeadBranchMock).not.toHaveBeenCalled();
     expect(addIssueLabelMock).not.toHaveBeenCalled();
     expect(removeIssueLabelMock).toHaveBeenCalled();
   });
