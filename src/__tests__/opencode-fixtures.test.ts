@@ -204,6 +204,25 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     expect(result.output).toContain("Tool call timed out:");
   });
 
+  fixtureTest("context-length-exceeded.jsonl: sets SessionResult.errorCode", async () => {
+    const scheduler = new FakeScheduler(0);
+    const lines = await loadFixtureLines("context-length-exceeded.jsonl");
+
+    const testOverrides = {
+      scheduler: scheduler as any,
+      sessionsDir,
+      spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 1 }) as any,
+    };
+
+    const promise = runCommand("/tmp", "plan", [], {}, testOverrides);
+
+    scheduler.advanceBy(0);
+    const result = await promise;
+
+    expect(result.success).toBe(false);
+    expect(result.errorCode).toBe("context_length_exceeded");
+  });
+
   fixtureTest("pr-url-structured.jsonl: structured PR URL beats text output", async () => {
     const scheduler = new FakeScheduler(0);
     const lines = await loadFixtureLines("pr-url-structured.jsonl");
