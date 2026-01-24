@@ -3030,6 +3030,11 @@ ${guidance}`
     const resolvedWorktreePath = worktreePath ?? task["worktree-path"]?.trim();
     const resolvedWorkerId = workerId ?? task["worker-id"]?.trim();
     const resolvedRepoSlot = repoSlot ?? task["repo-slot"]?.trim();
+    const shouldClearWorktree = Boolean(resolvedWorktreePath && String(resolvedWorktreePath).trim());
+    const shouldClearWorkerId = Boolean(resolvedWorkerId && String(resolvedWorkerId).trim());
+    const shouldClearRepoSlot = Boolean(
+      resolvedRepoSlot !== undefined && resolvedRepoSlot !== null && String(resolvedRepoSlot).trim()
+    );
 
     const endTime = new Date();
     await this.createAgentRun(task, {
@@ -3046,14 +3051,14 @@ ${guidance}`
       "completed-at": endTime.toISOString().split("T")[0],
       "session-id": "",
       "watchdog-retries": "",
-      ...(resolvedWorktreePath ? { "worktree-path": "" } : {}),
-      ...(resolvedWorkerId ? { "worker-id": "" } : {}),
-      ...(resolvedRepoSlot ? { "repo-slot": "" } : {}),
+      ...(shouldClearWorktree ? { "worktree-path": "" } : {}),
+      ...(shouldClearWorkerId ? { "worker-id": "" } : {}),
+      ...(shouldClearRepoSlot ? { "repo-slot": "" } : {}),
     });
 
     await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
 
-    if (resolvedWorktreePath) {
+    if (shouldClearWorktree && resolvedWorktreePath) {
       await this.cleanupGitWorktree(resolvedWorktreePath);
     }
 
@@ -4795,11 +4800,23 @@ ${guidance}`
       await this.ensureRalphWorkflowLabelsOnce();
 
       // 3. Mark task starting (restart-safe pre-session state)
+      const shouldClearBlocked = Boolean(
+        task["blocked-source"]?.trim() || task["blocked-reason"]?.trim() || task["blocked-details"]?.trim()
+      );
       const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
         ...(!task["opencode-profile"]?.trim() && opencodeProfileName ? { "opencode-profile": opencodeProfileName } : {}),
         ...(workerId ? { "worker-id": workerId } : {}),
         ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
+        ...(shouldClearBlocked
+          ? {
+              "blocked-source": "",
+              "blocked-reason": "",
+              "blocked-details": "",
+              "blocked-at": "",
+              "blocked-checked-at": "",
+            }
+          : {}),
       });
       if (workerId) task["worker-id"] = workerId;
       if (typeof allocatedSlot === "number") task["repo-slot"] = String(allocatedSlot);

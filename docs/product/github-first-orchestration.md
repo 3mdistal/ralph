@@ -104,6 +104,11 @@ Blocked metadata (agent-task frontmatter):
 - `blocked-details` - truncated diagnostics (redacted) used for status snippets and run notes
 - `blocked-checked-at` - last time blocked state was evaluated
 
+Requeue resolution (non-dependency blocked tasks):
+- Operators requeue by re-adding `ralph:queued` on the issue.
+- When Ralph claims the task again, it clears all `blocked-*` metadata and resumes work.
+- If a `session-id` exists, Ralph resumes the prior OpenCode session; otherwise it starts a fresh session.
+
 ## Done semantics (Pattern A)
 
 - Issue remains open until the rollup PR merges to `main`.
