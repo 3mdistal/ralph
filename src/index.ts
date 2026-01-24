@@ -685,10 +685,8 @@ async function startTask(opts: {
 
     try {
       const blockedSource = claimedTask["blocked-source"]?.trim() || "";
-      const blockedReason = claimedTask["blocked-reason"]?.trim() || "";
       const sessionId = claimedTask["session-id"]?.trim() || "";
-      const shouldResumeMergeConflict =
-        sessionId && (blockedSource === "merge-conflict" || blockedReason.toLowerCase().includes("merge conflict"));
+      const shouldResumeMergeConflict = sessionId && blockedSource === "merge-conflict";
 
       if (shouldResumeMergeConflict) {
         console.log(
