@@ -66,6 +66,8 @@ import {
   DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
   shouldDeferWaitingResolutionCheck,
 } from "./escalation-resume";
+import { priorityRank } from "./queue/priority";
+import { buildStatusSnapshot } from "./status-snapshot";
 import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 
 // --- State ---
@@ -847,6 +849,22 @@ function formatTaskLabel(task: Pick<AgentTask, "name" | "issue" | "repo">): stri
   return `${repoShort}#${issueNumber} ${task.name}`;
 }
 
+function formatBlockedIdleSuffix(task: AgentTask): string {
+  const blockedAt = task["blocked-at"]?.trim() ?? "";
+  if (!blockedAt) return "";
+  const blockedAtMs = Date.parse(blockedAt);
+  if (!Number.isFinite(blockedAtMs)) return "";
+  return ` [idle ${formatDuration(Date.now() - blockedAtMs)}]`;
+}
+
+function summarizeBlockedDetailsSnippet(text: string, maxChars = 500): string {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  const normalized = trimmed.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return normalized.slice(0, maxChars).trimEnd() + "…";
+}
+
 async function getTaskNowDoingLine(task: AgentTask): Promise<string> {
   const sessionId = task["session-id"]?.trim();
   const label = formatTaskLabel(task);
@@ -1537,13 +1555,27 @@ if (args[0] === "status") {
           ? "soft-throttled"
           : "running";
 
-  const [starting, inProgress, queued, throttled, pendingEscalations] = await Promise.all([
+  const [starting, inProgress, queued, throttled, blocked, pendingEscalations] = await Promise.all([
     getTasksByStatus("starting"),
     getTasksByStatus("in-progress"),
     getQueuedTasks(),
     getTasksByStatus("throttled"),
+    getTasksByStatus("blocked"),
     getEscalationsByStatus("pending"),
   ]);
+
+  const blockedSorted = [...blocked].sort((a, b) => {
+    const priorityDelta = priorityRank(a.priority) - priorityRank(b.priority);
+    if (priorityDelta !== 0) return priorityDelta;
+    const aTime = Date.parse(a["blocked-at"]?.trim() ?? "");
+    const bTime = Date.parse(b["blocked-at"]?.trim() ?? "");
+    if (Number.isFinite(aTime) && Number.isFinite(bTime)) return bTime - aTime;
+    if (Number.isFinite(aTime)) return -1;
+    if (Number.isFinite(bTime)) return 1;
+    const repoCompare = a.repo.localeCompare(b.repo);
+    if (repoCompare !== 0) return repoCompare;
+    return a.issue.localeCompare(b.issue);
+  });
 
   if (json) {
     const inProgressWithStatus = await Promise.all(
@@ -1564,57 +1596,68 @@ if (args[0] === "status") {
       })
     );
 
-    console.log(
-      JSON.stringify(
-        {
-          mode,
-          queue: {
-            backend: queueState.backend,
-            health: queueState.health,
-            fallback: queueState.fallback,
-            diagnostics: queueState.diagnostics ?? null,
-          },
-          controlProfile: controlProfile || null,
-          activeProfile: resolvedProfile ?? null,
-          throttle: throttle.snapshot,
-          escalations: {
-            pending: pendingEscalations.length,
-          },
-          inProgress: inProgressWithStatus,
-          starting: starting.map((t) => ({
-            name: t.name,
-            repo: t.repo,
-            issue: t.issue,
-            priority: t.priority ?? "p2-medium",
-            opencodeProfile: getTaskOpencodeProfileName(t),
-          })),
-          drain: {
-            requestedAt: drainRequestedAt ? new Date(drainRequestedAt).toISOString() : null,
-            timeoutMs: drainTimeoutMs ?? null,
-            pauseRequested: pauseRequestedByControl,
-            pauseAtCheckpoint,
-          },
-          queued: queued.map((t) => ({
-            name: t.name,
-            repo: t.repo,
-            issue: t.issue,
-            priority: t.priority ?? "p2-medium",
-            opencodeProfile: getTaskOpencodeProfileName(t),
-          })),
-          throttled: throttled.map((t) => ({
-            name: t.name,
-            repo: t.repo,
-            issue: t.issue,
-            priority: t.priority ?? "p2-medium",
-            opencodeProfile: getTaskOpencodeProfileName(t),
-            sessionId: t["session-id"]?.trim() || null,
-            resumeAt: t["resume-at"]?.trim() || null,
-          })),
-        },
-        null,
-        2
-      )
-    );
+    const snapshot = buildStatusSnapshot({
+      mode,
+      queue: {
+        backend: queueState.backend,
+        health: queueState.health,
+        fallback: queueState.fallback,
+        diagnostics: queueState.diagnostics ?? null,
+      },
+      controlProfile: controlProfile || null,
+      activeProfile: resolvedProfile ?? null,
+      throttle: throttle.snapshot,
+      escalations: {
+        pending: pendingEscalations.length,
+      },
+      inProgress: inProgressWithStatus,
+      starting: starting.map((t) => ({
+        name: t.name,
+        repo: t.repo,
+        issue: t.issue,
+        priority: t.priority ?? "p2-medium",
+        opencodeProfile: getTaskOpencodeProfileName(t),
+      })),
+      drain: {
+        requestedAt: drainRequestedAt ? new Date(drainRequestedAt).toISOString() : null,
+        timeoutMs: drainTimeoutMs ?? null,
+        pauseRequested: pauseRequestedByControl,
+        pauseAtCheckpoint,
+      },
+      queued: queued.map((t) => ({
+        name: t.name,
+        repo: t.repo,
+        issue: t.issue,
+        priority: t.priority ?? "p2-medium",
+        opencodeProfile: getTaskOpencodeProfileName(t),
+      })),
+      throttled: throttled.map((t) => ({
+        name: t.name,
+        repo: t.repo,
+        issue: t.issue,
+        priority: t.priority ?? "p2-medium",
+        opencodeProfile: getTaskOpencodeProfileName(t),
+        sessionId: t["session-id"]?.trim() || null,
+        resumeAt: t["resume-at"]?.trim() || null,
+      })),
+      blocked: blockedSorted.map((t) => {
+        const details = t["blocked-details"]?.trim() ?? "";
+        return {
+          name: t.name,
+          repo: t.repo,
+          issue: t.issue,
+          priority: t.priority ?? "p2-medium",
+          opencodeProfile: getTaskOpencodeProfileName(t),
+          sessionId: t["session-id"]?.trim() || null,
+          blockedAt: t["blocked-at"]?.trim() || null,
+          blockedSource: t["blocked-source"]?.trim() || null,
+          blockedReason: t["blocked-reason"]?.trim() || null,
+          blockedDetailsSnippet: details ? summarizeBlockedDetailsSnippet(details) : null,
+        };
+      }),
+    });
+
+    console.log(JSON.stringify(snapshot, null, 2));
     process.exit(0);
   }
 
@@ -1648,6 +1691,17 @@ if (args[0] === "status") {
   console.log(`In-progress tasks: ${inProgress.length}`);
   for (const task of inProgress) {
     console.log(`  - ${await getTaskNowDoingLine(task)}`);
+  }
+
+  console.log(`Blocked tasks: ${blockedSorted.length}`);
+  for (const task of blockedSorted) {
+    const reason = task["blocked-reason"]?.trim() || "(no reason)";
+    const source = task["blocked-source"]?.trim();
+    const idleSuffix = formatBlockedIdleSuffix(task);
+    const sourceSuffix = source ? ` source=${source}` : "";
+    console.log(
+      `  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}] reason=${reason}${sourceSuffix}${idleSuffix}`
+    );
   }
 
   console.log(`Queued tasks: ${queued.length}`);
