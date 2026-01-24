@@ -3,12 +3,14 @@ import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
 import { ensureBwrbVaultLayout, getConfig, getRepoBotBranch, getRepoPath } from "./config";
+import { parseIssueRef } from "./github/issue-blocking-core";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { canActOnTask, isHeartbeatStale } from "./ownership";
+import { priorityRank } from "./queue/priority";
 import type { AgentTask, QueueChangeHandler, QueueTaskStatus } from "./queue/types";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
@@ -680,10 +682,14 @@ export function groupByRepo(tasks: AgentTask[]): Map<string, AgentTask[]> {
 
   for (const [repo, repoTasks] of grouped) {
     repoTasks.sort((a, b) => {
-      const priorityOrder = ["p0-critical", "p1-high", "p2-medium", "p3-low", "p4-backlog"];
-      const aIdx = priorityOrder.indexOf(a.priority ?? "p2-medium");
-      const bIdx = priorityOrder.indexOf(b.priority ?? "p2-medium");
-      return aIdx - bIdx;
+      const rankDelta = priorityRank(a.priority) - priorityRank(b.priority);
+      if (rankDelta !== 0) return rankDelta;
+
+      const aIssue = parseIssueRef(a.issue, a.repo)?.number ?? Number.POSITIVE_INFINITY;
+      const bIssue = parseIssueRef(b.issue, b.repo)?.number ?? Number.POSITIVE_INFINITY;
+      if (aIssue !== bIssue) return aIssue - bIssue;
+
+      return a._path.localeCompare(b._path);
     });
 
     grouped.set(repo, repoTasks);
