@@ -16,7 +16,7 @@ const DEFAULT_PLAN_TEMPLATE = [
   "",
 ].join("\n");
 
-export function getRalphPlanPath(worktreePath: string): string {
+function getRalphPlanPath(worktreePath: string): string {
   return join(worktreePath, RALPH_ARTIFACT_DIR, PLAN_FILENAME);
 }
 
