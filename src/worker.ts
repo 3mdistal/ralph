@@ -2838,6 +2838,9 @@ ${guidance}`
 
     if (!this.isGitHubQueueTask(task)) return null;
 
+    const existingSessionId = task["session-id"]?.trim();
+    if (!existingSessionId) return null;
+
     const existingPr = await this.getIssuePrResolution(issueNumber);
     if (!existingPr.selectedUrl) return null;
 

@@ -90,7 +90,7 @@ Blocked enforcement:
 Blocked attribution (`blocked-source` in agent-task frontmatter):
 - `deps` - blocked by issue dependencies or sub-issues
 - `allowlist` - repo owner not in allowlist
-- `dirty-repo` - repo root has uncommitted changes
+- `dirty-repo` - repo root has uncommitted changes (only blocks when a task would run in the main checkout; isolated worktrees may proceed)
 - `merge-target` - PR targets protected base (e.g. main without override)
 - `ci-only` - CI-only PR for non-CI issue
 - `merge-conflict` - PR has merge conflicts
