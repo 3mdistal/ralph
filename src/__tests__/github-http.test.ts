@@ -1,3 +1,5 @@
+import { describe, expect, test } from "bun:test";
+
 import { fetchJson, parseLinkHeader } from "../github/http";
 
 describe("github http helpers", () => {
