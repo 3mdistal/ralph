@@ -51,7 +51,10 @@ describe("existing PR recovery", () => {
       opencodeSessionOptions: {},
     });
 
-    expect(observedStage as NonNullable<typeof observedStage>).toBe("merge-conflict");
+    if (!observedStage) {
+      throw new Error("Expected merge-conflict recovery stage to be set.");
+    }
+    expect(observedStage).toBe("merge-conflict");
     expect(result?.outcome).toBe("success");
   });
 
@@ -99,7 +102,10 @@ describe("existing PR recovery", () => {
       opencodeSessionOptions: {},
     });
 
-    expect(observedStage as NonNullable<typeof observedStage>).toBe("ci-failure");
+    if (!observedStage) {
+      throw new Error("Expected ci-failure recovery stage to be set.");
+    }
+    expect(observedStage).toBe("ci-failure");
     expect(result?.outcome).toBe("success");
   });
 });
