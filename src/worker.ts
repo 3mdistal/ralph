@@ -2667,6 +2667,13 @@ ${guidance}`
       `Resolve merge conflicts by rebasing/merging '${baseName}' into the PR branch.`,
       "Do NOT create a new PR.",
       "After resolving conflicts, push updates and keep working on this PR until required checks pass.",
+      "",
+      "Commands (run in the task worktree):",
+      "```bash",
+      "git fetch origin",
+      `gh pr checkout ${prUrl}`,
+      "git status",
+      "```",
     ].join("\n");
   }
 
@@ -2677,6 +2684,13 @@ ${guidance}`
       "Required checks are failing.",
       "Fix failing CI checks or re-run stalled workflows on the existing PR branch.",
       "After checks pass, continue with the existing PR only.",
+      "",
+      "Commands (run in the task worktree):",
+      "```bash",
+      "git fetch origin",
+      `gh pr checkout ${prUrl}`,
+      "git status",
+      "```",
       "",
       formatRequiredChecksForHumans(summary),
     ].join("\n");
