@@ -34,9 +34,18 @@ import { normalizeGitRef } from "./midpoint-labels";
 import { computeHeadBranchDeletionDecision } from "./pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
 import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
-import { continueCommand, continueSession, getRalphXdgCacheHome, runAgent, type SessionResult } from "./session";
+import {
+  continueCommand,
+  continueSession,
+  getRalphXdgCacheHome,
+  runAgent,
+  type RunSessionOptionsBase,
+  type SessionResult,
+} from "./session";
 import { buildPlannerPrompt } from "./planner-prompt";
 import { getThrottleDecision } from "./throttle";
+import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
+import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
 import { LogLimiter } from "./logging";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
@@ -699,11 +708,14 @@ export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuid
 
 export class RepoWorker {
   private session: SessionAdapter;
+  private baseSession: SessionAdapter;
   private queue: QueueAdapter;
   private notify: NotifyAdapter;
   private throttle: ThrottleAdapter;
   private github: GitHubClient;
   private labelEnsurer: ReturnType<typeof createRalphWorkflowLabelsEnsurer>;
+  private contextRecoveryContext: { task: AgentTask; repoPath: string; planPath: string } | null = null;
+  private contextCompactAttempts = new Map<string, number>();
 
   constructor(
     public readonly repo: string,
@@ -716,7 +728,8 @@ export class RepoWorker {
       relationships?: IssueRelationshipProvider;
     }
   ) {
-    this.session = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+    this.baseSession = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+    this.session = this.createContextRecoveryAdapter(this.baseSession);
     this.queue = opts?.queue ?? DEFAULT_QUEUE_ADAPTER;
     this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
     this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
@@ -793,6 +806,150 @@ export class RepoWorker {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
     }
     return runLogPath;
+  }
+
+  private createContextRecoveryAdapter(base: SessionAdapter): SessionAdapter {
+    return {
+      runAgent: async (repoPath, agent, message, options, testOverrides) => {
+        const result = await base.runAgent(repoPath, agent, message, options, testOverrides);
+        return this.maybeRecoverFromContextLengthExceeded({
+          repoPath,
+          sessionId: result.sessionId,
+          stepKey: options?.introspection?.stepTitle ?? `agent:${agent}`,
+          result,
+          options,
+        });
+      },
+      continueSession: async (repoPath, sessionId, message, options) => {
+        const result = await base.continueSession(repoPath, sessionId, message, options);
+        return this.maybeRecoverFromContextLengthExceeded({
+          repoPath,
+          sessionId,
+          stepKey: options?.introspection?.stepTitle ?? `session:${sessionId}`,
+          result,
+          options,
+        });
+      },
+      continueCommand: async (repoPath, sessionId, command, args, options) => {
+        const result = await base.continueCommand(repoPath, sessionId, command, args, options);
+        return this.maybeRecoverFromContextLengthExceeded({
+          repoPath,
+          sessionId,
+          stepKey: options?.introspection?.stepTitle ?? `command:${command}`,
+          result,
+          options,
+          command,
+        });
+      },
+      getRalphXdgCacheHome: base.getRalphXdgCacheHome,
+    };
+  }
+
+  private recordContextCompactAttempt(task: AgentTask, stepKey: string): { allowed: boolean; attempt: number } {
+    const key = `${task._path}:${stepKey}`;
+    const next = (this.contextCompactAttempts.get(key) ?? 0) + 1;
+    this.contextCompactAttempts.set(key, next);
+    return { allowed: next <= 1, attempt: next };
+  }
+
+  private buildContextRecoveryOptions(
+    options: RunSessionOptionsBase | undefined,
+    stepTitle: string
+  ): RunSessionOptionsBase {
+    const introspection = {
+      ...(options?.introspection ?? {}),
+      stepTitle,
+    };
+    return { ...(options ?? {}), introspection };
+  }
+
+  private async getWorktreeStatusPorcelain(worktreePath: string): Promise<string> {
+    try {
+      const status = await $`git status --porcelain`.cwd(worktreePath).quiet();
+      return status.stdout.toString().trim();
+    } catch (e: any) {
+      return `ERROR: ${e?.message ?? String(e)}`;
+    }
+  }
+
+  private async maybeRecoverFromContextLengthExceeded(params: {
+    repoPath: string;
+    sessionId?: string;
+    stepKey: string;
+    result: SessionResult;
+    options?: RunSessionOptionsBase;
+    command?: string;
+  }): Promise<SessionResult> {
+    if (params.result.success || params.result.errorCode !== "context_length_exceeded") return params.result;
+    if (params.command === "compact") return params.result;
+
+    const context = this.contextRecoveryContext;
+    if (!context) return params.result;
+
+    const sessionId = params.result.sessionId?.trim() || params.sessionId?.trim();
+    if (!sessionId) return params.result;
+
+    const attempt = this.recordContextCompactAttempt(context.task, params.stepKey);
+    if (!attempt.allowed) return params.result;
+
+    const compactOptions = this.buildContextRecoveryOptions(
+      params.options,
+      `context compact (${params.stepKey})`
+    );
+    const resumeOptions = this.buildContextRecoveryOptions(
+      params.options,
+      `context resume (${params.stepKey})`
+    );
+
+    const gitStatus = await this.getWorktreeStatusPorcelain(params.repoPath);
+    const resumeMessage = buildContextResumePrompt({
+      planPath: context.planPath,
+      gitStatus,
+    });
+
+    const recovered = await retryContextCompactOnce({
+      session: this.baseSession,
+      repoPath: params.repoPath,
+      sessionId,
+      stepKey: params.stepKey,
+      attempt,
+      resumeMessage,
+      compactOptions,
+      resumeOptions,
+      onEvent: (event) => {
+        ralphEventBus.publish(
+          buildRalphEvent({
+            type: "worker.context_compact.triggered",
+            level: "info",
+            repo: this.repo,
+            taskId: context.task._path,
+            sessionId: event.sessionId,
+            data: {
+              stepTitle: event.stepKey,
+              attempt: event.attempt,
+            },
+          })
+        );
+      },
+    });
+
+    return recovered ?? params.result;
+  }
+
+  private async prepareContextRecovery(task: AgentTask, worktreePath: string): Promise<void> {
+    try {
+      await ensureRalphWorktreeArtifacts(worktreePath);
+    } catch (e: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to ensure worktree artifacts at ${worktreePath}: ${e?.message ?? String(e)}`
+      );
+    }
+
+    this.contextRecoveryContext = {
+      task,
+      repoPath: worktreePath,
+      planPath: RALPH_PLAN_RELATIVE_PATH,
+    };
   }
 
   private async getRepoRootStatusPorcelain(): Promise<string> {
@@ -3829,6 +3986,8 @@ ${guidance}`
 
       const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
 
+      await this.prepareContextRecovery(task, taskRepoPath);
+
       const workerIdChanged = task["worker-id"]?.trim() !== workerId;
       const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
 
@@ -4409,6 +4568,8 @@ ${guidance}`
         throw new Error(resolvedRepoPath.reason);
       }
       const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
+
+      await this.prepareContextRecovery(task, taskRepoPath);
 
       ralphEventBus.publish(
         buildRalphEvent({
