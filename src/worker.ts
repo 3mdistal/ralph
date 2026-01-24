@@ -57,13 +57,8 @@ import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
-import {
-  computeBlockedDecision,
-  formatIssueRef,
-  parseIssueRef,
-  type IssueRef,
-  type RelationshipSignal,
-} from "./github/issue-blocking-core";
+import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
+import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
 import {
   GitHubRelationshipProvider,
   type IssueRelationshipProvider,
