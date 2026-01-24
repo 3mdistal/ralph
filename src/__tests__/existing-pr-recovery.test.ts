@@ -54,7 +54,7 @@ describe("existing PR recovery", () => {
     if (!observedStage) {
       throw new Error("Expected merge-conflict recovery stage to be set.");
     }
-    expect(observedStage).toBe("merge-conflict");
+    expect(observedStage as unknown as string).toBe("merge-conflict");
     expect(result?.outcome).toBe("success");
   });
 
@@ -105,7 +105,7 @@ describe("existing PR recovery", () => {
     if (!observedStage) {
       throw new Error("Expected ci-failure recovery stage to be set.");
     }
-    expect(observedStage).toBe("ci-failure");
+    expect(observedStage as unknown as string).toBe("ci-failure");
     expect(result?.outcome).toBe("success");
   });
 });
