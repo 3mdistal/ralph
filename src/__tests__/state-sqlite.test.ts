@@ -22,6 +22,8 @@ import {
   recordIssueSnapshot,
   recordIssueLabelsSnapshot,
   recordRepoGithubIssueSync,
+  recordRepoGithubDoneReconcileCursor,
+  getRepoGithubDoneReconcileCursor,
   recordTaskSnapshot,
   recordPrSnapshot,
   PR_STATE_MERGED,
@@ -149,7 +151,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("6");
+      expect(meta.value).toBe("7");
 
       const columns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -165,6 +167,11 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_issue_sync'")
         .get() as { name?: string } | undefined;
       expect(cursorTable?.name).toBe("repo_github_issue_sync");
+
+      const doneCursorTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_done_reconcile_cursor'")
+        .get() as { name?: string } | undefined;
+      expect(doneCursorTable?.name).toBe("repo_github_done_reconcile_cursor");
     } finally {
       migrated.close();
     }
@@ -208,6 +215,20 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       repoPath: "/tmp/ralph",
       botBranch: "bot/integration",
       lastSyncAt: "2026-01-11T00:00:00.250Z",
+    });
+
+    recordRepoGithubDoneReconcileCursor({
+      repo: "3mdistal/ralph",
+      repoPath: "/tmp/ralph",
+      botBranch: "bot/integration",
+      lastMergedAt: "2026-01-12T00:00:00.250Z",
+      lastPrNumber: 42,
+      updatedAt: "2026-01-12T00:00:00.500Z",
+    });
+
+    expect(getRepoGithubDoneReconcileCursor("3mdistal/ralph")).toEqual({
+      lastMergedAt: "2026-01-12T00:00:00.250Z",
+      lastPrNumber: 42,
     });
 
     recordIssueSnapshot({
@@ -279,7 +300,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("6");
+      expect(meta.value).toBe("7");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
