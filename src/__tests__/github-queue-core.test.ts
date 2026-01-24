@@ -131,9 +131,14 @@ describe("github queue core", () => {
     expect(plan.claimable).toBe(false);
   });
 
-  test("planClaim rejects blocked issues", () => {
+  test("planClaim allows blocked issues to requeue", () => {
     const plan = planClaim(["ralph:queued", "ralph:blocked"]);
-    expect(plan.claimable).toBe(false);
+    expect(plan.claimable).toBe(true);
+    expect(plan.steps).toEqual([
+      { action: "add", label: "ralph:in-progress" },
+      { action: "remove", label: "ralph:queued" },
+      { action: "remove", label: "ralph:blocked" },
+    ]);
   });
 
   test("planClaim rejects done issues", () => {
@@ -149,9 +154,9 @@ describe("github queue core", () => {
     expect(planClaim(updated).claimable).toBe(true);
   });
 
-  test("deriveRalphStatus honors blocked precedence", () => {
+  test("deriveRalphStatus treats queued+blocked as queued", () => {
     const status = deriveRalphStatus(["ralph:queued", "ralph:blocked"], "OPEN");
-    expect(status).toBe("blocked");
+    expect(status).toBe("queued");
   });
 
   test("deriveRalphStatus treats ralph:done as done", () => {

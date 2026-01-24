@@ -1,7 +1,7 @@
 import { $ } from "bun";
 import { appendFile, mkdir, readFile, readdir, rm } from "fs/promises";
-import { existsSync } from "fs";
-import { dirname, isAbsolute, join } from "path";
+import { existsSync, realpathSync } from "fs";
+import { dirname, isAbsolute, join, resolve } from "path";
 import { randomUUID } from "crypto";
 
 type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
@@ -965,6 +965,14 @@ export class RepoWorker {
     const status = await this.getRepoRootStatusPorcelain();
     if (!status) return;
 
+    const worktreePath = task["worktree-path"]?.trim();
+    if (worktreePath && !this.isSameRepoRootPath(worktreePath)) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Repo root dirty but task is isolated in worktree (${phase}); continuing.`
+      );
+      return;
+    }
+
     const reason = `Repo root has uncommitted changes; refusing to run to protect main checkout (${phase}).`;
     const message = [reason, "", "Status:", status].join("\n");
 
@@ -1298,12 +1306,13 @@ export class RepoWorker {
 
   private async applyMidpointLabelsBestEffort(params: {
     task: AgentTask;
-    prUrl: string;
+    prUrl: string | null;
     botBranch: string;
     baseBranch?: string | null;
   }): Promise<void> {
     const issueRef = parseIssueRef(params.task.issue, this.repo);
     if (!issueRef) return;
+    if (!params.prUrl) return;
     await applyMidpointLabelsBestEffortCore({
       issueRef,
       issue: params.task.issue,
@@ -1878,7 +1887,15 @@ ${guidance}`
   }
 
   private isSameRepoRootPath(worktreePath: string): boolean {
-    return this.repoPath === worktreePath;
+    return this.normalizeRepoRootPath(this.repoPath) === this.normalizeRepoRootPath(worktreePath);
+  }
+
+  private normalizeRepoRootPath(path: string): string {
+    try {
+      return realpathSync(path);
+    } catch {
+      return resolve(path);
+    }
   }
 
   private isHealthyWorktreePath(worktreePath: string): boolean {
@@ -2806,6 +2823,439 @@ ${guidance}`
     const message = String(error?.message ?? "").trim();
     const stderr = String(error?.stderr ?? "").trim();
     return [message, stderr].filter(Boolean).join("\n");
+  }
+
+  private buildMergeConflictPrompt(prUrl: string, baseRefName: string | null, botBranch: string): string {
+    const baseName = baseRefName || botBranch;
+    return [
+      `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
+      `Resolve merge conflicts by rebasing/merging '${baseName}' into the PR branch.`,
+      "Do NOT create a new PR.",
+      "After resolving conflicts, push updates and keep working on this PR until required checks pass.",
+      "",
+      "Commands (run in the task worktree):",
+      "```bash",
+      "git fetch origin",
+      `gh pr checkout ${prUrl}`,
+      "git status",
+      "```",
+    ].join("\n");
+  }
+
+  private buildCiFailurePrompt(prUrl: string, summary: RequiredChecksSummary): string {
+    return [
+      `An open PR already exists for this issue: ${prUrl}.`,
+      "Do NOT create a new PR.",
+      "Required checks are failing.",
+      "Fix failing CI checks or re-run stalled workflows on the existing PR branch.",
+      "After checks pass, continue with the existing PR only.",
+      "",
+      "Commands (run in the task worktree):",
+      "```bash",
+      "git fetch origin",
+      `gh pr checkout ${prUrl}`,
+      "git status",
+      "```",
+      "",
+      formatRequiredChecksForHumans(summary),
+    ].join("\n");
+  }
+
+  private isGitHubQueueTask(task: AgentTask): boolean {
+    return Boolean(task._path?.startsWith("github:"));
+  }
+
+  private async maybeHandleQueuedMergeConflict(params: {
+    task: AgentTask;
+    issueNumber: string;
+    taskRepoPath: string;
+    cacheKey: string;
+    botBranch: string;
+    issueMeta: IssueMetadata;
+    startTime: Date;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+  }): Promise<AgentRun | null> {
+    const { task, issueNumber, taskRepoPath, cacheKey, botBranch, issueMeta, startTime, opencodeXdg, opencodeSessionOptions } = params;
+
+    if (!this.isGitHubQueueTask(task)) return null;
+
+    let existingPr: ResolvedIssuePr;
+    try {
+      existingPr = await this.getIssuePrResolution(issueNumber);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Merge conflict preflight failed for ${task.issue}: ${this.formatGhError(error)}`
+      );
+      return null;
+    }
+    if (!existingPr.selectedUrl) return null;
+
+    let prState: PullRequestMergeState;
+    try {
+      prState = await this.getPullRequestMergeState(existingPr.selectedUrl);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Merge conflict preflight failed for ${existingPr.selectedUrl}: ${this.formatGhError(
+          error
+        )}`
+      );
+      return null;
+    }
+    if (prState.mergeStateStatus !== "DIRTY") return null;
+
+    console.warn(
+      `[ralph:worker:${this.repo}] Existing PR has merge conflicts; skipping planner for ${task.issue}.`
+    );
+
+    this.updateOpenPrSnapshot(task, null, existingPr.selectedUrl);
+
+    const mergeConflictPrompt = this.buildMergeConflictPrompt(
+      existingPr.selectedUrl,
+      prState.baseRefName ?? null,
+      botBranch
+    );
+    const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+      prUrl: existingPr.selectedUrl,
+      baseRefName: prState.baseRefName,
+    });
+
+    return await this.runExistingPrRecovery({
+      task,
+      issueNumber,
+      taskRepoPath,
+      cacheKey,
+      botBranch,
+      issueMeta,
+      startTime,
+      opencodeXdg,
+      opencodeSessionOptions,
+      prUrl: existingPr.selectedUrl,
+      stage: "merge-conflict",
+      prompt: mergeConflictPrompt,
+      blocked: {
+        source: "merge-conflict",
+        reason: blockedReasonShort,
+        notifyBody,
+      },
+    });
+  }
+
+  private async maybeHandleQueuedCiFailure(params: {
+    task: AgentTask;
+    issueNumber: string;
+    taskRepoPath: string;
+    cacheKey: string;
+    botBranch: string;
+    issueMeta: IssueMetadata;
+    startTime: Date;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+  }): Promise<AgentRun | null> {
+    const { task, issueNumber, taskRepoPath, cacheKey, botBranch, issueMeta, startTime, opencodeXdg, opencodeSessionOptions } = params;
+
+    if (!this.isGitHubQueueTask(task)) return null;
+
+    let existingPr: ResolvedIssuePr;
+    try {
+      existingPr = await this.getIssuePrResolution(issueNumber);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] CI recovery preflight failed for ${task.issue}: ${this.formatGhError(error)}`
+      );
+      return null;
+    }
+    if (!existingPr.selectedUrl) return null;
+
+    let requiredChecks: string[] = [];
+    let prStatus: Awaited<ReturnType<RepoWorker["getPullRequestChecks"]>>;
+    try {
+      ({ checks: requiredChecks } = await this.resolveRequiredChecksForMerge());
+      prStatus = await this.getPullRequestChecks(existingPr.selectedUrl);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] CI recovery preflight failed for ${existingPr.selectedUrl}: ${this.formatGhError(
+          error
+        )}`
+      );
+      return null;
+    }
+    if (prStatus.mergeStateStatus === "DIRTY") return null;
+
+    const summary = summarizeRequiredChecks(prStatus.checks, requiredChecks);
+    if (summary.status !== "failure") return null;
+
+    console.warn(
+      `[ralph:worker:${this.repo}] Existing PR has non-green checks; skipping planner for ${task.issue}.`
+    );
+
+    this.updateOpenPrSnapshot(task, null, existingPr.selectedUrl);
+
+    const ciPrompt = this.buildCiFailurePrompt(existingPr.selectedUrl, summary);
+    const reason = summarizeBlockedReason(`Required checks failed for ${existingPr.selectedUrl}`);
+    const notifyBody = [reason, "", formatRequiredChecksForHumans(summary)].join("\n");
+
+    return await this.runExistingPrRecovery({
+      task,
+      issueNumber,
+      taskRepoPath,
+      cacheKey,
+      botBranch,
+      issueMeta,
+      startTime,
+      opencodeXdg,
+      opencodeSessionOptions,
+      prUrl: existingPr.selectedUrl,
+      stage: "ci-failure",
+      prompt: ciPrompt,
+      blocked: {
+        source: "ci-failure",
+        reason,
+        notifyBody,
+      },
+    });
+  }
+
+  private async runExistingPrRecovery(params: {
+    task: AgentTask;
+    issueNumber: string;
+    taskRepoPath: string;
+    cacheKey: string;
+    botBranch: string;
+    issueMeta: IssueMetadata;
+    startTime: Date;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+    prUrl: string;
+    stage: "merge-conflict" | "ci-failure";
+    prompt: string;
+    blocked: { source: BlockedSource; reason: string; notifyBody: string };
+  }): Promise<AgentRun | null> {
+    const {
+      task,
+      issueNumber,
+      taskRepoPath,
+      cacheKey,
+      botBranch,
+      issueMeta,
+      startTime,
+      opencodeXdg,
+      opencodeSessionOptions,
+      prUrl,
+      stage,
+      prompt,
+      blocked,
+    } = params;
+
+    const pausedBefore = await this.pauseIfHardThrottled(task, stage, task["session-id"]?.trim());
+    if (pausedBefore) return pausedBefore;
+
+    const runLogPath = await this.recordRunLogPath(task, issueNumber, stage, "in-progress");
+    const resumeSessionId = task["session-id"]?.trim();
+
+    const recoveryResult = resumeSessionId
+      ? await this.session.continueSession(taskRepoPath, resumeSessionId, prompt, {
+          repo: this.repo,
+          cacheKey,
+          runLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 2,
+            stepTitle: stage,
+          },
+          ...this.buildWatchdogOptions(task, stage),
+          ...opencodeSessionOptions,
+        })
+      : await this.session.runAgent(taskRepoPath, "general", prompt, {
+          repo: this.repo,
+          cacheKey,
+          runLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 2,
+            stepTitle: stage,
+          },
+          ...this.buildWatchdogOptions(task, stage),
+          ...opencodeSessionOptions,
+        });
+
+    const pausedAfter = await this.pauseIfHardThrottled(task, `${stage} (post)`, recoveryResult.sessionId);
+    if (pausedAfter) return pausedAfter;
+
+    if (!recoveryResult.success) {
+      if (recoveryResult.watchdogTimeout) {
+        return await this.handleWatchdogTimeout(task, cacheKey, stage, recoveryResult, opencodeXdg);
+      }
+
+      const details = summarizeBlockedDetails(recoveryResult.output);
+      await this.markTaskBlocked(task, blocked.source, {
+        reason: blocked.reason,
+        details,
+        sessionId: recoveryResult.sessionId ?? task["session-id"]?.trim(),
+      });
+      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, task.name);
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: recoveryResult.sessionId,
+        escalationReason: blocked.reason,
+      };
+    }
+
+    if (recoveryResult.sessionId) {
+      await this.queue.updateTaskStatus(task, "in-progress", { "session-id": recoveryResult.sessionId });
+    }
+
+    await this.drainNudges(task, taskRepoPath, recoveryResult.sessionId, cacheKey, stage, opencodeXdg);
+
+    const recoverySessionId = recoveryResult.sessionId || resumeSessionId || "";
+    const mergeGate = await this.mergePrWithRequiredChecks({
+      task,
+      repoPath: taskRepoPath,
+      cacheKey,
+      botBranch,
+      prUrl,
+      sessionId: recoverySessionId,
+      issueMeta,
+      watchdogStagePrefix: stage,
+      notifyTitle: `Merging ${task.name}`,
+      opencodeXdg,
+    });
+
+    if (!mergeGate.ok) return mergeGate.run;
+
+    const pausedSurvey = await this.pauseIfHardThrottled(task, "survey", mergeGate.sessionId || recoverySessionId);
+    if (pausedSurvey) return pausedSurvey;
+
+    const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+    const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
+
+    const surveyResult = await this.session.continueCommand(surveyRepoPath, mergeGate.sessionId, "survey", [], {
+      repo: this.repo,
+      cacheKey,
+      runLogPath: surveyRunLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: task.issue,
+        taskName: task.name,
+        step: 3,
+        stepTitle: "survey",
+      },
+      ...this.buildWatchdogOptions(task, "survey"),
+      ...opencodeSessionOptions,
+    });
+
+    const pausedSurveyAfter = await this.pauseIfHardThrottled(
+      task,
+      "survey (post)",
+      surveyResult.sessionId || mergeGate.sessionId
+    );
+    if (pausedSurveyAfter) return pausedSurveyAfter;
+
+    if (!surveyResult.success && surveyResult.watchdogTimeout) {
+      return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    return await this.finalizeTaskSuccess({
+      task,
+      prUrl: mergeGate.prUrl,
+      sessionId: mergeGate.sessionId,
+      startTime,
+      surveyResults: surveyResult.output,
+      cacheKey,
+      opencodeXdg,
+      notify: true,
+      logMessage: `Task completed (recovery): ${task.name}`,
+    });
+  }
+
+  private async finalizeTaskSuccess(params: {
+    task: AgentTask;
+    prUrl: string;
+    sessionId: string;
+    startTime: Date;
+    surveyResults?: string;
+    cacheKey: string;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    worktreePath?: string;
+    workerId?: string;
+    repoSlot?: string | number | null;
+    devex?: EscalationContext["devex"];
+    notify?: boolean;
+    logMessage?: string;
+  }): Promise<AgentRun> {
+    const {
+      task,
+      prUrl,
+      sessionId,
+      startTime,
+      surveyResults,
+      cacheKey,
+      opencodeXdg,
+      worktreePath,
+      workerId,
+      repoSlot,
+      devex,
+      notify,
+      logMessage,
+    } = params;
+    const resolvedWorktreePath = worktreePath ?? task["worktree-path"]?.trim();
+    const resolvedWorkerId = workerId ?? task["worker-id"]?.trim();
+    const resolvedRepoSlot = repoSlot ?? task["repo-slot"]?.trim();
+    const shouldClearWorktree = Boolean(resolvedWorktreePath && String(resolvedWorktreePath).trim());
+    const shouldClearWorkerId = Boolean(resolvedWorkerId && String(resolvedWorkerId).trim());
+    const shouldClearRepoSlot = Boolean(
+      resolvedRepoSlot !== undefined && resolvedRepoSlot !== null && String(resolvedRepoSlot).trim()
+    );
+
+    const endTime = new Date();
+    await this.createAgentRun(task, {
+      sessionId,
+      pr: prUrl,
+      outcome: "success",
+      started: startTime,
+      completed: endTime,
+      surveyResults,
+      devex,
+    });
+
+    await this.queue.updateTaskStatus(task, "done", {
+      "completed-at": endTime.toISOString().split("T")[0],
+      "session-id": "",
+      "watchdog-retries": "",
+      ...(shouldClearWorktree ? { "worktree-path": "" } : {}),
+      ...(shouldClearWorkerId ? { "worker-id": "" } : {}),
+      ...(shouldClearRepoSlot ? { "repo-slot": "" } : {}),
+    });
+
+    await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
+
+    if (shouldClearWorktree && resolvedWorktreePath) {
+      await this.cleanupGitWorktree(resolvedWorktreePath);
+    }
+
+    await this.assertRepoRootClean(task, "post-run");
+
+    if (notify ?? true) {
+      await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
+    }
+    if (logMessage) {
+      console.log(`[ralph:worker:${this.repo}] ${logMessage}`);
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+      sessionId,
+      pr: prUrl ?? undefined,
+    };
   }
 
   private async updatePullRequestBranchViaWorktree(prUrl: string): Promise<void> {
@@ -3985,6 +4435,7 @@ ${guidance}`
       }
 
       const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
+      if (worktreePath) task["worktree-path"] = worktreePath;
 
       await this.prepareContextRecovery(task, taskRepoPath);
 
@@ -4038,16 +4489,20 @@ ${guidance}`
         "If you already created a PR, paste the PR URL. " +
         `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
 
-      const resumeMessage = opts?.resumeMessage?.trim() || defaultResumeMessage;
+      const resumeMessage = opts?.resumeMessage?.trim();
+      const baseResumeMessage = resumeMessage || defaultResumeMessage;
       const existingPr = await this.getIssuePrResolution(issueNumber);
       const finalResumeMessage = existingPr.selectedUrl
         ? [
             `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
             "Do NOT create a new PR.",
             "Continue work on the existing PR branch and push updates as needed.",
+            resumeMessage ?? "",
             "Only paste a PR URL if it changes.",
-          ].join(" ")
-        : resumeMessage;
+          ]
+            .filter(Boolean)
+            .join(" ")
+        : baseResumeMessage;
 
       if (existingPr.selectedUrl) {
         console.log(
@@ -4446,44 +4901,20 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
-      const endTime = new Date();
-      const completedAt = endTime.toISOString().split("T")[0];
-      await this.createAgentRun(task, {
+      return await this.finalizeTaskSuccess({
+        task,
+        prUrl,
         sessionId: buildResult.sessionId,
-        pr: prUrl,
-        outcome: "success",
-        started: startTime,
-        completed: endTime,
+        startTime,
         surveyResults: surveyResult.output,
+        cacheKey,
+        opencodeXdg,
+        worktreePath,
+        workerId,
+        repoSlot: typeof allocatedSlot === "number" ? String(allocatedSlot) : undefined,
+        notify: false,
+        logMessage: `Task resumed to completion: ${task.name}`,
       });
-
-      await this.queue.updateTaskStatus(task, "done", {
-        "completed-at": completedAt,
-        "session-id": "",
-        "watchdog-retries": "",
-        ...(worktreePath ? { "worktree-path": "" } : {}),
-        ...(workerId ? { "worker-id": "" } : {}),
-        ...(typeof allocatedSlot === "number" ? { "repo-slot": "" } : {}),
-      });
-
-      // Cleanup per-task OpenCode cache on success
-      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
-
-      if (worktreePath) {
-        await this.cleanupGitWorktree(worktreePath);
-      }
-
-      await this.assertRepoRootClean(task, "post-run");
-
-      console.log(`[ralph:worker:${this.repo}] Task resumed to completion: ${task.name}`);
-
-      return {
-        taskName: task.name,
-        repo: this.repo,
-        outcome: "success",
-        pr: prUrl ?? undefined,
-        sessionId: buildResult.sessionId,
-      };
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
@@ -4549,11 +4980,23 @@ ${guidance}`
       await this.ensureRalphWorkflowLabelsOnce();
 
       // 3. Mark task starting (restart-safe pre-session state)
+      const shouldClearBlocked = Boolean(
+        task["blocked-source"]?.trim() || task["blocked-reason"]?.trim() || task["blocked-details"]?.trim()
+      );
       const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
         ...(!task["opencode-profile"]?.trim() && opencodeProfileName ? { "opencode-profile": opencodeProfileName } : {}),
         ...(workerId ? { "worker-id": workerId } : {}),
         ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
+        ...(shouldClearBlocked
+          ? {
+              "blocked-source": "",
+              "blocked-reason": "",
+              "blocked-details": "",
+              "blocked-at": "",
+              "blocked-checked-at": "",
+            }
+          : {}),
       });
       if (workerId) task["worker-id"] = workerId;
       if (typeof allocatedSlot === "number") task["repo-slot"] = String(allocatedSlot);
@@ -4568,6 +5011,7 @@ ${guidance}`
         throw new Error(resolvedRepoPath.reason);
       }
       const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
+      if (worktreePath) task["worktree-path"] = worktreePath;
 
       await this.prepareContextRecovery(task, taskRepoPath);
 
@@ -4587,6 +5031,33 @@ ${guidance}`
       );
 
       await this.assertRepoRootClean(task, "start");
+
+      const botBranch = getRepoBotBranch(this.repo);
+      const mergeConflictRun = await this.maybeHandleQueuedMergeConflict({
+        task,
+        issueNumber,
+        taskRepoPath,
+        cacheKey,
+        botBranch,
+        issueMeta,
+        startTime,
+        opencodeXdg,
+        opencodeSessionOptions,
+      });
+      if (mergeConflictRun) return mergeConflictRun;
+
+      const ciFailureRun = await this.maybeHandleQueuedCiFailure({
+        task,
+        issueNumber,
+        taskRepoPath,
+        cacheKey,
+        botBranch,
+        issueMeta,
+        startTime,
+        opencodeXdg,
+        opencodeSessionOptions,
+      });
+      if (ciFailureRun) return ciFailureRun;
 
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
@@ -4857,7 +5328,6 @@ ${guidance}`
 
       // 6. Proceed with build
       console.log(`[ralph:worker:${this.repo}] Proceeding with build...`);
-      const botBranch = getRepoBotBranch(this.repo);
       const existingPr = await this.getIssuePrResolution(issueNumber);
       const proceedMessage = existingPr.selectedUrl
         ? [
@@ -5248,49 +5718,21 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
-      // 10. Create agent-run note
-      const endTime = new Date();
-      await this.createAgentRun(task, {
+      return await this.finalizeTaskSuccess({
+        task,
+        prUrl,
         sessionId: buildResult.sessionId,
-        pr: prUrl,
-        outcome: "success",
-        started: startTime,
-        completed: endTime,
+        startTime,
         surveyResults: surveyResult.output,
+        cacheKey,
+        opencodeXdg,
+        worktreePath,
+        workerId,
+        repoSlot: typeof allocatedSlot === "number" ? String(allocatedSlot) : undefined,
         devex: devexContext,
+        notify: true,
+        logMessage: `Task completed: ${task.name}`,
       });
-
-      // 11. Mark task done
-      await this.queue.updateTaskStatus(task, "done", {
-        "completed-at": endTime.toISOString().split("T")[0],
-        "session-id": "",
-        "watchdog-retries": "",
-        ...(worktreePath ? { "worktree-path": "" } : {}),
-        ...(workerId ? { "worker-id": "" } : {}),
-        ...(typeof allocatedSlot === "number" ? { "repo-slot": "" } : {}),
-      });
-
-      // 12. Cleanup per-task OpenCode cache on success
-      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey, opencodeXdg?.cacheHome), { recursive: true, force: true });
-
-      if (worktreePath) {
-        await this.cleanupGitWorktree(worktreePath);
-      }
-
-      await this.assertRepoRootClean(task, "post-run");
-
-      // 13. Send desktop notification for completion
-      await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
-
-      console.log(`[ralph:worker:${this.repo}] Task completed: ${task.name}`);
-
-      return {
-        taskName: task.name,
-        repo: this.repo,
-        outcome: "success",
-        pr: prUrl ?? undefined,
-        sessionId: buildResult.sessionId,
-      };
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 

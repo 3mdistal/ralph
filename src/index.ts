@@ -684,6 +684,61 @@ async function startTask(opts: {
     }
 
     try {
+      const blockedSource = claimedTask["blocked-source"]?.trim() || "";
+      const sessionId = claimedTask["session-id"]?.trim() || "";
+      const shouldResumeMergeConflict = sessionId && blockedSource === "merge-conflict";
+
+      if (shouldResumeMergeConflict) {
+        console.log(
+          `[ralph] Requeued merge-conflict task ${claimedTask.name}; resuming session ${sessionId} for conflict resolution`
+        );
+
+        await updateTaskStatus(claimedTask, "in-progress", {
+          "assigned-at": new Date().toISOString().split("T")[0],
+          "session-id": sessionId,
+          "throttled-at": "",
+          "resume-at": "",
+          "usage-snapshot": "",
+          "blocked-source": "",
+          "blocked-reason": "",
+          "blocked-details": "",
+          "blocked-at": "",
+          "blocked-checked-at": "",
+        });
+
+        void getOrCreateWorker(repo)
+          .resumeTask(claimedTask, {
+            resumeMessage:
+              "This task already has an open PR with merge conflicts blocking CI. Resolve the merge conflicts by rebasing/merging the base branch into the PR branch, push updates, and continue with the existing PR only.",
+          })
+          .then(async (run: AgentRun) => {
+            if (run.outcome === "success" && run.pr) {
+              try {
+                recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: PR_STATE_MERGED });
+              } catch {
+                // best-effort
+              }
+
+              await rollupMonitor.recordMerge(repo, run.pr);
+            }
+          })
+          .catch((e) => {
+            console.error(`[ralph] Error resuming task ${claimedTask.name}:`, e);
+          })
+          .finally(() => {
+            inFlightTasks.delete(key);
+            forgetOwnedTask(claimedTask);
+            releaseGlobal();
+            releaseRepo();
+            if (!isShuttingDown) {
+              scheduleQueuedTasksSoon();
+              void checkIdleRollups();
+            }
+          });
+
+        return true;
+      }
+
       void getOrCreateWorker(repo)
         .processTask(claimedTask)
         .then(async (run: AgentRun) => {
