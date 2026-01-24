@@ -151,12 +151,16 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("7");
+      expect(meta.value).toBe("8");
 
-      const columns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
-      const columnNames = columns.map((column) => column.name);
-      expect(columnNames).toContain("github_node_id");
-      expect(columnNames).toContain("github_updated_at");
+      const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
+      const issueColumnNames = issueColumns.map((column) => column.name);
+      expect(issueColumnNames).toContain("github_node_id");
+      expect(issueColumnNames).toContain("github_updated_at");
+
+      const taskColumns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+      const taskColumnNames = taskColumns.map((column) => column.name);
+      expect(taskColumnNames).toContain("session_events_path");
 
       const issueLabelsTable = migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'issue_labels'")
@@ -172,6 +176,54 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_done_reconcile_cursor'")
         .get() as { name?: string } | undefined;
       expect(doneCursorTable?.name).toBe("repo_github_done_reconcile_cursor");
+    } finally {
+      migrated.close();
+    }
+  });
+
+  test("migrates schema from v7", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '7')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT NOT NULL,
+          task_name TEXT,
+          status TEXT,
+          session_id TEXT,
+          worktree_path TEXT,
+          worker_id TEXT,
+          repo_slot TEXT,
+          daemon_id TEXT,
+          heartbeat_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, task_path)
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const migrated = new Database(dbPath);
+    try {
+      const meta = migrated
+        .query("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get() as { value?: string };
+      expect(meta.value).toBe("8");
+
+      const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+      const columnNames = columns.map((column) => column.name);
+      expect(columnNames).toContain("session_events_path");
     } finally {
       migrated.close();
     }
@@ -300,7 +352,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("7");
+      expect(meta.value).toBe("8");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
