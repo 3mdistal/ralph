@@ -66,7 +66,19 @@ const defaultGetThrottleDecisionImpl = async (now: number, opts?: GetThrottleArg
     });
   }
 
-  // Later reset, also healthy remaining.
+  if (name === "tempo") {
+    // Later reset, healthy remaining but lower than apple.
+    return mk({
+      state: "ok",
+      nextResetTs: now + 5 * 24 * 60 * 60 * 1000,
+      weeklyHardCapTokens: 1000,
+      weeklyUsedTokens: 200,
+      rolling5hHardCapTokens: 200,
+      rolling5hUsedTokens: 60,
+    });
+  }
+
+  // Later reset, healthiest remaining.
   return mk({
     state: "ok",
     nextResetTs: now + 5 * 24 * 60 * 60 * 1000,
@@ -107,6 +119,7 @@ describe("auto opencode profile selection", () => {
         profiles: {
           apple: { xdgDataHome: "/tmp", xdgConfigHome: "/tmp", xdgStateHome: "/tmp" },
           google: { xdgDataHome: "/tmp", xdgConfigHome: "/tmp", xdgStateHome: "/tmp" },
+          tempo: { xdgDataHome: "/tmp", xdgConfigHome: "/tmp", xdgStateHome: "/tmp" },
         },
       },
     });
