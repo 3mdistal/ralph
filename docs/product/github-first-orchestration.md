@@ -90,7 +90,7 @@ Blocked enforcement:
 Blocked attribution (`blocked-source` in agent-task frontmatter):
 - `deps` - blocked by issue dependencies or sub-issues
 - `allowlist` - repo owner not in allowlist
-- `dirty-repo` - repo root has uncommitted changes
+- `dirty-repo` - repo root has uncommitted changes (only blocks when a task would run in the main checkout; isolated worktrees may proceed)
 - `merge-target` - PR targets protected base (e.g. main without override)
 - `ci-only` - CI-only PR for non-CI issue
 - `merge-conflict` - PR has merge conflicts
@@ -103,6 +103,14 @@ Blocked metadata (agent-task frontmatter):
 - `blocked-reason` - short human-readable summary (bounded)
 - `blocked-details` - truncated diagnostics (redacted) used for status snippets and run notes
 - `blocked-checked-at` - last time blocked state was evaluated
+
+Requeue resolution (non-dependency blocked tasks):
+- Operators requeue by re-adding `ralph:queued` on the issue.
+- Ralph removes the `ralph:blocked` label when it claims the issue again.
+- When Ralph claims the task again, it clears all `blocked-*` metadata and resumes work.
+- If a `session-id` exists, Ralph resumes the prior OpenCode session; otherwise it starts a fresh session.
+- Requeue does not override dependency blockers; if dependencies are still open, Ralph keeps the issue blocked.
+- In that case Ralph leaves `ralph:queued` in place and rechecks when dependencies change.
 
 ## Done semantics (Pattern A)
 

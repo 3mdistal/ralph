@@ -19,7 +19,7 @@ const KNOWN_RALPH_LABELS = Array.from(
   new Set([...Object.values(RALPH_STATUS_LABELS).filter(Boolean), RALPH_LABEL_DONE])
 ) as string[];
 const RALPH_LABEL_QUEUED = RALPH_STATUS_LABELS.queued ?? "ralph:queued";
-// Preserve queued intent while blocked; blocked remains non-claimable.
+// Preserve queued intent while blocked; claimability is determined at the queue layer.
 const PRESERVE_LABELS_BY_STATUS: Partial<Record<QueueTaskStatus, readonly string[]>> = {
   blocked: [RALPH_LABEL_QUEUED],
 };
@@ -30,6 +30,7 @@ export function deriveRalphStatus(labels: string[], issueState?: string | null):
   if (labels.includes(RALPH_LABEL_DONE)) return "done";
   if (labels.includes("ralph:in-bot")) return "done";
   if (labels.includes("ralph:escalated")) return "escalated";
+  if (labels.includes("ralph:blocked") && labels.includes("ralph:queued")) return "queued";
   if (labels.includes("ralph:blocked")) return "blocked";
   if (labels.includes("ralph:in-progress")) return "in-progress";
   if (labels.includes("ralph:queued")) return "queued";
@@ -64,9 +65,6 @@ export function planClaim(currentLabels: string[]): {
   if (labelSet.has("ralph:escalated")) {
     return { claimable: false, steps: [], reason: "Issue is escalated" };
   }
-  if (labelSet.has("ralph:blocked")) {
-    return { claimable: false, steps: [], reason: "Issue is blocked" };
-  }
   if (labelSet.has("ralph:in-bot")) {
     return { claimable: false, steps: [], reason: "Issue already in bot" };
   }
@@ -75,6 +73,17 @@ export function planClaim(currentLabels: string[]): {
   }
   if (!labelSet.has("ralph:queued")) {
     return { claimable: false, steps: [], reason: "Missing ralph:queued label" };
+  }
+
+  if (labelSet.has("ralph:blocked")) {
+    return {
+      claimable: true,
+      steps: [
+        { action: "add", label: "ralph:in-progress" },
+        { action: "remove", label: "ralph:queued" },
+        { action: "remove", label: "ralph:blocked" },
+      ],
+    };
   }
 
   return {

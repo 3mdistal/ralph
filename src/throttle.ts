@@ -5,6 +5,7 @@ import { join } from "path";
 
 import { getConfig, resolveOpencodeProfile } from "./config";
 import { shouldLog } from "./logging";
+import { extractProviderId, extractRole } from "./opencode-message-utils";
 
 export type ThrottleState = "ok" | "soft" | "hard";
 
@@ -121,19 +122,6 @@ function parseTimestampMs(value: unknown): number | null {
   return null;
 }
 
-function extractProviderId(message: any): string | null {
-  const direct = typeof message?.providerID === "string" ? message.providerID : null;
-  if (direct) return direct;
-
-  const alt = typeof message?.providerId === "string" ? message.providerId : null;
-  if (alt) return alt;
-
-  const nested = typeof message?.provider?.id === "string" ? message.provider.id : null;
-  if (nested) return nested;
-
-  return null;
-}
-
 function extractCreatedTs(message: any): number | null {
   const fromTime = parseTimestampMs(message?.time?.created);
   if (fromTime != null) return fromTime;
@@ -145,10 +133,6 @@ function extractCreatedTs(message: any): number | null {
   if (fromTs != null) return fromTs;
 
   return null;
-}
-
-function extractRole(message: any): string {
-  return typeof message?.role === "string" ? message.role : "";
 }
 
 function extractTokenCount(message: any): number {

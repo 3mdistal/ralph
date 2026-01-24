@@ -18,6 +18,7 @@ export type RalphEventType =
   | "worker.activity.updated"
   | "worker.anomaly.updated"
   | "worker.summary.updated"
+  | "worker.context_compact.triggered"
   | "log.ralph"
   | "log.worker"
   | "log.opencode.event"
@@ -62,6 +63,7 @@ export type RalphEvent =
   | RalphEventEnvelope<"worker.activity.updated", { activity: string }>
   | RalphEventEnvelope<"worker.anomaly.updated", { total?: number; recentBurst?: boolean }>
   | RalphEventEnvelope<"worker.summary.updated", { text: string; confidence?: number; top_activities?: string[] }>
+  | RalphEventEnvelope<"worker.context_compact.triggered", { stepTitle?: string; attempt?: number }>
   | RalphEventEnvelope<"log.ralph", { message: string }>
   | RalphEventEnvelope<"log.worker", { message: string }>
   | RalphEventEnvelope<"log.opencode.event", { event: unknown }>
@@ -86,6 +88,7 @@ const EVENT_TYPES: ReadonlySet<string> = new Set<string>([
   "worker.activity.updated",
   "worker.anomaly.updated",
   "worker.summary.updated",
+  "worker.context_compact.triggered",
   "log.ralph",
   "log.worker",
   "log.opencode.event",

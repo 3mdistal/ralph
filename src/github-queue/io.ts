@@ -2,7 +2,9 @@ import { getConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "../github/client";
 import { createRalphWorkflowLabelsEnsurer, type EnsureOutcome } from "../github/ensure-ralph-workflow-labels";
+import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
+import { GitHubRelationshipProvider } from "../github/issue-relationships";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {
@@ -360,6 +362,33 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         let plan = planClaim(issue.labels);
         try {
           const liveLabels = await io.listIssueLabels(issueRef.repo, issueRef.number);
+          if (liveLabels.includes("ralph:queued") && liveLabels.includes("ralph:blocked")) {
+            try {
+              const relationships = new GitHubRelationshipProvider(issueRef.repo);
+              const snapshot = await relationships.getSnapshot(issueRef);
+              if (!snapshot.coverage.githubDepsComplete || !snapshot.coverage.githubSubIssuesComplete) {
+                return {
+                  claimed: false,
+                  task: opts.task,
+                  reason: "Dependency coverage unknown; treating issue as blocked",
+                };
+              }
+              const ignoreBodyDeps = snapshot.coverage.githubDepsComplete && snapshot.coverage.githubSubIssuesComplete;
+              const signals = ignoreBodyDeps
+                ? snapshot.signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
+                : snapshot.signals;
+              const decision = computeBlockedDecision(signals);
+              if (decision.blocked || decision.confidence === "unknown") {
+                const reason =
+                  decision.blocked && decision.reasons.length > 0
+                    ? `Issue blocked by dependencies (${decision.reasons.join(", ")})`
+                    : "Dependency coverage unknown; treating issue as blocked";
+                return { claimed: false, task: opts.task, reason };
+              }
+            } catch (error: any) {
+              return { claimed: false, task: opts.task, reason: error?.message ?? String(error) };
+            }
+          }
           plan = planClaim(liveLabels);
           if (!plan.claimable) {
             return { claimed: false, task: opts.task, reason: plan.reason ?? "Task not claimable" };

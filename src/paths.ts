@@ -42,7 +42,7 @@ export function getRalphStateDbPath(): string {
   return join(getRalphHomeDir(), "state.sqlite");
 }
 
-export function getRalphSessionsDir(): string {
+function getRalphSessionsDir(): string {
   const raw = process.env.RALPH_SESSIONS_DIR?.trim();
   if (raw) return isAbsolute(raw) ? raw : join(process.cwd(), raw);
   return join(getRalphHomeDir(), "sessions");
