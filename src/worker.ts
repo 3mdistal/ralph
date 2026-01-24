@@ -867,6 +867,25 @@ export class RepoWorker {
       );
     }
   }
+
+  private isNoCommitFoundError(error: unknown): boolean {
+    if (!(error instanceof GitHubApiError)) return false;
+    if (error.status !== 422) return false;
+    return /No commit found for SHA/i.test(error.responseText);
+  }
+
+  private isRefAlreadyExistsError(error: unknown): boolean {
+    if (!(error instanceof GitHubApiError)) return false;
+    if (error.status !== 422) return false;
+    return /Reference already exists/i.test(error.responseText);
+  }
+
+  private buildMissingBranchError(error: GitHubApiError): Error {
+    const message = error.message || error.responseText || "Missing branch";
+    const missingBranchError = new Error(message);
+    missingBranchError.cause = "missing-branch";
+    return missingBranchError;
+  }
   private async fetchCheckRunNames(branch: string): Promise<string[]> {
     const { owner, name } = splitRepoFullName(this.repo);
     const encodedBranch = encodeURIComponent(branch);
@@ -876,11 +895,8 @@ export class RepoWorker {
       );
       return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
     } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      if (/HTTP 422/.test(msg) && /No commit found/i.test(msg)) {
-        const missingBranchError = new Error(msg);
-        missingBranchError.cause = "missing-branch";
-        throw missingBranchError;
+      if (this.isNoCommitFoundError(e)) {
+        throw this.buildMissingBranchError(e);
       }
       throw e;
     }
@@ -895,11 +911,8 @@ export class RepoWorker {
       );
       return toSortedUniqueStrings(payload?.statuses?.map((status) => status?.context ?? "") ?? []);
     } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      if (/HTTP 422/.test(msg) && /No commit found/i.test(msg)) {
-        const missingBranchError = new Error(msg);
-        missingBranchError.cause = "missing-branch";
-        throw missingBranchError;
+      if (this.isNoCommitFoundError(e)) {
+        throw this.buildMissingBranchError(e);
       }
       throw e;
     }
@@ -992,9 +1005,7 @@ export class RepoWorker {
       );
       return true;
     } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      if (/Reference already exists/i.test(msg)) return false;
-      if (/HTTP 422/.test(msg) && /already exists/i.test(msg)) return false;
+      if (this.isRefAlreadyExistsError(e)) return false;
       throw e;
     }
   }
@@ -1076,16 +1087,6 @@ export class RepoWorker {
     }
 
     return "main";
-  }
-
-  private async ensureBotBranchExistsBestEffort(): Promise<void> {
-    const botBranch = getRepoBotBranch(this.repo);
-    try {
-      await this.ensureRemoteBranchExists(botBranch);
-    } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      console.warn(`[ralph:worker:${this.repo}] Unable to ensure bot branch ${botBranch}: ${msg}`);
-    }
   }
 
   private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
@@ -1186,14 +1187,14 @@ ${guidance}`
 
     this.ensureBranchProtectionPromise = (async () => {
       const botBranch = getRepoBotBranch(this.repo);
-      const branches = Array.from(new Set([botBranch, "main"]));
       const requiredChecksOverride = getRepoRequiredChecksOverride(this.repo);
 
       if (requiredChecksOverride === null || requiredChecksOverride.length === 0) {
         return;
       }
 
-      await this.ensureBotBranchExistsBestEffort();
+      const fallbackBranch = await this.resolveFallbackBranch(botBranch);
+      const branches = Array.from(new Set([botBranch, fallbackBranch]));
 
       for (const branch of branches) {
         await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
