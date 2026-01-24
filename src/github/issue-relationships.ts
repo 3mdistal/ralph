@@ -1,9 +1,6 @@
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./client";
-import {
-  type IssueRef,
-  type RelationshipSignal,
-  parseIssueBodyDependencies,
-} from "./issue-blocking-core";
+import { parseIssueBodyDependencies, type RelationshipSignal } from "./issue-blocking-core";
+import type { IssueRef } from "./issue-ref";
 
 export type IssueRelationshipSnapshot = {
   issue: IssueRef;

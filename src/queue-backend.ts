@@ -9,6 +9,7 @@ import {
 import { shouldLog } from "./logging";
 import * as bwrbQueue from "./queue";
 import type { QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
+import type { TaskPriority } from "./queue/priority";
 import { createGitHubQueueDriver } from "./github-queue";
 
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
@@ -38,7 +39,7 @@ export type QueueBackendDriver = {
     repo: string;
     scope: string;
     status: QueueTaskStatus;
-    priority?: string;
+    priority?: TaskPriority;
   }): Promise<{ taskPath: string; taskFileName: string } | null>;
   resolveAgentTaskByIssue(issue: string, repo?: string): Promise<QueueTask | null>;
 };
@@ -325,7 +326,7 @@ export async function createAgentTask(opts: {
   repo: string;
   scope: string;
   status: QueueTaskStatus;
-  priority?: string;
+  priority?: TaskPriority;
 }): Promise<{ taskPath: string; taskFileName: string } | null> {
   return getQueueBackendDriver().createAgentTask(opts);
 }

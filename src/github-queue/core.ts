@@ -1,4 +1,5 @@
 import type { AgentTask, QueueTaskStatus } from "../queue/types";
+import { inferPriorityFromLabels } from "../queue/priority";
 import type { IssueSnapshot, TaskOpState } from "../state";
 
 export type LabelOp = { action: "add" | "remove"; label: string };
@@ -104,6 +105,7 @@ export function deriveTaskView(params: {
   const status = opStatus === "throttled" ? "throttled" : labelStatus ?? opStatus ?? "queued";
   const creationDate = params.issue.githubUpdatedAt ?? params.nowIso;
   const name = params.issue.title?.trim() ? params.issue.title : `Issue ${params.issue.number}`;
+  const priority = inferPriorityFromLabels(params.issue.labels);
 
   return {
     _path: taskPath,
@@ -114,6 +116,7 @@ export function deriveTaskView(params: {
     issue: issueRef,
     repo: params.issue.repo,
     status,
+    priority,
     name,
     "session-id": params.opState?.sessionId ?? undefined,
     "worktree-path": params.opState?.worktreePath ?? undefined,

@@ -23,6 +23,24 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 | `ralph:blocked` | Blocked by dependencies | `D73A4A` |
 | `ralph:escalated` | Waiting on human input | `B60205` |
 
+## Operator-owned priority labels
+
+Operators can influence queue ordering by applying `p0`-`p4` labels on GitHub issues. Ralph infers task priority from
+these labels but does not create or manage them.
+
+Rules:
+- Any label whose name starts with `p0`, `p1`, `p2`, `p3`, or `p4` (case-insensitive) is treated as a priority label.
+- Mapping:
+  - `p0*` -> `p0-critical`
+  - `p1*` -> `p1-high`
+  - `p2*` -> `p2-medium`
+  - `p3*` -> `p3-low`
+  - `p4*` -> `p4-backlog`
+- If multiple priority labels are present, the highest priority (lowest number) wins.
+- If no priority labels are present, Ralph defaults to `p2-medium`.
+
+Note: scheduler "priority tasks" are reserved for resume work and are separate from label-based priority.
+
 ## Claim semantics + daemon model
 
 - Ralph treats `ralph:queued` as the only claimable state once it is not blocked or escalated. Claiming means applying `ralph:in-progress` and removing `ralph:queued`.

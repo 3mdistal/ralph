@@ -1,4 +1,5 @@
 import type { BlockedSource } from "../blocked-sources";
+import type { TaskPriority } from "./priority";
 
 export type QueueTaskStatus =
   | "queued"
@@ -18,7 +19,7 @@ export interface QueueTask {
   issue: string;
   repo: string;
   status: QueueTaskStatus;
-  priority?: string;
+  priority?: TaskPriority;
   name: string;
   run?: string;
   "assigned-at"?: string;
