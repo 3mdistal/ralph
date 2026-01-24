@@ -27,6 +27,7 @@ import { dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
+import { isSafeSessionId } from "./session-id";
 import { ensureManagedOpencodeConfigInstalled } from "./opencode-managed-config";
 import { registerOpencodeRun, unregisterOpencodeRun, updateOpencodeRun } from "./opencode-process-registry";
 import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
@@ -766,7 +767,11 @@ async function runSession(
 
   // If continuing an existing session, mark it as active for `ralph nudge`.
   const continueSessionId = options?.continueSession;
-  const lockPath = continueSessionId ? getSessionLockPathForRun(continueSessionId) : null;
+  const safeContinueSessionId = continueSessionId && isSafeSessionId(continueSessionId) ? continueSessionId : null;
+  if (continueSessionId && !safeContinueSessionId) {
+    console.warn(`[ralph] Refusing to write session lock for unsafe session id: ${continueSessionId}`);
+  }
+  const lockPath = safeContinueSessionId ? getSessionLockPathForRun(safeContinueSessionId) : null;
   const cleanupLock = () => {
     if (!lockPath) return;
     try {
@@ -884,6 +889,10 @@ async function runSession(
 
   const ensureEventStream = (id: string): void => {
     if (eventStream) return;
+    if (!isSafeSessionId(id)) {
+      console.warn(`[ralph] Refusing to write session events for unsafe session id: ${id}`);
+      return;
+    }
 
     try {
       mkdirSync(getSessionDirForRun(id), { recursive: true });

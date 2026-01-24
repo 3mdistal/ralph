@@ -65,9 +65,12 @@ import {
   type IssueRelationshipProvider,
   type IssueRelationshipSnapshot,
 } from "./github/issue-relationships";
-import { getRalphRunLogPath, getRalphSessionsDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
+import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import { cleanupSessionArtifacts } from "./introspection-traces";
+import { redactHomePathForDisplay } from "./redaction";
+import { isSafeSessionId } from "./session-id";
 import {
   getIdempotencyPayload,
   upsertIdempotencyKey,
@@ -163,9 +166,6 @@ const DEFAULT_THROTTLE_ADAPTER: ThrottleAdapter = {
   getThrottleDecision,
 };
 
-// Ralph introspection logs location
-const RALPH_SESSIONS_DIR = getRalphSessionsDir();
-
 // Git worktrees for per-task repo isolation
 const RALPH_WORKTREES_DIR = getRalphWorktreesDir();
 
@@ -195,7 +195,8 @@ interface LiveAnomalyCount {
 }
 
 async function readIntrospectionSummary(sessionId: string): Promise<IntrospectionSummary | null> {
-  const summaryPath = join(RALPH_SESSIONS_DIR, sessionId, "summary.json");
+  if (!isSafeSessionId(sessionId)) return null;
+  const summaryPath = join(getRalphSessionDir(sessionId), "summary.json");
   if (!existsSync(summaryPath)) return null;
   
   try {
@@ -211,6 +212,7 @@ async function readIntrospectionSummary(sessionId: string): Promise<Introspectio
  * Returns total count and whether there's been a recent burst.
  */
 async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount> {
+  if (!isSafeSessionId(sessionId)) return { total: 0, recentBurst: false };
   const eventsPath = getSessionEventsPath(sessionId);
   if (!existsSync(eventsPath)) return { total: 0, recentBurst: false };
 
@@ -223,13 +225,10 @@ async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount
 }
 
 async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
-  const sessionDir = join(RALPH_SESSIONS_DIR, sessionId);
-  if (existsSync(sessionDir)) {
-    try {
-      await rm(sessionDir, { recursive: true });
-    } catch (e) {
-      console.warn(`[ralph:worker] Failed to cleanup introspection logs: ${e}`);
-    }
+  try {
+    await cleanupSessionArtifacts(sessionId);
+  } catch (e) {
+    console.warn(`[ralph:worker] Failed to cleanup introspection logs: ${e}`);
   }
 }
 
@@ -365,7 +364,13 @@ function buildAgentRunBodyPrefix(params: {
   const lines: string[] = [params.headline];
   lines.push("", `Issue: ${params.task.issue}`, `Repo: ${params.task.repo}`);
   if (params.sessionId) lines.push(`Session: ${params.sessionId}`);
-  if (params.runLogPath) lines.push(`Run log: ${params.runLogPath}`);
+  if (params.runLogPath) lines.push(`Run log: ${redactHomePathForDisplay(params.runLogPath)}`);
+  if (params.sessionId && isSafeSessionId(params.sessionId)) {
+    const eventsPath = getSessionEventsPath(params.sessionId);
+    if (existsSync(eventsPath)) {
+      lines.push(`Trace: ${redactHomePathForDisplay(eventsPath)}`);
+    }
+  }
 
   const sanitizedReason = params.reason ? sanitizeDiagnosticsText(params.reason) : "";
   const reasonSummary = sanitizedReason ? summarizeForNote(sanitizedReason, 800) : "";
