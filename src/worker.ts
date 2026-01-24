@@ -106,6 +106,7 @@ type PullRequestMergeStateStatus =
   | "DIRTY"
   | "DRAFT"
   | "HAS_HOOKS"
+  | "UNSTABLE"
   | "UNKNOWN";
 
 type PullRequestMergeState = {
@@ -271,6 +272,7 @@ function normalizeMergeStateStatus(value: unknown): PullRequestMergeStateStatus 
     case "DIRTY":
     case "DRAFT":
     case "HAS_HOOKS":
+    case "UNSTABLE":
     case "UNKNOWN":
       return upper as PullRequestMergeStateStatus;
     default:
@@ -2567,7 +2569,7 @@ ${guidance}`
     return {
       number: Number(pr?.number ?? prNumber),
       url: String(pr?.url ?? prUrl),
-      mergeStateStatus: (pr?.mergeStateStatus ?? null) as PullRequestMergeStateStatus | null,
+      mergeStateStatus: normalizeMergeStateStatus(pr?.mergeStateStatus),
       isCrossRepository: Boolean(pr?.isCrossRepository),
       headRefName: String(pr?.headRefName ?? ""),
       headRepoFullName: String(pr?.headRepository?.nameWithOwner ?? ""),
