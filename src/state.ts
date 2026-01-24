@@ -818,6 +818,98 @@ export function recordPrSnapshot(input: {
     });
 }
 
+export type PrSnapshotRow = {
+  url: string;
+  prNumber: number | null;
+  state: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+function formatPrSnapshotRows(rows: Array<{
+  url?: string | null;
+  pr_number?: number | null;
+  state?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}>): PrSnapshotRow[] {
+  return rows
+    .map((row) => {
+      const url = typeof row.url === "string" ? row.url.trim() : "";
+      const createdAt = typeof row.created_at === "string" ? row.created_at : "";
+      const updatedAt = typeof row.updated_at === "string" ? row.updated_at : "";
+      if (!url || !createdAt || !updatedAt) return null;
+      return {
+        url,
+        prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
+        state: typeof row.state === "string" ? row.state : null,
+        createdAt,
+        updatedAt,
+      };
+    })
+    .filter((row): row is PrSnapshotRow => Boolean(row));
+}
+
+export function listPrSnapshotsForIssue(repo: string, issueNumber: number): PrSnapshotRow[] {
+  const database = requireDb();
+  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: repo,
+  }) as { id?: number } | undefined;
+  if (!repoRow?.id) return [];
+
+  const rows = database
+    .query(
+      `SELECT url, pr_number, state, created_at, updated_at
+       FROM prs
+       WHERE repo_id = $repo_id AND issue_number = $issue_number
+       ORDER BY updated_at DESC, created_at DESC`
+    )
+    .all({
+      $repo_id: repoRow.id,
+      $issue_number: issueNumber,
+    }) as Array<{
+    url?: string | null;
+    pr_number?: number | null;
+    state?: string | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+  }>;
+
+  return formatPrSnapshotRows(rows);
+}
+
+export function listOpenPrCandidatesForIssue(repo: string, issueNumber: number): PrSnapshotRow[] {
+  const database = requireDb();
+  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: repo,
+  }) as { id?: number } | undefined;
+  if (!repoRow?.id) return [];
+
+  const rows = database
+    .query(
+      `SELECT url, pr_number, state, created_at, updated_at
+       FROM prs
+       WHERE repo_id = $repo_id
+         AND issue_number = $issue_number
+         AND url IS NOT NULL
+         AND TRIM(url) != ''
+         AND (state = 'open' OR state IS NULL)
+       ORDER BY updated_at DESC, created_at DESC`
+    )
+    .all({
+      $repo_id: repoRow.id,
+      $issue_number: issueNumber,
+    }) as Array<{
+    url?: string | null;
+    pr_number?: number | null;
+    state?: string | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+  }>;
+
+  return formatPrSnapshotRows(rows);
+}
+
 export function hasIdempotencyKey(key: string): boolean {
   const database = requireDb();
   const row = database.query("SELECT key FROM idempotency WHERE key = $key").get({
