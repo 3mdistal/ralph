@@ -97,6 +97,12 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
 - `ci-failure` - required checks failed or non-actionable
 - `runtime-error` - unexpected runtime failure while processing/resuming a task
 
+Blocked metadata (agent-task frontmatter):
+- `blocked-at` - ISO timestamp for when the task entered blocked (resets only when the blocked signature changes)
+- `blocked-reason` - short human-readable summary (bounded)
+- `blocked-details` - truncated diagnostics (redacted) used for status snippets and run notes
+- `blocked-checked-at` - last time blocked state was evaluated
+
 ## Done semantics (Pattern A)
 
 - Issue remains open until the rollup PR merges to `main`.

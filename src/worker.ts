@@ -55,7 +55,7 @@ import { RALPH_LABEL_BLOCKED } from "./github-labels";
 import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
-import { writeEscalationToGitHub } from "./github/escalation-writeback";
+import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
@@ -254,19 +254,22 @@ function summarizeForNote(text: string, maxChars = 900): string {
   return trimmed.slice(0, maxChars).trimEnd() + "…";
 }
 
+function sanitizeDiagnosticsText(text: string): string {
+  return sanitizeEscalationReason(text);
+}
+
 function summarizeBlockedReason(text: string): string {
-  const trimmed = text.trim();
+  const trimmed = sanitizeDiagnosticsText(text).trim();
   if (!trimmed) return "";
   if (trimmed.length <= BLOCKED_REASON_MAX_LEN) return trimmed;
   return trimmed.slice(0, BLOCKED_REASON_MAX_LEN).trimEnd() + "…";
 }
 
 function summarizeBlockedDetails(text: string): string {
-  const trimmed = text.trim();
+  const trimmed = sanitizeDiagnosticsText(text).trim();
   if (!trimmed) return "";
-  const normalized = trimmed.replace(/\s+/g, " ").trim();
-  if (normalized.length <= BLOCKED_DETAILS_MAX_LEN) return normalized;
-  return normalized.slice(0, BLOCKED_DETAILS_MAX_LEN).trimEnd() + "…";
+  if (trimmed.length <= BLOCKED_DETAILS_MAX_LEN) return trimmed;
+  return trimmed.slice(0, BLOCKED_DETAILS_MAX_LEN).trimEnd() + "…";
 }
 
 function buildBlockedSignature(source?: BlockedSource, reason?: string): string {
@@ -324,10 +327,13 @@ function buildAgentRunBodyPrefix(params: {
   if (params.sessionId) lines.push(`Session: ${params.sessionId}`);
   if (params.runLogPath) lines.push(`Run log: ${params.runLogPath}`);
 
-  const reasonSummary = params.reason ? summarizeForNote(params.reason, 800) : "";
+  const sanitizedReason = params.reason ? sanitizeDiagnosticsText(params.reason) : "";
+  const reasonSummary = sanitizedReason ? summarizeForNote(sanitizedReason, 800) : "";
   if (reasonSummary) lines.push("", `Reason: ${reasonSummary}`);
 
-  const detailText = params.details && params.details !== params.reason ? summarizeForNote(params.details, 1400) : "";
+  const sanitizedDetails = params.details ? sanitizeDiagnosticsText(params.details) : "";
+  const detailText =
+    sanitizedDetails && sanitizedDetails !== sanitizedReason ? summarizeForNote(sanitizedDetails, 1400) : "";
   if (detailText) lines.push("", "Details:", detailText);
 
   return lines.join("\n").trim();
@@ -818,7 +824,21 @@ export class RepoWorker {
       nowIso,
     });
     const extraFields = opts?.extraFields ?? {};
-    const updatePatch = { ...patch, ...extraFields };
+    const reservedBlockedFields = new Set([
+      "blocked-source",
+      "blocked-reason",
+      "blocked-at",
+      "blocked-details",
+      "blocked-checked-at",
+    ]);
+    const sanitizedExtraFields = Object.fromEntries(
+      Object.entries(extraFields).filter(([key]) => {
+        if (!reservedBlockedFields.has(key)) return true;
+        console.warn(`[ralph:worker:${this.repo}] Ignoring blocked override field '${key}' in markTaskBlocked`);
+        return false;
+      })
+    );
+    const updatePatch = { ...sanitizedExtraFields, ...patch };
     const updated = await this.queue.updateTaskStatus(task, "blocked", updatePatch);
 
     if (updated) {
