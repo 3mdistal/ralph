@@ -1,6 +1,6 @@
 export type TaskPriority = "p0-critical" | "p1-high" | "p2-medium" | "p3-low" | "p4-backlog";
 
-export const DEFAULT_PRIORITY: TaskPriority = "p2-medium";
+const DEFAULT_PRIORITY: TaskPriority = "p2-medium";
 
 const PRIORITY_BY_INDEX: TaskPriority[] = [
   "p0-critical",
