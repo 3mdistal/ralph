@@ -1,6 +1,6 @@
 import { RALPH_LABEL_IN_BOT, RALPH_LABEL_IN_PROGRESS } from "./github-labels";
 import { computeMidpointLabelPlan } from "./midpoint-labels";
-import type { IssueRef } from "./github/issue-blocking-core";
+import type { IssueRef } from "./github/issue-ref";
 
 const MIDPOINT_LABEL_TIMEOUT_MS = 10_000;
 

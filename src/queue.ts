@@ -3,12 +3,14 @@ import { join } from "path";
 import { $ } from "bun";
 import crypto from "crypto";
 import { ensureBwrbVaultLayout, getConfig, getRepoBotBranch, getRepoPath } from "./config";
+import { parseIssueRef } from "./github/issue-ref";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { canActOnTask, isHeartbeatStale } from "./ownership";
+import { normalizeTaskPriority, priorityRank } from "./queue/priority";
 import type { AgentTask, QueueChangeHandler, QueueTaskStatus } from "./queue/types";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
@@ -217,7 +219,7 @@ async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentT
     const parsed = JSON.parse(result.stdout.toString());
     const rows = Array.isArray(parsed) ? parsed : [];
 
-    const tasks = rows.filter((row): row is AgentTask => {
+  const tasks = rows.filter((row): row is AgentTask => {
       return (
         typeof row === "object" &&
         row !== null &&
@@ -227,7 +229,10 @@ async function listTasksInQueueDir(status?: AgentTask["status"]): Promise<AgentT
       );
     });
 
-    const normalized = tasks.map((t) => normalizeAgentTaskIdentity(t));
+    const normalized = tasks.map((t) => ({
+      ...normalizeAgentTaskIdentity(t),
+      priority: normalizeTaskPriority((t as { priority?: unknown }).priority),
+    }));
     warnIfNestedTaskPaths(normalized);
     recordQueueStateSnapshot(normalized);
     refreshTaskFingerprints(normalized);
@@ -367,7 +372,7 @@ export async function createAgentTask(opts: {
   repo: string;
   scope: string;
   status: AgentTask["status"];
-  priority?: string;
+  priority?: AgentTask["priority"];
 }): Promise<{ taskPath: string; taskFileName: string } | null> {
   const config = getConfig();
   const today = new Date().toISOString().split("T")[0];
@@ -680,10 +685,14 @@ export function groupByRepo(tasks: AgentTask[]): Map<string, AgentTask[]> {
 
   for (const [repo, repoTasks] of grouped) {
     repoTasks.sort((a, b) => {
-      const priorityOrder = ["p0-critical", "p1-high", "p2-medium", "p3-low", "p4-backlog"];
-      const aIdx = priorityOrder.indexOf(a.priority ?? "p2-medium");
-      const bIdx = priorityOrder.indexOf(b.priority ?? "p2-medium");
-      return aIdx - bIdx;
+      const rankDelta = priorityRank(a.priority) - priorityRank(b.priority);
+      if (rankDelta !== 0) return rankDelta;
+
+      const aIssue = parseIssueRef(a.issue, a.repo)?.number ?? Number.POSITIVE_INFINITY;
+      const bIssue = parseIssueRef(b.issue, b.repo)?.number ?? Number.POSITIVE_INFINITY;
+      if (aIssue !== bIssue) return aIssue - bIssue;
+
+      return a._path.localeCompare(b._path);
     });
 
     grouped.set(repo, repoTasks);
