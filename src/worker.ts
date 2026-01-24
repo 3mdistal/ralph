@@ -1545,7 +1545,7 @@ ${guidance}`
 
       if (mode === "resume") {
         console.warn(`[ralph:worker:${this.repo}] ${reason} (resetting task for retry)`);
-        await this.queue.updateTaskStatus(task, "queued", {
+        const updated = await this.queue.updateTaskStatus(task, "queued", {
           "session-id": "",
           "worktree-path": "",
           "worker-id": "",
@@ -1554,6 +1554,9 @@ ${guidance}`
           "heartbeat-at": "",
           "watchdog-retries": "",
         });
+        if (!updated) {
+          throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
+        }
         await this.safeRemoveWorktree(recorded, { allowDiskCleanup: true });
         return { kind: "reset", reason: `${reason} (task reset to queued)` };
       }

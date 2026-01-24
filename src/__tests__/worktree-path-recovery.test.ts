@@ -34,8 +34,10 @@ describe("worktree-path recovery", () => {
 
   test("start mode recreates missing recorded worktree path", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { queue: queueAdapter });
-    (worker as any).ensureGitWorktree = mock(async () => {});
-    (worker as any).safeRemoveWorktree = mock(async () => {});
+    const ensureGitWorktreeMock = mock(async () => {});
+    const safeRemoveWorktreeMock = mock(async () => {});
+    (worker as any).ensureGitWorktree = ensureGitWorktreeMock;
+    (worker as any).safeRemoveWorktree = safeRemoveWorktreeMock;
 
     const stalePath = join(getRalphWorktreesDir(), repoSlug, "slot-0", "277", "stale-worktree");
     const task = createMockTask({
@@ -52,11 +54,13 @@ describe("worktree-path recovery", () => {
     expect(lastCall[1]).toBe("starting");
     expect(lastCall[2]["worktree-path"]).toBe(result.worktreePath);
     expect(result.worktreePath).toBeTruthy();
+    expect(safeRemoveWorktreeMock).toHaveBeenCalledWith(stalePath, { allowDiskCleanup: true });
   });
 
   test("resume mode resets task when recorded worktree path is missing", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { queue: queueAdapter });
-    (worker as any).safeRemoveWorktree = mock(async () => {});
+    const safeRemoveWorktreeMock = mock(async () => {});
+    (worker as any).safeRemoveWorktree = safeRemoveWorktreeMock;
 
     const stalePath = join(getRalphWorktreesDir(), repoSlug, "slot-0", "277", "missing-worktree");
     const task = createMockTask({
@@ -79,5 +83,6 @@ describe("worktree-path recovery", () => {
     expect(lastCall[2]["daemon-id"]).toBe("");
     expect(lastCall[2]["heartbeat-at"]).toBe("");
     expect(lastCall[2]["watchdog-retries"]).toBe("");
+    expect(safeRemoveWorktreeMock).toHaveBeenCalledWith(stalePath, { allowDiskCleanup: true });
   });
 });
