@@ -21,6 +21,7 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 | `ralph:in-progress` | Ralph is actively working | `FBCA04` |
 | `ralph:in-bot` | Task PR merged to `bot/integration` | `0E8A16` |
 | `ralph:blocked` | Blocked by dependencies | `D73A4A` |
+| `ralph:done` | Task merged to default branch | `1A7F37` |
 | `ralph:escalated` | Waiting on human input | `B60205` |
 
 ## Operator-owned priority labels
@@ -97,17 +98,26 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
 - `ci-failure` - required checks failed or non-actionable
 - `runtime-error` - unexpected runtime failure while processing/resuming a task
 
+Blocked metadata (agent-task frontmatter):
+- `blocked-at` - ISO timestamp for when the task entered blocked (resets only when the blocked signature changes)
+- `blocked-reason` - short human-readable summary (bounded)
+- `blocked-details` - truncated diagnostics (redacted) used for status snippets and run notes
+- `blocked-checked-at` - last time blocked state was evaluated
+
 ## Done semantics (Pattern A)
 
 - Issue remains open until the rollup PR merges to `main`.
 - When a task PR merges to `bot/integration`, Ralph applies `ralph:in-bot` and clears `ralph:in-progress`.
-- When the rollup PR merges to `main`, Ralph closes the issue and removes `ralph:in-bot`.
+- When the rollup PR merges to `main`, Ralph applies `ralph:done` and clears transitional labels (`ralph:in-bot`, `ralph:in-progress`, `ralph:blocked`, `ralph:escalated`, `ralph:queued`).
+- Closing the issue remains a separate policy decision (not required for done).
 
 Direct-to-main (override / Pattern B):
 - If a task PR is merged directly to `main` (or the repo config sets `botBranch: main`), Ralph does **not** apply the
   `ralph:in-bot` midpoint label, but **does** clear `ralph:in-progress` as part of the merge step.
 - Direct-to-main merges leave the issue open; closing behavior is handled by a separate policy (manual or future
-  automation) and is not part of the midpoint transition.
+  automation).
+- `ralph:done` is applied once the merge to the default branch is reconciled, regardless of whether it was a rollup
+  or direct-to-main merge.
 - If a task PR merges to a non-default branch (for example, a release branch), Ralph clears `ralph:in-progress` but does
   not apply `ralph:in-bot`.
 - Midpoint label updates are best-effort and do not block merges; failures are surfaced via non-blocking notifications

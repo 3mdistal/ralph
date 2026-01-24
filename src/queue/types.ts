@@ -50,6 +50,10 @@ export interface QueueTask {
   "blocked-source"?: BlockedSource;
   /** Short explanation of block reason */
   "blocked-reason"?: string;
+  /** When the task entered blocked (ISO timestamp) */
+  "blocked-at"?: string;
+  /** Optional truncated diagnostics for blocked state */
+  "blocked-details"?: string;
   /** Last time blocking was checked */
   "blocked-checked-at"?: string;
   /** Last checkpoint reached by worker */

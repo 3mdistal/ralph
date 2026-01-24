@@ -5,7 +5,7 @@ import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath } from "./paths";
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 
 export type PrState = "open" | "merged";
 export const PR_STATE_OPEN: PrState = "open";
@@ -86,6 +86,11 @@ function ensureSchema(database: Database): void {
           "DELETE FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL AND rowid NOT IN (" +
             "SELECT MAX(rowid) FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL GROUP BY repo_id, issue_number" +
             ")"
+        );
+      }
+      if (existingVersion < 7) {
+        database.exec(
+          "CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (repo_id INTEGER PRIMARY KEY, last_merged_at TEXT NOT NULL, last_pr_number INTEGER NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
         );
       }
     })();
@@ -170,6 +175,14 @@ function ensureSchema(database: Database): void {
     CREATE TABLE IF NOT EXISTS repo_github_issue_sync (
       repo_id INTEGER PRIMARY KEY,
       last_sync_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (
+      repo_id INTEGER PRIMARY KEY,
+      last_merged_at TEXT NOT NULL,
+      last_pr_number INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
 
@@ -329,6 +342,52 @@ export function getRepoGithubIssueLastSyncAt(repo: string): string | null {
     .get({ $name: repo }) as { last_sync_at?: string } | undefined;
 
   return typeof row?.last_sync_at === "string" ? row.last_sync_at : null;
+}
+
+export type RepoGithubDoneCursor = { lastMergedAt: string; lastPrNumber: number };
+
+export function getRepoGithubDoneReconcileCursor(repo: string): RepoGithubDoneCursor | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT dc.last_merged_at as last_merged_at, dc.last_pr_number as last_pr_number
+       FROM repo_github_done_reconcile_cursor dc
+       JOIN repos r ON r.id = dc.repo_id
+       WHERE r.name = $name`
+    )
+    .get({ $name: repo }) as { last_merged_at?: string; last_pr_number?: number } | undefined;
+
+  if (!row?.last_merged_at || typeof row.last_pr_number !== "number") return null;
+  return { lastMergedAt: row.last_merged_at, lastPrNumber: row.last_pr_number };
+}
+
+export function recordRepoGithubDoneReconcileCursor(params: {
+  repo: string;
+  repoPath?: string;
+  botBranch?: string;
+  lastMergedAt: string;
+  lastPrNumber: number;
+  updatedAt?: string;
+}): void {
+  const database = requireDb();
+  const at = params.updatedAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, repoPath: params.repoPath, botBranch: params.botBranch, at });
+
+  database
+    .query(
+      `INSERT INTO repo_github_done_reconcile_cursor(repo_id, last_merged_at, last_pr_number, updated_at)
+       VALUES ($repo_id, $last_merged_at, $last_pr_number, $updated_at)
+       ON CONFLICT(repo_id) DO UPDATE SET
+         last_merged_at = excluded.last_merged_at,
+         last_pr_number = excluded.last_pr_number,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $last_merged_at: params.lastMergedAt,
+      $last_pr_number: params.lastPrNumber,
+      $updated_at: at,
+    });
 }
 
 export function hasIssueSnapshot(repo: string, issue: string): boolean {

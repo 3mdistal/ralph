@@ -54,6 +54,7 @@ const TASK_FINGERPRINT_FIELDS = [
   "watchdog-retries",
   "blocked-source",
   "blocked-reason",
+  "blocked-at",
   "blocked-checked-at",
 ] as const;
 
