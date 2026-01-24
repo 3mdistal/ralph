@@ -19,7 +19,7 @@ const KNOWN_RALPH_LABELS = Array.from(
   new Set([...Object.values(RALPH_STATUS_LABELS).filter(Boolean), RALPH_LABEL_DONE])
 ) as string[];
 const RALPH_LABEL_QUEUED = RALPH_STATUS_LABELS.queued ?? "ralph:queued";
-// Preserve queued intent while blocked; blocked remains non-claimable.
+// Preserve queued intent while blocked; claimability is determined at the queue layer.
 const PRESERVE_LABELS_BY_STATUS: Partial<Record<QueueTaskStatus, readonly string[]>> = {
   blocked: [RALPH_LABEL_QUEUED],
 };
