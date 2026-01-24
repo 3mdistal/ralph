@@ -1,3 +1,4 @@
+import { describe, expect, test } from "bun:test";
 import { computeHeadBranchDeletionDecision } from "../pr-head-branch-cleanup";
 
 const baseInput = {
