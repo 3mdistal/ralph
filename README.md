@@ -384,7 +384,7 @@ Edit the control file (`~/.local/state/ralph/control.json`):
 
 Or send `SIGUSR1` to the daemon for immediate reload after editing.
 
-You can also use automatic selection for new tasks:
+You can also use automatic selection for new tasks (for example between "apple", "google", and "tempo"):
 
 ```json
 { "mode": "running", "opencode_profile": "auto" }
@@ -446,6 +446,13 @@ timeZone = "America/Indiana/Indianapolis"
 dayOfWeek = 4
 hour = 19
 minute = 9
+timeZone = "America/Indiana/Indianapolis"
+
+[throttle.perProfile.tempo.reset.weekly]
+# Wed 7:12pm
+dayOfWeek = 3
+hour = 19
+minute = 12
 timeZone = "America/Indiana/Indianapolis"
 ```
 
