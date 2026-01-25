@@ -15,6 +15,11 @@ async function writeToml(path: string, body: string): Promise<void> {
   await writeFile(path, body, "utf8");
 }
 
+async function writeJson(path: string, value: unknown): Promise<void> {
+  await mkdir(join(homeDir, ".ralph"), { recursive: true });
+  await writeFile(path, JSON.stringify(value, null, 2), "utf8");
+}
+
 describe("repos[].setup config", () => {
   beforeEach(async () => {
     priorHome = process.env.HOME;
@@ -63,19 +68,11 @@ describe("repos[].setup config", () => {
 
   test("warns and ignores invalid setup values", async () => {
     const configJsonPath = getRalphConfigJsonPath();
-    await writeFile(
-      configJsonPath,
-      JSON.stringify(
-        {
-          maxWorkers: 1,
-          ownershipTtlMs: 60000,
-          repos: [{ name: "demo/repo", setup: ["", 123] }],
-        },
-        null,
-        2
-      ),
-      "utf8"
-    );
+    await writeJson(configJsonPath, {
+      maxWorkers: 1,
+      ownershipTtlMs: 60000,
+      repos: [{ name: "demo/repo", setup: ["", 123] }],
+    });
 
     const warn = mock(() => {});
     const priorWarn = console.warn;
