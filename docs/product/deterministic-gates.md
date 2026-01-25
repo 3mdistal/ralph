@@ -142,6 +142,22 @@ Guidelines:
 - avoid pasting full CI logs into LLM context; summarize and attach a short excerpt
 - store the CI URL and any extracted snippets as artifacts on the run record
 
+### CI-debug recovery path (PR-first, bounded)
+
+When CI is red for an existing PR, CI-debug is the first-class recovery path:
+
+- Post a single canonical CI-debug status comment (updated in place, not duplicated) that includes:
+  - failing required check names + links to failing runs/jobs
+  - base/head refs
+  - the explicit action statement: "Ralph is spawning a dedicated CI-debug run to make required checks green."
+- Spawn a dedicated CI-debug run (fresh worktree + fresh OpenCode session; skip planning).
+- Retry in bounded attempts (2-3) and stop early if the same failure signature repeats.
+- Label semantics:
+  - Use `ralph:stuck` while CI remediation is in progress.
+  - Do not use `ralph:blocked` for CI remediation.
+  - Apply `ralph:escalated` only after bounded CI-debug attempts fail.
+- On escalation, update the CI-debug status comment with a final summary: what failed, what was tried, and the exact next human action.
+
 Escalation policy:
 - CI failures should default to an internal rework loop (resume/spawn) and only escalate to a human when they meet an escalation condition in `docs/escalation-policy.md` (e.g. product doc gap, hard external blocker).
 

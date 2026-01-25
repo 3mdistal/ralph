@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
 import { isSafeSessionId } from "./session-id";
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 export type PrState = "open" | "merged";
 export const PR_STATE_OPEN: PrState = "open";
@@ -96,6 +96,28 @@ function ensureSchema(database: Database): void {
       }
       if (existingVersion < 8) {
         database.exec("ALTER TABLE tasks ADD COLUMN session_events_path TEXT");
+      }
+      if (existingVersion < 9) {
+        database.exec(
+          "CREATE TABLE IF NOT EXISTS ci_debug_state (" +
+            "repo_id INTEGER NOT NULL, " +
+            "pr_number INTEGER NOT NULL, " +
+            "status TEXT NOT NULL, " +
+            "attempt_count_total INTEGER NOT NULL, " +
+            "last_attempt_at TEXT, " +
+            "last_signature TEXT, " +
+            "head_sha TEXT, " +
+            "active_session_id TEXT, " +
+            "active_worktree_path TEXT, " +
+            "comment_id INTEGER, " +
+            "last_body_hash TEXT, " +
+            "lease_owner TEXT, " +
+            "lease_until TEXT, " +
+            "created_at TEXT NOT NULL, " +
+            "updated_at TEXT NOT NULL, " +
+            "PRIMARY KEY(repo_id, pr_number), " +
+            "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE"
+        );
       }
     })();
   }
@@ -225,6 +247,26 @@ function ensureSchema(database: Database): void {
       UNIQUE(batch_id, pr_url)
     );
 
+    CREATE TABLE IF NOT EXISTS ci_debug_state (
+      repo_id INTEGER NOT NULL,
+      pr_number INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      attempt_count_total INTEGER NOT NULL,
+      last_attempt_at TEXT,
+      last_signature TEXT,
+      head_sha TEXT,
+      active_session_id TEXT,
+      active_worktree_path TEXT,
+      comment_id INTEGER,
+      last_body_hash TEXT,
+      lease_owner TEXT,
+      lease_until TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(repo_id, pr_number),
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -234,6 +276,7 @@ function ensureSchema(database: Database): void {
     CREATE INDEX IF NOT EXISTS idx_issue_labels_issue_id ON issue_labels(issue_id);
     CREATE INDEX IF NOT EXISTS idx_rollup_batches_repo_status ON rollup_batches(repo_id, bot_branch, status);
     CREATE INDEX IF NOT EXISTS idx_rollup_batch_prs_batch ON rollup_batch_prs(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_ci_debug_state_repo_pr ON ci_debug_state(repo_id, pr_number);
   `);
 }
 
@@ -1044,6 +1087,219 @@ export function upsertIdempotencyKey(input: {
 export function deleteIdempotencyKey(key: string): void {
   const database = requireDb();
   database.query("DELETE FROM idempotency WHERE key = $key").run({ $key: key });
+}
+
+export type CiDebugStatus = "idle" | "running" | "escalated";
+
+export type CiDebugState = {
+  repo: string;
+  prNumber: number;
+  status: CiDebugStatus;
+  attemptCountTotal: number;
+  lastAttemptAt: string | null;
+  lastSignature: string | null;
+  headSha: string | null;
+  activeSessionId: string | null;
+  activeWorktreePath: string | null;
+  commentId: number | null;
+  lastBodyHash: string | null;
+  leaseOwner: string | null;
+  leaseUntil: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CiDebugStateInput = {
+  repo: string;
+  prNumber: number;
+  status: CiDebugStatus;
+  attemptCountTotal: number;
+  lastAttemptAt: string | null;
+  lastSignature: string | null;
+  headSha: string | null;
+  activeSessionId: string | null;
+  activeWorktreePath: string | null;
+  commentId: number | null;
+  lastBodyHash: string | null;
+  leaseOwner: string | null;
+  leaseUntil: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+function formatCiDebugStateRow(row: {
+  repo?: string | null;
+  pr_number?: number | null;
+  status?: string | null;
+  attempt_count_total?: number | null;
+  last_attempt_at?: string | null;
+  last_signature?: string | null;
+  head_sha?: string | null;
+  active_session_id?: string | null;
+  active_worktree_path?: string | null;
+  comment_id?: number | null;
+  last_body_hash?: string | null;
+  lease_owner?: string | null;
+  lease_until?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}): CiDebugState | null {
+  if (!row.repo || typeof row.pr_number !== "number" || !row.status || !row.created_at || !row.updated_at) {
+    return null;
+  }
+  return {
+    repo: row.repo,
+    prNumber: row.pr_number,
+    status: row.status as CiDebugStatus,
+    attemptCountTotal: row.attempt_count_total ?? 0,
+    lastAttemptAt: row.last_attempt_at ?? null,
+    lastSignature: row.last_signature ?? null,
+    headSha: row.head_sha ?? null,
+    activeSessionId: row.active_session_id ?? null,
+    activeWorktreePath: row.active_worktree_path ?? null,
+    commentId: row.comment_id ?? null,
+    lastBodyHash: row.last_body_hash ?? null,
+    leaseOwner: row.lease_owner ?? null,
+    leaseUntil: row.lease_until ?? null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function getCiDebugState(repo: string, prNumber: number): CiDebugState | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT r.name as repo, cds.pr_number, cds.status, cds.attempt_count_total, cds.last_attempt_at,
+              cds.last_signature, cds.head_sha, cds.active_session_id, cds.active_worktree_path,
+              cds.comment_id, cds.last_body_hash, cds.lease_owner, cds.lease_until,
+              cds.created_at, cds.updated_at
+       FROM ci_debug_state cds
+       JOIN repos r ON r.id = cds.repo_id
+       WHERE r.name = $name AND cds.pr_number = $pr_number`
+    )
+    .get({ $name: repo, $pr_number: prNumber }) as {
+    repo?: string | null;
+    pr_number?: number | null;
+    status?: string | null;
+    attempt_count_total?: number | null;
+    last_attempt_at?: string | null;
+    last_signature?: string | null;
+    head_sha?: string | null;
+    active_session_id?: string | null;
+    active_worktree_path?: string | null;
+    comment_id?: number | null;
+    last_body_hash?: string | null;
+    lease_owner?: string | null;
+    lease_until?: string | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+  } | undefined;
+
+  if (!row) return null;
+  return formatCiDebugStateRow(row);
+}
+
+export function recordCiDebugState(input: CiDebugStateInput): CiDebugState {
+  const database = requireDb();
+  const at = input.updatedAt ?? nowIso();
+  const createdAt = input.createdAt ?? at;
+  const repoId = upsertRepo({ repo: input.repo, at });
+
+  database
+    .query(
+      `INSERT INTO ci_debug_state(
+         repo_id, pr_number, status, attempt_count_total, last_attempt_at,
+         last_signature, head_sha, active_session_id, active_worktree_path,
+         comment_id, last_body_hash, lease_owner, lease_until, created_at, updated_at
+       ) VALUES (
+         $repo_id, $pr_number, $status, $attempt_count_total, $last_attempt_at,
+         $last_signature, $head_sha, $active_session_id, $active_worktree_path,
+         $comment_id, $last_body_hash, $lease_owner, $lease_until, $created_at, $updated_at
+       )
+       ON CONFLICT(repo_id, pr_number) DO UPDATE SET
+         status = excluded.status,
+         attempt_count_total = excluded.attempt_count_total,
+         last_attempt_at = excluded.last_attempt_at,
+         last_signature = excluded.last_signature,
+         head_sha = excluded.head_sha,
+         active_session_id = excluded.active_session_id,
+         active_worktree_path = excluded.active_worktree_path,
+         comment_id = excluded.comment_id,
+         last_body_hash = excluded.last_body_hash,
+         lease_owner = excluded.lease_owner,
+         lease_until = excluded.lease_until,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $pr_number: input.prNumber,
+      $status: input.status,
+      $attempt_count_total: input.attemptCountTotal,
+      $last_attempt_at: input.lastAttemptAt,
+      $last_signature: input.lastSignature,
+      $head_sha: input.headSha,
+      $active_session_id: input.activeSessionId,
+      $active_worktree_path: input.activeWorktreePath,
+      $comment_id: input.commentId,
+      $last_body_hash: input.lastBodyHash,
+      $lease_owner: input.leaseOwner,
+      $lease_until: input.leaseUntil,
+      $created_at: createdAt,
+      $updated_at: at,
+    });
+
+  const recorded = getCiDebugState(input.repo, input.prNumber);
+  if (!recorded) {
+    throw new Error(`Failed to record ci_debug_state for ${input.repo}#${input.prNumber}`);
+  }
+  return recorded;
+}
+
+export function tryAcquireCiDebugLease(params: {
+  repo: string;
+  prNumber: number;
+  owner: string;
+  leaseUntil: string;
+  nowIso?: string;
+}): boolean {
+  const database = requireDb();
+  const at = params.nowIso ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+  const result = database
+    .query(
+      `UPDATE ci_debug_state
+       SET lease_owner = $owner, lease_until = $lease_until, updated_at = $updated_at
+       WHERE repo_id = $repo_id
+         AND pr_number = $pr_number
+         AND (lease_until IS NULL OR lease_until <= $updated_at OR lease_owner = $owner)`
+    )
+    .run({
+      $repo_id: repoId,
+      $pr_number: params.prNumber,
+      $owner: params.owner,
+      $lease_until: params.leaseUntil,
+      $updated_at: at,
+    });
+  return result.changes > 0;
+}
+
+export function releaseCiDebugLease(params: { repo: string; prNumber: number; owner: string; nowIso?: string }): void {
+  const database = requireDb();
+  const at = params.nowIso ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+  database
+    .query(
+      `UPDATE ci_debug_state
+       SET lease_owner = NULL, lease_until = NULL, updated_at = $updated_at
+       WHERE repo_id = $repo_id AND pr_number = $pr_number AND lease_owner = $owner`
+    )
+    .run({
+      $repo_id: repoId,
+      $pr_number: params.prNumber,
+      $owner: params.owner,
+      $updated_at: at,
+    });
 }
 
 export type RollupBatchStatus = "open" | "rolled-up";

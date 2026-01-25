@@ -8,6 +8,7 @@ const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   queued: "ralph:queued",
   "in-progress": "ralph:in-progress",
   blocked: "ralph:blocked",
+  stuck: "ralph:stuck",
   escalated: "ralph:escalated",
   done: "ralph:in-bot",
   starting: "ralph:in-progress",
@@ -30,6 +31,7 @@ export function deriveRalphStatus(labels: string[], issueState?: string | null):
   if (labels.includes(RALPH_LABEL_DONE)) return "done";
   if (labels.includes("ralph:in-bot")) return "done";
   if (labels.includes("ralph:escalated")) return "escalated";
+  if (labels.includes("ralph:stuck")) return "stuck";
   if (labels.includes("ralph:blocked") && labels.includes("ralph:queued")) return "queued";
   if (labels.includes("ralph:blocked")) return "blocked";
   if (labels.includes("ralph:in-progress")) return "in-progress";
@@ -70,6 +72,9 @@ export function planClaim(currentLabels: string[]): {
   }
   if (labelSet.has("ralph:in-progress")) {
     return { claimable: false, steps: [], reason: "Issue already in progress" };
+  }
+  if (labelSet.has("ralph:stuck")) {
+    return { claimable: false, steps: [], reason: "Issue is stuck" };
   }
   if (!labelSet.has("ralph:queued")) {
     return { claimable: false, steps: [], reason: "Missing ralph:queued label" };

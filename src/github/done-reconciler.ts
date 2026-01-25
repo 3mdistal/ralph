@@ -46,7 +46,14 @@ const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
 
 const DONE_LABEL = RALPH_LABEL_DONE;
-const TRANSITION_LABELS = ["ralph:queued", "ralph:in-progress", "ralph:in-bot", "ralph:blocked", "ralph:escalated"];
+const TRANSITION_LABELS = [
+  "ralph:queued",
+  "ralph:in-progress",
+  "ralph:in-bot",
+  "ralph:blocked",
+  "ralph:stuck",
+  "ralph:escalated",
+];
 
 function applyJitter(valueMs: number): number {
   const clamped = Math.max(valueMs, MIN_DELAY_MS);

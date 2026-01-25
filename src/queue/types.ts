@@ -7,6 +7,7 @@ export type QueueTaskStatus =
   | "in-progress"
   | "throttled"
   | "blocked"
+  | "stuck"
   | "escalated"
   | "done";
 

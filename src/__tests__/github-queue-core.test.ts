@@ -131,6 +131,11 @@ describe("github queue core", () => {
     expect(plan.claimable).toBe(false);
   });
 
+  test("planClaim rejects stuck issues", () => {
+    const plan = planClaim(["ralph:stuck", "ralph:queued"]);
+    expect(plan.claimable).toBe(false);
+  });
+
   test("planClaim allows blocked issues to requeue", () => {
     const plan = planClaim(["ralph:queued", "ralph:blocked"]);
     expect(plan.claimable).toBe(true);
@@ -157,6 +162,11 @@ describe("github queue core", () => {
   test("deriveRalphStatus treats queued+blocked as queued", () => {
     const status = deriveRalphStatus(["ralph:queued", "ralph:blocked"], "OPEN");
     expect(status).toBe("queued");
+  });
+
+  test("deriveRalphStatus prefers stuck over blocked", () => {
+    const status = deriveRalphStatus(["ralph:stuck", "ralph:blocked", "ralph:queued"], "OPEN");
+    expect(status).toBe("stuck");
   });
 
   test("deriveRalphStatus treats ralph:done as done", () => {
