@@ -22,6 +22,8 @@ export interface RepoConfig {
   requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
+  /** Optional setup commands to run in task worktrees before agents. */
+  setup?: string[];
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
   /** Enable proactive update-branch when a PR is BEHIND (default: false). */
@@ -388,6 +390,19 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           `${JSON.stringify((repo as any).autoUpdateBehindMinMinutes)}; falling back to ${DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES}`
       );
       updates.autoUpdateBehindMinMinutes = DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES;
+    }
+
+    const rawSetup = (repo as any).setup;
+    if (rawSetup !== undefined) {
+      const setupCommands = toStringArrayOrNull(rawSetup);
+      if (setupCommands === null) {
+        console.warn(
+          `[ralph] Invalid config setup for repo ${repo.name}: ${JSON.stringify(rawSetup)}; disabling setup`
+        );
+        updates.setup = undefined;
+      } else {
+        updates.setup = setupCommands;
+      }
     }
 
     if (Object.keys(updates).length === 0) return repo;
@@ -1022,6 +1037,19 @@ export function getRepoRequiredChecksOverride(repoName: string): string[] | null
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   return toStringArrayOrNull(explicit?.requiredChecks);
+}
+
+export function getRepoSetupCommands(repoName: string): string[] {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const raw = explicit?.setup;
+  if (raw === undefined) return [];
+  const parsed = toStringArrayOrNull(raw);
+  if (parsed === null) {
+    console.warn(`[ralph] Invalid config setup for repo ${repoName}: ${JSON.stringify(raw)}; ignoring`);
+    return [];
+  }
+  return parsed;
 }
 
 export function getGlobalMaxWorkers(): number {

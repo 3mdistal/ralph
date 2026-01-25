@@ -25,6 +25,7 @@ import {
   getRepoBotBranch,
   getRepoMaxWorkers,
   getRepoRequiredChecksOverride,
+  getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
   getConfig,
@@ -80,6 +81,7 @@ import { buildRalphEvent } from "./dashboard/events";
 import { cleanupSessionArtifacts } from "./introspection-traces";
 import { redactHomePathForDisplay } from "./redaction";
 import { isSafeSessionId } from "./session-id";
+import { runWorktreeSetup } from "./worktree-setup";
 import {
   getIdempotencyPayload,
   upsertIdempotencyKey,
@@ -949,6 +951,74 @@ export class RepoWorker {
       task,
       repoPath: worktreePath,
       planPath: RALPH_PLAN_RELATIVE_PATH,
+    };
+  }
+
+  private async ensureWorktreeSetup(params: {
+    task: AgentTask;
+    issueNumber: string;
+    worktreePath: string;
+    status: AgentTask["status"];
+  }): Promise<AgentRun | null> {
+    const commands = getRepoSetupCommands(this.repo);
+    if (commands.length === 0) return null;
+
+    const runLogPath = await this.recordRunLogPath(params.task, params.issueNumber, "setup", params.status);
+    let result: Awaited<ReturnType<typeof runWorktreeSetup>>;
+
+    try {
+      result = await runWorktreeSetup({
+        worktreePath: params.worktreePath,
+        commands,
+        runLogPath,
+      });
+    } catch (error: any) {
+      const raw = error?.message ?? String(error);
+      const reason = sanitizeDiagnosticsText(`Setup hooks crashed: ${raw}`);
+      console.warn(`[ralph:worker:${this.repo}] Setup hooks crashed: ${raw}`);
+      return await this.escalateSetupFailure(params.task, reason, raw);
+    }
+
+    if (result.status !== "failed") return null;
+
+    const reason = sanitizeDiagnosticsText(result.reason);
+    const details = result.output ? sanitizeDiagnosticsText(result.output) : reason;
+    console.warn(`[ralph:worker:${this.repo}] Setup hooks failed: ${reason}`);
+    return await this.escalateSetupFailure(params.task, reason, details);
+  }
+
+  private async escalateSetupFailure(task: AgentTask, reason: string, details?: string): Promise<AgentRun> {
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated");
+    if (escalated) {
+      applyTaskPatch(task, "escalated", {});
+    }
+
+    await this.writeEscalationWriteback(task, { reason, escalationType: "blocked" });
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name ?? task.name,
+      taskPath: task._path ?? task.name,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      reason,
+      escalationType: "blocked",
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        details,
+      });
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      escalationReason: reason,
     };
   }
 
@@ -4520,6 +4590,14 @@ ${guidance}`
       const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
       if (pausedBefore) return pausedBefore;
 
+      const setupRun = await this.ensureWorktreeSetup({
+        task,
+        issueNumber: issueNumber || cacheKey,
+        worktreePath: taskRepoPath,
+        status: "in-progress",
+      });
+      if (setupRun) return setupRun;
+
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
       let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
@@ -5073,6 +5151,14 @@ ${guidance}`
 
       const pausedPlan = await this.pauseIfHardThrottled(task, "plan");
       if (pausedPlan) return pausedPlan;
+
+      const setupRun = await this.ensureWorktreeSetup({
+        task,
+        issueNumber,
+        worktreePath: taskRepoPath,
+        status: "starting",
+      });
+      if (setupRun) return setupRun;
 
       const plannerPrompt = buildPlannerPrompt({ repo: this.repo, issueNumber });
       const planRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan", "starting");
