@@ -23,6 +23,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
@@ -63,6 +64,21 @@ function printCommandHelp(command: string): void {
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "usage":
+      console.log(
+        [
+          "Usage:",
+          "  ralph usage [--json] [--profile <name|auto>]",
+          "",
+          "Prints OpenAI usage meters (5h + weekly) that drive throttling and auto profile selection.",
+          "",
+          "Options:",
+          "  --json                 Emit machine-readable JSON output.",
+          "  --profile <name|auto>  Override the control/default profile for this command.",
         ].join("\n")
       );
       return;
@@ -148,7 +164,7 @@ if (!cmd || cmd.startsWith("-")) {
   }
 }
 
-if ((cmd === "resume" || cmd === "status" || cmd === "repos" || cmd === "watch" || cmd === "nudge" || cmd === "rollup") && hasHelpFlag) {
+if ((cmd === "resume" || cmd === "status" || cmd === "usage" || cmd === "repos" || cmd === "watch" || cmd === "nudge" || cmd === "rollup") && hasHelpFlag) {
   printCommandHelp(cmd);
   process.exit(0);
 }
