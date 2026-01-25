@@ -10,6 +10,10 @@ describe("escalation resolution reconciliation", () => {
       request: async (path: string, opts: { method?: string; body?: any } = {}) => {
         requests.push({ path, method: opts.method ?? "GET" });
 
+        if (path.startsWith("/repos/3mdistal/ralph/labels")) {
+          return { data: [] };
+        }
+
         if (path === "/graphql") {
           const number = opts.body?.variables?.number;
           const nodes =
@@ -102,6 +106,9 @@ describe("escalation resolution reconciliation", () => {
   test("ignores RALPH RESOLVED from non-operator", async () => {
     const github = {
       request: async (path: string, opts: { method?: string; body?: any } = {}) => {
+        if (path.startsWith("/repos/3mdistal/ralph/labels")) {
+          return { data: [] };
+        }
         if (path === "/graphql") {
           const nodes = [
             {

@@ -1,7 +1,8 @@
 import { resolveAgentTaskByIssue, updateTaskStatus } from "../queue-backend";
 import { initStateDb, listIssuesWithAllLabels } from "../state";
 import { GitHubClient, splitRepoFullName } from "./client";
-import { addIssueLabel, removeIssueLabel } from "./issue-label-io";
+import { ensureRalphWorkflowLabelsOnce } from "./ensure-ralph-workflow-labels";
+import { executeIssueLabelOps, type LabelOp } from "./issue-label-io";
 import {
   RALPH_ESCALATION_MARKER_PREFIX,
   RALPH_LABEL_ESCALATED,
@@ -75,12 +76,13 @@ async function listRecentIssueComments(params: {
   }));
 }
 
-async function addEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await addIssueLabel(params);
-}
-
-async function removeEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await removeIssueLabel({ ...params, allowNotFound: true });
+function buildResolutionLabelOps(params: { ensureQueued: boolean }): LabelOp[] {
+  const ops: LabelOp[] = [];
+  if (params.ensureQueued) {
+    ops.push({ action: "add", label: RALPH_LABEL_QUEUED });
+  }
+  ops.push({ action: "remove", label: RALPH_LABEL_ESCALATED });
+  return ops;
 }
 
 async function resolveEscalation(params: {
@@ -93,32 +95,20 @@ async function resolveEscalation(params: {
 }): Promise<void> {
   const prefix = `[ralph:gh-escalation:${params.repo}]`;
 
-  if (params.ensureQueued) {
-    try {
-      await addEscalationLabel({
-        github: params.deps.github,
-        repo: params.repo,
-        issueNumber: params.issueNumber,
-        label: RALPH_LABEL_QUEUED,
-      });
-    } catch (error: any) {
-      params.log(
-        `${prefix} Failed to add ralph:queued while resolving #${params.issueNumber}: ${error?.message ?? String(error)}`
-      );
-    }
-  }
-
-  try {
-    await removeEscalationLabel({
-      github: params.deps.github,
-      repo: params.repo,
-      issueNumber: params.issueNumber,
-      label: RALPH_LABEL_ESCALATED,
-    });
-  } catch (error: any) {
-    params.log(
-      `${prefix} Failed to remove ralph:escalated while resolving #${params.issueNumber}: ${error?.message ?? String(error)}`
-    );
+  const labelOps = buildResolutionLabelOps({ ensureQueued: params.ensureQueued });
+  const labelResult = await executeIssueLabelOps({
+    github: params.deps.github,
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    ops: labelOps,
+    log: (message) => params.log(`${prefix} ${message}`),
+    logLabel: `${params.repo}#${params.issueNumber}`,
+    ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: params.repo, github: params.deps.github }),
+    retryMissingLabelOnce: true,
+    ensureBefore: true,
+  });
+  if (!labelResult.ok) {
+    params.log(`${prefix} Failed to update escalation labels for #${params.issueNumber}.`);
   }
 
   try {

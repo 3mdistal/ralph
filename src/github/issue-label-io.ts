@@ -1,11 +1,39 @@
-import { splitRepoFullName, type GitHubClient, type GitHubResponse } from "./client";
+import { GitHubApiError, splitRepoFullName, type GitHubClient, type GitHubResponse } from "./client";
+import type { EnsureOutcome } from "./ensure-ralph-workflow-labels";
 
 export type LabelOp = { action: "add" | "remove"; label: string };
+
+export type ApplyIssueLabelOpsResult =
+  | { ok: true; add: string[]; remove: string[]; didRetry: boolean }
+  | {
+      ok: false;
+      add: string[];
+      remove: string[];
+      didRetry: boolean;
+      kind: "policy" | "auth" | "transient" | "unknown";
+      error: unknown;
+    };
 
 type GitHubRequester = Pick<GitHubClient, "request">;
 
 type LabelMutationOptions = {
   allowNonRalph?: boolean;
+};
+
+type LabelOpsIo = {
+  addLabel: (label: string) => Promise<void>;
+  removeLabel: (label: string) => Promise<{ removed?: boolean } | void>;
+};
+
+type ApplyIssueLabelOpsParams = {
+  ops: LabelOp[];
+  io: LabelOpsIo;
+  log?: (message: string) => void;
+  logLabel?: string;
+  allowNonRalph?: boolean;
+  ensureLabels?: () => Promise<EnsureOutcome>;
+  retryMissingLabelOnce?: boolean;
+  ensureBefore?: boolean;
 };
 
 function normalizeLabel(label: string): string | null {
@@ -19,6 +47,39 @@ function assertRalphLabel(label: string, opts?: LabelMutationOptions): void {
   if (!label.toLowerCase().startsWith("ralph:")) {
     throw new Error(`Refusing to mutate non-Ralph label: ${label}`);
   }
+}
+
+function isRalphLabel(label: string): boolean {
+  return label.toLowerCase().startsWith("ralph:");
+}
+
+function isMissingLabelError(error: unknown): boolean {
+  if (!(error instanceof GitHubApiError)) return false;
+  if (error.status !== 422) return false;
+  return /label[^\n]*does not exist/i.test(error.responseText);
+}
+
+function isSecondaryRateLimit(error: GitHubApiError): boolean {
+  const text = error.responseText.toLowerCase();
+  return (
+    text.includes("secondary rate limit") ||
+    text.includes("abuse detection") ||
+    text.includes("temporarily blocked")
+  );
+}
+
+function classifyLabelOpError(error: unknown): "auth" | "transient" | "unknown" {
+  if (!(error instanceof GitHubApiError)) return "unknown";
+  if (error.status === 429 || error.code === "rate_limit" || isSecondaryRateLimit(error)) {
+    return "transient";
+  }
+  if (error.status === 401 || error.status === 403 || error.code === "auth") {
+    return "auth";
+  }
+  if (error.status === 404) {
+    return "auth";
+  }
+  return "unknown";
 }
 
 function uniqueOrderedLabels(labels: string[], opts?: LabelMutationOptions): string[] {
@@ -93,70 +154,131 @@ export async function executeIssueLabelOps(params: {
   log?: (message: string) => void;
   logLabel?: string;
   allowNonRalph?: boolean;
-}): Promise<{ add: string[]; remove: string[]; ok: boolean }> {
-  const added: string[] = [];
-  const removed: string[] = [];
-  const applied: LabelOp[] = [];
-  const log = params.log ?? console.warn;
-  const logLabel = params.logLabel ?? `${params.repo}#${params.issueNumber}`;
-
-  for (const step of params.ops) {
-    try {
-      if (step.action === "add") {
+  ensureLabels?: () => Promise<EnsureOutcome>;
+  retryMissingLabelOnce?: boolean;
+  ensureBefore?: boolean;
+}): Promise<ApplyIssueLabelOpsResult> {
+  return await applyIssueLabelOps({
+    ops: params.ops,
+    io: {
+      addLabel: async (label) =>
         await addIssueLabel({
           github: params.github,
           repo: params.repo,
           issueNumber: params.issueNumber,
-          label: step.label,
+          label,
           allowNonRalph: params.allowNonRalph,
-        });
-        added.push(step.label);
-        applied.push(step);
-      } else {
-        const result = await removeIssueLabel({
+        }),
+      removeLabel: async (label) =>
+        await removeIssueLabel({
           github: params.github,
           repo: params.repo,
           issueNumber: params.issueNumber,
-          label: step.label,
+          label,
           allowNotFound: true,
           allowNonRalph: params.allowNonRalph,
-        });
-        if (result.removed) {
-          removed.push(step.label);
-          applied.push(step);
-        }
+        }),
+    },
+    log: params.log,
+    logLabel: params.logLabel ?? `${params.repo}#${params.issueNumber}`,
+    allowNonRalph: params.allowNonRalph,
+    ensureLabels: params.ensureLabels,
+    retryMissingLabelOnce: params.retryMissingLabelOnce,
+    ensureBefore: params.ensureBefore,
+  });
+}
+
+export async function applyIssueLabelOps(params: ApplyIssueLabelOpsParams): Promise<ApplyIssueLabelOpsResult> {
+  const added: string[] = [];
+  const removed: string[] = [];
+  const applied: LabelOp[] = [];
+  const log = params.log ?? console.warn;
+  const logLabel = params.logLabel ?? "issue";
+  const allowNonRalph = params.allowNonRalph ?? false;
+  const retryMissingLabelOnce = params.retryMissingLabelOnce ?? Boolean(params.ensureLabels);
+  let lastEnsureOutcome: EnsureOutcome | null = null;
+
+  if (!allowNonRalph) {
+    for (const step of params.ops) {
+      if (!isRalphLabel(step.label)) {
+        const error = new Error(`Refusing to mutate non-Ralph label: ${step.label}`);
+        return { ok: false, add: [], remove: [], didRetry: false, kind: "policy", error };
       }
-    } catch (error: any) {
-      log(
-        `[ralph:github:labels] Failed to ${step.action} ${step.label} for ${logLabel}: ${error?.message ?? String(error)}`
-      );
-      for (const rollback of [...applied].reverse()) {
-        try {
-          if (rollback.action === "add") {
-            await removeIssueLabel({
-              github: params.github,
-              repo: params.repo,
-              issueNumber: params.issueNumber,
-              label: rollback.label,
-              allowNotFound: true,
-              allowNonRalph: params.allowNonRalph,
-            });
-          } else {
-            await addIssueLabel({
-              github: params.github,
-              repo: params.repo,
-              issueNumber: params.issueNumber,
-              label: rollback.label,
-              allowNonRalph: params.allowNonRalph,
-            });
-          }
-        } catch {
-          // best-effort rollback
-        }
-      }
-      return { add: added, remove: removed, ok: false };
     }
   }
 
-  return { add: added, remove: removed, ok: true };
+  if (params.ensureBefore && params.ensureLabels) {
+    try {
+      lastEnsureOutcome = await params.ensureLabels();
+    } catch (error) {
+      lastEnsureOutcome = { ok: false, kind: "transient", error };
+    }
+  }
+
+  const applyOnce = async (didRetry: boolean): Promise<ApplyIssueLabelOpsResult> => {
+    for (const step of params.ops) {
+      try {
+        if (step.action === "add") {
+          await params.io.addLabel(step.label);
+          added.push(step.label);
+          applied.push(step);
+        } else {
+          const result = await params.io.removeLabel(step.label);
+          if (result && "removed" in result && !result.removed) {
+            continue;
+          }
+          removed.push(step.label);
+          applied.push(step);
+        }
+      } catch (error: any) {
+        log(
+          `[ralph:github:labels] Failed to ${step.action} ${step.label} for ${logLabel}: ${
+            error?.message ?? String(error)
+          }`
+        );
+        for (const rollback of [...applied].reverse()) {
+          try {
+            if (rollback.action === "add") {
+              await params.io.removeLabel(rollback.label);
+            } else {
+              await params.io.addLabel(rollback.label);
+            }
+          } catch {
+            // best-effort rollback
+          }
+        }
+
+        if (!didRetry && retryMissingLabelOnce && isMissingLabelError(error) && params.ensureLabels) {
+          if (lastEnsureOutcome && !lastEnsureOutcome.ok && lastEnsureOutcome.kind === "auth") {
+            return { ok: false, add: added, remove: removed, didRetry: true, kind: "auth", error: lastEnsureOutcome.error };
+          }
+          lastEnsureOutcome = await params.ensureLabels();
+          if (!lastEnsureOutcome.ok) {
+            return {
+              ok: false,
+              add: added,
+              remove: removed,
+              didRetry: true,
+              kind: lastEnsureOutcome.kind,
+              error: lastEnsureOutcome.error,
+            };
+          }
+          return await applyOnce(true);
+        }
+
+        return {
+          ok: false,
+          add: added,
+          remove: removed,
+          didRetry,
+          kind: classifyLabelOpError(error),
+          error,
+        };
+      }
+    }
+
+    return { ok: true, add: added, remove: removed, didRetry };
+  };
+
+  return await applyOnce(false);
 }
