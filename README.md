@@ -116,6 +116,8 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `control` (object, optional): control file defaults
   - `autoCreate` (boolean): create `control.json` on startup (default: true)
   - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
+- `dashboard` (object, optional): control plane event persistence
+  - `eventsRetentionDays` (number): days to keep `~/.ralph/events/YYYY-MM-DD.jsonl` logs (default: 14; UTC bucketing; cleanup on daemon startup)
 
 Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derives required checks from GitHub branch protection on `bot/integration` (or `repos[].botBranch`), falling back to the repository default branch (usually `main`). If branch protection is missing or unreadable, Ralph does not gate merges. Ralph considers both check runs and legacy status contexts when matching available check names. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
