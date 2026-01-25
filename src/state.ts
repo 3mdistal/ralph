@@ -6,9 +6,18 @@ import { Database } from "bun:sqlite";
 import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
 import { isSafeSessionId } from "./session-id";
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 export type PrState = "open" | "merged";
+export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
+export type RalphRunAttemptKind = "process" | "resume";
+export type RalphRunDetails = {
+  reasonCode?: string;
+  errorCode?: string;
+  escalationType?: string;
+  prUrl?: string;
+  watchdogTimeout?: boolean;
+};
 export const PR_STATE_OPEN: PrState = "open";
 export const PR_STATE_MERGED: PrState = "merged";
 
@@ -21,6 +30,38 @@ function nowIso(): string {
 function toJson(value: unknown): string {
   if (value === undefined) return "[]";
   return JSON.stringify(value);
+}
+
+function trimRunLabel(value: string | undefined | null, maxLength = 200): string | null {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= maxLength) return trimmed;
+  return trimmed.slice(0, maxLength).trimEnd();
+}
+
+function sanitizeRunDetailString(value: unknown, maxLength = 400): string | undefined {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) return undefined;
+  if (trimmed.length <= maxLength) return trimmed;
+  return trimmed.slice(0, maxLength).trimEnd();
+}
+
+function sanitizeRalphRunDetails(details?: RalphRunDetails | null): RalphRunDetails | null {
+  if (!details) return null;
+
+  const sanitized: RalphRunDetails = {};
+  const reasonCode = sanitizeRunDetailString(details.reasonCode, 120);
+  const errorCode = sanitizeRunDetailString(details.errorCode, 120);
+  const escalationType = sanitizeRunDetailString(details.escalationType, 120);
+  const prUrl = sanitizeRunDetailString(details.prUrl, 500);
+
+  if (reasonCode) sanitized.reasonCode = reasonCode;
+  if (errorCode) sanitized.errorCode = errorCode;
+  if (escalationType) sanitized.escalationType = escalationType;
+  if (prUrl) sanitized.prUrl = prUrl;
+  if (details.watchdogTimeout) sanitized.watchdogTimeout = true;
+
+  return Object.keys(sanitized).length ? sanitized : null;
 }
 
 function parseJsonArray(value?: string | null): string[] {
@@ -96,6 +137,42 @@ function ensureSchema(database: Database): void {
       }
       if (existingVersion < 8) {
         database.exec("ALTER TABLE tasks ADD COLUMN session_events_path TEXT");
+      }
+      if (existingVersion < 9) {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS ralph_runs (
+            run_id TEXT PRIMARY KEY,
+            repo_id INTEGER NOT NULL,
+            issue_number INTEGER,
+            task_path TEXT,
+            attempt_kind TEXT NOT NULL CHECK (attempt_kind IN ('process', 'resume')),
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            outcome TEXT CHECK (outcome IN ('success', 'throttled', 'escalated', 'failed') OR outcome IS NULL),
+            details_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+          );
+          CREATE TABLE IF NOT EXISTS ralph_run_sessions (
+            run_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            first_step_title TEXT,
+            last_step_title TEXT,
+            first_agent TEXT,
+            last_agent TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(run_id, session_id),
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_sessions_session_id
+            ON ralph_run_sessions(session_id);
+          CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started
+            ON ralph_runs(repo_id, issue_number, started_at);
+        `);
       }
     })();
   }
@@ -225,6 +302,36 @@ function ensureSchema(database: Database): void {
       UNIQUE(batch_id, pr_url)
     );
 
+    CREATE TABLE IF NOT EXISTS ralph_runs (
+      run_id TEXT PRIMARY KEY,
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER,
+      task_path TEXT,
+      attempt_kind TEXT NOT NULL CHECK (attempt_kind IN ('process', 'resume')),
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      outcome TEXT CHECK (outcome IN ('success', 'throttled', 'escalated', 'failed') OR outcome IS NULL),
+      details_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ralph_run_sessions (
+      run_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      first_step_title TEXT,
+      last_step_title TEXT,
+      first_agent TEXT,
+      last_agent TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, session_id),
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -234,6 +341,8 @@ function ensureSchema(database: Database): void {
     CREATE INDEX IF NOT EXISTS idx_issue_labels_issue_id ON issue_labels(issue_id);
     CREATE INDEX IF NOT EXISTS idx_rollup_batches_repo_status ON rollup_batches(repo_id, bot_branch, status);
     CREATE INDEX IF NOT EXISTS idx_rollup_batch_prs_batch ON rollup_batch_prs(batch_id);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_sessions_session_id ON ralph_run_sessions(session_id);
+    CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started ON ralph_runs(repo_id, issue_number, started_at);
   `);
 }
 
@@ -631,6 +740,122 @@ export function recordTaskSnapshot(input: {
       $daemon_id: input.daemonId ?? null,
       $heartbeat_at: input.heartbeatAt ?? null,
       $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function createRalphRun(params: {
+  repo: string;
+  issue: string;
+  taskPath: string;
+  attemptKind: RalphRunAttemptKind;
+  startedAt?: string;
+}): string {
+  const database = requireDb();
+  const at = params.startedAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+  const issueNumber = parseIssueNumber(params.issue);
+  const runId = randomUUID();
+
+  database
+    .query(
+      `INSERT INTO ralph_runs(
+         run_id, repo_id, issue_number, task_path, attempt_kind, started_at, created_at, updated_at
+       ) VALUES (
+         $run_id, $repo_id, $issue_number, $task_path, $attempt_kind, $started_at, $created_at, $updated_at
+       )`
+    )
+    .run({
+      $run_id: runId,
+      $repo_id: repoId,
+      $issue_number: issueNumber,
+      $task_path: params.taskPath,
+      $attempt_kind: params.attemptKind,
+      $started_at: at,
+      $created_at: at,
+      $updated_at: at,
+    });
+
+  return runId;
+}
+
+export function recordRalphRunSessionUse(params: {
+  runId: string;
+  sessionId: string;
+  stepTitle?: string | null;
+  agent?: string | null;
+  at?: string;
+}): void {
+  if (!isSafeSessionId(params.sessionId)) return;
+
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const stepTitle = trimRunLabel(params.stepTitle ?? undefined, 200);
+  const agent = trimRunLabel(params.agent ?? undefined, 120);
+
+  database
+    .query(
+      `INSERT INTO ralph_run_sessions(
+         run_id, session_id, first_seen_at, last_seen_at, first_step_title, last_step_title, first_agent, last_agent, created_at, updated_at
+       ) VALUES (
+         $run_id, $session_id, $first_seen_at, $last_seen_at, $first_step_title, $last_step_title, $first_agent, $last_agent, $created_at, $updated_at
+       )
+       ON CONFLICT(run_id, session_id) DO UPDATE SET
+         first_seen_at = CASE
+           WHEN ralph_run_sessions.first_seen_at <= excluded.first_seen_at
+             THEN ralph_run_sessions.first_seen_at
+           ELSE excluded.first_seen_at
+         END,
+         last_seen_at = CASE
+           WHEN ralph_run_sessions.last_seen_at >= excluded.last_seen_at
+             THEN ralph_run_sessions.last_seen_at
+           ELSE excluded.last_seen_at
+         END,
+         first_step_title = COALESCE(ralph_run_sessions.first_step_title, excluded.first_step_title),
+         last_step_title = COALESCE(excluded.last_step_title, ralph_run_sessions.last_step_title),
+         first_agent = COALESCE(ralph_run_sessions.first_agent, excluded.first_agent),
+         last_agent = COALESCE(excluded.last_agent, ralph_run_sessions.last_agent),
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $run_id: params.runId,
+      $session_id: params.sessionId,
+      $first_seen_at: at,
+      $last_seen_at: at,
+      $first_step_title: stepTitle,
+      $last_step_title: stepTitle,
+      $first_agent: agent,
+      $last_agent: agent,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function completeRalphRun(params: {
+  runId: string;
+  outcome: RalphRunOutcome;
+  completedAt?: string;
+  details?: RalphRunDetails | null;
+}): void {
+  const database = requireDb();
+  const at = params.completedAt ?? nowIso();
+  const sanitizedDetails = sanitizeRalphRunDetails(params.details ?? null);
+  const detailsJson = sanitizedDetails ? JSON.stringify(sanitizedDetails) : null;
+
+  database
+    .query(
+      `UPDATE ralph_runs
+       SET completed_at = CASE WHEN completed_at IS NULL THEN $completed_at ELSE completed_at END,
+           outcome = CASE WHEN outcome IS NULL THEN $outcome ELSE outcome END,
+           details_json = CASE WHEN details_json IS NULL THEN $details_json ELSE details_json END,
+           updated_at = $updated_at
+       WHERE run_id = $run_id`
+    )
+    .run({
+      $run_id: params.runId,
+      $completed_at: at,
+      $outcome: params.outcome,
+      $details_json: detailsJson,
       $updated_at: at,
     });
 }

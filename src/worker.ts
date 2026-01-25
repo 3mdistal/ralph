@@ -78,9 +78,12 @@ import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessio
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { cleanupSessionArtifacts } from "./introspection-traces";
+import { createRunRecordingSessionAdapter, type SessionAdapter } from "./run-recording-session-adapter";
 import { redactHomePathForDisplay } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import {
+  completeRalphRun,
+  createRalphRun,
   getIdempotencyPayload,
   upsertIdempotencyKey,
   recordIssueSnapshot,
@@ -89,6 +92,8 @@ import {
   PR_STATE_MERGED,
   PR_STATE_OPEN,
   type PrState,
+  type RalphRunAttemptKind,
+  type RalphRunDetails,
 } from "./state";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
@@ -104,13 +109,6 @@ import {
   viewPullRequest,
   type PullRequestSearchResult,
 } from "./github/pr";
-
-type SessionAdapter = {
-  runAgent: typeof runAgent;
-  continueSession: typeof continueSession;
-  continueCommand: typeof continueCommand;
-  getRalphXdgCacheHome: typeof getRalphXdgCacheHome;
-};
 
 type PullRequestMergeStateStatus =
   | "BEHIND"
@@ -275,6 +273,25 @@ function summarizeBlockedReason(text: string): string {
   if (!trimmed) return "";
   if (trimmed.length <= BLOCKED_REASON_MAX_LEN) return trimmed;
   return trimmed.slice(0, BLOCKED_REASON_MAX_LEN).trimEnd() + "…";
+}
+
+function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
+  if (!result) return undefined;
+  const details: RalphRunDetails = {};
+
+  if (result.pr) {
+    details.prUrl = result.pr;
+  }
+
+  if (result.outcome === "escalated") {
+    details.reasonCode = "escalated";
+  }
+
+  if (result.outcome === "failed") {
+    details.reasonCode = "failed";
+  }
+
+  return Object.keys(details).length ? details : undefined;
 }
 
 function normalizeMergeStateStatus(value: unknown): PullRequestMergeStateStatus | null {
@@ -806,6 +823,75 @@ export class RepoWorker {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
     }
     return runLogPath;
+  }
+
+  private async withSessionAdapters<T>(
+    next: { baseSession: SessionAdapter; session: SessionAdapter },
+    run: () => Promise<T>
+  ): Promise<T> {
+    const previousBase = this.baseSession;
+    const previousSession = this.session;
+    this.baseSession = next.baseSession;
+    this.session = next.session;
+
+    try {
+      return await run();
+    } finally {
+      this.baseSession = previousBase;
+      this.session = previousSession;
+    }
+  }
+
+  private async withRunContext(
+    task: AgentTask,
+    attemptKind: RalphRunAttemptKind,
+    run: () => Promise<AgentRun>
+  ): Promise<AgentRun> {
+    let runId: string | null = null;
+
+    try {
+      runId = createRalphRun({
+        repo: this.repo,
+        issue: task.issue,
+        taskPath: task._path,
+        attemptKind,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to create run record for ${task.name}: ${error?.message ?? String(error)}`
+      );
+    }
+
+    if (!runId) {
+      return await run();
+    }
+
+    const recordingBase = createRunRecordingSessionAdapter({
+      base: this.baseSession,
+      runId,
+      repo: this.repo,
+      issue: task.issue,
+    });
+    const recordingSession = this.createContextRecoveryAdapter(recordingBase);
+
+    let result: AgentRun | null = null;
+
+    try {
+      result = await this.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, run);
+      return result;
+    } finally {
+      try {
+        completeRalphRun({
+          runId,
+          outcome: result?.outcome ?? "failed",
+          details: buildRunDetails(result),
+        });
+      } catch (error: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to complete run record for ${task.name}: ${error?.message ?? String(error)}`
+        );
+      }
+    }
   }
 
   private createContextRecoveryAdapter(base: SessionAdapter): SessionAdapter {
@@ -4520,6 +4606,7 @@ ${guidance}`
       const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
       if (pausedBefore) return pausedBefore;
 
+      return await this.withRunContext(task, "resume", async () => {
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
       let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
@@ -4915,6 +5002,7 @@ ${guidance}`
         notify: false,
         logMessage: `Task resumed to completion: ${task.name}`,
       });
+      });
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
@@ -5032,6 +5120,7 @@ ${guidance}`
 
       await this.assertRepoRootClean(task, "start");
 
+      return await this.withRunContext(task, "process", async () => {
       const botBranch = getRepoBotBranch(this.repo);
       const mergeConflictRun = await this.maybeHandleQueuedMergeConflict({
         task,
@@ -5732,6 +5821,7 @@ ${guidance}`
         devex: devexContext,
         notify: true,
         logMessage: `Task completed: ${task.name}`,
+      });
       });
     } catch (error: any) {
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
