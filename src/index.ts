@@ -14,6 +14,7 @@ import crypto from "crypto";
 import {
   ensureBwrbVaultLayout,
   getConfig,
+  getDashboardEventsRetentionDays,
   getOpencodeDefaultProfileName,
   getRepoMaxWorkers,
   getRepoPath,
@@ -53,6 +54,7 @@ import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
 import { startGitHubIssuePollers } from "./github-issues-sync";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import {
@@ -79,6 +81,7 @@ let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
 let drainRequestedAt: number | null = null;
 let drainTimeoutMs: number | null = null;
+let dashboardEventPersistence: DashboardEventPersistence | null = null;
 let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
@@ -1165,6 +1168,13 @@ async function main(): Promise<void> {
   // Initialize durable local state (SQLite)
   initStateDb();
 
+  const retentionDays = getDashboardEventsRetentionDays();
+  await cleanupDashboardEventLogs({ retentionDays });
+  dashboardEventPersistence = installDashboardEventPersistence({
+    bus: ralphEventBus,
+    retentionDays,
+  });
+
   githubIssuePollers = startGitHubIssuePollers({
     repos: config.repos,
     baseIntervalMs: config.pollInterval,
@@ -1432,6 +1442,14 @@ async function main(): Promise<void> {
         data: { reason: signal },
       })
     );
+
+    if (dashboardEventPersistence) {
+      const { flushed } = await dashboardEventPersistence.flush({ timeoutMs: 5000 });
+      if (!flushed) {
+        console.warn("[ralph] Dashboard event flush timed out; some tail events may be missing");
+      }
+      dashboardEventPersistence.unsubscribe();
+    }
 
     console.log("[ralph] Goodbye!");
     process.exit(0);

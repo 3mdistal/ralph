@@ -193,5 +193,17 @@ export function buildRalphEvent<T extends RalphEvent>(
 }
 
 export function safeJsonStringifyRalphEvent(event: RalphEvent): string {
-  return JSON.stringify(event);
+  return safeJsonStringify(event);
+}
+
+function safeJsonStringify(value: unknown): string {
+  const seen = new WeakSet<object>();
+  return JSON.stringify(value, (_key, val) => {
+    if (typeof val === "bigint") return val.toString();
+    if (val && typeof val === "object") {
+      if (seen.has(val)) return "[Circular]";
+      seen.add(val);
+    }
+    return val;
+  });
 }
