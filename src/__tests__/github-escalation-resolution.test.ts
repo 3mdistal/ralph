@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 
-import { reconcileEscalationResolutions } from "../github/escalation-resolution";
+import { __shouldFetchEscalationCommentsForTests, reconcileEscalationResolutions } from "../github/escalation-resolution";
 import {
   closeStateDbForTests,
   getEscalationCommentCheckState,
@@ -338,5 +338,18 @@ describe("escalation resolution reconciliation", () => {
     });
 
     expect(requests).toEqual([]);
+  });
+
+  test("allows fetch when issue updated", () => {
+    const decision = __shouldFetchEscalationCommentsForTests({
+      nowMs: Date.parse("2026-01-11T00:02:00.000Z"),
+      lastCheckedAt: "2026-01-11T00:00:30.000Z",
+      lastSeenUpdatedAt: "2026-01-11T00:00:00.000Z",
+      githubUpdatedAt: "2026-01-11T00:01:00.000Z",
+      minIntervalMs: 10 * 60_000,
+    });
+
+    expect(decision.shouldFetch).toBe(true);
+    expect(decision.reason).toBe("updated");
   });
 });
