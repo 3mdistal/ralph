@@ -125,6 +125,11 @@ export interface ControlConfig {
   suppressMissingWarnings?: boolean;
 }
 
+export interface DashboardConfig {
+  /** Days to retain dashboard event logs (default: 14). */
+  eventsRetentionDays?: number;
+}
+
 export type QueueBackend = "github" | "bwrb" | "none";
 
 export interface RalphConfig {
@@ -159,6 +164,7 @@ export interface RalphConfig {
   throttle?: ThrottleConfig;
   opencode?: OpencodeConfig;
   control?: ControlConfig;
+  dashboard?: DashboardConfig;
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
@@ -173,6 +179,7 @@ const DEFAULT_THROTTLE_HARD_PCT = 0.75;
 const DEFAULT_THROTTLE_MIN_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_THROTTLE_BUDGET_5H_TOKENS = 16_987_015;
 const DEFAULT_THROTTLE_BUDGET_WEEKLY_TOKENS = 55_769_305;
+const DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS = 14;
 
 function detectDefaultBwrbVault(): string {
   const start = process.cwd();
@@ -456,6 +463,24 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     } else {
       loaded.control = undefined;
     }
+  }
+
+  // Best-effort validation for dashboard config.
+  const rawDashboard = (loaded as any).dashboard;
+  if (rawDashboard !== undefined && rawDashboard !== null && (typeof rawDashboard !== "object" || Array.isArray(rawDashboard))) {
+    console.warn(`[ralph] Invalid config dashboard=${JSON.stringify(rawDashboard)}; ignoring`);
+    (loaded as any).dashboard = undefined;
+  } else if (rawDashboard && typeof rawDashboard === "object") {
+    const rawRetention = (rawDashboard as any).eventsRetentionDays;
+    const parsedRetention = rawRetention === undefined ? null : toPositiveIntOrNull(rawRetention);
+    if (rawRetention !== undefined && parsedRetention == null) {
+      console.warn(
+        `[ralph] Invalid config dashboard.eventsRetentionDays=${JSON.stringify(rawRetention)}; ` +
+          `defaulting to ${DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS}`
+      );
+    }
+    const retention = parsedRetention ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
+    loaded.dashboard = { eventsRetentionDays: retention };
   }
 
   // Best-effort validation for OpenCode profile config.
@@ -1042,6 +1067,13 @@ export function getRepoRequiredChecksOverride(repoName: string): string[] | null
 
 export function getGlobalMaxWorkers(): number {
   return getConfig().maxWorkers;
+}
+
+export function getDashboardEventsRetentionDays(): number {
+  const cfg = getConfig();
+  const raw = cfg.dashboard?.eventsRetentionDays;
+  const parsed = toPositiveIntOrNull(raw);
+  return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
 }
 
 export function getRepoMaxWorkers(repoName: string): number {
