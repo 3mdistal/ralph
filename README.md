@@ -88,7 +88,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 
 ### Sandbox profile
 
-Sandbox runs are opt-in and enforce a write tripwire. When `profile = "sandbox"`, you must provide a `sandbox` block with dedicated GitHub credentials and repo boundaries.
+Sandbox runs are opt-in and enforce a write tripwire. When `profile = "sandbox"`, you must provide a `sandbox` block with dedicated GitHub credentials and repo boundaries. Ralph fails fast at startup if the sandbox block is missing or invalid. Any GitHub write that targets a repo outside the sandbox boundary aborts with a `SANDBOX TRIPWIRE:` error.
 
 `~/.ralph/config.toml`:
 

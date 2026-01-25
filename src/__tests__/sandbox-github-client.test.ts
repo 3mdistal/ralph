@@ -73,10 +73,35 @@ describe("sandbox github client", () => {
     expect(fetchMock).toHaveBeenCalled();
   });
 
+  test("blocks REST writes before fetch outside sandbox boundary", async () => {
+    const fetchMock = mock(async () => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const client = new GitHubClient("3mdistal/prod-repo");
+    await expect(
+      client.request("/repos/3mdistal/prod-repo/issues", { method: "POST", body: { title: "nope" } })
+    ).rejects.toThrow(/SANDBOX TRIPWIRE/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   test("blocks GraphQL mutation outside sandbox boundary", async () => {
+    const fetchMock = mock(async () => {
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
     const client = new GitHubClient("3mdistal/prod-repo");
     await expect(
       client.request("/graphql", { method: "POST", body: { query: "mutation { addStar }" } })
     ).rejects.toThrow(/SANDBOX TRIPWIRE/i);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

@@ -524,9 +524,7 @@ export class RollupMonitor {
 
   private async extractClosingIssueRefsFromPr(repo: string, pr: string, repoPath: string, logPrefix: string): Promise<string[]> {
     try {
-      const result = await $`gh pr view --repo ${repo} ${pr} --json body`
-        .cwd(repoPath)
-        .quiet();
+      const result = await ghRead(repo)`gh pr view --repo ${repo} ${pr} --json body`.cwd(repoPath).quiet();
       const output = result.stdout.toString().trim();
       if (!output) {
         return [];

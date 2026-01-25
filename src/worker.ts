@@ -20,7 +20,7 @@ import {
 import { normalizeGitRef } from "./midpoint-labels";
 import { computeHeadBranchDeletionDecision } from "./pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
-import { ensureGhTokenEnv, getAllowedOwners, isRepoAllowed } from "./github-app-auth";
+import { getAllowedOwners, isRepoAllowed } from "./github-app-auth";
 import {
   continueCommand,
   continueSession,
@@ -1170,8 +1170,6 @@ export class RepoWorker {
       return { selectedUrl: null, duplicates: [], source: null, diagnostics };
     }
 
-    await ensureGhTokenEnv();
-
     const dbCandidates = await this.resolveDbPrCandidates(parsedIssue, diagnostics);
     if (dbCandidates.length > 0) {
       const resolved = selectCanonicalPr(dbCandidates);
@@ -1707,8 +1705,6 @@ ${guidance}`
     if (allowRefresh) {
       this.lastBlockedSyncAt = now;
     }
-
-    await ensureGhTokenEnv();
 
     const byIssue = new Map<string, { issue: IssueRef; tasks: AgentTask[] }>();
     for (const task of tasks) {
@@ -2282,8 +2278,6 @@ ${guidance}`
     botBranch: string;
   }): Promise<{ prUrl: string | null; diagnostics: string }> {
     const { task, issueNumber, issueTitle, botBranch } = params;
-
-    await ensureGhTokenEnv();
 
     const diagnostics: string[] = [
 
@@ -4380,8 +4374,6 @@ ${guidance}`
       return await this.blockDisallowedRepo(task, startTime, "resume");
     }
 
-    await ensureGhTokenEnv();
-
     const issueMeta = await this.getIssueMetadata(task.issue);
     if (issueMeta.state === "CLOSED") {
       return await this.skipClosedIssue(task, issueMeta, startTime);
@@ -4946,8 +4938,6 @@ ${guidance}`
       if (!isRepoAllowed(task.repo)) {
         return await this.blockDisallowedRepo(task, startTime, "start");
       }
-
-      await ensureGhTokenEnv();
 
       // 2. Preflight: skip work if the upstream issue is already CLOSED
       const issueMeta = await this.getIssueMetadata(task.issue);

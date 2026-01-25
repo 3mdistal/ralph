@@ -193,39 +193,35 @@ export async function getInstallationToken(profile: RalphProfile = getProfile())
   return fresh.token;
 }
 
-export async function ensureGhTokenEnv(): Promise<void> {
+export async function resolveGhTokenEnv(): Promise<string | null> {
   const profile = getProfile();
   const cfg = getConfig();
 
   if (profile === "sandbox") {
     const app = getGitHubAppConfigForProfile(profile, cfg);
     if (app) {
-      const token = await getInstallationToken(profile);
-      process.env.GH_TOKEN = token;
-      process.env.GITHUB_TOKEN = token;
-      return;
+      return await getInstallationToken(profile);
     }
 
     const sandbox = getSandboxProfileConfig();
     const tokenEnvVar = sandbox?.githubAuth?.tokenEnvVar;
     if (tokenEnvVar) {
       const token = process.env[tokenEnvVar];
-      if (token && token.trim()) {
-        process.env.GH_TOKEN = token.trim();
-        process.env.GITHUB_TOKEN = token.trim();
-      }
+      if (token && token.trim()) return token.trim();
     }
-    return;
+    return null;
   }
 
   // Best-effort: if githubApp isn't configured, leave GH_TOKEN as-is.
   const app = getGitHubAppConfigForProfile("prod", cfg);
-  if (!app) return;
+  if (app) {
+    return await getInstallationToken("prod");
+  }
 
-  const token = await getInstallationToken("prod");
-  // Memory-only: set env for child gh calls; never write to disk.
-  process.env.GH_TOKEN = token;
-  process.env.GITHUB_TOKEN = token;
+  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN;
+  if (token && token.trim()) return token.trim();
+
+  return null;
 }
 
 

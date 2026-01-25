@@ -1,5 +1,5 @@
 import { getProfile, getSandboxProfileConfig } from "../config";
-import { ensureGhTokenEnv } from "../github-app-auth";
+import { resolveGhTokenEnv } from "../github-app-auth";
 import { SandboxTripwireError, assertSandboxWriteAllowed } from "./sandbox-tripwire";
 
 type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
@@ -12,6 +12,36 @@ type GhProcess = {
 type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProcess;
 
 const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
+
+let ghEnvLock: Promise<void> = Promise.resolve();
+
+async function withGhEnvLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = ghEnvLock;
+  let release: () => void;
+  ghEnvLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release!();
+  }
+}
+
+function applyGhEnv(token: string | null): () => void {
+  if (!token) return () => {};
+  const priorGh = process.env.GH_TOKEN;
+  const priorGithub = process.env.GITHUB_TOKEN;
+  process.env.GH_TOKEN = token;
+  process.env.GITHUB_TOKEN = token;
+  return () => {
+    if (priorGh === undefined) delete process.env.GH_TOKEN;
+    else process.env.GH_TOKEN = priorGh;
+    if (priorGithub === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = priorGithub;
+  };
+}
 
 function buildCommandString(strings: TemplateStringsArray, values: unknown[]): string {
   let out = strings[0] ?? "";
@@ -116,10 +146,17 @@ export function createGhRunner(params: { repo: string; mode: "read" | "write" })
         return wrapper;
       },
       quiet: async () => {
-        await ensureGhTokenEnv();
-        const proc = DEFAULT_GH_RUNNER(strings, ...values);
-        const configured = cwdPath ? proc.cwd(cwdPath) : proc;
-        return configured.quiet();
+        const token = await resolveGhTokenEnv();
+        return await withGhEnvLock(async () => {
+          const restore = applyGhEnv(token);
+          try {
+            const proc = DEFAULT_GH_RUNNER(strings, ...values);
+            const configured = cwdPath ? proc.cwd(cwdPath) : proc;
+            return await configured.quiet();
+          } finally {
+            restore();
+          }
+        });
       },
     };
 

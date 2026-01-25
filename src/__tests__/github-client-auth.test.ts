@@ -13,6 +13,7 @@ let homeDir: string;
 let priorHome: string | undefined;
 let priorGhToken: string | undefined;
 let priorGithubToken: string | undefined;
+let priorSandboxToken: string | undefined;
 let priorFetch: typeof fetch | undefined;
 let releaseLock: (() => void) | null = null;
 
@@ -50,6 +51,7 @@ describe("github client auth", () => {
     priorHome = process.env.HOME;
     priorGhToken = process.env.GH_TOKEN;
     priorGithubToken = process.env.GITHUB_TOKEN;
+    priorSandboxToken = process.env.GITHUB_SANDBOX_TOKEN;
     priorFetch = globalThis.fetch;
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
@@ -74,6 +76,8 @@ describe("github client auth", () => {
   afterEach(async () => {
     restoreEnvVar("GH_TOKEN", priorGhToken);
     restoreEnvVar("GITHUB_TOKEN", priorGithubToken);
+    if (priorSandboxToken === undefined) delete process.env.GITHUB_SANDBOX_TOKEN;
+    else process.env.GITHUB_SANDBOX_TOKEN = priorSandboxToken;
     if (priorFetch) {
       globalThis.fetch = priorFetch;
     }
@@ -102,6 +106,44 @@ describe("github client auth", () => {
 
     expect(fetchMock).toHaveBeenCalled();
     expect(result.data?.auth).toBe("token late-token");
+  });
+
+  test("uses sandbox token env var instead of GH_TOKEN", async () => {
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+      profile: "sandbox",
+      sandbox: {
+        allowedOwners: ["3mdistal"],
+        repoNamePrefix: "ralph-sandbox-",
+        githubAuth: { tokenEnvVar: "GITHUB_SANDBOX_TOKEN" },
+      },
+    });
+    __resetConfigForTests();
+
+    process.env.GH_TOKEN = "prod-token";
+    process.env.GITHUB_SANDBOX_TOKEN = "sandbox-token";
+
+    const fetchMock = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const auth = getHeader(init?.headers, "Authorization");
+      return new Response(JSON.stringify({ ok: true, auth }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const client = new GitHubClient("3mdistal/ralph-sandbox-demo");
+    const result = await client.request<{ ok: boolean; auth: string | null }>("/rate_limit");
+
+    expect(fetchMock).toHaveBeenCalled();
+    expect(result.data?.auth).toBe("token sandbox-token");
   });
 
   test("refreshes GitHub App tokens between requests", async () => {
