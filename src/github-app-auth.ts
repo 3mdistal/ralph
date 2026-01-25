@@ -1,6 +1,6 @@
 import { readFile as readFileFs } from "fs/promises";
 import crypto from "crypto";
-import { getConfig, type RalphConfig } from "./config";
+import { getConfig, getProfile, getSandboxProfileConfig, type RalphConfig, type RalphProfile } from "./config";
 import { fetchJson, parseLinkHeader } from "./github/http";
 
 export interface GitHubRepoSummary {
@@ -59,8 +59,7 @@ function asPositiveInt(value: unknown): number | null {
   return n;
 }
 
-function getGitHubAppConfig(cfg: RalphConfig): GitHubAppConfig | null {
-  const raw = (cfg as any).githubApp;
+function getGitHubAppConfigFromRaw(raw: any, label: string): GitHubAppConfig | null {
   if (!raw) return null;
 
   const appId = asPositiveInt(raw.appId);
@@ -69,11 +68,19 @@ function getGitHubAppConfig(cfg: RalphConfig): GitHubAppConfig | null {
 
   if (!appId || !installationId || !privateKeyPath) {
     throw new GitHubAuthError(
-      "GitHub App auth is configured but invalid. Expected githubApp: { appId, installationId, privateKeyPath }"
+      `${label} GitHub App auth is configured but invalid. Expected githubApp: { appId, installationId, privateKeyPath }`
     );
   }
 
   return { appId, installationId, privateKeyPath };
+}
+
+function getGitHubAppConfigForProfile(profile: RalphProfile, cfg: RalphConfig): GitHubAppConfig | null {
+  if (profile === "sandbox") {
+    const sandbox = cfg.sandbox?.githubAuth?.githubApp;
+    return getGitHubAppConfigFromRaw(sandbox as any, "Sandbox");
+  }
+  return getGitHubAppConfigFromRaw((cfg as any).githubApp, "Prod");
 }
 
 function base64UrlEncode(input: string | Uint8Array): string {
@@ -117,8 +124,12 @@ type InstallationTokenCache = {
 };
 
 const EXPIRY_SKEW_MS = 60_000;
-let tokenCache: InstallationTokenCache | null = null;
-let inFlightToken: Promise<InstallationTokenCache> | null = null;
+const tokenCache = new Map<string, InstallationTokenCache>();
+const inFlightToken = new Map<string, Promise<InstallationTokenCache>>();
+
+function buildTokenCacheKey(profile: RalphProfile, app: GitHubAppConfig): string {
+  return `${profile}:${app.appId}:${app.installationId}:${app.privateKeyPath}`;
+}
 
 
 async function mintInstallationToken(cfg: GitHubAppConfig): Promise<InstallationTokenCache> {
@@ -151,40 +162,67 @@ async function mintInstallationToken(cfg: GitHubAppConfig): Promise<Installation
   return { token, expiresAtMs };
 }
 
-export async function getInstallationToken(): Promise<string> {
+export async function getInstallationToken(profile: RalphProfile = getProfile()): Promise<string> {
   const cfg = getConfig();
-  const app = getGitHubAppConfig(cfg);
+  const app = getGitHubAppConfigForProfile(profile, cfg);
   if (!app) {
-    throw new GitHubAuthError("GitHub App auth not configured (missing githubApp in ralph.json)");
+    const label = profile === "sandbox" ? "sandbox.githubAuth.githubApp" : "githubApp";
+    throw new GitHubAuthError(`GitHub App auth not configured (missing ${label} in config)`);
   }
 
+  const cacheKey = buildTokenCacheKey(profile, app);
+  const cached = tokenCache.get(cacheKey);
   const now = Date.now();
-  if (tokenCache && tokenCache.expiresAtMs - EXPIRY_SKEW_MS > now) {
-    return tokenCache.token;
+  if (cached && cached.expiresAtMs - EXPIRY_SKEW_MS > now) {
+    return cached.token;
   }
 
-  if (!inFlightToken) {
-    inFlightToken = mintInstallationToken(app)
+  if (!inFlightToken.has(cacheKey)) {
+    const promise = mintInstallationToken(app)
       .then((fresh) => {
-        tokenCache = fresh;
+        tokenCache.set(cacheKey, fresh);
         return fresh;
       })
       .finally(() => {
-        inFlightToken = null;
+        inFlightToken.delete(cacheKey);
       });
+    inFlightToken.set(cacheKey, promise);
   }
 
-  const fresh = await inFlightToken;
+  const fresh = await inFlightToken.get(cacheKey)!;
   return fresh.token;
 }
 
 export async function ensureGhTokenEnv(): Promise<void> {
-  // Best-effort: if githubApp isn't configured, leave GH_TOKEN as-is.
+  const profile = getProfile();
   const cfg = getConfig();
-  const app = getGitHubAppConfig(cfg);
+
+  if (profile === "sandbox") {
+    const app = getGitHubAppConfigForProfile(profile, cfg);
+    if (app) {
+      const token = await getInstallationToken(profile);
+      process.env.GH_TOKEN = token;
+      process.env.GITHUB_TOKEN = token;
+      return;
+    }
+
+    const sandbox = getSandboxProfileConfig();
+    const tokenEnvVar = sandbox?.githubAuth?.tokenEnvVar;
+    if (tokenEnvVar) {
+      const token = process.env[tokenEnvVar];
+      if (token && token.trim()) {
+        process.env.GH_TOKEN = token.trim();
+        process.env.GITHUB_TOKEN = token.trim();
+      }
+    }
+    return;
+  }
+
+  // Best-effort: if githubApp isn't configured, leave GH_TOKEN as-is.
+  const app = getGitHubAppConfigForProfile("prod", cfg);
   if (!app) return;
 
-  const token = await getInstallationToken();
+  const token = await getInstallationToken("prod");
   // Memory-only: set env for child gh calls; never write to disk.
   process.env.GH_TOKEN = token;
   process.env.GITHUB_TOKEN = token;
@@ -253,6 +291,13 @@ export async function listAccessibleRepos(): Promise<GitHubRepoSummary[]> {
 
 export function getAllowedOwners(): string[] {
   const cfg = getConfig() as any;
+  const profile = getProfile();
+  if (profile === "sandbox") {
+    const sandbox = getSandboxProfileConfig();
+    const sandboxOwners = sandbox?.allowedOwners ?? [];
+    if (sandboxOwners.length > 0) return sandboxOwners;
+  }
+
   const raw = cfg.allowedOwners;
 
   const owners: string[] = Array.isArray(raw)
@@ -280,7 +325,7 @@ export function filterReposToAllowedOwners(repos: GitHubRepoSummary[]): GitHubRe
 }
 
 export function __resetGitHubAuthForTests(): void {
-  tokenCache = null;
-  inFlightToken = null;
+  tokenCache.clear();
+  inFlightToken.clear();
   deps = { ...DEFAULT_DEPS };
 }

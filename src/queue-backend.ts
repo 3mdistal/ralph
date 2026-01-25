@@ -2,6 +2,8 @@ import {
   checkBwrbVaultLayout,
   getConfig,
   getConfigMeta,
+  getProfile,
+  getSandboxProfileConfig,
   isQueueBackendExplicit,
   type QueueBackend,
   type RalphConfig,
@@ -60,6 +62,15 @@ let cachedDriver: QueueBackendDriver | null = null;
 const GITHUB_QUEUE_IMPLEMENTED = true;
 
 function isGitHubAuthConfigured(config: RalphConfig): boolean {
+  const profile = getProfile();
+  if (profile === "sandbox") {
+    const sandbox = getSandboxProfileConfig();
+    if (sandbox?.githubAuth?.githubApp) return true;
+    const tokenEnvVar = sandbox?.githubAuth?.tokenEnvVar;
+    const token = tokenEnvVar ? process.env[tokenEnvVar] : undefined;
+    return Boolean(token && token.trim());
+  }
+
   if (config.githubApp) return true;
   const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
   return Boolean(token && token.trim());

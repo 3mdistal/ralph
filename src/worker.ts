@@ -4,19 +4,6 @@ import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { randomUUID } from "crypto";
 
-type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
-
-type GhProcess = {
-  cwd: (path: string) => GhProcess;
-  quiet: () => Promise<GhCommandResult>;
-};
-
-type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProcess;
-
-const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
-
-const gh: GhRunner = DEFAULT_GH_RUNNER;
-
 import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "./queue-backend";
 import {
   getAutoUpdateBehindLabelGate,
@@ -64,6 +51,7 @@ import { drainQueuedNudges } from "./nudge";
 import { RALPH_LABEL_BLOCKED } from "./github-labels";
 import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
@@ -111,6 +99,9 @@ type SessionAdapter = {
   continueCommand: typeof continueCommand;
   getRalphXdgCacheHome: typeof getRalphXdgCacheHome;
 };
+
+const ghRead = (repo: string) => createGhRunner({ repo, mode: "read" });
+const ghWrite = (repo: string) => createGhRunner({ repo, mode: "write" });
 
 type PullRequestMergeStateStatus =
   | "BEHIND"
@@ -2113,7 +2104,7 @@ ${guidance}`
 
     const [, repo, number] = match;
     try {
-      const result = await gh`gh issue view ${number} --repo ${repo} --json state,stateReason,closedAt,url,labels,title`.quiet();
+      const result = await ghRead(repo)`gh issue view ${number} --repo ${repo} --json state,stateReason,closedAt,url,labels,title`.quiet();
       const data = JSON.parse(result.stdout.toString());
       const metadata: IssueMetadata = {
         labels: data.labels?.map((l: any) => l.name) ?? [],
@@ -2336,7 +2327,7 @@ ${guidance}`
     }
 
     try {
-      const list = await gh`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
+      const list = await ghRead(this.repo)`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
       const data = JSON.parse(list.stdout.toString());
       const existingUrl = data?.[0]?.url as string | undefined;
       if (existingUrl) {
@@ -2381,7 +2372,7 @@ ${guidance}`
     ].join("\n");
 
     try {
-      const created = await gh`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
+      const created = await ghWrite(this.repo)`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
         .cwd(candidate.worktreePath)
         .quiet();
 
@@ -2394,7 +2385,7 @@ ${guidance}`
     }
 
     try {
-      const list = await gh`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
+      const list = await ghRead(this.repo)`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
       const data = JSON.parse(list.stdout.toString());
       const url = data?.[0]?.url as string | undefined;
       if (url) {
@@ -2439,7 +2430,7 @@ ${guidance}`
       "}",
     ].join(" ");
 
-    const result = await gh`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
+    const result = await ghRead(this.repo)`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
     const parsed = JSON.parse(result.stdout.toString());
 
     const pr = parsed?.data?.repository?.pullRequest;
@@ -2505,7 +2496,7 @@ ${guidance}`
       "}",
     ].join(" ");
 
-    const result = await gh`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
+    const result = await ghRead(this.repo)`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
     const parsed = JSON.parse(result.stdout.toString());
     const base = parsed?.data?.repository?.pullRequest?.baseRefName;
     return typeof base === "string" && base.trim() ? base.trim() : null;
@@ -2600,12 +2591,12 @@ ${guidance}`
 
   private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
     // Never pass --admin or -d (delete branch). Branch cleanup is handled separately with guardrails.
-    await gh`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
+    await ghWrite(this.repo)`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
   }
 
   private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
     try {
-      await gh`gh pr update-branch ${prUrl} --repo ${this.repo}`.cwd(cwd).quiet();
+      await ghWrite(this.repo)`gh pr update-branch ${prUrl} --repo ${this.repo}`.cwd(cwd).quiet();
       return;
     } catch (error: any) {
       const message = this.formatGhError(error);
@@ -2674,7 +2665,7 @@ ${guidance}`
 
   private async getCheckLog(runId: string): Promise<CheckLogResult> {
     try {
-      const result = await gh`gh run view ${runId} --repo ${this.repo} --log-failed`.quiet();
+      const result = await ghRead(this.repo)`gh run view ${runId} --repo ${this.repo} --log-failed`.quiet();
       const output = result.stdout.toString();
       if (!output.trim()) return { runId };
       return { runId, logExcerpt: this.clipLogExcerpt(output) };
@@ -3338,7 +3329,7 @@ ${guidance}`
       "}",
     ].join(" ");
 
-    const result = await gh`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
+    const result = await ghRead(this.repo)`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
     const parsed = JSON.parse(result.stdout.toString());
     const pr = parsed?.data?.repository?.pullRequest;
 

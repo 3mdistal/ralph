@@ -123,6 +123,38 @@ export interface ControlConfig {
   suppressMissingWarnings?: boolean;
 }
 
+export class RalphConfigError extends Error {
+  readonly code: "RALPH_CONFIG_INVALID" | "RALPH_CONFIG_SANDBOX_INVALID";
+
+  constructor(code: "RALPH_CONFIG_INVALID" | "RALPH_CONFIG_SANDBOX_INVALID", message: string) {
+    super(message);
+    this.name = "RalphConfigError";
+    this.code = code;
+  }
+}
+
+export type RalphProfile = "prod" | "sandbox";
+
+export interface SandboxGithubAuthConfig {
+  githubApp?: {
+    appId: number | string;
+    installationId: number | string;
+    /** PEM file path (read at runtime; never log key material). */
+    privateKeyPath: string;
+  };
+  /** Env var name for a fine-grained PAT restricted to sandbox repos. */
+  tokenEnvVar?: string;
+}
+
+export interface SandboxProfileConfig {
+  /** Allowed repo owners for sandbox runs (non-empty). */
+  allowedOwners: string[];
+  /** Required repo name prefix for sandbox repos. */
+  repoNamePrefix: string;
+  /** Dedicated GitHub auth for sandbox runs. */
+  githubAuth: SandboxGithubAuthConfig;
+}
+
 export type QueueBackend = "github" | "bwrb" | "none";
 
 export interface RalphConfig {
@@ -137,6 +169,11 @@ export interface RalphConfig {
   queueBackend?: QueueBackend;
   bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // default GitHub owner (default: "3mdistal")
+
+  /** Runtime profile for safety rails (default: "prod"). */
+  profile?: RalphProfile;
+  /** Sandbox profile configuration (required when profile="sandbox"). */
+  sandbox?: SandboxProfileConfig;
 
   /**
    * Guardrail: only touch repos whose owner is in this allowlist.
@@ -241,6 +278,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   bwrbVault: detectDefaultBwrbVault(),
   owner: "3mdistal",
   devDir: join(homedir(), "Developer"),
+  profile: "prod",
 };
 
 type ConfigSource = "default" | "toml" | "json" | "legacy";
@@ -269,6 +307,20 @@ function toPositiveIntOrNull(value: unknown): number | null {
   if (!Number.isInteger(value)) return null;
   if (value <= 0) return null;
   return value;
+}
+
+function toPositiveIntFromUnknownOrNull(value: unknown): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(n)) return null;
+  if (!Number.isInteger(n)) return null;
+  if (n <= 0) return null;
+  return n;
+}
+
+function toNonEmptyStringOrNull(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
 }
 
 function toStringArrayOrNull(value: unknown): string[] | null {
@@ -335,6 +387,18 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     }
   } else if (!loaded.queueBackend) {
     loaded.queueBackend = "github";
+  }
+
+  const rawProfile = (loaded as any).profile;
+  if (rawProfile === undefined || rawProfile === null || rawProfile === "") {
+    loaded.profile = "prod";
+  } else if (rawProfile === "prod" || rawProfile === "sandbox") {
+    loaded.profile = rawProfile;
+  } else {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_INVALID",
+      `[ralph] Invalid config profile=${JSON.stringify(rawProfile)}; expected "prod" or "sandbox".`
+    );
   }
 
   // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
@@ -409,6 +473,83 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.allowedOwners = [loaded.owner];
   } else {
     loaded.allowedOwners = [loaded.owner];
+  }
+
+  if (loaded.profile === "sandbox") {
+    const rawSandbox = (loaded as any).sandbox;
+    if (!rawSandbox || typeof rawSandbox !== "object" || Array.isArray(rawSandbox)) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires a sandbox config block."
+      );
+    }
+
+    const allowedOwners = toStringArrayOrNull((rawSandbox as any).allowedOwners);
+    if (!allowedOwners || allowedOwners.length === 0) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires sandbox.allowedOwners (non-empty array)."
+      );
+    }
+
+    const repoNamePrefix = toNonEmptyStringOrNull((rawSandbox as any).repoNamePrefix);
+    if (!repoNamePrefix) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires sandbox.repoNamePrefix (non-empty string)."
+      );
+    }
+
+    const rawGithubAuth = (rawSandbox as any).githubAuth;
+    if (!rawGithubAuth || typeof rawGithubAuth !== "object" || Array.isArray(rawGithubAuth)) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires sandbox.githubAuth with githubApp or tokenEnvVar."
+      );
+    }
+
+    const rawSandboxApp = (rawGithubAuth as any).githubApp;
+    const tokenEnvVar = toNonEmptyStringOrNull((rawGithubAuth as any).tokenEnvVar) ?? undefined;
+
+    let hasValidApp = false;
+    if (rawSandboxApp && typeof rawSandboxApp === "object" && !Array.isArray(rawSandboxApp)) {
+      const appId = toPositiveIntFromUnknownOrNull((rawSandboxApp as any).appId);
+      const installationId = toPositiveIntFromUnknownOrNull((rawSandboxApp as any).installationId);
+      const privateKeyPath = toNonEmptyStringOrNull((rawSandboxApp as any).privateKeyPath);
+      hasValidApp = Boolean(appId && installationId && privateKeyPath);
+      if (!hasValidApp) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox githubAuth.githubApp is invalid; expected { appId, installationId, privateKeyPath }."
+        );
+      }
+    }
+
+    if (!hasValidApp && !tokenEnvVar) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires githubAuth.githubApp or githubAuth.tokenEnvVar."
+      );
+    }
+
+    if (!hasValidApp && tokenEnvVar) {
+      const tokenValue = process.env[tokenEnvVar];
+      if (!tokenValue || !tokenValue.trim()) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          `[ralph] Sandbox githubAuth.tokenEnvVar is set but ${tokenEnvVar} is missing/empty.`
+        );
+      }
+    }
+
+    loaded.sandbox = {
+      allowedOwners,
+      repoNamePrefix,
+      githubAuth: {
+        ...(hasValidApp ? { githubApp: rawSandboxApp } : {}),
+        ...(tokenEnvVar ? { tokenEnvVar } : {}),
+      },
+    };
   }
 
   // Best-effort validation for GitHub App auth config.
@@ -998,6 +1139,19 @@ export function isQueueBackendExplicit(): boolean {
 
 export function getConfig(): RalphConfig {
   return loadConfig().config;
+}
+
+export function getProfile(): RalphProfile {
+  return getConfig().profile ?? "prod";
+}
+
+export function isSandboxProfile(): boolean {
+  return getProfile() === "sandbox";
+}
+
+export function getSandboxProfileConfig(): SandboxProfileConfig | null {
+  const cfg = getConfig();
+  return cfg.profile === "sandbox" ? (cfg.sandbox ?? null) : null;
 }
 
 export function getRepoPath(repoName: string): string {

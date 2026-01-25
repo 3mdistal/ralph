@@ -1,7 +1,7 @@
 import { $ } from "bun";
 
 import { getConfig, getRepoPath, getRepoBotBranch, getRepoRollupBatchSize } from "./config";
-import { ensureGhTokenEnv } from "./github-app-auth";
+import { createGhRunner } from "./github/gh-runner";
 import { notifyRollupReady, notifyError } from "./notify";
 import {
   createNewRollupBatch,
@@ -38,6 +38,9 @@ type ClosingIssueOptions = {
   batchId: string;
   generatedAt: string;
 };
+
+const ghRead = (repo: string) => createGhRunner({ repo, mode: "read" });
+const ghWrite = (repo: string) => createGhRunner({ repo, mode: "write" });
 
 const CLOSING_KEYWORDS = [
   "fix",
@@ -288,12 +291,11 @@ export class RollupMonitor {
       return { kind: "exists", prUrl: batch.rollupPrUrl, prNumber: batch.rollupPrNumber ?? null };
     }
 
-    await ensureGhTokenEnv();
     const marker = makeRollupBatchMarker(params.batchId);
     const search = marker.searchQuery;
 
     try {
-      const result = await $`gh pr list --repo ${params.repo} --base main --search ${search} --state all --json url,number`.quiet();
+      const result = await ghRead(params.repo)`gh pr list --repo ${params.repo} --base main --search ${search} --state all --json url,number`.quiet();
       const rows = JSON.parse(result.stdout.toString() || "[]") as Array<{ url?: string; number?: number }>;
 
       if (rows.length > 0 && rows[0]?.url) {
@@ -384,8 +386,6 @@ export class RollupMonitor {
     let leaseAcquired = false;
 
     try {
-      await ensureGhTokenEnv();
-
       leaseAcquired = tryAcquireRollupCreateLease(lockKey);
       if (!leaseAcquired) {
         console.warn(`[ralph:rollup] Rollup creation already in progress for ${repo} (${batch.id}); skipping duplicate.`);
@@ -414,7 +414,7 @@ export class RollupMonitor {
         generatedAt: new Date().toISOString(),
       });
 
-      const result = await $`gh pr create --repo ${repo} --base main --head ${botBranch} --title "Rollup: ${today} batch (${prs.length} PRs)" --body ${body}`
+      const result = await ghWrite(repo)`gh pr create --repo ${repo} --base main --head ${botBranch} --title "Rollup: ${today} batch (${prs.length} PRs)" --body ${body}`
         .cwd(repoPath)
         .quiet();
 
@@ -458,7 +458,7 @@ export class RollupMonitor {
     logPrefix: string
   ): Promise<RollupPullRequest | null> {
     try {
-      const result = await $`gh pr list --repo ${repo} --state open --base main --head ${botBranch} --json url,body --limit 5`
+      const result = await ghRead(repo)`gh pr list --repo ${repo} --state open --base main --head ${botBranch} --json url,body --limit 5`
         .cwd(repoPath)
         .quiet();
       const output = result.stdout.toString().trim();

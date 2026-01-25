@@ -86,12 +86,45 @@ Or JSON (`~/.ralph/config.json`):
 
 Note: Config values are read as plain TOML/JSON. `~` is not expanded, and comments/trailing commas are not supported.
 
+### Sandbox profile
+
+Sandbox runs are opt-in and enforce a write tripwire. When `profile = "sandbox"`, you must provide a `sandbox` block with dedicated GitHub credentials and repo boundaries.
+
+`~/.ralph/config.toml`:
+
+```toml
+profile = "sandbox"
+sandbox = {
+  allowedOwners = ["3mdistal"],
+  repoNamePrefix = "ralph-sandbox-",
+  githubAuth = { tokenEnvVar = "GITHUB_SANDBOX_TOKEN" }
+}
+```
+
+Or with a dedicated GitHub App installation:
+
+```toml
+profile = "sandbox"
+sandbox = {
+  allowedOwners = ["3mdistal"],
+  repoNamePrefix = "ralph-sandbox-",
+  githubAuth = { githubApp = { appId = 123, installationId = 456, privateKeyPath = "/abs/path/key.pem" } }
+}
+```
+
 ### Supported settings
 
 - `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
 - `bwrbVault` (string): bwrb vault path for the task queue (required when `queueBackend = "bwrb"`)
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
+- `profile` (string): `prod` (default) or `sandbox`
+- `sandbox` (object, required when `profile = "sandbox"`)
+  - `allowedOwners` (array): non-empty allowlist of repo owners for sandbox runs
+  - `repoNamePrefix` (string): required repo name prefix (e.g. `ralph-sandbox-`)
+  - `githubAuth` (object): dedicated sandbox auth
+    - `githubApp` (object): GitHub App installation auth for sandbox runs
+    - `tokenEnvVar` (string): env var name for a fine-grained PAT restricted to sandbox repos
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
 - `githubApp` (object, optional): GitHub App installation auth for `gh` + REST (tokens cached in memory)
   - `appId` (number|string)
@@ -129,6 +162,8 @@ If Ralph logs that required checks are unavailable with `Available check context
 ### GitHub auth precedence
 
 Ralph uses the GitHub App installation token when `githubApp` is configured. If no `githubApp` is configured, it falls back to `GH_TOKEN` or `GITHUB_TOKEN` from the environment. Env tokens are ignored when `githubApp` is configured to avoid using stale installation tokens that were minted earlier for `gh` CLI calls.
+
+When `profile = "sandbox"`, Ralph uses only `sandbox.githubAuth` (GitHub App or `tokenEnvVar`) and never falls back to prod credentials. If sandbox config is missing or invalid, Ralph fails fast at startup.
 
 ### Environment variables
 

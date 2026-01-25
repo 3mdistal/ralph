@@ -1,14 +1,6 @@
-import { $ } from "bun";
+import { createGhRunner } from "./gh-runner";
 
-type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
-
-type GhProcess = {
-  quiet: () => Promise<GhCommandResult>;
-};
-
-type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProcess;
-
-const gh: GhRunner = $ as unknown as GhRunner;
+const ghRead = (repo: string) => createGhRunner({ repo, mode: "read" });
 
 export type PullRequestView = {
   url: string;
@@ -35,7 +27,7 @@ export function normalizePrUrl(url: string): string {
 }
 
 export async function viewPullRequest(repo: string, prUrl: string): Promise<PullRequestView | null> {
-  const response = await gh`gh pr view ${prUrl} --repo ${repo} --json url,state,createdAt,updatedAt,baseRefName,headRefName,isDraft`.quiet();
+  const response = await ghRead(repo)`gh pr view ${prUrl} --repo ${repo} --json url,state,createdAt,updatedAt,baseRefName,headRefName,isDraft`.quiet();
   const data = JSON.parse(response.stdout.toString());
   if (!data?.url) return null;
   return {
@@ -67,7 +59,7 @@ function parseSearchOutput(output: string): PullRequestSearchResult[] {
 }
 
 async function runSearch(repo: string, search: string): Promise<PullRequestSearchResult[]> {
-  const response = await gh`gh pr list --repo ${repo} --state open --search ${search} --json url,createdAt,updatedAt,number`.quiet();
+  const response = await ghRead(repo)`gh pr list --repo ${repo} --state open --search ${search} --json url,createdAt,updatedAt,number`.quiet();
   return parseSearchOutput(response.stdout.toString());
 }
 
