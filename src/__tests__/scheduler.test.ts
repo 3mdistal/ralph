@@ -158,6 +158,53 @@ describe("Scheduler invariants", () => {
     expect(started.length).toBe(1);
   });
 
+  test("startQueuedTasks respects per-repo concurrency", async () => {
+    const inFlightTasks = new Set<string>();
+    const started: TestTask[] = [];
+
+    const globalSemaphore = new Semaphore(10);
+
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(1);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const rrCursor = { value: 0 };
+
+    const startTask = ({ repo, task }: { repo: string; task: TestTask }) => {
+      inFlightTasks.add(task._path || task.name);
+      started.push({ ...task, repo });
+      return true;
+    };
+
+    const tasks = [
+      { repo: "a", _path: "orchestration/tasks/t1.md", name: "t1" },
+      { repo: "a", _path: "orchestration/tasks/t2.md", name: "t2" },
+    ];
+
+    const startedCount = await startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks,
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor,
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+    });
+
+    expect(startedCount).toBe(1);
+    expect(started.length).toBe(1);
+  });
+
   test("no duplicate scheduling when watcher double-fires", async () => {
     const inFlightTasks = new Set<string>();
     const started: TestTask[] = [];

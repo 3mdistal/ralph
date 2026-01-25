@@ -1264,6 +1264,7 @@ async function runSession(
 export type RunSessionOptionsBase = {
   repo?: string;
   cacheKey?: string;
+  contextKey?: string;
   opencodeXdg?: {
     dataHome?: string;
     configHome?: string;

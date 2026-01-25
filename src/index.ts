@@ -986,7 +986,7 @@ async function printHeartbeatTick(): Promise<void> {
     if (!sessionId) continue;
 
     const taskId = task._path || task.name;
-    const workerId = taskId ? `${task.repo}#${taskId}` : undefined;
+    const workerId = task["worker-id"]?.trim() || (taskId ? `${task.repo}#${taskId}` : undefined);
     activeSessionTasks.set(sessionId, { task, workerId, taskId });
   }
 

@@ -714,7 +714,7 @@ export class RepoWorker {
   private throttle: ThrottleAdapter;
   private github: GitHubClient;
   private labelEnsurer: ReturnType<typeof createRalphWorkflowLabelsEnsurer>;
-  private contextRecoveryContext: { task: AgentTask; repoPath: string; planPath: string } | null = null;
+  private contextRecoveryContexts = new Map<string, { task: AgentTask; repoPath: string; planPath: string }>();
   private contextCompactAttempts = new Map<string, number>();
 
   constructor(
@@ -846,10 +846,26 @@ export class RepoWorker {
   }
 
   private recordContextCompactAttempt(task: AgentTask, stepKey: string): { allowed: boolean; attempt: number } {
-    const key = `${task._path}:${stepKey}`;
+    const taskKey = this.getTaskContextKey(task) ?? task._path ?? task._name ?? task.name;
+    const key = `${taskKey}:${stepKey}`;
     const next = (this.contextCompactAttempts.get(key) ?? 0) + 1;
     this.contextCompactAttempts.set(key, next);
     return { allowed: next <= 1, attempt: next };
+  }
+
+  private getTaskContextKey(task: AgentTask): string | null {
+    const raw = task._path ?? task._name ?? task.name;
+    const trimmed = typeof raw === "string" ? raw.trim() : "";
+    return trimmed ? trimmed : null;
+  }
+
+  private withTaskContext(
+    task: AgentTask,
+    options?: RunSessionOptionsBase & { agent?: string }
+  ): RunSessionOptionsBase & { agent?: string } {
+    const contextKey = this.getTaskContextKey(task);
+    if (!contextKey) return { ...(options ?? {}) };
+    return { ...(options ?? {}), contextKey };
   }
 
   private buildContextRecoveryOptions(
@@ -883,7 +899,8 @@ export class RepoWorker {
     if (params.result.success || params.result.errorCode !== "context_length_exceeded") return params.result;
     if (params.command === "compact") return params.result;
 
-    const context = this.contextRecoveryContext;
+    const contextKey = params.options?.contextKey;
+    const context = contextKey ? this.contextRecoveryContexts.get(contextKey) : null;
     if (!context) return params.result;
 
     const sessionId = params.result.sessionId?.trim() || params.sessionId?.trim();
@@ -921,6 +938,7 @@ export class RepoWorker {
           buildRalphEvent({
             type: "worker.context_compact.triggered",
             level: "info",
+            ...(context.task["worker-id"]?.trim() ? { workerId: context.task["worker-id"]?.trim() } : {}),
             repo: this.repo,
             taskId: context.task._path,
             sessionId: event.sessionId,
@@ -945,11 +963,13 @@ export class RepoWorker {
       );
     }
 
-    this.contextRecoveryContext = {
+    const contextKey = this.getTaskContextKey(task);
+    if (!contextKey) return;
+    this.contextRecoveryContexts.set(contextKey, {
       task,
       repoPath: worktreePath,
       planPath: RALPH_PLAN_RELATIVE_PATH,
-    };
+    });
   }
 
   private async getRepoRootStatusPorcelain(): Promise<string> {
@@ -2219,14 +2239,26 @@ ${guidance}`
   }
 
   private async ensureWorkerId(task: AgentTask, taskId?: string | null): Promise<string> {
-    const existing = task["worker-id"]?.trim();
-    if (existing) return existing;
     const derived = this.buildWorkerId(task, taskId);
-    if (derived) return derived;
+    const existing = task["worker-id"]?.trim();
+
+    if (derived) {
+      if (!existing || existing !== derived) {
+        await this.queue.updateTaskStatus(task, task.status === "in-progress" ? "in-progress" : "starting", {
+          "worker-id": derived,
+        });
+        task["worker-id"] = derived;
+      }
+      return derived;
+    }
+
+    if (existing) return existing;
+
     const fallback = `w_${randomUUID()}`;
     await this.queue.updateTaskStatus(task, task.status === "in-progress" ? "in-progress" : "starting", {
       "worker-id": fallback,
     });
+    task["worker-id"] = fallback;
     return fallback;
   }
 
@@ -2248,6 +2280,18 @@ ${guidance}`
     return this.normalizeRepoSlot(value, this.getRepoSlotLimit());
   }
 
+  private parseRepoSlot(value: string | number | null | undefined): number | null {
+    if (typeof value === "number") {
+      return Number.isInteger(value) ? value : null;
+    }
+    if (typeof value === "string") {
+      const parsed = Number.parseInt(value, 10);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return null;
+      return parsed;
+    }
+    return null;
+  }
+
   private normalizeRepoSlot(value: number, limit: number): number {
     if (Number.isInteger(value) && value >= 0 && value < limit) return value;
     console.warn(`[scheduler] repoSlot allocation failed; using slot 0 (repo=${this.repo})`);
@@ -2259,11 +2303,18 @@ ${guidance}`
     return Number.isFinite(limit) && limit > 0 ? limit : 1;
   }
 
-  private allocateRepoSlot(): number {
+  private allocateRepoSlot(preferredSlot?: number | null): number {
     const limit = this.getRepoSlotLimit();
 
     if (!this.repoSlotsInUse) {
       this.repoSlotsInUse = new Set<number>();
+    }
+
+    if (typeof preferredSlot === "number" && Number.isInteger(preferredSlot)) {
+      if (preferredSlot >= 0 && preferredSlot < limit && !this.repoSlotsInUse.has(preferredSlot)) {
+        this.repoSlotsInUse.add(preferredSlot);
+        return preferredSlot;
+      }
     }
 
     for (let slot = 0; slot < limit; slot++) {
@@ -3054,7 +3105,7 @@ ${guidance}`
     const resumeSessionId = task["session-id"]?.trim();
 
     const recoveryResult = resumeSessionId
-      ? await this.session.continueSession(taskRepoPath, resumeSessionId, prompt, {
+      ? await this.session.continueSession(taskRepoPath, resumeSessionId, prompt, this.withTaskContext(task, {
           repo: this.repo,
           cacheKey,
           runLogPath,
@@ -3067,8 +3118,8 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, stage),
           ...opencodeSessionOptions,
-        })
-      : await this.session.runAgent(taskRepoPath, "general", prompt, {
+        }))
+      : await this.session.runAgent(taskRepoPath, "general", prompt, this.withTaskContext(task, {
           repo: this.repo,
           cacheKey,
           runLogPath,
@@ -3081,7 +3132,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, stage),
           ...opencodeSessionOptions,
-        });
+        }));
 
     const pausedAfter = await this.pauseIfHardThrottled(task, `${stage} (post)`, recoveryResult.sessionId);
     if (pausedAfter) return pausedAfter;
@@ -3136,20 +3187,26 @@ ${guidance}`
     const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
     const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
 
-    const surveyResult = await this.session.continueCommand(surveyRepoPath, mergeGate.sessionId, "survey", [], {
-      repo: this.repo,
-      cacheKey,
-      runLogPath: surveyRunLogPath,
-      introspection: {
+    const surveyResult = await this.session.continueCommand(
+      surveyRepoPath,
+      mergeGate.sessionId,
+      "survey",
+      [],
+      this.withTaskContext(task, {
         repo: this.repo,
-        issue: task.issue,
-        taskName: task.name,
-        step: 3,
-        stepTitle: "survey",
-      },
-      ...this.buildWatchdogOptions(task, "survey"),
-      ...opencodeSessionOptions,
-    });
+        cacheKey,
+        runLogPath: surveyRunLogPath,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 3,
+          stepTitle: "survey",
+        },
+        ...this.buildWatchdogOptions(task, "survey"),
+        ...opencodeSessionOptions,
+      })
+    );
 
     const pausedSurveyAfter = await this.pauseIfHardThrottled(
       task,
@@ -3921,20 +3978,25 @@ ${guidance}`
         "in-progress"
       );
 
-      const fixResult = await this.session.continueSession(params.repoPath, sessionId, fixMessage, {
-        repo: this.repo,
-        cacheKey: params.cacheKey,
-        runLogPath,
-        introspection: {
+      const fixResult = await this.session.continueSession(
+        params.repoPath,
+        sessionId,
+        fixMessage,
+        this.withTaskContext(params.task, {
           repo: this.repo,
-          issue: params.task.issue,
-          taskName: params.task.name,
-          step: 5,
-          stepTitle: "fix CI",
-        },
-        ...this.buildWatchdogOptions(params.task, `${params.watchdogStagePrefix}-ci-fix`),
-        ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
-      });
+          cacheKey: params.cacheKey,
+          runLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: params.task.issue,
+            taskName: params.task.name,
+            step: 5,
+            stepTitle: "fix CI",
+          },
+          ...this.buildWatchdogOptions(params.task, `${params.watchdogStagePrefix}-ci-fix`),
+          ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
+        })
+      );
 
       sessionId = fixResult.sessionId || sessionId;
 
@@ -4277,13 +4339,18 @@ ${guidance}`
 
         const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`, "in-progress");
 
-        const res = await this.session.continueSession(repoPath, sid, message, {
-          repo: this.repo,
-          cacheKey,
-          runLogPath,
-          ...this.buildWatchdogOptions(task, `nudge-${stage}`),
-          ...opencodeSessionOptions,
-        });
+        const res = await this.session.continueSession(
+          repoPath,
+          sid,
+          message,
+          this.withTaskContext(task, {
+            repo: this.repo,
+            cacheKey,
+            runLogPath,
+            ...this.buildWatchdogOptions(task, `nudge-${stage}`),
+            ...opencodeSessionOptions,
+          })
+        );
         return { success: res.success, error: res.success ? undefined : res.output };
       });
 
@@ -4412,7 +4479,8 @@ ${guidance}`
     }
 
     const workerId = await this.formatWorkerId(task, task._path);
-    const allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot());
+    const preferredSlot = this.parseRepoSlot(task["repo-slot"]);
+    const allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot(preferredSlot));
 
     try {
       await this.assertRepoRootClean(task, "resume");
@@ -4522,20 +4590,25 @@ ${guidance}`
 
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
-      let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: resumeRunLogPath,
-        introspection: {
+      let buildResult = await this.session.continueSession(
+        taskRepoPath,
+        existingSessionId,
+        finalResumeMessage,
+        this.withTaskContext(task, {
           repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 4,
-          stepTitle: "resume",
-        },
-        ...this.buildWatchdogOptions(task, "resume"),
-        ...opencodeSessionOptions,
-      });
+          cacheKey,
+          runLogPath: resumeRunLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 4,
+            stepTitle: "resume",
+          },
+          ...this.buildWatchdogOptions(task, "resume"),
+          ...opencodeSessionOptions,
+        })
+      );
 
       const pausedAfter = await this.pauseIfHardThrottled(task, "resume (post)", buildResult.sessionId || existingSessionId);
       if (pausedAfter) return pausedAfter;
@@ -4659,7 +4732,7 @@ ${guidance}`
             taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
-            {
+            this.withTaskContext(task, {
               repo: this.repo,
               cacheKey,
               runLogPath: loopBreakRunLogPath,
@@ -4672,7 +4745,7 @@ ${guidance}`
               },
               ...this.buildWatchdogOptions(task, "resume-loop-break"),
               ...opencodeSessionOptions,
-            }
+            })
           );
 
           const pausedLoopBreakAfter = await this.pauseIfHardThrottled(
@@ -4728,21 +4801,26 @@ ${guidance}`
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
         const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue", "in-progress");
 
-        buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
-          repo: this.repo,
-          cacheKey,
-          runLogPath: resumeContinueRunLogPath,
-          timeoutMs: 10 * 60_000,
-          introspection: {
+        buildResult = await this.session.continueSession(
+          taskRepoPath,
+          buildResult.sessionId,
+          nudge,
+          this.withTaskContext(task, {
             repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 4,
-            stepTitle: "continue",
-          },
-          ...this.buildWatchdogOptions(task, "resume-continue"),
-          ...opencodeSessionOptions,
-        });
+            cacheKey,
+            runLogPath: resumeContinueRunLogPath,
+            timeoutMs: 10 * 60_000,
+            introspection: {
+              repo: this.repo,
+              issue: task.issue,
+              taskName: task.name,
+              step: 4,
+              stepTitle: "continue",
+            },
+            ...this.buildWatchdogOptions(task, "resume-continue"),
+            ...opencodeSessionOptions,
+          })
+        );
 
         const pausedContinueAfter = await this.pauseIfHardThrottled(
           task,
@@ -4878,13 +4956,19 @@ ${guidance}`
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
       const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey", "in-progress");
 
-      const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: resumeSurveyRunLogPath,
-        ...this.buildWatchdogOptions(task, "resume-survey"),
-        ...opencodeSessionOptions,
-      });
+      const surveyResult = await this.session.continueCommand(
+        surveyRepoPath,
+        buildResult.sessionId,
+        "survey",
+        [],
+        this.withTaskContext(task, {
+          repo: this.repo,
+          cacheKey,
+          runLogPath: resumeSurveyRunLogPath,
+          ...this.buildWatchdogOptions(task, "resume-survey"),
+          ...opencodeSessionOptions,
+        })
+      );
 
 
       const pausedSurveyAfter = await this.pauseIfHardThrottled(
@@ -4965,7 +5049,8 @@ ${guidance}`
       }
 
       workerId = await this.formatWorkerId(task, task._path);
-      allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot());
+      const preferredSlot = this.parseRepoSlot(task["repo-slot"]);
+      allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot(preferredSlot));
 
       const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
       if (pausedPreStart) return pausedPreStart;
@@ -5077,20 +5162,25 @@ ${guidance}`
       const plannerPrompt = buildPlannerPrompt({ repo: this.repo, issueNumber });
       const planRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan", "starting");
 
-      let planResult = await this.session.runAgent(taskRepoPath, "ralph-plan", plannerPrompt, {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: planRunLogPath,
-        introspection: {
+      let planResult = await this.session.runAgent(
+        taskRepoPath,
+        "ralph-plan",
+        plannerPrompt,
+        this.withTaskContext(task, {
           repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 1,
-          stepTitle: "plan",
-        },
-        ...this.buildWatchdogOptions(task, "plan"),
-        ...opencodeSessionOptions,
-      });
+          cacheKey,
+          runLogPath: planRunLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 1,
+            stepTitle: "plan",
+          },
+          ...this.buildWatchdogOptions(task, "plan"),
+          ...opencodeSessionOptions,
+        })
+      );
 
       const pausedAfterPlan = await this.pauseIfHardThrottled(task, "plan (post)", planResult.sessionId);
       if (pausedAfterPlan) return pausedAfterPlan;
@@ -5104,20 +5194,25 @@ ${guidance}`
         await new Promise((r) => setTimeout(r, 750));
         const planRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan-retry", "starting");
 
-        planResult = await this.session.runAgent(taskRepoPath, "ralph-plan", plannerPrompt, {
-          repo: this.repo,
-          cacheKey,
-          runLogPath: planRetryRunLogPath,
-          introspection: {
+        planResult = await this.session.runAgent(
+          taskRepoPath,
+          "ralph-plan",
+          plannerPrompt,
+          this.withTaskContext(task, {
             repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 1,
-            stepTitle: "plan (retry)",
-          },
-          ...this.buildWatchdogOptions(task, "plan-retry"),
-          ...opencodeSessionOptions,
-        });
+            cacheKey,
+            runLogPath: planRetryRunLogPath,
+            introspection: {
+              repo: this.repo,
+              issue: task.issue,
+              taskName: task.name,
+              step: 1,
+              stepTitle: "plan (retry)",
+            },
+            ...this.buildWatchdogOptions(task, "plan-retry"),
+            ...opencodeSessionOptions,
+          })
+        );
       }
 
       const pausedAfterPlanRetry = await this.pauseIfHardThrottled(task, "plan (post retry)", planResult.sessionId);
@@ -5163,20 +5258,25 @@ ${guidance}`
 
         const devexRunLogPath = await this.recordRunLogPath(task, issueNumber, "consult devex", "in-progress");
 
-        const devexResult = await this.session.continueSession(taskRepoPath, baseSessionId, devexPrompt, {
-          agent: "devex",
-          repo: this.repo,
-          cacheKey,
-          runLogPath: devexRunLogPath,
-          introspection: {
+        const devexResult = await this.session.continueSession(
+          taskRepoPath,
+          baseSessionId,
+          devexPrompt,
+          this.withTaskContext(task, {
+            agent: "devex",
             repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 2,
-            stepTitle: "consult devex",
-          },
-          ...opencodeSessionOptions,
-        });
+            cacheKey,
+            runLogPath: devexRunLogPath,
+            introspection: {
+              repo: this.repo,
+              issue: task.issue,
+              taskName: task.name,
+              step: 2,
+              stepTitle: "consult devex",
+            },
+            ...opencodeSessionOptions,
+          })
+        );
 
         const pausedAfterDevexConsult = await this.pauseIfHardThrottled(
           task,
@@ -5219,19 +5319,24 @@ ${guidance}`
 
           const rerouteRunLogPath = await this.recordRunLogPath(task, issueNumber, "reroute after devex", "in-progress");
 
-          const rerouteResult = await this.session.continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
-            repo: this.repo,
-            cacheKey,
-            runLogPath: rerouteRunLogPath,
-            introspection: {
+          const rerouteResult = await this.session.continueSession(
+            taskRepoPath,
+            baseSessionId,
+            reroutePrompt,
+            this.withTaskContext(task, {
               repo: this.repo,
-              issue: task.issue,
-              taskName: task.name,
-              step: 3,
-              stepTitle: "reroute after devex",
-            },
-            ...opencodeSessionOptions,
-          });
+              cacheKey,
+              runLogPath: rerouteRunLogPath,
+              introspection: {
+                repo: this.repo,
+                issue: task.issue,
+                taskName: task.name,
+                step: 3,
+                stepTitle: "reroute after devex",
+              },
+              ...opencodeSessionOptions,
+            })
+          );
 
           const pausedAfterReroute = await this.pauseIfHardThrottled(
             task,
@@ -5356,20 +5461,25 @@ ${guidance}`
 
       const buildRunLogPath = await this.recordRunLogPath(task, issueNumber, "build", "in-progress");
 
-      let buildResult = await this.session.continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: buildRunLogPath,
-        introspection: {
+      let buildResult = await this.session.continueSession(
+        taskRepoPath,
+        planResult.sessionId,
+        proceedMessage,
+        this.withTaskContext(task, {
           repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 4,
-          stepTitle: "build",
-        },
-        ...this.buildWatchdogOptions(task, "build"),
-        ...opencodeSessionOptions,
-      });
+          cacheKey,
+          runLogPath: buildRunLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 4,
+            stepTitle: "build",
+          },
+          ...this.buildWatchdogOptions(task, "build"),
+          ...opencodeSessionOptions,
+        })
+      );
 
       const pausedAfterBuild = await this.pauseIfHardThrottled(task, "build (post)", buildResult.sessionId || planResult.sessionId);
       if (pausedAfterBuild) return pausedAfterBuild;
@@ -5485,7 +5595,7 @@ ${guidance}`
             taskRepoPath,
             buildResult.sessionId,
             "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
-            {
+            this.withTaskContext(task, {
               repo: this.repo,
               cacheKey,
               runLogPath: buildLoopBreakRunLogPath,
@@ -5498,7 +5608,7 @@ ${guidance}`
               },
               ...this.buildWatchdogOptions(task, "build-loop-break"),
               ...opencodeSessionOptions,
-            }
+            })
           );
 
           const pausedBuildLoopBreakAfter = await this.pauseIfHardThrottled(task, "build loop-break (post)", buildResult.sessionId);
@@ -5550,21 +5660,26 @@ ${guidance}`
         const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
         const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue", "in-progress");
 
-        buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
-          repo: this.repo,
-          cacheKey,
-          runLogPath: buildContinueRunLogPath,
-          timeoutMs: 10 * 60_000,
-          introspection: {
+        buildResult = await this.session.continueSession(
+          taskRepoPath,
+          buildResult.sessionId,
+          nudge,
+          this.withTaskContext(task, {
             repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 4,
-            stepTitle: "build continue",
-          },
-          ...this.buildWatchdogOptions(task, "build-continue"),
-          ...opencodeSessionOptions,
-        });
+            cacheKey,
+            runLogPath: buildContinueRunLogPath,
+            timeoutMs: 10 * 60_000,
+            introspection: {
+              repo: this.repo,
+              issue: task.issue,
+              taskName: task.name,
+              step: 4,
+              stepTitle: "build continue",
+            },
+            ...this.buildWatchdogOptions(task, "build-continue"),
+            ...opencodeSessionOptions,
+          })
+        );
 
         const pausedBuildContinueAfter = await this.pauseIfHardThrottled(task, "build continue (post)", buildResult.sessionId);
         if (pausedBuildContinueAfter) return pausedBuildContinueAfter;
@@ -5693,20 +5808,26 @@ ${guidance}`
       const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
       const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
 
-      const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: surveyRunLogPath,
-        introspection: {
+      const surveyResult = await this.session.continueCommand(
+        surveyRepoPath,
+        buildResult.sessionId,
+        "survey",
+        [],
+        this.withTaskContext(task, {
           repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 6,
-          stepTitle: "survey",
-        },
-        ...this.buildWatchdogOptions(task, "survey"),
-        ...opencodeSessionOptions,
-      });
+          cacheKey,
+          runLogPath: surveyRunLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: task.issue,
+            taskName: task.name,
+            step: 6,
+            stepTitle: "survey",
+          },
+          ...this.buildWatchdogOptions(task, "survey"),
+          ...opencodeSessionOptions,
+        })
+      );
 
       const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "survey (post)", surveyResult.sessionId || buildResult.sessionId);
       if (pausedSurveyAfter) return pausedSurveyAfter;

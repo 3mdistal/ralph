@@ -21,6 +21,8 @@ export interface RepoConfig {
    */
   requiredChecks?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
+  concurrencySlots?: number;
+  /** Deprecated alias for concurrencySlots (default: 1) */
   maxWorkers?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
@@ -160,7 +162,7 @@ export interface RalphConfig {
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
-const DEFAULT_REPO_MAX_WORKERS = 1;
+const DEFAULT_REPO_CONCURRENCY_SLOTS = 1;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 
@@ -337,19 +339,42 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.queueBackend = "github";
   }
 
-  // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
+  // Validate per-repo concurrency slots + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
   loaded.repos = (loaded.repos ?? []).map((repo) => {
-    const mw = toPositiveIntOrNull((repo as any).maxWorkers);
+    const rawSlots = (repo as any).concurrencySlots;
+    const slots = toPositiveIntOrNull(rawSlots);
+    const rawMaxWorkers = (repo as any).maxWorkers;
+    const mw = toPositiveIntOrNull(rawMaxWorkers);
     const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
     const autoUpdateMin = toPositiveIntOrNull((repo as any).autoUpdateBehindMinMinutes);
     const updates: Partial<RepoConfig> = {};
 
-    if ((repo as any).maxWorkers !== undefined && !mw) {
-      console.warn(
-        `[ralph] Invalid config maxWorkers for repo ${repo.name}: ${JSON.stringify((repo as any).maxWorkers)}; ` +
-          `falling back to default ${DEFAULT_REPO_MAX_WORKERS}`
-      );
-      updates.maxWorkers = DEFAULT_REPO_MAX_WORKERS;
+    if (rawSlots !== undefined) {
+      if (!slots) {
+        console.warn(
+          `[ralph] Invalid config concurrencySlots for repo ${repo.name}: ${JSON.stringify(rawSlots)}; ` +
+            `falling back to default ${DEFAULT_REPO_CONCURRENCY_SLOTS}`
+        );
+        updates.concurrencySlots = DEFAULT_REPO_CONCURRENCY_SLOTS;
+      }
+      if (rawMaxWorkers !== undefined) {
+        console.warn(
+          `[ralph] Deprecated config maxWorkers for repo ${repo.name} is ignored in favor of concurrencySlots`
+        );
+      }
+    } else if (rawMaxWorkers !== undefined) {
+      if (!mw) {
+        console.warn(
+          `[ralph] Invalid config maxWorkers for repo ${repo.name}: ${JSON.stringify(rawMaxWorkers)}; ` +
+            `falling back to default ${DEFAULT_REPO_CONCURRENCY_SLOTS}`
+        );
+        updates.concurrencySlots = DEFAULT_REPO_CONCURRENCY_SLOTS;
+      } else {
+        console.warn(
+          `[ralph] Deprecated config maxWorkers for repo ${repo.name}; use concurrencySlots instead`
+        );
+        updates.concurrencySlots = mw;
+      }
     }
 
     if ((repo as any).rollupBatchSize !== undefined && !rollupBatch) {
@@ -1031,8 +1056,10 @@ export function getGlobalMaxWorkers(): number {
 export function getRepoMaxWorkers(repoName: string): number {
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
+  const slots = toPositiveIntOrNull(explicit?.concurrencySlots);
+  if (slots) return slots;
   const maxWorkers = toPositiveIntOrNull(explicit?.maxWorkers);
-  return maxWorkers ?? DEFAULT_REPO_MAX_WORKERS;
+  return maxWorkers ?? DEFAULT_REPO_CONCURRENCY_SLOTS;
 }
 
 export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {
