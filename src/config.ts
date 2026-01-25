@@ -20,6 +20,11 @@ export interface RepoConfig {
    * falling back to the repo default branch. Missing/unreadable protection disables gating.
    */
   requiredChecks?: string[];
+  /**
+   * Optional per-repo setup commands run in the task worktree before any agent execution.
+   * Commands are operator-owned and defined in ~/.ralph/config.toml|json.
+   */
+  setup?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
@@ -1022,6 +1027,21 @@ export function getRepoRequiredChecksOverride(repoName: string): string[] | null
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   return toStringArrayOrNull(explicit?.requiredChecks);
+}
+
+export function getRepoSetupCommands(repoName: string): string[] | null {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  if (!explicit || (explicit as any).setup === undefined) return null;
+
+  const parsed = toStringArrayOrNull((explicit as any).setup);
+  if (parsed === null) {
+    console.warn(
+      `[ralph] Invalid config setup for repo ${repoName}: ${JSON.stringify((explicit as any).setup)}; ignoring.`
+    );
+    return null;
+  }
+  return parsed;
 }
 
 export function getGlobalMaxWorkers(): number {

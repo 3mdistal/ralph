@@ -25,6 +25,7 @@ import {
   getRepoBotBranch,
   getRepoMaxWorkers,
   getRepoRequiredChecksOverride,
+  getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
   getConfig,
@@ -46,6 +47,7 @@ import { buildPlannerPrompt } from "./planner-prompt";
 import { getThrottleDecision } from "./throttle";
 import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
 import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
+import { ensureWorktreeSetup, type SetupFailure } from "./worktree-setup";
 import { LogLimiter } from "./logging";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
@@ -806,6 +808,106 @@ export class RepoWorker {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
     }
     return runLogPath;
+  }
+
+  private formatSetupFailureReason(failure: SetupFailure): string {
+    const lines: string[] = [];
+    if (failure.command) {
+      lines.push(`Setup command failed (${failure.commandIndex}/${failure.totalCommands}).`);
+      lines.push(`Command: ${failure.command}`);
+      const exitInfo = [
+        `Exit code: ${failure.exitCode ?? "null"}`,
+        failure.signal ? `Signal: ${failure.signal}` : "",
+        failure.timedOut ? "Timed out: true" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+      if (exitInfo) lines.push(exitInfo);
+    } else if (failure.reason) {
+      lines.push(failure.reason);
+    }
+    if (failure.outputTail) {
+      lines.push("Output tail:");
+      lines.push(failure.outputTail);
+    }
+    return lines.join("\n").trim() || "Setup failed.";
+  }
+
+  private async escalateSetupFailure(task: AgentTask, reason: string, sessionId?: string): Promise<AgentRun> {
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated");
+    if (escalated) {
+      applyTaskPatch(task, "escalated", {});
+    }
+
+    await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      sessionId: (sessionId ?? task["session-id"]?.trim()) || undefined,
+      reason,
+      escalationType: "other",
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, { reason, sessionId, details: reason });
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId,
+      escalationReason: reason,
+    };
+  }
+
+  private async ensureSetupForTask(params: {
+    task: AgentTask;
+    issueNumber: string;
+    taskRepoPath: string;
+    status: AgentTask["status"];
+    sessionId?: string;
+  }): Promise<AgentRun | null> {
+    const setupCommands = getRepoSetupCommands(this.repo);
+    if (!setupCommands || setupCommands.length === 0) return null;
+
+    const setupRunLogPath = await this.recordRunLogPath(params.task, params.issueNumber, "setup", params.status);
+    const result = await ensureWorktreeSetup({
+      worktreePath: params.taskRepoPath,
+      commands: setupCommands,
+      runLogPath: setupRunLogPath,
+    });
+
+    if (result.ok) {
+      if (result.skipped) {
+        console.log(`[ralph:worker:${this.repo}] Setup skipped: ${result.skipReason ?? "no reason"}`);
+      } else {
+        console.log(`[ralph:worker:${this.repo}] Setup completed successfully.`);
+      }
+      return null;
+    }
+
+    const failure = result.failure ?? {
+      command: "",
+      commandIndex: 0,
+      totalCommands: setupCommands.length,
+      exitCode: null,
+      signal: null,
+      timedOut: false,
+      durationMs: 0,
+      outputTail: "",
+      reason: "Setup failed.",
+    };
+
+    const reason = this.formatSetupFailureReason(failure);
+    console.warn(`[ralph:worker:${this.repo}] Setup failed; escalating: ${reason}`);
+    return await this.escalateSetupFailure(params.task, reason, params.sessionId);
   }
 
   private createContextRecoveryAdapter(base: SessionAdapter): SessionAdapter {
@@ -4480,6 +4582,18 @@ ${guidance}`
         await this.queue.updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
       }
 
+      const pausedSetup = await this.pauseIfHardThrottled(task, "setup (resume)", existingSessionId);
+      if (pausedSetup) return pausedSetup;
+
+      const setupRun = await this.ensureSetupForTask({
+        task,
+        issueNumber: issueNumber || cacheKey,
+        taskRepoPath,
+        status: "in-progress",
+        sessionId: existingSessionId,
+      });
+      if (setupRun) return setupRun;
+
       const botBranch = getRepoBotBranch(this.repo);
       const issueMeta = await this.getIssueMetadata(task.issue);
 
@@ -5031,6 +5145,17 @@ ${guidance}`
       );
 
       await this.assertRepoRootClean(task, "start");
+
+      const pausedSetup = await this.pauseIfHardThrottled(task, "setup");
+      if (pausedSetup) return pausedSetup;
+
+      const setupRun = await this.ensureSetupForTask({
+        task,
+        issueNumber,
+        taskRepoPath,
+        status: "starting",
+      });
+      if (setupRun) return setupRun;
 
       const botBranch = getRepoBotBranch(this.repo);
       const mergeConflictRun = await this.maybeHandleQueuedMergeConflict({
