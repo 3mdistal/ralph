@@ -272,7 +272,7 @@ export async function getRemoteOpenaiUsage(opts: {
   const autoRefresh = opts.autoRefresh !== false;
 
   const ttlMs =
-    typeof opts.cacheTtlMs === "number" && Number.isFinite(opts.cacheTtlMs) ? Math.max(0, Math.floor(opts.cacheTtlMs)) : 30_000;
+    typeof opts.cacheTtlMs === "number" && Number.isFinite(opts.cacheTtlMs) ? Math.max(0, Math.floor(opts.cacheTtlMs)) : 120_000;
 
   if (!skipCache) {
     const cached = cache.get(opts.authFilePath);

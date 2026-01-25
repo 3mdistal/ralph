@@ -96,6 +96,8 @@ const DEFAULT_HARD_PCT = 0.75;
 
 const DEFAULT_MIN_CHECK_INTERVAL_MS = 15_000;
 
+const DEFAULT_REMOTE_USAGE_CACHE_TTL_MS = 120_000;
+
 type ThrottleCacheEntry = { lastCheckedAt: number; lastDecision: ThrottleDecision | null };
 const decisionCache = new Map<string, ThrottleCacheEntry>();
 
@@ -637,7 +639,7 @@ export async function getThrottleDecision(
       remoteUsage = await getRemoteOpenaiUsage({
         authFilePath,
         now,
-        cacheTtlMs: minCheckIntervalMs,
+        cacheTtlMs: Math.max(minCheckIntervalMs, DEFAULT_REMOTE_USAGE_CACHE_TTL_MS),
         autoRefresh: true,
         skipCache: false,
       });
