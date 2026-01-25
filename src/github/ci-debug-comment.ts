@@ -53,12 +53,12 @@ function buildMarkerId(params: { repo: string; issueNumber: number }): string {
   return `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
 }
 
-export function buildCiDebugMarker(params: { repo: string; issueNumber: number }): { markerId: string; marker: string } {
+function buildCiDebugMarker(params: { repo: string; issueNumber: number }): { markerId: string; marker: string } {
   const markerId = buildMarkerId(params);
   return { markerId, marker: `<!-- ralph-ci-debug:id=${markerId} -->` };
 }
 
-export function serializeCiDebugState(state: CiDebugCommentState): string {
+function serializeCiDebugState(state: CiDebugCommentState): string {
   return JSON.stringify(state);
 }
 
