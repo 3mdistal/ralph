@@ -6,6 +6,7 @@ import { join } from "path";
 import { getConfig, resolveOpencodeProfile } from "./config";
 import { shouldLog } from "./logging";
 import { extractProviderId, extractRole } from "./opencode-message-utils";
+import { getRemoteOpenaiUsage, type RemoteOpenaiUsage } from "./openai-remote-usage";
 
 export type ThrottleState = "ok" | "soft" | "hard";
 
@@ -41,6 +42,13 @@ export interface ThrottleWindowSnapshot {
 export interface ThrottleSnapshot {
   computedAt: string;
   providerID: string;
+
+  /** OpenAI throttle source (best-effort). */
+  openaiSource?: "localLogs" | "remoteUsage";
+
+  /** Remote usage meters when available (best-effort). */
+  remoteUsage?: RemoteOpenaiUsage;
+  remoteUsageError?: string | null;
 
   /** Best-effort, config-selected profile name (for debugging). */
   opencodeProfile?: string | null;
@@ -90,6 +98,12 @@ const DEFAULT_MIN_CHECK_INTERVAL_MS = 15_000;
 
 type ThrottleCacheEntry = { lastCheckedAt: number; lastDecision: ThrottleDecision | null };
 const decisionCache = new Map<string, ThrottleCacheEntry>();
+
+function safeErrorMessage(err: unknown): string {
+  if (!err) return "unknown error";
+  if (err instanceof Error) return err.message || err.toString();
+  return String(err);
+}
 
 function num(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -546,6 +560,9 @@ export async function getThrottleDecision(
 ): Promise<ThrottleDecision> {
   const cfg = getConfig().throttle;
 
+  const openaiSource: "localLogs" | "remoteUsage" =
+    cfg?.openaiSource === "remoteUsage" || cfg?.openaiSource === "localLogs" ? cfg.openaiSource : "remoteUsage";
+
   const { effectiveProfile, xdgDataHome, messagesRootDir } = resolveOpencodeMessagesRootDir(opts?.opencodeProfile);
   const perProfileCfg = effectiveProfile ? cfg?.perProfile?.[effectiveProfile] : undefined;
 
@@ -600,6 +617,7 @@ export async function getThrottleDecision(
 
   const cacheKey =
     `${providerID}|${messagesRootDir}|` +
+    `openaiSource=${openaiSource}|auth=${join(xdgDataHome, "opencode", "auth.json")}|` +
     `b5h=${budget5hTokens}|bw=${budgetWeeklyTokens}|soft=${softPct}|hard=${hardPct}|enabled=${enabled}`;
 
   const cached = decisionCache.get(cacheKey);
@@ -607,10 +625,31 @@ export async function getThrottleDecision(
 
   const prevState: ThrottleState = cached?.lastDecision?.state ?? "ok";
 
+  const authFilePath = join(xdgDataHome, "opencode", "auth.json");
+  const authFileExists = existsSync(authFilePath);
+
+  const tryRemote = enabled && providerID === "openai" && openaiSource === "remoteUsage";
+  let remoteUsage: RemoteOpenaiUsage | null = null;
+  let remoteUsageError: string | null = null;
+
+  if (tryRemote) {
+    try {
+      remoteUsage = await getRemoteOpenaiUsage({
+        authFilePath,
+        now,
+        cacheTtlMs: minCheckIntervalMs,
+        autoRefresh: true,
+        skipCache: false,
+      });
+    } catch (e) {
+      remoteUsageError = safeErrorMessage(e);
+    }
+  }
+
   const weeklyLookbackMs = weeklyBoundaries ? Math.max(0, now - weeklyBoundaries.lastResetTs) : ROLLING_WEEKLY_MS;
   const maxWindowMs = Math.max(ROLLING_5H_MS, ROLLING_WEEKLY_MS, weeklyLookbackMs) + 2 * 60 * 60 * 1000;
   const usage =
-    enabled
+    enabled && !remoteUsage
       ? await scanOpencodeUsageEvents(now, providerID, messagesRootDir, maxWindowMs)
       : {
           events: [],
@@ -626,71 +665,110 @@ export async function getThrottleDecision(
   const events = usage.events;
 
   // First compute hard/soft separately so the snapshot includes both caps.
-  const hardRolling5h = computeWindowSnapshot({
-    now,
-    events,
-    name: "rolling5h",
-    windowMs: ROLLING_5H_MS,
-    budgetTokens: budget5hTokens,
-    softPct,
-    hardPct,
-    threshold: "hard",
-  });
+  const remoteWindow = (
+    name: "rolling5h" | "weekly",
+    usedPct: number,
+    resetAtTs: number | null,
+    threshold: "soft" | "hard"
+  ): ThrottleWindowSnapshot => {
+    const windowMs = name === "rolling5h" ? ROLLING_5H_MS : ROLLING_WEEKLY_MS;
+    const cap = threshold === "hard" ? hardPct : softPct;
+    const throttled = usedPct >= cap;
 
-  const softRolling5h = computeWindowSnapshot({
-    now,
-    events,
-    name: "rolling5h",
-    windowMs: ROLLING_5H_MS,
-    budgetTokens: budget5hTokens,
-    softPct,
-    hardPct,
-    threshold: "soft",
-  });
+    const windowEndTs = resetAtTs;
+    const windowStartTs = resetAtTs != null ? resetAtTs - windowMs : null;
+    const resumeAtTs = throttled ? resetAtTs : null;
 
-  const hardWeekly = weeklySchedule && weeklyBoundaries
-    ? computeFixedWeeklySnapshot({
-        now,
-        events,
-        budgetTokens: budgetWeeklyTokens,
-        softPct,
-        hardPct,
-        threshold: "hard",
-        schedule: weeklySchedule,
-        boundaries: weeklyBoundaries,
-      })
+    return {
+      name,
+      windowMs,
+      windowStartTs,
+      windowEndTs,
+      // Percent-based accounting: treat budget as 1.0 and used as usedPct.
+      budgetTokens: 1,
+      softCapTokens: softPct,
+      hardCapTokens: hardPct,
+      usedTokens: usedPct,
+      usedPct,
+      oldestTsInWindow: null,
+      resumeAtTs,
+      ...(name === "weekly" ? { weeklyNextResetTs: resetAtTs } : {}),
+    };
+  };
+
+  const hardRolling5h = remoteUsage
+    ? remoteWindow("rolling5h", remoteUsage.rolling5h.usedPct, remoteUsage.rolling5h.resetAtTs, "hard")
     : computeWindowSnapshot({
         now,
         events,
-        name: "weekly",
-        windowMs: ROLLING_WEEKLY_MS,
-        budgetTokens: budgetWeeklyTokens,
+        name: "rolling5h",
+        windowMs: ROLLING_5H_MS,
+        budgetTokens: budget5hTokens,
         softPct,
         hardPct,
         threshold: "hard",
       });
 
-  const softWeekly = weeklySchedule && weeklyBoundaries
-    ? computeFixedWeeklySnapshot({
-        now,
-        events,
-        budgetTokens: budgetWeeklyTokens,
-        softPct,
-        hardPct,
-        threshold: "soft",
-        schedule: weeklySchedule,
-        boundaries: weeklyBoundaries,
-      })
+  const softRolling5h = remoteUsage
+    ? remoteWindow("rolling5h", remoteUsage.rolling5h.usedPct, remoteUsage.rolling5h.resetAtTs, "soft")
     : computeWindowSnapshot({
         now,
         events,
-        name: "weekly",
-        windowMs: ROLLING_WEEKLY_MS,
-        budgetTokens: budgetWeeklyTokens,
+        name: "rolling5h",
+        windowMs: ROLLING_5H_MS,
+        budgetTokens: budget5hTokens,
         softPct,
         hardPct,
         threshold: "soft",
       });
+
+  const hardWeekly = remoteUsage
+    ? remoteWindow("weekly", remoteUsage.weekly.usedPct, remoteUsage.weekly.resetAtTs, "hard")
+    : weeklySchedule && weeklyBoundaries
+      ? computeFixedWeeklySnapshot({
+          now,
+          events,
+          budgetTokens: budgetWeeklyTokens,
+          softPct,
+          hardPct,
+          threshold: "hard",
+          schedule: weeklySchedule,
+          boundaries: weeklyBoundaries,
+        })
+      : computeWindowSnapshot({
+          now,
+          events,
+          name: "weekly",
+          windowMs: ROLLING_WEEKLY_MS,
+          budgetTokens: budgetWeeklyTokens,
+          softPct,
+          hardPct,
+          threshold: "hard",
+        });
+
+  const softWeekly = remoteUsage
+    ? remoteWindow("weekly", remoteUsage.weekly.usedPct, remoteUsage.weekly.resetAtTs, "soft")
+    : weeklySchedule && weeklyBoundaries
+      ? computeFixedWeeklySnapshot({
+          now,
+          events,
+          budgetTokens: budgetWeeklyTokens,
+          softPct,
+          hardPct,
+          threshold: "soft",
+          schedule: weeklySchedule,
+          boundaries: weeklyBoundaries,
+        })
+      : computeWindowSnapshot({
+          now,
+          events,
+          name: "weekly",
+          windowMs: ROLLING_WEEKLY_MS,
+          budgetTokens: budgetWeeklyTokens,
+          softPct,
+          hardPct,
+          threshold: "soft",
+        });
 
   const hardWindows = [hardRolling5h, hardWeekly];
   const softWindows = [softRolling5h, softWeekly];
@@ -723,14 +801,14 @@ export async function getThrottleDecision(
     };
   });
 
-  const authFilePath = join(xdgDataHome, "opencode", "auth.json");
-  const authFileExists = existsSync(authFilePath);
-
   const newestMessageAt = usage.stats.newestMessageTs != null ? new Date(usage.stats.newestMessageTs).toISOString() : null;
 
   const snapshot: ThrottleSnapshot = {
     computedAt: new Date(now).toISOString(),
     providerID,
+    openaiSource: providerID === "openai" ? openaiSource : undefined,
+    remoteUsage: remoteUsage ?? undefined,
+    remoteUsageError,
     opencodeProfile: effectiveProfile,
     xdgDataHome,
     messagesRootDir,
