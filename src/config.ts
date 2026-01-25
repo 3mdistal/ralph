@@ -131,6 +131,8 @@ export interface RalphConfig {
   maxWorkers: number;
   batchSize: number;       // PRs before rollup (default: 10)
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
+  /** ms between done reconciliation checks (default: 300000) */
+  doneReconcileIntervalMs: number;
   /** Ownership TTL in ms for task heartbeats (default: 60000). */
   ownershipTtlMs: number;
   /** Queue backend selection (default: "github"). */
@@ -162,6 +164,7 @@ export interface RalphConfig {
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
+const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
@@ -236,6 +239,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   maxWorkers: DEFAULT_GLOBAL_MAX_WORKERS,
   batchSize: 10,
   pollInterval: 30000,
+  doneReconcileIntervalMs: DEFAULT_DONE_RECONCILE_INTERVAL_MS,
   ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
   queueBackend: "github",
   bwrbVault: detectDefaultBwrbVault(),
@@ -321,6 +325,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       );
     }
     loaded.ownershipTtlMs = DEFAULT_OWNERSHIP_TTL_MS;
+  }
+
+  const doneInterval = toPositiveIntOrNull((loaded as any).doneReconcileIntervalMs);
+  if (!doneInterval) {
+    const raw = (loaded as any).doneReconcileIntervalMs;
+    if (raw !== undefined) {
+      console.warn(
+        `[ralph] Invalid config doneReconcileIntervalMs=${JSON.stringify(raw)}; falling back to default ${DEFAULT_DONE_RECONCILE_INTERVAL_MS}`
+      );
+    }
+    loaded.doneReconcileIntervalMs = DEFAULT_DONE_RECONCILE_INTERVAL_MS;
   }
 
   const rawQueueBackend = (loaded as any).queueBackend;
