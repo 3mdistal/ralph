@@ -104,6 +104,7 @@ Add a throttle config section to Ralph:
 
 - `throttle.enabled`
 - `throttle.providerID` (default `openai`)
+- `throttle.openaiSource` (`localLogs` | `remoteUsage`, default `remoteUsage`; OpenAI-only)
 - `throttle.windows.rolling5h.budgetTokens` (default 16,987,015)
 - `throttle.windows.weekly.budgetTokens` (default 55,769,305)
 - `throttle.softPct` (default 0.65)
@@ -130,6 +131,7 @@ Add a throttle config section to Ralph:
 5) Add observability
 - Log a structured snapshot when entering/leaving throttled state.
 - Add a small summary line in `queue.json` / run logs so it’s obvious why work stopped.
+- Add a CLI view of the current meters: `ralph usage` (table) and `ralph usage --json`.
 
 6) Add a `calibrate` helper (optional but valuable)
 - A CLI command that takes two timestamped dashboard snapshots (5h/week % + reset times) and computes budgets automatically from OpenCode logs.
