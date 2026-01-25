@@ -15,13 +15,17 @@ const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
 };
 
 const RALPH_LABEL_DONE = "ralph:done";
+const RALPH_LABEL_STUCK = "ralph:stuck";
 const KNOWN_RALPH_LABELS = Array.from(
-  new Set([...Object.values(RALPH_STATUS_LABELS).filter(Boolean), RALPH_LABEL_DONE])
+  new Set([...Object.values(RALPH_STATUS_LABELS).filter(Boolean), RALPH_LABEL_DONE, RALPH_LABEL_STUCK])
 ) as string[];
 const RALPH_LABEL_QUEUED = RALPH_STATUS_LABELS.queued ?? "ralph:queued";
 // Preserve queued intent while blocked; claimability is determined at the queue layer.
 const PRESERVE_LABELS_BY_STATUS: Partial<Record<QueueTaskStatus, readonly string[]>> = {
-  blocked: [RALPH_LABEL_QUEUED],
+  blocked: [RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK],
+  queued: [RALPH_LABEL_STUCK],
+  "in-progress": [RALPH_LABEL_STUCK],
+  starting: [RALPH_LABEL_STUCK],
 };
 
 export function deriveRalphStatus(labels: string[], issueState?: string | null): QueueTaskStatus | null {

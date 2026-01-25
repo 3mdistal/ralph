@@ -102,6 +102,16 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:blocked"], remove: [] });
   });
 
+  test("statusToRalphLabelDelta preserves stuck when queued", () => {
+    const delta = statusToRalphLabelDelta("queued", ["ralph:queued", "ralph:stuck"]);
+    expect(delta).toEqual({ add: [], remove: [] });
+  });
+
+  test("statusToRalphLabelDelta preserves stuck when in-progress", () => {
+    const delta = statusToRalphLabelDelta("in-progress", ["ralph:in-progress", "ralph:stuck"]);
+    expect(delta).toEqual({ add: [], remove: [] });
+  });
+
   test("statusToRalphLabelDelta removes other status labels when blocked", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:queued", "ralph:in-progress"]);
     expect(delta).toEqual({ add: ["ralph:blocked"], remove: ["ralph:in-progress"] });
@@ -115,6 +125,11 @@ describe("github queue core", () => {
   test("statusToRalphLabelDelta still removes queued when escalated", () => {
     const delta = statusToRalphLabelDelta("escalated", ["ralph:queued"]);
     expect(delta).toEqual({ add: ["ralph:escalated"], remove: ["ralph:queued"] });
+  });
+
+  test("statusToRalphLabelDelta removes stuck when escalated", () => {
+    const delta = statusToRalphLabelDelta("escalated", ["ralph:queued", "ralph:stuck"]);
+    expect(delta).toEqual({ add: ["ralph:escalated"], remove: ["ralph:queued", "ralph:stuck"] });
   });
 
   test("planClaim requires queued label", () => {

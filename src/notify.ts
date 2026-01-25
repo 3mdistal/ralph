@@ -199,6 +199,8 @@ export interface EscalationContext {
   taskPath: string;
   issue: string;
   repo: string;
+  /** GitHub escalation comment URL (if available) */
+  commentUrl?: string;
   /** The original task scope (if known) */
   scope?: string;
   /** The original task priority (if known) */
@@ -373,6 +375,7 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     `| Field | Value |`,
     `|-------|-------|`,
     `| Issue | ${ctx.issue} |`,
+    ctx.commentUrl ? `| GitHub Comment | ${ctx.commentUrl} |` : "",
     `| Repo | ${ctx.repo} |`,
     `| Type | ${ctx.escalationType} |`,
     `| Reason | ${ctx.reason} |`,

@@ -98,7 +98,7 @@ describe("github escalation writeback", () => {
         }
         if (path.includes("/comments") && opts.method === "POST") {
           postedBodies.push(opts.body?.body ?? "");
-          return { data: {} };
+          return { data: { html_url: "https://github.com/3mdistal/ralph/issues/66#issuecomment-1" } };
         }
         return { data: {} };
       },
@@ -123,10 +123,12 @@ describe("github escalation writeback", () => {
         deleteIdempotencyKey: (key) => {
           keys.delete(key);
         },
+        getIdempotencyPayload: () => null,
       }
     );
 
     expect(result.postedComment).toBe(true);
+    expect(result.commentUrl).toBe("https://github.com/3mdistal/ralph/issues/66#issuecomment-1");
     expect(keys.has(plan.idempotencyKey)).toBe(true);
     expect(postedBodies.length).toBe(1);
     expect(postedBodies[0]).toContain(plan.marker);
@@ -154,7 +156,7 @@ describe("github escalation writeback", () => {
                 repository: {
                   issue: {
                     comments: {
-                      nodes: [{ body: `prior\n${plan.marker}` }],
+                      nodes: [{ body: `prior\n${plan.marker}`, url: "https://github.com/3mdistal/ralph/issues/66#issuecomment-2" }],
                       pageInfo: { hasPreviousPage: false },
                     },
                   },
@@ -190,11 +192,13 @@ describe("github escalation writeback", () => {
         deleteIdempotencyKey: (key) => {
           keys.delete(key);
         },
+        getIdempotencyPayload: () => null,
       }
     );
 
     expect(result.postedComment).toBe(false);
     expect(result.markerFound).toBe(true);
+    expect(result.commentUrl).toBe("https://github.com/3mdistal/ralph/issues/66#issuecomment-2");
     expect(postedBodies.length).toBe(0);
     expect(keys.has(plan.idempotencyKey)).toBe(true);
   });

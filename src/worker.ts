@@ -66,6 +66,7 @@ import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelI
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
+import { writeWatchdogStuckToGitHub } from "./github/watchdog-stuck-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
@@ -91,6 +92,8 @@ import {
   type PrState,
 } from "./state";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
+import { buildWatchdogSignature, shouldEarlyTerminateWatchdog } from "./watchdog-policy";
+import { getWatchdogSignatureRecord, upsertWatchdogSignatureRecord } from "./watchdog-state";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -1332,11 +1335,11 @@ export class RepoWorker {
   private async writeEscalationWriteback(
     task: AgentTask,
     params: { reason: string; escalationType: EscalationContext["escalationType"] }
-  ): Promise<void> {
+  ): Promise<string | null> {
     const escalationIssueRef = parseIssueRef(task.issue, task.repo);
     if (!escalationIssueRef) {
       console.warn(`[ralph:worker:${this.repo}] Cannot parse issue ref for escalation writeback: ${task.issue}`);
-      return;
+      return null;
     }
 
     try {
@@ -1350,7 +1353,7 @@ export class RepoWorker {
     }
 
     try {
-      await writeEscalationToGitHub(
+      const result = await writeEscalationToGitHub(
         {
           repo: escalationIssueRef.repo,
           issueNumber: escalationIssueRef.number,
@@ -1364,10 +1367,66 @@ export class RepoWorker {
           log: (message) => console.log(message),
         }
       );
+      return result.commentUrl ?? null;
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Escalation writeback failed for ${task.issue}: ${error?.message ?? String(error)}`
       );
+    }
+    return null;
+  }
+
+  private async writeWatchdogStuckWriteback(params: {
+    task: AgentTask;
+    stage: string;
+    result: SessionResult;
+    retryIndex: number;
+    signatureHash: string;
+    worktreePath?: string | null;
+  }): Promise<{ commentUrl: string | null; failed: boolean }> {
+    const issueRef = parseIssueRef(params.task.issue, params.task.repo);
+    if (!issueRef) {
+      console.warn(`[ralph:worker:${this.repo}] Cannot parse issue ref for watchdog writeback: ${params.task.issue}`);
+      return { commentUrl: null, failed: true };
+    }
+
+    try {
+      await this.ensureRalphWorkflowLabelsOnce();
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to ensure ralph workflow labels before watchdog writeback: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+
+    try {
+      const sessionId = params.result.sessionId || params.task["session-id"]?.trim() || undefined;
+      const worktreePath = params.worktreePath ?? params.task["worktree-path"]?.trim();
+      const result = await writeWatchdogStuckToGitHub(
+        {
+          repo: issueRef.repo,
+          issueNumber: issueRef.number,
+          taskName: params.task.name,
+          taskPath: params.task._path ?? params.task.name,
+          stage: params.stage,
+          retryIndex: params.retryIndex,
+          signatureHash: params.signatureHash,
+          sessionId,
+          worktreePath: worktreePath || undefined,
+          timeout: params.result.watchdogTimeout,
+        },
+        {
+          github: this.github,
+          log: (message) => console.log(message),
+        }
+      );
+      return { commentUrl: result.commentUrl ?? null, failed: false };
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Watchdog writeback failed for ${params.task.issue}: ${error?.message ?? String(error)}`
+      );
+      return { commentUrl: null, failed: true };
     }
   }
 
@@ -4307,11 +4366,26 @@ ${guidance}`
   ): Promise<AgentRun> {
     const timeout = result.watchdogTimeout;
     const retryCount = this.getWatchdogRetryCount(task);
+    const issueRef = parseIssueRef(task.issue, task.repo);
+    const currentSignature = buildWatchdogSignature({ stage, timeout });
+    const priorRecord = issueRef
+      ? getWatchdogSignatureRecord({ repo: issueRef.repo, issueNumber: issueRef.number, stage })
+      : null;
+    const priorSignature = priorRecord?.signatureHash ?? "";
+    const earlyTermination = shouldEarlyTerminateWatchdog({
+      retryCount,
+      currentSignature,
+      priorSignature,
+      sessionId: result.sessionId || null,
+      priorSessionId: priorRecord?.sessionId ?? null,
+      timeout,
+    });
     const nextRetryCount = retryCount + 1;
 
-    const reason = timeout
+    const reasonBase = timeout
       ? `Tool call timed out: ${timeout.toolName} ${timeout.callId} after ${Math.round(timeout.elapsedMs / 1000)}s (${stage})`
       : `Tool call timed out (${stage})`;
+    const reason = earlyTermination ? `${reasonBase} (repeat watchdog pattern; skipping retry)` : reasonBase;
 
     // Cleanup per-task OpenCode cache on watchdog timeouts (best-effort)
     try {
@@ -4320,8 +4394,38 @@ ${guidance}`
       // ignore
     }
 
-    if (retryCount === 0) {
+    if (retryCount === 0 && !earlyTermination) {
       console.warn(`[ralph:worker:${this.repo}] Watchdog hard timeout; re-queuing once for recovery: ${reason}`);
+      const stuckWriteback = await this.writeWatchdogStuckWriteback({
+        task,
+        stage,
+        result,
+        retryIndex: retryCount,
+        signatureHash: currentSignature,
+        worktreePath: task["worktree-path"]?.trim() || undefined,
+      });
+      if (stuckWriteback.failed) {
+        await this.notify.notifyError(
+          `Watchdog timeout (${stage}) for ${task.name}`,
+          sanitizeEscalationReason(reason),
+          task.name
+        );
+      }
+
+      if (issueRef && currentSignature) {
+        upsertWatchdogSignatureRecord({
+          repo: issueRef.repo,
+          issueNumber: issueRef.number,
+          stage,
+          record: {
+            signatureHash: currentSignature,
+            retryIndex: retryCount,
+            sessionId: result.sessionId || undefined,
+            stuckCommentUrl: stuckWriteback.commentUrl ?? priorRecord?.stuckCommentUrl ?? null,
+            updatedAt: new Date().toISOString(),
+          },
+        });
+      }
       await this.queue.updateTaskStatus(task, "queued", {
         "session-id": "",
         "watchdog-retries": String(nextRetryCount),
@@ -4349,7 +4453,21 @@ ${guidance}`
       applyTaskPatch(task, "escalated", escalationFields);
     }
 
-    await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+    const commentUrl = await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+    if (issueRef && currentSignature) {
+      upsertWatchdogSignatureRecord({
+        repo: issueRef.repo,
+        issueNumber: issueRef.number,
+        stage,
+        record: {
+          signatureHash: currentSignature,
+          retryIndex: retryCount,
+          sessionId: result.sessionId || undefined,
+          stuckCommentUrl: priorRecord?.stuckCommentUrl ?? null,
+          updatedAt: new Date().toISOString(),
+        },
+      });
+    }
     await this.notify.notifyEscalation({
       taskName: task.name,
       taskFileName: task._name,
@@ -4361,6 +4479,7 @@ ${guidance}`
       sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
       reason,
       escalationType: "other",
+      ...(commentUrl ? { commentUrl } : {}),
       planOutput: result.output,
     });
 
@@ -4613,7 +4732,7 @@ ${guidance}`
             if (escalated) {
               applyTaskPatch(task, "escalated", {});
             }
-            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+            const commentUrl = await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -4623,6 +4742,7 @@ ${guidance}`
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
+              ...(commentUrl ? { commentUrl } : {}),
               planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
@@ -4799,7 +4919,7 @@ ${guidance}`
         if (escalated) {
           applyTaskPatch(task, "escalated", {});
         }
-        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+        const commentUrl = await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
@@ -4809,6 +4929,7 @@ ${guidance}`
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
+          ...(commentUrl ? { commentUrl } : {}),
           planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
         });
 
@@ -5287,7 +5408,7 @@ ${guidance}`
         if (escalated) {
           applyTaskPatch(task, "escalated", {});
         }
-        await this.writeEscalationWriteback(task, { reason, escalationType });
+        const commentUrl = await this.writeEscalationWriteback(task, { reason, escalationType });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
@@ -5297,6 +5418,7 @@ ${guidance}`
           sessionId: planResult.sessionId,
           reason,
           escalationType,
+          ...(commentUrl ? { commentUrl } : {}),
           planOutput: planResult.output,
           routing: routing
             ? {
@@ -5438,7 +5560,7 @@ ${guidance}`
             if (escalated) {
               applyTaskPatch(task, "escalated", {});
             }
-            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+            const commentUrl = await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -5448,6 +5570,7 @@ ${guidance}`
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
               escalationType: "other",
+              ...(commentUrl ? { commentUrl } : {}),
               planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
@@ -5618,7 +5741,7 @@ ${guidance}`
         if (escalated) {
           applyTaskPatch(task, "escalated", {});
         }
-        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+        const commentUrl = await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
         await this.notify.notifyEscalation({
           taskName: task.name,
           taskFileName: task._name,
@@ -5628,6 +5751,7 @@ ${guidance}`
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
           reason,
           escalationType: "other",
+          ...(commentUrl ? { commentUrl } : {}),
           planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
         });
 

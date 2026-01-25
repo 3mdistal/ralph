@@ -1,25 +1,26 @@
+import { RALPH_LABEL_STUCK } from "../github-labels";
+import { redactHomePathForDisplay } from "../redaction";
 import { deleteIdempotencyKey, getIdempotencyPayload, hasIdempotencyKey, initStateDb, recordIdempotencyKey } from "../state";
-import {
-  RALPH_LABEL_ESCALATED,
-  RALPH_LABEL_IN_PROGRESS,
-  RALPH_LABEL_QUEUED,
-  RALPH_ESCALATION_MARKER_REGEX,
-  RALPH_RESOLVED_TEXT,
-} from "./escalation-constants";
+import type { WatchdogTimeoutInfo } from "../session";
+import { sanitizeEscalationReason } from "./escalation-writeback";
 import { GitHubClient, splitRepoFullName } from "./client";
-import { addIssueLabel, removeIssueLabel } from "./issue-label-io";
+import { addIssueLabel } from "./issue-label-io";
 
-export type EscalationWritebackContext = {
+export type WatchdogStuckWritebackContext = {
   repo: string;
   issueNumber: number;
   taskName: string;
   taskPath: string;
-  reason: string;
-  escalationType: string;
-  ownerHandle?: string;
+  stage: string;
+  retryIndex: number;
+  signatureHash: string;
+  sessionId?: string;
+  worktreePath?: string;
+  timeout?: WatchdogTimeoutInfo;
+  suggestedCommands?: string[];
 };
 
-export type EscalationWritebackPlan = {
+export type WatchdogStuckWritebackPlan = {
   marker: string;
   markerId: string;
   commentBody: string;
@@ -28,7 +29,7 @@ export type EscalationWritebackPlan = {
   idempotencyKey: string;
 };
 
-export type EscalationWritebackResult = {
+export type WatchdogStuckWritebackResult = {
   postedComment: boolean;
   skippedComment: boolean;
   markerFound: boolean;
@@ -48,9 +49,14 @@ type WritebackDeps = {
 };
 
 const DEFAULT_COMMENT_SCAN_LIMIT = 100;
+const MAX_EVENT_LINES = 20;
+const MAX_EVENT_CHARS = 400;
+const MAX_SNIPPET_CHARS = 800;
 const MAX_REASON_CHARS = 500;
 const FNV_OFFSET = 2166136261;
 const FNV_PRIME = 16777619;
+const DEFAULT_COMMANDS = ["bun test", "bun run typecheck", "bun run build"];
+const MARKER_REGEX = /<!--\s*ralph-watchdog-stuck:id=([a-f0-9]+)\s*-->/i;
 
 function truncateText(input: string, maxChars: number): string {
   const trimmed = input.trim();
@@ -67,119 +73,110 @@ function hashFNV1a(input: string): string {
   return hash.toString(16).padStart(8, "0");
 }
 
-function extractCommentUrl(payloadJson: string | null | undefined): string | null {
-  if (!payloadJson) return null;
-  try {
-    const parsed = JSON.parse(payloadJson) as { commentUrl?: string | null };
-    return parsed.commentUrl ?? null;
-  } catch {
-    return null;
-  }
-}
-
-export function sanitizeEscalationReason(input: string): string {
-  let out = input.replace(/\x1b\[[0-9;]*m/g, "");
-  const patterns: Array<{ re: RegExp; replacement: string }> = [
-    { re: /ghp_[A-Za-z0-9]{20,}/g, replacement: "ghp_[REDACTED]" },
-    { re: /github_pat_[A-Za-z0-9_]{20,}/g, replacement: "github_pat_[REDACTED]" },
-    { re: /sk-[A-Za-z0-9]{20,}/g, replacement: "sk-[REDACTED]" },
-    { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "xox-[REDACTED]" },
-    { re: /(Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
-    { re: /(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
-    { re: /\/home\/[A-Za-z0-9._-]+\//g, replacement: "~/" },
-    { re: /\/Users\/[A-Za-z0-9._-]+\//g, replacement: "~/" },
-  ];
-
-  for (const { re, replacement } of patterns) {
-    out = out.replace(re, replacement);
-  }
-
-  return out;
-}
-
-function buildEscalationMarkerId(params: {
+export function buildWatchdogStuckMarker(params: {
   repo: string;
   issueNumber: number;
-  escalationType: string;
+  stage: string;
+  retryIndex: number;
+  signatureHash: string;
+  sessionId?: string;
 }): string {
-  const base = [params.repo, params.issueNumber, params.escalationType].join("|");
-  return `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
+  const base = [
+    params.repo,
+    params.issueNumber,
+    params.stage,
+    String(params.retryIndex),
+    params.signatureHash,
+    params.sessionId ?? "",
+  ].join("|");
+  const markerId = `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
+  return `<!-- ralph-watchdog-stuck:id=${markerId} -->`;
 }
 
-export function buildEscalationMarker(params: {
-  repo: string;
-  issueNumber: number;
-  escalationType: string;
-}): string {
-  const markerId = buildEscalationMarkerId(params);
-  return `<!-- ralph-escalation:id=${markerId} -->`;
-}
-
-export function extractExistingMarker(body: string): string | null {
-  const match = body.match(RALPH_ESCALATION_MARKER_REGEX);
+export function extractExistingWatchdogMarker(body: string): string | null {
+  const match = body.match(MARKER_REGEX);
   return match?.[1] ?? null;
 }
 
-export function buildEscalationComment(params: {
-  marker: string;
-  taskName: string;
-  issueUrl: string;
-  reason: string;
-  ownerHandle: string;
-}): string {
-  const owner = params.ownerHandle.trim();
-  const mention = owner ? `${owner} ` : "";
-  const sanitized = sanitizeEscalationReason(params.reason);
-  const reason = truncateText(sanitized, MAX_REASON_CHARS) || "(no reason provided)";
+function buildWatchdogComment(ctx: WatchdogStuckWritebackContext, marker: string): string {
+  const worktreePath = ctx.worktreePath ? redactHomePathForDisplay(ctx.worktreePath) : "(unknown)";
+  const sessionId = ctx.sessionId?.trim() || "(unknown)";
+  const source = ctx.timeout?.source ?? "tool-watchdog";
+  const toolName = ctx.timeout?.toolName ?? "unknown";
+  const callId = ctx.timeout?.callId ?? "unknown";
+  const elapsedSec = ctx.timeout?.elapsedMs ? Math.round(ctx.timeout.elapsedMs / 1000) : null;
+  const timeoutLine = `Timeout: ${toolName} ${callId}${elapsedSec ? ` after ${elapsedSec}s` : ""} (${source})`;
+  const issueUrl = `https://github.com/${ctx.repo}/issues/${ctx.issueNumber}`;
 
-  return [
-    params.marker,
-    `${mention}Ralph needs a decision to proceed on **${params.taskName}**.`,
+  const recentEvents = ctx.timeout?.recentEvents ?? [];
+  const sanitizedEvents = recentEvents
+    .slice(-MAX_EVENT_LINES)
+    .map((line) => truncateText(sanitizeEscalationReason(line), MAX_EVENT_CHARS));
+
+  const lastSnippet = sanitizedEvents
+    .slice()
+    .reverse()
+    .find((line) => /anomaly|error|exception|failed|traceback/i.test(line));
+
+  const commands = (ctx.suggestedCommands?.length ? ctx.suggestedCommands : DEFAULT_COMMANDS)
+    .map((cmd) => cmd.trim())
+    .filter(Boolean);
+
+  const body: string[] = [
+    marker,
+    "Ralph hit a watchdog timeout and will retry once with a fresh OpenCode session.",
     "",
-    `Issue: ${params.issueUrl}`,
+    `Issue: ${issueUrl}`,
+    `Stage: ${ctx.stage}`,
+    `Session: ${sessionId}`,
+    `Worktree: ${worktreePath}`,
+    timeoutLine,
     "",
-    "Reason:",
-    reason,
-    "",
-    "To resolve:",
-    `1. Comment with \`${RALPH_RESOLVED_TEXT} <guidance>\` to resume with guidance.`,
-    `2. Or re-add the \`${RALPH_LABEL_QUEUED}\` label to resume without extra guidance. Ralph will remove \`${
-      RALPH_LABEL_ESCALATED
-    }\`.`,
-  ].join("\n");
+    "Recent OpenCode events (bounded):",
+  ];
+
+  if (sanitizedEvents.length > 0) {
+    body.push(...sanitizedEvents.map((line) => `- ${line}`));
+  } else {
+    body.push("- (no recent events captured)");
+  }
+
+  if (lastSnippet) {
+    body.push("", "Last anomaly/error snippet:", "```", truncateText(lastSnippet, MAX_SNIPPET_CHARS), "```");
+  }
+
+  if (commands.length > 0) {
+    body.push("", "Suggested deterministic commands:");
+    body.push(...commands.map((cmd) => `- ${cmd}`));
+  }
+
+  const reason = ctx.timeout
+    ? `Tool call timed out: ${toolName} ${callId} after ${elapsedSec ?? "?"}s (${ctx.stage})`
+    : `Tool call timed out (${ctx.stage})`;
+  body.push("", "Reason:", truncateText(sanitizeEscalationReason(reason), MAX_REASON_CHARS));
+
+  return body.join("\n");
 }
 
-export function planEscalationWriteback(ctx: EscalationWritebackContext): EscalationWritebackPlan {
-  const repoOwner = ctx.repo.split("/")[0] ?? "";
-  const ownerHandle = ctx.ownerHandle?.trim() || (repoOwner ? `@${repoOwner}` : "");
-  const marker = buildEscalationMarker({
+export function planWatchdogStuckWriteback(ctx: WatchdogStuckWritebackContext): WatchdogStuckWritebackPlan {
+  const marker = buildWatchdogStuckMarker({
     repo: ctx.repo,
     issueNumber: ctx.issueNumber,
-    escalationType: ctx.escalationType,
+    stage: ctx.stage,
+    retryIndex: ctx.retryIndex,
+    signatureHash: ctx.signatureHash,
+    sessionId: ctx.sessionId,
   });
-
-  const issueUrl = `https://github.com/${ctx.repo}/issues/${ctx.issueNumber}`;
-  const commentBody = buildEscalationComment({
-    marker,
-    taskName: ctx.taskName,
-    issueUrl,
-    reason: ctx.reason,
-    ownerHandle,
-  });
-
-  const markerId = buildEscalationMarkerId({
-    repo: ctx.repo,
-    issueNumber: ctx.issueNumber,
-    escalationType: ctx.escalationType,
-  });
-  const idempotencyKey = `gh-escalation:${ctx.repo}#${ctx.issueNumber}:${markerId}`;
+  const markerId = extractExistingWatchdogMarker(marker) ?? "";
+  const commentBody = buildWatchdogComment(ctx, marker);
+  const idempotencyKey = `gh-watchdog-stuck:${ctx.repo}#${ctx.issueNumber}:${markerId}`;
 
   return {
     marker,
     markerId,
     commentBody,
-    addLabels: [RALPH_LABEL_ESCALATED],
-    removeLabels: [RALPH_LABEL_IN_PROGRESS, RALPH_LABEL_QUEUED],
+    addLabels: [RALPH_LABEL_STUCK],
+    removeLabels: [],
     idempotencyKey,
   };
 }
@@ -210,9 +207,7 @@ async function listRecentIssueComments(params: {
   const response = await params.github.request<{
     data?: {
       repository?: {
-        issue?: {
-          comments?: { nodes?: Array<{ body?: string | null; url?: string | null }>; pageInfo?: { hasPreviousPage?: boolean } };
-        };
+        issue?: { comments?: { nodes?: Array<{ body?: string | null; url?: string | null }>; pageInfo?: { hasPreviousPage?: boolean } } };
       };
     };
   }>("/graphql", {
@@ -247,50 +242,42 @@ async function createIssueComment(params: {
   return response.data?.html_url ?? null;
 }
 
-async function addEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await addIssueLabel(params);
+function extractCommentUrl(payloadJson: string | null | undefined): string | null {
+  if (!payloadJson) return null;
+  try {
+    const parsed = JSON.parse(payloadJson) as { commentUrl?: string | null };
+    return parsed.commentUrl ?? null;
+  } catch {
+    return null;
+  }
 }
 
-async function removeEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await removeIssueLabel({ ...params, allowNotFound: true });
-}
-
-export async function writeEscalationToGitHub(
-  ctx: EscalationWritebackContext,
+export async function writeWatchdogStuckToGitHub(
+  ctx: WatchdogStuckWritebackContext,
   deps: WritebackDeps
-): Promise<EscalationWritebackResult> {
-  const overrideCount = [
-    deps.hasIdempotencyKey,
-    deps.recordIdempotencyKey,
-    deps.deleteIdempotencyKey,
-    deps.getIdempotencyPayload,
-  ].filter(Boolean).length;
+): Promise<WatchdogStuckWritebackResult> {
+  const overrideCount = [deps.hasIdempotencyKey, deps.recordIdempotencyKey, deps.deleteIdempotencyKey, deps.getIdempotencyPayload].filter(
+    Boolean
+  ).length;
   if (overrideCount > 0 && overrideCount < 4) {
-    throw new Error("writeEscalationToGitHub requires all idempotency overrides when any are provided");
+    throw new Error("writeWatchdogStuckToGitHub requires all idempotency overrides when any are provided");
   }
   if (overrideCount === 0) {
     initStateDb();
   }
-  const plan = planEscalationWriteback(ctx);
+
+  const plan = planWatchdogStuckWriteback(ctx);
   const log = deps.log ?? console.log;
   const commentLimit = Math.min(Math.max(1, deps.commentScanLimit ?? DEFAULT_COMMENT_SCAN_LIMIT), 100);
   const hasKey = deps.hasIdempotencyKey ?? hasIdempotencyKey;
   const recordKey = deps.recordIdempotencyKey ?? recordIdempotencyKey;
   const deleteKey = deps.deleteIdempotencyKey ?? deleteIdempotencyKey;
   const readPayload = deps.getIdempotencyPayload ?? getIdempotencyPayload;
-  const prefix = `[ralph:gh-escalation:${ctx.repo}]`;
-
-  for (const label of plan.removeLabels) {
-    try {
-      await removeEscalationLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
-    } catch (error: any) {
-      log(`${prefix} Failed to remove label '${label}' on #${ctx.issueNumber}: ${error?.message ?? String(error)}`);
-    }
-  }
+  const prefix = `[ralph:gh-watchdog-stuck:${ctx.repo}]`;
 
   for (const label of plan.addLabels) {
     try {
-      await addEscalationLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
+      await addIssueLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
     } catch (error: any) {
       log(`${prefix} Failed to add label '${label}' on #${ctx.issueNumber}: ${error?.message ?? String(error)}`);
     }
@@ -325,7 +312,7 @@ export async function writeEscalationToGitHub(
   const markerFound =
     listResult?.comments.some((comment) => {
       const body = comment.body ?? "";
-      const found = extractExistingMarker(body);
+      const found = extractExistingWatchdogMarker(body);
       const matched = found ? found.toLowerCase() === markerId : body.includes(plan.marker);
       if (matched && comment.url) markerCommentUrl = comment.url;
       return matched;
@@ -334,12 +321,11 @@ export async function writeEscalationToGitHub(
   const payloadUrl = extractCommentUrl(readPayload(plan.idempotencyKey));
 
   if (hasKeyResult && markerFound) {
-    log(`${prefix} Escalation comment already recorded (idempotency + marker); skipping.`);
+    log(`${prefix} Watchdog comment already recorded (idempotency + marker); skipping.`);
     return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: markerCommentUrl ?? payloadUrl };
   }
 
   const scanComplete = Boolean(listResult && !listResult.reachedMax);
-
   if (hasKeyResult && scanComplete && !markerFound) {
     ignoreExistingKey = true;
     try {
@@ -358,20 +344,19 @@ export async function writeEscalationToGitHub(
     try {
       recordKey({
         key: plan.idempotencyKey,
-        scope: "gh-escalation",
+        scope: "gh-watchdog-stuck",
         payloadJson: markerCommentUrl ? JSON.stringify({ commentUrl: markerCommentUrl }) : undefined,
       });
     } catch (error: any) {
       log(`${prefix} Failed to record idempotency after marker match: ${error?.message ?? String(error)}`);
     }
-    log(`${prefix} Existing escalation marker found for #${ctx.issueNumber}; skipping comment.`);
+    log(`${prefix} Existing watchdog marker found for #${ctx.issueNumber}; skipping comment.`);
     return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: markerCommentUrl ?? payloadUrl };
   }
 
-
   let claimed = false;
   try {
-    claimed = recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
+    claimed = recordKey({ key: plan.idempotencyKey, scope: "gh-watchdog-stuck" });
   } catch (error: any) {
     log(`${prefix} Failed to record idempotency before posting comment: ${error?.message ?? String(error)}`);
   }
@@ -384,11 +369,10 @@ export async function writeEscalationToGitHub(
       log(`${prefix} Failed to re-check idempotency: ${error?.message ?? String(error)}`);
     }
     if (alreadyClaimed) {
-      log(`${prefix} Escalation comment already claimed; skipping comment.`);
+      log(`${prefix} Watchdog comment already claimed; skipping comment.`);
       return { postedComment: false, skippedComment: true, markerFound: false, commentUrl: payloadUrl };
     }
   }
-
 
   let commentUrl: string | null = null;
   try {
@@ -413,7 +397,7 @@ export async function writeEscalationToGitHub(
     try {
       recordKey({
         key: plan.idempotencyKey,
-        scope: "gh-escalation",
+        scope: "gh-watchdog-stuck",
         payloadJson: commentUrl ? JSON.stringify({ commentUrl }) : undefined,
       });
     } catch (error: any) {
@@ -421,7 +405,6 @@ export async function writeEscalationToGitHub(
     }
   }
 
-  log(`${prefix} Posted escalation comment for #${ctx.issueNumber}.`);
-
+  log(`${prefix} Posted watchdog comment for #${ctx.issueNumber}.`);
   return { postedComment: true, skippedComment: false, markerFound: false, commentUrl };
 }

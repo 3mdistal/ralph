@@ -469,6 +469,7 @@ In daemon mode, a single tool call can hang indefinitely. Ralph uses a watchdog 
 
 - **Soft timeout**: log-only heartbeat warning (no interruption)
 - **Hard timeout**: kill the in-flight `opencode` run, re-queue the task once with a cleared `session-id`, then escalate if it repeats
+- On the first hard timeout, Ralph posts a GitHub comment with bounded context and applies a non-terminal `ralph:stuck` label before retrying.
 
 ### Configuration
 

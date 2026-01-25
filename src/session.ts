@@ -40,6 +40,7 @@ export interface ServerHandle {
 
 export interface WatchdogTimeoutInfo {
   kind: "watchdog-timeout";
+  source?: "tool-watchdog" | "run-fallback";
   toolName: string;
   callId: string;
   elapsedMs: number;
@@ -1002,6 +1003,35 @@ async function runSession(
 
   let watchdogTimeout: WatchdogTimeoutInfo | undefined;
 
+  const buildFallbackTimeoutInfo = (params: {
+    now: number;
+    fallbackMs: number;
+    inFlight: {
+      toolName: string;
+      callId: string;
+      startTs: number;
+      lastProgressTs: number;
+      argsPreview?: string;
+    } | null;
+  }): WatchdogTimeoutInfo => {
+    const elapsedMs = params.inFlight ? params.now - params.inFlight.startTs : params.fallbackMs;
+    const lastProgressMsAgo = params.inFlight ? params.now - params.inFlight.lastProgressTs : params.fallbackMs;
+
+    return {
+      kind: "watchdog-timeout",
+      source: "run-fallback",
+      toolName: params.inFlight?.toolName ?? "unknown",
+      callId: params.inFlight?.callId ?? "unknown",
+      elapsedMs: Math.max(0, elapsedMs),
+      softMs: params.fallbackMs,
+      hardMs: params.fallbackMs,
+      lastProgressMsAgo: Math.max(0, lastProgressMsAgo),
+      argsPreview: params.inFlight?.argsPreview,
+      context,
+      recentEvents,
+    };
+  };
+
   proc.stdout?.on("data", (data: Buffer) => {
     writeRunLog(data);
 
@@ -1113,6 +1143,7 @@ async function runSession(
       if (elapsedMs >= threshold.hardMs) {
         watchdogTimeout = {
           kind: "watchdog-timeout",
+          source: "tool-watchdog",
           toolName: inFlight.toolName,
           callId: inFlight.callId,
           elapsedMs,
@@ -1140,6 +1171,18 @@ async function runSession(
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
     timeout = scheduler.setTimeout(() => {
+      if (!watchdogTimeout) {
+        const now = scheduler.now();
+        watchdogTimeout = buildFallbackTimeoutInfo({
+          now,
+          fallbackMs: fallbackTimeoutMs,
+          inFlight,
+        });
+        const ctx = context ? ` ${context}` : "";
+        console.warn(
+          `[ralph:watchdog] Hard timeout${ctx}: run exceeded ${Math.round(fallbackTimeoutMs / 1000)}s fallback; killing opencode process`
+        );
+      }
       requestKill();
       resolve(124);
     }, fallbackTimeoutMs);
@@ -1158,6 +1201,14 @@ async function runSession(
   });
 
   await closeRunLogStream();
+
+  if (!watchdogTimeout && exitCode === 124) {
+    watchdogTimeout = buildFallbackTimeoutInfo({
+      now: scheduler.now(),
+      fallbackMs: fallbackTimeoutMs,
+      inFlight,
+    });
+  }
 
   if (watchdogTimeout) {
     const header = [

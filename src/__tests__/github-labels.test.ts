@@ -26,7 +26,13 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:in-progress", color: "FBCA04", description: "Ralph is actively working" },
     ];
     const { toCreate, toUpdate } = computeRalphLabelSync(existing);
-    expect(toCreate.map((l) => l.name)).toEqual(["ralph:in-bot", "ralph:blocked", "ralph:done", "ralph:escalated"]);
+    expect(toCreate.map((l) => l.name)).toEqual([
+      "ralph:in-bot",
+      "ralph:blocked",
+      "ralph:done",
+      "ralph:stuck",
+      "ralph:escalated",
+    ]);
     expect(toUpdate).toEqual([
       {
         currentName: "ralph:queued",
@@ -45,6 +51,7 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:blocked", color: "000000", description: "Blocked by dependencies" },
       { name: "ralph:done", color: "1A7F37", description: "Task merged to default branch" },
+      { name: "ralph:stuck", color: "E99695", description: "Watchdog timeout; retrying with a fresh session" },
       { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
@@ -63,6 +70,7 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:blocked", color: "D73A4A", description: "Blocked by dependencies" },
       { name: "ralph:done", color: "1A7F37", description: "Task merged to default branch" },
+      { name: "ralph:stuck", color: "E99695", description: "Watchdog timeout; retrying with a fresh session" },
       { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
@@ -92,6 +100,7 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:blocked", color: "D73A4A", description: "Blocked by dependencies" },
       { name: "ralph:done", color: "1A7F37", description: "Task merged to default branch" },
+      { name: "ralph:stuck", color: "E99695", description: "Watchdog timeout; retrying with a fresh session" },
       { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
@@ -105,6 +114,7 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:blocked", color: "D73A4A", description: "Blocked by dependencies" },
       { name: "ralph:done", color: "1A7F37", description: "Task merged to default branch" },
+      { name: "ralph:stuck", color: "E99695", description: "Watchdog timeout; retrying with a fresh session" },
       { name: "ralph:escalated", color: "B60205", description: "Waiting on human input" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);

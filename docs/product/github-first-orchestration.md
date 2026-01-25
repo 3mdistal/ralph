@@ -19,6 +19,7 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 | --- | --- | --- |
 | `ralph:queued` | In queue; claimable when not blocked or escalated | `0366D6` |
 | `ralph:in-progress` | Ralph is actively working | `FBCA04` |
+| `ralph:stuck` | Watchdog timeout; retrying with a fresh session | `E99695` |
 | `ralph:in-bot` | Task PR merged to `bot/integration` | `0E8A16` |
 | `ralph:blocked` | Blocked by dependencies | `D73A4A` |
 | `ralph:done` | Task merged to default branch | `1A7F37` |

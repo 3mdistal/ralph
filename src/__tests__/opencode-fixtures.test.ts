@@ -204,6 +204,39 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     expect(result.output).toContain("Tool call timed out:");
   });
 
+  fixtureTest("fallback timeout sets watchdogTimeout with run-fallback source", async () => {
+    const scheduler = new FakeScheduler(0);
+
+    const testOverrides = {
+      scheduler: scheduler as any,
+      sessionsDir,
+      spawn: (() => new FakeChildProcess()) as any,
+    };
+
+    const promise = runCommand(
+      "/tmp",
+      "plan",
+      [],
+      {
+        timeoutMs: 1000,
+        watchdog: {
+          thresholdsMs: {
+            bash: { softMs: 1000, hardMs: 2000 },
+          },
+        },
+      },
+      testOverrides
+    );
+
+    scheduler.advanceBy(1000);
+
+    const result = await promise;
+
+    expect(result.success).toBe(false);
+    expect(result.exitCode).toBe(124);
+    expect(result.watchdogTimeout?.source).toBe("run-fallback");
+  });
+
   fixtureTest("context-length-exceeded.jsonl: sets SessionResult.errorCode", async () => {
     const scheduler = new FakeScheduler(0);
     const lines = await loadFixtureLines("context-length-exceeded.jsonl");
