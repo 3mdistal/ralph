@@ -644,6 +644,59 @@ function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: string[])
   return { status: "pending", required, available };
 }
 
+const REQUIRED_CHECKS_BACKOFF_MULTIPLIER = 1.5;
+const REQUIRED_CHECKS_MAX_POLL_MS = 120_000;
+const REQUIRED_CHECKS_JITTER_PCT = 0.2;
+const REQUIRED_CHECKS_LOG_INTERVAL_MS = 60_000;
+
+function applyRequiredChecksJitter(valueMs: number, jitterPct = REQUIRED_CHECKS_JITTER_PCT): number {
+  const clamped = Math.max(1000, valueMs);
+  const variance = clamped * jitterPct;
+  const delta = (Math.random() * 2 - 1) * variance;
+  return Math.max(1000, Math.round(clamped + delta));
+}
+
+function buildRequiredChecksSignature(summary: RequiredChecksSummary): string {
+  return JSON.stringify({
+    status: summary.status,
+    required: summary.required.map((check) => ({
+      name: check.name,
+      state: check.state,
+      rawState: check.rawState,
+    })),
+  });
+}
+
+function computeRequiredChecksDelay(params: {
+  baseIntervalMs: number;
+  maxIntervalMs: number;
+  attempt: number;
+  lastSignature: string | null;
+  nextSignature: string;
+  pending: boolean;
+}): { delayMs: number; nextAttempt: number; reason: "progress" | "backoff" } {
+  if (!params.pending) {
+    return { delayMs: params.baseIntervalMs, nextAttempt: 0, reason: "progress" };
+  }
+
+  if (params.lastSignature && params.lastSignature === params.nextSignature) {
+    const nextAttempt = params.attempt + 1;
+    const delay = Math.min(
+      Math.round(params.baseIntervalMs * Math.pow(REQUIRED_CHECKS_BACKOFF_MULTIPLIER, nextAttempt)),
+      params.maxIntervalMs
+    );
+    return { delayMs: delay, nextAttempt, reason: "backoff" };
+  }
+
+  return { delayMs: params.baseIntervalMs, nextAttempt: 0, reason: "progress" };
+}
+
+export function __computeRequiredChecksDelayForTests(
+  params: Parameters<typeof computeRequiredChecksDelay>[0]
+): ReturnType<typeof computeRequiredChecksDelay> {
+  return computeRequiredChecksDelay(params);
+}
+
 export function __summarizeRequiredChecksForTests(
   allChecks: PrCheck[],
   requiredChecks: string[]
@@ -777,6 +830,7 @@ export class RepoWorker {
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
   private ignoredBodyDepsLogLimiter = new LogLimiter({ maxKeys: IGNORED_BODY_DEPS_LOG_MAX_KEYS });
+  private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -2590,6 +2644,11 @@ ${guidance}`
     stopReason?: "merge-conflict";
   }> {
     const startedAt = Date.now();
+    let pollDelayMs = opts.pollIntervalMs;
+    let lastSignature: string | null = null;
+    let attempt = 0;
+    const prNumber = extractPullRequestNumber(prUrl);
+    const logKey = `ralph:checks:${this.repo}:${prNumber ?? prUrl}`;
     let last: {
       headSha: string;
       mergeStateStatus: PullRequestMergeStateStatus | null;
@@ -2611,7 +2670,28 @@ ${guidance}`
         return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
       }
 
-      await new Promise((r) => setTimeout(r, opts.pollIntervalMs));
+      const signature = buildRequiredChecksSignature(summary);
+      const decision = computeRequiredChecksDelay({
+        baseIntervalMs: opts.pollIntervalMs,
+        maxIntervalMs: REQUIRED_CHECKS_MAX_POLL_MS,
+        attempt,
+        lastSignature,
+        nextSignature: signature,
+        pending: summary.status === "pending",
+      });
+      attempt = decision.nextAttempt;
+      pollDelayMs = decision.delayMs;
+      lastSignature = signature;
+
+      if (decision.reason === "backoff" && pollDelayMs > opts.pollIntervalMs) {
+        if (this.requiredChecksLogLimiter.shouldLog(logKey, REQUIRED_CHECKS_LOG_INTERVAL_MS)) {
+          console.log(
+            `[ralph:worker:${this.repo}] Required checks pending; backing off polling to ${Math.round(pollDelayMs / 1000)}s`
+          );
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, applyRequiredChecksJitter(pollDelayMs)));
     }
 
     if (last) {

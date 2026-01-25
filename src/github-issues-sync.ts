@@ -51,6 +51,7 @@ const DEFAULT_BACKOFF_MULTIPLIER = 1.5;
 const DEFAULT_ERROR_MULTIPLIER = 2;
 const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
+const ESCALATION_RECONCILE_MIN_INTERVAL_MS = 60_000;
 
 function applyJitter(valueMs: number, pct = DEFAULT_JITTER_PCT): number {
   const clamped = Math.max(valueMs, MIN_DELAY_MS);
@@ -344,6 +345,7 @@ function startRepoPoller(params: {
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let delayMs = resolveBaseIntervalMs(params.baseIntervalMs);
+  let lastEscalationReconcileAt = 0;
   const repoName = params.repo.name;
   const repoLabel = formatRepoLabel(repoName);
 
@@ -381,12 +383,24 @@ function startRepoPoller(params: {
           `delayMs=${delayMs}`
       );
 
-      try {
-        await reconcileEscalationResolutions({ repo: repoName, log: params.log });
-      } catch (error: any) {
-        params.log(
-          `[ralph:gh-sync:${repoLabel}] escalation resolution reconcile failed: ${error?.message ?? String(error)}`
-        );
+      const nowMs = Date.now();
+      const elapsedMs = nowMs - lastEscalationReconcileAt;
+      if (elapsedMs < ESCALATION_RECONCILE_MIN_INTERVAL_MS) {
+        if (shouldLog(`ralph:gh-sync:${repoLabel}:escalation-defer`, ESCALATION_RECONCILE_MIN_INTERVAL_MS)) {
+          const remaining = Math.max(0, ESCALATION_RECONCILE_MIN_INTERVAL_MS - elapsedMs);
+          params.log(
+            `[ralph:gh-sync:${repoLabel}] escalation reconcile deferred for ${Math.round(remaining / 1000)}s`
+          );
+        }
+      } else {
+        lastEscalationReconcileAt = nowMs;
+        try {
+          await reconcileEscalationResolutions({ repo: repoName, log: params.log });
+        } catch (error: any) {
+          params.log(
+            `[ralph:gh-sync:${repoLabel}] escalation resolution reconcile failed: ${error?.message ?? String(error)}`
+          );
+        }
       }
 
       if (params.onSync) {
