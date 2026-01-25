@@ -61,11 +61,20 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { RALPH_LABEL_BLOCKED } from "./github-labels";
+import { RALPH_LABEL_BLOCKED, RALPH_LABEL_STUCK } from "./github-labels";
 import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
+import {
+  buildCiDebugCommentBody,
+  createCiDebugComment,
+  findCiDebugComment,
+  parseCiDebugState,
+  updateCiDebugComment,
+  type CiDebugAttempt,
+  type CiDebugCommentState,
+} from "./github/ci-debug-comment";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
@@ -187,6 +196,9 @@ const IGNORED_BODY_DEPS_LOG_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const IGNORED_BODY_DEPS_LOG_MAX_KEYS = 2000;
 const BLOCKED_REASON_MAX_LEN = 200;
 const BLOCKED_DETAILS_MAX_LEN = 2000;
+const CI_DEBUG_LEASE_TTL_MS = 20 * 60_000;
+const CI_DEBUG_COMMENT_SCAN_LIMIT = 50;
+const CI_DEBUG_COMMENT_MIN_EDIT_MS = 60_000;
 
 interface IntrospectionSummary {
   sessionId: string;
@@ -413,6 +425,19 @@ type RequiredChecksSummary = {
   required: Array<{ name: string; state: RequiredCheckState; rawState: string; detailsUrl?: string | null }>;
   available: string[];
 };
+
+type CiDebugRecoveryOutcome =
+  | {
+      status: "success";
+      prUrl: string;
+      sessionId: string;
+      headSha: string;
+      summary: RequiredChecksSummary;
+    }
+  | {
+      status: "failed" | "escalated";
+      run: AgentRun;
+    };
 
 type ResolvedRequiredChecks = {
   checks: string[];
@@ -2767,7 +2792,11 @@ ${guidance}`
   private formatFailureSignature(summary: RequiredChecksSummary): string {
     const failed = summary.required
       .filter((check) => check.state === "FAILURE")
-      .map((check) => `${check.name}:${check.rawState}`)
+      .map((check) => {
+        const runId = this.parseGhRunId(check.detailsUrl);
+        const suffix = runId ? `:run:${runId}` : "";
+        return `${check.name}:${check.rawState}${suffix}`;
+      })
       .sort();
     return failed.join("|") || "none";
   }
@@ -2859,6 +2888,538 @@ ${guidance}`
       "",
       formatRequiredChecksForHumans(summary),
     ].join("\n");
+  }
+
+  private formatCiDebugSignature(summary: RequiredChecksSummary, timedOut: boolean): string {
+    const signature = this.formatFailureSignature(summary);
+    if (signature !== "none") return signature;
+    if (!timedOut) return signature;
+    const required = summary.required.map((check) => check.name).sort().join("|") || "checks";
+    return `timeout:${required}`;
+  }
+
+  private buildCiDebugPrompt(params: {
+    prUrl: string;
+    baseRefName: string | null;
+    headRefName: string | null;
+    summary: RequiredChecksSummary;
+    timedOut: boolean;
+    remediationContext: string;
+  }): string {
+    const base = params.baseRefName || "(unknown)";
+    const head = params.headRefName || "(unknown)";
+    const timedOutLine = params.timedOut ? "Timed out waiting for required checks to complete." : "";
+
+    return [
+      "CI-debug run for an existing PR with failing required checks.",
+      `PR: ${params.prUrl}`,
+      `Base: ${base}`,
+      `Head: ${head}`,
+      "",
+      "Ralph is spawning a dedicated CI-debug run to make required checks green.",
+      "If failures appear flaky, attempt deterministic reruns before code changes.",
+      "Do NOT create a new PR.",
+      "",
+      timedOutLine,
+      params.remediationContext,
+      "",
+      "Commands (run in the CI-debug worktree):",
+      "```bash",
+      "git fetch origin",
+      `gh pr checkout ${params.prUrl}`,
+      "git status",
+      "```",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  private buildCiDebugCommentLines(params: {
+    prUrl: string;
+    baseRefName: string | null;
+    headRefName: string | null;
+    summary: RequiredChecksSummary;
+    timedOut: boolean;
+    attemptCount: number;
+    maxAttempts: number;
+  }): string[] {
+    const base = params.baseRefName || "(unknown)";
+    const head = params.headRefName || "(unknown)";
+    const lines: string[] = [];
+
+    lines.push("CI-debug status");
+    lines.push("", `PR: ${params.prUrl}`, `Base: ${base}`, `Head: ${head}`);
+
+    const failing = params.summary.required.filter((check) => check.state === "FAILURE");
+    lines.push("", "Failing required checks:");
+    if (failing.length === 0) {
+      lines.push("- (none listed)");
+    } else {
+      for (const check of failing) {
+        const details = check.detailsUrl ? ` (${check.detailsUrl})` : "";
+        lines.push(`- ${check.name}: ${check.rawState}${details}`);
+      }
+    }
+
+    if (params.timedOut) {
+      lines.push("", "Timed out waiting for required checks to complete.");
+    }
+
+    lines.push(
+      "",
+      "Action: Ralph is spawning a dedicated CI-debug run to make required checks green.",
+      `Attempts: ${params.attemptCount}/${params.maxAttempts}`
+    );
+
+    lines.push("", formatRequiredChecksForHumans(params.summary));
+    return lines;
+  }
+
+  private isCiDebugLeaseActive(lease: CiDebugCommentState["lease"], nowMs: number): boolean {
+    if (!lease?.expiresAt) return false;
+    const expiresAt = Date.parse(lease.expiresAt);
+    if (!Number.isFinite(expiresAt)) return false;
+    return expiresAt > nowMs;
+  }
+
+  private buildCiDebugLease(holder: string, nowMs: number): CiDebugCommentState["lease"] {
+    return { holder, expiresAt: new Date(nowMs + CI_DEBUG_LEASE_TTL_MS).toISOString() };
+  }
+
+  private async upsertCiDebugComment(params: {
+    issueNumber: number;
+    lines: string[];
+    state: CiDebugCommentState;
+  }): Promise<void> {
+    const match = await findCiDebugComment({
+      github: this.github,
+      repo: this.repo,
+      issueNumber: params.issueNumber,
+      limit: CI_DEBUG_COMMENT_SCAN_LIMIT,
+    });
+
+    const body = buildCiDebugCommentBody({ marker: match.marker, state: params.state, lines: params.lines });
+    const existing = match.comment?.body ?? "";
+    if (existing.trim() === body.trim()) return;
+
+    if (match.comment?.updatedAt) {
+      const updatedAtMs = Date.parse(match.comment.updatedAt);
+      if (Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs < CI_DEBUG_COMMENT_MIN_EDIT_MS) {
+        const existingState = parseCiDebugState(existing);
+        const nextState = params.state;
+        if (existingState && JSON.stringify(existingState) === JSON.stringify(nextState)) {
+          return;
+        }
+      }
+    }
+
+    if (match.comment) {
+      await updateCiDebugComment({ github: this.github, repo: this.repo, commentId: match.comment.id, body });
+      return;
+    }
+
+    await createCiDebugComment({ github: this.github, repo: this.repo, issueNumber: params.issueNumber, body });
+  }
+
+  private async applyCiDebugLabels(issue: IssueRef): Promise<void> {
+    try {
+      await this.addIssueLabel(issue, RALPH_LABEL_STUCK);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+
+    try {
+      await this.removeIssueLabel(issue, RALPH_LABEL_BLOCKED);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label for ${formatIssueRef(issue)}: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+  }
+
+  private async clearCiDebugLabels(issue: IssueRef): Promise<void> {
+    try {
+      await this.removeIssueLabel(issue, RALPH_LABEL_STUCK);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+  }
+
+  private collectFailureRunUrls(summary: RequiredChecksSummary): string[] {
+    const urls = summary.required
+      .filter((check) => check.state === "FAILURE" && check.detailsUrl)
+      .map((check) => check.detailsUrl ?? "")
+      .filter(Boolean);
+    return Array.from(new Set(urls));
+  }
+
+  private buildCiDebugEscalationSummary(params: {
+    prUrl: string;
+    summary: RequiredChecksSummary;
+    attempts: CiDebugAttempt[];
+    reason: string;
+  }): string {
+    const lines: string[] = [];
+    lines.push("CI-debug escalation summary", "", `PR: ${params.prUrl}`, "", "Reason:", params.reason, "");
+
+    if (params.attempts.length > 0) {
+      lines.push("Attempts:");
+      for (const attempt of params.attempts) {
+        const when = attempt.completedAt || attempt.startedAt;
+        lines.push(
+          `- Attempt ${attempt.attempt} (${attempt.status ?? "unknown"}, ${when}): ${attempt.signature || "(no signature)"}`
+        );
+        if (attempt.runUrls && attempt.runUrls.length > 0) {
+          lines.push(...attempt.runUrls.map((url) => `  - ${url}`));
+        }
+      }
+      lines.push("");
+    }
+
+    lines.push("Failing required checks:");
+    const failing = params.summary.required.filter((check) => check.state === "FAILURE");
+    if (failing.length === 0) {
+      lines.push("- (none listed)");
+    } else {
+      for (const check of failing) {
+        const details = check.detailsUrl ? ` (${check.detailsUrl})` : "";
+        lines.push(`- ${check.name}: ${check.rawState}${details}`);
+      }
+    }
+
+    lines.push(
+      "",
+      "Next action:",
+      "- Inspect the failing check runs linked above, fix or rerun as needed, then re-add `ralph:queued` (or comment `RALPH RESOLVED:`) to resume."
+    );
+
+    return lines.join("\n");
+  }
+
+  private async writeCiDebugEscalationComment(params: {
+    issueNumber: number;
+    body: string;
+  }): Promise<void> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    await this.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments`, {
+      method: "POST",
+      body: { body: params.body },
+    });
+  }
+
+  private async runCiDebugRecovery(params: {
+    task: AgentTask;
+    issueNumber: string;
+    cacheKey: string;
+    prUrl: string;
+    requiredChecks: string[];
+    issueMeta: IssueMetadata;
+    botBranch: string;
+    timedOut: boolean;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+  }): Promise<CiDebugRecoveryOutcome> {
+    const issueRef = parseIssueRef(params.task.issue, params.task.repo) ?? {
+      repo: this.repo,
+      number: Number(params.issueNumber),
+    };
+    const maxAttempts = this.resolveCiFixAttempts();
+    const workerId = await this.formatWorkerId(params.task, params.task._path);
+
+    let summary: RequiredChecksSummary;
+    let headSha = "";
+    let baseRefName: string | null = null;
+    let headRefName: string | null = null;
+
+    try {
+      const prStatus = await this.getPullRequestChecks(params.prUrl);
+      summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
+      headSha = prStatus.headSha;
+      baseRefName = prStatus.baseRefName;
+      const prState = await this.getPullRequestMergeState(params.prUrl);
+      headRefName = prState.headRefName || null;
+    } catch (error: any) {
+      const reason = `CI-debug preflight failed for ${params.prUrl}: ${this.formatGhError(error)}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      const run: AgentRun = {
+        taskName: params.task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: params.task["session-id"]?.trim(),
+        escalationReason: reason,
+      };
+      return { status: "failed", run };
+    }
+
+    const signature = this.formatCiDebugSignature(summary, params.timedOut);
+    const commentMatch = await findCiDebugComment({
+      github: this.github,
+      repo: this.repo,
+      issueNumber: Number(params.issueNumber),
+      limit: CI_DEBUG_COMMENT_SCAN_LIMIT,
+    });
+    const existingState = commentMatch.state ?? ({ version: 1 } satisfies CiDebugCommentState);
+    const attempts = [...(existingState.attempts ?? [])];
+    const lastAttempt = attempts[attempts.length - 1];
+    const repeatedFailure =
+      signature !== "none" && existingState.lastSignature === signature && lastAttempt?.status === "failed";
+
+    if (repeatedFailure || attempts.length >= maxAttempts) {
+      const reason = repeatedFailure
+        ? `CI failed repeatedly with identical failures; stopping remediation for ${params.prUrl}`
+        : `Required checks not passing after ${maxAttempts} attempt(s); refusing to merge ${params.prUrl}`;
+
+      const finalState: CiDebugCommentState = {
+        version: 1,
+        attempts,
+        lastSignature: signature,
+      };
+
+      const lines = this.buildCiDebugCommentLines({
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        summary,
+        timedOut: params.timedOut,
+        attemptCount: attempts.length,
+        maxAttempts,
+      });
+      await this.upsertCiDebugComment({ issueNumber: Number(params.issueNumber), lines, state: finalState });
+
+      await this.clearCiDebugLabels(issueRef);
+
+      const escalationBody = this.buildCiDebugEscalationSummary({
+        prUrl: params.prUrl,
+        summary,
+        attempts,
+        reason,
+      });
+      await this.writeCiDebugEscalationComment({ issueNumber: Number(params.issueNumber), body: escalationBody });
+
+      const wasEscalated = params.task.status === "escalated";
+      const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
+      if (escalated) {
+        applyTaskPatch(params.task, "escalated", {});
+      }
+      await this.writeEscalationWriteback(params.task, { reason, escalationType: "blocked" });
+      await this.notify.notifyEscalation({
+        taskName: params.task.name,
+        taskFileName: params.task._name,
+        taskPath: params.task._path,
+        issue: params.task.issue,
+        repo: this.repo,
+        sessionId: params.task["session-id"]?.trim() || undefined,
+        reason,
+        escalationType: "blocked",
+        planOutput: escalationBody,
+      });
+
+      if (escalated && !wasEscalated) {
+        await this.recordEscalatedRunNote(params.task, {
+          reason,
+          sessionId: params.task["session-id"]?.trim(),
+          details: escalationBody,
+        });
+      }
+
+      return {
+        status: "escalated",
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "escalated",
+          sessionId: params.task["session-id"]?.trim(),
+          escalationReason: reason,
+        },
+      };
+    }
+
+    const nowMs = Date.now();
+    const lease = existingState.lease;
+    if (this.isCiDebugLeaseActive(lease, nowMs) && lease?.holder !== workerId) {
+      const reason = `CI-debug lease already held by ${lease?.holder ?? "unknown"}; skipping duplicate run for ${params.prUrl}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return {
+        status: "failed",
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: params.task["session-id"]?.trim(),
+          escalationReason: reason,
+        },
+      };
+    }
+
+    const attemptNumber = attempts.length + 1;
+    const attempt: CiDebugAttempt = {
+      attempt: attemptNumber,
+      signature,
+      startedAt: new Date().toISOString(),
+      status: "running",
+      runUrls: this.collectFailureRunUrls(summary),
+    };
+
+    const nextState: CiDebugCommentState = {
+      version: 1,
+      lease: this.buildCiDebugLease(workerId, nowMs),
+      attempts: [...attempts, attempt],
+      lastSignature: signature,
+    };
+
+    const lines = this.buildCiDebugCommentLines({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      summary,
+      timedOut: params.timedOut,
+      attemptCount: attemptNumber,
+      maxAttempts,
+    });
+    await this.upsertCiDebugComment({ issueNumber: Number(params.issueNumber), lines, state: nextState });
+    await this.applyCiDebugLabels(issueRef);
+
+    const remediationContext = this.formatRemediationFailureContext(
+      await this.buildRemediationFailureContext(summary, { includeLogs: true })
+    );
+    const prompt = this.buildCiDebugPrompt({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      summary,
+      timedOut: params.timedOut,
+      remediationContext,
+    });
+
+    const runLogPath = await this.recordRunLogPath(
+      params.task,
+      params.issueNumber,
+      `ci-debug-${attemptNumber}`,
+      "in-progress"
+    );
+
+    const worktreePath = join(
+      RALPH_WORKTREES_DIR,
+      safeNoteName(this.repo),
+      "ci-debug",
+      params.issueNumber,
+      safeNoteName(`attempt-${attemptNumber}`)
+    );
+
+    await this.ensureGitWorktree(worktreePath);
+
+    let sessionResult = await this.session.runAgent(worktreePath, "general", prompt, {
+      repo: this.repo,
+      cacheKey: params.cacheKey,
+      runLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: params.task.issue,
+        taskName: params.task.name,
+        step: 5,
+        stepTitle: `ci-debug attempt ${attemptNumber}`,
+      },
+      ...this.buildWatchdogOptions(params.task, `ci-debug-${attemptNumber}`),
+      ...params.opencodeSessionOptions,
+    });
+
+    const pausedAfter = await this.pauseIfHardThrottled(params.task, `ci-debug-${attemptNumber} (post)`, sessionResult.sessionId);
+    if (pausedAfter) {
+      await this.cleanupGitWorktree(worktreePath);
+      return { status: "failed", run: pausedAfter };
+    }
+
+    if (sessionResult.watchdogTimeout) {
+      await this.cleanupGitWorktree(worktreePath);
+      const run = await this.handleWatchdogTimeout(
+        params.task,
+        params.cacheKey,
+        `ci-debug-${attemptNumber}`,
+        sessionResult,
+        params.opencodeXdg
+      );
+      return { status: "failed", run };
+    }
+
+    const completedAt = new Date().toISOString();
+    if (sessionResult.sessionId) {
+      await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": sessionResult.sessionId });
+    }
+
+    try {
+      const prStatus = await this.getPullRequestChecks(params.prUrl);
+      summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
+      headSha = prStatus.headSha;
+    } catch (error: any) {
+      const reason = `Failed to re-check CI status after CI-debug run: ${this.formatGhError(error)}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      attempt.status = "failed";
+      attempt.completedAt = completedAt;
+      const failedState: CiDebugCommentState = {
+        version: 1,
+        attempts: [...attempts, attempt],
+        lastSignature: signature,
+      };
+      await this.upsertCiDebugComment({ issueNumber: Number(params.issueNumber), lines, state: failedState });
+      await this.cleanupGitWorktree(worktreePath);
+      return {
+        status: "failed",
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: sessionResult.sessionId ?? params.task["session-id"]?.trim(),
+          escalationReason: reason,
+        },
+      };
+    }
+
+    attempt.status = summary.status === "success" ? "succeeded" : "failed";
+    attempt.completedAt = completedAt;
+
+    const finalState: CiDebugCommentState = {
+      version: 1,
+      attempts: [...attempts, attempt],
+      lastSignature: this.formatCiDebugSignature(summary, false),
+    };
+    const finalLines = this.buildCiDebugCommentLines({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      summary,
+      timedOut: false,
+      attemptCount: attemptNumber,
+      maxAttempts,
+    });
+    await this.upsertCiDebugComment({ issueNumber: Number(params.issueNumber), lines: finalLines, state: finalState });
+
+    await this.cleanupGitWorktree(worktreePath);
+
+    if (summary.status === "success") {
+      await this.clearCiDebugLabels(issueRef);
+      return {
+        status: "success",
+        prUrl: params.prUrl,
+        sessionId: sessionResult.sessionId || params.task["session-id"]?.trim() || "",
+        headSha,
+        summary,
+      };
+    }
+
+    return this.runCiDebugRecovery({
+      ...params,
+      timedOut: false,
+    });
   }
 
   private isGitHubQueueTask(task: AgentTask): boolean {
@@ -2991,29 +3552,68 @@ ${guidance}`
 
     this.updateOpenPrSnapshot(task, null, existingPr.selectedUrl);
 
-    const ciPrompt = this.buildCiFailurePrompt(existingPr.selectedUrl, summary);
-    const reason = summarizeBlockedReason(`Required checks failed for ${existingPr.selectedUrl}`);
-    const notifyBody = [reason, "", formatRequiredChecksForHumans(summary)].join("\n");
-
-    return await this.runExistingPrRecovery({
+    const recovery = await this.runCiDebugRecovery({
       task,
       issueNumber,
-      taskRepoPath,
       cacheKey,
-      botBranch,
+      prUrl: existingPr.selectedUrl,
+      requiredChecks,
       issueMeta,
-      startTime,
+      botBranch,
+      timedOut: false,
       opencodeXdg,
       opencodeSessionOptions,
-      prUrl: existingPr.selectedUrl,
-      stage: "ci-failure",
-      prompt: ciPrompt,
-      blocked: {
-        source: "ci-failure",
-        reason,
-        notifyBody,
-      },
     });
+
+    if (recovery.status !== "success") return recovery.run;
+
+    const mergeGate = await this.mergePrWithRequiredChecks({
+      task,
+      repoPath: taskRepoPath,
+      cacheKey,
+      botBranch,
+      prUrl: recovery.prUrl,
+      sessionId: recovery.sessionId,
+      issueMeta,
+      watchdogStagePrefix: "ci-debug",
+      notifyTitle: `Merging ${task.name}`,
+      opencodeXdg,
+    });
+
+    if (!mergeGate.ok) return mergeGate.run;
+
+    const pausedSurvey = await this.pauseIfHardThrottled(task, "survey", mergeGate.sessionId || recovery.sessionId);
+    if (pausedSurvey) return pausedSurvey;
+
+    const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+    const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
+
+    const surveyResult = await this.session.continueCommand(surveyRepoPath, mergeGate.sessionId, "survey", [], {
+      repo: this.repo,
+      cacheKey,
+      runLogPath: surveyRunLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: task.issue,
+        taskName: task.name,
+        step: 3,
+        stepTitle: "survey",
+      },
+      ...this.buildWatchdogOptions(task, "survey"),
+      ...opencodeSessionOptions,
+    });
+
+    if (!surveyResult.success && surveyResult.watchdogTimeout) {
+      return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+      sessionId: mergeGate.sessionId,
+      surveyResults: surveyResult.output,
+    };
   }
 
   private async runExistingPrRecovery(params: {
@@ -3568,12 +4168,9 @@ ${guidance}`
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
     const { checks: REQUIRED_CHECKS } = await this.resolveRequiredChecksForMerge();
-    const MAX_CI_FIX_ATTEMPTS = this.resolveCiFixAttempts();
 
     let prUrl = params.prUrl;
     let sessionId = params.sessionId;
-    let lastSummary: RequiredChecksSummary | null = null;
-    let lastFailureSignature = "";
     let didUpdateBranch = false;
 
     const prFiles = await this.getPullRequestFiles(prUrl);
@@ -3671,28 +4268,71 @@ ${guidance}`
       };
     }
 
-    for (let attempt = 1; attempt <= MAX_CI_FIX_ATTEMPTS; attempt++) {
-      if (!didUpdateBranch && isAutoUpdateBehindEnabled(this.repo)) {
+    const mergeWhenReady = async (headSha: string): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> => {
+      console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
+      try {
+        await this.mergePullRequest(prUrl, headSha, params.repoPath);
+        this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
         try {
-          const prState = await this.getPullRequestMergeState(prUrl);
-          const guard = this.shouldAttemptProactiveUpdate(prState);
-          const labelGate = getAutoUpdateBehindLabelGate(this.repo);
-          const minMinutes = getAutoUpdateBehindMinMinutes(this.repo);
-          const rateLimited = this.shouldRateLimitAutoUpdate(prState, minMinutes);
+          await this.applyMidpointLabelsBestEffort({
+            task: params.task,
+            prUrl,
+            botBranch: params.botBranch,
+            baseBranch,
+          });
+        } catch (error: any) {
+          console.warn(`[ralph:worker:${this.repo}] Failed to apply midpoint labels: ${this.formatGhError(error)}`);
+        }
+        try {
+          const normalizedBase = baseBranch ? this.normalizeGitRef(baseBranch) : "";
+          const normalizedBot = this.normalizeGitRef(params.botBranch);
+          if (normalizedBase && normalizedBase === normalizedBot) {
+            await this.deleteMergedPrHeadBranchBestEffort({
+              prUrl,
+              botBranch: params.botBranch,
+              mergedHeadSha: headSha,
+            });
+          }
+        } catch (error: any) {
+          console.warn(`[ralph:worker:${this.repo}] Failed to delete PR head branch: ${this.formatGhError(error)}`);
+        }
+        return { ok: true, prUrl, sessionId };
+      } catch (error: any) {
+        if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
+          console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
+          didUpdateBranch = true;
+          try {
+            await this.updatePullRequestBranch(prUrl, params.repoPath);
+          } catch (updateError: any) {
+            const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
+            console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+            await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
+            await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
-          if (prState.mergeStateStatus === "DIRTY") {
+            return {
+              ok: false,
+              run: {
+                taskName: params.task.name,
+                repo: this.repo,
+                outcome: "failed",
+                sessionId,
+                escalationReason: reason,
+              },
+            };
+          }
+
+          const refreshed = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
+            timeoutMs: 45 * 60_000,
+            pollIntervalMs: 30_000,
+          });
+
+          if (refreshed.stopReason === "merge-conflict") {
             const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
               prUrl,
-              baseRefName: prState.baseRefName,
+              baseRefName: refreshed.baseRefName,
             });
-            const reason = `PR has merge conflicts; refusing auto-update ${prUrl}`;
-            console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-            this.recordAutoUpdateFailure(prState, minMinutes);
-            await this.markTaskBlocked(params.task, "merge-conflict", {
-              reason: blockedReasonShort,
-              details: notifyBody,
-              sessionId,
-            });
+            console.warn(`[ralph:worker:${this.repo}] ${blockedReasonShort}`);
+            await this.markTaskBlocked(params.task, "merge-conflict", { reason: blockedReasonShort });
             await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
 
             return {
@@ -3707,36 +4347,52 @@ ${guidance}`
             };
           }
 
-          const hasLabelGate = labelGate
-            ? prState.labels.map((label) => label.toLowerCase()).includes(labelGate.toLowerCase())
-            : true;
+          if (refreshed.summary.status === "success") {
+            return await mergeWhenReady(refreshed.headSha);
+          }
 
-          if (!hasLabelGate) {
-            console.log(
-              `[ralph:worker:${this.repo}] PR behind but missing label gate ${labelGate ?? ""}; skipping auto-update ${prUrl}`
-            );
-          } else if (!guard.ok) {
-            console.log(`[ralph:worker:${this.repo}] PR auto-update skipped (${guard.reason ?? "guardrail"}): ${prUrl}`);
-          } else if (rateLimited) {
-            console.log(`[ralph:worker:${this.repo}] PR auto-update rate-limited; skipping ${prUrl}`);
-          } else {
-            console.log(`[ralph:worker:${this.repo}] PR BEHIND; updating branch ${prUrl}`);
-            this.recordAutoUpdateAttempt(prState, minMinutes);
-            await this.updatePullRequestBranch(prUrl, params.repoPath);
-            didUpdateBranch = true;
-          }
-        } catch (updateError: any) {
-          const reason = `Failed while auto-updating PR branch: ${this.formatGhError(updateError)}`;
+          const ciDebug = await this.runCiDebugRecovery({
+            task: params.task,
+            issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+            cacheKey: params.cacheKey,
+            prUrl,
+            requiredChecks: REQUIRED_CHECKS,
+            issueMeta: params.issueMeta,
+            botBranch: params.botBranch,
+            timedOut: refreshed.timedOut,
+            opencodeXdg: params.opencodeXdg,
+            opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
+          });
+          if (ciDebug.status !== "success") return { ok: false, run: ciDebug.run };
+          sessionId = ciDebug.sessionId || sessionId;
+          return await mergeWhenReady(ciDebug.headSha);
+        }
+        throw error;
+      }
+    };
+
+    if (!didUpdateBranch && isAutoUpdateBehindEnabled(this.repo)) {
+      try {
+        const prState = await this.getPullRequestMergeState(prUrl);
+        const guard = this.shouldAttemptProactiveUpdate(prState);
+        const labelGate = getAutoUpdateBehindLabelGate(this.repo);
+        const minMinutes = getAutoUpdateBehindMinMinutes(this.repo);
+        const rateLimited = this.shouldRateLimitAutoUpdate(prState, minMinutes);
+
+        if (prState.mergeStateStatus === "DIRTY") {
+          const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+            prUrl,
+            baseRefName: prState.baseRefName,
+          });
+          const reason = `PR has merge conflicts; refusing auto-update ${prUrl}`;
           console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-          try {
-            const prState = await this.getPullRequestMergeState(prUrl);
-            const minMinutes = getAutoUpdateBehindMinMinutes(this.repo);
-            this.recordAutoUpdateFailure(prState, minMinutes);
-          } catch {
-            // best-effort
-          }
-          await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-          await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+          this.recordAutoUpdateFailure(prState, minMinutes);
+          await this.markTaskBlocked(params.task, "merge-conflict", {
+            reason: blockedReasonShort,
+            details: notifyBody,
+            sessionId,
+          });
+          await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
 
           return {
             ok: false,
@@ -3745,214 +4401,40 @@ ${guidance}`
               repo: this.repo,
               outcome: "failed",
               sessionId,
-              escalationReason: reason,
+              escalationReason: blockedReasonShort,
             },
           };
         }
-      }
 
-      const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
-        timeoutMs: 45 * 60_000,
-        pollIntervalMs: 30_000,
-      });
+        const hasLabelGate = labelGate
+          ? prState.labels.map((label) => label.toLowerCase()).includes(labelGate.toLowerCase())
+          : true;
 
-      lastSummary = checkResult.summary;
-
-      if (checkResult.stopReason === "merge-conflict") {
-        const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
-          prUrl,
-          baseRefName: checkResult.baseRefName,
-        });
-        console.warn(`[ralph:worker:${this.repo}] ${blockedReasonShort}`);
-        await this.markTaskBlocked(params.task, "merge-conflict", { reason: blockedReasonShort });
-        await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
-
-        return {
-          ok: false,
-          run: {
-            taskName: params.task.name,
-            repo: this.repo,
-            outcome: "failed",
-            sessionId,
-            escalationReason: blockedReasonShort,
-          },
-        };
-      }
-
-      const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
-      if (throttled) return { ok: false, run: throttled };
-
-      if (checkResult.summary.status === "success") {
-        console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
-        try {
-          await this.mergePullRequest(prUrl, checkResult.headSha, params.repoPath);
-          this.recordPrSnapshotBestEffort({ issue: params.task.issue, prUrl, state: PR_STATE_MERGED });
-          try {
-            await this.applyMidpointLabelsBestEffort({
-              task: params.task,
-              prUrl,
-              botBranch: params.botBranch,
-              baseBranch,
-            });
-          } catch (error: any) {
-            console.warn(
-              `[ralph:worker:${this.repo}] Failed to apply midpoint labels: ${this.formatGhError(error)}`
-            );
-          }
-          try {
-            const normalizedBase = baseBranch ? this.normalizeGitRef(baseBranch) : "";
-            const normalizedBot = this.normalizeGitRef(params.botBranch);
-            if (normalizedBase && normalizedBase === normalizedBot) {
-              await this.deleteMergedPrHeadBranchBestEffort({
-                prUrl,
-                botBranch: params.botBranch,
-                mergedHeadSha: checkResult.headSha,
-              });
-            }
-          } catch (error: any) {
-            console.warn(
-              `[ralph:worker:${this.repo}] Failed to delete PR head branch: ${this.formatGhError(error)}`
-            );
-          }
-          return { ok: true, prUrl, sessionId };
-        } catch (error: any) {
-          if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
-            console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
-            didUpdateBranch = true;
-            try {
-              await this.updatePullRequestBranch(prUrl, params.repoPath);
-              continue;
-            } catch (updateError: any) {
-              const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
-              console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-              await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-              await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
-
-              return {
-                ok: false,
-                run: {
-                  taskName: params.task.name,
-                  repo: this.repo,
-                  outcome: "failed",
-                  sessionId,
-                  escalationReason: reason,
-                },
-              };
-            }
-          }
-          throw error;
-        }
-      }
-
-      const baseFailureContext = await this.buildRemediationFailureContext(checkResult.summary, { includeLogs: false });
-      const failureSignature = this.formatFailureSignature(checkResult.summary);
-      if (failureSignature !== "none" && failureSignature === lastFailureSignature) {
-        const reason = `CI failed repeatedly with identical failures; stopping remediation for ${prUrl}`;
-        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.markTaskBlocked(params.task, "ci-failure", { reason, details: reason, sessionId });
-        await this.notify.notifyError(
-          params.notifyTitle,
-          [reason, this.formatRemediationFailureContext(baseFailureContext)].filter(Boolean).join("\n\n"),
-          params.task.name
-        );
-        return {
-          ok: false,
-          run: {
-            taskName: params.task.name,
-            repo: this.repo,
-            outcome: "failed",
-            sessionId,
-            escalationReason: reason,
-          },
-        };
-      }
-      lastFailureSignature = failureSignature;
-
-      const actionCheckContext = await this.buildRemediationFailureContext(checkResult.summary, { includeLogs: true });
-      if (!this.isActionableFailureContext(actionCheckContext)) {
-        const reason = `CI failed with non-actionable status; refusing to remediate ${prUrl}`;
-        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.markTaskBlocked(params.task, "ci-failure", { reason, details: reason, sessionId });
-        await this.notify.notifyError(
-          params.notifyTitle,
-          [reason, this.formatRemediationFailureContext(actionCheckContext)].filter(Boolean).join("\n\n"),
-          params.task.name
-        );
-
-        return {
-          ok: false,
-          run: {
-            taskName: params.task.name,
-            repo: this.repo,
-            outcome: "failed",
-            sessionId,
-            escalationReason: reason,
-          },
-        };
-      }
-
-      if (attempt >= MAX_CI_FIX_ATTEMPTS) break;
-
-      const remediationContext = this.formatRemediationFailureContext(actionCheckContext);
-      const fixMessage = [
-        `CI is required before merging to '${params.botBranch}'.`,
-        `PR: ${prUrl}`,
-        "",
-        checkResult.timedOut
-          ? "Timed out waiting for required checks to complete."
-          : "One or more required checks failed.",
-        "",
-        remediationContext,
-        "",
-        "Do NOT merge yet.",
-        "Fix the CI failure (or rerun CI), push updates to the PR branch, and reply when CI is green.",
-        "",
-        "Commands:",
-        "```bash",
-        `gh pr checks ${prUrl} --repo ${this.repo}`,
-        "```",
-      ].join("\n");
-
-      const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
-      const runLogPath = await this.recordRunLogPath(
-        params.task,
-        issueNumber,
-        `${params.watchdogStagePrefix}-fix-ci`,
-        "in-progress"
-      );
-
-      const fixResult = await this.session.continueSession(params.repoPath, sessionId, fixMessage, {
-        repo: this.repo,
-        cacheKey: params.cacheKey,
-        runLogPath,
-        introspection: {
-          repo: this.repo,
-          issue: params.task.issue,
-          taskName: params.task.name,
-          step: 5,
-          stepTitle: "fix CI",
-        },
-        ...this.buildWatchdogOptions(params.task, `${params.watchdogStagePrefix}-ci-fix`),
-        ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
-      });
-
-      sessionId = fixResult.sessionId || sessionId;
-
-      if (!fixResult.success) {
-        if (fixResult.watchdogTimeout) {
-          const run = await this.handleWatchdogTimeout(
-            params.task,
-            params.cacheKey,
-            `${params.watchdogStagePrefix}-ci-fix`,
-            fixResult,
-            params.opencodeXdg
+        if (!hasLabelGate) {
+          console.log(
+            `[ralph:worker:${this.repo}] PR behind but missing label gate ${labelGate ?? ""}; skipping auto-update ${prUrl}`
           );
-          return { ok: false, run };
+        } else if (!guard.ok) {
+          console.log(`[ralph:worker:${this.repo}] PR auto-update skipped (${guard.reason ?? "guardrail"}): ${prUrl}`);
+        } else if (rateLimited) {
+          console.log(`[ralph:worker:${this.repo}] PR auto-update rate-limited; skipping ${prUrl}`);
+        } else {
+          console.log(`[ralph:worker:${this.repo}] PR BEHIND; updating branch ${prUrl}`);
+          this.recordAutoUpdateAttempt(prState, minMinutes);
+          await this.updatePullRequestBranch(prUrl, params.repoPath);
+          didUpdateBranch = true;
         }
-
-        const reason = `Failed while fixing CI before merge: ${fixResult.output}`;
+      } catch (updateError: any) {
+        const reason = `Failed while auto-updating PR branch: ${this.formatGhError(updateError)}`;
         console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-        await this.markTaskBlocked(params.task, "ci-failure", { reason, details: reason, sessionId });
+        try {
+          const prState = await this.getPullRequestMergeState(prUrl);
+          const minMinutes = getAutoUpdateBehindMinMinutes(this.repo);
+          this.recordAutoUpdateFailure(prState, minMinutes);
+        } catch {
+          // best-effort
+        }
+        await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
         await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
 
         return {
@@ -3966,32 +4448,58 @@ ${guidance}`
           },
         };
       }
-
-      if (fixResult.sessionId) {
-        await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": fixResult.sessionId });
-      }
-
-      const updatedPrUrl = selectPrUrl({ output: fixResult.output, repo: this.repo });
-      prUrl = this.updateOpenPrSnapshot(params.task, prUrl, updatedPrUrl);
     }
 
-    const summaryText = lastSummary ? formatRequiredChecksForHumans(lastSummary) : "";
-    const reason = `Required checks not passing after ${MAX_CI_FIX_ATTEMPTS} attempt(s); refusing to merge ${prUrl}`;
-    console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+    const checkResult = await this.waitForRequiredChecks(prUrl, REQUIRED_CHECKS, {
+      timeoutMs: 45 * 60_000,
+      pollIntervalMs: 30_000,
+    });
 
-    await this.markTaskBlocked(params.task, "ci-failure", { reason, details: reason, sessionId });
-    await this.notify.notifyError(params.notifyTitle, [reason, summaryText].filter(Boolean).join("\n\n"), params.task.name);
+    if (checkResult.stopReason === "merge-conflict") {
+      const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+        prUrl,
+        baseRefName: checkResult.baseRefName,
+      });
+      console.warn(`[ralph:worker:${this.repo}] ${blockedReasonShort}`);
+      await this.markTaskBlocked(params.task, "merge-conflict", { reason: blockedReasonShort });
+      await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
 
-    return {
-      ok: false,
-      run: {
-        taskName: params.task.name,
-        repo: this.repo,
-        outcome: "failed",
-        sessionId,
-        escalationReason: reason,
-      },
-    };
+      return {
+        ok: false,
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId,
+          escalationReason: blockedReasonShort,
+        },
+      };
+    }
+
+    const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
+    if (throttled) return { ok: false, run: throttled };
+
+    if (checkResult.summary.status === "success") {
+      return await mergeWhenReady(checkResult.headSha);
+    }
+
+    const ciDebug = await this.runCiDebugRecovery({
+      task: params.task,
+      issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+      cacheKey: params.cacheKey,
+      prUrl,
+      requiredChecks: REQUIRED_CHECKS,
+      issueMeta: params.issueMeta,
+      botBranch: params.botBranch,
+      timedOut: checkResult.timedOut,
+      opencodeXdg: params.opencodeXdg,
+      opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
+    });
+
+    if (ciDebug.status !== "success") return { ok: false, run: ciDebug.run };
+
+    sessionId = ciDebug.sessionId || sessionId;
+    return await mergeWhenReady(ciDebug.headSha);
   }
 
   private async skipClosedIssue(task: AgentTask, issueMeta: IssueMetadata, started: Date): Promise<AgentRun> {
