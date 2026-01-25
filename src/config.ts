@@ -76,6 +76,8 @@ export interface ThrottleConfig {
   enabled?: boolean;
   /** Provider ID to count toward usage (default: "openai"). */
   providerID?: string;
+  /** OpenAI throttle source (default: "remoteUsage"). */
+  openaiSource?: "localLogs" | "remoteUsage";
   /** Soft throttle threshold as fraction of budget (default: 0.65). */
   softPct?: number;
   /** Hard throttle threshold (reserved for #72; default: 0.75). */
@@ -171,6 +173,7 @@ const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
+const DEFAULT_THROTTLE_OPENAI_SOURCE: "localLogs" | "remoteUsage" = "remoteUsage";
 const DEFAULT_THROTTLE_SOFT_PCT = 0.65;
 const DEFAULT_THROTTLE_HARD_PCT = 0.75;
 const DEFAULT_THROTTLE_MIN_CHECK_INTERVAL_MS = 15_000;
@@ -627,6 +630,18 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       }
     }
 
+    const openaiSourceRaw = throttleObj.openaiSource;
+    let openaiSource: "localLogs" | "remoteUsage" = DEFAULT_THROTTLE_OPENAI_SOURCE;
+    if (openaiSourceRaw !== undefined) {
+      if (openaiSourceRaw === "localLogs" || openaiSourceRaw === "remoteUsage") {
+        openaiSource = openaiSourceRaw;
+      } else {
+        console.warn(
+          `[ralph] Invalid config throttle.openaiSource=${JSON.stringify(openaiSourceRaw)}; defaulting to ${JSON.stringify(DEFAULT_THROTTLE_OPENAI_SOURCE)}`
+        );
+      }
+    }
+
     const rawSoftPct = throttleObj.softPct;
     const rawHardPct = throttleObj.hardPct;
 
@@ -906,6 +921,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.throttle = {
       enabled,
       providerID,
+      openaiSource,
       softPct,
       hardPct,
       minCheckIntervalMs,
