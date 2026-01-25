@@ -14,7 +14,9 @@ import crypto from "crypto";
 import {
   ensureBwrbVaultLayout,
   getConfig,
+  getDashboardEventsRetentionDays,
   getOpencodeDefaultProfileName,
+  listOpencodeProfileNames,
   getRepoMaxWorkers,
   getRepoPath,
   type ControlConfig,
@@ -53,6 +55,7 @@ import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
+import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
 import { startGitHubIssuePollers } from "./github-issues-sync";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import {
@@ -79,6 +82,7 @@ let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
 let drainRequestedAt: number | null = null;
 let drainTimeoutMs: number | null = null;
+let dashboardEventPersistence: DashboardEventPersistence | null = null;
 let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
@@ -1165,6 +1169,13 @@ async function main(): Promise<void> {
   // Initialize durable local state (SQLite)
   initStateDb();
 
+  const retentionDays = getDashboardEventsRetentionDays();
+  await cleanupDashboardEventLogs({ retentionDays });
+  dashboardEventPersistence = installDashboardEventPersistence({
+    bus: ralphEventBus,
+    retentionDays,
+  });
+
   githubIssuePollers = startGitHubIssuePollers({
     repos: config.repos,
     baseIntervalMs: config.pollInterval,
@@ -1177,7 +1188,7 @@ async function main(): Promise<void> {
 
   githubDoneReconciler = startGitHubDoneReconciler({
     repos: config.repos,
-    baseIntervalMs: config.pollInterval,
+    baseIntervalMs: config.doneReconcileIntervalMs,
     log: (message) => console.log(message),
     warn: (message) => console.warn(message),
   });
@@ -1433,6 +1444,14 @@ async function main(): Promise<void> {
       })
     );
 
+    if (dashboardEventPersistence) {
+      const { flushed } = await dashboardEventPersistence.flush({ timeoutMs: 5000 });
+      if (!flushed) {
+        console.warn("[ralph] Dashboard event flush timed out; some tail events may be missing");
+      }
+      dashboardEventPersistence.unsubscribe();
+    }
+
     console.log("[ralph] Goodbye!");
     process.exit(0);
   };
@@ -1452,6 +1471,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
@@ -1510,6 +1530,21 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "usage":
+      console.log(
+        [
+          "Usage:",
+          "  ralph usage [--json] [--profile <name|auto>]",
+          "",
+          "Prints OpenAI usage meters (5h + weekly) that drive throttling and auto profile selection.",
+          "",
+          "Options:",
+          "  --json                 Emit machine-readable JSON output.",
+          "  --profile <name|auto>  Override the control/default profile for this command.",
+        ].join("\n")
+      );
+      return;
+
     case "watch":
       console.log(
         [
@@ -1548,6 +1583,21 @@ function printCommandHelp(command: string): void {
       printGlobalHelp();
       return;
   }
+}
+
+function getWindow(snapshot: any, name: string): any | null {
+  const windows = Array.isArray(snapshot?.windows) ? snapshot.windows : [];
+  return windows.find((w: any) => w && typeof w === "object" && w.name === name) ?? null;
+}
+
+function formatPct(value: number | null): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "-";
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function formatResetAt(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) return "-";
+  return value;
 }
 
 const args = process.argv.slice(2);
@@ -1779,6 +1829,160 @@ if (args[0] === "status") {
   for (const task of throttled) {
     const resumeAt = task["resume-at"]?.trim() || "unknown";
     console.log(`  - ${task.name} (${task.repo}) resumeAt=${resumeAt} [${task.priority || "p2-medium"}]`);
+  }
+
+  process.exit(0);
+}
+
+if (args[0] === "usage") {
+  if (hasHelpFlag) {
+    printCommandHelp("usage");
+    process.exit(0);
+  }
+
+  const json = args.includes("--json");
+  const profileFlagIdx = args.findIndex((a) => a === "--profile");
+  const profileOverride = profileFlagIdx >= 0 ? (args[profileFlagIdx + 1]?.trim() ?? "") : "";
+
+  const now = Date.now();
+  const config = getConfig();
+  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
+  const controlProfile = control.opencodeProfile?.trim() || "";
+
+  const requestedProfile =
+    profileOverride ||
+    (controlProfile === "auto" ? "auto" : controlProfile || getOpencodeDefaultProfileName() || null);
+
+  const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
+  const chosenProfile = selection.profileName;
+
+  const profileNames = listOpencodeProfileNames();
+  const targets = profileNames.length > 0 ? profileNames : ["ambient"];
+
+  const decisions = await Promise.all(
+    targets.map(async (name) => {
+      const opencodeProfile = name === "ambient" ? null : name;
+      const decision = await getThrottleDecision(now, { opencodeProfile });
+      return { name, opencodeProfile, decision };
+    })
+  );
+
+  const toUsedPct = (w: any): number | null => {
+    if (!w || typeof w !== "object") return null;
+    if (typeof w.usedPct === "number" && Number.isFinite(w.usedPct)) return w.usedPct;
+    if (
+      typeof w.usedTokens === "number" &&
+      Number.isFinite(w.usedTokens) &&
+      typeof w.budgetTokens === "number" &&
+      Number.isFinite(w.budgetTokens) &&
+      w.budgetTokens > 0
+    ) {
+      return w.usedTokens / w.budgetTokens;
+    }
+    return null;
+  };
+
+  const toResetIso = (ts: unknown): string | null => {
+    if (typeof ts !== "number" || !Number.isFinite(ts)) return null;
+    return new Date(ts).toISOString();
+  };
+
+  const rows = decisions.map(({ name, decision }) => {
+    const snap: any = decision.snapshot;
+    const rolling = getWindow(snap, "rolling5h");
+    const weekly = getWindow(snap, "weekly");
+
+    const rollingUsed = toUsedPct(rolling);
+    const weeklyUsed = toUsedPct(weekly);
+
+    const rollingResetAt =
+      typeof snap?.remoteUsage?.rolling5h?.resetAt === "string"
+        ? snap.remoteUsage.rolling5h.resetAt
+        : null;
+    const weeklyResetAt =
+      typeof snap?.remoteUsage?.weekly?.resetAt === "string"
+        ? snap.remoteUsage.weekly.resetAt
+        : toResetIso(weekly?.weeklyNextResetTs) ?? toResetIso(weekly?.windowEndTs);
+
+    return {
+      profile: name,
+      chosen: chosenProfile ? name === chosenProfile : name === "ambient",
+      state: decision.state,
+      openaiSource: snap?.openaiSource ?? "remoteUsage",
+      rollingUsedPct: rollingUsed,
+      weeklyUsedPct: weeklyUsed,
+      rollingResetAt,
+      weeklyResetAt,
+    };
+  });
+
+  if (json) {
+    console.log(
+      JSON.stringify(
+        {
+          computedAt: new Date(now).toISOString(),
+          requestedProfile,
+          selection,
+          profiles: rows.map((r) => ({
+            profile: r.profile,
+            chosen: r.chosen,
+            state: r.state,
+            openaiSource: r.openaiSource,
+            rolling5h: {
+              usedPct: r.rollingUsedPct,
+              remainingPct: typeof r.rollingUsedPct === "number" ? 1 - r.rollingUsedPct : null,
+              resetAt: r.rollingResetAt,
+            },
+            weekly: {
+              usedPct: r.weeklyUsedPct,
+              remainingPct: typeof r.weeklyUsedPct === "number" ? 1 - r.weeklyUsedPct : null,
+              resetAt: r.weeklyResetAt,
+            },
+          })),
+        },
+        null,
+        2
+      )
+    );
+    process.exit(0);
+  }
+
+  const header = [
+    "PROFILE",
+    "CHOSEN",
+    "STATE",
+    "SOURCE",
+    "5H_USED",
+    "5H_LEFT",
+    "5H_RESET",
+    "WEEK_USED",
+    "WEEK_LEFT",
+    "WEEK_RESET",
+  ];
+
+  const fmt = (s: string, w: number) => (s.length >= w ? s.slice(0, w) : s.padEnd(w));
+  const widths = [12, 7, 6, 10, 8, 8, 20, 10, 10, 20];
+
+  console.log(header.map((h, i) => fmt(h, widths[i]!)).join(" "));
+  console.log(widths.map((w) => "-".repeat(w)).join(" "));
+
+  for (const r of rows) {
+    const rollingLeft = typeof r.rollingUsedPct === "number" ? 1 - r.rollingUsedPct : null;
+    const weeklyLeft = typeof r.weeklyUsedPct === "number" ? 1 - r.weeklyUsedPct : null;
+
+    const line = [
+      r.profile,
+      r.chosen ? "*" : "",
+      r.state,
+      r.openaiSource,
+      formatPct(r.rollingUsedPct),
+      formatPct(rollingLeft),
+      formatResetAt(r.rollingResetAt),
+      formatPct(r.weeklyUsedPct),
+      formatPct(weeklyLeft),
+      formatResetAt(r.weeklyResetAt),
+    ];
+    console.log(line.map((v, i) => fmt(v, widths[i]!)).join(" "));
   }
 
   process.exit(0);
