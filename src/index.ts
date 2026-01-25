@@ -1188,7 +1188,7 @@ async function main(): Promise<void> {
 
   githubDoneReconciler = startGitHubDoneReconciler({
     repos: config.repos,
-    baseIntervalMs: config.pollInterval,
+    baseIntervalMs: config.doneReconcileIntervalMs,
     log: (message) => console.log(message),
     warn: (message) => console.warn(message),
   });
