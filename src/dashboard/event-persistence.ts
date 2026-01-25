@@ -29,13 +29,13 @@ export function bucketUtcDay(ts: string, nowMs: number): string {
   return new Date(ms).toISOString().slice(0, 10);
 }
 
-export function parseEventLogFilename(filename: string): string | null {
+function parseEventLogFilename(filename: string): string | null {
   const match = /^\d{4}-\d{2}-\d{2}\.jsonl$/.exec(filename);
   if (!match) return null;
   return filename.slice(0, 10);
 }
 
-export function buildDashboardEventJsonlLine(
+function buildDashboardEventJsonlLine(
   event: RalphEvent,
   redactor: (value: string) => string = redactSensitiveText
 ): string {
