@@ -66,6 +66,7 @@ import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelI
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
+import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "./github/watchdog-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
@@ -231,6 +232,34 @@ async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount
   } catch {
     return { total: 0, recentBurst: false };
   }
+}
+
+function hasRepeatedToolPattern(recentEvents?: string[]): boolean {
+  if (!recentEvents?.length) return false;
+  const counts = new Map<string, number>();
+
+  for (const line of recentEvents) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+
+    let event: any;
+    try {
+      event = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+
+    if (!event || typeof event !== "object" || event.type !== "tool-start") continue;
+    const toolName = String(event.toolName ?? "");
+    if (!toolName) continue;
+    const argsPreview = typeof event.argsPreview === "string" ? event.argsPreview : "";
+    const key = `${toolName}:${argsPreview}`;
+    const nextCount = (counts.get(key) ?? 0) + 1;
+    if (nextCount >= 3) return true;
+    counts.set(key, nextCount);
+  }
+
+  return false;
 }
 
 async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
@@ -1331,12 +1360,12 @@ export class RepoWorker {
 
   private async writeEscalationWriteback(
     task: AgentTask,
-    params: { reason: string; escalationType: EscalationContext["escalationType"] }
-  ): Promise<void> {
+    params: { reason: string; details?: string; escalationType: EscalationContext["escalationType"] }
+  ): Promise<string | null> {
     const escalationIssueRef = parseIssueRef(task.issue, task.repo);
     if (!escalationIssueRef) {
       console.warn(`[ralph:worker:${this.repo}] Cannot parse issue ref for escalation writeback: ${task.issue}`);
-      return;
+      return null;
     }
 
     try {
@@ -1350,13 +1379,14 @@ export class RepoWorker {
     }
 
     try {
-      await writeEscalationToGitHub(
+      const result = await writeEscalationToGitHub(
         {
           repo: escalationIssueRef.repo,
           issueNumber: escalationIssueRef.number,
           taskName: task.name,
           taskPath: task._path ?? task.name,
           reason: params.reason,
+          details: params.details,
           escalationType: params.escalationType,
         },
         {
@@ -1364,11 +1394,13 @@ export class RepoWorker {
           log: (message) => console.log(message),
         }
       );
+      return result.commentUrl ?? null;
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Escalation writeback failed for ${task.issue}: ${error?.message ?? String(error)}`
       );
     }
+    return null;
   }
 
   private isNoCommitFoundError(error: unknown): boolean {
@@ -4308,10 +4340,33 @@ ${guidance}`
     const timeout = result.watchdogTimeout;
     const retryCount = this.getWatchdogRetryCount(task);
     const nextRetryCount = retryCount + 1;
+    const sessionId = result.sessionId || task["session-id"]?.trim() || null;
+    const worktreePath = task["worktree-path"]?.trim() || null;
 
     const reason = timeout
       ? `Tool call timed out: ${timeout.toolName} ${timeout.callId} after ${Math.round(timeout.elapsedMs / 1000)}s (${stage})`
       : `Tool call timed out (${stage})`;
+
+    const issueRef = parseIssueRef(task.issue, task.repo);
+    const watchdogWritebackContext = issueRef
+      ? {
+          repo: issueRef.repo,
+          issueNumber: issueRef.number,
+          taskName: task.name,
+          taskPath: task._path ?? task.name,
+          sessionId,
+          worktreePath,
+          stage,
+          watchdogTimeout: timeout ?? null,
+          output: result.output ?? null,
+          kind: "stuck" as const,
+          suggestedCommands: ["bun test", "bun run typecheck", "bun run build"],
+        }
+      : null;
+    const earlyTermination = retryCount === 0 && hasRepeatedToolPattern(timeout?.recentEvents);
+    const escalationReason = earlyTermination
+      ? `${reason} (early termination: repeated watchdog signature)`
+      : reason;
 
     // Cleanup per-task OpenCode cache on watchdog timeouts (best-effort)
     try {
@@ -4320,7 +4375,27 @@ ${guidance}`
       // ignore
     }
 
-    if (retryCount === 0) {
+    if (retryCount === 0 && !earlyTermination) {
+      if (watchdogWritebackContext) {
+        try {
+          await this.ensureRalphWorkflowLabelsOnce();
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to ensure ralph workflow labels before watchdog writeback: ${
+              error?.message ?? String(error)
+            }`
+          );
+        }
+
+        try {
+          await writeWatchdogToGitHub(watchdogWritebackContext, { github: this.github, log: (m) => console.log(m) });
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Watchdog writeback failed for ${task.issue}: ${error?.message ?? String(error)}`
+          );
+        }
+      }
+
       console.warn(`[ralph:worker:${this.repo}] Watchdog hard timeout; re-queuing once for recovery: ${reason}`);
       await this.queue.updateTaskStatus(task, "queued", {
         "session-id": "",
@@ -4336,7 +4411,13 @@ ${guidance}`
       };
     }
 
-    console.log(`[ralph:worker:${this.repo}] Watchdog hard timeout repeated; escalating: ${reason}`);
+    if (earlyTermination) {
+      console.log(
+        `[ralph:worker:${this.repo}] Watchdog timeout signature repeats; escalating without retry: ${escalationReason}`
+      );
+    } else {
+      console.log(`[ralph:worker:${this.repo}] Watchdog hard timeout repeated; escalating: ${escalationReason}`);
+    }
 
     const escalationFields: Record<string, string> = {
       "watchdog-retries": String(nextRetryCount),
@@ -4349,7 +4430,24 @@ ${guidance}`
       applyTaskPatch(task, "escalated", escalationFields);
     }
 
-    await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+    let diagnostics: string | null = null;
+    if (watchdogWritebackContext) {
+      try {
+        diagnostics = await buildWatchdogDiagnostics({ ...watchdogWritebackContext, kind: "escalated" });
+      } catch (error: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to build watchdog diagnostics for ${task.issue}: ${
+            error?.message ?? String(error)
+          }`
+        );
+      }
+    }
+
+    const githubCommentUrl = await this.writeEscalationWriteback(task, {
+      reason: escalationReason,
+      details: diagnostics ?? undefined,
+      escalationType: "other",
+    });
     await this.notify.notifyEscalation({
       taskName: task.name,
       taskFileName: task._name,
@@ -4359,14 +4457,15 @@ ${guidance}`
       scope: task.scope,
       priority: task.priority,
       sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
-      reason,
+      reason: escalationReason,
       escalationType: "other",
+      githubCommentUrl: githubCommentUrl ?? undefined,
       planOutput: result.output,
     });
 
     if (escalated && !wasEscalated) {
       await this.recordEscalatedRunNote(task, {
-        reason,
+        reason: escalationReason,
         sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
         details: result.output,
       });
@@ -4377,7 +4476,7 @@ ${guidance}`
       repo: this.repo,
       outcome: "escalated",
       sessionId: result.sessionId || undefined,
-      escalationReason: reason,
+      escalationReason: escalationReason,
     };
   }
 
