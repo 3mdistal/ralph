@@ -39,6 +39,7 @@ import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
+import { deriveTaskId, deriveWorkerId } from "./task-identifiers";
 
 import { DrainMonitor, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
@@ -985,8 +986,8 @@ async function printHeartbeatTick(): Promise<void> {
     const sessionId = task["session-id"]?.trim();
     if (!sessionId) continue;
 
-    const taskId = task._path || task.name;
-    const workerId = task["worker-id"]?.trim() || (taskId ? `${task.repo}#${taskId}` : undefined);
+    const taskId = deriveTaskId(task) ?? undefined;
+    const workerId = task["worker-id"]?.trim() || (taskId ? deriveWorkerId(task, taskId) ?? undefined : undefined);
     activeSessionTasks.set(sessionId, { task, workerId, taskId });
   }
 

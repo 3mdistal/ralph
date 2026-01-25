@@ -79,6 +79,7 @@ import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { cleanupSessionArtifacts } from "./introspection-traces";
 import { redactHomePathForDisplay } from "./redaction";
+import { deriveTaskId, deriveWorkerId } from "./task-identifiers";
 import { isSafeSessionId } from "./session-id";
 import {
   getIdempotencyPayload,
@@ -742,7 +743,7 @@ export class RepoWorker {
 
   private ensureBranchProtectionPromise: Promise<void> | null = null;
   private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
-  private repoSlotsInUse: Set<number> | null = null;
+  private repoSlotsInUse: Map<number, string> | null = null;
   private relationships: IssueRelationshipProvider;
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
@@ -2228,14 +2229,13 @@ ${guidance}`
   }
 
   async runTaskCleanup(tasks: AgentTask[]): Promise<void> {
+    this.seedRepoSlotsInUse(tasks);
     await this.cleanupWorktreesForTasks(tasks);
   }
 
   private buildWorkerId(task: AgentTask, taskId?: string | null): string | undefined {
-    const rawTaskId = taskId ?? task._path ?? task._name ?? task.name;
-    const normalizedTaskId = rawTaskId?.trim();
-    if (!normalizedTaskId) return undefined;
-    return `${this.repo}#${normalizedTaskId}`;
+    const workerId = deriveWorkerId({ ...task, repo: this.repo }, taskId);
+    return workerId ?? undefined;
   }
 
   private async ensureWorkerId(task: AgentTask, taskId?: string | null): Promise<string> {
@@ -2268,7 +2268,7 @@ ${guidance}`
     if (trimmed && trimmed.length <= 256) return trimmed;
     const fallback = `w_${randomUUID()}`;
     console.warn(
-      `[dashboard] invalid workerId; falling back (repo=${this.repo}, task=${taskId ?? task._path ?? task._name ?? task.name})`
+      `[dashboard] invalid workerId; falling back (repo=${this.repo}, task=${taskId ?? deriveTaskId(task) ?? task.name})`
     );
     await this.queue.updateTaskStatus(task, task.status === "in-progress" ? "in-progress" : "starting", {
       "worker-id": fallback,
@@ -2276,26 +2276,20 @@ ${guidance}`
     return fallback;
   }
 
-  private sanitizeRepoSlot(value: number): number {
-    return this.normalizeRepoSlot(value, this.getRepoSlotLimit());
-  }
-
   private parseRepoSlot(value: string | number | null | undefined): number | null {
     if (typeof value === "number") {
-      return Number.isInteger(value) ? value : null;
+      return Number.isInteger(value) && value >= 0 ? value : null;
     }
     if (typeof value === "string") {
       const parsed = Number.parseInt(value, 10);
-      if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return null;
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) return null;
       return parsed;
     }
     return null;
   }
 
-  private normalizeRepoSlot(value: number, limit: number): number {
-    if (Number.isInteger(value) && value >= 0 && value < limit) return value;
-    console.warn(`[scheduler] repoSlot allocation failed; using slot 0 (repo=${this.repo})`);
-    return 0;
+  private getTaskKey(task: Pick<AgentTask, "_path" | "name">): string {
+    return task._path || task.name;
   }
 
   private getRepoSlotLimit(): number {
@@ -2303,35 +2297,86 @@ ${guidance}`
     return Number.isFinite(limit) && limit > 0 ? limit : 1;
   }
 
-  private allocateRepoSlot(preferredSlot?: number | null): number {
+  private seedRepoSlotsInUse(tasks: AgentTask[]): void {
+    if (tasks.length === 0) return;
+    if (!this.repoSlotsInUse) this.repoSlotsInUse = new Map<number, string>();
+
     const limit = this.getRepoSlotLimit();
+    for (const task of tasks) {
+      const slot = this.parseRepoSlot(task["repo-slot"]);
+      if (slot === null) continue;
+      const taskKey = this.getTaskKey(task);
+      const existing = this.repoSlotsInUse.get(slot);
 
-    if (!this.repoSlotsInUse) {
-      this.repoSlotsInUse = new Set<number>();
+      if (slot >= limit) {
+        console.warn(
+          `[scheduler] repoSlot ${slot} exceeds limit ${limit} for ${this.repo}; reserving for ${taskKey}`
+        );
+      }
+
+      if (existing && existing !== taskKey) {
+        console.warn(
+          `[scheduler] repoSlot ${slot} already reserved by ${existing}; keeping existing reservation (task=${taskKey})`
+        );
+        continue;
+      }
+
+      this.repoSlotsInUse.set(slot, taskKey);
     }
+  }
 
-    if (typeof preferredSlot === "number" && Number.isInteger(preferredSlot)) {
-      if (preferredSlot >= 0 && preferredSlot < limit && !this.repoSlotsInUse.has(preferredSlot)) {
-        this.repoSlotsInUse.add(preferredSlot);
+  private allocateRepoSlot(task: AgentTask, preferredSlot?: number | null): number {
+    const limit = this.getRepoSlotLimit();
+    if (!this.repoSlotsInUse) this.repoSlotsInUse = new Map<number, string>();
+
+    const taskKey = this.getTaskKey(task);
+
+    if (typeof preferredSlot === "number" && Number.isInteger(preferredSlot) && preferredSlot >= 0) {
+      const existing = this.repoSlotsInUse.get(preferredSlot);
+
+      if (!existing || existing === taskKey) {
+        if (preferredSlot >= limit) {
+          console.warn(
+            `[scheduler] repoSlot ${preferredSlot} exceeds limit ${limit} for ${this.repo}; reusing persisted slot for ${taskKey}`
+          );
+        }
+        this.repoSlotsInUse.set(preferredSlot, taskKey);
         return preferredSlot;
       }
+
+      console.warn(
+        `[scheduler] repoSlot ${preferredSlot} already reserved by ${existing}; allocating next free slot for ${taskKey}`
+      );
     }
 
     for (let slot = 0; slot < limit; slot++) {
       if (!this.repoSlotsInUse.has(slot)) {
-        this.repoSlotsInUse.add(slot);
+        this.repoSlotsInUse.set(slot, taskKey);
         return slot;
       }
     }
 
     console.warn(`[scheduler] repoSlot allocation failed; using slot 0 (repo=${this.repo})`);
-    this.repoSlotsInUse.add(0);
+    this.repoSlotsInUse.set(0, taskKey);
     return 0;
   }
 
-  private releaseRepoSlot(slot: number | null): void {
+  private releaseRepoSlot(slot: number | null, task?: AgentTask): void {
     if (slot === null) return;
     if (!this.repoSlotsInUse) return;
+    if (!task) {
+      this.repoSlotsInUse.delete(slot);
+      return;
+    }
+    const taskKey = this.getTaskKey(task);
+    const existing = this.repoSlotsInUse.get(slot);
+    if (!existing) return;
+    if (existing !== taskKey) {
+      console.warn(
+        `[scheduler] repoSlot ${slot} release skipped (repo=${this.repo}, task=${taskKey}, reserved=${existing})`
+      );
+      return;
+    }
     this.repoSlotsInUse.delete(slot);
   }
 
@@ -4480,7 +4525,7 @@ ${guidance}`
 
     const workerId = await this.formatWorkerId(task, task._path);
     const preferredSlot = this.parseRepoSlot(task["repo-slot"]);
-    const allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot(preferredSlot));
+    const allocatedSlot = this.allocateRepoSlot(task, preferredSlot);
 
     try {
       await this.assertRepoRootClean(task, "resume");
@@ -4521,13 +4566,15 @@ ${guidance}`
 
       const eventWorkerId = task["worker-id"]?.trim();
 
+      const derivedTaskId = deriveTaskId(task) ?? undefined;
+
       ralphEventBus.publish(
         buildRalphEvent({
           type: "worker.created",
           level: "info",
           ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
           repo: this.repo,
-          taskId: task._path,
+          taskId: derivedTaskId,
           sessionId: existingSessionId,
           data: {
             ...(worktreePath ? { worktreePath } : {}),
@@ -5017,7 +5064,7 @@ ${guidance}`
       };
     } finally {
       if (typeof allocatedSlot === "number") {
-        this.releaseRepoSlot(allocatedSlot);
+        this.releaseRepoSlot(allocatedSlot, task);
       }
     }
   }
@@ -5050,7 +5097,7 @@ ${guidance}`
 
       workerId = await this.formatWorkerId(task, task._path);
       const preferredSlot = this.parseRepoSlot(task["repo-slot"]);
-      allocatedSlot = this.sanitizeRepoSlot(this.allocateRepoSlot(preferredSlot));
+      allocatedSlot = this.allocateRepoSlot(task, preferredSlot);
 
       const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
       if (pausedPreStart) return pausedPreStart;
@@ -5100,13 +5147,15 @@ ${guidance}`
 
       await this.prepareContextRecovery(task, taskRepoPath);
 
+      const derivedTaskId = deriveTaskId(task) ?? undefined;
+
       ralphEventBus.publish(
         buildRalphEvent({
           type: "worker.created",
           level: "info",
           ...(workerId ? { workerId } : {}),
           repo: this.repo,
-          taskId: task._path,
+          taskId: derivedTaskId,
           sessionId: task["session-id"]?.trim() || undefined,
           data: {
             ...(worktreePath ? { worktreePath } : {}),
@@ -5872,7 +5921,7 @@ ${guidance}`
       };
     } finally {
       if (typeof allocatedSlot === "number") {
-        this.releaseRepoSlot(allocatedSlot);
+        this.releaseRepoSlot(allocatedSlot, task);
       }
     }
   }
