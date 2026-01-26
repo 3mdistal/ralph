@@ -145,6 +145,18 @@ Guidelines:
 Escalation policy:
 - CI failures should default to an internal rework loop (resume/spawn) and only escalate to a human when they meet an escalation condition in `docs/escalation-policy.md` (e.g. product doc gap, hard external blocker).
 
+## CI-debug lane (required checks red)
+
+When an issue already has an open PR and required checks are failing or timed out, Ralph must treat CI-debug as a first-class recovery path.
+
+Behavior:
+- Detect: if required checks are failing or timed out, do **not** end in `ralph:blocked`.
+- Comment: post a single canonical GitHub **issue** comment listing failing required check names + links, base/head refs, and the action statement: “Ralph is spawning a dedicated CI-debug run to make required checks green.” Edit this comment as CI state changes (no duplicates).
+- Run: spawn a dedicated CI-debug run immediately with a fresh worktree and fresh OpenCode session (no planning phase). Seed the prompt with failing check names/URLs/refs and a brief failure summary.
+- Retries: allow bounded retries (2–3). If the same failure signature repeats across attempts, stop early and escalate.
+- Labels: while CI-debug is in progress, apply `ralph:stuck` and avoid `ralph:blocked`. Apply `ralph:escalated` only after bounded CI-debug attempts fail.
+- Escalation: post a final comment summarizing what failed, what was tried (links to attempts), and the exact next human action.
+
 ## Test Philosophy (Agentic Coding)
 
 Tests are most valuable when they defend product behavior, not implementation details.
