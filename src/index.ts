@@ -56,6 +56,7 @@ import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
 import { startGitHubIssuePollers } from "./github-issues-sync";
+import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
@@ -87,6 +88,7 @@ let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
 let githubDoneReconciler: { stop: () => void } | null = null;
+let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
 
@@ -1105,15 +1107,30 @@ async function main(): Promise<void> {
     retentionDays,
   });
 
+  autoQueueRunner = createAutoQueueRunner({
+    scheduleQueuedTasksSoon,
+  });
+
   githubIssuePollers = startGitHubIssuePollers({
     repos: config.repos,
     baseIntervalMs: config.pollInterval,
     log: (message) => console.log(message),
-    onSync: ({ result }) => {
-      if (!result.hadChanges || isShuttingDown || queueState.backend !== "github") return;
+    onSync: ({ repo, result }) => {
+      if (isShuttingDown || queueState.backend !== "github") return;
+      const repoConfig = config.repos.find((entry) => entry.name === repo);
+      if (repoConfig && autoQueueRunner) {
+        autoQueueRunner.schedule(repoConfig, "sync");
+      }
+      if (!result.hadChanges) return;
       scheduleQueuedTasksSoon();
     },
   });
+
+  if (queueState.backend === "github") {
+    for (const repo of config.repos) {
+      autoQueueRunner?.schedule(repo, "startup");
+    }
+  }
 
   githubDoneReconciler = startGitHubDoneReconciler({
     repos: config.repos,

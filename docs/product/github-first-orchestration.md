@@ -54,6 +54,21 @@ Note: scheduler "priority tasks" are reserved for resume work and are separate f
 - Stale recovery: Ralph only re-queues `ralph:in-progress` issues when the stored `heartbeat-at` exists and is stale beyond `ownershipTtlMs`.
   Missing or invalid heartbeats do not trigger automatic recovery.
 
+## Auto-queue (optional)
+
+Auto-queue is opt-in per repo and reconciles GitHub issues into the Ralph workflow based on dependency state.
+
+Config (`repos[].autoQueue`):
+- `enabled` (boolean): enable auto-queue reconciliation (default: false)
+- `scope` (string): `labeled-only` or `all-open` (default: `labeled-only`)
+- `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
+- `dryRun` (boolean): compute decisions without mutating labels (default: false)
+
+Behavior (when enabled):
+- Evaluates open issues for dependency/sub-issue blockers using GitHub-native relationships (body parsing is fallback).
+- Adds/removes `ralph:blocked` and `ralph:queued` labels based on blocked state.
+- Skips issues already in `ralph:in-progress`, `ralph:escalated`, or `ralph:done` states.
+
 ## Dependency encoding
 
 Dependencies can be encoded in issue bodies with deterministic section headers and task lists.

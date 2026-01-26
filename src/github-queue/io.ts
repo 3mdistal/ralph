@@ -1,10 +1,11 @@
-import { getConfig } from "../config";
+import { getConfig, getRepoAutoQueueConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
 import { GitHubClient, splitRepoFullName } from "../github/client";
 import { createRalphWorkflowLabelsEnsurer, type EnsureOutcome } from "../github/ensure-ralph-workflow-labels";
 import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
 import { GitHubRelationshipProvider } from "../github/issue-relationships";
+import { resolveRelationshipSignals } from "../github/relationship-signals";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {
@@ -314,22 +315,14 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         let plan = planClaim(issue.labels);
         try {
           const liveLabels = await io.listIssueLabels(issueRef.repo, issueRef.number);
-          if (liveLabels.includes("ralph:queued") && liveLabels.includes("ralph:blocked")) {
+          const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
+          const shouldCheckDependencies = liveLabels.includes("ralph:blocked") || autoQueueEnabled;
+          if (shouldCheckDependencies) {
             try {
               const relationships = new GitHubRelationshipProvider(issueRef.repo);
               const snapshot = await relationships.getSnapshot(issueRef);
-              if (!snapshot.coverage.githubDepsComplete || !snapshot.coverage.githubSubIssuesComplete) {
-                return {
-                  claimed: false,
-                  task: opts.task,
-                  reason: "Dependency coverage unknown; treating issue as blocked",
-                };
-              }
-              const ignoreBodyDeps = snapshot.coverage.githubDepsComplete && snapshot.coverage.githubSubIssuesComplete;
-              const signals = ignoreBodyDeps
-                ? snapshot.signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
-                : snapshot.signals;
-              const decision = computeBlockedDecision(signals);
+              const resolved = resolveRelationshipSignals(snapshot);
+              const decision = computeBlockedDecision(resolved.signals);
               if (decision.blocked || decision.confidence === "unknown") {
                 const reason =
                   decision.blocked && decision.reasons.length > 0

@@ -55,6 +55,7 @@ import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
+import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import {
   buildCiDebugCommentBody,
@@ -2130,40 +2131,11 @@ ${guidance}`
   }
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
-    const resolved = this.resolveDependencySignals(snapshot);
+    const resolved = resolveRelationshipSignals(snapshot);
     if (resolved.ignoredBodyBlockers > 0) {
       this.logIgnoredBodyBlockers(snapshot.issue, resolved.ignoredBodyBlockers, resolved.ignoreReason);
     }
-
-    if (!snapshot.coverage.githubDepsComplete && !resolved.hasBodyDepsCoverage) {
-      resolved.signals.push({ source: "github", kind: "blocked_by", state: "unknown" });
-    }
-    if (!snapshot.coverage.githubSubIssuesComplete) {
-      resolved.signals.push({ source: "github", kind: "sub_issue", state: "unknown" });
-    }
     return resolved.signals;
-  }
-
-  private resolveDependencySignals(snapshot: IssueRelationshipSnapshot): {
-    signals: RelationshipSignal[];
-    hasBodyDepsCoverage: boolean;
-    ignoredBodyBlockers: number;
-    ignoreReason: "complete" | "partial";
-  } {
-    const signals = [...snapshot.signals];
-    const githubDepsSignals = signals.filter((signal) => signal.source === "github" && signal.kind === "blocked_by");
-    const bodyDepsSignals = signals.filter((signal) => signal.source === "body" && signal.kind === "blocked_by");
-    const hasGithubDepsSignals = githubDepsSignals.length > 0;
-    const hasGithubDepsCoverage = snapshot.coverage.githubDepsComplete;
-    const shouldIgnoreBodyDeps = hasGithubDepsCoverage || (!hasGithubDepsCoverage && hasGithubDepsSignals);
-    const filteredSignals = shouldIgnoreBodyDeps
-      ? signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
-      : signals;
-    const hasBodyDepsCoverage = snapshot.coverage.bodyDeps && !shouldIgnoreBodyDeps;
-    const ignoredBodyBlockers = shouldIgnoreBodyDeps ? bodyDepsSignals.length : 0;
-    const ignoreReason = hasGithubDepsCoverage ? "complete" : "partial";
-
-    return { signals: filteredSignals, hasBodyDepsCoverage, ignoredBodyBlockers, ignoreReason };
   }
 
   private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {

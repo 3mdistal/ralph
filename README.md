@@ -144,6 +144,11 @@ sandbox = {
 - `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
 - `repos[].autoUpdateBehindLabel` (string): optional label gate required for proactive update-branch
 - `repos[].autoUpdateBehindMinMinutes` (number): minimum minutes between updates per PR (default: 30)
+- `repos[].autoQueue` (object, optional): auto-queue configuration
+  - `enabled` (boolean): enable auto-queue reconciliation (default: false)
+  - `scope` (string): `labeled-only` or `all-open` (default: `labeled-only`)
+  - `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
+  - `dryRun` (boolean): compute decisions without mutating labels (default: false)
 - `repos[].setup` (array): optional setup commands to run in the task worktree before any agent execution (operator-owned)
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
 - Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
