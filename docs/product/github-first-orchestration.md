@@ -21,6 +21,7 @@ Ralph only manages namespaced labels under `ralph:*` and never edits unrelated l
 | `ralph:in-progress` | Ralph is actively working | `FBCA04` |
 | `ralph:in-bot` | Task PR merged to `bot/integration` | `0E8A16` |
 | `ralph:blocked` | Blocked by dependencies | `D73A4A` |
+| `ralph:stuck` | CI remediation in progress | `F9A825` |
 | `ralph:done` | Task merged to default branch | `1A7F37` |
 | `ralph:escalated` | Waiting on human input | `B60205` |
 

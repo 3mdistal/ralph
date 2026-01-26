@@ -1,6 +1,48 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "fs/promises";
+import { join } from "path";
+import { tmpdir } from "os";
 
-import { reconcileEscalationResolutions } from "../github/escalation-resolution";
+import { __shouldFetchEscalationCommentsForTests, reconcileEscalationResolutions } from "../github/escalation-resolution";
+import {
+  closeStateDbForTests,
+  getEscalationCommentCheckState,
+  getIssueSnapshotByNumber,
+  initStateDb,
+  listIssuesWithAllLabels,
+  recordEscalationCommentCheckState,
+  recordIssueLabelsSnapshot,
+  recordIssueSnapshot,
+} from "../state";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
+
+let homeDir: string;
+let priorStateDbPath: string | undefined;
+let releaseLock: (() => void) | null = null;
+
+beforeEach(async () => {
+  priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
+  releaseLock = await acquireGlobalTestLock();
+  homeDir = await mkdtemp(join(tmpdir(), "ralph-escalation-"));
+  process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
+  closeStateDbForTests();
+  initStateDb();
+});
+
+afterEach(async () => {
+  try {
+    closeStateDbForTests();
+    await rm(homeDir, { recursive: true, force: true });
+  } finally {
+    if (priorStateDbPath === undefined) {
+      delete process.env.RALPH_STATE_DB_PATH;
+    } else {
+      process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
+    }
+    releaseLock?.();
+    releaseLock = null;
+  }
+});
 
 describe("escalation resolution reconciliation", () => {
   test("requeues on queued label and RALPH RESOLVED comment", async () => {
@@ -74,6 +116,7 @@ describe("escalation resolution reconciliation", () => {
       return true;
     };
 
+    const checkStates = new Map<number, { lastCheckedAt: string | null; lastSeenUpdatedAt: string | null }>();
     await reconcileEscalationResolutions({
       repo: "3mdistal/ralph",
       deps: {
@@ -81,6 +124,20 @@ describe("escalation resolution reconciliation", () => {
         listIssuesWithAllLabels,
         resolveAgentTaskByIssue,
         updateTaskStatus,
+        getIssueSnapshotByNumber: (_repo, issueNumber) => ({
+          repo: "3mdistal/ralph",
+          number: issueNumber,
+          title: null,
+          state: null,
+          url: null,
+          githubNodeId: null,
+          githubUpdatedAt: "2026-01-11T00:00:00.000Z",
+          labels: [],
+        }),
+        getEscalationCommentCheckState: (repo, issueNumber) => checkStates.get(issueNumber) ?? null,
+        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt }) => {
+          checkStates.set(issueNumber, { lastCheckedAt, lastSeenUpdatedAt: lastSeenUpdatedAt ?? null });
+        },
       },
       log: () => {},
     });
@@ -157,6 +214,7 @@ describe("escalation resolution reconciliation", () => {
       return true;
     };
 
+    const checkStates = new Map<number, { lastCheckedAt: string | null; lastSeenUpdatedAt: string | null }>();
     await reconcileEscalationResolutions({
       repo: "3mdistal/ralph",
       deps: {
@@ -164,10 +222,134 @@ describe("escalation resolution reconciliation", () => {
         listIssuesWithAllLabels,
         resolveAgentTaskByIssue,
         updateTaskStatus,
+        getIssueSnapshotByNumber: (_repo, issueNumber) => ({
+          repo: "3mdistal/ralph",
+          number: issueNumber,
+          title: null,
+          state: null,
+          url: null,
+          githubNodeId: null,
+          githubUpdatedAt: "2026-01-11T00:00:00.000Z",
+          labels: [],
+        }),
+        getEscalationCommentCheckState: (repo, issueNumber) => checkStates.get(issueNumber) ?? null,
+        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt }) => {
+          checkStates.set(issueNumber, { lastCheckedAt, lastSeenUpdatedAt: lastSeenUpdatedAt ?? null });
+        },
       },
       log: () => {},
     });
 
     expect(updated).toEqual([]);
+  });
+
+  test("skips comment fetch when interval has not elapsed", async () => {
+    const requests: string[] = [];
+    const github = {
+      request: async (path: string) => {
+        requests.push(path);
+        return { data: {} };
+      },
+    } as any;
+
+    const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
+      if (labels.includes("ralph:queued")) return [];
+      return [{ repo: "3mdistal/ralph", number: 42 }];
+    };
+
+    const checkStates = new Map<number, { lastCheckedAt: string | null; lastSeenUpdatedAt: string | null }>();
+    checkStates.set(42, { lastCheckedAt: "2026-01-11T00:00:00.000Z", lastSeenUpdatedAt: "2026-01-11T00:00:00.000Z" });
+
+    await reconcileEscalationResolutions({
+      repo: "3mdistal/ralph",
+      minRecheckIntervalMs: 10 * 60_000,
+      now: () => new Date("2026-01-11T00:01:00.000Z"),
+      deps: {
+        github,
+        listIssuesWithAllLabels,
+        resolveAgentTaskByIssue: async () => null,
+        updateTaskStatus: async () => true,
+        getIssueSnapshotByNumber: (_repo, issueNumber) => ({
+          repo: "3mdistal/ralph",
+          number: issueNumber,
+          title: null,
+          state: null,
+          url: null,
+          githubNodeId: null,
+          githubUpdatedAt: "2026-01-11T00:00:00.000Z",
+          labels: [],
+        }),
+        getEscalationCommentCheckState: (repo, issueNumber) => checkStates.get(issueNumber) ?? null,
+        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt }) => {
+          checkStates.set(issueNumber, { lastCheckedAt, lastSeenUpdatedAt: lastSeenUpdatedAt ?? null });
+        },
+      },
+      log: () => {},
+    });
+
+    expect(requests).toEqual([]);
+  });
+
+  test("uses persisted check state to avoid immediate refetch", async () => {
+    recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#77",
+      title: "Escalation",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/77",
+      githubUpdatedAt: "2026-01-11T00:00:00.000Z",
+      at: "2026-01-11T00:00:00.000Z",
+    });
+    recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#77",
+      labels: ["ralph:escalated"],
+      at: "2026-01-11T00:00:00.000Z",
+    });
+    recordEscalationCommentCheckState({
+      repo: "3mdistal/ralph",
+      issueNumber: 77,
+      lastCheckedAt: "2026-01-11T00:00:30.000Z",
+      lastSeenUpdatedAt: "2026-01-11T00:00:00.000Z",
+    });
+
+    const requests: string[] = [];
+    const github = {
+      request: async (path: string) => {
+        requests.push(path);
+        return { data: { data: {} } };
+      },
+    } as any;
+
+    await reconcileEscalationResolutions({
+      repo: "3mdistal/ralph",
+      minRecheckIntervalMs: 10 * 60_000,
+      now: () => new Date("2026-01-11T00:02:00.000Z"),
+      deps: {
+        github,
+        listIssuesWithAllLabels,
+        resolveAgentTaskByIssue: async () => null,
+        updateTaskStatus: async () => true,
+        getIssueSnapshotByNumber,
+        getEscalationCommentCheckState,
+        recordEscalationCommentCheckState,
+      },
+      log: () => {},
+    });
+
+    expect(requests).toEqual([]);
+  });
+
+  test("allows fetch when issue updated", () => {
+    const decision = __shouldFetchEscalationCommentsForTests({
+      nowMs: Date.parse("2026-01-11T00:02:00.000Z"),
+      lastCheckedAt: "2026-01-11T00:00:30.000Z",
+      lastSeenUpdatedAt: "2026-01-11T00:00:00.000Z",
+      githubUpdatedAt: "2026-01-11T00:01:00.000Z",
+      minIntervalMs: 10 * 60_000,
+    });
+
+    expect(decision.shouldFetch).toBe(true);
+    expect(decision.reason).toBe("updated");
   });
 });

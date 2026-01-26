@@ -115,6 +115,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
 - Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
+- `doneReconcileIntervalMs` (number): ms between GitHub done reconciliation checks (defaults to 300000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 - `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
@@ -122,6 +123,8 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `control` (object, optional): control file defaults
   - `autoCreate` (boolean): create `control.json` on startup (default: true)
   - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
+- `dashboard` (object, optional): control plane event persistence
+  - `eventsRetentionDays` (number): days to keep `~/.ralph/events/YYYY-MM-DD.jsonl` logs (default: 14; UTC bucketing; cleanup on daemon startup)
 
 Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derives required checks from GitHub branch protection on `bot/integration` (or `repos[].botBranch`), falling back to the repository default branch (usually `main`). If branch protection is missing or unreadable, Ralph does not gate merges. Ralph considers both check runs and legacy status contexts when matching available check names. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
@@ -392,7 +395,7 @@ Edit the control file (`~/.local/state/ralph/control.json`):
 
 Or send `SIGUSR1` to the daemon for immediate reload after editing.
 
-You can also use automatic selection for new tasks:
+You can also use automatic selection for new tasks (for example between "apple", "google", and "tempo"):
 
 ```json
 { "mode": "running", "opencode_profile": "auto" }
@@ -454,6 +457,13 @@ timeZone = "America/Indiana/Indianapolis"
 dayOfWeek = 4
 hour = 19
 minute = 9
+timeZone = "America/Indiana/Indianapolis"
+
+[throttle.perProfile.tempo.reset.weekly]
+# Wed 7:12pm
+dayOfWeek = 3
+hour = 19
+minute = 12
 timeZone = "America/Indiana/Indianapolis"
 ```
 
