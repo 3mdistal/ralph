@@ -30,16 +30,13 @@ export function formatLegacyWorktreeWarning(input: LegacyWorktreeWarningInput): 
     "Legacy paths:",
     ...legacyList.map((path) => `  ${path}`),
     "",
-    "Ralph will not auto-delete legacy worktrees.",
+    "Ralph will not auto-delete or auto-migrate legacy worktrees.",
     "",
-    "Review and clean safely:",
-    `  ralph worktrees legacy --repo ${input.repo} --dry-run --action cleanup`,
+    "Review and clean safely (manual):",
+    `  git -C ${input.repoPath} worktree list`,
     "",
-    "To clean safe worktrees:",
-    `  ralph worktrees legacy --repo ${input.repo} --action cleanup`,
-    "",
-    "Optional migrate (safe worktrees only):",
-    `  ralph worktrees legacy --repo ${input.repo} --action migrate`,
+    "To remove a legacy worktree after verifying it is safe:",
+    `  git -C ${input.repoPath} worktree remove <legacy-path>`,
   ];
 
   return lines.join("\n");

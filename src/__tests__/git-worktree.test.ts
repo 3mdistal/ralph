@@ -36,27 +36,67 @@ describe("git-worktree helpers", () => {
     expect(stripHeadsRef(undefined)).toBeNull();
   });
 
-  test("pickWorktreeForIssue prefers worktree-<issue> paths", () => {
+  test("pickWorktreeForIssue prefers managed issue segment paths", () => {
     const entries = parseGitWorktreeListPorcelain(
       [
         "worktree /repo",
         "HEAD deadbeef",
         "branch refs/heads/main",
         "",
-        "worktree /Users/alice/Developer/worktree-272-audit-fix-phase5",
+        "worktree /Users/alice/.ralph/worktrees/owner-repo/slot-0/346/task",
         "HEAD abcdef01",
-        "branch refs/heads/fix/audit-fix-phase5-272",
+        "branch refs/heads/fix/audit-fix-writes-346",
+        "",
+        "worktree /Users/alice/Developer/worktree-issue-346-audit-fix",
+        "HEAD abcdef02",
+        "branch refs/heads/fix/audit-fix-346",
         "",
         "worktree /Users/alice/Developer/worktree-346-audit-fix-writes",
-        "HEAD abcdef02",
+        "HEAD abcdef03",
         "branch refs/heads/fix/audit-fix-writes-346",
         "",
       ].join("\n")
     );
 
     const picked = pickWorktreeForIssue(entries, "346", { deprioritizeBranches: ["main", "bot/integration"] });
-    expect(picked?.worktreePath).toContain("worktree-346");
+    expect(picked?.worktreePath).toContain("/346/");
     expect(stripHeadsRef(picked?.branch ?? undefined)).toBe("fix/audit-fix-writes-346");
+  });
+
+  test("pickWorktreeForIssue avoids substring matches", () => {
+    const entries = parseGitWorktreeListPorcelain(
+      [
+        "worktree /Users/alice/.ralph/worktrees/owner-repo/slot-0/150/task",
+        "HEAD abcdef01",
+        "branch refs/heads/fix/legacy-150",
+        "",
+        "worktree /Users/alice/.ralph/worktrees/owner-repo/slot-0/15/task",
+        "HEAD abcdef02",
+        "branch refs/heads/fix/legacy-15",
+        "",
+        "worktree /Users/alice/Developer/worktree-issue-150-other",
+        "HEAD abcdef03",
+        "branch refs/heads/fix/legacy-150",
+        "",
+      ].join("\n")
+    );
+
+    const picked = pickWorktreeForIssue(entries, "15", { deprioritizeBranches: ["main", "bot/integration"] });
+    expect(picked?.worktreePath).toContain("/15/");
+  });
+
+  test("pickWorktreeForIssue ignores numeric substrings in branch names", () => {
+    const entries = parseGitWorktreeListPorcelain(
+      [
+        "worktree /Users/alice/Developer/worktree-issue-150-other",
+        "HEAD abcdef01",
+        "branch refs/heads/fix/legacy-150",
+        "",
+      ].join("\n")
+    );
+
+    const picked = pickWorktreeForIssue(entries, "15", { deprioritizeBranches: ["main", "bot/integration"] });
+    expect(picked).toBeNull();
   });
 
   test("parseGitWorktreeListPorcelain handles detached entry", () => {
