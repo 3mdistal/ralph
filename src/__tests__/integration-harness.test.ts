@@ -6,6 +6,7 @@ import { tmpdir } from "os";
 import { __resetConfigForTests } from "../config";
 import { getRalphConfigJsonPath } from "../paths";
 import { RepoWorker } from "../worker";
+import { closeStateDbForTests, initStateDb } from "../state";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let autoUpdateEnabled = false;
@@ -355,6 +356,44 @@ describe("integration-ish harness: full task lifecycle", () => {
       expect.objectContaining({ repo: "3mdistal/ralph", number: 102 }),
       "ralph:in-progress"
     );
+  });
+
+  test("restores session adapters after processTask", async () => {
+    initStateDb();
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ kind: "ok", repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).prepareContextRecovery = async () => {};
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).resolveOpencodeXdgForTask = async () => ({ profileName: null });
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    (worker as any).maybeHandleQueuedMergeConflict = async () => ({
+      taskName: "Integration Harness Task",
+      repo: "3mdistal/ralph",
+      outcome: "failed",
+    });
+    (worker as any).maybeHandleQueuedCiFailure = async () => null;
+
+    const originalBase = (worker as any).baseSession;
+    const originalSession = (worker as any).session;
+
+    try {
+      await worker.processTask(createMockTask());
+      expect((worker as any).baseSession).toBe(originalBase);
+      expect((worker as any).session).toBe(originalSession);
+    } finally {
+      closeStateDbForTests();
+    }
   });
 
   test("merge to main with allow-main does not apply in-bot labels", async () => {

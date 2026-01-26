@@ -3,11 +3,13 @@ import {
   RALPH_LABEL_ESCALATED,
   RALPH_LABEL_IN_PROGRESS,
   RALPH_LABEL_QUEUED,
+  RALPH_LABEL_STUCK,
   RALPH_ESCALATION_MARKER_REGEX,
   RALPH_RESOLVED_TEXT,
 } from "./escalation-constants";
 import { GitHubClient, splitRepoFullName } from "./client";
-import { addIssueLabel, removeIssueLabel } from "./issue-label-io";
+import { ensureRalphWorkflowLabelsOnce } from "./ensure-ralph-workflow-labels";
+import { executeIssueLabelOps, type LabelOp } from "./issue-label-io";
 
 export type EscalationWritebackContext = {
   repo: string;
@@ -15,6 +17,7 @@ export type EscalationWritebackContext = {
   taskName: string;
   taskPath: string;
   reason: string;
+  details?: string;
   escalationType: string;
   ownerHandle?: string;
 };
@@ -32,6 +35,7 @@ export type EscalationWritebackResult = {
   postedComment: boolean;
   skippedComment: boolean;
   markerFound: boolean;
+  commentUrl?: string | null;
 };
 
 type IssueComment = { body?: string | null };
@@ -47,6 +51,7 @@ type WritebackDeps = {
 
 const DEFAULT_COMMENT_SCAN_LIMIT = 100;
 const MAX_REASON_CHARS = 500;
+const MAX_DETAILS_CHARS = 5000;
 const FNV_OFFSET = 2166136261;
 const FNV_PRIME = 16777619;
 
@@ -113,12 +118,15 @@ export function buildEscalationComment(params: {
   taskName: string;
   issueUrl: string;
   reason: string;
+  details?: string;
   ownerHandle: string;
 }): string {
   const owner = params.ownerHandle.trim();
   const mention = owner ? `${owner} ` : "";
   const sanitized = sanitizeEscalationReason(params.reason);
   const reason = truncateText(sanitized, MAX_REASON_CHARS) || "(no reason provided)";
+  const rawDetails = params.details ? sanitizeEscalationReason(params.details) : "";
+  const details = rawDetails ? truncateText(rawDetails, MAX_DETAILS_CHARS) : "";
 
   return [
     params.marker,
@@ -128,6 +136,9 @@ export function buildEscalationComment(params: {
     "",
     "Reason:",
     reason,
+    details ? "" : null,
+    details ? "Details:" : null,
+    details || null,
     "",
     "To resolve:",
     `1. Comment with \`${RALPH_RESOLVED_TEXT} <guidance>\` to resume with guidance.`,
@@ -152,6 +163,7 @@ export function planEscalationWriteback(ctx: EscalationWritebackContext): Escala
     taskName: ctx.taskName,
     issueUrl,
     reason: ctx.reason,
+    details: ctx.details,
     ownerHandle,
   });
 
@@ -167,7 +179,7 @@ export function planEscalationWriteback(ctx: EscalationWritebackContext): Escala
     markerId,
     commentBody,
     addLabels: [RALPH_LABEL_ESCALATED],
-    removeLabels: [RALPH_LABEL_IN_PROGRESS, RALPH_LABEL_QUEUED],
+    removeLabels: [RALPH_LABEL_IN_PROGRESS, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK],
     idempotencyKey,
   };
 }
@@ -215,20 +227,28 @@ async function listRecentIssueComments(params: {
   return { comments, reachedMax };
 }
 
-async function createIssueComment(params: { github: GitHubClient; repo: string; issueNumber: number; body: string }) {
+async function createIssueComment(params: {
+  github: GitHubClient;
+  repo: string;
+  issueNumber: number;
+  body: string;
+}): Promise<{ html_url?: string | null }> {
   const { owner, name } = splitRepoFullName(params.repo);
-  await params.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments`, {
-    method: "POST",
-    body: { body: params.body },
-  });
+  const response = await params.github.request<{ html_url?: string | null }>(
+    `/repos/${owner}/${name}/issues/${params.issueNumber}/comments`,
+    {
+      method: "POST",
+      body: { body: params.body },
+    }
+  );
+  return response.data ?? {};
 }
 
-async function addEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await addIssueLabel(params);
-}
-
-async function removeEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await removeIssueLabel({ ...params, allowNotFound: true });
+function buildEscalationLabelOps(plan: EscalationWritebackPlan): LabelOp[] {
+  return [
+    ...plan.removeLabels.map((label) => ({ action: "remove" as const, label })),
+    ...plan.addLabels.map((label) => ({ action: "add" as const, label })),
+  ];
 }
 
 export async function writeEscalationToGitHub(
@@ -252,19 +272,21 @@ export async function writeEscalationToGitHub(
   const deleteKey = deps.deleteIdempotencyKey ?? deleteIdempotencyKey;
   const prefix = `[ralph:gh-escalation:${ctx.repo}]`;
 
-  for (const label of plan.removeLabels) {
-    try {
-      await removeEscalationLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
-    } catch (error: any) {
-      log(`${prefix} Failed to remove label '${label}' on #${ctx.issueNumber}: ${error?.message ?? String(error)}`);
-    }
-  }
-
-  for (const label of plan.addLabels) {
-    try {
-      await addEscalationLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
-    } catch (error: any) {
-      log(`${prefix} Failed to add label '${label}' on #${ctx.issueNumber}: ${error?.message ?? String(error)}`);
+  const labelOps = buildEscalationLabelOps(plan);
+  if (labelOps.length > 0) {
+    const labelResult = await executeIssueLabelOps({
+      github: deps.github,
+      repo: ctx.repo,
+      issueNumber: ctx.issueNumber,
+      ops: labelOps,
+      log: (message) => log(`${prefix} ${message}`),
+      logLabel: `${ctx.repo}#${ctx.issueNumber}`,
+      ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: ctx.repo, github: deps.github }),
+      retryMissingLabelOnce: true,
+      ensureBefore: true,
+    });
+    if (!labelResult.ok) {
+      log(`${prefix} Failed to update escalation labels for #${ctx.issueNumber}; continuing.`);
     }
   }
 
@@ -302,7 +324,7 @@ export async function writeEscalationToGitHub(
 
   if (hasKeyResult && markerFound) {
     log(`${prefix} Escalation comment already recorded (idempotency + marker); skipping.`);
-    return { postedComment: false, skippedComment: true, markerFound: true };
+    return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: null };
   }
 
   const scanComplete = Boolean(listResult && !listResult.reachedMax);
@@ -328,7 +350,7 @@ export async function writeEscalationToGitHub(
       log(`${prefix} Failed to record idempotency after marker match: ${error?.message ?? String(error)}`);
     }
     log(`${prefix} Existing escalation marker found for #${ctx.issueNumber}; skipping comment.`);
-    return { postedComment: false, skippedComment: true, markerFound: true };
+    return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: null };
   }
 
 
@@ -348,18 +370,20 @@ export async function writeEscalationToGitHub(
     }
     if (alreadyClaimed) {
       log(`${prefix} Escalation comment already claimed; skipping comment.`);
-      return { postedComment: false, skippedComment: true, markerFound: false };
+      return { postedComment: false, skippedComment: true, markerFound: false, commentUrl: null };
     }
   }
 
 
+  let commentUrl: string | null = null;
   try {
-    await createIssueComment({
+    const comment = await createIssueComment({
       github: deps.github,
       repo: ctx.repo,
       issueNumber: ctx.issueNumber,
       body: plan.commentBody,
     });
+    commentUrl = comment?.html_url ?? null;
   } catch (error) {
     if (claimed) {
       try {
@@ -381,5 +405,5 @@ export async function writeEscalationToGitHub(
 
   log(`${prefix} Posted escalation comment for #${ctx.issueNumber}.`);
 
-  return { postedComment: true, skippedComment: false, markerFound: false };
+  return { postedComment: true, skippedComment: false, markerFound: false, commentUrl };
 }

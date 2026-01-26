@@ -21,8 +21,26 @@ type EnsureFactoryParams = {
 const AUTH_SCOPE_GUIDANCE =
   "Ensure the GitHub token can manage labels (PAT: repo scope or fine-grained Issues read/write + Metadata read; GitHub App: Issues read/write + Metadata read).";
 
+const TRANSIENT_CACHE_TTL_MS = 60_000;
+
+function isSecondaryRateLimit(error: GitHubApiError): boolean {
+  const text = error.responseText.toLowerCase();
+  return (
+    text.includes("secondary rate limit") ||
+    text.includes("abuse detection") ||
+    text.includes("temporarily blocked")
+  );
+}
+
 function classifyEnsureError(error: unknown): "auth" | "transient" {
-  if (error instanceof GitHubApiError && (error.code === "auth" || error.status === 401 || error.status === 403)) {
+  if (!(error instanceof GitHubApiError)) return "transient";
+  if (error.status === 429 || error.code === "rate_limit" || isSecondaryRateLimit(error)) {
+    return "transient";
+  }
+  if (error.status === 401 || error.status === 403 || error.code === "auth") {
+    return "auth";
+  }
+  if (error.status === 404) {
     return "auth";
   }
   return "transient";
@@ -30,8 +48,18 @@ function classifyEnsureError(error: unknown): "auth" | "transient" {
 
 function formatEnsureErrorMessage(error: unknown): string {
   if (!error) return "Unknown error";
+  if (error instanceof GitHubApiError) {
+    const requestId = error.requestId ? ` requestId=${error.requestId}` : "";
+    const responseText = error.responseText.trim().slice(0, 200);
+    const response = responseText ? ` response=\"${responseText}\"` : "";
+    return `${error.message || error.name}${requestId}${response}`.trim();
+  }
   if (error instanceof Error) return error.message || error.name;
   return String(error);
+}
+
+function isAuthNotFound(error: unknown): boolean {
+  return Boolean(error instanceof GitHubApiError && error.status === 404);
 }
 
 function isAlreadyExistsError(error: unknown): boolean {
@@ -81,6 +109,7 @@ export function createRalphWorkflowLabelsEnsurer(params: EnsureFactoryParams): {
   ensure: (repo: string) => Promise<EnsureOutcome>;
 } {
   const cache = new Map<string, EnsureOutcome>();
+  const transientCache = new Map<string, { outcome: EnsureOutcome; expiresAt: number }>();
   const inFlight = new Map<string, Promise<EnsureOutcome>>();
   const log = params.log ?? ((message: string) => console.log(message));
   const warn = params.warn ?? ((message: string) => console.warn(message));
@@ -88,8 +117,11 @@ export function createRalphWorkflowLabelsEnsurer(params: EnsureFactoryParams): {
 
   const warnAuth = (repo: string, error: unknown) => {
     if (!shouldLogFn(`ralph:labels:auth:${repo}`, 60_000)) return;
+    const notFoundHint = isAuthNotFound(error) ? " (404 may be permissions)" : "";
     warn(
-      `[ralph:labels:${repo}] GitHub label bootstrap failed due to permissions: ${formatEnsureErrorMessage(error)}`
+      `[ralph:labels:${repo}] GitHub label bootstrap failed due to permissions${notFoundHint}: ${formatEnsureErrorMessage(
+        error
+      )}`
     );
     warn(`[ralph:labels:${repo}] ${AUTH_SCOPE_GUIDANCE}`);
   };
@@ -102,6 +134,14 @@ export function createRalphWorkflowLabelsEnsurer(params: EnsureFactoryParams): {
   const ensure = async (repo: string): Promise<EnsureOutcome> => {
     const cached = cache.get(repo);
     if (cached) return cached;
+
+    const cachedTransient = transientCache.get(repo);
+    if (cachedTransient) {
+      if (Date.now() < cachedTransient.expiresAt) {
+        return cachedTransient.outcome;
+      }
+      transientCache.delete(repo);
+    }
 
     const existing = inFlight.get(repo);
     if (existing) return existing;
@@ -117,11 +157,17 @@ export function createRalphWorkflowLabelsEnsurer(params: EnsureFactoryParams): {
           log(`[ralph:labels:${repo}] Updated GitHub label(s): ${outcome.updated.join(", ")}`);
         }
         cache.set(repo, outcome);
+        transientCache.delete(repo);
       } else if (outcome.kind === "auth") {
         warnAuth(repo, outcome.error);
         cache.set(repo, outcome);
+        transientCache.delete(repo);
       } else {
         warnTransient(repo, outcome.error);
+        transientCache.set(repo, {
+          outcome,
+          expiresAt: Date.now() + TRANSIENT_CACHE_TTL_MS,
+        });
       }
 
       return outcome;

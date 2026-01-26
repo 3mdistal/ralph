@@ -20,6 +20,10 @@ export function getRalphHomeDir(): string {
   return join(resolveHomeDir(), ".ralph");
 }
 
+export function getRalphEventsDir(): string {
+  return join(getRalphHomeDir(), "events");
+}
+
 export function getRalphConfigTomlPath(): string {
   return join(getRalphHomeDir(), "config.toml");
 }
@@ -96,4 +100,9 @@ export function getRalphSessionLockPath(sessionId: string): string {
 
 export function getRalphSessionNudgesPath(sessionId: string): string {
   return join(getRalphSessionDir(sessionId), "nudges.jsonl");
+}
+
+export function getRalphEventsDayLogPath(day: string, eventsDir?: string): string {
+  const baseDir = eventsDir ?? getRalphEventsDir();
+  return join(baseDir, `${day}.jsonl`);
 }

@@ -20,6 +20,11 @@ export interface RepoConfig {
    * falling back to the repo default branch. Missing/unreadable protection disables gating.
    */
   requiredChecks?: string[];
+  /**
+   * Optional per-repo setup commands run in the task worktree before any agent execution.
+   * Commands are operator-owned and defined in ~/.ralph/config.toml|json.
+   */
+  setup?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
@@ -125,6 +130,43 @@ export interface ControlConfig {
   suppressMissingWarnings?: boolean;
 }
 
+export class RalphConfigError extends Error {
+  readonly code: "RALPH_CONFIG_INVALID" | "RALPH_CONFIG_SANDBOX_INVALID";
+
+  constructor(code: "RALPH_CONFIG_INVALID" | "RALPH_CONFIG_SANDBOX_INVALID", message: string) {
+    super(message);
+    this.name = "RalphConfigError";
+    this.code = code;
+  }
+}
+
+export type RalphProfile = "prod" | "sandbox";
+
+export interface SandboxGithubAuthConfig {
+  githubApp?: {
+    appId: number | string;
+    installationId: number | string;
+    /** PEM file path (read at runtime; never log key material). */
+    privateKeyPath: string;
+  };
+  /** Env var name for a fine-grained PAT restricted to sandbox repos. */
+  tokenEnvVar?: string;
+}
+
+export interface SandboxProfileConfig {
+  /** Allowed repo owners for sandbox runs (non-empty). */
+  allowedOwners: string[];
+  /** Required repo name prefix for sandbox repos. */
+  repoNamePrefix: string;
+  /** Dedicated GitHub auth for sandbox runs. */
+  githubAuth: SandboxGithubAuthConfig;
+}
+
+export interface DashboardConfig {
+  /** Days to retain dashboard event logs (default: 14). */
+  eventsRetentionDays?: number;
+}
+
 export type QueueBackend = "github" | "bwrb" | "none";
 
 export interface RalphConfig {
@@ -133,12 +175,19 @@ export interface RalphConfig {
   maxWorkers: number;
   batchSize: number;       // PRs before rollup (default: 10)
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
+  /** ms between done reconciliation checks (default: 300000) */
+  doneReconcileIntervalMs: number;
   /** Ownership TTL in ms for task heartbeats (default: 60000). */
   ownershipTtlMs: number;
   /** Queue backend selection (default: "github"). */
   queueBackend?: QueueBackend;
   bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // default GitHub owner (default: "3mdistal")
+
+  /** Runtime profile for safety rails (default: "prod"). */
+  profile?: RalphProfile;
+  /** Sandbox profile configuration (required when profile="sandbox"). */
+  sandbox?: SandboxProfileConfig;
 
   /**
    * Guardrail: only touch repos whose owner is in this allowlist.
@@ -159,11 +208,13 @@ export interface RalphConfig {
   throttle?: ThrottleConfig;
   opencode?: OpencodeConfig;
   control?: ControlConfig;
+  dashboard?: DashboardConfig;
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
+const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
@@ -173,6 +224,7 @@ const DEFAULT_THROTTLE_HARD_PCT = 0.75;
 const DEFAULT_THROTTLE_MIN_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_THROTTLE_BUDGET_5H_TOKENS = 16_987_015;
 const DEFAULT_THROTTLE_BUDGET_WEEKLY_TOKENS = 55_769_305;
+const DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS = 14;
 
 function detectDefaultBwrbVault(): string {
   const start = process.cwd();
@@ -239,11 +291,13 @@ const DEFAULT_CONFIG: RalphConfig = {
   maxWorkers: DEFAULT_GLOBAL_MAX_WORKERS,
   batchSize: 10,
   pollInterval: 30000,
+  doneReconcileIntervalMs: DEFAULT_DONE_RECONCILE_INTERVAL_MS,
   ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
   queueBackend: "github",
   bwrbVault: detectDefaultBwrbVault(),
   owner: "3mdistal",
   devDir: join(homedir(), "Developer"),
+  profile: "prod",
 };
 
 type ConfigSource = "default" | "toml" | "json" | "legacy";
@@ -272,6 +326,20 @@ function toPositiveIntOrNull(value: unknown): number | null {
   if (!Number.isInteger(value)) return null;
   if (value <= 0) return null;
   return value;
+}
+
+function toPositiveIntFromUnknownOrNull(value: unknown): number | null {
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
+  if (!Number.isFinite(n)) return null;
+  if (!Number.isInteger(n)) return null;
+  if (n <= 0) return null;
+  return n;
+}
+
+function toNonEmptyStringOrNull(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
 }
 
 function toStringArrayOrNull(value: unknown): string[] | null {
@@ -326,6 +394,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.ownershipTtlMs = DEFAULT_OWNERSHIP_TTL_MS;
   }
 
+  const doneInterval = toPositiveIntOrNull((loaded as any).doneReconcileIntervalMs);
+  if (!doneInterval) {
+    const raw = (loaded as any).doneReconcileIntervalMs;
+    if (raw !== undefined) {
+      console.warn(
+        `[ralph] Invalid config doneReconcileIntervalMs=${JSON.stringify(raw)}; falling back to default ${DEFAULT_DONE_RECONCILE_INTERVAL_MS}`
+      );
+    }
+    loaded.doneReconcileIntervalMs = DEFAULT_DONE_RECONCILE_INTERVAL_MS;
+  }
+
   const rawQueueBackend = (loaded as any).queueBackend;
   if (rawQueueBackend !== undefined) {
     if (isQueueBackendValue(rawQueueBackend)) {
@@ -338,6 +417,18 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     }
   } else if (!loaded.queueBackend) {
     loaded.queueBackend = "github";
+  }
+
+  const rawProfile = (loaded as any).profile;
+  if (rawProfile === undefined || rawProfile === null || rawProfile === "") {
+    loaded.profile = "prod";
+  } else if (rawProfile === "prod" || rawProfile === "sandbox") {
+    loaded.profile = rawProfile;
+  } else {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_INVALID",
+      `[ralph] Invalid config profile=${JSON.stringify(rawProfile)}; expected "prod" or "sandbox".`
+    );
   }
 
   // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
@@ -414,6 +505,83 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.allowedOwners = [loaded.owner];
   }
 
+  if (loaded.profile === "sandbox") {
+    const rawSandbox = (loaded as any).sandbox;
+    if (!rawSandbox || typeof rawSandbox !== "object" || Array.isArray(rawSandbox)) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires a sandbox config block."
+      );
+    }
+
+    const allowedOwners = toStringArrayOrNull((rawSandbox as any).allowedOwners);
+    if (!allowedOwners || allowedOwners.length === 0) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires sandbox.allowedOwners (non-empty array)."
+      );
+    }
+
+    const repoNamePrefix = toNonEmptyStringOrNull((rawSandbox as any).repoNamePrefix);
+    if (!repoNamePrefix) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires sandbox.repoNamePrefix (non-empty string)."
+      );
+    }
+
+    const rawGithubAuth = (rawSandbox as any).githubAuth;
+    if (!rawGithubAuth || typeof rawGithubAuth !== "object" || Array.isArray(rawGithubAuth)) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires sandbox.githubAuth with githubApp or tokenEnvVar."
+      );
+    }
+
+    const rawSandboxApp = (rawGithubAuth as any).githubApp;
+    const tokenEnvVar = toNonEmptyStringOrNull((rawGithubAuth as any).tokenEnvVar) ?? undefined;
+
+    let hasValidApp = false;
+    if (rawSandboxApp && typeof rawSandboxApp === "object" && !Array.isArray(rawSandboxApp)) {
+      const appId = toPositiveIntFromUnknownOrNull((rawSandboxApp as any).appId);
+      const installationId = toPositiveIntFromUnknownOrNull((rawSandboxApp as any).installationId);
+      const privateKeyPath = toNonEmptyStringOrNull((rawSandboxApp as any).privateKeyPath);
+      hasValidApp = Boolean(appId && installationId && privateKeyPath);
+      if (!hasValidApp) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox githubAuth.githubApp is invalid; expected { appId, installationId, privateKeyPath }."
+        );
+      }
+    }
+
+    if (!hasValidApp && !tokenEnvVar) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_SANDBOX_INVALID",
+        "[ralph] Sandbox profile requires githubAuth.githubApp or githubAuth.tokenEnvVar."
+      );
+    }
+
+    if (!hasValidApp && tokenEnvVar) {
+      const tokenValue = process.env[tokenEnvVar];
+      if (!tokenValue || !tokenValue.trim()) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          `[ralph] Sandbox githubAuth.tokenEnvVar is set but ${tokenEnvVar} is missing/empty.`
+        );
+      }
+    }
+
+    loaded.sandbox = {
+      allowedOwners,
+      repoNamePrefix,
+      githubAuth: {
+        ...(hasValidApp ? { githubApp: rawSandboxApp } : {}),
+        ...(tokenEnvVar ? { tokenEnvVar } : {}),
+      },
+    };
+  }
+
   // Best-effort validation for GitHub App auth config.
   const rawGithubApp = (loaded as any).githubApp;
   if (rawGithubApp !== undefined && rawGithubApp !== null && typeof rawGithubApp !== "object") {
@@ -456,6 +624,24 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     } else {
       loaded.control = undefined;
     }
+  }
+
+  // Best-effort validation for dashboard config.
+  const rawDashboard = (loaded as any).dashboard;
+  if (rawDashboard !== undefined && rawDashboard !== null && (typeof rawDashboard !== "object" || Array.isArray(rawDashboard))) {
+    console.warn(`[ralph] Invalid config dashboard=${JSON.stringify(rawDashboard)}; ignoring`);
+    (loaded as any).dashboard = undefined;
+  } else if (rawDashboard && typeof rawDashboard === "object") {
+    const rawRetention = (rawDashboard as any).eventsRetentionDays;
+    const parsedRetention = rawRetention === undefined ? null : toPositiveIntOrNull(rawRetention);
+    if (rawRetention !== undefined && parsedRetention == null) {
+      console.warn(
+        `[ralph] Invalid config dashboard.eventsRetentionDays=${JSON.stringify(rawRetention)}; ` +
+          `defaulting to ${DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS}`
+      );
+    }
+    const retention = parsedRetention ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
+    loaded.dashboard = { eventsRetentionDays: retention };
   }
 
   // Best-effort validation for OpenCode profile config.
@@ -1016,6 +1202,19 @@ export function getConfig(): RalphConfig {
   return loadConfig().config;
 }
 
+export function getProfile(): RalphProfile {
+  return getConfig().profile ?? "prod";
+}
+
+export function isSandboxProfile(): boolean {
+  return getProfile() === "sandbox";
+}
+
+export function getSandboxProfileConfig(): SandboxProfileConfig | null {
+  const cfg = getConfig();
+  return cfg.profile === "sandbox" ? (cfg.sandbox ?? null) : null;
+}
+
 export function getRepoPath(repoName: string): string {
   const cfg = getConfig();
   
@@ -1040,8 +1239,30 @@ export function getRepoRequiredChecksOverride(repoName: string): string[] | null
   return toStringArrayOrNull(explicit?.requiredChecks);
 }
 
+export function getRepoSetupCommands(repoName: string): string[] | null {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  if (!explicit || (explicit as any).setup === undefined) return null;
+
+  const parsed = toStringArrayOrNull((explicit as any).setup);
+  if (parsed === null) {
+    console.warn(
+      `[ralph] Invalid config setup for repo ${repoName}: ${JSON.stringify((explicit as any).setup)}; ignoring.`
+    );
+    return null;
+  }
+  return parsed;
+}
+
 export function getGlobalMaxWorkers(): number {
   return getConfig().maxWorkers;
+}
+
+export function getDashboardEventsRetentionDays(): number {
+  const cfg = getConfig();
+  const raw = cfg.dashboard?.eventsRetentionDays;
+  const parsed = toPositiveIntOrNull(raw);
+  return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
 }
 
 export function getRepoMaxWorkers(repoName: string): number {

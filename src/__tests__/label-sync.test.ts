@@ -59,6 +59,50 @@ describe("ensureRalphWorkflowLabelsOnce", () => {
       expect(outcome.kind).toBe("auth");
     }
   });
+
+  test("treats secondary rate limit as transient", async () => {
+    const listLabelSpecs = mock(async () => {
+      throw new GitHubApiError({
+        message: "Rate limited",
+        code: "auth",
+        status: 403,
+        requestId: "req-123",
+        responseText: "You have exceeded a secondary rate limit",
+      });
+    });
+
+    const outcome = await ensureRalphWorkflowLabelsOnce({
+      repo: "3mdistal/ralph",
+      github: { listLabelSpecs, createLabel: mock(async () => {}), updateLabel: mock(async () => {}) } as any,
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.kind).toBe("transient");
+    }
+  });
+
+  test("treats rate limit status as transient", async () => {
+    const listLabelSpecs = mock(async () => {
+      throw new GitHubApiError({
+        message: "Rate limit",
+        code: "rate_limit",
+        status: 429,
+        requestId: "req-429",
+        responseText: "API rate limit exceeded",
+      });
+    });
+
+    const outcome = await ensureRalphWorkflowLabelsOnce({
+      repo: "3mdistal/ralph",
+      github: { listLabelSpecs, createLabel: mock(async () => {}), updateLabel: mock(async () => {}) } as any,
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) {
+      expect(outcome.kind).toBe("transient");
+    }
+  });
 });
 
 describe("createRalphWorkflowLabelsEnsurer", () => {
@@ -82,7 +126,7 @@ describe("createRalphWorkflowLabelsEnsurer", () => {
     expect(listLabelSpecs).toHaveBeenCalledTimes(1);
   });
 
-  test("retries after transient failures", async () => {
+  test("throttles transient failures", async () => {
     let calls = 0;
     const listLabelSpecs = mock(async () => {
       calls += 1;
@@ -96,6 +140,6 @@ describe("createRalphWorkflowLabelsEnsurer", () => {
     await ensurer.ensure("3mdistal/ralph");
     await ensurer.ensure("3mdistal/ralph");
 
-    expect(listLabelSpecs).toHaveBeenCalledTimes(2);
+    expect(listLabelSpecs).toHaveBeenCalledTimes(1);
   });
 });

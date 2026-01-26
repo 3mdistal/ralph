@@ -1,6 +1,6 @@
 import { getConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
-import { GitHubApiError, GitHubClient, splitRepoFullName } from "../github/client";
+import { GitHubClient, splitRepoFullName } from "../github/client";
 import { createRalphWorkflowLabelsEnsurer, type EnsureOutcome } from "../github/ensure-ralph-workflow-labels";
 import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
@@ -9,6 +9,7 @@ import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {
   addIssueLabel as addIssueLabelIo,
+  applyIssueLabelOps,
   removeIssueLabel as removeIssueLabelIo,
 } from "../github/issue-label-io";
 import {
@@ -117,56 +118,6 @@ function applyLabelDelta(params: {
   });
 }
 
-async function applyLabelOps(params: {
-  repo: string;
-  issueNumber: number;
-  steps: LabelOp[];
-  logLabel: string;
-  io: GitHubQueueIO;
-  didRetry?: boolean;
-}): Promise<{ add: string[]; remove: string[]; ok: boolean }> {
-  const added: string[] = [];
-  const removed: string[] = [];
-  const applied: LabelOp[] = [];
-
-  for (const step of params.steps) {
-    try {
-      if (step.action === "add") {
-        await params.io.addIssueLabel(params.repo, params.issueNumber, step.label);
-        added.push(step.label);
-        applied.push(step);
-      } else {
-        const result = await params.io.removeIssueLabel(params.repo, params.issueNumber, step.label);
-        if (result.removed) {
-          removed.push(step.label);
-          applied.push(step);
-        }
-      }
-    } catch (error: any) {
-      console.warn(
-        `[ralph:queue:github] Failed to ${step.action} ${step.label} for ${params.logLabel}: ${error?.message ?? String(error)}`
-      );
-      for (const rollback of [...applied].reverse()) {
-        try {
-          if (rollback.action === "add") {
-            await params.io.removeIssueLabel(params.repo, params.issueNumber, rollback.label);
-          } else {
-            await params.io.addIssueLabel(params.repo, params.issueNumber, rollback.label);
-          }
-        } catch {
-          // best-effort rollback
-        }
-      }
-      if (!params.didRetry && isMissingLabelError(error)) {
-        await params.io.ensureWorkflowLabels(params.repo);
-        return await applyLabelOps({ ...params, didRetry: true });
-      }
-      return { add: added, remove: removed, ok: false };
-    }
-  }
-
-  return { add: added, remove: removed, ok: true };
-}
 
 function normalizeOptionalString(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -174,10 +125,11 @@ function normalizeOptionalString(value: unknown): string | undefined {
   return trimmed ? trimmed : undefined;
 }
 
-function isMissingLabelError(error: unknown): boolean {
-  if (!(error instanceof GitHubApiError)) return false;
-  if (error.status !== 422) return false;
-  return /label[^\n]*does not exist/i.test(error.responseText);
+function buildLabelOpsIo(io: GitHubQueueIO, repo: string, issueNumber: number) {
+  return {
+    addLabel: async (label: string) => await io.addIssueLabel(repo, issueNumber, label),
+    removeLabel: async (label: string) => await io.removeIssueLabel(repo, issueNumber, label),
+  };
 }
 
 function buildOwnershipSkipReason(state: TaskOpState, daemonId: string, nowMs: number, ttlMs: number): string {
@@ -400,12 +352,13 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         const nowIso = new Date(opts.nowMs).toISOString();
         const taskPath = opState.taskPath || `github:${issueRef.repo}#${issueRef.number}`;
 
-        const labelOps = await applyLabelOps({
-          repo: issueRef.repo,
-          issueNumber: issueRef.number,
-          steps: plan.steps,
+        const labelOps = await applyIssueLabelOps({
+          ops: plan.steps,
+          io: buildLabelOpsIo(io, issueRef.repo, issueRef.number),
           logLabel: `${issueRef.repo}#${issueRef.number}`,
-          io,
+          log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+          ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
+          retryMissingLabelOnce: true,
         });
         if (!labelOps.ok) {
           return { claimed: false, task: opts.task, reason: "Failed to update claim labels" };
@@ -530,12 +483,13 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         ...delta.add.map((label) => ({ action: "add" as const, label })),
         ...delta.remove.map((label) => ({ action: "remove" as const, label })),
       ];
-      const labelOps = await applyLabelOps({
-        repo: issueRef.repo,
-        issueNumber: issueRef.number,
-        steps,
+      const labelOps = await applyIssueLabelOps({
+        ops: steps,
+        io: buildLabelOpsIo(io, issueRef.repo, issueRef.number),
         logLabel: `${issueRef.repo}#${issueRef.number}`,
-        io,
+        log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+        ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
+        retryMissingLabelOnce: true,
       });
       if (!labelOps.ok) return false;
 

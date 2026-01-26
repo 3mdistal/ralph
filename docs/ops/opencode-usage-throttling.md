@@ -13,12 +13,28 @@ Ensure Ralph never consumes more than a configurable fraction of the operator's 
 - Add pacing so usage stays smooth and I don’t hit the wall suddenly.
 
 ## Key Constraints
-- No official API (today) to programmatically query Codex plan remaining percent/reset times.
-- We can treat plan limits as constants after a one-time calibration.
+- No official stable API to query Codex plan remaining percent/reset times; remote meters are best-effort and may fail.
+- We can treat plan limits as constants after a one-time calibration when relying on local logs.
 - Weekly + 5-hour windows must both be respected.
 
-## Data Source (Ground Truth)
-OpenCode stores per-message usage locally; we can sum usage in rolling windows by timestamp.
+## Usage Source Precedence (OpenAI)
+
+Ralph prefers remote usage meters for OpenAI when available and falls back to local OpenCode logs when remote usage is unavailable or fails.
+
+- Default/preferred: `openaiSource=remoteUsage`.
+- Fallback: `localLogs` (OpenCode message-log scan).
+- If `openaiSource=localLogs`, never attempt remote usage.
+
+## Data Source (Meters + Fallback)
+
+### Remote meters (preferred for OpenAI)
+
+- Uses OpenAI remote usage meters (best-effort) when `openaiSource=remoteUsage`.
+- Remote usage provides per-window `usedPct` and `resetAt` values for rolling 5h + weekly.
+
+### Local logs (fallback)
+
+OpenCode stores per-message usage locally; Ralph sums usage in rolling windows by timestamp.
 
 - Location (macOS): `~/.local/share/opencode/storage/message/**/msg_*.json`
 - Relevant fields: `providerID`, `role`, `time.created`, `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read/write`

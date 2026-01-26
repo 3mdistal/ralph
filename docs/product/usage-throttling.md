@@ -40,6 +40,22 @@ When using multiple OpenCode profiles (multi-account), Ralph may apply throttle 
 
 When no effective profile is known, Ralph should fall back to global throttle settings.
 
+### Usage source precedence (OpenAI)
+
+When the effective provider is OpenAI, the usage source used for throttling **and** status must follow this precedence:
+
+- Default/preferred: remote meters (`openaiSource=remoteUsage`).
+- If remote usage is enabled but unavailable/fails, fall back to local OpenCode message-log scanning.
+- If `openaiSource` is explicitly set to `localLogs`, do not attempt remote usage.
+
+### Status visibility
+
+`bun run status` must reuse the same throttle snapshot logic and show per-profile usage for rolling 5h + weekly windows.
+
+- When remote meters are used: show `source=remoteUsage`, `usedPct`, and `resetAt` for both windows.
+- When falling back to local logs: show `source=localLogs`, `used/softCap/hardCap` tokens, and include `remoteUsageError` when present.
+- If no local logs exist: degrade gracefully with “no data / 0 usage” (status must not fail).
+
 #### Profile failover (new work)
 
 Hard throttle is evaluated against the **effective** OpenCode profile used for that operation.
