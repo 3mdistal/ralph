@@ -239,6 +239,18 @@ Live updates (prints when status changes):
 bun run watch
 ```
 
+### Inspect deterministic gate state
+
+```bash
+ralph gates 3mdistal/ralph 232
+```
+
+Machine-readable output:
+
+```bash
+ralph gates 3mdistal/ralph 232 --json
+```
+
 ### List accessible repos
 
 ```bash

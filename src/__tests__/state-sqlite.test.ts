@@ -10,7 +10,10 @@ import {
   createRalphRun,
   createNewRollupBatch,
   deleteIdempotencyKey,
+  ensureRalphRunGateRows,
   getIdempotencyPayload,
+  getLatestRunGateStateForIssue,
+  getRalphRunGateState,
   getOrCreateRollupBatch,
   initStateDb,
   listIssuesWithAllLabels,
@@ -27,11 +30,13 @@ import {
   recordRepoGithubDoneReconcileCursor,
   getRepoGithubDoneReconcileCursor,
   recordRalphRunSessionUse,
+  recordRalphRunGateArtifact,
   recordTaskSnapshot,
   recordPrSnapshot,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
   recordRollupMerge,
+  upsertRalphRunGateResult,
   upsertIdempotencyKey,
 } from "../state";
 import { getRalphStateDbPath } from "../paths";
@@ -154,7 +159,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("9");
+      expect(meta.value).toBe("10");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -184,6 +189,16 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_sessions'")
         .get() as { name?: string } | undefined;
       expect(runSessionsTable?.name).toBe("ralph_run_sessions");
+
+      const gateResultsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_results'")
+        .get() as { name?: string } | undefined;
+      expect(gateResultsTable?.name).toBe("ralph_run_gate_results");
+
+      const gateArtifactsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_artifacts'")
+        .get() as { name?: string } | undefined;
+      expect(gateArtifactsTable?.name).toBe("ralph_run_gate_artifacts");
 
       const doneCursorTable = migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_done_reconcile_cursor'")
@@ -232,7 +247,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("9");
+      expect(meta.value).toBe("10");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -247,6 +262,16 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_sessions'")
         .get() as { name?: string } | undefined;
       expect(runSessionsTable?.name).toBe("ralph_run_sessions");
+
+      const gateResultsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_results'")
+        .get() as { name?: string } | undefined;
+      expect(gateResultsTable?.name).toBe("ralph_run_gate_results");
+
+      const gateArtifactsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_artifacts'")
+        .get() as { name?: string } | undefined;
+      expect(gateArtifactsTable?.name).toBe("ralph_run_gate_artifacts");
     } finally {
       migrated.close();
     }
@@ -339,6 +364,62 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("persists gate state across restarts", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#232",
+      taskPath: "github:3mdistal/ralph#232",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:00:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:00:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "fail",
+      url: "https://github.com/3mdistal/ralph/actions/runs/999",
+      prNumber: 232,
+      prUrl: "https://github.com/3mdistal/ralph/pull/232",
+      at: "2026-01-20T12:00:02.000Z",
+    });
+
+    const noisyLog = [
+      ...Array.from({ length: 210 }, (_, index) => `line-${index}`),
+      "ghp_abcdefghijklmnopqrstuv",
+    ].join("\n");
+
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "failure_excerpt",
+      content: noisyLog,
+      at: "2026-01-20T12:00:03.000Z",
+    });
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const state = getRalphRunGateState(runId);
+    expect(state.results.length).toBe(4);
+    const ciGate = state.results.find((result) => result.gate === "ci");
+    expect(ciGate?.status).toBe("fail");
+    expect(ciGate?.url).toContain("actions/runs/999");
+    expect(ciGate?.prNumber).toBe(232);
+    expect(ciGate?.prUrl).toContain("pull/232");
+
+    const artifact = state.artifacts[0];
+    expect(artifact?.kind).toBe("failure_excerpt");
+    expect(artifact?.truncated).toBe(true);
+    expect(artifact?.content).not.toContain("ghp_abcdefghijklmnopqrstuv");
+    expect(artifact?.content.split("\n").length).toBeLessThanOrEqual(200);
+
+    const latest = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 232 });
+    expect(latest?.results.find((result) => result.gate === "ci")?.status).toBe("fail");
   });
 
   beforeEach(async () => {
@@ -464,7 +545,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("9");
+      expect(meta.value).toBe("10");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
