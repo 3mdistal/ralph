@@ -20,6 +20,18 @@ export function getRalphHomeDir(): string {
   return join(resolveHomeDir(), ".ralph");
 }
 
+export function getRalphSandboxDir(): string {
+  return join(getRalphHomeDir(), "sandbox");
+}
+
+export function getRalphSandboxManifestsDir(): string {
+  return join(getRalphSandboxDir(), "manifests");
+}
+
+export function getRalphSandboxManifestPath(runId: string): string {
+  return join(getRalphSandboxManifestsDir(), `${runId}.json`);
+}
+
 export function getRalphEventsDir(): string {
   return join(getRalphHomeDir(), "events");
 }
