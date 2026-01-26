@@ -1,3 +1,5 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+
 import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
@@ -44,7 +46,7 @@ describe("sandbox config validation", () => {
       devDir: "/tmp",
     });
 
-    const cfgMod = await import("../config?sandbox-default");
+    const cfgMod = await import("../config");
     cfgMod.__resetConfigForTests();
     const cfg = cfgMod.loadConfig().config;
 
@@ -64,7 +66,7 @@ describe("sandbox config validation", () => {
       profile: "sandbox",
     });
 
-    const cfgMod = await import("../config?sandbox-missing");
+    const cfgMod = await import("../config");
     cfgMod.__resetConfigForTests();
     expect(() => cfgMod.loadConfig()).toThrow(/sandbox config block/i);
   });
@@ -90,7 +92,7 @@ describe("sandbox config validation", () => {
       },
     });
 
-    const cfgMod = await import("../config?sandbox-token");
+    const cfgMod = await import("../config");
     cfgMod.__resetConfigForTests();
     expect(() => cfgMod.loadConfig()).toThrow(/GITHUB_SANDBOX_TOKEN/i);
 

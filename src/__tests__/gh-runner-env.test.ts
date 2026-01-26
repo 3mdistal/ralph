@@ -1,3 +1,5 @@
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+
 import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
@@ -86,7 +88,7 @@ describe("gh runner env scoping", () => {
     });
     __resetConfigForTests();
 
-    const ghModule = await import("../github/gh-runner?env-test=sandbox");
+    const ghModule = await import("../github/gh-runner");
     const ghRead = ghModule.createGhRunner({ repo: "3mdistal/ralph-sandbox-demo", mode: "read" });
     await ghRead`gh issue view 1 --repo 3mdistal/ralph-sandbox-demo`.quiet();
 
