@@ -16,6 +16,7 @@ Migration policy for `state.sqlite`: see `docs/ops/state-sqlite.md`.
 ## Ralph-managed labels
 
 Ralph only manages namespaced labels under `ralph:*` and never edits unrelated labels.
+The label descriptions and colors are enforced to match `src/github-labels.ts` (`RALPH_WORKFLOW_LABELS`); the "Meaning" column is the exact GitHub label `description` Ralph applies.
 
 | Label | Meaning | Color |
 | --- | --- | --- |

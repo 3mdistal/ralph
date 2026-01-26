@@ -64,7 +64,7 @@ import {
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
 import { RALPH_LABEL_BLOCKED, RALPH_LABEL_STUCK } from "./github-labels";
-import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
+import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
@@ -1425,17 +1425,45 @@ export class RepoWorker {
   }
 
   private async addIssueLabel(issue: IssueRef, label: string): Promise<void> {
-    await addIssueLabelIo({ github: this.github, repo: issue.repo, issueNumber: issue.number, label });
-  }
-
-  private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
-    await removeIssueLabelIo({
+    const result = await executeIssueLabelOps({
       github: this.github,
       repo: issue.repo,
       issueNumber: issue.number,
-      label,
-      allowNotFound: true,
+      ops: [{ action: "add", label } satisfies LabelOp],
+      log: (message: string) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
+      logLabel: `${issue.repo}#${issue.number}`,
+      ensureLabels: async () => await this.labelEnsurer.ensure(issue.repo),
+      retryMissingLabelOnce: true,
+      ensureBefore: true,
     });
+    if (!result.ok) {
+      if (result.kind === "policy") {
+        console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
+        return;
+      }
+      throw result.error instanceof Error ? result.error : new Error(String(result.error));
+    }
+  }
+
+  private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
+    const result = await executeIssueLabelOps({
+      github: this.github,
+      repo: issue.repo,
+      issueNumber: issue.number,
+      ops: [{ action: "remove", label } satisfies LabelOp],
+      log: (message: string) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
+      logLabel: `${issue.repo}#${issue.number}`,
+      ensureLabels: async () => await this.labelEnsurer.ensure(issue.repo),
+      retryMissingLabelOnce: true,
+      ensureBefore: true,
+    });
+    if (!result.ok) {
+      if (result.kind === "policy") {
+        console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
+        return;
+      }
+      throw result.error instanceof Error ? result.error : new Error(String(result.error));
+    }
   }
 
   private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {

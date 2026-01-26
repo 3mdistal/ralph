@@ -8,7 +8,8 @@ import {
   RALPH_RESOLVED_TEXT,
 } from "./escalation-constants";
 import { GitHubClient, splitRepoFullName } from "./client";
-import { addIssueLabel, removeIssueLabel } from "./issue-label-io";
+import { ensureRalphWorkflowLabelsOnce } from "./ensure-ralph-workflow-labels";
+import { executeIssueLabelOps, type LabelOp } from "./issue-label-io";
 
 export type EscalationWritebackContext = {
   repo: string;
@@ -243,12 +244,11 @@ async function createIssueComment(params: {
   return response.data ?? {};
 }
 
-async function addEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await addIssueLabel(params);
-}
-
-async function removeEscalationLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await removeIssueLabel({ ...params, allowNotFound: true });
+function buildEscalationLabelOps(plan: EscalationWritebackPlan): LabelOp[] {
+  return [
+    ...plan.removeLabels.map((label) => ({ action: "remove" as const, label })),
+    ...plan.addLabels.map((label) => ({ action: "add" as const, label })),
+  ];
 }
 
 export async function writeEscalationToGitHub(
@@ -272,19 +272,21 @@ export async function writeEscalationToGitHub(
   const deleteKey = deps.deleteIdempotencyKey ?? deleteIdempotencyKey;
   const prefix = `[ralph:gh-escalation:${ctx.repo}]`;
 
-  for (const label of plan.removeLabels) {
-    try {
-      await removeEscalationLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
-    } catch (error: any) {
-      log(`${prefix} Failed to remove label '${label}' on #${ctx.issueNumber}: ${error?.message ?? String(error)}`);
-    }
-  }
-
-  for (const label of plan.addLabels) {
-    try {
-      await addEscalationLabel({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber, label });
-    } catch (error: any) {
-      log(`${prefix} Failed to add label '${label}' on #${ctx.issueNumber}: ${error?.message ?? String(error)}`);
+  const labelOps = buildEscalationLabelOps(plan);
+  if (labelOps.length > 0) {
+    const labelResult = await executeIssueLabelOps({
+      github: deps.github,
+      repo: ctx.repo,
+      issueNumber: ctx.issueNumber,
+      ops: labelOps,
+      log: (message) => log(`${prefix} ${message}`),
+      logLabel: `${ctx.repo}#${ctx.issueNumber}`,
+      ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: ctx.repo, github: deps.github }),
+      retryMissingLabelOnce: true,
+      ensureBefore: true,
+    });
+    if (!labelResult.ok) {
+      log(`${prefix} Failed to update escalation labels for #${ctx.issueNumber}; continuing.`);
     }
   }
 
