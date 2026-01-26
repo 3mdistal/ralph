@@ -13,6 +13,8 @@ Migration policy for `state.sqlite`: see `docs/ops/state-sqlite.md`.
   and last-sync cursors. These do not round-trip to GitHub.
 - bwrb notes (if present) are optional audit artifacts, not the queue source of truth.
 
+Legacy note: bwrb is a deprecated backend. Treat bwrb as best-effort mirror output (escalation notes, agent-run notes, notifications). Do not add new bwrb-dependent behavior; GitHub + `~/.ralph/state.sqlite` are the canonical queue surfaces.
+
 ## Ralph-managed labels
 
 Ralph only manages namespaced labels under `ralph:*` and never edits unrelated labels.

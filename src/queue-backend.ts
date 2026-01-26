@@ -16,6 +16,14 @@ import { createGitHubQueueDriver } from "./github-queue";
 
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
 
+export type QueueBackendNotice = {
+  code: "bwrb-legacy";
+  severity: "warning";
+  message: string;
+  docsPath: string;
+  suggestedAction: string;
+};
+
 export type QueueBackendDriver = {
   name: QueueBackend;
   initialPoll(): Promise<QueueTask[]>;
@@ -54,6 +62,7 @@ export type QueueBackendState = {
   diagnostics?: string;
   explicit: boolean;
   bwrbVault?: string;
+  notices: QueueBackendNotice[];
 };
 
 let cachedState: QueueBackendState | null = null;
@@ -81,58 +90,71 @@ export function __resetQueueBackendStateForTests(): void {
   cachedDriver = null;
 }
 
-export function getQueueBackendState(): QueueBackendState {
-  if (cachedState) return cachedState;
+type QueueBackendResolutionInput = {
+  desiredBackend: QueueBackend;
+  explicit: boolean;
+  githubQueueImplemented: boolean;
+  githubAuthConfigured: boolean;
+  bwrbVault: string;
+  bwrbVaultCheck: { ok: boolean; error?: string };
+  meta: {
+    queueBackendExplicit: boolean;
+    queueBackendValid: boolean;
+    queueBackendRaw?: unknown;
+  };
+};
 
-  const config = getConfig();
-  const meta = getConfigMeta();
-  const desiredBackend = config.queueBackend ?? "github";
-  const explicit = isQueueBackendExplicit();
-  let backend: QueueBackend = desiredBackend;
+const buildBwrbLegacyNotice = (): QueueBackendNotice => ({
+  code: "bwrb-legacy",
+  severity: "warning",
+  message:
+    "bwrb queue backend is legacy; GitHub issues and ~/.ralph/state.sqlite are the canonical queue surfaces.",
+  docsPath: "docs/product/github-first-orchestration.md",
+  suggestedAction: "Prefer queueBackend=github and configure GitHub auth; bwrb output is best-effort only.",
+});
+
+export function resolveQueueBackendState(input: QueueBackendResolutionInput): QueueBackendState {
+  let backend: QueueBackend = input.desiredBackend;
   let health: QueueBackendHealth = "ok";
   let diagnostics: string | undefined;
 
-  if (meta.queueBackendExplicit && !meta.queueBackendValid) {
-    cachedState = {
-      desiredBackend,
+  if (input.meta.queueBackendExplicit && !input.meta.queueBackendValid) {
+    return {
+      desiredBackend: input.desiredBackend,
       backend,
       health: "unavailable",
       fallback: false,
       diagnostics:
-        `Invalid queueBackend=${JSON.stringify(meta.queueBackendRaw)}; ` +
+        `Invalid queueBackend=${JSON.stringify(input.meta.queueBackendRaw)}; ` +
         `valid values are "github", "bwrb", "none".`,
-      explicit,
-      bwrbVault: config.bwrbVault,
+      explicit: input.explicit,
+      bwrbVault: input.bwrbVault,
+      notices: [],
     };
-
-    return cachedState;
   }
 
-  if (desiredBackend === "bwrb") {
-    const check = checkBwrbVaultLayout(config.bwrbVault);
-    if (!check.ok) {
+  if (input.desiredBackend === "bwrb") {
+    if (!input.bwrbVaultCheck.ok) {
       health = "unavailable";
-      diagnostics = check.error ?? `bwrbVault is missing or invalid: ${JSON.stringify(config.bwrbVault)}`;
+      diagnostics = input.bwrbVaultCheck.error ?? `bwrbVault is missing or invalid: ${JSON.stringify(input.bwrbVault)}`;
     }
-  } else if (desiredBackend === "github") {
-    if (!GITHUB_QUEUE_IMPLEMENTED) {
-      const fallbackCheck = checkBwrbVaultLayout(config.bwrbVault);
-      if (!explicit && fallbackCheck.ok) {
+  } else if (input.desiredBackend === "github") {
+    if (!input.githubQueueImplemented) {
+      if (!input.explicit && input.bwrbVaultCheck.ok) {
         backend = "bwrb";
         health = "ok";
         diagnostics = "GitHub queue backend is not yet implemented (see #61/#63); falling back to bwrb.";
       } else {
         diagnostics = "GitHub queue backend is not yet implemented (see #61/#63).";
-        if (explicit) {
+        if (input.explicit) {
           health = "unavailable";
         } else {
           backend = "none";
           health = "degraded";
         }
       }
-    } else if (!isGitHubAuthConfigured(config)) {
-      const fallbackCheck = checkBwrbVaultLayout(config.bwrbVault);
-      if (!explicit && fallbackCheck.ok) {
+    } else if (!input.githubAuthConfigured) {
+      if (!input.explicit && input.bwrbVaultCheck.ok) {
         backend = "bwrb";
         health = "ok";
         diagnostics =
@@ -140,7 +162,7 @@ export function getQueueBackendState(): QueueBackendState {
       } else {
         diagnostics =
           "GitHub auth is not configured (set githubApp in ~/.ralph/config.* or GH_TOKEN/GITHUB_TOKEN).";
-        if (explicit) {
+        if (input.explicit) {
           health = "unavailable";
         } else {
           backend = "none";
@@ -152,15 +174,38 @@ export function getQueueBackendState(): QueueBackendState {
     backend = "none";
   }
 
-  cachedState = {
-    desiredBackend,
+  const notices = backend === "bwrb" ? [buildBwrbLegacyNotice()] : [];
+
+  return {
+    desiredBackend: input.desiredBackend,
     backend,
     health,
-    fallback: backend !== desiredBackend,
+    fallback: backend !== input.desiredBackend,
     diagnostics,
-    explicit,
-    bwrbVault: config.bwrbVault,
+    explicit: input.explicit,
+    bwrbVault: input.bwrbVault,
+    notices,
   };
+}
+
+export function getQueueBackendState(): QueueBackendState {
+  if (cachedState) return cachedState;
+
+  const config = getConfig();
+  const meta = getConfigMeta();
+  const desiredBackend = config.queueBackend ?? "github";
+  const explicit = isQueueBackendExplicit();
+  const bwrbVaultCheck = checkBwrbVaultLayout(config.bwrbVault);
+
+  cachedState = resolveQueueBackendState({
+    desiredBackend,
+    explicit,
+    githubQueueImplemented: GITHUB_QUEUE_IMPLEMENTED,
+    githubAuthConfigured: isGitHubAuthConfigured(config),
+    bwrbVault: config.bwrbVault,
+    bwrbVaultCheck,
+    meta,
+  });
 
   return cachedState;
 }

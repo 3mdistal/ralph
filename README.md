@@ -53,6 +53,8 @@ Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, the
 
 When using the GitHub queue backend, `bwrbVault` is optional. When `queueBackend = "bwrb"`, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
 
+`bwrb` is a legacy backend. GitHub issues plus `~/.ralph/state.sqlite` are the canonical queue surfaces. Existing bwrb usage (escalation notes, agent-run notes, and notifications) is best-effort mirror output only, and new bwrb-dependent behavior should not be added.
+
 Note: `orchestration/` is gitignored in this repo, but bwrb still needs to traverse it for queue operations. `.bwrbignore` re-includes `orchestration/**` for bwrb even when `.gitignore` excludes it; if your queue appears empty, check `bwrb --version` and upgrade to >= 0.1.3.
 
 Config is loaded once at startup, so restart the daemon after editing.

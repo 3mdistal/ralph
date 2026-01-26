@@ -6,7 +6,23 @@ describe("buildStatusSnapshot", () => {
   test("normalizes optional blocked/throttled fields", () => {
     const snapshot = buildStatusSnapshot({
       mode: "running",
-      queue: { backend: "bwrb", health: "ok", fallback: false, diagnostics: null },
+      queue: {
+        backend: "bwrb",
+        desiredBackend: "bwrb",
+        explicit: true,
+        health: "ok",
+        fallback: false,
+        diagnostics: null,
+        notices: [
+          {
+            code: "bwrb-legacy",
+            severity: "warning",
+            message: "bwrb queue backend is legacy; GitHub issues and ~/.ralph/state.sqlite are the canonical queue surfaces.",
+            docsPath: "docs/product/github-first-orchestration.md",
+            suggestedAction: "Prefer queueBackend=github and configure GitHub auth; bwrb output is best-effort only.",
+          },
+        ],
+      },
       controlProfile: null,
       activeProfile: null,
       throttle: { state: "ok" },

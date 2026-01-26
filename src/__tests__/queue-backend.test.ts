@@ -5,7 +5,7 @@ import { tmpdir } from "os";
 
 import { getRalphConfigJsonPath } from "../paths";
 import { __resetConfigForTests, loadConfig } from "../config";
-import { __resetQueueBackendStateForTests, getQueueBackendState } from "../queue-backend";
+import { __resetQueueBackendStateForTests, getQueueBackendState, resolveQueueBackendState } from "../queue-backend";
 
 let homeDir: string;
 let priorHome: string | undefined;
@@ -162,5 +162,57 @@ describe("queue backend selection", () => {
     expect(state.health).toBe("unavailable");
     expect(state.fallback).toBe(false);
     expect(state.diagnostics ?? "").toContain("Invalid queueBackend");
+  });
+});
+
+describe("queue backend notices", () => {
+  const baseInput = {
+    desiredBackend: "github" as const,
+    explicit: false,
+    githubQueueImplemented: true,
+    githubAuthConfigured: true,
+    bwrbVault: "/tmp",
+    bwrbVaultCheck: { ok: true },
+    meta: {
+      queueBackendExplicit: false,
+      queueBackendValid: true,
+      queueBackendRaw: undefined,
+    },
+  };
+
+  test("emits legacy notice when backend is bwrb", () => {
+    const state = resolveQueueBackendState({
+      ...baseInput,
+      desiredBackend: "bwrb",
+      explicit: true,
+    });
+
+    expect(state.backend).toBe("bwrb");
+    expect(state.notices).toHaveLength(1);
+    expect(state.notices[0]?.code).toBe("bwrb-legacy");
+  });
+
+  test("emits legacy notice on fallback to bwrb", () => {
+    const state = resolveQueueBackendState({
+      ...baseInput,
+      desiredBackend: "github",
+      explicit: false,
+      githubAuthConfigured: false,
+    });
+
+    expect(state.backend).toBe("bwrb");
+    expect(state.fallback).toBe(true);
+    expect(state.notices).toHaveLength(1);
+  });
+
+  test("does not emit notice when backend is none", () => {
+    const state = resolveQueueBackendState({
+      ...baseInput,
+      desiredBackend: "none",
+      explicit: true,
+    });
+
+    expect(state.backend).toBe("none");
+    expect(state.notices).toHaveLength(0);
   });
 });

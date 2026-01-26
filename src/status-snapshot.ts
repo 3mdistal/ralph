@@ -1,8 +1,14 @@
+import type { QueueBackendNotice } from "./queue-backend";
+import type { StatusUsageSnapshot } from "./status-usage";
+
 export type StatusQueueSnapshot = {
   backend: string;
+  desiredBackend: string;
+  explicit: boolean;
   health: string;
   fallback: boolean;
   diagnostics: string | null;
+  notices: QueueBackendNotice[];
 };
 
 export type StatusDrainSnapshot = {
@@ -38,8 +44,6 @@ export type StatusBlockedTask = StatusTaskBase & {
   blockedReason: string | null;
   blockedDetailsSnippet: string | null;
 };
-
-import type { StatusUsageSnapshot } from "./status-usage";
 
 export type StatusSnapshot = {
   mode: string;

@@ -116,9 +116,12 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       mode,
       queue: {
         backend: queueState.backend,
+        desiredBackend: queueState.desiredBackend,
+        explicit: queueState.explicit,
         health: queueState.health,
         fallback: queueState.fallback,
         diagnostics: queueState.diagnostics ?? null,
+        notices: queueState.notices ?? [],
       },
       controlProfile: controlProfile || null,
       activeProfile: resolvedProfile ?? null,
@@ -180,6 +183,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
 
   console.log(`Mode: ${mode}`);
   const statusTags = [
+    queueState.backend === "bwrb" ? "legacy" : null,
     queueState.health === "degraded" ? "degraded" : null,
     queueState.fallback ? "fallback" : null,
   ].filter(Boolean);
@@ -187,6 +191,11 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   console.log(`Queue backend: ${queueState.backend}${statusSuffix}`);
   if (queueState.diagnostics) {
     console.log(`Queue diagnostics: ${queueState.diagnostics}`);
+  }
+  if (queueState.notices.length > 0) {
+    for (const notice of queueState.notices) {
+      console.log(`Queue notice: ${notice.message}`);
+    }
   }
   if (opts.drain.pauseRequested) {
     console.log(

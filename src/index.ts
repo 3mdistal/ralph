@@ -1091,6 +1091,13 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  if (queueState.backend === "bwrb" && queueState.notices.length > 0) {
+    if (shouldLog("queue-backend:legacy", 60_000)) {
+      const notice = queueState.notices[0];
+      console.warn(`[ralph:queue] ${notice.message} ${notice.suggestedAction}`);
+    }
+  }
+
   if (queueState.backend === "bwrb") {
     if (!ensureBwrbVaultLayout(config.bwrbVault)) process.exit(1);
   }
@@ -1143,6 +1150,11 @@ async function main(): Promise<void> {
   }
   if (queueState.diagnostics) {
     console.log(`        Queue diagnostics: ${queueState.diagnostics}`);
+  }
+  if (queueState.notices.length > 0) {
+    for (const notice of queueState.notices) {
+      console.log(`        Queue notice: ${notice.message}`);
+    }
   }
   console.log(`        Max workers: ${config.maxWorkers}`);
   console.log(`        Batch size: ${config.batchSize} PRs before rollup`);
