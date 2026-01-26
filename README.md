@@ -138,9 +138,10 @@ sandbox = {
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `maxWorkers`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `concurrencySlots`, optional `maxWorkers` (deprecated), optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
+- `repos[].concurrencySlots` (number): per-repo concurrency slots (defaults to 1; overrides `repos[].maxWorkers`)
 - `repos[].rollupBatchSize` (number): per-repo override for rollup batch size (defaults to `batchSize`)
 - `ownershipTtlMs` (number): task ownership TTL in milliseconds (defaults to 60000)
 - `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
@@ -203,7 +204,7 @@ Older README versions mentioned `RALPH_VAULT`, `RALPH_DEV_DIR`, and `RALPH_BATCH
 - **Config changes not taking effect**: Ralph caches config after the first `loadConfig()`; restart the daemon.
 - **Config file not picked up**: Ralph reads `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json`.
 - **Config parse errors**: Ralph logs `[ralph] Failed to load TOML/JSON config from ...` and continues with defaults.
-- **Invalid maxWorkers values**: Non-positive/non-integer values fall back to defaults and emit a warning.
+- **Invalid maxWorkers/concurrencySlots values**: Non-positive/non-integer values fall back to defaults and emit a warning.
 
 ## Usage
 
