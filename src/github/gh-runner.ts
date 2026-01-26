@@ -1,4 +1,4 @@
-import { $ } from "bun";
+import { $ as bunDollar } from "bun";
 
 import { getProfile, getSandboxProfileConfig } from "../config";
 import { resolveGhTokenEnv } from "../github-app-auth";
@@ -13,7 +13,7 @@ type GhProcess = {
 
 type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProcess;
 
-const DEFAULT_GH_RUNNER: GhRunner = $ as unknown as GhRunner;
+const DEFAULT_GH_RUNNER: GhRunner = ((globalThis as any).$ ?? bunDollar) as unknown as GhRunner;
 
 let ghEnvLock: Promise<void> = Promise.resolve();
 
