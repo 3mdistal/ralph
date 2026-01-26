@@ -160,6 +160,22 @@ export interface SandboxProfileConfig {
   repoNamePrefix: string;
   /** Dedicated GitHub auth for sandbox runs. */
   githubAuth: SandboxGithubAuthConfig;
+  /** Optional sandbox provisioning configuration. */
+  provisioning?: SandboxProvisioningConfig;
+}
+
+export type SandboxProvisioningSettingsPreset = "minimal" | "parity";
+
+export type SandboxProvisioningSeedConfig =
+  | { preset: "baseline"; file?: undefined }
+  | { file: string; preset?: undefined };
+
+export interface SandboxProvisioningConfig {
+  templateRepo: string;
+  templateRef?: string;
+  repoVisibility?: "private";
+  settingsPreset?: SandboxProvisioningSettingsPreset;
+  seed?: SandboxProvisioningSeedConfig;
 }
 
 export interface DashboardConfig {
@@ -572,6 +588,94 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       }
     }
 
+    let provisioning: SandboxProvisioningConfig | undefined;
+    const rawProvisioning = (rawSandbox as any).provisioning;
+    if (rawProvisioning !== undefined) {
+      if (!rawProvisioning || typeof rawProvisioning !== "object" || Array.isArray(rawProvisioning)) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning must be an object when provided."
+        );
+      }
+
+      const templateRepo = toNonEmptyStringOrNull((rawProvisioning as any).templateRepo);
+      if (!templateRepo) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning requires provisioning.templateRepo (non-empty string)."
+        );
+      }
+
+      const templateRef = toNonEmptyStringOrNull((rawProvisioning as any).templateRef) ?? "main";
+      const repoVisibility = toNonEmptyStringOrNull((rawProvisioning as any).repoVisibility) ?? "private";
+      if (repoVisibility !== "private") {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning repoVisibility must be \"private\"."
+        );
+      }
+
+      const settingsPreset =
+        (toNonEmptyStringOrNull((rawProvisioning as any).settingsPreset) as SandboxProvisioningSettingsPreset | null) ??
+        "minimal";
+      if (settingsPreset !== "minimal" && settingsPreset !== "parity") {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning settingsPreset must be \"minimal\" or \"parity\"."
+        );
+      }
+
+      const rawSeed = (rawProvisioning as any).seed;
+      let seed: SandboxProvisioningSeedConfig | undefined;
+      if (rawSeed !== undefined) {
+        if (!rawSeed || typeof rawSeed !== "object" || Array.isArray(rawSeed)) {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed must be an object."
+          );
+        }
+        const preset = toNonEmptyStringOrNull((rawSeed as any).preset);
+        const file = toNonEmptyStringOrNull((rawSeed as any).file);
+
+        if (preset && file) {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed cannot set both preset and file."
+          );
+        }
+        if (preset) {
+          if (preset !== "baseline") {
+            throw new RalphConfigError(
+              "RALPH_CONFIG_SANDBOX_INVALID",
+              "[ralph] Sandbox provisioning seed preset must be \"baseline\"."
+            );
+          }
+          seed = { preset: "baseline" };
+        } else if (file) {
+          if (!isAbsolute(file)) {
+            throw new RalphConfigError(
+              "RALPH_CONFIG_SANDBOX_INVALID",
+              "[ralph] Sandbox provisioning seed file must be an absolute path."
+            );
+          }
+          seed = { file };
+        } else {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed must include preset or file."
+          );
+        }
+      }
+
+      provisioning = {
+        templateRepo,
+        templateRef,
+        repoVisibility: "private",
+        settingsPreset,
+        seed,
+      };
+    }
+
     loaded.sandbox = {
       allowedOwners,
       repoNamePrefix,
@@ -579,6 +683,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
         ...(hasValidApp ? { githubApp: rawSandboxApp } : {}),
         ...(tokenEnvVar ? { tokenEnvVar } : {}),
       },
+      ...(provisioning ? { provisioning } : {}),
     };
   }
 
@@ -1213,6 +1318,11 @@ export function isSandboxProfile(): boolean {
 export function getSandboxProfileConfig(): SandboxProfileConfig | null {
   const cfg = getConfig();
   return cfg.profile === "sandbox" ? (cfg.sandbox ?? null) : null;
+}
+
+export function getSandboxProvisioningConfig(): SandboxProvisioningConfig | null {
+  const sandbox = getSandboxProfileConfig();
+  return sandbox?.provisioning ?? null;
 }
 
 export function getRepoPath(repoName: string): string {
