@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 
-const recordRalphRunSessionUseMock = mock(async () => {});
+const recordRalphRunSessionUseMock = mock(async (_input: any) => {});
 
 mock.module("../state", () => ({
   recordRalphRunSessionUse: recordRalphRunSessionUseMock,
