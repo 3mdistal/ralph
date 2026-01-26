@@ -7,6 +7,7 @@ import { getQueueBackendState, getQueuedTasks, getTasksByStatus } from "../queue
 import { priorityRank } from "../queue/priority";
 import { buildStatusSnapshot } from "../status-snapshot";
 import { collectStatusUsageRows, formatStatusUsageSection } from "../status-usage";
+import { readRunTokenTotals, type SessionTokenReadResult } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
 import { initStateDb } from "../state";
 import { getThrottleDecision } from "../throttle";
@@ -21,6 +22,9 @@ import {
 
 const STATUS_USAGE_TIMEOUT_MS = 10_000;
 const STATUS_USAGE_CONCURRENCY = 2;
+const STATUS_TOKEN_TIMEOUT_MS = 5_000;
+const STATUS_TOKEN_CONCURRENCY = 3;
+const STATUS_TOKEN_BUDGET_MS = 4_000;
 
 type StatusDrainState = {
   requestedAt: number | null;
@@ -95,19 +99,32 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   });
 
   if (json) {
+    const tokenReadCache = new Map<string, Promise<SessionTokenReadResult>>();
     const inProgressWithStatus = await Promise.all(
       inProgress.map(async (task) => {
         const sessionId = task["session-id"]?.trim() || null;
         const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
+        const opencodeProfile = getTaskOpencodeProfileName(task);
+        const tokens = await readRunTokenTotals({
+          repo: task.repo,
+          issue: task.issue,
+          opencodeProfile,
+          timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
+          concurrency: STATUS_TOKEN_CONCURRENCY,
+          budgetMs: STATUS_TOKEN_BUDGET_MS,
+          cache: tokenReadCache,
+        });
         return {
           name: task.name,
           repo: task.repo,
           issue: task.issue,
           priority: task.priority ?? "p2-medium",
-          opencodeProfile: getTaskOpencodeProfileName(task),
+          opencodeProfile,
           sessionId,
           nowDoing,
           line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
+          tokensTotal: tokens.tokensTotal,
+          tokensComplete: tokens.tokensComplete,
         };
       })
     );
@@ -211,8 +228,20 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   }
 
   console.log(`In-progress tasks: ${inProgress.length}`);
+  const tokenReadCache = new Map<string, Promise<SessionTokenReadResult>>();
   for (const task of inProgress) {
-    console.log(`  - ${await getTaskNowDoingLine(task)}`);
+    const opencodeProfile = getTaskOpencodeProfileName(task);
+    const tokens = await readRunTokenTotals({
+      repo: task.repo,
+      issue: task.issue,
+      opencodeProfile,
+      timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
+      concurrency: STATUS_TOKEN_CONCURRENCY,
+      budgetMs: STATUS_TOKEN_BUDGET_MS,
+      cache: tokenReadCache,
+    });
+    const tokensLabel = tokens.tokensComplete && typeof tokens.tokensTotal === "number" ? tokens.tokensTotal : "?";
+    console.log(`  - ${await getTaskNowDoingLine(task)} tokens=${tokensLabel}`);
   }
 
   console.log(`Blocked tasks: ${blockedSorted.length}`);
