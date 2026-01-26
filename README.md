@@ -64,7 +64,12 @@ Config is loaded once at startup, so restart the daemon after editing.
 ```toml
 devDir = "/absolute/path/to/your/dev-directory"
 repos = [
-  { name = "3mdistal/ralph", path = "/absolute/path/to/your/ralph", botBranch = "bot/integration" }
+  {
+    name = "3mdistal/ralph",
+    path = "/absolute/path/to/your/ralph",
+    botBranch = "bot/integration",
+    setup = ["bun install --frozen-lockfile"]
+  }
 ]
 ```
 
@@ -78,7 +83,8 @@ Or JSON (`~/.ralph/config.json`):
       "name": "3mdistal/ralph",
       "path": "/absolute/path/to/your/ralph",
       "botBranch": "bot/integration",
-      "requiredChecks": ["CI"]
+      "requiredChecks": ["CI"],
+      "setup": ["bun install --frozen-lockfile"]
     }
   ]
 }
@@ -97,7 +103,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `maxWorkers`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `maxWorkers`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `repos[].rollupBatchSize` (number): per-repo override for rollup batch size (defaults to `batchSize`)
@@ -105,6 +111,7 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
 - `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
 - `repos[].autoUpdateBehindLabel` (string): optional label gate required for proactive update-branch
 - `repos[].autoUpdateBehindMinMinutes` (number): minimum minutes between updates per PR (default: 30)
+- `repos[].setup` (array): optional setup commands to run in the task worktree before any agent execution (operator-owned)
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
 - Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
@@ -120,6 +127,8 @@ Note: Config values are read as plain TOML/JSON. `~` is not expanded, and commen
   - `eventsRetentionDays` (number): days to keep `~/.ralph/events/YYYY-MM-DD.jsonl` logs (default: 14; UTC bucketing; cleanup on daemon startup)
 
 Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derives required checks from GitHub branch protection on `bot/integration` (or `repos[].botBranch`), falling back to the repository default branch (usually `main`). If branch protection is missing or unreadable, Ralph does not gate merges. Ralph considers both check runs and legacy status contexts when matching available check names. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
+
+Note: `repos[].setup` commands run in the task worktree before any OpenCode agent execution. Setup is cached per worktree by `(commands hash + lockfile signature)`; if commands or lockfiles change, setup runs again.
 
 
 When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
