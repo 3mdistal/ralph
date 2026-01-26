@@ -6666,9 +6666,7 @@ ${guidance}`
         escalationReason: error?.message ?? String(error),
       };
     } finally {
-      if (typeof allocatedSlot === "number") {
-        this.releaseRepoSlot(allocatedSlot);
-      }
+      // slot release handled by scheduler-level reservation
     }
   }
 
