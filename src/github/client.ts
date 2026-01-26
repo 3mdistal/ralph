@@ -1,5 +1,7 @@
 import type { ExistingLabelSpec, LabelSpec } from "../github-labels";
+import { getProfile, getSandboxProfileConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
+import { SandboxTripwireError, assertSandboxWriteAllowed } from "./sandbox-tripwire";
 
 export type GitHubErrorCode = "rate_limit" | "not_found" | "conflict" | "auth" | "unknown";
 
@@ -44,6 +46,25 @@ type ClientOptions = {
   userAgent?: string;
   getToken?: () => Promise<string | null>;
 };
+
+function isGraphqlPath(path: string): boolean {
+  return /^\/?graphql(?:\?|$)/.test(path);
+}
+
+function getGraphqlOperation(body: unknown): "query" | "mutation" | null {
+  if (!body || typeof body !== "object") return null;
+  const query = (body as any).query;
+  if (typeof query !== "string") return null;
+  const trimmed = query
+    .replace(/^[\s\uFEFF\u200B]+/g, "")
+    .replace(/^#.*$/gm, "")
+    .trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith("mutation")) return "mutation";
+  if (trimmed.startsWith("query")) return "query";
+  if (trimmed.startsWith("{")) return "query";
+  return null;
+}
 
 function classifyStatus(status: number): GitHubErrorCode {
   if (status === 401 || status === 403) return "auth";
@@ -96,6 +117,36 @@ export class GitHubClient {
     const token = this.tokenOverride ?? (await this.getToken());
     const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
     const method = (opts.method ?? "GET").toUpperCase();
+    const profile = getProfile();
+    if (profile === "sandbox" && method !== "GET" && method !== "HEAD") {
+      if (isGraphqlPath(path)) {
+        const op = getGraphqlOperation(opts.body);
+        if (op === "mutation") {
+          const sandbox = getSandboxProfileConfig();
+          assertSandboxWriteAllowed({
+            profile,
+            repo: this.repo,
+            allowedOwners: sandbox?.allowedOwners,
+            repoNamePrefix: sandbox?.repoNamePrefix,
+          });
+        } else if (op === "query") {
+          // read-only; allowed
+        } else {
+          throw new SandboxTripwireError({
+            repo: this.repo,
+            reason: "unknown GraphQL operation",
+          });
+        }
+      } else {
+        const sandbox = getSandboxProfileConfig();
+        assertSandboxWriteAllowed({
+          profile,
+          repo: this.repo,
+          allowedOwners: sandbox?.allowedOwners,
+          repoNamePrefix: sandbox?.repoNamePrefix,
+        });
+      }
+    }
     if (method === "PUT" && isIssueLabelsCollectionPath(path)) {
       throw new Error(`Refusing to replace issue labels via PUT ${path}`);
     }
