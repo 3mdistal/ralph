@@ -139,6 +139,14 @@ function ensureSchema(database: Database): void {
         database.exec("ALTER TABLE tasks ADD COLUMN session_events_path TEXT");
       }
       if (existingVersion < 9) {
+        database.exec(
+          "CREATE TABLE IF NOT EXISTS issue_escalation_comment_checks (" +
+            "issue_id INTEGER PRIMARY KEY, " +
+            "last_checked_at TEXT NOT NULL, " +
+            "last_seen_updated_at TEXT, " +
+            "FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE" +
+            ")"
+        );
         database.exec(`
           CREATE TABLE IF NOT EXISTS ralph_runs (
             run_id TEXT PRIMARY KEY,
@@ -212,6 +220,13 @@ function ensureSchema(database: Database): void {
       name TEXT NOT NULL,
       created_at TEXT NOT NULL,
       UNIQUE(issue_id, name),
+      FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS issue_escalation_comment_checks (
+      issue_id INTEGER PRIMARY KEY,
+      last_checked_at TEXT NOT NULL,
+      last_seen_updated_at TEXT,
       FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
 
@@ -971,6 +986,68 @@ export function getIssueSnapshotByNumber(repo: string, issueNumber: number): Iss
     githubUpdatedAt: row.github_updated_at ?? null,
     labels: parseLabelList(row.labels),
   };
+}
+
+export type EscalationCommentCheckState = {
+  lastCheckedAt: string | null;
+  lastSeenUpdatedAt: string | null;
+};
+
+export function getEscalationCommentCheckState(
+  repo: string,
+  issueNumber: number
+): EscalationCommentCheckState | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT ecc.last_checked_at as last_checked_at, ecc.last_seen_updated_at as last_seen_updated_at
+       FROM issue_escalation_comment_checks ecc
+       JOIN issues i ON i.id = ecc.issue_id
+       JOIN repos r ON r.id = i.repo_id
+       WHERE r.name = $name AND i.number = $number`
+    )
+    .get({ $name: repo, $number: issueNumber }) as
+    | { last_checked_at?: string | null; last_seen_updated_at?: string | null }
+    | undefined;
+
+  if (!row) return null;
+  return {
+    lastCheckedAt: row.last_checked_at ?? null,
+    lastSeenUpdatedAt: row.last_seen_updated_at ?? null,
+  };
+}
+
+export function recordEscalationCommentCheckState(params: {
+  repo: string;
+  issueNumber: number;
+  lastCheckedAt: string;
+  lastSeenUpdatedAt?: string | null;
+}): void {
+  const database = requireDb();
+  const issueRow = database
+    .query(
+      `SELECT i.id as id
+       FROM issues i
+       JOIN repos r ON r.id = i.repo_id
+       WHERE r.name = $name AND i.number = $number`
+    )
+    .get({ $name: params.repo, $number: params.issueNumber }) as { id?: number } | undefined;
+
+  if (!issueRow?.id) return;
+
+  database
+    .query(
+      `INSERT INTO issue_escalation_comment_checks(issue_id, last_checked_at, last_seen_updated_at)
+       VALUES ($issue_id, $last_checked_at, $last_seen_updated_at)
+       ON CONFLICT(issue_id) DO UPDATE SET
+         last_checked_at = excluded.last_checked_at,
+         last_seen_updated_at = excluded.last_seen_updated_at`
+    )
+    .run({
+      $issue_id: issueRow.id,
+      $last_checked_at: params.lastCheckedAt,
+      $last_seen_updated_at: params.lastSeenUpdatedAt ?? null,
+    });
 }
 
 export function getIssueLabels(repo: string, issueNumber: number): string[] {

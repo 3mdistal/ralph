@@ -19,7 +19,7 @@ export type SessionAdapter = {
     repoPath: string,
     sessionId: string,
     command: string,
-    args: string[],
+    args?: string[],
     options?: RunSessionOptionsBase
   ) => Promise<SessionResult>;
   getRalphXdgCacheHome: (repo: string, cacheKey: string, xdgCacheHome?: string) => string;
@@ -87,7 +87,7 @@ export function createRunRecordingSessionAdapter(params: {
     continueCommand: async (repoPath, sessionId, command, args, options) => {
       const fallbackTitle = `command:${command}`;
       const stepTitle = resolveStepTitle(options?.introspection?.stepTitle, fallbackTitle);
-      const result = await base.continueCommand(repoPath, sessionId, command, args, options);
+      const result = await base.continueCommand(repoPath, sessionId, command, args ?? [], options);
       await recordSessionUse({
         runId,
         sessionId: result.sessionId?.trim() || sessionId?.trim(),

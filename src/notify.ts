@@ -208,6 +208,7 @@ export interface EscalationContext {
   reason: string;
   escalationType: "product-gap" | "low-confidence" | "ambiguous-requirements" | "blocked" | "other";
   planOutput?: string;
+  githubCommentUrl?: string;
   routing?: {
     decision: string;
     confidence?: string | null;
@@ -373,6 +374,7 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     `| Field | Value |`,
     `|-------|-------|`,
     `| Issue | ${ctx.issue} |`,
+    ...(ctx.githubCommentUrl ? [`| GitHub Comment | ${ctx.githubCommentUrl} |`] : []),
     `| Repo | ${ctx.repo} |`,
     `| Type | ${ctx.escalationType} |`,
     `| Reason | ${ctx.reason} |`,

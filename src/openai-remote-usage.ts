@@ -1,0 +1,310 @@
+import { existsSync } from "fs";
+import { readFile, rename, writeFile } from "fs/promises";
+import { dirname, join } from "path";
+
+type OpenCodeAuthFile = {
+  openai?: {
+    type?: unknown;
+    access?: unknown;
+    refresh?: unknown;
+    expires?: unknown;
+  };
+};
+
+export type RemoteOpenaiUsageWindow = {
+  usedPct: number;
+  resetAt: string | null;
+  resetAtTs: number | null;
+  usedPercentRaw: number | null;
+};
+
+export type RemoteOpenaiUsage = {
+  fetchedAt: string;
+  planType: string;
+  rolling5h: RemoteOpenaiUsageWindow;
+  weekly: RemoteOpenaiUsageWindow;
+};
+
+const USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
+const TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
+
+// Observed OpenAI web client id used by OpenCode/ChatGPT OAuth refresh flow.
+const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+type CacheEntry = { fetchedAtMs: number; data: RemoteOpenaiUsage };
+const cache = new Map<string, CacheEntry>();
+const inFlight = new Map<string, Promise<RemoteOpenaiUsage>>();
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value !== "number") return null;
+  if (!Number.isFinite(value)) return null;
+  return value;
+}
+
+function parseTimestampMs(value: unknown): number | null {
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return null;
+    // Heuristic: treat small numbers as epoch seconds.
+    if (value > 0 && value < 1e12) return Math.floor(value * 1000);
+    return Math.floor(value);
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const parsed = Date.parse(trimmed);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function normalizeUsedPct(raw: number | null): { usedPct: number; usedPercentRaw: number | null } {
+  if (raw == null) return { usedPct: 0, usedPercentRaw: null };
+  const usedPercentRaw = raw;
+  // Some responses return 0..1, others return 0..100.
+  const frac = raw <= 1 ? raw : raw / 100;
+  const clamped = Math.max(0, Math.min(1, frac));
+  return { usedPct: clamped, usedPercentRaw };
+}
+
+function normalizeResetAt(value: unknown): { resetAt: string | null; resetAtTs: number | null } {
+  const ts = parseTimestampMs(value);
+  if (ts == null) return { resetAt: null, resetAtTs: null };
+  return { resetAt: new Date(ts).toISOString(), resetAtTs: ts };
+}
+
+async function readAuthFile(path: string): Promise<OpenCodeAuthFile> {
+  const raw = await readFile(path, "utf8");
+  return JSON.parse(raw) as OpenCodeAuthFile;
+}
+
+async function writeAuthFileAtomic(path: string, auth: OpenCodeAuthFile): Promise<void> {
+  const dir = dirname(path);
+  const tmp = join(dir, `.auth.json.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`);
+  const content = JSON.stringify(auth, null, 2) + "\n";
+  await writeFile(tmp, content, "utf8");
+  await rename(tmp, path);
+}
+
+function isTokenExpired(expiresAtMs: number, nowMs: number): boolean {
+  // 5 minute buffer.
+  const bufferMs = 5 * 60 * 1000;
+  return nowMs >= expiresAtMs - bufferMs;
+}
+
+async function refreshToken(refreshTokenValue: string): Promise<{
+  access_token: string;
+  refresh_token?: string;
+  expires_in: number;
+  token_type?: string;
+}> {
+  const attemptJson = async (): Promise<Response> => {
+    return fetch(TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: refreshTokenValue,
+        client_id: OPENAI_CLIENT_ID,
+      }),
+    });
+  };
+
+  const attemptForm = async (): Promise<Response> => {
+    const body = new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshTokenValue,
+      client_id: OPENAI_CLIENT_ID,
+    });
+
+    return fetch(TOKEN_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+  };
+
+  let response = await attemptJson();
+
+  if (!response.ok && (response.status === 400 || response.status === 415)) {
+    // Some OAuth servers only accept form-encoded refresh requests.
+    response = await attemptForm();
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Token refresh failed: ${response.status} ${text}`.trim());
+  }
+
+  return response.json();
+}
+
+function parseUsageResponse(raw: unknown): {
+  planType: string;
+  rollingUsedPercent: number | null;
+  rollingResetAt: unknown;
+  weeklyUsedPercent: number | null;
+  weeklyResetAt: unknown;
+} {
+  const data = (raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {}) as Record<string, unknown>;
+
+  const planType =
+    (typeof data.planType === "string" && data.planType.trim() ? data.planType.trim() : null) ??
+    (typeof data.plan_type === "string" && data.plan_type.trim() ? data.plan_type.trim() : null) ??
+    "unknown";
+
+  let rollingUsedPercent: number | null = null;
+  let rollingResetAt: unknown = null;
+  let weeklyUsedPercent: number | null = null;
+  let weeklyResetAt: unknown = null;
+
+  const breakdown = data.usage_breakdown;
+  if (breakdown && typeof breakdown === "object" && !Array.isArray(breakdown)) {
+    const b = breakdown as Record<string, unknown>;
+    const rolling = b.rolling;
+    if (rolling && typeof rolling === "object" && !Array.isArray(rolling)) {
+      const r = rolling as Record<string, unknown>;
+      rollingUsedPercent = toFiniteNumber(r.used_percent);
+      rollingResetAt = r.reset_at;
+    }
+    const weekly = b.weekly;
+    if (weekly && typeof weekly === "object" && !Array.isArray(weekly)) {
+      const w = weekly as Record<string, unknown>;
+      weeklyUsedPercent = toFiniteNumber(w.used_percent);
+      weeklyResetAt = w.reset_at;
+    }
+  }
+
+  // Flat fallbacks (best-effort).
+  if (rollingUsedPercent == null) rollingUsedPercent = toFiniteNumber(data.primary_used_percent);
+  if (weeklyUsedPercent == null) weeklyUsedPercent = toFiniteNumber(data.secondary_used_percent);
+  if (rollingUsedPercent == null) rollingUsedPercent = toFiniteNumber(data.used_percent);
+
+  return {
+    planType,
+    rollingUsedPercent,
+    rollingResetAt,
+    weeklyUsedPercent,
+    weeklyResetAt,
+  };
+}
+
+async function fetchUsage(accessToken: string): Promise<RemoteOpenaiUsage> {
+  const response = await fetch(USAGE_ENDPOINT, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Usage API failed: ${response.status} ${text}`.trim());
+  }
+
+  const raw = await response.json();
+  const parsed = parseUsageResponse(raw);
+
+  const rollingPct = normalizeUsedPct(parsed.rollingUsedPercent);
+  const weeklyPct = normalizeUsedPct(parsed.weeklyUsedPercent);
+  const rollingReset = normalizeResetAt(parsed.rollingResetAt);
+  const weeklyReset = normalizeResetAt(parsed.weeklyResetAt);
+
+  return {
+    fetchedAt: new Date().toISOString(),
+    planType: parsed.planType,
+    rolling5h: {
+      usedPct: rollingPct.usedPct,
+      usedPercentRaw: rollingPct.usedPercentRaw,
+      resetAt: rollingReset.resetAt,
+      resetAtTs: rollingReset.resetAtTs,
+    },
+    weekly: {
+      usedPct: weeklyPct.usedPct,
+      usedPercentRaw: weeklyPct.usedPercentRaw,
+      resetAt: weeklyReset.resetAt,
+      resetAtTs: weeklyReset.resetAtTs,
+    },
+  };
+}
+
+export async function getRemoteOpenaiUsage(opts: {
+  authFilePath: string;
+  now?: number;
+  skipCache?: boolean;
+  cacheTtlMs?: number;
+  autoRefresh?: boolean;
+}): Promise<RemoteOpenaiUsage> {
+  const nowMs = typeof opts.now === "number" && Number.isFinite(opts.now) ? Math.floor(opts.now) : Date.now();
+  const skipCache = opts.skipCache === true;
+  const autoRefresh = opts.autoRefresh !== false;
+
+  const ttlMs =
+    typeof opts.cacheTtlMs === "number" && Number.isFinite(opts.cacheTtlMs) ? Math.max(0, Math.floor(opts.cacheTtlMs)) : 30_000;
+
+  if (!skipCache) {
+    const cached = cache.get(opts.authFilePath);
+    if (cached && nowMs - cached.fetchedAtMs < ttlMs) return cached.data;
+  }
+
+  const existing = inFlight.get(opts.authFilePath);
+  if (existing) return existing;
+
+  const promise = (async (): Promise<RemoteOpenaiUsage> => {
+    if (!existsSync(opts.authFilePath)) {
+      throw new Error(`Missing auth file: ${opts.authFilePath}`);
+    }
+
+    const auth = await readAuthFile(opts.authFilePath);
+    const openai = auth.openai;
+    const access = typeof openai?.access === "string" ? openai.access.trim() : "";
+    if (!access) throw new Error("No OpenAI access token in auth.json");
+
+    const expiresAtMs = parseTimestampMs(openai?.expires);
+    const expired = expiresAtMs != null ? isTokenExpired(expiresAtMs, nowMs) : false;
+
+    let accessToken = access;
+
+    if (expired) {
+      if (!autoRefresh) throw new Error("OpenAI access token expired");
+      const refresh = typeof openai?.refresh === "string" ? openai.refresh.trim() : "";
+      if (!refresh) throw new Error("OpenAI access token expired and no refresh token available");
+
+      const tokens = await refreshToken(refresh);
+      accessToken = tokens.access_token;
+
+      auth.openai = {
+        type: openai?.type,
+        access: tokens.access_token,
+        refresh: tokens.refresh_token ?? refresh,
+        expires: nowMs + tokens.expires_in * 1000,
+      };
+
+      await writeAuthFileAtomic(opts.authFilePath, auth);
+    }
+
+    const data = await fetchUsage(accessToken);
+    if (!skipCache && ttlMs > 0) {
+      cache.set(opts.authFilePath, { fetchedAtMs: nowMs, data });
+    }
+    return data;
+  })();
+
+  inFlight.set(opts.authFilePath, promise);
+  try {
+    return await promise;
+  } finally {
+    inFlight.delete(opts.authFilePath);
+  }
+}
+
+export function __clearRemoteOpenaiUsageCacheForTests(): void {
+  cache.clear();
+  inFlight.clear();
+}

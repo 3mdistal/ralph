@@ -62,7 +62,7 @@ describe("existing PR recovery", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
     const task = { ...baseTask, "session-id": "ses_123" };
 
-    let observedStage: "merge-conflict" | "ci-failure" | null = null;
+    let observedStage: "merge-conflict" | "ci-debug" | null = null;
     (worker as any).getIssuePrResolution = async () => ({
       selectedUrl: "https://github.com/3mdistal/ralph/pull/456",
       duplicates: [],
@@ -86,9 +86,9 @@ describe("existing PR recovery", () => {
         },
       ],
     });
-    (worker as any).runExistingPrRecovery = async (params: any) => {
-      observedStage = params.stage;
-      return { taskName: task.name, repo: task.repo, outcome: "success" };
+    (worker as any).runCiDebugRecovery = async () => {
+      observedStage = "ci-debug";
+      return { status: "failed", run: { taskName: task.name, repo: task.repo, outcome: "failed" } };
     };
 
     const result = await (worker as any).maybeHandleQueuedCiFailure({
@@ -105,7 +105,7 @@ describe("existing PR recovery", () => {
     if (!observedStage) {
       throw new Error("Expected ci-failure recovery stage to be set.");
     }
-    expect(observedStage as unknown as string).toBe("ci-failure");
-    expect(result?.outcome).toBe("success");
+    expect(observedStage as unknown as string).toBe("ci-debug");
+    expect(result?.outcome).toBe("failed");
   });
 });
