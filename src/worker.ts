@@ -64,7 +64,7 @@ import {
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
 import { RALPH_LABEL_BLOCKED, RALPH_LABEL_STUCK } from "./github-labels";
-import { addIssueLabel as addIssueLabelIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
+import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
@@ -1430,7 +1430,7 @@ export class RepoWorker {
       repo: issue.repo,
       issueNumber: issue.number,
       ops: [{ action: "add", label } satisfies LabelOp],
-      log: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
+      log: (message: string) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
       logLabel: `${issue.repo}#${issue.number}`,
       ensureLabels: async () => await this.labelEnsurer.ensure(issue.repo),
       retryMissingLabelOnce: true,
@@ -1451,7 +1451,7 @@ export class RepoWorker {
       repo: issue.repo,
       issueNumber: issue.number,
       ops: [{ action: "remove", label } satisfies LabelOp],
-      log: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
+      log: (message: string) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
       logLabel: `${issue.repo}#${issue.number}`,
       ensureLabels: async () => await this.labelEnsurer.ensure(issue.repo),
       retryMissingLabelOnce: true,

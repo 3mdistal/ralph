@@ -6,7 +6,11 @@ import { applyIssueLabelOps } from "../github/issue-label-io";
 describe("applyIssueLabelOps", () => {
   test("retries once after missing label error", async () => {
     let addCalls = 0;
-    const ensureLabels = mock(async () => ({ ok: true, created: [], updated: [] }));
+    const ensureLabels = mock(async () => ({
+      ok: true as const,
+      created: [] as string[],
+      updated: [] as string[],
+    }));
     const io = {
       addLabel: async () => {
         addCalls += 1;
@@ -37,7 +41,11 @@ describe("applyIssueLabelOps", () => {
   });
 
   test("skips retry when ensure fails auth", async () => {
-    const ensureLabels = mock(async () => ({ ok: false, kind: "auth", error: new Error("nope") }));
+    const ensureLabels = mock(async () => ({
+      ok: false as const,
+      kind: "auth" as const,
+      error: new Error("nope"),
+    }));
     const io = {
       addLabel: async () => {
         throw new GitHubApiError({
