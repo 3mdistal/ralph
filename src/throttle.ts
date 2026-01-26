@@ -1,11 +1,11 @@
 import { existsSync } from "fs";
 import { readdir, readFile } from "fs/promises";
-import { homedir } from "os";
 import { join } from "path";
 
-import { getConfig, resolveOpencodeProfile } from "./config";
+import { getConfig } from "./config";
 import { shouldLog } from "./logging";
 import { extractProviderId, extractRole } from "./opencode-message-utils";
+import { resolveOpencodeMessagesRootDir } from "./opencode-messages-root";
 import { getRemoteOpenaiUsage, type RemoteOpenaiUsage } from "./openai-remote-usage";
 
 export type ThrottleState = "ok" | "soft" | "hard";
@@ -514,46 +514,6 @@ function computeWindowSnapshot(opts: {
     oldestTsInWindow: oldestTs,
     resumeAtTs,
   };
-}
-
-function resolveDefaultXdgDataHome(homeDir: string = homedir()): string {
-  const raw = process.env.XDG_DATA_HOME?.trim();
-  return raw ? raw : join(homeDir, ".local", "share");
-}
-
-function resolveOpencodeMessagesRootDir(opencodeProfile?: string | null): {
-  effectiveProfile: string | null;
-  xdgDataHome: string;
-  messagesRootDir: string;
-} {
-  const requested = (opencodeProfile ?? "").trim();
-  if (requested) {
-    const resolved = resolveOpencodeProfile(requested);
-    if (resolved) {
-      return {
-        effectiveProfile: resolved.name,
-        xdgDataHome: resolved.xdgDataHome,
-        messagesRootDir: join(resolved.xdgDataHome, "opencode", "storage", "message"),
-      };
-    }
-
-    // Unknown profile: fall back to ambient XDG dirs.
-    const xdgDataHome = resolveDefaultXdgDataHome();
-    return { effectiveProfile: null, xdgDataHome, messagesRootDir: join(xdgDataHome, "opencode", "storage", "message") };
-  }
-
-  // No explicit profile: prefer configured default profile if enabled.
-  const resolvedDefault = resolveOpencodeProfile(null);
-  if (resolvedDefault) {
-    return {
-      effectiveProfile: resolvedDefault.name,
-      xdgDataHome: resolvedDefault.xdgDataHome,
-      messagesRootDir: join(resolvedDefault.xdgDataHome, "opencode", "storage", "message"),
-    };
-  }
-
-  const xdgDataHome = resolveDefaultXdgDataHome();
-  return { effectiveProfile: null, xdgDataHome, messagesRootDir: join(xdgDataHome, "opencode", "storage", "message") };
 }
 
 export async function getThrottleDecision(

@@ -875,6 +875,44 @@ export function completeRalphRun(params: {
     });
 }
 
+export function getActiveRalphRunId(params: { repo: string; issueNumber: number }): string | null {
+  const database = requireDb();
+  const active = database
+    .query(
+      `SELECT rr.run_id as run_id
+       FROM ralph_runs rr
+       JOIN repos r ON r.id = rr.repo_id
+       WHERE r.name = $name AND rr.issue_number = $issue AND rr.completed_at IS NULL
+       ORDER BY rr.started_at DESC
+       LIMIT 1`
+    )
+    .get({ $name: params.repo, $issue: params.issueNumber }) as { run_id?: string } | undefined;
+
+  if (active?.run_id) return active.run_id;
+
+  const fallback = database
+    .query(
+      `SELECT rr.run_id as run_id
+       FROM ralph_runs rr
+       JOIN repos r ON r.id = rr.repo_id
+       WHERE r.name = $name AND rr.issue_number = $issue
+       ORDER BY rr.started_at DESC
+       LIMIT 1`
+    )
+    .get({ $name: params.repo, $issue: params.issueNumber }) as { run_id?: string } | undefined;
+
+  return fallback?.run_id ?? null;
+}
+
+export function listRalphRunSessionIds(runId: string): string[] {
+  const database = requireDb();
+  const rows = database
+    .query("SELECT session_id FROM ralph_run_sessions WHERE run_id = $run_id ORDER BY session_id")
+    .all({ $run_id: runId }) as Array<{ session_id?: string | null }>;
+
+  return rows.map((row) => String(row.session_id ?? "")).filter((value) => value.trim() !== "");
+}
+
 const LABEL_SEPARATOR = "\u0001";
 
 function parseLabelList(value?: string | null): string[] {

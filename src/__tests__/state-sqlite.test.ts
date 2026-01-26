@@ -10,6 +10,7 @@ import {
   createRalphRun,
   createNewRollupBatch,
   deleteIdempotencyKey,
+  getActiveRalphRunId,
   getIdempotencyPayload,
   getOrCreateRollupBatch,
   initStateDb,
@@ -17,6 +18,7 @@ import {
   listOpenPrCandidatesForIssue,
   listOpenRollupBatches,
   listRollupBatchEntries,
+  listRalphRunSessionIds,
   markRollupBatchRolledUp,
   recordIdempotencyKey,
   hasIdempotencyKey,
@@ -339,6 +341,67 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("selects active run and lists session ids", () => {
+    initStateDb();
+
+    const run1 = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#200",
+      taskPath: "github:3mdistal/ralph#200",
+      attemptKind: "process",
+      startedAt: "2026-01-20T09:00:00.000Z",
+    });
+
+    recordRalphRunSessionUse({
+      runId: run1,
+      sessionId: "ses_old",
+      stepTitle: "build",
+      at: "2026-01-20T09:01:00.000Z",
+    });
+
+    completeRalphRun({
+      runId: run1,
+      outcome: "success",
+      completedAt: "2026-01-20T09:10:00.000Z",
+    });
+
+    const run2 = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#200",
+      taskPath: "github:3mdistal/ralph#200",
+      attemptKind: "process",
+      startedAt: "2026-01-20T10:00:00.000Z",
+    });
+
+    recordRalphRunSessionUse({
+      runId: run2,
+      sessionId: "ses_new_a",
+      stepTitle: "plan",
+      at: "2026-01-20T10:01:00.000Z",
+    });
+    recordRalphRunSessionUse({
+      runId: run2,
+      sessionId: "ses_new_b",
+      stepTitle: "build",
+      at: "2026-01-20T10:02:00.000Z",
+    });
+
+    const active = getActiveRalphRunId({ repo: "3mdistal/ralph", issueNumber: 200 });
+    expect(active).toBe(run2);
+
+    const sessions = listRalphRunSessionIds(run2);
+    expect(sessions).toEqual(["ses_new_a", "ses_new_b"]);
+
+    completeRalphRun({
+      runId: run2,
+      outcome: "success",
+      completedAt: "2026-01-20T10:10:00.000Z",
+    });
+
+    const latest = getActiveRalphRunId({ repo: "3mdistal/ralph", issueNumber: 200 });
+    expect(latest).toBe(run2);
   });
 
   beforeEach(async () => {

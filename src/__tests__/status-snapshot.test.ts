@@ -11,7 +11,20 @@ describe("buildStatusSnapshot", () => {
       activeProfile: null,
       throttle: { state: "ok" },
       escalations: { pending: 0 },
-      inProgress: [],
+      inProgress: [
+        {
+          name: "Task IP",
+          repo: "3mdistal/ralph",
+          issue: "3mdistal/ralph#3",
+          priority: "p2-medium",
+          opencodeProfile: null,
+          sessionId: null,
+          nowDoing: null,
+          line: null,
+          tokensTotal: 42,
+          tokensComplete: true,
+        },
+      ],
       starting: [],
       queued: [],
       throttled: [

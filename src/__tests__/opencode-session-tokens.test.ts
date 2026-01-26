@@ -3,7 +3,10 @@ import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { readOpencodeSessionTokenTotals } from "../opencode-session-tokens";
+import {
+  readOpencodeSessionTokenTotals,
+  readOpencodeSessionTokenTotalsWithQuality,
+} from "../opencode-session-tokens";
 
 async function writeMessage(opts: {
   root: string;
@@ -163,6 +166,37 @@ describe("opencode session token totals", () => {
       });
 
       expect(totals).toEqual({ input: 0, output: 0, reasoning: 0, total: 0 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports missing quality for absent or empty sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ralph-opencode-session-"));
+
+    try {
+      const missing = await readOpencodeSessionTokenTotalsWithQuality({ sessionId: "ses_missing", messagesRootDir: root });
+      expect(missing.quality).toBe("missing");
+
+      const emptyDir = join(root, "ses_empty");
+      await mkdir(emptyDir, { recursive: true });
+      const empty = await readOpencodeSessionTokenTotalsWithQuality({ sessionId: "ses_empty", messagesRootDir: root });
+      expect(empty.quality).toBe("missing");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports unreadable quality when only malformed files exist", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ralph-opencode-session-"));
+
+    try {
+      const dir = join(root, "ses_bad");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "msg_1.json"), "{", "utf8");
+
+      const result = await readOpencodeSessionTokenTotalsWithQuality({ sessionId: "ses_bad", messagesRootDir: root });
+      expect(result.quality).toBe("unreadable");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
