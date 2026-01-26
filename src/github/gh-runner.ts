@@ -1,3 +1,5 @@
+import { $ } from "bun";
+
 import { getProfile, getSandboxProfileConfig } from "../config";
 import { resolveGhTokenEnv } from "../github-app-auth";
 import { SandboxTripwireError, assertSandboxWriteAllowed } from "./sandbox-tripwire";
