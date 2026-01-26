@@ -39,11 +39,21 @@ export type StatusBlockedTask = StatusTaskBase & {
   blockedDetailsSnippet: string | null;
 };
 
+export type StatusDaemonSnapshot = {
+  daemonId: string | null;
+  pid: number | null;
+  startedAt: string | null;
+  version: string | null;
+  controlFilePath: string | null;
+  command: string[] | null;
+};
+
 import type { StatusUsageSnapshot } from "./status-usage";
 
 export type StatusSnapshot = {
   mode: string;
   queue: StatusQueueSnapshot;
+  daemon: StatusDaemonSnapshot | null;
   controlProfile: string | null;
   activeProfile: string | null;
   throttle: unknown;

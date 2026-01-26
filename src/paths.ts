@@ -58,7 +58,7 @@ export function getRalphWorktreesDir(): string {
   return join(getRalphHomeDir(), "worktrees");
 }
 
-function getRalphStateDir(): string {
+export function getRalphStateDir(): string {
   const raw = process.env.XDG_STATE_HOME?.trim();
   const stateHome = raw ? raw : join(resolveHomeDir(), ".local", "state");
   return join(stateHome, "ralph");

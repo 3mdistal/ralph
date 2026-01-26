@@ -7,6 +7,7 @@ describe("buildStatusSnapshot", () => {
     const snapshot = buildStatusSnapshot({
       mode: "running",
       queue: { backend: "bwrb", health: "ok", fallback: false, diagnostics: null },
+      daemon: null,
       controlProfile: null,
       activeProfile: null,
       throttle: { state: "ok" },

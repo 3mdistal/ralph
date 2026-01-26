@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/index.ts",
   "bin": {
-    "ralph": "src/cli.ts"
+    "ralph": "src/cli.ts",
+    "ralphctl": "src/ralphctl.ts"
   },
   "scripts": {
     "start": "bun run src/index.ts",

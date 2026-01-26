@@ -366,6 +366,24 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
 
+### ralphctl (operator CLI)
+
+`ralphctl` wraps the control file and restart flow:
+
+- `ralphctl status [--json]`
+- `ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]`
+- `ralphctl resume`
+- `ralphctl restart [--grace 5m] [--start-cmd "<command>"]`
+- `ralphctl upgrade [--grace 5m] [--start-cmd "<command>"] [--upgrade-cmd "<command>"]`
+
+Daemon discovery for restart/upgrade uses a lease record at:
+
+- `$XDG_STATE_HOME/ralph/daemon.json`
+- Fallback: `~/.local/state/ralph/daemon.json`
+- Last resort: `/tmp/ralph/<uid>/daemon.json`
+
+The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
+
 ## Managed OpenCode config (daemon runs)
 
 Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `$HOME/.ralph/opencode`. This directory is owned by Ralph and overwritten on startup to match the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Override precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. Overrides must be absolute paths (no `~` expansion). For safety, Ralph refuses to manage non-managed directories unless they already contain the `.ralph-managed-opencode` marker file. This does not change OpenCode profile storage; profiles still control XDG roots for auth/storage/usage logs.

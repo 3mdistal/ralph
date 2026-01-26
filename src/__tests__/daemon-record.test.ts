@@ -1,0 +1,58 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
+import { tmpdir } from "os";
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+
+import { readDaemonRecord, resolveDaemonRecordPath, writeDaemonRecord } from "../daemon-record";
+
+describe("daemon record", () => {
+  let priorXdgStateHome: string | undefined;
+  const tempDirs: string[] = [];
+
+  beforeEach(() => {
+    priorXdgStateHome = process.env.XDG_STATE_HOME;
+  });
+
+  afterEach(() => {
+    if (priorXdgStateHome !== undefined) process.env.XDG_STATE_HOME = priorXdgStateHome;
+    else delete process.env.XDG_STATE_HOME;
+    for (const dir of tempDirs) {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    tempDirs.length = 0;
+  });
+
+  test("writes and reads daemon record", () => {
+    const base = mkdtempSync(join(tmpdir(), "ralph-daemon-"));
+    tempDirs.push(base);
+    process.env.XDG_STATE_HOME = base;
+
+    writeDaemonRecord({
+      version: 1,
+      daemonId: "d_test",
+      pid: 1234,
+      startedAt: new Date().toISOString(),
+      ralphVersion: "0.1.0",
+      command: ["bun", "src/index.ts"],
+      cwd: "/tmp",
+      controlFilePath: "/tmp/control.json",
+    });
+
+    const record = readDaemonRecord();
+    expect(record?.daemonId).toBe("d_test");
+    expect(record?.pid).toBe(1234);
+    expect(record?.command).toEqual(["bun", "src/index.ts"]);
+  });
+
+  test("returns null for invalid record", () => {
+    const base = mkdtempSync(join(tmpdir(), "ralph-daemon-"));
+    tempDirs.push(base);
+    process.env.XDG_STATE_HOME = base;
+
+    const recordPath = resolveDaemonRecordPath();
+    mkdirSync(dirname(recordPath), { recursive: true });
+    writeFileSync(recordPath, "{invalid json");
+    const record = readDaemonRecord();
+    expect(record).toBeNull();
+  });
+});
