@@ -39,12 +39,15 @@ export type StatusBlockedTask = StatusTaskBase & {
   blockedDetailsSnippet: string | null;
 };
 
+import type { StatusUsageSnapshot } from "./status-usage";
+
 export type StatusSnapshot = {
   mode: string;
   queue: StatusQueueSnapshot;
   controlProfile: string | null;
   activeProfile: string | null;
   throttle: unknown;
+  usage?: StatusUsageSnapshot;
   escalations: { pending: number };
   inProgress: StatusInProgressTask[];
   starting: StatusTaskBase[];
