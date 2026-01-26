@@ -20,6 +20,11 @@ export interface RepoConfig {
    * falling back to the repo default branch. Missing/unreadable protection disables gating.
    */
   requiredChecks?: string[];
+  /**
+   * Optional per-repo setup commands run in the task worktree before any agent execution.
+   * Commands are operator-owned and defined in ~/.ralph/config.toml|json.
+   */
+  setup?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
@@ -76,6 +81,8 @@ export interface ThrottleConfig {
   enabled?: boolean;
   /** Provider ID to count toward usage (default: "openai"). */
   providerID?: string;
+  /** OpenAI throttle source (default: "remoteUsage"). */
+  openaiSource?: "localLogs" | "remoteUsage";
   /** Soft throttle threshold as fraction of budget (default: 0.65). */
   softPct?: number;
   /** Hard throttle threshold (reserved for #72; default: 0.75). */
@@ -155,6 +162,11 @@ export interface SandboxProfileConfig {
   githubAuth: SandboxGithubAuthConfig;
 }
 
+export interface DashboardConfig {
+  /** Days to retain dashboard event logs (default: 14). */
+  eventsRetentionDays?: number;
+}
+
 export type QueueBackend = "github" | "bwrb" | "none";
 
 export interface RalphConfig {
@@ -163,6 +175,8 @@ export interface RalphConfig {
   maxWorkers: number;
   batchSize: number;       // PRs before rollup (default: 10)
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
+  /** ms between done reconciliation checks (default: 300000) */
+  doneReconcileIntervalMs: number;
   /** Ownership TTL in ms for task heartbeats (default: 60000). */
   ownershipTtlMs: number;
   /** Queue backend selection (default: "github"). */
@@ -194,19 +208,23 @@ export interface RalphConfig {
   throttle?: ThrottleConfig;
   opencode?: OpencodeConfig;
   control?: ControlConfig;
+  dashboard?: DashboardConfig;
 }
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
+const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
+const DEFAULT_THROTTLE_OPENAI_SOURCE: "localLogs" | "remoteUsage" = "remoteUsage";
 const DEFAULT_THROTTLE_SOFT_PCT = 0.65;
 const DEFAULT_THROTTLE_HARD_PCT = 0.75;
 const DEFAULT_THROTTLE_MIN_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_THROTTLE_BUDGET_5H_TOKENS = 16_987_015;
 const DEFAULT_THROTTLE_BUDGET_WEEKLY_TOKENS = 55_769_305;
+const DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS = 14;
 
 function detectDefaultBwrbVault(): string {
   const start = process.cwd();
@@ -273,6 +291,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   maxWorkers: DEFAULT_GLOBAL_MAX_WORKERS,
   batchSize: 10,
   pollInterval: 30000,
+  doneReconcileIntervalMs: DEFAULT_DONE_RECONCILE_INTERVAL_MS,
   ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
   queueBackend: "github",
   bwrbVault: detectDefaultBwrbVault(),
@@ -373,6 +392,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       );
     }
     loaded.ownershipTtlMs = DEFAULT_OWNERSHIP_TTL_MS;
+  }
+
+  const doneInterval = toPositiveIntOrNull((loaded as any).doneReconcileIntervalMs);
+  if (!doneInterval) {
+    const raw = (loaded as any).doneReconcileIntervalMs;
+    if (raw !== undefined) {
+      console.warn(
+        `[ralph] Invalid config doneReconcileIntervalMs=${JSON.stringify(raw)}; falling back to default ${DEFAULT_DONE_RECONCILE_INTERVAL_MS}`
+      );
+    }
+    loaded.doneReconcileIntervalMs = DEFAULT_DONE_RECONCILE_INTERVAL_MS;
   }
 
   const rawQueueBackend = (loaded as any).queueBackend;
@@ -596,6 +626,24 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     }
   }
 
+  // Best-effort validation for dashboard config.
+  const rawDashboard = (loaded as any).dashboard;
+  if (rawDashboard !== undefined && rawDashboard !== null && (typeof rawDashboard !== "object" || Array.isArray(rawDashboard))) {
+    console.warn(`[ralph] Invalid config dashboard=${JSON.stringify(rawDashboard)}; ignoring`);
+    (loaded as any).dashboard = undefined;
+  } else if (rawDashboard && typeof rawDashboard === "object") {
+    const rawRetention = (rawDashboard as any).eventsRetentionDays;
+    const parsedRetention = rawRetention === undefined ? null : toPositiveIntOrNull(rawRetention);
+    if (rawRetention !== undefined && parsedRetention == null) {
+      console.warn(
+        `[ralph] Invalid config dashboard.eventsRetentionDays=${JSON.stringify(rawRetention)}; ` +
+          `defaulting to ${DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS}`
+      );
+    }
+    const retention = parsedRetention ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
+    loaded.dashboard = { eventsRetentionDays: retention };
+  }
+
   // Best-effort validation for OpenCode profile config.
   const rawOpencode = (loaded as any).opencode;
   if (rawOpencode !== undefined && rawOpencode !== null && (typeof rawOpencode !== "object" || Array.isArray(rawOpencode))) {
@@ -739,6 +787,18 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       } else {
         console.warn(
           `[ralph] Invalid config throttle.providerID=${JSON.stringify(providerRaw)}; defaulting to ${JSON.stringify(DEFAULT_THROTTLE_PROVIDER_ID)}`
+        );
+      }
+    }
+
+    const openaiSourceRaw = throttleObj.openaiSource;
+    let openaiSource: "localLogs" | "remoteUsage" = DEFAULT_THROTTLE_OPENAI_SOURCE;
+    if (openaiSourceRaw !== undefined) {
+      if (openaiSourceRaw === "localLogs" || openaiSourceRaw === "remoteUsage") {
+        openaiSource = openaiSourceRaw;
+      } else {
+        console.warn(
+          `[ralph] Invalid config throttle.openaiSource=${JSON.stringify(openaiSourceRaw)}; defaulting to ${JSON.stringify(DEFAULT_THROTTLE_OPENAI_SOURCE)}`
         );
       }
     }
@@ -1022,6 +1082,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.throttle = {
       enabled,
       providerID,
+      openaiSource,
       softPct,
       hardPct,
       minCheckIntervalMs,
@@ -1178,8 +1239,30 @@ export function getRepoRequiredChecksOverride(repoName: string): string[] | null
   return toStringArrayOrNull(explicit?.requiredChecks);
 }
 
+export function getRepoSetupCommands(repoName: string): string[] | null {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  if (!explicit || (explicit as any).setup === undefined) return null;
+
+  const parsed = toStringArrayOrNull((explicit as any).setup);
+  if (parsed === null) {
+    console.warn(
+      `[ralph] Invalid config setup for repo ${repoName}: ${JSON.stringify((explicit as any).setup)}; ignoring.`
+    );
+    return null;
+  }
+  return parsed;
+}
+
 export function getGlobalMaxWorkers(): number {
   return getConfig().maxWorkers;
+}
+
+export function getDashboardEventsRetentionDays(): number {
+  const cfg = getConfig();
+  const raw = cfg.dashboard?.eventsRetentionDays;
+  const parsed = toPositiveIntOrNull(raw);
+  return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
 }
 
 export function getRepoMaxWorkers(repoName: string): number {

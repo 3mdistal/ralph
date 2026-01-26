@@ -83,6 +83,9 @@ describe("github escalation writeback", () => {
 
     const github = {
       request: async (path: string, opts: { method?: string; body?: { body?: string } } = {}) => {
+        if (path.startsWith("/repos/3mdistal/ralph/labels")) {
+          return { data: [] };
+        }
         if (path === "/graphql") {
           return {
             data: {
@@ -147,6 +150,9 @@ describe("github escalation writeback", () => {
 
     const github = {
       request: async (path: string, opts: { method?: string; body?: { body?: string } } = {}) => {
+        if (path.startsWith("/repos/3mdistal/ralph/labels")) {
+          return { data: [] };
+        }
         if (path === "/graphql") {
           return {
             data: {
@@ -210,6 +216,9 @@ describe("github escalation writeback", () => {
 
       const github = {
         request: async (path: string, opts: { method?: string } = {}) => {
+          if (path.startsWith("/repos/3mdistal/ralph/labels")) {
+            return { data: [] };
+          }
           if (path === "/graphql") {
             return {
               data: {

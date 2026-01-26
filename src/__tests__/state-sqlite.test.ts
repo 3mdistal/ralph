@@ -6,6 +6,8 @@ import { Database } from "bun:sqlite";
 
 import {
   closeStateDbForTests,
+  completeRalphRun,
+  createRalphRun,
   createNewRollupBatch,
   deleteIdempotencyKey,
   getIdempotencyPayload,
@@ -24,6 +26,7 @@ import {
   recordRepoGithubIssueSync,
   recordRepoGithubDoneReconcileCursor,
   getRepoGithubDoneReconcileCursor,
+  recordRalphRunSessionUse,
   recordTaskSnapshot,
   recordPrSnapshot,
   PR_STATE_MERGED,
@@ -151,7 +154,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("8");
+      expect(meta.value).toBe("9");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -171,6 +174,16 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_issue_sync'")
         .get() as { name?: string } | undefined;
       expect(cursorTable?.name).toBe("repo_github_issue_sync");
+
+      const runsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_runs'")
+        .get() as { name?: string } | undefined;
+      expect(runsTable?.name).toBe("ralph_runs");
+
+      const runSessionsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_sessions'")
+        .get() as { name?: string } | undefined;
+      expect(runSessionsTable?.name).toBe("ralph_run_sessions");
 
       const doneCursorTable = migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_done_reconcile_cursor'")
@@ -219,13 +232,112 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("8");
+      expect(meta.value).toBe("9");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
       expect(columnNames).toContain("session_events_path");
+
+      const runsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_runs'")
+        .get() as { name?: string } | undefined;
+      expect(runsTable?.name).toBe("ralph_runs");
+
+      const runSessionsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_sessions'")
+        .get() as { name?: string } | undefined;
+      expect(runSessionsTable?.name).toBe("ralph_run_sessions");
     } finally {
       migrated.close();
+    }
+  });
+
+  test("records ralph runs and session usage", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#101",
+      taskPath: "github:3mdistal/ralph#101",
+      attemptKind: "process",
+      startedAt: "2026-01-20T10:00:00.000Z",
+    });
+
+    recordRalphRunSessionUse({
+      runId,
+      sessionId: "ses_alpha",
+      stepTitle: "plan",
+      agent: "ralph-plan",
+      at: "2026-01-20T10:01:00.000Z",
+    });
+
+    recordRalphRunSessionUse({
+      runId,
+      sessionId: "ses_alpha",
+      stepTitle: "build",
+      agent: "general",
+      at: "2026-01-20T10:02:00.000Z",
+    });
+
+    recordRalphRunSessionUse({
+      runId,
+      sessionId: "ses_beta",
+      stepTitle: "survey",
+      at: "2026-01-20T10:03:00.000Z",
+    });
+
+    completeRalphRun({
+      runId,
+      outcome: "success",
+      completedAt: "2026-01-20T10:10:00.000Z",
+      details: { prUrl: "https://github.com/3mdistal/ralph/pull/123" },
+    });
+
+    completeRalphRun({
+      runId,
+      outcome: "failed",
+      completedAt: "2026-01-20T10:20:00.000Z",
+      details: { reasonCode: "late-write" },
+    });
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      const runRow = db
+        .query("SELECT outcome, completed_at, details_json FROM ralph_runs WHERE run_id = $run_id")
+        .get({ $run_id: runId }) as { outcome?: string; completed_at?: string; details_json?: string };
+
+      expect(runRow.outcome).toBe("success");
+      expect(runRow.completed_at).toBe("2026-01-20T10:10:00.000Z");
+      expect(runRow.details_json).toContain("pull/123");
+
+      const sessionRows = db
+        .query(
+          "SELECT session_id, first_step_title, last_step_title, first_agent, last_agent, first_seen_at, last_seen_at FROM ralph_run_sessions WHERE run_id = $run_id ORDER BY session_id"
+        )
+        .all({ $run_id: runId }) as Array<{
+        session_id: string;
+        first_step_title?: string | null;
+        last_step_title?: string | null;
+        first_agent?: string | null;
+        last_agent?: string | null;
+        first_seen_at: string;
+        last_seen_at: string;
+      }>;
+
+      expect(sessionRows).toHaveLength(2);
+      expect(sessionRows[0]?.session_id).toBe("ses_alpha");
+      expect(sessionRows[0]?.first_step_title).toBe("plan");
+      expect(sessionRows[0]?.last_step_title).toBe("build");
+      expect(sessionRows[0]?.first_agent).toBe("ralph-plan");
+      expect(sessionRows[0]?.last_agent).toBe("general");
+      expect(sessionRows[0]?.first_seen_at).toBe("2026-01-20T10:01:00.000Z");
+      expect(sessionRows[0]?.last_seen_at).toBe("2026-01-20T10:02:00.000Z");
+
+      expect(sessionRows[1]?.session_id).toBe("ses_beta");
+      expect(sessionRows[1]?.first_step_title).toBe("survey");
+      expect(sessionRows[1]?.last_step_title).toBe("survey");
+    } finally {
+      db.close();
     }
   });
 
@@ -352,7 +464,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("8");
+      expect(meta.value).toBe("9");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);

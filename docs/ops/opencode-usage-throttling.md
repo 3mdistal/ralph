@@ -13,12 +13,28 @@ Ensure Ralph never consumes more than a configurable fraction of the operator's 
 - Add pacing so usage stays smooth and I don’t hit the wall suddenly.
 
 ## Key Constraints
-- No official API (today) to programmatically query Codex plan remaining percent/reset times.
-- We can treat plan limits as constants after a one-time calibration.
+- No official stable API to query Codex plan remaining percent/reset times; remote meters are best-effort and may fail.
+- We can treat plan limits as constants after a one-time calibration when relying on local logs.
 - Weekly + 5-hour windows must both be respected.
 
-## Data Source (Ground Truth)
-OpenCode stores per-message usage locally; we can sum usage in rolling windows by timestamp.
+## Usage Source Precedence (OpenAI)
+
+Ralph prefers remote usage meters for OpenAI when available and falls back to local OpenCode logs when remote usage is unavailable or fails.
+
+- Default/preferred: `openaiSource=remoteUsage`.
+- Fallback: `localLogs` (OpenCode message-log scan).
+- If `openaiSource=localLogs`, never attempt remote usage.
+
+## Data Source (Meters + Fallback)
+
+### Remote meters (preferred for OpenAI)
+
+- Uses OpenAI remote usage meters (best-effort) when `openaiSource=remoteUsage`.
+- Remote usage provides per-window `usedPct` and `resetAt` values for rolling 5h + weekly.
+
+### Local logs (fallback)
+
+OpenCode stores per-message usage locally; Ralph sums usage in rolling windows by timestamp.
 
 - Location (macOS): `~/.local/share/opencode/storage/message/**/msg_*.json`
 - Relevant fields: `providerID`, `role`, `time.created`, `tokens.input`, `tokens.output`, `tokens.reasoning`, `tokens.cache.read/write`
@@ -104,6 +120,7 @@ Add a throttle config section to Ralph:
 
 - `throttle.enabled`
 - `throttle.providerID` (default `openai`)
+- `throttle.openaiSource` (`localLogs` | `remoteUsage`, default `remoteUsage`; OpenAI-only)
 - `throttle.windows.rolling5h.budgetTokens` (default 16,987,015)
 - `throttle.windows.weekly.budgetTokens` (default 55,769,305)
 - `throttle.softPct` (default 0.65)
@@ -130,6 +147,7 @@ Add a throttle config section to Ralph:
 5) Add observability
 - Log a structured snapshot when entering/leaving throttled state.
 - Add a small summary line in `queue.json` / run logs so it’s obvious why work stopped.
+- Add a CLI view of the current meters: `ralph usage` (table) and `ralph usage --json`.
 
 6) Add a `calibrate` helper (optional but valuable)
 - A CLI command that takes two timestamped dashboard snapshots (5h/week % + reset times) and computes budgets automatically from OpenCode logs.
