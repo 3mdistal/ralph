@@ -4,6 +4,8 @@ This document defines the v0.1.0 GitHub-first contract for Ralph. GitHub Issues 
 source of truth for queue state and dependency relationships. SQLite is the durable
 operational state store under `~/.ralph`.
 
+Migration policy for `state.sqlite`: see `docs/ops/state-sqlite.md`.
+
 ## Source of truth boundaries
 
 - GitHub Issues are authoritative for: queue state, dependency graph, and completion status.
@@ -22,6 +24,7 @@ The label descriptions and colors are enforced to match `src/github-labels.ts` (
 | `ralph:in-progress` | Ralph is actively working | `FBCA04` |
 | `ralph:in-bot` | Task PR merged to `bot/integration` | `0E8A16` |
 | `ralph:blocked` | Blocked by dependencies | `D73A4A` |
+| `ralph:stuck` | CI remediation in progress | `F9A825` |
 | `ralph:done` | Task merged to default branch | `1A7F37` |
 | `ralph:escalated` | Waiting on human input | `B60205` |
 

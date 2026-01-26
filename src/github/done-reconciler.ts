@@ -6,7 +6,7 @@ import {
   type RepoGithubDoneCursor,
 } from "../state";
 import { isRepoAllowed } from "../github-app-auth";
-import { ensureRalphWorkflowLabelsOnce } from "./ensure-ralph-workflow-labels";
+import { createRalphWorkflowLabelsEnsurer, ensureRalphWorkflowLabelsOnce, type EnsureOutcome } from "./ensure-ralph-workflow-labels";
 import { GitHubClient, splitRepoFullName } from "./client";
 import { executeIssueLabelOps, planIssueLabelOps } from "./issue-label-io";
 import { RALPH_LABEL_DONE } from "../github-labels";
@@ -30,6 +30,9 @@ type MergedPullRequest = {
   closingIssues: ClosingIssue[];
 };
 
+type EnsureLabels = (repo: string) => Promise<EnsureOutcome>;
+type ResolveDefaultBranch = (repo: string, github: GitHubClient) => Promise<string | null>;
+
 type DoneReconcileResult = {
   ok: boolean;
   processedPrs: number;
@@ -44,6 +47,8 @@ const DEFAULT_BACKOFF_MULTIPLIER = 1.5;
 const DEFAULT_ERROR_MULTIPLIER = 2;
 const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
+const DEFAULT_DEFAULT_BRANCH_CACHE_TTL_MS = 10 * 60_000;
+const IDLE_LOG_INTERVAL_MS = 60_000;
 
 const DONE_LABEL = RALPH_LABEL_DONE;
 const TRANSITION_LABELS = ["ralph:queued", "ralph:in-progress", "ralph:in-bot", "ralph:blocked", "ralph:escalated"];
@@ -63,6 +68,24 @@ function nextDelayMs(params: {
   const multiplier = params.hadError ? DEFAULT_ERROR_MULTIPLIER : DEFAULT_BACKOFF_MULTIPLIER;
   const next = params.previousMs * multiplier;
   return Math.min(next, params.baseMs * DEFAULT_MAX_BACKOFF_MULTIPLIER);
+}
+
+function resolveDelay(params: {
+  baseMs: number;
+  previousMs: number;
+  hadError: boolean;
+  hadWork: boolean;
+}): { delayMs: number; reason: "work" | "idle" | "error" } {
+  if (params.hadError) {
+    return { delayMs: nextDelayMs({ baseMs: params.baseMs, previousMs: params.previousMs, hadError: true }), reason: "error" };
+  }
+  if (params.hadWork) {
+    return { delayMs: params.baseMs, reason: "work" };
+  }
+  return {
+    delayMs: nextDelayMs({ baseMs: params.baseMs, previousMs: params.previousMs, hadError: false }),
+    reason: "idle",
+  };
 }
 
 function parseIsoMs(value: string): number | null {
@@ -123,6 +146,39 @@ async function fetchDefaultBranch(github: GitHubClient, repo: string): Promise<s
   const response = await github.request<{ default_branch?: string | null }>(`/repos/${owner}/${name}`);
   const branch = response.data?.default_branch ?? null;
   return typeof branch === "string" && branch.trim() ? branch.trim() : null;
+}
+
+function createDefaultBranchCache(params?: { ttlMs?: number; now?: () => number }) {
+  const ttlMs = params?.ttlMs ?? DEFAULT_DEFAULT_BRANCH_CACHE_TTL_MS;
+  const now = params?.now ?? (() => Date.now());
+  const cache = new Map<string, { value: string | null; expiresAt: number }>();
+
+  const get = async (repo: string, github: GitHubClient): Promise<string | null> => {
+    const cached = cache.get(repo);
+    const nowMs = now();
+    if (cached && cached.expiresAt > nowMs) return cached.value;
+
+    try {
+      const value = await fetchDefaultBranch(github, repo);
+      cache.set(repo, { value, expiresAt: nowMs + ttlMs });
+      return value;
+    } catch (error) {
+      if (cached) return cached.value;
+      throw error;
+    }
+  };
+
+  return { get };
+}
+
+export function __resolveDoneReconcileDelayForTests(
+  params: Parameters<typeof resolveDelay>[0]
+): ReturnType<typeof resolveDelay> {
+  return resolveDelay(params);
+}
+
+export function __createDefaultBranchCacheForTests(params?: { ttlMs?: number; now?: () => number }) {
+  return createDefaultBranchCache(params);
 }
 
 async function fetchMergedPullRequests(params: {
@@ -231,6 +287,8 @@ export async function reconcileRepoDoneState(params: {
   log?: (message: string) => void;
   warn?: (message: string) => void;
   maxPrsPerRun?: number;
+  ensureLabels?: EnsureLabels;
+  resolveDefaultBranch?: ResolveDefaultBranch;
 }): Promise<DoneReconcileResult> {
   const log = params.log ?? ((message: string) => console.log(message));
   const warn = params.warn ?? ((message: string) => console.warn(message));
@@ -238,13 +296,17 @@ export async function reconcileRepoDoneState(params: {
   const repo = params.repo.name;
   const maxPrs = params.maxPrsPerRun ?? DEFAULT_MAX_PRS_PER_RUN;
   const prefix = `[ralph:done:${repo}]`;
+  const ensureLabels =
+    params.ensureLabels ??
+    (async (targetRepo: string) => ensureRalphWorkflowLabelsOnce({ repo: targetRepo, github: params.github }));
+  const resolveDefaultBranch = params.resolveDefaultBranch ?? ((targetRepo, github) => fetchDefaultBranch(github, targetRepo));
 
   if (!isRepoAllowed(repo)) {
     log(`${prefix} Skipping repo (owner not in allowlist)`);
     return { ok: true, processedPrs: 0, updatedIssues: 0 };
   }
 
-  const labelOutcome = await ensureRalphWorkflowLabelsOnce({ repo, github: params.github });
+  const labelOutcome = await ensureLabels(repo);
   if (!labelOutcome.ok) {
     const key = `ralph:done:labels:${repo}`;
     if (shouldLog(key, 60_000)) {
@@ -270,7 +332,7 @@ export async function reconcileRepoDoneState(params: {
 
   let defaultBranch: string | null = null;
   try {
-    defaultBranch = await fetchDefaultBranch(params.github, repo);
+    defaultBranch = await resolveDefaultBranch(repo, params.github);
   } catch (error: any) {
     warn(`${prefix} Failed to fetch default branch: ${error?.message ?? String(error)}`);
     return { ok: false, processedPrs: 0, updatedIssues: 0, error: "default-branch" };
@@ -355,6 +417,8 @@ function startRepoDoneReconciler(params: {
   baseIntervalMs: number;
   log?: (message: string) => void;
   warn?: (message: string) => void;
+  ensureLabels?: EnsureLabels;
+  resolveDefaultBranch?: ResolveDefaultBranch;
 }): PollerHandle {
   let stopped = false;
   let timer: TimeoutHandle | null = null;
@@ -378,9 +442,30 @@ function startRepoDoneReconciler(params: {
     const github = new GitHubClient(params.repo.name);
     let hadError = false;
     try {
-      const result = await reconcileRepoDoneState({ repo: params.repo, github, log: params.log, warn: params.warn });
+      const result = await reconcileRepoDoneState({
+        repo: params.repo,
+        github,
+        log: params.log,
+        warn: params.warn,
+        ensureLabels: params.ensureLabels,
+        resolveDefaultBranch: params.resolveDefaultBranch,
+      });
       hadError = !result.ok;
-      delayMs = result.ok ? params.baseIntervalMs : nextDelayMs({ baseMs: params.baseIntervalMs, previousMs: delayMs, hadError });
+      const hadWork = result.ok && (result.processedPrs > 0 || result.updatedIssues > 0);
+      const resolved = resolveDelay({
+        baseMs: params.baseIntervalMs,
+        previousMs: delayMs,
+        hadError,
+        hadWork,
+      });
+      delayMs = resolved.delayMs;
+      if (resolved.reason === "idle" && shouldLog(`ralph:done:${params.repo.name}:idle`, IDLE_LOG_INTERVAL_MS)) {
+        const seconds = Math.round(delayMs / 1000);
+        const details = result.initializedCursor ? "initialized cursor" : "no new merges";
+        (params.log ?? ((message: string) => console.log(message)))(
+          `[ralph:done:${params.repo.name}] idle (${details}); next check in ${seconds}s`
+        );
+      }
     } catch (error: any) {
       hadError = true;
       const warn = params.warn ?? ((message: string) => console.warn(message));
@@ -414,13 +499,28 @@ export function startGitHubDoneReconciler(params: {
   const log = params.log ?? ((message: string) => console.log(message));
   const warn = params.warn ?? ((message: string) => console.warn(message));
   const handles: PollerHandle[] = [];
+  const labelsEnsurer = createRalphWorkflowLabelsEnsurer({
+    githubFactory: (repo) => new GitHubClient(repo),
+    log,
+    warn,
+  });
+  const defaultBranchCache = createDefaultBranchCache();
 
   for (const repo of params.repos) {
     if (!repo.name || !repo.path || !repo.botBranch) {
       log(`[ralph:done] Skipping repo with missing config: ${JSON.stringify(repo.name)}`);
       continue;
     }
-    handles.push(startRepoDoneReconciler({ repo, baseIntervalMs: params.baseIntervalMs, log, warn }));
+    handles.push(
+      startRepoDoneReconciler({
+        repo,
+        baseIntervalMs: params.baseIntervalMs,
+        log,
+        warn,
+        ensureLabels: labelsEnsurer.ensure,
+        resolveDefaultBranch: defaultBranchCache.get,
+      })
+    );
   }
 
   if (handles.length === 0) {

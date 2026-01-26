@@ -1,6 +1,13 @@
 import { resolveAgentTaskByIssue, updateTaskStatus } from "../queue-backend";
-import { initStateDb, listIssuesWithAllLabels } from "../state";
+import {
+  getEscalationCommentCheckState,
+  getIssueSnapshotByNumber,
+  initStateDb,
+  listIssuesWithAllLabels,
+  recordEscalationCommentCheckState,
+} from "../state";
 import { GitHubClient, splitRepoFullName } from "./client";
+import { shouldLog } from "../logging";
 import { ensureRalphWorkflowLabelsOnce } from "./ensure-ralph-workflow-labels";
 import { executeIssueLabelOps, type LabelOp } from "./issue-label-io";
 import {
@@ -17,10 +24,15 @@ export type EscalationResolutionDeps = {
   listIssuesWithAllLabels: typeof listIssuesWithAllLabels;
   resolveAgentTaskByIssue: typeof resolveAgentTaskByIssue;
   updateTaskStatus: typeof updateTaskStatus;
+  getIssueSnapshotByNumber: typeof getIssueSnapshotByNumber;
+  getEscalationCommentCheckState: typeof getEscalationCommentCheckState;
+  recordEscalationCommentCheckState: typeof recordEscalationCommentCheckState;
 };
 
 const DEFAULT_MAX_ESCALATIONS = 10;
 const DEFAULT_MAX_RECENT_COMMENTS = 20;
+const DEFAULT_ESCALATION_RECHECK_INTERVAL_MS = 10 * 60_000;
+const ESCALATION_DEFER_LOG_INTERVAL_MS = 60_000;
 const AUTHORIZED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 
 type IssueCommentNode = {
@@ -35,6 +47,39 @@ type IssueCommentsResponse = {
 
 function issueKey(issue: EscalatedIssue): string {
   return `${issue.repo}#${issue.number}`;
+}
+
+function parseIsoMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function shouldFetchEscalationComments(params: {
+  nowMs: number;
+  lastCheckedAt: string | null;
+  lastSeenUpdatedAt: string | null;
+  githubUpdatedAt: string | null;
+  minIntervalMs: number;
+}): { shouldFetch: boolean; reason: "initial" | "updated" | "interval" | "defer" } {
+  const lastCheckedMs = parseIsoMs(params.lastCheckedAt);
+  const lastSeenUpdatedMs = parseIsoMs(params.lastSeenUpdatedAt);
+  const currentUpdatedMs = parseIsoMs(params.githubUpdatedAt);
+
+  if (lastCheckedMs === null) return { shouldFetch: true, reason: "initial" };
+  if (currentUpdatedMs !== null && (lastSeenUpdatedMs === null || currentUpdatedMs > lastSeenUpdatedMs)) {
+    return { shouldFetch: true, reason: "updated" };
+  }
+  if (params.nowMs - lastCheckedMs >= params.minIntervalMs) {
+    return { shouldFetch: true, reason: "interval" };
+  }
+  return { shouldFetch: false, reason: "defer" };
+}
+
+export function __shouldFetchEscalationCommentsForTests(
+  params: Parameters<typeof shouldFetchEscalationComments>[0]
+): ReturnType<typeof shouldFetchEscalationComments> {
+  return shouldFetchEscalationComments(params);
 }
 
 async function listRecentIssueComments(params: {
@@ -136,10 +181,16 @@ export async function reconcileEscalationResolutions(params: {
   maxEscalations?: number;
   maxRecentComments?: number;
   deps?: EscalationResolutionDeps;
+  minRecheckIntervalMs?: number;
+  now?: () => Date;
 }): Promise<void> {
   const log = params.log ?? console.log;
   const maxEscalations = params.maxEscalations ?? DEFAULT_MAX_ESCALATIONS;
   const maxRecentComments = params.maxRecentComments ?? DEFAULT_MAX_RECENT_COMMENTS;
+  const minRecheckIntervalMs = params.minRecheckIntervalMs ?? DEFAULT_ESCALATION_RECHECK_INTERVAL_MS;
+  const now = params.now ?? (() => new Date());
+  const nowMs = now().getTime();
+  const nowIso = new Date(nowMs).toISOString();
   const repoOwner = params.repo.split("/")[0]?.toLowerCase() ?? "";
   if (!params.deps) {
     initStateDb();
@@ -151,6 +202,9 @@ export async function reconcileEscalationResolutions(params: {
       listIssuesWithAllLabels,
       resolveAgentTaskByIssue,
       updateTaskStatus,
+      getIssueSnapshotByNumber,
+      getEscalationCommentCheckState,
+      recordEscalationCommentCheckState,
     } satisfies EscalationResolutionDeps);
 
   const queuedEscalations = deps.listIssuesWithAllLabels({
@@ -186,6 +240,31 @@ export async function reconcileEscalationResolutions(params: {
 
   const toCheck = pendingCommentChecks.slice(0, maxEscalations);
   for (const issue of toCheck) {
+    const snapshot = deps.getIssueSnapshotByNumber(params.repo, issue.number);
+    const githubUpdatedAt = snapshot?.githubUpdatedAt ?? null;
+    const checkState = deps.getEscalationCommentCheckState(params.repo, issue.number) ?? {
+      lastCheckedAt: null,
+      lastSeenUpdatedAt: null,
+    };
+    const decision = shouldFetchEscalationComments({
+      nowMs,
+      lastCheckedAt: checkState.lastCheckedAt,
+      lastSeenUpdatedAt: checkState.lastSeenUpdatedAt,
+      githubUpdatedAt,
+      minIntervalMs: minRecheckIntervalMs,
+    });
+    if (!decision.shouldFetch) {
+      if (shouldLog(`ralph:gh-escalation:${params.repo}:defer:${issue.number}`, ESCALATION_DEFER_LOG_INTERVAL_MS)) {
+        const lastCheckedMs = parseIsoMs(checkState.lastCheckedAt) ?? nowMs;
+        const remainingMs = minRecheckIntervalMs - (nowMs - lastCheckedMs);
+        const remaining = remainingMs > 0 ? ` next_in=${Math.round(remainingMs / 1000)}s` : "";
+        log(
+          `[ralph:gh-escalation:${params.repo}] deferring comment check for #${issue.number} ` +
+            `(reason=${decision.reason}${remaining})`
+        );
+      }
+      continue;
+    }
     let bodies: Array<{ body: string; authorLogin: string | null; authorAssociation: string | null }> = [];
     try {
       bodies = await listRecentIssueComments({
@@ -195,6 +274,12 @@ export async function reconcileEscalationResolutions(params: {
         limit: maxRecentComments,
       });
     } catch (error: any) {
+      deps.recordEscalationCommentCheckState({
+        repo: params.repo,
+        issueNumber: issue.number,
+        lastCheckedAt: nowIso,
+        lastSeenUpdatedAt: githubUpdatedAt ?? checkState.lastSeenUpdatedAt,
+      });
       log(
         `[ralph:gh-escalation:${params.repo}] Failed to list comments for #${issue.number}: ${
           error?.message ?? String(error)
@@ -202,6 +287,12 @@ export async function reconcileEscalationResolutions(params: {
       );
       continue;
     }
+    deps.recordEscalationCommentCheckState({
+      repo: params.repo,
+      issueNumber: issue.number,
+      lastCheckedAt: nowIso,
+      lastSeenUpdatedAt: githubUpdatedAt ?? checkState.lastSeenUpdatedAt,
+    });
     const hasResolution = bodies.some((entry) => {
       const author = entry.authorLogin?.toLowerCase() ?? "";
       const association = entry.authorAssociation?.toUpperCase() ?? "";
