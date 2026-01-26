@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
 
 import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "./queue-backend";
+import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "./bwrb/artifacts";
 import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
@@ -6701,70 +6702,84 @@ ${guidance}`
 
     const runName = safeNoteName(`Run for ${shortIssue} - ${task.name.slice(0, 40)}`);
 
-    const json = JSON.stringify({
+    const payload = buildAgentRunPayload({
       name: runName,
       task: `[[${task._name}]]`,  // Use _name (filename) not name (display) for wikilinks
       started: data.started.toISOString().split("T")[0],
       completed: today,
       outcome: data.outcome,
       pr: data.pr || "",
-      "creation-date": today,
+      creationDate: today,
       scope: "builder",
     });
 
     try {
-      const result = await $`bwrb new agent-run --json ${json}`.cwd(vault).quiet();
-      const output = JSON.parse(result.stdout.toString());
+      const output = await createBwrbNote({
+        type: "agent-run",
+        action: "create agent-run note",
+        payload,
+      });
 
-        if (output.success && output.path) {
-          const notePath = resolveVaultPath(output.path);
-          const bodySections: string[] = [];
+      if (!output.ok || !output.path) {
+        const error = output.ok ? "bwrb did not return a note path" : output.error;
+        const log = !output.ok && output.skipped ? console.warn : console.error;
+        log(`[ralph:worker:${this.repo}] Failed to create agent-run: ${error}`);
+        return;
+      }
 
-          if (data.bodyPrefix?.trim()) {
-            bodySections.push(data.bodyPrefix.trim(), "");
-          }
+      const bodySections: string[] = [];
 
-          // Add introspection summary if available
-          if (data.sessionId) {
-            const introspection = await readIntrospectionSummary(data.sessionId);
-            if (introspection) {
-              bodySections.push(
-                "## Session Summary",
-                "",
-                `- **Steps:** ${introspection.stepCount}`,
-                `- **Tool calls:** ${introspection.totalToolCalls}`,
-                `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
-                `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
-                ""
-              );
-            }
-          }
+      if (data.bodyPrefix?.trim()) {
+        bodySections.push(data.bodyPrefix.trim(), "");
+      }
 
-
-        // Add devex consult summary (if we used devex-before-escalate)
-        if (data.devex?.consulted) {
+      // Add introspection summary if available
+      if (data.sessionId) {
+        const introspection = await readIntrospectionSummary(data.sessionId);
+        if (introspection) {
           bodySections.push(
-            "## Devex Consult",
+            "## Session Summary",
             "",
-            data.devex.sessionId ? `- **Session:** ${data.devex.sessionId}` : "",
-            data.devex.summary ?? "",
+            `- **Steps:** ${introspection.stepCount}`,
+            `- **Tool calls:** ${introspection.totalToolCalls}`,
+            `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
+            `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
             ""
           );
         }
+      }
 
-        // Add survey results
-        if (data.surveyResults) {
-          bodySections.push("## Survey Results", "", data.surveyResults, "");
-        }
 
-        if (bodySections.length > 0) {
-          await appendFile(notePath, "\n" + bodySections.join("\n"), "utf8");
-        }
+      // Add devex consult summary (if we used devex-before-escalate)
+      if (data.devex?.consulted) {
+        bodySections.push(
+          "## Devex Consult",
+          "",
+          data.devex.sessionId ? `- **Session:** ${data.devex.sessionId}` : "",
+          data.devex.summary ?? "",
+          ""
+        );
+      }
 
-        // Clean up introspection logs
-        if (data.sessionId) {
-          await cleanupIntrospectionLogs(data.sessionId);
+      // Add survey results
+      if (data.surveyResults) {
+        bodySections.push("## Survey Results", "", data.surveyResults, "");
+      }
+
+      if (bodySections.length > 0) {
+        const bodyResult = await appendBwrbNoteBody({
+          notePath: output.path,
+          body: "\n" + bodySections.join("\n"),
+        });
+        if (!bodyResult.ok) {
+          const log = bodyResult.skipped ? console.warn : console.error;
+          log(`[ralph:worker:${this.repo}] Failed to write agent-run body: ${bodyResult.error}`);
         }
+      }
+
+      // Clean up introspection logs
+      if (data.sessionId) {
+        await cleanupIntrospectionLogs(data.sessionId);
       }
 
       console.log(`[ralph:worker:${this.repo}] Created agent-run note`);
