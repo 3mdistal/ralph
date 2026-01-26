@@ -181,6 +181,26 @@ function parseUsageResponse(raw: unknown): {
     }
   }
 
+  // ChatGPT "wham" rate_limit structure.
+  const rateLimit = data.rate_limit;
+  if (rateLimit && typeof rateLimit === "object" && !Array.isArray(rateLimit)) {
+    const rl = rateLimit as Record<string, unknown>;
+
+    const primary = rl.primary_window;
+    if (primary && typeof primary === "object" && !Array.isArray(primary)) {
+      const w = primary as Record<string, unknown>;
+      if (rollingUsedPercent == null) rollingUsedPercent = toFiniteNumber(w.used_percent);
+      if (rollingResetAt == null) rollingResetAt = w.reset_at;
+    }
+
+    const secondary = rl.secondary_window;
+    if (secondary && typeof secondary === "object" && !Array.isArray(secondary)) {
+      const w = secondary as Record<string, unknown>;
+      if (weeklyUsedPercent == null) weeklyUsedPercent = toFiniteNumber(w.used_percent);
+      if (weeklyResetAt == null) weeklyResetAt = w.reset_at;
+    }
+  }
+
   // Flat fallbacks (best-effort).
   if (rollingUsedPercent == null) rollingUsedPercent = toFiniteNumber(data.primary_used_percent);
   if (weeklyUsedPercent == null) weeklyUsedPercent = toFiniteNumber(data.secondary_used_percent);
@@ -210,6 +230,12 @@ async function fetchUsage(accessToken: string): Promise<RemoteOpenaiUsage> {
 
   const raw = await response.json();
   const parsed = parseUsageResponse(raw);
+
+  // If the API response shape changes, do not silently return 0%.
+  if (parsed.rollingUsedPercent == null && parsed.weeklyUsedPercent == null) {
+    const keys = raw && typeof raw === "object" ? Object.keys(raw as Record<string, unknown>).slice(0, 20) : [];
+    throw new Error(`Usage API parse failed (missing used_percent fields). keys=${JSON.stringify(keys)}`);
+  }
 
   const rollingPct = normalizeUsedPct(parsed.rollingUsedPercent);
   const weeklyPct = normalizeUsedPct(parsed.weeklyUsedPercent);
@@ -246,7 +272,7 @@ export async function getRemoteOpenaiUsage(opts: {
   const autoRefresh = opts.autoRefresh !== false;
 
   const ttlMs =
-    typeof opts.cacheTtlMs === "number" && Number.isFinite(opts.cacheTtlMs) ? Math.max(0, Math.floor(opts.cacheTtlMs)) : 30_000;
+    typeof opts.cacheTtlMs === "number" && Number.isFinite(opts.cacheTtlMs) ? Math.max(0, Math.floor(opts.cacheTtlMs)) : 120_000;
 
   if (!skipCache) {
     const cached = cache.get(opts.authFilePath);
