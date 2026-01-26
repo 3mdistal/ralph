@@ -13,7 +13,9 @@ type GhProcess = {
 
 type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProcess;
 
-const DEFAULT_GH_RUNNER: GhRunner = ((globalThis as any).$ ?? bunDollar) as unknown as GhRunner;
+function getDefaultGhRunner(): GhRunner {
+  return ((globalThis as any).$ ?? bunDollar) as unknown as GhRunner;
+}
 
 let ghEnvLock: Promise<void> = Promise.resolve();
 
@@ -152,7 +154,7 @@ export function createGhRunner(params: { repo: string; mode: "read" | "write" })
         return await withGhEnvLock(async () => {
           const restore = applyGhEnv(token);
           try {
-            const proc = DEFAULT_GH_RUNNER(strings, ...values);
+            const proc = getDefaultGhRunner()(strings, ...values);
             const configured = cwdPath ? proc.cwd(cwdPath) : proc;
             return await configured.quiet();
           } finally {
