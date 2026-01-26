@@ -23,6 +23,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph gates <repo> <issue> [--json] Show deterministic gate state",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
@@ -61,6 +62,20 @@ function printCommandHelp(command: string): void {
           "  ralph status [--json]",
           "",
           "Shows daemon mode plus starting, queued, in-progress, and throttled tasks, plus pending escalations.",
+          "",
+          "Options:",
+          "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "gates":
+      console.log(
+        [
+          "Usage:",
+          "  ralph gates <repo> <issueNumber> [--json]",
+          "",
+          "Shows the latest deterministic gate state for an issue.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -164,7 +179,17 @@ if (!cmd || cmd.startsWith("-")) {
   }
 }
 
-if ((cmd === "resume" || cmd === "status" || cmd === "usage" || cmd === "repos" || cmd === "watch" || cmd === "nudge" || cmd === "rollup") && hasHelpFlag) {
+if (
+  (cmd === "resume" ||
+    cmd === "status" ||
+    cmd === "gates" ||
+    cmd === "usage" ||
+    cmd === "repos" ||
+    cmd === "watch" ||
+    cmd === "nudge" ||
+    cmd === "rollup") &&
+  hasHelpFlag
+) {
   printCommandHelp(cmd);
   process.exit(0);
 }

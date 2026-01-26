@@ -4,9 +4,10 @@ import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
+import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -20,6 +21,17 @@ export type RalphRunDetails = {
 };
 export const PR_STATE_OPEN: PrState = "open";
 export const PR_STATE_MERGED: PrState = "merged";
+
+export type GateName = "preflight" | "product_review" | "devex_review" | "ci";
+export type GateStatus = "pending" | "pass" | "fail" | "skipped";
+export type GateArtifactKind = "command_output" | "failure_excerpt" | "note";
+
+const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci"];
+const GATE_STATUSES: GateStatus[] = ["pending", "pass", "fail", "skipped"];
+const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_excerpt", "note"];
+
+const ARTIFACT_MAX_LINES = 200;
+const ARTIFACT_MAX_CHARS = 20_000;
 
 let db: Database | null = null;
 
@@ -72,6 +84,59 @@ function parseJsonArray(value?: string | null): string[] {
   } catch {
     return [];
   }
+}
+
+function assertGateName(value: string): GateName {
+  if (GATE_NAMES.includes(value as GateName)) return value as GateName;
+  throw new Error(`Unsupported gate name: ${value}`);
+}
+
+function assertGateStatus(value: string): GateStatus {
+  if (GATE_STATUSES.includes(value as GateStatus)) return value as GateStatus;
+  throw new Error(`Unsupported gate status: ${value}`);
+}
+
+function assertGateArtifactKind(value: string): GateArtifactKind {
+  if (GATE_ARTIFACT_KINDS.includes(value as GateArtifactKind)) return value as GateArtifactKind;
+  throw new Error(`Unsupported gate artifact kind: ${value}`);
+}
+
+function sanitizeOptionalText(
+  value: string | null | undefined,
+  maxLength: number
+): string | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const trimmed = String(value).trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= maxLength) return trimmed;
+  return trimmed.slice(0, maxLength).trimEnd();
+}
+
+function redactAndBoundArtifact(value: string): {
+  content: string;
+  truncated: boolean;
+  originalChars: number;
+  originalLines: number;
+} {
+  const raw = String(value ?? "");
+  const originalChars = raw.length;
+  const originalLines = raw ? raw.split("\n").length : 0;
+  let content = redactSensitiveText(raw);
+  let truncated = false;
+
+  if (content.length > ARTIFACT_MAX_CHARS) {
+    content = content.slice(content.length - ARTIFACT_MAX_CHARS);
+    truncated = true;
+  }
+
+  const lines = content.split("\n");
+  if (lines.length > ARTIFACT_MAX_LINES) {
+    content = lines.slice(lines.length - ARTIFACT_MAX_LINES).join("\n");
+    truncated = true;
+  }
+
+  return { content, truncated, originalChars, originalLines };
 }
 
 function requireDb(): Database {
@@ -180,6 +245,47 @@ function ensureSchema(database: Database): void {
             ON ralph_run_sessions(session_id);
           CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started
             ON ralph_runs(repo_id, issue_number, started_at);
+        `);
+      }
+      if (existingVersion < 10) {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
+            run_id TEXT NOT NULL,
+            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
+            command TEXT,
+            skip_reason TEXT,
+            url TEXT,
+            pr_number INTEGER,
+            pr_url TEXT,
+            repo_id INTEGER NOT NULL,
+            issue_number INTEGER,
+            task_path TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(run_id, gate),
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE,
+            FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+          );
+          CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL,
+            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+            kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
+            content TEXT NOT NULL,
+            truncated INTEGER NOT NULL DEFAULT 0,
+            original_chars INTEGER,
+            original_lines INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
+            ON ralph_run_gate_results(repo_id, issue_number, updated_at);
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr
+            ON ralph_run_gate_results(repo_id, pr_number);
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_artifacts_run
+            ON ralph_run_gate_artifacts(run_id);
         `);
       }
     })();
@@ -347,6 +453,39 @@ function ensureSchema(database: Database): void {
       FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
+      run_id TEXT NOT NULL,
+      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+      status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
+      command TEXT,
+      skip_reason TEXT,
+      url TEXT,
+      pr_number INTEGER,
+      pr_url TEXT,
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER,
+      task_path TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, gate),
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+      kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
+      content TEXT NOT NULL,
+      truncated INTEGER NOT NULL DEFAULT 0,
+      original_chars INTEGER,
+      original_lines INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -358,6 +497,12 @@ function ensureSchema(database: Database): void {
     CREATE INDEX IF NOT EXISTS idx_rollup_batch_prs_batch ON rollup_batch_prs(batch_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_run_sessions_session_id ON ralph_run_sessions(session_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started ON ralph_runs(repo_id, issue_number, started_at);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
+      ON ralph_run_gate_results(repo_id, issue_number, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr
+      ON ralph_run_gate_results(repo_id, pr_number);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_artifacts_run
+      ON ralph_run_gate_artifacts(run_id);
   `);
 }
 
@@ -873,6 +1018,368 @@ export function completeRalphRun(params: {
       $details_json: detailsJson,
       $updated_at: at,
     });
+}
+
+type GateResultRow = {
+  runId: string;
+  gate: GateName;
+  status: GateStatus;
+  command: string | null;
+  skipReason: string | null;
+  url: string | null;
+  prNumber: number | null;
+  prUrl: string | null;
+  repoId: number;
+  issueNumber: number | null;
+  taskPath: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type GateArtifactRow = {
+  id: number;
+  runId: string;
+  gate: GateName;
+  kind: GateArtifactKind;
+  content: string;
+  truncated: boolean;
+  originalChars: number | null;
+  originalLines: number | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type RalphRunGateState = {
+  results: GateResultRow[];
+  artifacts: GateArtifactRow[];
+};
+
+function getRunMeta(runId: string): { repoId: number; issueNumber: number | null; taskPath: string | null } {
+  const database = requireDb();
+  const row = database
+    .query("SELECT repo_id, issue_number, task_path FROM ralph_runs WHERE run_id = $run_id")
+    .get({ $run_id: runId }) as { repo_id?: number; issue_number?: number | null; task_path?: string | null } | undefined;
+
+  if (!row?.repo_id) {
+    throw new Error(`Failed to resolve run metadata for run_id=${runId}`);
+  }
+
+  return {
+    repoId: row.repo_id,
+    issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
+    taskPath: row.task_path ?? null,
+  };
+}
+
+function getRepoIdByName(repo: string): number | null {
+  const database = requireDb();
+  const row = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: repo,
+  }) as { id?: number } | undefined;
+  return row?.id ?? null;
+}
+
+export function ensureRalphRunGateRows(params: { runId: string; at?: string }): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const meta = getRunMeta(params.runId);
+
+  for (const gate of GATE_NAMES) {
+    database
+      .query(
+        `INSERT INTO ralph_run_gate_results(
+           run_id, gate, status, repo_id, issue_number, task_path, created_at, updated_at
+         ) VALUES (
+           $run_id, $gate, $status, $repo_id, $issue_number, $task_path, $created_at, $updated_at
+         )
+         ON CONFLICT(run_id, gate) DO NOTHING`
+      )
+      .run({
+        $run_id: params.runId,
+        $gate: gate,
+        $status: "pending",
+        $repo_id: meta.repoId,
+        $issue_number: meta.issueNumber,
+        $task_path: meta.taskPath,
+        $created_at: at,
+        $updated_at: at,
+      });
+  }
+}
+
+export function upsertRalphRunGateResult(params: {
+  runId: string;
+  gate: GateName;
+  status?: GateStatus;
+  command?: string | null;
+  skipReason?: string | null;
+  url?: string | null;
+  prNumber?: number | null;
+  prUrl?: string | null;
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const meta = getRunMeta(params.runId);
+  const gate = assertGateName(params.gate);
+
+  const existing = database
+    .query(
+      `SELECT status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at
+       FROM ralph_run_gate_results
+       WHERE run_id = $run_id AND gate = $gate`
+    )
+    .get({ $run_id: params.runId, $gate: gate }) as
+    | {
+        status?: string;
+        command?: string | null;
+        skip_reason?: string | null;
+        url?: string | null;
+        pr_number?: number | null;
+        pr_url?: string | null;
+        repo_id?: number;
+        issue_number?: number | null;
+        task_path?: string | null;
+        created_at?: string;
+      }
+    | undefined;
+
+  if (params.status === null) {
+    throw new Error("Gate status cannot be null");
+  }
+
+  const status = params.status
+    ? assertGateStatus(params.status)
+    : existing?.status
+      ? assertGateStatus(existing.status)
+      : "pending";
+
+  const commandPatch = sanitizeOptionalText(params.command, 1000);
+  const skipReasonPatch = sanitizeOptionalText(params.skipReason, 400);
+  const urlPatch = sanitizeOptionalText(params.url, 500);
+  const prUrlPatch = sanitizeOptionalText(params.prUrl, 500);
+
+  const command = commandPatch === undefined ? existing?.command ?? null : commandPatch;
+  const skipReason = skipReasonPatch === undefined ? existing?.skip_reason ?? null : skipReasonPatch;
+  const url = urlPatch === undefined ? existing?.url ?? null : urlPatch;
+  const prUrl = prUrlPatch === undefined ? existing?.pr_url ?? null : prUrlPatch;
+
+  const prNumber =
+    params.prNumber === undefined
+      ? existing?.pr_number ?? null
+      : params.prNumber === null
+        ? null
+        : Number.isFinite(params.prNumber)
+          ? params.prNumber
+          : null;
+
+  if (existing) {
+    database
+      .query(
+        `UPDATE ralph_run_gate_results
+         SET status = $status,
+             command = $command,
+             skip_reason = $skip_reason,
+             url = $url,
+             pr_number = $pr_number,
+             pr_url = $pr_url,
+             updated_at = $updated_at
+         WHERE run_id = $run_id AND gate = $gate`
+      )
+      .run({
+        $status: status,
+        $command: command,
+        $skip_reason: skipReason,
+        $url: url,
+        $pr_number: prNumber,
+        $pr_url: prUrl,
+        $updated_at: at,
+        $run_id: params.runId,
+        $gate: gate,
+      });
+    return;
+  }
+
+  database
+    .query(
+      `INSERT INTO ralph_run_gate_results(
+         run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+       ) VALUES (
+         $run_id, $gate, $status, $command, $skip_reason, $url, $pr_number, $pr_url, $repo_id, $issue_number, $task_path, $created_at, $updated_at
+       )`
+    )
+    .run({
+      $run_id: params.runId,
+      $gate: gate,
+      $status: status,
+      $command: command,
+      $skip_reason: skipReason,
+      $url: url,
+      $pr_number: prNumber,
+      $pr_url: prUrl,
+      $repo_id: meta.repoId,
+      $issue_number: meta.issueNumber,
+      $task_path: meta.taskPath,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function recordRalphRunGateArtifact(params: {
+  runId: string;
+  gate: GateName;
+  kind: GateArtifactKind;
+  content: string;
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const gate = assertGateName(params.gate);
+  const kind = assertGateArtifactKind(params.kind);
+  const bounded = redactAndBoundArtifact(params.content);
+
+  database
+    .query(
+      `INSERT INTO ralph_run_gate_artifacts(
+         run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+       ) VALUES (
+         $run_id, $gate, $kind, $content, $truncated, $original_chars, $original_lines, $created_at, $updated_at
+       )`
+    )
+    .run({
+      $run_id: params.runId,
+      $gate: gate,
+      $kind: kind,
+      $content: bounded.content,
+      $truncated: bounded.truncated ? 1 : 0,
+      $original_chars: bounded.originalChars,
+      $original_lines: bounded.originalLines,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function getRalphRunGateState(runId: string): RalphRunGateState {
+  const database = requireDb();
+
+  const results = database
+    .query(
+      `SELECT run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+       FROM ralph_run_gate_results
+       WHERE run_id = $run_id
+       ORDER BY gate ASC`
+    )
+    .all({ $run_id: runId }) as Array<{
+    run_id: string;
+    gate: string;
+    status: string;
+    command?: string | null;
+    skip_reason?: string | null;
+    url?: string | null;
+    pr_number?: number | null;
+    pr_url?: string | null;
+    repo_id: number;
+    issue_number?: number | null;
+    task_path?: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+
+  const artifacts = database
+    .query(
+      `SELECT id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+       FROM ralph_run_gate_artifacts
+       WHERE run_id = $run_id
+       ORDER BY id ASC`
+    )
+    .all({ $run_id: runId }) as Array<{
+    id: number;
+    run_id: string;
+    gate: string;
+    kind: string;
+    content: string;
+    truncated: number;
+    original_chars?: number | null;
+    original_lines?: number | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+
+  return {
+    results: results.map((row) => ({
+      runId: row.run_id,
+      gate: assertGateName(row.gate),
+      status: assertGateStatus(row.status),
+      command: row.command ?? null,
+      skipReason: row.skip_reason ?? null,
+      url: row.url ?? null,
+      prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
+      prUrl: row.pr_url ?? null,
+      repoId: row.repo_id,
+      issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
+      taskPath: row.task_path ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+    artifacts: artifacts.map((row) => ({
+      id: row.id,
+      runId: row.run_id,
+      gate: assertGateName(row.gate),
+      kind: assertGateArtifactKind(row.kind),
+      content: row.content,
+      truncated: Boolean(row.truncated),
+      originalChars: typeof row.original_chars === "number" ? row.original_chars : null,
+      originalLines: typeof row.original_lines === "number" ? row.original_lines : null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+  };
+}
+
+export function getLatestRunGateStateForIssue(params: {
+  repo: string;
+  issueNumber: number;
+}): RalphRunGateState | null {
+  const database = requireDb();
+  const repoId = getRepoIdByName(params.repo);
+  if (!repoId) return null;
+
+  const row = database
+    .query(
+      `SELECT run_id, MAX(updated_at) as updated_at
+       FROM ralph_run_gate_results
+       WHERE repo_id = $repo_id AND issue_number = $issue_number
+       GROUP BY run_id
+       ORDER BY updated_at DESC, run_id DESC
+       LIMIT 1`
+    )
+    .get({ $repo_id: repoId, $issue_number: params.issueNumber }) as { run_id?: string } | undefined;
+
+  if (!row?.run_id) return null;
+  return getRalphRunGateState(row.run_id);
+}
+
+export function getLatestRunGateStateForPr(params: {
+  repo: string;
+  prNumber: number;
+}): RalphRunGateState | null {
+  const database = requireDb();
+  const repoId = getRepoIdByName(params.repo);
+  if (!repoId) return null;
+
+  const row = database
+    .query(
+      `SELECT run_id, MAX(updated_at) as updated_at
+       FROM ralph_run_gate_results
+       WHERE repo_id = $repo_id AND pr_number = $pr_number
+       GROUP BY run_id
+       ORDER BY updated_at DESC, run_id DESC
+       LIMIT 1`
+    )
+    .get({ $repo_id: repoId, $pr_number: params.prNumber }) as { run_id?: string } | undefined;
+
+  if (!row?.run_id) return null;
+  return getRalphRunGateState(row.run_id);
 }
 
 const LABEL_SEPARATOR = "\u0001";
