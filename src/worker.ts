@@ -78,6 +78,7 @@ import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessio
 import { ralphEventBus } from "./dashboard/bus";
 import { buildRalphEvent } from "./dashboard/events";
 import { cleanupSessionArtifacts } from "./introspection-traces";
+import { isIntrospectionSummary, type IntrospectionSummary } from "./introspection/summary";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "./run-recording-session-adapter";
 import { redactHomePathForDisplay } from "./redaction";
 import { isSafeSessionId } from "./session-id";
@@ -191,16 +192,6 @@ const CI_DEBUG_LEASE_TTL_MS = 20 * 60_000;
 const CI_DEBUG_COMMENT_SCAN_LIMIT = 50;
 const CI_DEBUG_COMMENT_MIN_EDIT_MS = 60_000;
 
-interface IntrospectionSummary {
-  sessionId: string;
-  endTime: number;
-  toolResultAsTextCount: number;
-  totalToolCalls: number;
-  stepCount: number;
-  hasAnomalies: boolean;
-  recentTools: string[];
-}
-
 interface LiveAnomalyCount {
   total: number;
   recentBurst: boolean;
@@ -213,7 +204,8 @@ async function readIntrospectionSummary(sessionId: string): Promise<Introspectio
   
   try {
     const content = await readFile(summaryPath, "utf8");
-    return JSON.parse(content);
+    const parsed = JSON.parse(content);
+    return isIntrospectionSummary(parsed) ? parsed : null;
   } catch {
     return null;
   }
