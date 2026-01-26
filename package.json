@@ -11,6 +11,8 @@
     "start": "bun run src/index.ts",
     "dev": "bun run --watch src/index.ts",
     "status": "bun run src/index.ts status",
+    "usage": "bun run src/index.ts usage",
+    "usage:json": "bun run src/index.ts usage --json",
     "watch": "bun run src/index.ts watch",
     "test": "bun test",
     "typecheck": "tsc --noEmit",

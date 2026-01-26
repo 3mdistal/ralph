@@ -149,6 +149,9 @@ Add a throttle config section to Ralph:
 - Add a small summary line in `queue.json` / run logs so it’s obvious why work stopped.
 - Add a CLI view of the current meters: `ralph usage` (table) and `ralph usage --json`.
 
+Notes:
+- When using `throttle.openaiSource = "remoteUsage"`, remote usage is cached in-process for ~2 minutes per OpenCode auth file (deduped across concurrent requests).
+
 6) Add a `calibrate` helper (optional but valuable)
 - A CLI command that takes two timestamped dashboard snapshots (5h/week % + reset times) and computes budgets automatically from OpenCode logs.
 
