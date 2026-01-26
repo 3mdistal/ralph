@@ -1,4 +1,4 @@
-import { resolve, sep } from "path";
+import { basename, resolve, sep } from "path";
 
 export interface GitWorktreeEntry {
   worktreePath: string;
@@ -7,10 +7,30 @@ export interface GitWorktreeEntry {
   detached?: boolean;
 }
 
+export type LegacyWorktreeOptions = {
+  devDir: string;
+  managedRoot: string;
+};
+
 export function isPathUnderDir(path: string, baseDir: string): boolean {
   const resolvedPath = resolve(path);
   const resolvedBase = resolve(baseDir);
   return resolvedPath === resolvedBase || resolvedPath.startsWith(`${resolvedBase}${sep}`);
+}
+
+export function isLegacyWorktreePath(path: string, options: LegacyWorktreeOptions): boolean {
+  if (!path) return false;
+  if (isPathUnderDir(path, options.managedRoot)) return false;
+  if (!isPathUnderDir(path, options.devDir)) return false;
+  const name = basename(path);
+  return /^worktree-issue-\d+(?:-.*)?$/.test(name) || /^worktree-\d+(?:-.*)?$/.test(name);
+}
+
+export function detectLegacyWorktrees(
+  entries: GitWorktreeEntry[],
+  options: LegacyWorktreeOptions
+): GitWorktreeEntry[] {
+  return entries.filter((entry) => isLegacyWorktreePath(entry.worktreePath, options));
 }
 
 export function parseGitWorktreeListPorcelain(output: string): GitWorktreeEntry[] {

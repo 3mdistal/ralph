@@ -1,7 +1,9 @@
 import { describe, test, expect } from "bun:test";
 
 import {
+  detectLegacyWorktrees,
   isPathUnderDir,
+  isLegacyWorktreePath,
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
   stripHeadsRef,
@@ -74,5 +76,40 @@ describe("git-worktree helpers", () => {
     expect(isPathUnderDir("/tmp/ralph/worktrees", "/tmp/ralph/worktrees")).toBe(true);
     expect(isPathUnderDir("/tmp/ralph/worktrees-2", "/tmp/ralph/worktrees")).toBe(false);
     expect(isPathUnderDir("/tmp/ralph/worktrees/a/b", "/tmp/ralph/worktrees/a")).toBe(true);
+  });
+
+  test("isLegacyWorktreePath matches legacy devDir patterns", () => {
+    const opts = { devDir: "/Users/alice/Developer", managedRoot: "/Users/alice/.ralph/worktrees" };
+    expect(isLegacyWorktreePath("/Users/alice/Developer/worktree-issue-215", opts)).toBe(true);
+    expect(isLegacyWorktreePath("/Users/alice/Developer/worktree-215-fix", opts)).toBe(true);
+    expect(isLegacyWorktreePath("/Users/alice/.ralph/worktrees/owner-repo/slot-0/215/foo", opts)).toBe(false);
+    expect(isLegacyWorktreePath("/tmp/worktree-215", opts)).toBe(false);
+  });
+
+  test("detectLegacyWorktrees returns only legacy paths", () => {
+    const entries = parseGitWorktreeListPorcelain(
+      [
+        "worktree /repo",
+        "HEAD deadbeef",
+        "branch refs/heads/main",
+        "",
+        "worktree /Users/alice/Developer/worktree-215-fix",
+        "HEAD cafe",
+        "branch refs/heads/fix/215",
+        "",
+        "worktree /Users/alice/.ralph/worktrees/owner-repo/slot-0/215/foo",
+        "HEAD beef",
+        "branch refs/heads/fix/foo",
+        "",
+      ].join("\n")
+    );
+
+    const legacy = detectLegacyWorktrees(entries, {
+      devDir: "/Users/alice/Developer",
+      managedRoot: "/Users/alice/.ralph/worktrees",
+    });
+
+    expect(legacy.length).toBe(1);
+    expect(legacy[0]?.worktreePath).toContain("worktree-215-fix");
   });
 });
