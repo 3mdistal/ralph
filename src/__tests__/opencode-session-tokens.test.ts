@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 
-import { readOpencodeSessionTokenTotals } from "../opencode-session-tokens";
+import { readOpencodeSessionTokenTotals, readOpencodeSessionTokenTotalsWithQuality } from "../opencode-session-tokens";
 
 async function writeMessage(opts: {
   root: string;
@@ -163,6 +163,21 @@ describe("opencode session token totals", () => {
       });
 
       expect(totals).toEqual({ input: 0, output: 0, reasoning: 0, total: 0 });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reports missing quality for absent or empty sessions", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ralph-opencode-session-"));
+
+    try {
+      const missing = await readOpencodeSessionTokenTotalsWithQuality({ sessionId: "ses_missing", messagesRootDir: root });
+      expect(missing.quality).toBe("missing");
+
+      await mkdir(join(root, "ses_empty"), { recursive: true });
+      const empty = await readOpencodeSessionTokenTotalsWithQuality({ sessionId: "ses_empty", messagesRootDir: root });
+      expect(empty.quality).toBe("missing");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
