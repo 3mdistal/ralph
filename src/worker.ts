@@ -65,6 +65,21 @@ import {
   type CiDebugAttempt,
   type CiDebugCommentState,
 } from "./github/ci-debug-comment";
+import {
+  buildMergeConflictCommentBody,
+  createMergeConflictComment,
+  findMergeConflictComment,
+  parseMergeConflictState,
+  updateMergeConflictComment,
+  type MergeConflictAttempt,
+  type MergeConflictCommentState,
+} from "./github/merge-conflict-comment";
+import {
+  buildMergeConflictCommentLines,
+  buildMergeConflictSignature,
+  computeMergeConflictDecision,
+  formatMergeConflictPaths,
+} from "./merge-conflict-recovery";
 import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "./github/watchdog-writeback";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
@@ -140,6 +155,10 @@ type ResolvedIssuePr = {
   diagnostics: string[];
 };
 
+type MergeConflictRecoveryOutcome =
+  | { status: "success"; prUrl: string; sessionId: string; headSha: string }
+  | { status: "failed" | "escalated"; run: AgentRun };
+
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
   runAgent,
   continueSession,
@@ -190,6 +209,11 @@ const BLOCKED_DETAILS_MAX_LEN = 2000;
 const CI_DEBUG_LEASE_TTL_MS = 20 * 60_000;
 const CI_DEBUG_COMMENT_SCAN_LIMIT = 50;
 const CI_DEBUG_COMMENT_MIN_EDIT_MS = 60_000;
+const MERGE_CONFLICT_LEASE_TTL_MS = 20 * 60_000;
+const MERGE_CONFLICT_COMMENT_SCAN_LIMIT = 50;
+const MERGE_CONFLICT_COMMENT_MIN_EDIT_MS = 60_000;
+const MERGE_CONFLICT_WAIT_TIMEOUT_MS = 10 * 60_000;
+const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
 
 interface IntrospectionSummary {
   sessionId: string;
@@ -344,23 +368,6 @@ function normalizeMergeStateStatus(value: unknown): PullRequestMergeStateStatus 
     default:
       return "UNKNOWN";
   }
-}
-
-function formatMergeConflictMessage(params: {
-  prUrl: string;
-  baseRefName?: string | null;
-}): { blockedReasonShort: string; notifyBody: string } {
-  const baseRefName = params.baseRefName?.trim() || "";
-  const blockedReasonShort = `PR has merge conflicts; CI will not start until conflicts are resolved. PR: ${params.prUrl}`;
-  const notifyBody = [
-    "PR has merge conflicts; GitHub will not start CI until conflicts are resolved.",
-    "Resolve conflicts by rebasing/merging the base branch into the PR branch, then push updates.",
-    `PR: ${params.prUrl}`,
-    baseRefName ? `Base: ${baseRefName}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
-  return { blockedReasonShort, notifyBody };
 }
 
 function summarizeBlockedDetails(text: string): string {
@@ -2963,6 +2970,10 @@ ${guidance}`
     return this.parseCiFixAttempts(process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS) ?? 2;
   }
 
+  private resolveMergeConflictAttempts(): number {
+    return this.parseCiFixAttempts(process.env.RALPH_MERGE_CONFLICT_MAX_ATTEMPTS) ?? 2;
+  }
+
   private isActionableCheckFailure(rawState: string): boolean {
     const normalized = rawState.trim().toLowerCase();
     if (!normalized) return false;
@@ -3170,9 +3181,10 @@ ${guidance}`
     const baseName = baseRefName || botBranch;
     return [
       `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
-      `Resolve merge conflicts by rebasing/merging '${baseName}' into the PR branch.`,
+      `Resolve merge conflicts by merging '${baseName}' into the PR branch (no rebase or force-push).`,
+      "The base branch has already been merged into the PR branch in this worktree; finish the merge and resolve conflicts if present.",
       "Do NOT create a new PR.",
-      "After resolving conflicts, push updates and keep working on this PR until required checks pass.",
+      "After resolving conflicts, run tests/typecheck/build/knip and push updates on the PR branch.",
       "",
       "Commands (run in the task worktree):",
       "```bash",
@@ -3367,12 +3379,681 @@ ${guidance}`
     }
   }
 
+  private isMergeConflictLeaseActive(lease: MergeConflictCommentState["lease"], nowMs: number): boolean {
+    if (!lease?.expiresAt) return false;
+    const expiresAt = Date.parse(lease.expiresAt);
+    if (!Number.isFinite(expiresAt)) return false;
+    return expiresAt > nowMs;
+  }
+
+  private buildMergeConflictLease(holder: string, nowMs: number): MergeConflictCommentState["lease"] {
+    return { holder, expiresAt: new Date(nowMs + MERGE_CONFLICT_LEASE_TTL_MS).toISOString() };
+  }
+
+  private async upsertMergeConflictComment(params: {
+    issueNumber: number;
+    lines: string[];
+    state: MergeConflictCommentState;
+  }): Promise<void> {
+    const match = await findMergeConflictComment({
+      github: this.github,
+      repo: this.repo,
+      issueNumber: params.issueNumber,
+      limit: MERGE_CONFLICT_COMMENT_SCAN_LIMIT,
+    });
+
+    const body = buildMergeConflictCommentBody({ marker: match.marker, state: params.state, lines: params.lines });
+    const existing = match.comment?.body ?? "";
+    if (existing.trim() === body.trim()) return;
+
+    if (match.comment?.updatedAt) {
+      const updatedAtMs = Date.parse(match.comment.updatedAt);
+      if (Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs < MERGE_CONFLICT_COMMENT_MIN_EDIT_MS) {
+        const existingState = parseMergeConflictState(existing);
+        const nextState = params.state;
+        if (existingState && JSON.stringify(existingState) === JSON.stringify(nextState)) {
+          return;
+        }
+      }
+    }
+
+    if (match.comment) {
+      await updateMergeConflictComment({ github: this.github, repo: this.repo, commentId: match.comment.id, body });
+      return;
+    }
+
+    await createMergeConflictComment({ github: this.github, repo: this.repo, issueNumber: params.issueNumber, body });
+  }
+
+  private async applyMergeConflictLabels(issue: IssueRef): Promise<void> {
+    try {
+      await this.addIssueLabel(issue, RALPH_LABEL_STUCK);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+
+    try {
+      await this.removeIssueLabel(issue, RALPH_LABEL_BLOCKED);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label for ${formatIssueRef(issue)}: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+  }
+
+  private async clearMergeConflictLabels(issue: IssueRef): Promise<void> {
+    try {
+      await this.removeIssueLabel(issue, RALPH_LABEL_STUCK);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+  }
+
   private collectFailureRunUrls(summary: RequiredChecksSummary): string[] {
     const urls = summary.required
       .filter((check) => check.state === "FAILURE" && check.detailsUrl)
       .map((check) => check.detailsUrl ?? "")
       .filter(Boolean);
     return Array.from(new Set(urls));
+  }
+
+  private parseMergeConflictPathsFromLsFiles(output: string): string[] {
+    const paths = new Set<string>();
+    for (const line of output.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const tabIndex = trimmed.indexOf("\t");
+      if (tabIndex === -1) continue;
+      const path = trimmed.slice(tabIndex + 1).trim();
+      if (path) paths.add(path);
+    }
+    return Array.from(paths);
+  }
+
+  private async listMergeConflictPaths(worktreePath: string): Promise<string[]> {
+    const result = await $`git ls-files -u`.cwd(worktreePath).quiet();
+    return this.parseMergeConflictPathsFromLsFiles(result.stdout.toString());
+  }
+
+  private async waitForMergeConflictRecoverySignals(params: {
+    prUrl: string;
+    previousHeadSha: string;
+    requiredChecks: string[];
+    timeoutMs: number;
+    pollIntervalMs: number;
+  }): Promise<{
+    headSha: string;
+    mergeStateStatus: PullRequestMergeStateStatus | null;
+    baseRefName: string;
+    summary: RequiredChecksSummary;
+    checks: PrCheck[];
+    timedOut: boolean;
+  }> {
+    const startedAt = Date.now();
+    let last: {
+      headSha: string;
+      mergeStateStatus: PullRequestMergeStateStatus | null;
+      baseRefName: string;
+      summary: RequiredChecksSummary;
+      checks: PrCheck[];
+    } | null = null;
+
+    while (Date.now() - startedAt < params.timeoutMs) {
+      const { headSha, mergeStateStatus, baseRefName, checks } = await this.getPullRequestChecks(params.prUrl);
+      const summary = summarizeRequiredChecks(checks, params.requiredChecks);
+      last = { headSha, mergeStateStatus, baseRefName, summary, checks };
+
+      const headUpdated = !params.previousHeadSha || headSha !== params.previousHeadSha;
+      const mergeOk = mergeStateStatus !== "DIRTY";
+      const checksObserved =
+        params.requiredChecks.length === 0 || summary.required.some((check) => check.state !== "UNKNOWN");
+
+      if (headUpdated && mergeOk && checksObserved) {
+        return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
+      }
+
+      await new Promise((r) => setTimeout(r, params.pollIntervalMs));
+    }
+
+    if (last) {
+      return { ...last, timedOut: true };
+    }
+
+    const fallback = await this.getPullRequestChecks(params.prUrl);
+    return {
+      headSha: fallback.headSha,
+      mergeStateStatus: fallback.mergeStateStatus,
+      baseRefName: fallback.baseRefName,
+      summary: summarizeRequiredChecks(fallback.checks, params.requiredChecks),
+      checks: fallback.checks,
+      timedOut: true,
+    };
+  }
+
+  private buildMergeConflictEscalationSummary(params: {
+    prUrl: string;
+    baseRefName: string | null;
+    headRefName: string | null;
+    attempts: MergeConflictAttempt[];
+    reason: string;
+  }): string {
+    const lines: string[] = [];
+    const base = params.baseRefName || "(unknown)";
+    const head = params.headRefName || "(unknown)";
+    lines.push("Merge-conflict escalation summary", "", `PR: ${params.prUrl}`, `Base: ${base}`, `Head: ${head}`, "", "Reason:", params.reason, "");
+
+    if (params.attempts.length > 0) {
+      lines.push("Attempts:");
+      for (const attempt of params.attempts) {
+        const when = attempt.completedAt || attempt.startedAt;
+        const conflictCount = typeof attempt.conflictCount === "number" ? `, ${attempt.conflictCount} files` : "";
+        lines.push(
+          `- Attempt ${attempt.attempt} (${attempt.status ?? "unknown"}, ${when})${conflictCount}: ${
+            attempt.signature || "(no signature)"
+          }`
+        );
+        if (attempt.conflictPaths && attempt.conflictPaths.length > 0) {
+          lines.push(...attempt.conflictPaths.map((file) => `  - ${file}`));
+        }
+      }
+      lines.push("");
+    }
+
+    lines.push(
+      "Next action:",
+      "- Resolve conflicts on the PR branch, push updates, then re-add `ralph:queued` (or comment `RALPH RESOLVED:`) to resume."
+    );
+
+    return lines.join("\n");
+  }
+
+  private async writeMergeConflictEscalationComment(params: { issueNumber: number; body: string }): Promise<void> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    await this.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments`, {
+      method: "POST",
+      body: { body: params.body },
+    });
+  }
+
+  private async finalizeMergeConflictEscalation(params: {
+    task: AgentTask;
+    issueNumber: string;
+    prUrl: string;
+    reason: string;
+    attempts: MergeConflictAttempt[];
+    baseRefName: string | null;
+    headRefName: string | null;
+    sessionId?: string;
+  }): Promise<MergeConflictRecoveryOutcome> {
+    const issueRef = parseIssueRef(params.task.issue, params.task.repo) ?? {
+      repo: this.repo,
+      number: Number(params.issueNumber),
+    };
+
+    await this.clearMergeConflictLabels(issueRef);
+
+    const escalationBody = this.buildMergeConflictEscalationSummary({
+      prUrl: params.prUrl,
+      baseRefName: params.baseRefName,
+      headRefName: params.headRefName,
+      attempts: params.attempts,
+      reason: params.reason,
+    });
+    await this.writeMergeConflictEscalationComment({ issueNumber: Number(params.issueNumber), body: escalationBody });
+
+    const wasEscalated = params.task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
+    if (escalated) {
+      applyTaskPatch(params.task, "escalated", {});
+    }
+    await this.writeEscalationWriteback(params.task, { reason: params.reason, escalationType: "blocked" });
+    await this.notify.notifyEscalation({
+      taskName: params.task.name,
+      taskFileName: params.task._name,
+      taskPath: params.task._path,
+      issue: params.task.issue,
+      repo: this.repo,
+      sessionId: params.sessionId,
+      reason: params.reason,
+      escalationType: "blocked",
+      planOutput: escalationBody,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(params.task, {
+        reason: params.reason,
+        sessionId: params.sessionId,
+        details: escalationBody,
+      });
+    }
+
+    return {
+      status: "escalated",
+      run: {
+        taskName: params.task.name,
+        repo: this.repo,
+        outcome: "escalated",
+        sessionId: params.sessionId,
+        escalationReason: params.reason,
+      },
+    };
+  }
+
+  private async runMergeConflictRecovery(params: {
+    task: AgentTask;
+    issueNumber: string;
+    cacheKey: string;
+    prUrl: string;
+    issueMeta: IssueMetadata;
+    botBranch: string;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+  }): Promise<MergeConflictRecoveryOutcome> {
+    const issueRef = parseIssueRef(params.task.issue, params.task.repo) ?? {
+      repo: this.repo,
+      number: Number(params.issueNumber),
+    };
+    const maxAttempts = this.resolveMergeConflictAttempts();
+    const workerId = await this.formatWorkerId(params.task, params.task._path);
+
+    let prState: PullRequestMergeState;
+    let requiredChecks: string[] = [];
+    let baseRefName: string | null = null;
+    let headRefName: string | null = null;
+    let previousHeadSha = "";
+
+    try {
+      prState = await this.getPullRequestMergeState(params.prUrl);
+      baseRefName = prState.baseRefName || params.botBranch;
+      headRefName = prState.headRefName || null;
+      ({ checks: requiredChecks } = await this.resolveRequiredChecksForMerge());
+      const prStatus = await this.getPullRequestChecks(params.prUrl);
+      previousHeadSha = prStatus.headSha;
+    } catch (error: any) {
+      const reason = `Merge-conflict recovery preflight failed for ${params.prUrl}: ${this.formatGhError(error)}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return {
+        status: "failed",
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: params.task["session-id"]?.trim(),
+          escalationReason: reason,
+        },
+      };
+    }
+
+    if (prState.isCrossRepository || prState.headRepoFullName !== this.repo) {
+      const reason = `Merge-conflict recovery cannot push cross-repo PR ${params.prUrl}; requires same-repo branch access`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return await this.finalizeMergeConflictEscalation({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        prUrl: params.prUrl,
+        reason,
+        attempts: [],
+        baseRefName,
+        headRefName,
+        sessionId: params.task["session-id"]?.trim(),
+      });
+    }
+
+    if (!headRefName) {
+      const reason = `Merge-conflict recovery missing head ref for ${params.prUrl}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return await this.finalizeMergeConflictEscalation({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        prUrl: params.prUrl,
+        reason,
+        attempts: [],
+        baseRefName,
+        headRefName,
+        sessionId: params.task["session-id"]?.trim(),
+      });
+    }
+
+    const commentMatch = await findMergeConflictComment({
+      github: this.github,
+      repo: this.repo,
+      issueNumber: Number(params.issueNumber),
+      limit: MERGE_CONFLICT_COMMENT_SCAN_LIMIT,
+    });
+    const existingState = commentMatch.state ?? ({ version: 1 } satisfies MergeConflictCommentState);
+    const attempts = [...(existingState.attempts ?? [])];
+
+    const nowMs = Date.now();
+    const lease = existingState.lease;
+    if (this.isMergeConflictLeaseActive(lease, nowMs) && lease?.holder !== workerId) {
+      const reason = `Merge-conflict lease already held by ${lease?.holder ?? "unknown"}; skipping duplicate run for ${params.prUrl}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return {
+        status: "failed",
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: params.task["session-id"]?.trim(),
+          escalationReason: reason,
+        },
+      };
+    }
+
+    const attemptNumber = attempts.length + 1;
+    const worktreePath = join(
+      RALPH_WORKTREES_DIR,
+      safeNoteName(this.repo),
+      "merge-conflict",
+      params.issueNumber,
+      safeNoteName(`attempt-${attemptNumber}`)
+    );
+
+    await this.ensureGitWorktree(worktreePath);
+
+    let conflictPaths: string[] = [];
+    let baseSha = "";
+    let headSha = "";
+    let normalizedBase = this.normalizeGitRef(baseRefName || params.botBranch);
+    let normalizedHead = this.normalizeGitRef(headRefName);
+
+    try {
+      await $`git fetch origin`.cwd(worktreePath).quiet();
+      await ghWrite(this.repo)`gh pr checkout ${params.prUrl}`.cwd(worktreePath).quiet();
+
+      if (!normalizedHead) {
+        throw new Error(`Missing head ref for merge-conflict recovery: ${params.prUrl}`);
+      }
+
+      try {
+        await $`git push --dry-run origin HEAD:${normalizedHead}`.cwd(worktreePath).quiet();
+      } catch (error: any) {
+        const reason = `Merge-conflict recovery cannot push to ${normalizedHead} for ${params.prUrl}: ${this.formatGhError(error)}`;
+        console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+        const finalState: MergeConflictCommentState = {
+          version: 1,
+          attempts,
+          lastSignature: existingState.lastSignature,
+        };
+        const lines = buildMergeConflictCommentLines({
+          prUrl: params.prUrl,
+          baseRefName,
+          headRefName,
+          conflictPaths,
+          attemptCount: attempts.length,
+          maxAttempts,
+          action: "Ralph cannot push to the PR branch; escalating merge-conflict recovery.",
+          reason,
+        });
+        await this.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines, state: finalState });
+        await this.clearMergeConflictLabels(issueRef);
+        await this.cleanupGitWorktree(worktreePath);
+        return await this.finalizeMergeConflictEscalation({
+          task: params.task,
+          issueNumber: params.issueNumber,
+          prUrl: params.prUrl,
+          reason,
+          attempts,
+          baseRefName,
+          headRefName,
+          sessionId: params.task["session-id"]?.trim(),
+        });
+      }
+
+      try {
+        await $`git merge --no-commit origin/${normalizedBase}`.cwd(worktreePath).quiet();
+      } catch {
+        // Expected when conflicts exist.
+      }
+
+      conflictPaths = await this.listMergeConflictPaths(worktreePath);
+      baseSha = (await $`git rev-parse origin/${normalizedBase}`.cwd(worktreePath).quiet()).stdout.toString().trim();
+      headSha = (await $`git rev-parse HEAD`.cwd(worktreePath).quiet()).stdout.toString().trim();
+    } catch (error: any) {
+      const reason = `Merge-conflict recovery setup failed for ${params.prUrl}: ${this.formatGhError(error)}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      await this.cleanupGitWorktree(worktreePath);
+      return {
+        status: "failed",
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: params.task["session-id"]?.trim(),
+          escalationReason: reason,
+        },
+      };
+    }
+
+    const signature = buildMergeConflictSignature({ baseSha, headSha, conflictPaths });
+    const decision = computeMergeConflictDecision({ attempts, maxAttempts, nextSignature: signature });
+    if (decision.stop) {
+      const reason = decision.reason || "Merge-conflict recovery stopping without a specific reason.";
+      const finalState: MergeConflictCommentState = {
+        version: 1,
+        attempts,
+        lastSignature: signature,
+      };
+      const lines = buildMergeConflictCommentLines({
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        conflictPaths,
+        attemptCount: attempts.length,
+        maxAttempts,
+        action: "Ralph is escalating merge-conflict recovery.",
+        reason,
+      });
+      await this.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines, state: finalState });
+      await this.clearMergeConflictLabels(issueRef);
+      await this.cleanupGitWorktree(worktreePath);
+      return await this.finalizeMergeConflictEscalation({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        prUrl: params.prUrl,
+        reason,
+        attempts,
+        baseRefName,
+        headRefName,
+        sessionId: params.task["session-id"]?.trim(),
+      });
+    }
+
+    const attemptStart = new Date().toISOString();
+    const conflictSummary = formatMergeConflictPaths(conflictPaths);
+    const attempt: MergeConflictAttempt = {
+      attempt: attemptNumber,
+      signature,
+      startedAt: attemptStart,
+      status: "running",
+      conflictCount: conflictSummary.total,
+      conflictPaths: conflictSummary.sample,
+    };
+
+    const nextState: MergeConflictCommentState = {
+      version: 1,
+      lease: this.buildMergeConflictLease(workerId, nowMs),
+      attempts: [...attempts, attempt],
+      lastSignature: signature,
+    };
+
+    const lines = buildMergeConflictCommentLines({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      conflictPaths,
+      attemptCount: attemptNumber,
+      maxAttempts,
+      action: "Ralph is spawning a dedicated merge-conflict recovery run to resolve conflicts.",
+    });
+    await this.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines, state: nextState });
+    await this.applyMergeConflictLabels(issueRef);
+
+    const prompt = this.buildMergeConflictPrompt(params.prUrl, baseRefName, params.botBranch);
+    const runLogPath = await this.recordRunLogPath(params.task, params.issueNumber, `merge-conflict-${attemptNumber}`, "in-progress");
+
+    let sessionResult = await this.session.runAgent(worktreePath, "general", prompt, {
+      repo: this.repo,
+      cacheKey: params.cacheKey,
+      runLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: params.task.issue,
+        taskName: params.task.name,
+        step: 4,
+        stepTitle: `merge-conflict attempt ${attemptNumber}`,
+      },
+      ...this.buildWatchdogOptions(params.task, `merge-conflict-${attemptNumber}`),
+      ...params.opencodeSessionOptions,
+    });
+
+    const pausedAfter = await this.pauseIfHardThrottled(
+      params.task,
+      `merge-conflict-${attemptNumber} (post)`,
+      sessionResult.sessionId
+    );
+    if (pausedAfter) {
+      await this.cleanupGitWorktree(worktreePath);
+      return { status: "failed", run: pausedAfter };
+    }
+
+    if (sessionResult.watchdogTimeout) {
+      await this.cleanupGitWorktree(worktreePath);
+      const run = await this.handleWatchdogTimeout(
+        params.task,
+        params.cacheKey,
+        `merge-conflict-${attemptNumber}`,
+        sessionResult,
+        params.opencodeXdg
+      );
+      return { status: "failed", run };
+    }
+
+    const completedAt = new Date().toISOString();
+    if (sessionResult.sessionId) {
+      await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": sessionResult.sessionId });
+    }
+
+    if (!sessionResult.success) {
+      attempt.status = "failed";
+      attempt.completedAt = completedAt;
+      const failedState: MergeConflictCommentState = {
+        version: 1,
+        attempts: [...attempts, attempt],
+        lastSignature: signature,
+      };
+      const failedLines = buildMergeConflictCommentLines({
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        conflictPaths,
+        attemptCount: attemptNumber,
+        maxAttempts,
+        action: "Merge-conflict recovery attempt failed; retrying if attempts remain.",
+      });
+      await this.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+      await this.cleanupGitWorktree(worktreePath);
+      return await this.runMergeConflictRecovery({ ...params, opencodeSessionOptions: params.opencodeSessionOptions });
+    }
+
+    let postRecovery;
+    try {
+      postRecovery = await this.waitForMergeConflictRecoverySignals({
+        prUrl: params.prUrl,
+        previousHeadSha,
+        requiredChecks,
+        timeoutMs: MERGE_CONFLICT_WAIT_TIMEOUT_MS,
+        pollIntervalMs: MERGE_CONFLICT_WAIT_POLL_MS,
+      });
+    } catch (error: any) {
+      const reason = `Merge-conflict recovery failed while waiting for updated PR state: ${this.formatGhError(error)}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      attempt.status = "failed";
+      attempt.completedAt = completedAt;
+      const failedState: MergeConflictCommentState = {
+        version: 1,
+        attempts: [...attempts, attempt],
+        lastSignature: signature,
+      };
+      const failedLines = buildMergeConflictCommentLines({
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        conflictPaths,
+        attemptCount: attemptNumber,
+        maxAttempts,
+        action: "Merge-conflict recovery attempt failed; retrying if attempts remain.",
+        reason,
+      });
+      await this.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+      await this.cleanupGitWorktree(worktreePath);
+      return await this.runMergeConflictRecovery({ ...params, opencodeSessionOptions: params.opencodeSessionOptions });
+    }
+
+    if (postRecovery.mergeStateStatus === "DIRTY" || postRecovery.timedOut) {
+      const reason = postRecovery.timedOut
+        ? `Merge-conflict recovery timed out waiting for updated PR state for ${params.prUrl}`
+        : `Merge conflicts remain after recovery attempt for ${params.prUrl}`;
+      attempt.status = "failed";
+      attempt.completedAt = completedAt;
+      const failedState: MergeConflictCommentState = {
+        version: 1,
+        attempts: [...attempts, attempt],
+        lastSignature: signature,
+      };
+      const failedLines = buildMergeConflictCommentLines({
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        conflictPaths,
+        attemptCount: attemptNumber,
+        maxAttempts,
+        action: "Merge-conflict recovery attempt failed; retrying if attempts remain.",
+        reason,
+      });
+      await this.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+      await this.cleanupGitWorktree(worktreePath);
+      return await this.runMergeConflictRecovery({ ...params, opencodeSessionOptions: params.opencodeSessionOptions });
+    }
+
+    attempt.status = "succeeded";
+    attempt.completedAt = completedAt;
+
+    const finalState: MergeConflictCommentState = {
+      version: 1,
+      attempts: [...attempts, attempt],
+      lastSignature: signature,
+    };
+    const finalLines = buildMergeConflictCommentLines({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      conflictPaths,
+      attemptCount: attemptNumber,
+      maxAttempts,
+      action: "Merge conflicts resolved; waiting for required checks to finish.",
+    });
+    await this.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: finalLines, state: finalState });
+    await this.cleanupGitWorktree(worktreePath);
+
+    await this.clearMergeConflictLabels(issueRef);
+
+    return {
+      status: "success",
+      prUrl: params.prUrl,
+      sessionId: sessionResult.sessionId || params.task["session-id"]?.trim() || "",
+      headSha: postRecovery.headSha,
+    };
   }
 
   private buildCiDebugEscalationSummary(params: {
@@ -3783,35 +4464,66 @@ ${guidance}`
 
     this.updateOpenPrSnapshot(task, null, existingPr.selectedUrl);
 
-    const mergeConflictPrompt = this.buildMergeConflictPrompt(
-      existingPr.selectedUrl,
-      prState.baseRefName ?? null,
-      botBranch
-    );
-    const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
-      prUrl: existingPr.selectedUrl,
-      baseRefName: prState.baseRefName,
-    });
-
-    return await this.runExistingPrRecovery({
+    const recovery = await this.runMergeConflictRecovery({
       task,
       issueNumber,
-      taskRepoPath,
       cacheKey,
-      botBranch,
+      prUrl: existingPr.selectedUrl,
       issueMeta,
-      startTime,
+      botBranch,
       opencodeXdg,
       opencodeSessionOptions,
-      prUrl: existingPr.selectedUrl,
-      stage: "merge-conflict",
-      prompt: mergeConflictPrompt,
-      blocked: {
-        source: "merge-conflict",
-        reason: blockedReasonShort,
-        notifyBody,
-      },
     });
+
+    if (recovery.status !== "success") return recovery.run;
+
+    const mergeGate = await this.mergePrWithRequiredChecks({
+      task,
+      repoPath: taskRepoPath,
+      cacheKey,
+      botBranch,
+      prUrl: recovery.prUrl,
+      sessionId: recovery.sessionId,
+      issueMeta,
+      watchdogStagePrefix: "merge-conflict",
+      notifyTitle: `Merging ${task.name}`,
+      opencodeXdg,
+    });
+
+    if (!mergeGate.ok) return mergeGate.run;
+
+    const pausedSurvey = await this.pauseIfHardThrottled(task, "survey", mergeGate.sessionId || recovery.sessionId);
+    if (pausedSurvey) return pausedSurvey;
+
+    const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
+    const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
+
+    const surveyResult = await this.session.continueCommand(surveyRepoPath, mergeGate.sessionId, "survey", [], {
+      repo: this.repo,
+      cacheKey,
+      runLogPath: surveyRunLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: task.issue,
+        taskName: task.name,
+        step: 3,
+        stepTitle: "survey",
+      },
+      ...this.buildWatchdogOptions(task, "survey"),
+      ...opencodeSessionOptions,
+    });
+
+    if (!surveyResult.success && surveyResult.watchdogTimeout) {
+      return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+      sessionId: mergeGate.sessionId,
+      surveyResults: surveyResult.output,
+    };
   }
 
   private async maybeHandleQueuedCiFailure(params: {
@@ -4639,24 +5351,23 @@ ${guidance}`
           });
 
           if (refreshed.stopReason === "merge-conflict") {
-            const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+            const recovery = await this.runMergeConflictRecovery({
+              task: params.task,
+              issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+              cacheKey: params.cacheKey,
               prUrl,
-              baseRefName: refreshed.baseRefName,
+              issueMeta: params.issueMeta,
+              botBranch: params.botBranch,
+              opencodeXdg: params.opencodeXdg,
+              opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
             });
-            console.warn(`[ralph:worker:${this.repo}] ${blockedReasonShort}`);
-            await this.markTaskBlocked(params.task, "merge-conflict", { reason: blockedReasonShort });
-            await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
-
-            return {
-              ok: false,
-              run: {
-                taskName: params.task.name,
-                repo: this.repo,
-                outcome: "failed",
-                sessionId,
-                escalationReason: blockedReasonShort,
-              },
-            };
+            if (recovery.status !== "success") return { ok: false, run: recovery.run };
+            sessionId = recovery.sessionId || sessionId;
+            return await this.mergePrWithRequiredChecks({
+              ...params,
+              prUrl: recovery.prUrl,
+              sessionId,
+            });
           }
 
           if (refreshed.summary.status === "success") {
@@ -4692,30 +5403,23 @@ ${guidance}`
         const rateLimited = this.shouldRateLimitAutoUpdate(prState, minMinutes);
 
         if (prState.mergeStateStatus === "DIRTY") {
-          const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+          const recovery = await this.runMergeConflictRecovery({
+            task: params.task,
+            issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+            cacheKey: params.cacheKey,
             prUrl,
-            baseRefName: prState.baseRefName,
+            issueMeta: params.issueMeta,
+            botBranch: params.botBranch,
+            opencodeXdg: params.opencodeXdg,
+            opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
           });
-          const reason = `PR has merge conflicts; refusing auto-update ${prUrl}`;
-          console.warn(`[ralph:worker:${this.repo}] ${reason}`);
-          this.recordAutoUpdateFailure(prState, minMinutes);
-          await this.markTaskBlocked(params.task, "merge-conflict", {
-            reason: blockedReasonShort,
-            details: notifyBody,
+          if (recovery.status !== "success") return { ok: false, run: recovery.run };
+          sessionId = recovery.sessionId || sessionId;
+          return await this.mergePrWithRequiredChecks({
+            ...params,
+            prUrl: recovery.prUrl,
             sessionId,
           });
-          await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
-
-          return {
-            ok: false,
-            run: {
-              taskName: params.task.name,
-              repo: this.repo,
-              outcome: "failed",
-              sessionId,
-              escalationReason: blockedReasonShort,
-            },
-          };
         }
 
         const hasLabelGate = labelGate
@@ -4768,24 +5472,23 @@ ${guidance}`
     });
 
     if (checkResult.stopReason === "merge-conflict") {
-      const { blockedReasonShort, notifyBody } = formatMergeConflictMessage({
+      const recovery = await this.runMergeConflictRecovery({
+        task: params.task,
+        issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+        cacheKey: params.cacheKey,
         prUrl,
-        baseRefName: checkResult.baseRefName,
+        issueMeta: params.issueMeta,
+        botBranch: params.botBranch,
+        opencodeXdg: params.opencodeXdg,
+        opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
       });
-      console.warn(`[ralph:worker:${this.repo}] ${blockedReasonShort}`);
-      await this.markTaskBlocked(params.task, "merge-conflict", { reason: blockedReasonShort });
-      await this.notify.notifyError(params.notifyTitle, notifyBody, params.task.name);
-
-      return {
-        ok: false,
-        run: {
-          taskName: params.task.name,
-          repo: this.repo,
-          outcome: "failed",
-          sessionId,
-          escalationReason: blockedReasonShort,
-        },
-      };
+      if (recovery.status !== "success") return { ok: false, run: recovery.run };
+      sessionId = recovery.sessionId || sessionId;
+      return await this.mergePrWithRequiredChecks({
+        ...params,
+        prUrl: recovery.prUrl,
+        sessionId,
+      });
     }
 
     const throttled = await this.pauseIfHardThrottled(params.task, `${params.watchdogStagePrefix}-ci-remediation`, sessionId);
