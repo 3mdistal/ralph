@@ -1017,9 +1017,14 @@ describe("integration-ish harness: full task lifecycle", () => {
       },
       timedOut: false,
     }));
+    const runMergeConflictRecoveryMock = mock(async () => ({
+      status: "failed",
+      run: { taskName: "Test", repo: "3mdistal/ralph", outcome: "failed" },
+    }));
 
     (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).runMergeConflictRecovery = runMergeConflictRecoveryMock;
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -1027,8 +1032,8 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("failed");
     expect(getPullRequestMergeStateMock).toHaveBeenCalledTimes(1);
     expect(waitForRequiredChecksMock).not.toHaveBeenCalled();
-    expect(notifyErrorMock).toHaveBeenCalled();
-    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
+    expect(runMergeConflictRecoveryMock).toHaveBeenCalled();
+    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).not.toContain("blocked");
   });
 
   test("waitForRequiredChecks short-circuits on merge conflicts", async () => {
@@ -1099,17 +1104,22 @@ describe("integration-ish harness: full task lifecycle", () => {
       timedOut: false,
       stopReason: "merge-conflict",
     }));
+    const runMergeConflictRecoveryMock = mock(async () => ({
+      status: "failed",
+      run: { taskName: "Test", repo: "3mdistal/ralph", outcome: "failed" },
+    }));
 
     (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).runMergeConflictRecovery = runMergeConflictRecoveryMock;
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
 
     expect(result.outcome).toBe("failed");
     expect(waitForRequiredChecksMock).toHaveBeenCalled();
-    expect(notifyErrorMock).toHaveBeenCalled();
-    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
+    expect(runMergeConflictRecoveryMock).toHaveBeenCalled();
+    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).not.toContain("blocked");
 
     const messages = continueSessionMock.mock.calls.map((call: any[]) => String(call?.[2] ?? ""));
     const askedForCiFix = messages.some((message: string) =>
