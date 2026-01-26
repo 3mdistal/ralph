@@ -47,7 +47,7 @@ describe("repos[].setup config", () => {
       ].join("\n")
     );
 
-    const cfgMod = await import("../config?repo-setup-config");
+    const cfgMod = await import("../config");
     cfgMod.__resetConfigForTests();
     expect(cfgMod.getRepoSetupCommands("demo/repo")).toEqual(["bun install --frozen-lockfile"]);
   });
@@ -61,7 +61,7 @@ describe("repos[].setup config", () => {
       )
     );
 
-    const cfgMod = await import("../config?repo-setup-empty");
+    const cfgMod = await import("../config");
     cfgMod.__resetConfigForTests();
     expect(cfgMod.getRepoSetupCommands("demo/repo")).toEqual([]);
   });
@@ -79,7 +79,7 @@ describe("repos[].setup config", () => {
     console.warn = warn as any;
 
     try {
-      const cfgMod = await import("../config?repo-setup-invalid");
+      const cfgMod = await import("../config");
       cfgMod.__resetConfigForTests();
       expect(cfgMod.getRepoSetupCommands("demo/repo")).toBeNull();
       expect(warn).toHaveBeenCalled();
