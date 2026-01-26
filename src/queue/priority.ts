@@ -10,14 +10,24 @@ const PRIORITY_BY_INDEX: TaskPriority[] = [
   "p4-backlog",
 ];
 
+const PRIORITY_LABEL_RE = /^p([0-4])/i;
+
+function parsePriorityIndex(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(PRIORITY_LABEL_RE);
+  if (!match) return null;
+  const index = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(index)) return null;
+  return PRIORITY_BY_INDEX[index] ? index : null;
+}
+
 export function inferPriorityFromLabels(labels?: readonly string[] | null): TaskPriority {
   let bestIndex: number | null = null;
   const entries = labels ?? [];
   for (const label of entries) {
-    const match = label.match(/^p([0-4])/i);
-    if (!match) continue;
-    const index = Number.parseInt(match[1], 10);
-    if (!Number.isFinite(index)) continue;
+    const index = parsePriorityIndex(label);
+    if (index === null) continue;
     if (bestIndex === null || index < bestIndex) bestIndex = index;
   }
 
@@ -32,10 +42,8 @@ export function normalizeTaskPriority(value: unknown): TaskPriority {
     return normalized as TaskPriority;
   }
 
-  const match = normalized.match(/^p([0-4])/);
-  if (!match) return DEFAULT_PRIORITY;
-  const index = Number.parseInt(match[1], 10);
-  if (!Number.isFinite(index)) return DEFAULT_PRIORITY;
+  const index = parsePriorityIndex(value);
+  if (index === null) return DEFAULT_PRIORITY;
   return PRIORITY_BY_INDEX[index] ?? DEFAULT_PRIORITY;
 }
 
