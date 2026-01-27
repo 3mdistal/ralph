@@ -52,7 +52,7 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { RALPH_LABEL_BLOCKED, RALPH_LABEL_STUCK } from "./github-labels";
+import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createGhRunner } from "./github/gh-runner";
@@ -114,12 +114,14 @@ import {
 } from "./state";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
+  detectLegacyWorktrees,
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
   stripHeadsRef,
   type GitWorktreeEntry,
 } from "./git-worktree";
+import { formatLegacyWorktreeWarning } from "./legacy-worktrees";
 import {
   normalizePrUrl,
   searchOpenPullRequestsByIssueLink,
@@ -205,11 +207,12 @@ const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
 const IGNORED_BODY_DEPS_LOG_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const LEGACY_WORKTREES_LOG_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const IGNORED_BODY_DEPS_LOG_MAX_KEYS = 2000;
 const BLOCKED_REASON_MAX_LEN = 200;
 const BLOCKED_DETAILS_MAX_LEN = 2000;
 const CI_DEBUG_LEASE_TTL_MS = 20 * 60_000;
-const CI_DEBUG_COMMENT_SCAN_LIMIT = 50;
+const CI_DEBUG_COMMENT_SCAN_LIMIT = 100;
 const CI_DEBUG_COMMENT_MIN_EDIT_MS = 60_000;
 const MERGE_CONFLICT_LEASE_TTL_MS = 20 * 60_000;
 const MERGE_CONFLICT_COMMENT_SCAN_LIMIT = 50;
@@ -873,6 +876,7 @@ export class RepoWorker {
   private lastBlockedSyncAt = 0;
   private ignoredBodyDepsLogLimiter = new LogLimiter({ maxKeys: IGNORED_BODY_DEPS_LOG_MAX_KEYS });
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
+  private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -2508,6 +2512,38 @@ ${guidance}`
         `[ralph:worker:${this.repo}] Failed to cleanup orphaned worktrees on startup: ${e?.message ?? String(e)}`
       );
     }
+
+    try {
+      await this.warnLegacyWorktreesOnStartup();
+    } catch (e: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to check for legacy worktrees: ${e?.message ?? String(e)}`
+      );
+    }
+  }
+
+  private async warnLegacyWorktreesOnStartup(): Promise<void> {
+    const config = getConfig();
+    const entries = await this.getGitWorktrees();
+    const legacy = detectLegacyWorktrees(entries, {
+      devDir: config.devDir,
+      managedRoot: RALPH_WORKTREES_DIR,
+    });
+
+    if (legacy.length === 0) return;
+
+    const key = `${this.repo}:legacy-worktrees`;
+    if (!this.legacyWorktreesLogLimiter.shouldLog(key, LEGACY_WORKTREES_LOG_INTERVAL_MS)) return;
+
+    console.warn(
+      formatLegacyWorktreeWarning({
+        repo: this.repo,
+        repoPath: this.repoPath,
+        devDir: config.devDir,
+        managedRoot: RALPH_WORKTREES_DIR,
+        legacyPaths: legacy.map((entry) => entry.worktreePath),
+      })
+    );
   }
 
   private async cleanupWorktreesForTasks(tasks: AgentTask[]): Promise<void> {
@@ -4108,17 +4144,6 @@ ${guidance}`
     return lines.join("\n");
   }
 
-  private async writeCiDebugEscalationComment(params: {
-    issueNumber: number;
-    body: string;
-  }): Promise<void> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    await this.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments`, {
-      method: "POST",
-      body: { body: params.body },
-    });
-  }
-
   private async runCiDebugRecovery(params: {
     task: AgentTask;
     issueNumber: string;
@@ -4206,32 +4231,36 @@ ${guidance}`
         attempts,
         reason,
       });
-      await this.writeCiDebugEscalationComment({ issueNumber: Number(params.issueNumber), body: escalationBody });
 
       const wasEscalated = params.task.status === "escalated";
-      const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
-      if (escalated) {
-        applyTaskPatch(params.task, "escalated", {});
-      }
-      await this.writeEscalationWriteback(params.task, { reason, escalationType: "blocked" });
-      await this.notify.notifyEscalation({
-        taskName: params.task.name,
-        taskFileName: params.task._name,
-        taskPath: params.task._path,
-        issue: params.task.issue,
-        repo: this.repo,
-        sessionId: params.task["session-id"]?.trim() || undefined,
-        reason,
-        escalationType: "blocked",
-        planOutput: escalationBody,
-      });
+      if (!wasEscalated) {
+        const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
+        if (escalated) {
+          applyTaskPatch(params.task, "escalated", {});
+        }
 
-      if (escalated && !wasEscalated) {
-        await this.recordEscalatedRunNote(params.task, {
+        // Use the idempotent escalation writeback comment for the human-facing summary.
+        await this.writeEscalationWriteback(params.task, { reason, details: escalationBody, escalationType: "blocked" });
+
+        await this.notify.notifyEscalation({
+          taskName: params.task.name,
+          taskFileName: params.task._name,
+          taskPath: params.task._path,
+          issue: params.task.issue,
+          repo: this.repo,
+          sessionId: params.task["session-id"]?.trim() || undefined,
           reason,
-          sessionId: params.task["session-id"]?.trim(),
-          details: escalationBody,
+          escalationType: "blocked",
+          planOutput: escalationBody,
         });
+
+        if (escalated) {
+          await this.recordEscalatedRunNote(params.task, {
+            reason,
+            sessionId: params.task["session-id"]?.trim(),
+            details: escalationBody,
+          });
+        }
       }
 
       return {
@@ -4442,6 +4471,12 @@ ${guidance}`
     const { task, issueNumber, taskRepoPath, cacheKey, botBranch, issueMeta, startTime, opencodeXdg, opencodeSessionOptions } = params;
 
     if (!this.isGitHubQueueTask(task)) return null;
+
+    // Escalated issues are explicitly waiting on humans; do not attempt autonomous CI remediation.
+    const issueLabels = issueMeta.labels ?? [];
+    if (task.status === "escalated" || issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_ESCALATED)) {
+      return null;
+    }
 
     let existingPr: ResolvedIssuePr;
     try {

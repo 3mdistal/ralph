@@ -28,6 +28,7 @@ Keep this doc focused on product intent; update routing/escalation policy in one
 - `docs/product/graceful-drain-rolling-restart.md`
 - `docs/product/deterministic-gates.md`
 - `docs/product/usage-throttling.md`
+- `docs/product/worktree-management.md`
 
 ## The Problem We're Solving
 

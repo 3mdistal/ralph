@@ -16,7 +16,7 @@ export const RALPH_LABEL_IN_BOT = "ralph:in-bot";
 export const RALPH_LABEL_BLOCKED = "ralph:blocked";
 export const RALPH_LABEL_STUCK = "ralph:stuck";
 export const RALPH_LABEL_DONE = "ralph:done";
-const RALPH_LABEL_ESCALATED = "ralph:escalated";
+export const RALPH_LABEL_ESCALATED = "ralph:escalated";
 
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   { name: RALPH_LABEL_QUEUED, color: "0366D6", description: "In queue; claimable when not blocked or escalated" },
