@@ -70,7 +70,7 @@ describe("requiredChecks semantics", () => {
     expect(guidance).toContain("update repos[].requiredChecks");
   });
 
-  test("decideBranchProtection returns ok/defer/fail as expected", () => {
+  test("decideBranchProtection returns ok/defer as expected", () => {
     expect(
       __decideBranchProtectionForTests({ requiredChecks: [], availableChecks: [] })
     ).toEqual({ kind: "ok", missingChecks: [] });
@@ -81,7 +81,7 @@ describe("requiredChecks semantics", () => {
 
     expect(
       __decideBranchProtectionForTests({ requiredChecks: ["ci"], availableChecks: ["lint"] })
-    ).toEqual({ kind: "fail", missingChecks: ["ci"] });
+    ).toEqual({ kind: "defer", missingChecks: ["ci"] });
   });
 
   test("defers branch protection when check contexts are empty", async () => {
@@ -129,6 +129,7 @@ describe("requiredChecks semantics", () => {
       expect(result).toBe("defer");
       expect(warnMock).toHaveBeenCalled();
       const message = String(warnMock.mock.calls[0]?.[0] ?? "");
+      expect(message).toContain("RALPH_BRANCH_PROTECTION_SKIPPED_MISSING_CHECKS");
       expect(message).toContain("acme/rocket@main");
       expect(message).toContain("Required checks: ci");
       expect(message).toContain("Available check contexts: (none)");
@@ -138,7 +139,7 @@ describe("requiredChecks semantics", () => {
     }
   });
 
-  test("throws when required checks missing but contexts exist", async () => {
+  test("warns when required checks missing but contexts exist", async () => {
     process.env.GH_TOKEN = "test-token";
     const fetchMock = mock(async (url: string) => {
       if (url.endsWith("/repos/acme/rocket/commits/main/check-runs?per_page=100")) {
@@ -151,6 +152,56 @@ describe("requiredChecks semantics", () => {
 
       if (url.endsWith("/repos/acme/rocket/branches/main/protection")) {
         throw new Error("Unexpected branch protection fetch");
+      }
+
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+
+    const warnMock = mock(() => {});
+    const originalWarn = console.warn;
+    const originalFetch = globalThis.fetch;
+    console.warn = warnMock as any;
+    globalThis.fetch = fetchMock as any;
+
+    try {
+      const worker = new RepoWorker("acme/rocket", "/tmp", {
+        session: {
+          runAgent: mock(async () => ({ sessionId: "", success: true, output: "" })) as any,
+          continueSession: mock(async () => ({ sessionId: "" })) as any,
+          continueCommand: mock(async () => ({ stdout: "" })) as any,
+          getRalphXdgCacheHome: mock(() => "/tmp") as any,
+        },
+        queue: { updateTaskStatus: mock(async () => ({ ok: true })) as any },
+        notify: {
+          notifyEscalation: mock(async () => {}) as any,
+          notifyError: mock(async () => {}) as any,
+          notifyTaskComplete: mock(async () => {}) as any,
+        },
+        throttle: { getThrottleDecision: mock(async () => ({ shouldThrottle: false })) as any },
+      });
+
+      await expect((worker as any).ensureBranchProtectionForBranch("main", ["ci"])).resolves.toBe("defer");
+      expect(warnMock).toHaveBeenCalled();
+      const message = String(warnMock.mock.calls[0]?.[0] ?? "");
+      expect(message).toContain("RALPH_BRANCH_PROTECTION_SKIPPED_MISSING_CHECKS");
+      expect(message).toContain("acme/rocket@main");
+      expect(message).toContain("Required checks: ci");
+      expect(message).toContain("Available check contexts: lint");
+    } finally {
+      console.warn = originalWarn;
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("throws when check context fetch fails", async () => {
+    process.env.GH_TOKEN = "test-token";
+    const fetchMock = mock(async (url: string) => {
+      if (url.endsWith("/repos/acme/rocket/commits/main/check-runs?per_page=100")) {
+        throw new Error("HTTP 403");
+      }
+
+      if (url.endsWith("/repos/acme/rocket/commits/main/status?per_page=100")) {
+        throw new Error("HTTP 403");
       }
 
       throw new Error(`Unexpected fetch: ${url}`);
@@ -177,7 +228,7 @@ describe("requiredChecks semantics", () => {
       });
 
       await expect((worker as any).ensureBranchProtectionForBranch("main", ["ci"])).rejects.toThrow(
-        "Missing checks: ci"
+        "Unable to read check contexts"
       );
     } finally {
       globalThis.fetch = originalFetch;
@@ -286,6 +337,7 @@ describe("requiredChecks semantics", () => {
   });
 
   test("creates missing bot branch before checks", async () => {
+    let sawProtectionPut = false;
     const fetchMock = mock(async (url: string, init?: RequestInit) => {
       if (url.endsWith("/repos/acme/rocket")) {
         return new Response(JSON.stringify(__buildRepoDefaultBranchResponse()), { status: 200 });
@@ -315,6 +367,7 @@ describe("requiredChecks semantics", () => {
 
       if (url.endsWith("/repos/acme/rocket/branches/bot%2Fintegration/protection")) {
         if (init?.method === "PUT") {
+          sawProtectionPut = true;
           return new Response(JSON.stringify({}), { status: 200 });
         }
         return new Response("Not Found", { status: 404 });
@@ -350,5 +403,6 @@ describe("requiredChecks semantics", () => {
     }
 
     expect(fetchMock).toHaveBeenCalled();
+    expect(sawProtectionPut).toBe(true);
   });
 });

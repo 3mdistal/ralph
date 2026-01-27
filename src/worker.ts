@@ -824,12 +824,8 @@ function decideBranchProtection(input: {
     return { kind: "ok", missingChecks: [] };
   }
 
-  if (input.availableChecks.length === 0) {
-    return { kind: "defer", missingChecks };
-  }
-
   if (missingChecks.length > 0) {
-    return { kind: "fail", missingChecks };
+    return { kind: "defer", missingChecks };
   }
 
   return { kind: "ok", missingChecks: [] };
@@ -1976,11 +1972,13 @@ export class RepoWorker {
         availableChecks,
       });
       if (decision.kind === "defer") {
-        const logKey = `branch-protection-defer:${this.repo}:${branch}:${requiredChecks.join(",") || "none"}`;
+        const logKey = `branch-protection-defer:${this.repo}:${branch}:${decision.missingChecks.join(",") || "none"}::${availableChecks.join(",") || "none"}`;
         if (this.requiredChecksLogLimiter.shouldLog(logKey, REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS)) {
           console.warn(
-            `[ralph:worker:${this.repo}] Required checks not yet available for ${this.repo}@${branch} ` +
-              `(required: ${requiredChecks.join(", ") || "(none)"}). ` +
+            `[ralph:worker:${this.repo}] RALPH_BRANCH_PROTECTION_SKIPPED_MISSING_CHECKS ` +
+              `Required checks missing for ${this.repo}@${branch} ` +
+              `(required: ${requiredChecks.join(", ") || "(none)"}; ` +
+              `missing: ${decision.missingChecks.join(", ") || "(none)"}). ` +
               `Proceeding without branch protection for now; will retry in ${formatDuration(
                 REQUIRED_CHECKS_DEFER_RETRY_MS
               )}.
