@@ -32,6 +32,8 @@ const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_exce
 
 const ARTIFACT_MAX_LINES = 200;
 const ARTIFACT_MAX_CHARS = 20_000;
+const ARTIFACTS_MAX_PER_GATE_KIND = 20;
+const DB_BUSY_TIMEOUT_MS = 5_000;
 
 let db: Database | null = null;
 
@@ -150,6 +152,7 @@ function ensureSchema(database: Database): void {
   database.exec("PRAGMA journal_mode = WAL;");
   database.exec("PRAGMA synchronous = NORMAL;");
   database.exec("PRAGMA foreign_keys = ON;");
+  database.exec(`PRAGMA busy_timeout = ${DB_BUSY_TIMEOUT_MS};`);
 
   database.exec(
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
@@ -168,7 +171,8 @@ function ensureSchema(database: Database): void {
   }
 
   if (existingVersion && existingVersion < SCHEMA_VERSION) {
-    database.transaction(() => {
+    database.exec("BEGIN IMMEDIATE;");
+    try {
       if (existingVersion < 3) {
         database.exec("ALTER TABLE tasks ADD COLUMN worker_id TEXT");
         database.exec("ALTER TABLE tasks ADD COLUMN repo_slot TEXT");
@@ -288,13 +292,22 @@ function ensureSchema(database: Database): void {
             ON ralph_run_gate_artifacts(run_id);
         `);
       }
-    })();
-  }
 
-  database.exec(
-    `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
-     ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
-  );
+      database.exec(
+        `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
+      );
+      database.exec("COMMIT;");
+    } catch (error) {
+      database.exec("ROLLBACK;");
+      throw error;
+    }
+  } else {
+    database.exec(
+      `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
+    );
+  }
 
   database.exec(`
     CREATE TABLE IF NOT EXISTS repos (
@@ -1256,6 +1269,24 @@ export function recordRalphRunGateArtifact(params: {
       $original_lines: bounded.originalLines,
       $created_at: at,
       $updated_at: at,
+    });
+
+  database
+    .query(
+      `DELETE FROM ralph_run_gate_artifacts
+       WHERE run_id = $run_id AND gate = $gate AND kind = $kind
+         AND id NOT IN (
+           SELECT id FROM ralph_run_gate_artifacts
+           WHERE run_id = $run_id AND gate = $gate AND kind = $kind
+           ORDER BY id DESC
+           LIMIT $limit
+         )`
+    )
+    .run({
+      $run_id: params.runId,
+      $gate: gate,
+      $kind: kind,
+      $limit: ARTIFACTS_MAX_PER_GATE_KIND,
     });
 }
 
