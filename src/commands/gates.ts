@@ -1,4 +1,29 @@
-import { getLatestRunGateStateForIssue, initStateDb } from "../state";
+import { getLatestRunGateStateForIssue, initStateDb, RalphRunGateState } from "../state";
+
+const GATES_JSON_SCHEMA_VERSION = 1;
+
+export function buildGateJsonPayload(params: {
+  repo: string;
+  issueNumber: number;
+  state: RalphRunGateState | null;
+}): {
+  schemaVersion: number;
+  repo: string;
+  issueNumber: number;
+  runId: string | null;
+  results: RalphRunGateState["results"];
+  artifacts: RalphRunGateState["artifacts"];
+} {
+  const runId = params.state?.results[0]?.runId ?? null;
+  return {
+    schemaVersion: GATES_JSON_SCHEMA_VERSION,
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    runId,
+    results: params.state?.results ?? [],
+    artifacts: params.state?.artifacts ?? [],
+  };
+}
 
 function parseIssueNumber(raw: string | undefined): number | null {
   if (!raw) return null;
@@ -22,16 +47,9 @@ export async function runGatesCommand(opts: { args: string[] }): Promise<void> {
   const state = getLatestRunGateStateForIssue({ repo, issueNumber });
 
   if (json) {
-    const runId = state?.results[0]?.runId ?? null;
     console.log(
       JSON.stringify(
-        {
-          repo,
-          issueNumber,
-          runId,
-          results: state?.results ?? [],
-          artifacts: state?.artifacts ?? [],
-        },
+        buildGateJsonPayload({ repo, issueNumber, state }),
         null,
         2
       )

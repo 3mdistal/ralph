@@ -422,6 +422,35 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(latest?.results.find((result) => result.gate === "ci")?.status).toBe("fail");
   });
 
+  test("retains only the latest gate artifacts per kind", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#232",
+      taskPath: "github:3mdistal/ralph#232",
+      attemptKind: "process",
+      startedAt: "2026-01-21T10:00:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-21T10:00:01.000Z" });
+
+    for (let index = 0; index < 25; index += 1) {
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "ci",
+        kind: "failure_excerpt",
+        content: `artifact-${index}`,
+        at: `2026-01-21T10:00:${String(index).padStart(2, "0")}.000Z`,
+      });
+    }
+
+    const state = getRalphRunGateState(runId);
+    expect(state.artifacts).toHaveLength(20);
+    expect(state.artifacts[0]?.content).toBe("artifact-5");
+    expect(state.artifacts[state.artifacts.length - 1]?.content).toBe("artifact-24");
+  });
+
   beforeEach(async () => {
     priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
     releaseLock = await acquireGlobalTestLock();
