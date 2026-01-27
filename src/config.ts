@@ -27,6 +27,8 @@ export interface RepoConfig {
   setup?: string[];
   /** Max concurrent tasks for this repo (default: 1) */
   maxWorkers?: number;
+  /** Scheduler priority weighting for this repo (default: 0). */
+  schedulerPriority?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
   /** Enable proactive update-branch when a PR is BEHIND (default: false). */
@@ -328,6 +330,14 @@ function toPositiveIntOrNull(value: unknown): number | null {
   return value;
 }
 
+function toNonNegativeIntStrictOrNull(value: unknown): number | null {
+  if (typeof value !== "number") return null;
+  if (!Number.isFinite(value)) return null;
+  if (!Number.isInteger(value)) return null;
+  if (value < 0) return null;
+  return value;
+}
+
 function toPositiveIntFromUnknownOrNull(value: unknown): number | null {
   const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   if (!Number.isFinite(n)) return null;
@@ -434,6 +444,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
   // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
+    const schedulerPriority = toNonNegativeIntStrictOrNull((repo as any).schedulerPriority);
     const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
     const autoUpdateMin = toPositiveIntOrNull((repo as any).autoUpdateBehindMinMinutes);
     const updates: Partial<RepoConfig> = {};
@@ -452,6 +463,14 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           `falling back to global batchSize`
       );
       updates.rollupBatchSize = undefined;
+    }
+
+    if ((repo as any).schedulerPriority !== undefined && schedulerPriority === null) {
+      console.warn(
+        `[ralph] Invalid config schedulerPriority for repo ${repo.name}: ${JSON.stringify((repo as any).schedulerPriority)}; ` +
+          `defaulting to 0`
+      );
+      updates.schedulerPriority = undefined;
     }
 
     const rawAutoUpdate = (repo as any).autoUpdateBehindPrs;
@@ -1270,6 +1289,13 @@ export function getRepoMaxWorkers(repoName: string): number {
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const maxWorkers = toPositiveIntOrNull(explicit?.maxWorkers);
   return maxWorkers ?? DEFAULT_REPO_MAX_WORKERS;
+}
+
+export function getRepoSchedulerPriority(repoName: string): number {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const parsed = toNonNegativeIntStrictOrNull(explicit?.schedulerPriority);
+  return parsed ?? 0;
 }
 
 export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {

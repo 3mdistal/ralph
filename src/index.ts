@@ -18,6 +18,7 @@ import {
   getOpencodeDefaultProfileName,
   listOpencodeProfileNames,
   getRepoMaxWorkers,
+  getRepoSchedulerPriority,
   getRepoPath,
   type ControlConfig,
 } from "./config";
@@ -41,6 +42,7 @@ import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
+import { createPrioritySelectorState } from "./scheduler/priority-policy";
 
 import { DrainMonitor, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
@@ -235,6 +237,7 @@ let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
 const rrCursor = { value: 0 };
+const schedulerPriorityState = { value: createPrioritySelectorState() };
 
 function requireBwrbQueueOrExit(action: string): void {
   const state = getQueueBackendState();
@@ -266,6 +269,15 @@ function getRepoSemaphore(repo: string): Semaphore {
     repoSemaphores.set(repo, sem);
   }
   return sem;
+}
+
+function buildRepoPriorityMap(): Map<string, number> {
+  const cfg = getConfig();
+  const priorities = new Map<string, number>();
+  for (const repo of cfg.repos) {
+    priorities.set(repo.name, getRepoSchedulerPriority(repo.name));
+  }
+  return priorities;
 }
 
 async function checkIdleRollups(): Promise<void> {
@@ -416,6 +428,8 @@ const schedulerController = createSchedulerController({
       globalSemaphore,
       getRepoSemaphore,
       rrCursor,
+      repoPriorities: buildRepoPriorityMap(),
+      priorityState: schedulerPriorityState,
       shouldLog,
       log: (message) => console.log(message),
       startTask,
@@ -856,6 +870,8 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     globalSemaphore,
     getRepoSemaphore,
     rrCursor,
+    repoPriorities: buildRepoPriorityMap(),
+    priorityState: schedulerPriorityState,
     shouldLog,
     log: (message) => console.log(message),
     startTask,

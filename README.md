@@ -136,10 +136,11 @@ sandbox = {
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `maxWorkers`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `maxWorkers`, optional `schedulerPriority`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `repos[].rollupBatchSize` (number): per-repo override for rollup batch size (defaults to `batchSize`)
+- `repos[].schedulerPriority` (number): per-repo scheduler priority weighting (default: 0; higher values are scheduled more often while still avoiding starvation)
 - `ownershipTtlMs` (number): task ownership TTL in milliseconds (defaults to 60000)
 - `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
 - `repos[].autoUpdateBehindLabel` (string): optional label gate required for proactive update-branch

@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from "bun:test";
 
 import { Semaphore } from "../semaphore";
 import { createSchedulerController, startQueuedTasks } from "../scheduler";
+import { createPrioritySelectorState } from "../scheduler/priority-policy";
 import { attemptResumeResolvedEscalations } from "../escalation-resume-scheduler";
 import type { AgentTask } from "../queue";
 
@@ -263,6 +264,57 @@ describe("Scheduler invariants", () => {
     expect(startPriorityTask).toHaveBeenCalledTimes(1);
     expect(startTask).toHaveBeenCalledTimes(1);
     expect(started[0]).toBe("resume:t1");
+  });
+
+  test("legacy order preserved when priorities are unset", async () => {
+    const inFlightTasks = new Set<string>();
+    const started: string[] = [];
+
+    const globalSemaphore = new Semaphore(3);
+
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(1);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const startTask = ({ task }: { task: TestTask }) => {
+      started.push(task.repo);
+      return true;
+    };
+
+    const tasks = [
+      { repo: "a", _path: "t-a", name: "t-a" },
+      { repo: "b", _path: "t-b", name: "t-b" },
+      { repo: "c", _path: "t-c", name: "t-c" },
+    ];
+
+    const startedCount = await startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks,
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor: { value: 0 },
+      repoPriorities: new Map([
+        ["a", 0],
+        ["b", 0],
+        ["c", 0],
+      ]),
+      priorityState: { value: createPrioritySelectorState() },
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+    });
+
+    expect(startedCount).toBe(3);
+    expect(started).toEqual(["a", "b", "c"]);
   });
 
   test("resume scheduling does not block queued tasks", async () => {

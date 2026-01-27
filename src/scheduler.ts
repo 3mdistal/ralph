@@ -1,5 +1,11 @@
 import type { ReleaseFn } from "./semaphore";
 import type { Semaphore } from "./semaphore";
+import {
+  createPrioritySelectorState,
+  selectNextRepoPriority,
+  type PriorityRepo,
+  type PrioritySelectorState,
+} from "./scheduler/priority-policy";
 
 export type SchedulerGate = "running" | "draining" | "paused" | "soft-throttled";
 
@@ -12,6 +18,8 @@ export interface SchedulerDeps<Task> {
   globalSemaphore: Semaphore;
   getRepoSemaphore: (repo: string) => Semaphore;
   rrCursor: { value: number };
+  repoPriorities?: Map<string, number>;
+  priorityState?: { value: PrioritySelectorState };
   shouldLog: (key: string, intervalMs: number) => boolean;
   log: (message: string) => void;
   startTask: (opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }) => boolean | Promise<boolean>;
@@ -49,14 +57,99 @@ export async function startQueuedTasks<Task extends { repo: string }>(deps: Sche
   const repos = Array.from(new Set([...priorityByRepo.keys(), ...byRepo.keys()]));
   if (repos.length === 0) return 0;
 
+  const repoPriorities = deps.repoPriorities ?? new Map<string, number>();
+  const maxPriority = repos.reduce((max, repo) => Math.max(max, repoPriorities.get(repo) ?? 0), 0);
+
   let startedCount = 0;
+
+  if (maxPriority <= 0) {
+    while (deps.globalSemaphore.available() > 0) {
+      let startedThisRound = false;
+
+      for (let i = 0; i < repos.length; i++) {
+        const idx = (deps.rrCursor.value + i) % repos.length;
+        const repo = repos[idx];
+        const priorityTasksForRepo = priorityByRepo.get(repo);
+        const repoTasks = byRepo.get(repo);
+
+        let task: Task | undefined;
+        let isPriority = false;
+
+        if (priorityTasksForRepo && priorityTasksForRepo.length > 0) {
+          task = priorityTasksForRepo.shift();
+          isPriority = true;
+        } else if (repoTasks && repoTasks.length > 0) {
+          task = repoTasks.shift();
+        }
+
+        if (!task) continue;
+
+        const releaseGlobal = deps.globalSemaphore.tryAcquire();
+        if (!releaseGlobal) return startedCount;
+
+        const releaseRepo = deps.getRepoSemaphore(repo).tryAcquire();
+        if (!releaseRepo) {
+          releaseGlobal();
+          continue;
+        }
+
+        deps.rrCursor.value = (idx + 1) % repos.length;
+
+        const startFn = isPriority ? deps.startPriorityTask ?? deps.startTask : deps.startTask;
+        let started = false;
+        try {
+          started = await Promise.resolve(startFn({ repo, task, releaseGlobal, releaseRepo }));
+        } catch (error: any) {
+          const message = error instanceof Error ? error.message : String(error);
+          deps.log(`[ralph] Error starting task for ${repo}: ${message}`);
+        }
+
+        if (!started) {
+          releaseRepo();
+          releaseGlobal();
+          startedThisRound = false;
+          continue;
+        }
+
+        startedCount++;
+        startedThisRound = true;
+        break;
+      }
+
+      if (!startedThisRound) break;
+    }
+
+    return startedCount;
+  }
+
+  const priorityStateRef = deps.priorityState ?? { value: createPrioritySelectorState() };
+  let priorityState = priorityStateRef.value;
+
+  const buildRunnableRepos = (): PriorityRepo[] => {
+    const runnable: PriorityRepo[] = [];
+    for (const repo of repos) {
+      const priorityTasksForRepo = priorityByRepo.get(repo);
+      const repoTasks = byRepo.get(repo);
+      if ((priorityTasksForRepo?.length ?? 0) === 0 && (repoTasks?.length ?? 0) === 0) continue;
+      if (deps.getRepoSemaphore(repo).available() <= 0) continue;
+      runnable.push({ name: repo, priority: repoPriorities.get(repo) ?? 0 });
+    }
+    return runnable;
+  };
 
   while (deps.globalSemaphore.available() > 0) {
     let startedThisRound = false;
+    let attempts = 0;
+    const maxAttempts = repos.length;
 
-    for (let i = 0; i < repos.length; i++) {
-      const idx = (deps.rrCursor.value + i) % repos.length;
-      const repo = repos[idx];
+    while (attempts < maxAttempts) {
+      const runnableRepos = buildRunnableRepos();
+      if (runnableRepos.length === 0) break;
+
+      const selection = selectNextRepoPriority(runnableRepos, priorityState);
+      const repo = selection.selectedRepo;
+      if (!repo) break;
+
       const priorityTasksForRepo = priorityByRepo.get(repo);
       const repoTasks = byRepo.get(repo);
 
@@ -70,7 +163,10 @@ export async function startQueuedTasks<Task extends { repo: string }>(deps: Sche
         task = repoTasks.shift();
       }
 
-      if (!task) continue;
+      if (!task) {
+        attempts++;
+        continue;
+      }
 
       const releaseGlobal = deps.globalSemaphore.tryAcquire();
       if (!releaseGlobal) return startedCount;
@@ -78,10 +174,12 @@ export async function startQueuedTasks<Task extends { repo: string }>(deps: Sche
       const releaseRepo = deps.getRepoSemaphore(repo).tryAcquire();
       if (!releaseRepo) {
         releaseGlobal();
+        attempts++;
         continue;
       }
 
-      deps.rrCursor.value = (idx + 1) % repos.length;
+      priorityState = selection.state;
+      priorityStateRef.value = priorityState;
 
       const startFn = isPriority ? deps.startPriorityTask ?? deps.startTask : deps.startTask;
       let started = false;
@@ -95,7 +193,7 @@ export async function startQueuedTasks<Task extends { repo: string }>(deps: Sche
       if (!started) {
         releaseRepo();
         releaseGlobal();
-        startedThisRound = false;
+        attempts++;
         continue;
       }
 
