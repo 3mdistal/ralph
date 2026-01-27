@@ -157,6 +157,19 @@ Behavior:
 - Labels: while CI-debug is in progress, apply `ralph:stuck` and avoid `ralph:blocked`. Apply `ralph:escalated` only after bounded CI-debug attempts fail.
 - Escalation: post a final comment summarizing what failed, what was tried (links to attempts), and the exact next human action.
 
+## Merge-conflict recovery lane (mergeStateStatus=DIRTY)
+
+When an issue already has an open PR with merge conflicts, Ralph must treat merge-conflict recovery as a first-class lane (like CI-debug).
+
+Behavior:
+- Detect: if the PR is `mergeStateStatus=DIRTY`, do **not** end in `ralph:blocked` without attempting recovery.
+- Comment: post a single canonical GitHub **issue** comment with PR/base/head refs, conflict file count/sample, and the action statement. Edit the same comment as state changes (no duplicates).
+- Run: spawn a dedicated merge-conflict recovery run with a fresh worktree and fresh OpenCode session (no planning phase). Merge base into head (no rebase / no force-push), resolve conflicts, run tests/typecheck/build/knip, then push updates.
+- Wait: after pushing, wait for `mergeStateStatus != DIRTY` and for required checks to appear for the new head SHA before resuming merge-gate logic.
+- Retries: bounded attempts (2–3). If the same conflict signature repeats across attempts, stop early and escalate.
+- Labels: while recovery is in progress, apply `ralph:stuck` and avoid `ralph:blocked`. Apply `ralph:escalated` only after bounded attempts fail.
+- Escalation: post a final comment summarizing the conflict files and the exact next human action needed.
+
 ## Test Philosophy (Agentic Coding)
 
 Tests are most valuable when they defend product behavior, not implementation details.
