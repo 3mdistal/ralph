@@ -114,12 +114,14 @@ import {
 } from "./state";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
+  detectLegacyWorktrees,
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
   stripHeadsRef,
   type GitWorktreeEntry,
 } from "./git-worktree";
+import { formatLegacyWorktreeWarning } from "./legacy-worktrees";
 import {
   normalizePrUrl,
   searchOpenPullRequestsByIssueLink,
@@ -205,6 +207,7 @@ const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
 const IGNORED_BODY_DEPS_LOG_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const LEGACY_WORKTREES_LOG_INTERVAL_MS = 12 * 60 * 60 * 1000;
 const IGNORED_BODY_DEPS_LOG_MAX_KEYS = 2000;
 const BLOCKED_REASON_MAX_LEN = 200;
 const BLOCKED_DETAILS_MAX_LEN = 2000;
@@ -873,6 +876,7 @@ export class RepoWorker {
   private lastBlockedSyncAt = 0;
   private ignoredBodyDepsLogLimiter = new LogLimiter({ maxKeys: IGNORED_BODY_DEPS_LOG_MAX_KEYS });
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
+  private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -2508,6 +2512,38 @@ ${guidance}`
         `[ralph:worker:${this.repo}] Failed to cleanup orphaned worktrees on startup: ${e?.message ?? String(e)}`
       );
     }
+
+    try {
+      await this.warnLegacyWorktreesOnStartup();
+    } catch (e: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to check for legacy worktrees: ${e?.message ?? String(e)}`
+      );
+    }
+  }
+
+  private async warnLegacyWorktreesOnStartup(): Promise<void> {
+    const config = getConfig();
+    const entries = await this.getGitWorktrees();
+    const legacy = detectLegacyWorktrees(entries, {
+      devDir: config.devDir,
+      managedRoot: RALPH_WORKTREES_DIR,
+    });
+
+    if (legacy.length === 0) return;
+
+    const key = `${this.repo}:legacy-worktrees`;
+    if (!this.legacyWorktreesLogLimiter.shouldLog(key, LEGACY_WORKTREES_LOG_INTERVAL_MS)) return;
+
+    console.warn(
+      formatLegacyWorktreeWarning({
+        repo: this.repo,
+        repoPath: this.repoPath,
+        devDir: config.devDir,
+        managedRoot: RALPH_WORKTREES_DIR,
+        legacyPaths: legacy.map((entry) => entry.worktreePath),
+      })
+    );
   }
 
   private async cleanupWorktreesForTasks(tasks: AgentTask[]): Promise<void> {

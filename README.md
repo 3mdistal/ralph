@@ -37,6 +37,21 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 
 Ralph always runs workers inside a per-task git worktree and blocks execution if it cannot prove isolation. If the repo root checkout is dirty or a task is missing a valid `worktree-path`, the worker fails closed and reports the issue. This protects the main checkout from accidental writes.
 
+### Legacy worktree cleanup
+
+Older Ralph versions created git worktrees directly under `devDir` (for example, `~/Developer/worktree-<n>`). Ralph now warns when it detects these legacy paths but does not auto-delete them. To review and clean safe legacy worktrees:
+
+```bash
+ralph worktrees legacy --repo <owner/repo> --dry-run --action cleanup
+ralph worktrees legacy --repo <owner/repo> --action cleanup
+```
+
+Optional: migrate safe legacy worktrees into the managed worktrees directory:
+
+```bash
+ralph worktrees legacy --repo <owner/repo> --action migrate
+```
+
 If you previously installed bwrb via `pnpm link -g`, unlink it first so Ralph uses the published CLI on your PATH (Bun just shells out to the `bwrb` binary).
 
 ## Installation
