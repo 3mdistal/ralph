@@ -41,7 +41,7 @@ function buildBands(repos: PriorityRepo[]): Map<number, string[]> {
 function buildBandRemaining(bandOrder: number[]): Record<string, number> {
   const remaining: Record<string, number> = {};
   for (const priority of bandOrder) {
-    remaining[String(priority)] = priority + 1;
+    remaining[String(priority)] = Math.max(1, Math.round(priority));
   }
   return remaining;
 }

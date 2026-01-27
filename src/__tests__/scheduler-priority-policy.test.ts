@@ -23,8 +23,8 @@ function runSelections(repos: PriorityRepo[], count: number): string[] {
 describe("priority scheduler policy", () => {
   test("weights higher priority bands with extra selections", () => {
     const repos: PriorityRepo[] = [
-      { name: "high", priority: 2 },
-      { name: "low", priority: 0 },
+      { name: "high", priority: 3 },
+      { name: "low", priority: 1 },
     ];
 
     const selections = runSelections(repos, 4);
@@ -43,8 +43,8 @@ describe("priority scheduler policy", () => {
 
   test("no starvation across bands within a cycle", () => {
     const repos: PriorityRepo[] = [
-      { name: "alpha", priority: 3 },
-      { name: "beta", priority: 0 },
+      { name: "alpha", priority: 4 },
+      { name: "beta", priority: 1 },
     ];
 
     const selections = runSelections(repos, 5);

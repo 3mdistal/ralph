@@ -52,7 +52,7 @@ describe("repos[].schedulerPriority config", () => {
     expect(cfgMod.getRepoSchedulerPriority("demo/repo")).toBe(3);
   });
 
-  test("warns and defaults invalid schedulerPriority values", async () => {
+  test("clamps out-of-range schedulerPriority values", async () => {
     const configJsonPath = getRalphConfigJsonPath();
     await writeJson(configJsonPath, {
       maxWorkers: 1,
@@ -67,7 +67,29 @@ describe("repos[].schedulerPriority config", () => {
     try {
       const cfgMod = await import("../config");
       cfgMod.__resetConfigForTests();
-      expect(cfgMod.getRepoSchedulerPriority("demo/repo")).toBe(0);
+      expect(cfgMod.getRepoSchedulerPriority("demo/repo")).toBeCloseTo(0.1, 5);
+      expect(warn).toHaveBeenCalled();
+    } finally {
+      console.warn = priorWarn;
+    }
+  });
+
+  test("defaults invalid schedulerPriority types", async () => {
+    const configJsonPath = getRalphConfigJsonPath();
+    await writeJson(configJsonPath, {
+      maxWorkers: 1,
+      ownershipTtlMs: 60000,
+      repos: [{ name: "demo/repo", schedulerPriority: "oops" }],
+    });
+
+    const warn = mock(() => {});
+    const priorWarn = console.warn;
+    console.warn = warn as any;
+
+    try {
+      const cfgMod = await import("../config");
+      cfgMod.__resetConfigForTests();
+      expect(cfgMod.getRepoSchedulerPriority("demo/repo")).toBe(1);
       expect(warn).toHaveBeenCalled();
     } finally {
       console.warn = priorWarn;

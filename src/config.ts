@@ -25,9 +25,11 @@ export interface RepoConfig {
    * Commands are operator-owned and defined in ~/.ralph/config.toml|json.
    */
   setup?: string[];
-  /** Max concurrent tasks for this repo (default: 1) */
+  /** Per-repo concurrency slots for this repo (default: 1). */
+  concurrencySlots?: number;
+  /** Max concurrent tasks for this repo (default: 1). Deprecated: use concurrencySlots. */
   maxWorkers?: number;
-  /** Scheduler priority weighting for this repo (default: 0). */
+  /** Scheduler priority weighting for this repo (default: 1 when enabled). */
   schedulerPriority?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
@@ -215,6 +217,10 @@ export interface RalphConfig {
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
+const DEFAULT_REPO_CONCURRENCY_SLOTS = DEFAULT_REPO_MAX_WORKERS;
+export const DEFAULT_REPO_SCHEDULER_PRIORITY = 1;
+const MIN_REPO_SCHEDULER_PRIORITY = 0.1;
+const MAX_REPO_SCHEDULER_PRIORITY = 10;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
@@ -330,11 +336,9 @@ function toPositiveIntOrNull(value: unknown): number | null {
   return value;
 }
 
-function toNonNegativeIntStrictOrNull(value: unknown): number | null {
+function toFiniteNumberOrNull(value: unknown): number | null {
   if (typeof value !== "number") return null;
   if (!Number.isFinite(value)) return null;
-  if (!Number.isInteger(value)) return null;
-  if (value < 0) return null;
   return value;
 }
 
@@ -441,13 +445,23 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     );
   }
 
-  // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
+  // Validate per-repo concurrencySlots/maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
-    const schedulerPriority = toNonNegativeIntStrictOrNull((repo as any).schedulerPriority);
+    const slots = toPositiveIntOrNull((repo as any).concurrencySlots);
+    const schedulerPriorityRaw = (repo as any).schedulerPriority;
+    const schedulerPriority = toFiniteNumberOrNull(schedulerPriorityRaw);
     const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
     const autoUpdateMin = toPositiveIntOrNull((repo as any).autoUpdateBehindMinMinutes);
     const updates: Partial<RepoConfig> = {};
+
+    if ((repo as any).concurrencySlots !== undefined && !slots) {
+      console.warn(
+        `[ralph] Invalid config concurrencySlots for repo ${repo.name}: ${JSON.stringify((repo as any).concurrencySlots)}; ` +
+          `falling back to default ${DEFAULT_REPO_CONCURRENCY_SLOTS}`
+      );
+      updates.concurrencySlots = DEFAULT_REPO_CONCURRENCY_SLOTS;
+    }
 
     if ((repo as any).maxWorkers !== undefined && !mw) {
       console.warn(
@@ -465,12 +479,23 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       updates.rollupBatchSize = undefined;
     }
 
-    if ((repo as any).schedulerPriority !== undefined && schedulerPriority === null) {
-      console.warn(
-        `[ralph] Invalid config schedulerPriority for repo ${repo.name}: ${JSON.stringify((repo as any).schedulerPriority)}; ` +
-          `defaulting to 0`
-      );
-      updates.schedulerPriority = undefined;
+    if ((repo as any).schedulerPriority !== undefined) {
+      if (schedulerPriority === null) {
+        console.warn(
+          `[ralph] Invalid config schedulerPriority for repo ${repo.name}: ${JSON.stringify(schedulerPriorityRaw)}; ` +
+            `defaulting to ${DEFAULT_REPO_SCHEDULER_PRIORITY}`
+        );
+        updates.schedulerPriority = DEFAULT_REPO_SCHEDULER_PRIORITY;
+      } else {
+        const clamped = Math.min(MAX_REPO_SCHEDULER_PRIORITY, Math.max(MIN_REPO_SCHEDULER_PRIORITY, schedulerPriority));
+        if (clamped !== schedulerPriority) {
+          console.warn(
+            `[ralph] Clamped schedulerPriority for repo ${repo.name}: ${schedulerPriority} -> ${clamped} ` +
+              `(range ${MIN_REPO_SCHEDULER_PRIORITY}..${MAX_REPO_SCHEDULER_PRIORITY})`
+          );
+        }
+        updates.schedulerPriority = clamped;
+      }
     }
 
     const rawAutoUpdate = (repo as any).autoUpdateBehindPrs;
@@ -1284,18 +1309,23 @@ export function getDashboardEventsRetentionDays(): number {
   return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
 }
 
-export function getRepoMaxWorkers(repoName: string): number {
+export function getRepoConcurrencySlots(repoName: string): number {
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
+  const slots = toPositiveIntOrNull(explicit?.concurrencySlots);
+  if (slots) return slots;
   const maxWorkers = toPositiveIntOrNull(explicit?.maxWorkers);
-  return maxWorkers ?? DEFAULT_REPO_MAX_WORKERS;
+  return maxWorkers ?? DEFAULT_REPO_CONCURRENCY_SLOTS;
 }
 
-export function getRepoSchedulerPriority(repoName: string): number {
+export function getRepoMaxWorkers(repoName: string): number {
+  return getRepoConcurrencySlots(repoName);
+}
+
+export function getRepoSchedulerPriority(repoName: string): number | null {
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
-  const parsed = toNonNegativeIntStrictOrNull(explicit?.schedulerPriority);
-  return parsed ?? 0;
+  return typeof explicit?.schedulerPriority === "number" ? explicit.schedulerPriority : null;
 }
 
 export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {

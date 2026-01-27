@@ -2,7 +2,6 @@ import { describe, expect, mock, test } from "bun:test";
 
 import { Semaphore } from "../semaphore";
 import { createSchedulerController, startQueuedTasks } from "../scheduler";
-import { createPrioritySelectorState } from "../scheduler/priority-policy";
 import { attemptResumeResolvedEscalations } from "../escalation-resume-scheduler";
 import type { AgentTask } from "../queue";
 
@@ -302,12 +301,7 @@ describe("Scheduler invariants", () => {
       globalSemaphore,
       getRepoSemaphore,
       rrCursor: { value: 0 },
-      repoPriorities: new Map([
-        ["a", 0],
-        ["b", 0],
-        ["c", 0],
-      ]),
-      priorityState: { value: createPrioritySelectorState() },
+      priorityEnabled: false,
       shouldLog: () => false,
       log: () => {},
       startTask: startTask as any,

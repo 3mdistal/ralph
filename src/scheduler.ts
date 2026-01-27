@@ -7,6 +7,9 @@ import {
   type PrioritySelectorState,
 } from "./scheduler/priority-policy";
 
+const DEFAULT_REPO_PRIORITY = 1;
+const DEFAULT_REPO_PRIORITY_SCALE = 10;
+
 export type SchedulerGate = "running" | "draining" | "paused" | "soft-throttled";
 
 export interface SchedulerDeps<Task> {
@@ -18,8 +21,11 @@ export interface SchedulerDeps<Task> {
   globalSemaphore: Semaphore;
   getRepoSemaphore: (repo: string) => Semaphore;
   rrCursor: { value: number };
+  repoOrder?: string[];
   repoPriorities?: Map<string, number>;
+  priorityEnabled?: boolean;
   priorityState?: { value: PrioritySelectorState };
+  getTaskPriorityWeight?: (task: Task) => number;
   shouldLog: (key: string, intervalMs: number) => boolean;
   log: (message: string) => void;
   startTask: (opts: { repo: string; task: Task; releaseGlobal: ReleaseFn; releaseRepo: ReleaseFn }) => boolean | Promise<boolean>;
@@ -54,15 +60,23 @@ export async function startQueuedTasks<Task extends { repo: string }>(deps: Sche
 
   const byRepo = deps.groupByRepo(newTasks);
   const priorityByRepo = deps.groupByRepo(newPriorityTasks);
-  const repos = Array.from(new Set([...priorityByRepo.keys(), ...byRepo.keys()]));
+  const priorityEnabled = deps.priorityEnabled ?? false;
+  const repoSet = new Set([...priorityByRepo.keys(), ...byRepo.keys()]);
+  const repos = priorityEnabled && deps.repoOrder && deps.repoOrder.length > 0
+    ? (() => {
+        const ordered = deps.repoOrder.filter((repo) => repoSet.has(repo));
+        const orderedSet = new Set(ordered);
+        const extras = Array.from(repoSet)
+          .filter((repo) => !orderedSet.has(repo))
+          .sort((a, b) => a.localeCompare(b));
+        return ordered.concat(extras);
+      })()
+    : Array.from(repoSet);
   if (repos.length === 0) return 0;
-
-  const repoPriorities = deps.repoPriorities ?? new Map<string, number>();
-  const maxPriority = repos.reduce((max, repo) => Math.max(max, repoPriorities.get(repo) ?? 0), 0);
 
   let startedCount = 0;
 
-  if (maxPriority <= 0) {
+  if (!priorityEnabled) {
     while (deps.globalSemaphore.available() > 0) {
       let startedThisRound = false;
 
@@ -132,7 +146,11 @@ export async function startQueuedTasks<Task extends { repo: string }>(deps: Sche
       const repoTasks = byRepo.get(repo);
       if ((priorityTasksForRepo?.length ?? 0) === 0 && (repoTasks?.length ?? 0) === 0) continue;
       if (deps.getRepoSemaphore(repo).available() <= 0) continue;
-      runnable.push({ name: repo, priority: repoPriorities.get(repo) ?? 0 });
+      const nextTask = priorityTasksForRepo?.[0] ?? repoTasks?.[0];
+      const taskPriorityWeight = nextTask ? deps.getTaskPriorityWeight?.(nextTask) ?? 1 : 1;
+      const repoPriority = deps.repoPriorities?.get(repo) ?? DEFAULT_REPO_PRIORITY;
+      const scaledPriority = Math.max(1, Math.round(repoPriority * DEFAULT_REPO_PRIORITY_SCALE));
+      runnable.push({ name: repo, priority: scaledPriority * taskPriorityWeight });
     }
     return runnable;
   };
