@@ -52,7 +52,7 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { drainQueuedNudges } from "./nudge";
-import { RALPH_LABEL_BLOCKED, RALPH_LABEL_STUCK } from "./github-labels";
+import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createGhRunner } from "./github/gh-runner";
@@ -212,13 +212,16 @@ const IGNORED_BODY_DEPS_LOG_MAX_KEYS = 2000;
 const BLOCKED_REASON_MAX_LEN = 200;
 const BLOCKED_DETAILS_MAX_LEN = 2000;
 const CI_DEBUG_LEASE_TTL_MS = 20 * 60_000;
-const CI_DEBUG_COMMENT_SCAN_LIMIT = 50;
+const CI_DEBUG_COMMENT_SCAN_LIMIT = 100;
 const CI_DEBUG_COMMENT_MIN_EDIT_MS = 60_000;
 const MERGE_CONFLICT_LEASE_TTL_MS = 20 * 60_000;
 const MERGE_CONFLICT_COMMENT_SCAN_LIMIT = 50;
 const MERGE_CONFLICT_COMMENT_MIN_EDIT_MS = 60_000;
 const MERGE_CONFLICT_WAIT_TIMEOUT_MS = 10 * 60_000;
 const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
+
+const CI_REMEDIATION_BACKOFF_BASE_MS = 30_000;
+const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 
 interface IntrospectionSummary {
   sessionId: string;
@@ -3012,7 +3015,7 @@ ${guidance}`
   }
 
   private resolveCiFixAttempts(): number {
-    return this.parseCiFixAttempts(process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS) ?? 2;
+    return this.parseCiFixAttempts(process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS) ?? 5;
   }
 
   private resolveMergeConflictAttempts(): number {
@@ -3422,6 +3425,99 @@ ${guidance}`
         }`
       );
     }
+  }
+
+  private computeCiRemediationBackoffMs(attemptNumber: number): number {
+    const exponent = Math.max(0, attemptNumber - 1);
+    const raw = CI_REMEDIATION_BACKOFF_BASE_MS * Math.pow(2, exponent);
+    const clamped = Math.min(raw, CI_REMEDIATION_BACKOFF_MAX_MS);
+    return applyRequiredChecksJitter(clamped);
+  }
+
+  private async sleepMs(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async escalateCiDebugRecovery(params: {
+    task: AgentTask;
+    issueNumber: number;
+    issueRef: IssueRef;
+    prUrl: string;
+    baseRefName: string | null;
+    headRefName: string | null;
+    summary: RequiredChecksSummary;
+    timedOut: boolean;
+    attempts: CiDebugAttempt[];
+    signature: string;
+    maxAttempts: number;
+    reason: string;
+  }): Promise<CiDebugRecoveryOutcome> {
+    const finalState: CiDebugCommentState = {
+      version: 1,
+      attempts: params.attempts,
+      lastSignature: params.signature,
+    };
+
+    const lines = this.buildCiDebugCommentLines({
+      prUrl: params.prUrl,
+      baseRefName: params.baseRefName,
+      headRefName: params.headRefName,
+      summary: params.summary,
+      timedOut: params.timedOut,
+      attemptCount: params.attempts.length,
+      maxAttempts: params.maxAttempts,
+    });
+    await this.upsertCiDebugComment({ issueNumber: params.issueNumber, lines, state: finalState });
+    await this.clearCiDebugLabels(params.issueRef);
+
+    const escalationBody = this.buildCiDebugEscalationSummary({
+      prUrl: params.prUrl,
+      summary: params.summary,
+      attempts: params.attempts,
+      reason: params.reason,
+    });
+
+    const wasEscalated = params.task.status === "escalated";
+    if (!wasEscalated) {
+      const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
+      if (escalated) {
+        applyTaskPatch(params.task, "escalated", {});
+      }
+
+      // Use the idempotent escalation writeback comment for the human-facing summary.
+      await this.writeEscalationWriteback(params.task, { reason: params.reason, details: escalationBody, escalationType: "blocked" });
+
+      await this.notify.notifyEscalation({
+        taskName: params.task.name,
+        taskFileName: params.task._name,
+        taskPath: params.task._path,
+        issue: params.task.issue,
+        repo: this.repo,
+        sessionId: params.task["session-id"]?.trim() || undefined,
+        reason: params.reason,
+        escalationType: "blocked",
+        planOutput: escalationBody,
+      });
+
+      if (escalated) {
+        await this.recordEscalatedRunNote(params.task, {
+          reason: params.reason,
+          sessionId: params.task["session-id"]?.trim(),
+          details: escalationBody,
+        });
+      }
+    }
+
+    return {
+      status: "escalated",
+      run: {
+        taskName: params.task.name,
+        repo: this.repo,
+        outcome: "escalated",
+        sessionId: params.task["session-id"]?.trim(),
+        escalationReason: params.reason,
+      },
+    };
   }
 
   private isMergeConflictLeaseActive(lease: MergeConflictCommentState["lease"], nowMs: number): boolean {
@@ -4114,9 +4210,21 @@ ${guidance}`
       lines.push("Attempts:");
       for (const attempt of params.attempts) {
         const when = attempt.completedAt || attempt.startedAt;
-        lines.push(
-          `- Attempt ${attempt.attempt} (${attempt.status ?? "unknown"}, ${when}): ${attempt.signature || "(no signature)"}`
-        );
+        const status = attempt.status ?? "unknown";
+        const signatureBefore = attempt.signature || "(no signature)";
+        const signatureAfter = attempt.signatureAfter ? ` -> ${attempt.signatureAfter}` : "";
+        lines.push(`- Attempt ${attempt.attempt} (${status}, ${when}): ${signatureBefore}${signatureAfter}`);
+
+        if (attempt.headShaBefore || attempt.headShaAfter) {
+          const before = attempt.headShaBefore ? attempt.headShaBefore.slice(0, 7) : "?";
+          const after = attempt.headShaAfter ? attempt.headShaAfter.slice(0, 7) : "?";
+          lines.push(`  - head: ${before} -> ${after}`);
+        }
+
+        if (typeof attempt.backoffMs === "number" && Number.isFinite(attempt.backoffMs) && attempt.backoffMs > 0) {
+          lines.push(`  - backoff: ${Math.round(attempt.backoffMs / 1000)}s`);
+        }
+
         if (attempt.runUrls && attempt.runUrls.length > 0) {
           lines.push(...attempt.runUrls.map((url) => `  - ${url}`));
         }
@@ -4142,17 +4250,6 @@ ${guidance}`
     );
 
     return lines.join("\n");
-  }
-
-  private async writeCiDebugEscalationComment(params: {
-    issueNumber: number;
-    body: string;
-  }): Promise<void> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    await this.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments`, {
-      method: "POST",
-      body: { body: params.body },
-    });
   }
 
   private async runCiDebugRecovery(params: {
@@ -4208,78 +4305,22 @@ ${guidance}`
     });
     const existingState = commentMatch.state ?? ({ version: 1 } satisfies CiDebugCommentState);
     const attempts = [...(existingState.attempts ?? [])];
-    const lastAttempt = attempts[attempts.length - 1];
-    const repeatedFailure =
-      signature !== "none" && existingState.lastSignature === signature && lastAttempt?.status === "failed";
-
-    if (repeatedFailure || attempts.length >= maxAttempts) {
-      const reason = repeatedFailure
-        ? `CI failed repeatedly with identical failures; stopping remediation for ${params.prUrl}`
-        : `Required checks not passing after ${maxAttempts} attempt(s); refusing to merge ${params.prUrl}`;
-
-      const finalState: CiDebugCommentState = {
-        version: 1,
-        attempts,
-        lastSignature: signature,
-      };
-
-      const lines = this.buildCiDebugCommentLines({
+    if (attempts.length >= maxAttempts) {
+      const reason = `Required checks not passing after ${maxAttempts} attempt(s); refusing to merge ${params.prUrl}`;
+      return this.escalateCiDebugRecovery({
+        task: params.task,
+        issueNumber: Number(params.issueNumber),
+        issueRef,
         prUrl: params.prUrl,
         baseRefName,
         headRefName,
         summary,
         timedOut: params.timedOut,
-        attemptCount: attempts.length,
-        maxAttempts,
-      });
-      await this.upsertCiDebugComment({ issueNumber: Number(params.issueNumber), lines, state: finalState });
-
-      await this.clearCiDebugLabels(issueRef);
-
-      const escalationBody = this.buildCiDebugEscalationSummary({
-        prUrl: params.prUrl,
-        summary,
         attempts,
+        signature,
+        maxAttempts,
         reason,
       });
-      await this.writeCiDebugEscalationComment({ issueNumber: Number(params.issueNumber), body: escalationBody });
-
-      const wasEscalated = params.task.status === "escalated";
-      const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
-      if (escalated) {
-        applyTaskPatch(params.task, "escalated", {});
-      }
-      await this.writeEscalationWriteback(params.task, { reason, escalationType: "blocked" });
-      await this.notify.notifyEscalation({
-        taskName: params.task.name,
-        taskFileName: params.task._name,
-        taskPath: params.task._path,
-        issue: params.task.issue,
-        repo: this.repo,
-        sessionId: params.task["session-id"]?.trim() || undefined,
-        reason,
-        escalationType: "blocked",
-        planOutput: escalationBody,
-      });
-
-      if (escalated && !wasEscalated) {
-        await this.recordEscalatedRunNote(params.task, {
-          reason,
-          sessionId: params.task["session-id"]?.trim(),
-          details: escalationBody,
-        });
-      }
-
-      return {
-        status: "escalated",
-        run: {
-          taskName: params.task.name,
-          repo: this.repo,
-          outcome: "escalated",
-          sessionId: params.task["session-id"]?.trim(),
-          escalationReason: reason,
-        },
-      };
     }
 
     const nowMs = Date.now();
@@ -4303,6 +4344,7 @@ ${guidance}`
     const attempt: CiDebugAttempt = {
       attempt: attemptNumber,
       signature,
+      headShaBefore: headSha,
       startedAt: new Date().toISOString(),
       status: "running",
       runUrls: this.collectFailureRunUrls(summary),
@@ -4398,6 +4440,9 @@ ${guidance}`
       const prStatus = await this.getPullRequestChecks(params.prUrl);
       summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
       headSha = prStatus.headSha;
+
+      attempt.headShaAfter = headSha;
+      attempt.signatureAfter = this.formatCiDebugSignature(summary, false);
     } catch (error: any) {
       const reason = `Failed to re-check CI status after CI-debug run: ${this.formatGhError(error)}`;
       console.warn(`[ralph:worker:${this.repo}] ${reason}`);
@@ -4422,13 +4467,26 @@ ${guidance}`
       };
     }
 
+    const signatureAfter = attempt.signatureAfter ?? this.formatCiDebugSignature(summary, false);
+
     attempt.status = summary.status === "success" ? "succeeded" : "failed";
     attempt.completedAt = completedAt;
 
+    const noProgress =
+      attempt.status === "failed" &&
+      Boolean(attempt.headShaBefore) &&
+      Boolean(attempt.headShaAfter) &&
+      attempt.headShaBefore === attempt.headShaAfter;
+
+    if (!noProgress && attempt.status === "failed" && attemptNumber < maxAttempts) {
+      attempt.backoffMs = this.computeCiRemediationBackoffMs(attemptNumber);
+    }
+
+    const finalAttempts = [...attempts, attempt];
     const finalState: CiDebugCommentState = {
       version: 1,
-      attempts: [...attempts, attempt],
-      lastSignature: this.formatCiDebugSignature(summary, false),
+      attempts: finalAttempts,
+      lastSignature: signatureAfter,
     };
     const finalLines = this.buildCiDebugCommentLines({
       prUrl: params.prUrl,
@@ -4452,6 +4510,46 @@ ${guidance}`
         headSha,
         summary,
       };
+    }
+
+    if (noProgress) {
+      const reason = `CI remediation made no progress (head SHA unchanged); stopping remediation for ${params.prUrl}`;
+      return this.escalateCiDebugRecovery({
+        task: params.task,
+        issueNumber: Number(params.issueNumber),
+        issueRef,
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        summary,
+        timedOut: false,
+        attempts: finalAttempts,
+        signature: signatureAfter,
+        maxAttempts,
+        reason,
+      });
+    }
+
+    if (attemptNumber >= maxAttempts) {
+      const reason = `Required checks not passing after ${maxAttempts} attempt(s); refusing to merge ${params.prUrl}`;
+      return this.escalateCiDebugRecovery({
+        task: params.task,
+        issueNumber: Number(params.issueNumber),
+        issueRef,
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        summary,
+        timedOut: false,
+        attempts: finalAttempts,
+        signature: signatureAfter,
+        maxAttempts,
+        reason,
+      });
+    }
+
+    if (typeof attempt.backoffMs === "number" && Number.isFinite(attempt.backoffMs) && attempt.backoffMs > 0) {
+      await this.sleepMs(attempt.backoffMs);
     }
 
     return this.runCiDebugRecovery({
@@ -4478,6 +4576,12 @@ ${guidance}`
     const { task, issueNumber, taskRepoPath, cacheKey, botBranch, issueMeta, startTime, opencodeXdg, opencodeSessionOptions } = params;
 
     if (!this.isGitHubQueueTask(task)) return null;
+
+    // Escalated issues are explicitly waiting on humans; do not attempt autonomous CI remediation.
+    const issueLabels = issueMeta.labels ?? [];
+    if (task.status === "escalated" || issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_ESCALATED)) {
+      return null;
+    }
 
     let existingPr: ResolvedIssuePr;
     try {
