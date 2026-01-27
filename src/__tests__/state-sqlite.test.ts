@@ -446,9 +446,31 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     }
 
     const state = getRalphRunGateState(runId);
-    expect(state.artifacts).toHaveLength(20);
-    expect(state.artifacts[0]?.content).toBe("artifact-5");
+    expect(state.artifacts).toHaveLength(5);
+    expect(state.artifacts[0]?.content).toBe("artifact-20");
     expect(state.artifacts[state.artifacts.length - 1]?.content).toBe("artifact-24");
+  });
+
+  test("initializes schema under concurrent startup", async () => {
+    const dbPath = getRalphStateDbPath();
+    const lockScript = `const { Database } = require("bun:sqlite");
+const db = new Database(${JSON.stringify(dbPath)});
+db.exec("PRAGMA journal_mode = WAL;");
+db.exec("BEGIN IMMEDIATE;");
+setTimeout(() => { db.exec("COMMIT;"); db.close(); }, 200);`;
+
+    const lockProcess = Bun.spawn({
+      cmd: ["bun", "-e", lockScript],
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    initStateDb();
+    closeStateDbForTests();
+
+    const exitCode = await lockProcess.exited;
+    expect(exitCode).toBe(0);
   });
 
   beforeEach(async () => {

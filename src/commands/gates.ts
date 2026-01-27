@@ -1,4 +1,9 @@
-import { getLatestRunGateStateForIssue, initStateDb, RalphRunGateState } from "../state";
+import {
+  getLatestRunGateStateForIssue,
+  getStateSchemaVersion,
+  initStateDb,
+  RalphRunGateState,
+} from "../state";
 
 const GATES_JSON_SCHEMA_VERSION = 1;
 
@@ -7,7 +12,8 @@ export function buildGateJsonPayload(params: {
   issueNumber: number;
   state: RalphRunGateState | null;
 }): {
-  schemaVersion: number;
+  schema_version: number;
+  state_schema_version: number;
   repo: string;
   issueNumber: number;
   runId: string | null;
@@ -16,7 +22,8 @@ export function buildGateJsonPayload(params: {
 } {
   const runId = params.state?.results[0]?.runId ?? null;
   return {
-    schemaVersion: GATES_JSON_SCHEMA_VERSION,
+    schema_version: GATES_JSON_SCHEMA_VERSION,
+    state_schema_version: getStateSchemaVersion(),
     repo: params.repo,
     issueNumber: params.issueNumber,
     runId,

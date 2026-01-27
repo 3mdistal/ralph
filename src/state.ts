@@ -32,10 +32,14 @@ const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_exce
 
 const ARTIFACT_MAX_LINES = 200;
 const ARTIFACT_MAX_CHARS = 20_000;
-const ARTIFACTS_MAX_PER_GATE_KIND = 20;
+const ARTIFACTS_MAX_PER_GATE_KIND = 5;
 const DB_BUSY_TIMEOUT_MS = 5_000;
 
 let db: Database | null = null;
+
+export function getStateSchemaVersion(): number {
+  return SCHEMA_VERSION;
+}
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -1097,27 +1101,29 @@ export function ensureRalphRunGateRows(params: { runId: string; at?: string }): 
   const at = params.at ?? nowIso();
   const meta = getRunMeta(params.runId);
 
-  for (const gate of GATE_NAMES) {
-    database
-      .query(
-        `INSERT INTO ralph_run_gate_results(
-           run_id, gate, status, repo_id, issue_number, task_path, created_at, updated_at
-         ) VALUES (
-           $run_id, $gate, $status, $repo_id, $issue_number, $task_path, $created_at, $updated_at
-         )
-         ON CONFLICT(run_id, gate) DO NOTHING`
-      )
-      .run({
-        $run_id: params.runId,
-        $gate: gate,
-        $status: "pending",
-        $repo_id: meta.repoId,
-        $issue_number: meta.issueNumber,
-        $task_path: meta.taskPath,
-        $created_at: at,
-        $updated_at: at,
-      });
-  }
+  database.transaction(() => {
+    for (const gate of GATE_NAMES) {
+      database
+        .query(
+          `INSERT INTO ralph_run_gate_results(
+             run_id, gate, status, repo_id, issue_number, task_path, created_at, updated_at
+           ) VALUES (
+             $run_id, $gate, $status, $repo_id, $issue_number, $task_path, $created_at, $updated_at
+           )
+           ON CONFLICT(run_id, gate) DO NOTHING`
+        )
+        .run({
+          $run_id: params.runId,
+          $gate: gate,
+          $status: "pending",
+          $repo_id: meta.repoId,
+          $issue_number: meta.issueNumber,
+          $task_path: meta.taskPath,
+          $created_at: at,
+          $updated_at: at,
+        });
+    }
+  })();
 }
 
 export function upsertRalphRunGateResult(params: {
@@ -1136,82 +1142,38 @@ export function upsertRalphRunGateResult(params: {
   const meta = getRunMeta(params.runId);
   const gate = assertGateName(params.gate);
 
-  const existing = database
-    .query(
-      `SELECT status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at
-       FROM ralph_run_gate_results
-       WHERE run_id = $run_id AND gate = $gate`
-    )
-    .get({ $run_id: params.runId, $gate: gate }) as
-    | {
-        status?: string;
-        command?: string | null;
-        skip_reason?: string | null;
-        url?: string | null;
-        pr_number?: number | null;
-        pr_url?: string | null;
-        repo_id?: number;
-        issue_number?: number | null;
-        task_path?: string | null;
-        created_at?: string;
-      }
-    | undefined;
-
   if (params.status === null) {
     throw new Error("Gate status cannot be null");
   }
 
-  const status = params.status
-    ? assertGateStatus(params.status)
-    : existing?.status
-      ? assertGateStatus(existing.status)
-      : "pending";
+  const statusSet = params.status !== undefined;
+  const statusValue = statusSet ? assertGateStatus(params.status as GateStatus) : null;
+  const statusInsert = statusSet ? statusValue : "pending";
 
   const commandPatch = sanitizeOptionalText(params.command, 1000);
   const skipReasonPatch = sanitizeOptionalText(params.skipReason, 400);
   const urlPatch = sanitizeOptionalText(params.url, 500);
   const prUrlPatch = sanitizeOptionalText(params.prUrl, 500);
 
-  const command = commandPatch === undefined ? existing?.command ?? null : commandPatch;
-  const skipReason = skipReasonPatch === undefined ? existing?.skip_reason ?? null : skipReasonPatch;
-  const url = urlPatch === undefined ? existing?.url ?? null : urlPatch;
-  const prUrl = prUrlPatch === undefined ? existing?.pr_url ?? null : prUrlPatch;
+  const commandSet = commandPatch !== undefined;
+  const skipReasonSet = skipReasonPatch !== undefined;
+  const urlSet = urlPatch !== undefined;
+  const prUrlSet = prUrlPatch !== undefined;
 
-  const prNumber =
+  const commandValue = commandSet ? commandPatch : null;
+  const skipReasonValue = skipReasonSet ? skipReasonPatch : null;
+  const urlValue = urlSet ? urlPatch : null;
+  const prUrlValue = prUrlSet ? prUrlPatch : null;
+
+  const prNumberSet = params.prNumber !== undefined;
+  const prNumberValue =
     params.prNumber === undefined
-      ? existing?.pr_number ?? null
+      ? null
       : params.prNumber === null
         ? null
         : Number.isFinite(params.prNumber)
           ? params.prNumber
           : null;
-
-  if (existing) {
-    database
-      .query(
-        `UPDATE ralph_run_gate_results
-         SET status = $status,
-             command = $command,
-             skip_reason = $skip_reason,
-             url = $url,
-             pr_number = $pr_number,
-             pr_url = $pr_url,
-             updated_at = $updated_at
-         WHERE run_id = $run_id AND gate = $gate`
-      )
-      .run({
-        $status: status,
-        $command: command,
-        $skip_reason: skipReason,
-        $url: url,
-        $pr_number: prNumber,
-        $pr_url: prUrl,
-        $updated_at: at,
-        $run_id: params.runId,
-        $gate: gate,
-      });
-    return;
-  }
 
   database
     .query(
@@ -1219,22 +1181,42 @@ export function upsertRalphRunGateResult(params: {
          run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
        ) VALUES (
          $run_id, $gate, $status, $command, $skip_reason, $url, $pr_number, $pr_url, $repo_id, $issue_number, $task_path, $created_at, $updated_at
-       )`
+       )
+       ON CONFLICT(run_id, gate) DO UPDATE SET
+         status = CASE WHEN $status_set = 1 THEN $status_value ELSE ralph_run_gate_results.status END,
+         command = CASE WHEN $command_set = 1 THEN $command_value ELSE ralph_run_gate_results.command END,
+         skip_reason = CASE WHEN $skip_reason_set = 1 THEN $skip_reason_value ELSE ralph_run_gate_results.skip_reason END,
+         url = CASE WHEN $url_set = 1 THEN $url_value ELSE ralph_run_gate_results.url END,
+         pr_number = CASE WHEN $pr_number_set = 1 THEN $pr_number_value ELSE ralph_run_gate_results.pr_number END,
+         pr_url = CASE WHEN $pr_url_set = 1 THEN $pr_url_value ELSE ralph_run_gate_results.pr_url END,
+         updated_at = $updated_at`
     )
     .run({
       $run_id: params.runId,
       $gate: gate,
-      $status: status,
-      $command: command,
-      $skip_reason: skipReason,
-      $url: url,
-      $pr_number: prNumber,
-      $pr_url: prUrl,
+      $status: statusInsert,
+      $command: commandValue,
+      $skip_reason: skipReasonValue,
+      $url: urlValue,
+      $pr_number: prNumberValue,
+      $pr_url: prUrlValue,
       $repo_id: meta.repoId,
       $issue_number: meta.issueNumber,
       $task_path: meta.taskPath,
       $created_at: at,
       $updated_at: at,
+      $status_set: statusSet ? 1 : 0,
+      $status_value: statusValue,
+      $command_set: commandSet ? 1 : 0,
+      $command_value: commandValue,
+      $skip_reason_set: skipReasonSet ? 1 : 0,
+      $skip_reason_value: skipReasonValue,
+      $url_set: urlSet ? 1 : 0,
+      $url_value: urlValue,
+      $pr_number_set: prNumberSet ? 1 : 0,
+      $pr_number_value: prNumberValue,
+      $pr_url_set: prUrlSet ? 1 : 0,
+      $pr_url_value: prUrlValue,
     });
 }
 
@@ -1251,43 +1233,45 @@ export function recordRalphRunGateArtifact(params: {
   const kind = assertGateArtifactKind(params.kind);
   const bounded = redactAndBoundArtifact(params.content);
 
-  database
-    .query(
-      `INSERT INTO ralph_run_gate_artifacts(
-         run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
-       ) VALUES (
-         $run_id, $gate, $kind, $content, $truncated, $original_chars, $original_lines, $created_at, $updated_at
-       )`
-    )
-    .run({
-      $run_id: params.runId,
-      $gate: gate,
-      $kind: kind,
-      $content: bounded.content,
-      $truncated: bounded.truncated ? 1 : 0,
-      $original_chars: bounded.originalChars,
-      $original_lines: bounded.originalLines,
-      $created_at: at,
-      $updated_at: at,
-    });
-
-  database
-    .query(
-      `DELETE FROM ralph_run_gate_artifacts
-       WHERE run_id = $run_id AND gate = $gate AND kind = $kind
-         AND id NOT IN (
-           SELECT id FROM ralph_run_gate_artifacts
-           WHERE run_id = $run_id AND gate = $gate AND kind = $kind
-           ORDER BY id DESC
-           LIMIT $limit
+  database.transaction(() => {
+    database
+      .query(
+        `INSERT INTO ralph_run_gate_artifacts(
+           run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+         ) VALUES (
+           $run_id, $gate, $kind, $content, $truncated, $original_chars, $original_lines, $created_at, $updated_at
          )`
-    )
-    .run({
-      $run_id: params.runId,
-      $gate: gate,
-      $kind: kind,
-      $limit: ARTIFACTS_MAX_PER_GATE_KIND,
-    });
+      )
+      .run({
+        $run_id: params.runId,
+        $gate: gate,
+        $kind: kind,
+        $content: bounded.content,
+        $truncated: bounded.truncated ? 1 : 0,
+        $original_chars: bounded.originalChars,
+        $original_lines: bounded.originalLines,
+        $created_at: at,
+        $updated_at: at,
+      });
+
+    database
+      .query(
+        `DELETE FROM ralph_run_gate_artifacts
+         WHERE run_id = $run_id AND gate = $gate AND kind = $kind
+           AND id NOT IN (
+             SELECT id FROM ralph_run_gate_artifacts
+             WHERE run_id = $run_id AND gate = $gate AND kind = $kind
+             ORDER BY id DESC
+             LIMIT $limit
+           )`
+      )
+      .run({
+        $run_id: params.runId,
+        $gate: gate,
+        $kind: kind,
+        $limit: ARTIFACTS_MAX_PER_GATE_KIND,
+      });
+  })();
 }
 
 export function getRalphRunGateState(runId: string): RalphRunGateState {

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 
 import { buildGateJsonPayload } from "../commands/gates";
+import { getStateSchemaVersion } from "../state";
 
 test("buildGateJsonPayload includes schema version and state", () => {
   const payload = buildGateJsonPayload({
@@ -41,7 +42,8 @@ test("buildGateJsonPayload includes schema version and state", () => {
     },
   });
 
-  expect(payload.schemaVersion).toBe(1);
+  expect(payload.schema_version).toBe(1);
+  expect(payload.state_schema_version).toBe(getStateSchemaVersion());
   expect(payload.repo).toBe("3mdistal/ralph");
   expect(payload.issueNumber).toBe(232);
   expect(payload.runId).toBe("run-232");
@@ -52,7 +54,8 @@ test("buildGateJsonPayload includes schema version and state", () => {
 test("buildGateJsonPayload handles missing state", () => {
   const payload = buildGateJsonPayload({ repo: "3mdistal/ralph", issueNumber: 232, state: null });
 
-  expect(payload.schemaVersion).toBe(1);
+  expect(payload.schema_version).toBe(1);
+  expect(payload.state_schema_version).toBe(getStateSchemaVersion());
   expect(payload.runId).toBeNull();
   expect(payload.results).toHaveLength(0);
   expect(payload.artifacts).toHaveLength(0);
