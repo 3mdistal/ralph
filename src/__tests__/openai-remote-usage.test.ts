@@ -63,6 +63,55 @@ describe("openai remote usage", () => {
     }
   });
 
+  test("treats integer used_percent as 0..100 percent (not 0..1 fraction)", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ralph-openai-remote-usage-"));
+    const authPath = join(root, "opencode", "auth.json");
+    const now = Date.parse("2026-01-24T12:00:00Z");
+
+    const priorFetch = globalThis.fetch;
+    __clearRemoteOpenaiUsageCacheForTests();
+
+    try {
+      await writeJson(authPath, {
+        openai: {
+          type: "oauth",
+          access: "tok_access",
+          refresh: "tok_refresh",
+          expires: now + 30 * 60_000,
+        },
+      });
+
+      const fetchMock = mock(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/backend-api/wham/usage")) {
+          return new Response(
+            JSON.stringify({
+              plan_type: "pro",
+              rate_limit: {
+                primary_window: { used_percent: 1, reset_at: 1769307600 },
+                secondary_window: { used_percent: 65, reset_at: 1769817600 },
+              },
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response("unexpected", { status: 500 });
+      });
+
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const usage = await getRemoteOpenaiUsage({ authFilePath: authPath, now, skipCache: true });
+      // 1% => 0.01 (not 1.0)
+      expect(usage.rolling5h.usedPct).toBeCloseTo(0.01, 6);
+      // 65% => 0.65
+      expect(usage.weekly.usedPct).toBeCloseTo(0.65, 6);
+    } finally {
+      globalThis.fetch = priorFetch;
+      await rm(root, { recursive: true, force: true });
+      __clearRemoteOpenaiUsageCacheForTests();
+    }
+  });
+
   test("fetches usage and normalizes usedPct/resetAt", async () => {
     const root = await mkdtemp(join(tmpdir(), "ralph-openai-remote-usage-"));
     const authPath = join(root, "opencode", "auth.json");

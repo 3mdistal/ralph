@@ -1,47 +1,44 @@
 import { splitRepoFullName, type GitHubClient } from "./client";
 
-export type CiDebugAttempt = {
+export type MergeConflictAttempt = {
   attempt: number;
   signature: string;
-  signatureAfter?: string;
   startedAt: string;
   completedAt?: string;
   status?: "running" | "failed" | "succeeded";
-  runUrls?: string[];
-  headShaBefore?: string;
-  headShaAfter?: string;
-  backoffMs?: number;
+  conflictCount?: number;
+  conflictPaths?: string[];
 };
 
-export type CiDebugLease = {
+export type MergeConflictLease = {
   holder: string;
   expiresAt: string;
 };
 
-export type CiDebugCommentState = {
+export type MergeConflictCommentState = {
   version: 1;
-  lease?: CiDebugLease;
-  attempts?: CiDebugAttempt[];
+  lease?: MergeConflictLease;
+  attempts?: MergeConflictAttempt[];
   lastSignature?: string;
 };
 
-export type CiDebugCommentRecord = {
+export type MergeConflictCommentRecord = {
   id: number;
   body: string;
   updatedAt?: string;
 };
 
-export type CiDebugCommentMatch = {
+export type MergeConflictCommentMatch = {
   markerId: string;
   marker: string;
-  comment: CiDebugCommentRecord | null;
-  state: CiDebugCommentState | null;
+  comment: MergeConflictCommentRecord | null;
+  state: MergeConflictCommentState | null;
 };
 
 const FNV_OFFSET = 2166136261;
 const FNV_PRIME = 16777619;
-const CI_DEBUG_MARKER_REGEX = /<!--\s*ralph-ci-debug:id=([a-z0-9]+)\s*-->/i;
-const CI_DEBUG_STATE_REGEX = /<!--\s*ralph-ci-debug:state=([^>]+)\s*-->/i;
+const MERGE_CONFLICT_MARKER_REGEX = /<!--\s*ralph-merge-conflict:id=([a-z0-9]+)\s*-->/i;
+const MERGE_CONFLICT_STATE_REGEX = /<!--\s*ralph-merge-conflict:state=([^>]+)\s*-->/i;
 
 function hashFNV1a(input: string): string {
   let hash = FNV_OFFSET;
@@ -57,20 +54,20 @@ function buildMarkerId(params: { repo: string; issueNumber: number }): string {
   return `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
 }
 
-function buildCiDebugMarker(params: { repo: string; issueNumber: number }): { markerId: string; marker: string } {
+function buildMergeConflictMarker(params: { repo: string; issueNumber: number }): { markerId: string; marker: string } {
   const markerId = buildMarkerId(params);
-  return { markerId, marker: `<!-- ralph-ci-debug:id=${markerId} -->` };
+  return { markerId, marker: `<!-- ralph-merge-conflict:id=${markerId} -->` };
 }
 
-function serializeCiDebugState(state: CiDebugCommentState): string {
+function serializeMergeConflictState(state: MergeConflictCommentState): string {
   return JSON.stringify(state);
 }
 
-export function parseCiDebugState(body: string): CiDebugCommentState | null {
-  const match = body.match(CI_DEBUG_STATE_REGEX);
+export function parseMergeConflictState(body: string): MergeConflictCommentState | null {
+  const match = body.match(MERGE_CONFLICT_STATE_REGEX);
   if (!match?.[1]) return null;
   try {
-    const parsed = JSON.parse(match[1]) as CiDebugCommentState;
+    const parsed = JSON.parse(match[1]) as MergeConflictCommentState;
     if (!parsed || parsed.version !== 1) return null;
     return parsed;
   } catch {
@@ -78,23 +75,23 @@ export function parseCiDebugState(body: string): CiDebugCommentState | null {
   }
 }
 
-export function buildCiDebugCommentBody(params: {
+export function buildMergeConflictCommentBody(params: {
   marker: string;
-  state: CiDebugCommentState;
+  state: MergeConflictCommentState;
   lines: string[];
 }): string {
-  const stateLine = `<!-- ralph-ci-debug:state=${serializeCiDebugState(params.state)} -->`;
+  const stateLine = `<!-- ralph-merge-conflict:state=${serializeMergeConflictState(params.state)} -->`;
   return [params.marker, stateLine, "", ...params.lines].join("\n");
 }
 
-export async function findCiDebugComment(params: {
+export async function findMergeConflictComment(params: {
   github: GitHubClient;
   repo: string;
   issueNumber: number;
   limit?: number;
-}): Promise<CiDebugCommentMatch> {
+}): Promise<MergeConflictCommentMatch> {
   const { owner, name } = splitRepoFullName(params.repo);
-  const { markerId, marker } = buildCiDebugMarker({ repo: params.repo, issueNumber: params.issueNumber });
+  const { markerId, marker } = buildMergeConflictMarker({ repo: params.repo, issueNumber: params.issueNumber });
   const limit = Math.min(Math.max(1, params.limit ?? 50), 100);
 
   const response = await params.github.request<
@@ -104,7 +101,7 @@ export async function findCiDebugComment(params: {
 
   for (const comment of comments) {
     const body = comment?.body ?? "";
-    const match = body.match(CI_DEBUG_MARKER_REGEX);
+    const match = body.match(MERGE_CONFLICT_MARKER_REGEX);
     const found = match?.[1] ?? "";
     if (!found) continue;
     if (found.toLowerCase() !== markerId.toLowerCase() && !body.includes(marker)) continue;
@@ -118,14 +115,14 @@ export async function findCiDebugComment(params: {
         body,
         updatedAt: comment?.updated_at ?? undefined,
       },
-      state: parseCiDebugState(body),
+      state: parseMergeConflictState(body),
     };
   }
 
   return { markerId, marker, comment: null, state: null };
 }
 
-export async function createCiDebugComment(params: {
+export async function createMergeConflictComment(params: {
   github: GitHubClient;
   repo: string;
   issueNumber: number;
@@ -138,7 +135,7 @@ export async function createCiDebugComment(params: {
   });
 }
 
-export async function updateCiDebugComment(params: {
+export async function updateMergeConflictComment(params: {
   github: GitHubClient;
   repo: string;
   commentId: number;

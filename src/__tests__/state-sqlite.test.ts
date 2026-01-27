@@ -15,11 +15,13 @@ import {
   getLatestRunGateStateForIssue,
   getLatestRunGateStateForPr,
   getRalphRunGateState,
+  getActiveRalphRunId,
   getOrCreateRollupBatch,
   initStateDb,
   listIssuesWithAllLabels,
   listOpenPrCandidatesForIssue,
   listOpenRollupBatches,
+  listRalphRunSessionIds,
   listRollupBatchEntries,
   markRollupBatchRolledUp,
   recordRalphRunGateArtifact,
@@ -542,6 +544,52 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     const latest = getLatestRunGateStateForPr({ repo: "3mdistal/ralph", prNumber: 236 });
     expect(latest?.results[0]?.runId).toBe(runId);
+  });
+
+  test("selects active run and lists session ids", () => {
+    initStateDb();
+
+    const run1 = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#201",
+      taskPath: "github:3mdistal/ralph#201",
+      attemptKind: "process",
+      startedAt: "2026-01-20T10:01:00.000Z",
+    });
+
+    const run2 = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#201",
+      taskPath: "github:3mdistal/ralph#201",
+      attemptKind: "process",
+      startedAt: "2026-01-20T10:02:00.000Z",
+    });
+
+    completeRalphRun({
+      runId: run2,
+      outcome: "success",
+      completedAt: "2026-01-20T10:03:00.000Z",
+    });
+
+    recordRalphRunSessionUse({
+      runId: run1,
+      sessionId: "ses_new_a",
+      stepTitle: "plan",
+      at: "2026-01-20T10:01:30.000Z",
+    });
+
+    recordRalphRunSessionUse({
+      runId: run1,
+      sessionId: "ses_new_b",
+      stepTitle: "build",
+      at: "2026-01-20T10:01:40.000Z",
+    });
+
+    const active = getActiveRalphRunId({ repo: "3mdistal/ralph", issueNumber: 201 });
+    expect(active).toBe(run1);
+
+    const sessions = listRalphRunSessionIds(run1);
+    expect(sessions).toEqual(["ses_new_a", "ses_new_b"]);
   });
 
   beforeEach(async () => {
