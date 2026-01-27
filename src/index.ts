@@ -74,6 +74,7 @@ import {
 import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 import { computeDaemonGate } from "./daemon-gate";
 import { runStatusCommand } from "./commands/status";
+import { runWorktreesCommand } from "./commands/worktrees";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 import { buildProvisionPlan } from "./sandbox/provisioning-core";
@@ -1514,6 +1515,7 @@ function printGlobalHelp(): void {
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
+      "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "",
       "Options:",
@@ -1637,6 +1639,17 @@ function printCommandHelp(command: string): void {
           "  ralph rollup <repo>",
           "",
           "Rollup helpers. (Currently prints guidance; rollup is typically done via gh.)",
+        ].join("\n")
+      );
+      return;
+
+    case "worktrees":
+      console.log(
+        [
+          "Usage:",
+          "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
+          "",
+          "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
         ].join("\n")
       );
       return;
@@ -2185,6 +2198,16 @@ if (args[0] === "rollup") {
   // Note: This won't work well since we don't persist merge counts
   // For now, just create a PR from current bot/integration state
   console.log(`Force rollup not yet implemented. Use 'gh pr create --base main --head bot/integration' manually.`);
+  process.exit(0);
+}
+
+if (args[0] === "worktrees") {
+  if (hasHelpFlag) {
+    printCommandHelp("worktrees");
+    process.exit(0);
+  }
+
+  await runWorktreesCommand(args);
   process.exit(0);
 }
 
