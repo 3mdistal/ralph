@@ -510,6 +510,14 @@ ralph status --json | jq '{mode, activeProfile, throttle: .throttle.state, pendi
 
 Shows active profile, throttle state, pending escalations, and per-task profile assignments.
 
+### Checking gate state
+
+```bash
+ralph gates 3mdistal/ralph 232 --json | jq '.gates'
+```
+
+Shows the latest persisted deterministic gate state and any bounded artifacts for the issue.
+
 ### Notes
 
 - Paths must be absolute (no `~` expansion).

@@ -84,7 +84,9 @@ import { isSafeSessionId } from "./session-id";
 import {
   completeRalphRun,
   createRalphRun,
+  ensureRalphRunGateRows,
   getIdempotencyPayload,
+  recordRalphRunGateArtifact,
   upsertIdempotencyKey,
   recordIssueSnapshot,
   recordPrSnapshot,
@@ -94,6 +96,7 @@ import {
   type PrState,
   type RalphRunAttemptKind,
   type RalphRunDetails,
+  upsertRalphRunGateResult,
 } from "./state";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
@@ -866,6 +869,7 @@ export class RepoWorker {
   private ignoredBodyDepsLogLimiter = new LogLimiter({ maxKeys: IGNORED_BODY_DEPS_LOG_MAX_KEYS });
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
+  private activeRunId: string | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -948,6 +952,7 @@ export class RepoWorker {
     run: () => Promise<AgentRun>
   ): Promise<AgentRun> {
     let runId: string | null = null;
+    const previousRunId = this.activeRunId;
 
     try {
       runId = createRalphRun({
@@ -964,6 +969,15 @@ export class RepoWorker {
 
     if (!runId) {
       return await run();
+    }
+
+    this.activeRunId = runId;
+    try {
+      ensureRalphRunGateRows({ runId });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to initialize gate rows for ${task.name}: ${error?.message ?? String(error)}`
+      );
     }
 
     const recordingBase = createRunRecordingSessionAdapter({
@@ -991,6 +1005,7 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] Failed to complete run record for ${task.name}: ${error?.message ?? String(error)}`
         );
       }
+      this.activeRunId = previousRunId;
     }
   }
 
@@ -2888,10 +2903,12 @@ ${guidance}`
       last = { headSha, mergeStateStatus, baseRefName, summary, checks };
 
       if (mergeStateStatus === "DIRTY") {
+        this.recordCiGateSummary(prUrl, summary);
         return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false, stopReason: "merge-conflict" };
       }
 
       if (summary.status === "success" || summary.status === "failure") {
+        this.recordCiGateSummary(prUrl, summary);
         return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
       }
 
@@ -2920,16 +2937,19 @@ ${guidance}`
     }
 
     if (last) {
+      this.recordCiGateSummary(prUrl, last.summary);
       return { ...last, timedOut: true };
     }
 
     // Should be unreachable, but keep types happy.
     const fallback = await this.getPullRequestChecks(prUrl);
+    const fallbackSummary = summarizeRequiredChecks(fallback.checks, requiredChecks);
+    this.recordCiGateSummary(prUrl, fallbackSummary);
     return {
       headSha: fallback.headSha,
       mergeStateStatus: fallback.mergeStateStatus,
       baseRefName: fallback.baseRefName,
-      summary: summarizeRequiredChecks(fallback.checks, requiredChecks),
+      summary: fallbackSummary,
       checks: fallback.checks,
       timedOut: true,
     };
@@ -3009,6 +3029,50 @@ ${guidance}`
     return [...head, "...", ...tail].join("\n");
   }
 
+  private recordCiGateSummary(prUrl: string, summary: RequiredChecksSummary): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+    const status = summary.status === "success" ? "pass" : summary.status === "failure" ? "fail" : "pending";
+    const prNumber = extractPullRequestNumber(prUrl);
+    const ciUrl = summary.required.map((check) => check.detailsUrl).find(Boolean) ?? null;
+
+    try {
+      upsertRalphRunGateResult({
+        runId,
+        gate: "ci",
+        status,
+        url: ciUrl,
+        prNumber: prNumber ?? null,
+        prUrl,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist CI gate status for ${prUrl}: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
+  private recordCiFailureArtifacts(logs: FailedCheckLog[]): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    for (const entry of logs) {
+      if (!entry.logExcerpt) continue;
+      try {
+        recordRalphRunGateArtifact({
+          runId,
+          gate: "ci",
+          kind: "failure_excerpt",
+          content: entry.logExcerpt,
+        });
+      } catch (error: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to persist CI gate artifact: ${error?.message ?? String(error)}`
+        );
+      }
+    }
+  }
+
   private async getCheckLog(runId: string): Promise<CheckLogResult> {
     try {
       const result = await ghRead(this.repo)`gh run view ${runId} --repo ${this.repo} --log-failed`.quiet();
@@ -3057,6 +3121,10 @@ ${guidance}`
       }
 
       logs.push({ ...check, ...logResult, runUrl: check.detailsUrl ?? undefined });
+    }
+
+    if (opts.includeLogs) {
+      this.recordCiFailureArtifacts(logs);
     }
 
     return {
@@ -3460,6 +3528,7 @@ ${guidance}`
       baseRefName = prStatus.baseRefName;
       const prState = await this.getPullRequestMergeState(params.prUrl);
       headRefName = prState.headRefName || null;
+      this.recordCiGateSummary(params.prUrl, summary);
     } catch (error: any) {
       const reason = `CI-debug preflight failed for ${params.prUrl}: ${this.formatGhError(error)}`;
       console.warn(`[ralph:worker:${this.repo}] ${reason}`);
@@ -3672,6 +3741,7 @@ ${guidance}`
       const prStatus = await this.getPullRequestChecks(params.prUrl);
       summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
       headSha = prStatus.headSha;
+      this.recordCiGateSummary(params.prUrl, summary);
     } catch (error: any) {
       const reason = `Failed to re-check CI status after CI-debug run: ${this.formatGhError(error)}`;
       console.warn(`[ralph:worker:${this.repo}] ${reason}`);
