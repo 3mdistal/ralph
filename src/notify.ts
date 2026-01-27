@@ -1,11 +1,9 @@
 import { $ } from "bun";
-import crypto from "crypto";
-import { appendFile } from "fs/promises";
-import { isAbsolute, join } from "path";
-import { createAgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
+import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
 import type { TaskPriority } from "./queue/priority";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
+import { appendBwrbNoteBody, buildEscalationPayload, buildIdeaPayload, createBwrbNote } from "./bwrb/artifacts";
 
 const sanitizeNoteTitle = sanitizeNoteName;
 
@@ -91,48 +89,6 @@ function getNotificationPrefix(type: NotificationType): string {
   }
 }
 
-function resolveVaultPath(p: string): string {
-  const vault = getBwrbVaultIfValid();
-  if (!vault) return p;
-  return isAbsolute(p) ? p : join(vault, p);
-}
-
-async function bwrbNewIdea(json: string): Promise<{ success: boolean; path?: string; error?: string }> {
-  const vault = getBwrbVaultForStorage("create notification");
-  if (!vault) {
-    return { success: false, error: "bwrbVault is missing or invalid" };
-  }
-  try {
-    const result = await $`bwrb new idea --json ${json}`.cwd(vault).quiet();
-    return JSON.parse(result.stdout.toString());
-  } catch (e: any) {
-    const stdout = e?.stdout?.toString?.() ?? "";
-    try {
-      return JSON.parse(stdout);
-    } catch {
-      return { success: false, error: e?.message ?? "Unknown error" };
-    }
-  }
-}
-
-async function bwrbNewEscalation(json: string): Promise<{ success: boolean; path?: string; error?: string }> {
-  const vault = getBwrbVaultForStorage("create escalation");
-  if (!vault) {
-    return { success: false, error: "bwrbVault is missing or invalid" };
-  }
-  try {
-    const result = await $`bwrb new agent-escalation --json ${json}`.cwd(vault).quiet();
-    return JSON.parse(result.stdout.toString());
-  } catch (e: any) {
-    const stdout = e?.stdout?.toString?.() ?? "";
-    try {
-      return JSON.parse(stdout);
-    } catch {
-      return { success: false, error: e?.message ?? "Unknown error" };
-    }
-  }
-}
-
 /**
  * Create a notification as a bwrb idea note.
  */
@@ -160,34 +116,35 @@ async function createNotification(
 
   const baseTitle = sanitizeNoteName(`${prefix} ${title}`);
 
-  let output = await bwrbNewIdea(
-    JSON.stringify({
-      name: baseTitle,
-      "creation-date": today,
-      scope: "builder",
-    })
-  );
+  const payload = buildIdeaPayload({
+    name: baseTitle,
+    creationDate: today,
+    scope: "builder",
+  });
 
-  if (!output.success && output.error?.includes("File already exists")) {
-    const suffix = crypto.randomUUID().slice(0, 8);
-    output = await bwrbNewIdea(
-      JSON.stringify({
-        name: `${baseTitle} [${suffix}]`,
-        "creation-date": today,
-        scope: "builder",
-      })
-    );
+  const output = await createBwrbNote({
+    type: "idea",
+    action: "create notification",
+    payload,
+    allowDuplicateSuffix: true,
+  });
+
+  if (!output.ok || !output.path) {
+    const error = output.ok ? "bwrb did not return a note path" : output.error;
+    const log = !output.ok && output.skipped ? console.warn : console.error;
+    log(`[ralph:notify] Failed to create notification: ${error}`);
+    return false;
   }
 
-  if (output.success && output.path) {
-    const notePath = resolveVaultPath(output.path);
-    await appendFile(notePath, noteBody, "utf8");
-    console.log(`[ralph:notify] Created notification: ${baseTitle}`);
-    return true;
+  const bodyResult = await appendBwrbNoteBody({ notePath: output.path, body: noteBody });
+  if (!bodyResult.ok) {
+    const log = bodyResult.skipped ? console.warn : console.error;
+    log(`[ralph:notify] Failed to write notification body: ${bodyResult.error}`);
+    return false;
   }
 
-  console.error(`[ralph:notify] Failed to create notification:`, output.error ?? "Unknown error");
-  return false;
+  console.log(`[ralph:notify] Created notification: ${baseTitle}`);
+  return true;
 }
 
 export interface EscalationContext {
@@ -468,43 +425,34 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
 
   // Create the agent-escalation note
   // Use taskFileName (the actual filename) for wikilinks, not taskName (display name)
-  let output = await bwrbNewEscalation(
-    JSON.stringify({
-      name: noteName,
-      task: `[[${resolvedTaskFileName}]]`,
-      "task-path": resolvedTaskPath,
-      issue: ctx.issue,
-      repo: ctx.repo,
-      "session-id": ctx.sessionId ?? "",
-      "escalation-type": ctx.escalationType,
-      status: "pending",
-      "creation-date": today,
-      scope: "builder",
-    })
-  );
+  const escalationPayload = buildEscalationPayload({
+    name: noteName,
+    task: `[[${resolvedTaskFileName}]]`,
+    taskPath: resolvedTaskPath,
+    issue: ctx.issue,
+    repo: ctx.repo,
+    sessionId: ctx.sessionId ?? "",
+    escalationType: ctx.escalationType,
+    status: "pending",
+    creationDate: today,
+    scope: "builder",
+  });
 
-  // Handle duplicate names
-  if (!output.success && output.error?.includes("File already exists")) {
-    const suffix = crypto.randomUUID().slice(0, 8);
-    output = await bwrbNewEscalation(
-      JSON.stringify({
-        name: `${noteName} [${suffix}]`,
-        task: `[[${resolvedTaskFileName}]]`,
-        "task-path": resolvedTaskPath,
-        issue: ctx.issue,
-        repo: ctx.repo,
-        "session-id": ctx.sessionId ?? "",
-        "escalation-type": ctx.escalationType,
-        status: "pending",
-        "creation-date": today,
-        scope: "builder",
-      })
-    );
-  }
+  const output = await createBwrbNote({
+    type: "agent-escalation",
+    action: "create escalation",
+    payload: escalationPayload,
+    allowDuplicateSuffix: true,
+  });
 
-  if (output.success && output.path) {
-    const notePath = resolveVaultPath(output.path);
-    await appendFile(notePath, noteBody, "utf8");
+  if (output.ok && output.path) {
+    const bodyResult = await appendBwrbNoteBody({ notePath: output.path, body: noteBody });
+    if (!bodyResult.ok) {
+      const log = bodyResult.skipped ? console.warn : console.error;
+      log(`[ralph:notify] Failed to write escalation body: ${bodyResult.error}`);
+      return false;
+    }
+
     console.log(`[ralph:notify] Created escalation: ${noteName}`);
 
     try {
@@ -533,7 +481,9 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     return true;
   }
 
-  console.error(`[ralph:notify] Failed to create escalation:`, output.error ?? "Unknown error");
+  const error = output.ok ? "bwrb did not return a note path" : output.error;
+  const log = !output.ok && output.skipped ? console.warn : console.error;
+  log(`[ralph:notify] Failed to create escalation: ${error}`);
   return false;
 }
 

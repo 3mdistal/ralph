@@ -25,6 +25,13 @@ export type OpencodeSessionTokenTotals = {
   cacheWrite?: number;
 };
 
+type SessionDirStatus = "ok" | "missing" | "unreadable";
+
+export type OpencodeSessionTokenReadResult = {
+  totals: OpencodeSessionTokenTotals;
+  quality: SessionDirStatus;
+};
+
 type TokenAccumulator = {
   input: number;
   output: number;
@@ -97,20 +104,21 @@ function isValidSessionId(value: string): boolean {
   return true;
 }
 
-async function listSessionMessageFiles(sessionDir: string): Promise<string[]> {
-  if (!existsSync(sessionDir)) return [];
+async function listSessionMessageFiles(sessionDir: string): Promise<{ status: SessionDirStatus; files: string[] }> {
+  if (!existsSync(sessionDir)) return { status: "missing", files: [] };
 
   let entries: Array<{ name: string; isFile(): boolean }> = [];
   try {
     entries = await readdir(sessionDir, { withFileTypes: true });
   } catch {
-    return [];
+    return { status: "unreadable", files: [] };
   }
 
   entries.sort((a, b) => a.name.localeCompare(b.name));
-  return entries
+  const files = entries
     .filter((entry) => entry.isFile() && entry.name.startsWith("msg_") && entry.name.endsWith(".json"))
     .map((entry) => join(sessionDir, entry.name));
+  return { status: "ok", files };
 }
 
 export async function readOpencodeSessionTokenTotals(opts: {
@@ -130,7 +138,7 @@ export async function readOpencodeSessionTokenTotals(opts: {
 
   const messagesRootDir = opts.messagesRootDir ?? getDefaultOpencodeMessagesRootDir();
   const sessionDir = join(messagesRootDir, opts.sessionId);
-  const files = await listSessionMessageFiles(sessionDir);
+  const { files } = await listSessionMessageFiles(sessionDir);
 
   for (const path of files) {
     let raw: string;
@@ -151,4 +159,51 @@ export async function readOpencodeSessionTokenTotals(opts: {
   }
 
   return finalizeTokenTotals(acc, includeCache);
+}
+
+export async function readOpencodeSessionTokenTotalsWithQuality(opts: {
+  sessionId: string;
+  messagesRootDir?: string;
+  /** Optional provider filter; if unset, counts all providers. */
+  providerID?: string;
+  includeCache?: boolean;
+}): Promise<OpencodeSessionTokenReadResult> {
+  const includeCache = opts.includeCache === true;
+  const providerID = normalizeProviderID(opts.providerID);
+  const acc = createTokenAccumulator();
+
+  if (!isValidSessionId(opts.sessionId)) {
+    return { totals: finalizeTokenTotals(acc, includeCache), quality: "missing" };
+  }
+
+  const messagesRootDir = opts.messagesRootDir ?? getDefaultOpencodeMessagesRootDir();
+  const sessionDir = join(messagesRootDir, opts.sessionId);
+  const { status, files } = await listSessionMessageFiles(sessionDir);
+  if (status !== "ok") {
+    return { totals: finalizeTokenTotals(acc, includeCache), quality: status };
+  }
+
+  if (files.length === 0) {
+    return { totals: finalizeTokenTotals(acc, includeCache), quality: "missing" };
+  }
+
+  for (const path of files) {
+    let raw: string;
+    try {
+      raw = await readFile(path, "utf8");
+    } catch {
+      continue;
+    }
+
+    let msg: OpencodeMessage;
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      continue;
+    }
+
+    applyMessageTokens(acc, msg, { providerID, includeCache });
+  }
+
+  return { totals: finalizeTokenTotals(acc, includeCache), quality: "ok" };
 }

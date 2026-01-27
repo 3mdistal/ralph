@@ -17,7 +17,7 @@ import {
   getDashboardEventsRetentionDays,
   getOpencodeDefaultProfileName,
   listOpencodeProfileNames,
-  getRepoMaxWorkers,
+  getRepoConcurrencySlots,
   getRepoPath,
   type ControlConfig,
 } from "./config";
@@ -72,11 +72,16 @@ import {
 import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 import { computeDaemonGate } from "./daemon-gate";
 import { runStatusCommand } from "./commands/status";
+import { runWorktreesCommand } from "./commands/worktrees";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
+import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 
 // --- State ---
 
 const workers = new Map<string, RepoWorker>();
+const workersBySlot = new Map<string, RepoWorker>();
+const repoSlotManager = new RepoSlotManager(getRepoConcurrencySlots);
+const repoStartupCleanup = new Set<string>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
@@ -262,7 +267,7 @@ function ensureSemaphores(): void {
 function getRepoSemaphore(repo: string): Semaphore {
   let sem = repoSemaphores.get(repo);
   if (!sem) {
-    sem = new Semaphore(getRepoMaxWorkers(repo));
+    sem = new Semaphore(getRepoConcurrencySlots(repo));
     repoSemaphores.set(repo, sem);
   }
   return sem;
@@ -370,8 +375,68 @@ function getOrCreateWorker(repo: string): RepoWorker {
   const created = new RepoWorker(repo, repoPath);
   workers.set(repo, created);
   console.log(`[ralph] Created worker for ${repo} -> ${repoPath}`);
-  void created.runStartupCleanup();
+  ensureRepoStartupCleanup(repo, created);
   return created;
+}
+
+function getWorkerSlotKey(repo: string, repoSlot: number): string {
+  return `${repo}::${repoSlot}`;
+}
+
+function ensureRepoStartupCleanup(repo: string, worker: RepoWorker): void {
+  if (repoStartupCleanup.has(repo)) return;
+  repoStartupCleanup.add(repo);
+  void worker.runStartupCleanup();
+}
+
+function getOrCreateWorkerForSlot(repo: string, repoSlot: number): RepoWorker {
+  const key = getWorkerSlotKey(repo, repoSlot);
+  let worker = workersBySlot.get(key);
+  if (worker) return worker;
+
+  const repoPath = getRepoPath(repo);
+  const created = new RepoWorker(repo, repoPath);
+  workersBySlot.set(key, created);
+  console.log(`[ralph] Created worker slot ${repoSlot} for ${repo} -> ${repoPath}`);
+  ensureRepoStartupCleanup(repo, created);
+  return created;
+}
+
+function getTaskRepoSlotHint(task: AgentTask): number | null {
+  const explicit = parseRepoSlot(task["repo-slot"]);
+  if (explicit !== null) return explicit;
+  return parseRepoSlotFromWorktreePath(task["worktree-path"]?.trim());
+}
+
+function reserveRepoSlotForTask(task: AgentTask): { slot: number; release: () => void } | null {
+  const taskKey = getTaskKey(task);
+  const preferred = getTaskRepoSlotHint(task);
+  const reservation = repoSlotManager.reserveSlotForTask(task.repo, taskKey, { preferred });
+  if (!reservation) return null;
+  return { slot: reservation.slot, release: reservation.release };
+}
+
+async function seedRepoSlotReservations(): Promise<void> {
+  const statuses: AgentTask["status"][] = ["starting", "in-progress", "throttled"];
+  const tasks = (await Promise.all(statuses.map((status) => getTasksByStatus(status)))).flat();
+  if (tasks.length === 0) return;
+
+  for (const task of tasks) {
+    const taskKey = getTaskKey(task);
+    const preferred = getTaskRepoSlotHint(task);
+    const reservation = repoSlotManager.reserveSlotForTask(task.repo, taskKey, { preferred });
+    if (!reservation) {
+      console.warn(
+        `[scheduler] repoSlot reservation failed on startup (repo=${task.repo}, task=${task._path ?? task.name})`
+      );
+      continue;
+    }
+
+    if (preferred === null || preferred !== reservation.slot) {
+      await updateTaskStatus(task, task.status, { "repo-slot": String(reservation.slot) });
+      task["repo-slot"] = String(reservation.slot);
+    }
+  }
 }
 
 async function getRunnableTasks(): Promise<AgentTask[]> {
@@ -629,6 +694,8 @@ async function startTask(opts: {
   const initialKey = getTaskKey(task);
   inFlightTasks.add(initialKey);
 
+  let releaseSlot: (() => void) | null = null;
+
   try {
     const nowMs = Date.now();
     const claim = await tryClaimTask({ task, daemonId, nowMs });
@@ -652,6 +719,19 @@ async function startTask(opts: {
     }
 
     try {
+      const reservation = reserveRepoSlotForTask(claimedTask);
+      if (!reservation) {
+        if (shouldLog(`scheduler:repo-slot:${claimedTask.repo}`, 30_000)) {
+          console.warn(`[scheduler] Repo concurrency slots full; deferring ${claimedTask.name}`);
+        }
+        inFlightTasks.delete(key);
+        forgetOwnedTask(claimedTask);
+        if (!isShuttingDown) scheduleQueuedTasksSoon();
+        return false;
+      }
+      releaseSlot = reservation.release;
+      const slot = reservation.slot;
+
       const blockedSource = claimedTask["blocked-source"]?.trim() || "";
       const sessionId = claimedTask["session-id"]?.trim() || "";
       const shouldResumeMergeConflict = sessionId && blockedSource === "merge-conflict";
@@ -674,10 +754,11 @@ async function startTask(opts: {
           "blocked-checked-at": "",
         });
 
-        void getOrCreateWorker(repo)
+        void getOrCreateWorkerForSlot(repo, slot)
           .resumeTask(claimedTask, {
             resumeMessage:
               "This task already has an open PR with merge conflicts blocking CI. Resolve the merge conflicts by rebasing/merging the base branch into the PR branch, push updates, and continue with the existing PR only.",
+            repoSlot: slot,
           })
           .then(async (run: AgentRun) => {
             if (run.outcome === "success" && run.pr) {
@@ -696,6 +777,7 @@ async function startTask(opts: {
           .finally(() => {
             inFlightTasks.delete(key);
             forgetOwnedTask(claimedTask);
+            releaseSlot?.();
             releaseGlobal();
             releaseRepo();
             if (!isShuttingDown) {
@@ -707,8 +789,8 @@ async function startTask(opts: {
         return true;
       }
 
-      void getOrCreateWorker(repo)
-        .processTask(claimedTask)
+      void getOrCreateWorkerForSlot(repo, slot)
+        .processTask(claimedTask, { repoSlot: slot })
         .then(async (run: AgentRun) => {
           if (run.outcome === "success" && run.pr) {
             try {
@@ -726,6 +808,7 @@ async function startTask(opts: {
         .finally(() => {
           inFlightTasks.delete(key);
           forgetOwnedTask(claimedTask);
+          releaseSlot?.();
           releaseGlobal();
           releaseRepo();
           if (!isShuttingDown) {
@@ -737,6 +820,7 @@ async function startTask(opts: {
       console.error(`[ralph] Error starting task ${claimedTask.name}:`, error);
       inFlightTasks.delete(key);
       forgetOwnedTask(claimedTask);
+      releaseSlot?.();
       if (!isShuttingDown) scheduleQueuedTasksSoon();
       return false;
     }
@@ -758,11 +842,19 @@ function startResumeTask(opts: {
   const { repo, task, releaseGlobal, releaseRepo } = opts;
   const key = getTaskKey(task);
 
+  const reservation = reserveRepoSlotForTask(task);
+  if (!reservation) {
+    if (shouldLog(`scheduler:repo-slot:${task.repo}`, 30_000)) {
+      console.warn(`[scheduler] Repo concurrency slots full; deferring resume for ${task.name}`);
+    }
+    return false;
+  }
+
   pendingResumeTasks.delete(key);
   inFlightTasks.add(key);
 
-  void getOrCreateWorker(repo)
-    .resumeTask(task)
+  void getOrCreateWorkerForSlot(repo, reservation.slot)
+    .resumeTask(task, { repoSlot: reservation.slot })
     .then(() => {
       // ignore
     })
@@ -772,6 +864,7 @@ function startResumeTask(opts: {
     .finally(() => {
       inFlightTasks.delete(key);
       forgetOwnedTask(task);
+      reservation.release();
       releaseGlobal();
       releaseRepo();
       resolveResumeCompletion(key);
@@ -1031,7 +1124,7 @@ async function resumeTasksOnStartup(opts?: {
       const repoTasks = withSessionByRepo.get(repo);
       if (!repoTasks || repoTasks.length === 0) continue;
 
-      const limit = getRepoMaxWorkers(repo);
+      const limit = getRepoConcurrencySlots(repo);
       const already = perRepoResumed.get(repo) ?? 0;
       if (already >= limit) continue;
 
@@ -1056,6 +1149,7 @@ async function resumeTasksOnStartup(opts?: {
     console.warn(
       `[ralph] Concurrency limits exceeded on startup; resetting in-progress task to queued: ${task.name} (${task.repo})`
     );
+    repoSlotManager.releaseSlotForTask(task.repo, getTaskKey(task));
     await updateTaskStatus(task, "queued", { "session-id": "" });
   }
 
@@ -1097,6 +1191,10 @@ async function main(): Promise<void> {
 
   // Initialize durable local state (SQLite)
   initStateDb();
+
+  if (queueState.backend !== "none") {
+    await seedRepoSlotReservations();
+  }
 
   const retentionDays = getDashboardEventsRetentionDays();
   await cleanupDashboardEventLogs({ retentionDays });
@@ -1404,6 +1502,7 @@ function printGlobalHelp(): void {
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "",
       "Options:",
@@ -1504,6 +1603,17 @@ function printCommandHelp(command: string): void {
           "  ralph rollup <repo>",
           "",
           "Rollup helpers. (Currently prints guidance; rollup is typically done via gh.)",
+        ].join("\n")
+      );
+      return;
+
+    case "worktrees":
+      console.log(
+        [
+          "Usage:",
+          "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
+          "",
+          "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
         ].join("\n")
       );
       return;
@@ -1912,6 +2022,16 @@ if (args[0] === "rollup") {
   // Note: This won't work well since we don't persist merge counts
   // For now, just create a PR from current bot/integration state
   console.log(`Force rollup not yet implemented. Use 'gh pr create --base main --head bot/integration' manually.`);
+  process.exit(0);
+}
+
+if (args[0] === "worktrees") {
+  if (hasHelpFlag) {
+    printCommandHelp("worktrees");
+    process.exit(0);
+  }
+
+  await runWorktreesCommand(args);
   process.exit(0);
 }
 
