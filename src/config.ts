@@ -25,7 +25,9 @@ export interface RepoConfig {
    * Commands are operator-owned and defined in ~/.ralph/config.toml|json.
    */
   setup?: string[];
-  /** Max concurrent tasks for this repo (default: 1) */
+  /** Per-repo concurrency slots for this repo (default: 1). */
+  concurrencySlots?: number;
+  /** Max concurrent tasks for this repo (default: 1). Deprecated: use concurrencySlots. */
   maxWorkers?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
@@ -229,6 +231,7 @@ export interface RalphConfig {
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
+const DEFAULT_REPO_CONCURRENCY_SLOTS = DEFAULT_REPO_MAX_WORKERS;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
@@ -447,12 +450,21 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     );
   }
 
-  // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
+  // Validate per-repo concurrencySlots/maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
+    const slots = toPositiveIntOrNull((repo as any).concurrencySlots);
     const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
     const autoUpdateMin = toPositiveIntOrNull((repo as any).autoUpdateBehindMinMinutes);
     const updates: Partial<RepoConfig> = {};
+
+    if ((repo as any).concurrencySlots !== undefined && !slots) {
+      console.warn(
+        `[ralph] Invalid config concurrencySlots for repo ${repo.name}: ${JSON.stringify((repo as any).concurrencySlots)}; ` +
+          `falling back to default ${DEFAULT_REPO_CONCURRENCY_SLOTS}`
+      );
+      updates.concurrencySlots = DEFAULT_REPO_CONCURRENCY_SLOTS;
+    }
 
     if ((repo as any).maxWorkers !== undefined && !mw) {
       console.warn(
@@ -1375,11 +1387,17 @@ export function getDashboardEventsRetentionDays(): number {
   return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
 }
 
-export function getRepoMaxWorkers(repoName: string): number {
+export function getRepoConcurrencySlots(repoName: string): number {
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
+  const slots = toPositiveIntOrNull(explicit?.concurrencySlots);
+  if (slots) return slots;
   const maxWorkers = toPositiveIntOrNull(explicit?.maxWorkers);
-  return maxWorkers ?? DEFAULT_REPO_MAX_WORKERS;
+  return maxWorkers ?? DEFAULT_REPO_CONCURRENCY_SLOTS;
+}
+
+export function getRepoMaxWorkers(repoName: string): number {
+  return getRepoConcurrencySlots(repoName);
 }
 
 export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {
