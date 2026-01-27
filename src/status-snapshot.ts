@@ -24,6 +24,8 @@ export type StatusInProgressTask = StatusTaskBase & {
   sessionId: string | null;
   nowDoing: unknown | null;
   line: string | null;
+  tokensTotal?: number | null;
+  tokensComplete?: boolean;
 };
 
 export type StatusThrottledTask = StatusTaskBase & {

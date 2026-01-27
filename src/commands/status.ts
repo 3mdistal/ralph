@@ -13,6 +13,7 @@ import { getQueueBackendState, getQueuedTasks, getTasksByStatus } from "../queue
 import { priorityRank } from "../queue/priority";
 import { buildStatusSnapshot, type StatusSnapshot } from "../status-snapshot";
 import { collectStatusUsageRows, formatStatusUsageSection } from "../status-usage";
+import { readRunTokenTotals, type SessionTokenReadResult } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
 import { initStateDb } from "../state";
 import { getThrottleDecision } from "../throttle";
@@ -22,6 +23,9 @@ import { formatTaskLabel, getTaskOpencodeProfileName, summarizeBlockedDetailsSni
 
 const STATUS_USAGE_TIMEOUT_MS = 10_000;
 const STATUS_USAGE_CONCURRENCY = 2;
+const STATUS_TOKEN_TIMEOUT_MS = 5_000;
+const STATUS_TOKEN_CONCURRENCY = 3;
+const STATUS_TOKEN_BUDGET_MS = 4_000;
 
 export type StatusDrainState = {
   requestedAt?: number | null;
@@ -103,11 +107,22 @@ export async function getStatusSnapshot(opts?: { drain?: StatusDrainState }): Pr
     timeoutMs: STATUS_USAGE_TIMEOUT_MS,
   });
 
+  const tokenReadCache = new Map<string, Promise<SessionTokenReadResult>>();
   const inProgressWithStatus = await Promise.all(
     inProgress.map(async (task) => {
       const sessionId = task["session-id"]?.trim() || null;
       const label = formatTaskLabel(task);
       const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
+      const opencodeProfile = getTaskOpencodeProfileName(task);
+      const tokens = await readRunTokenTotals({
+        repo: task.repo,
+        issue: task.issue,
+        opencodeProfile,
+        timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
+        concurrency: STATUS_TOKEN_CONCURRENCY,
+        budgetMs: STATUS_TOKEN_BUDGET_MS,
+        cache: tokenReadCache,
+      });
       const line = sessionId
         ? nowDoing
           ? formatNowDoingLine(nowDoing, label)
@@ -118,10 +133,12 @@ export async function getStatusSnapshot(opts?: { drain?: StatusDrainState }): Pr
         repo: task.repo,
         issue: task.issue,
         priority: task.priority ?? "p2-medium",
-        opencodeProfile: getTaskOpencodeProfileName(task),
+        opencodeProfile,
         sessionId,
         nowDoing,
         line,
+        tokensTotal: tokens.tokensTotal,
+        tokensComplete: tokens.tokensComplete,
       };
     })
   );
@@ -253,7 +270,9 @@ export async function runStatusCommand(opts: { args: string[]; drain?: StatusDra
 
   console.log(`In-progress tasks: ${snapshot.inProgress.length}`);
   for (const task of snapshot.inProgress) {
-    console.log(`  - ${task.line ?? formatTaskLabel(task)}`);
+    const tokensLabel = task.tokensComplete && typeof task.tokensTotal === "number" ? task.tokensTotal : null;
+    const tokensSuffix = tokensLabel === null ? "" : ` tokens=${tokensLabel}`;
+    console.log(`  - ${task.line ?? formatTaskLabel(task)}${tokensSuffix}`);
   }
 
   console.log(`Blocked tasks: ${snapshot.blocked.length}`);

@@ -15,6 +15,7 @@ function printGlobalHelp(): void {
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "",
       "Options:",
@@ -120,6 +121,17 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "worktrees":
+      console.log(
+        [
+          "Usage:",
+          "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
+          "",
+          "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
+        ].join("\n")
+      );
+      return;
+
     default:
       printGlobalHelp();
       return;
@@ -152,7 +164,17 @@ if (!cmd || cmd.startsWith("-")) {
   }
 }
 
-if ((cmd === "resume" || cmd === "status" || cmd === "usage" || cmd === "repos" || cmd === "watch" || cmd === "nudge" || cmd === "rollup") && hasHelpFlag) {
+if (
+  (cmd === "resume" ||
+    cmd === "status" ||
+    cmd === "usage" ||
+    cmd === "repos" ||
+    cmd === "watch" ||
+    cmd === "nudge" ||
+    cmd === "worktrees" ||
+    cmd === "rollup") &&
+  hasHelpFlag
+) {
   printCommandHelp(cmd);
   process.exit(0);
 }

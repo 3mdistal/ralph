@@ -18,7 +18,7 @@ describe("existing PR recovery", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
     const task = { ...baseTask };
 
-    let observedStage: "merge-conflict" | "ci-failure" | null = null;
+    let recoveryCalled = false;
     (worker as any).getIssuePrResolution = async () => ({
       selectedUrl: "https://github.com/3mdistal/ralph/pull/123",
       duplicates: [],
@@ -35,10 +35,18 @@ describe("existing PR recovery", () => {
       baseRefName: "bot/integration",
       labels: [],
     });
-    (worker as any).runExistingPrRecovery = async (params: any) => {
-      observedStage = params.stage;
-      return { taskName: task.name, repo: task.repo, outcome: "success" };
+    (worker as any).runMergeConflictRecovery = async () => {
+      recoveryCalled = true;
+      return { status: "success", prUrl: "https://github.com/3mdistal/ralph/pull/123", sessionId: "ses_1", headSha: "sha" };
     };
+    (worker as any).mergePrWithRequiredChecks = async () => ({
+      ok: true,
+      prUrl: "https://github.com/3mdistal/ralph/pull/123",
+      sessionId: "ses_1",
+    });
+    (worker as any).pauseIfHardThrottled = async () => null;
+    (worker as any).recordRunLogPath = async () => "/tmp/log";
+    (worker as any).session.continueCommand = async () => ({ success: true, output: "survey", sessionId: "ses_1" });
 
     const result = await (worker as any).maybeHandleQueuedMergeConflict({
       task,
@@ -51,10 +59,7 @@ describe("existing PR recovery", () => {
       opencodeSessionOptions: {},
     });
 
-    if (!observedStage) {
-      throw new Error("Expected merge-conflict recovery stage to be set.");
-    }
-    expect(observedStage as unknown as string).toBe("merge-conflict");
+    expect(recoveryCalled).toBe(true);
     expect(result?.outcome).toBe("success");
   });
 

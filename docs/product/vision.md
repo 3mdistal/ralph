@@ -28,6 +28,7 @@ Keep this doc focused on product intent; update routing/escalation policy in one
 - `docs/product/graceful-drain-rolling-restart.md`
 - `docs/product/deterministic-gates.md`
 - `docs/product/usage-throttling.md`
+- `docs/product/worktree-management.md`
 
 ## The Problem We're Solving
 
@@ -65,7 +66,7 @@ bwrb remains supported as a legacy backend during the migration:
 - GitHub queue claim is best-effort and requires a single daemon per queue in v0.1.x
 - When GitHub queue support is unavailable, Ralph falls back to bwrb if a valid vault is configured
 - When GitHub is unavailable and no bwrb vault exists, Ralph runs in idle/no-queue mode and surfaces diagnostics
-- Escalation notes and agent-run records remain bwrb-only in v0.1.x; GitHub issue writeback (labels/comments) is supported in the meantime
+- Escalation notes and agent-run records are best-effort bwrb output only in v0.1.x; GitHub issue writeback (labels/comments) is supported in the meantime
 
 ### 2. Bot Branch Strategy
 
