@@ -25,7 +25,7 @@ export type ProvisionPlan = {
   };
 };
 
-export function buildRunIdShort(runId: string): string {
+function buildRunIdShort(runId: string): string {
   const trimmed = runId.trim();
   if (!trimmed) return "run";
   const normalized = trimmed.replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -33,7 +33,7 @@ export function buildRunIdShort(runId: string): string {
   return short.slice(0, 8);
 }
 
-export function buildSandboxRepoName(prefix: string, runIdShort: string): string {
+function buildSandboxRepoName(prefix: string, runIdShort: string): string {
   const trimmedPrefix = prefix.trim();
   const trimmedRun = runIdShort.trim();
   return `${trimmedPrefix}${trimmedRun}`;

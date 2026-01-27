@@ -581,7 +581,7 @@ export async function applySeedFromSpec(params: {
   return params.manifest;
 }
 
-export async function resolveSeedSpecFromPlan(plan: ProvisionPlan): Promise<NormalizedSeedSpec | null> {
+async function resolveSeedSpecFromPlan(plan: ProvisionPlan): Promise<NormalizedSeedSpec | null> {
   if (!plan.seed) return null;
   if (plan.seed.spec) return plan.seed.spec;
   if (plan.seed.mode === "preset" && plan.seed.preset === "baseline") {
@@ -593,7 +593,7 @@ export async function resolveSeedSpecFromPlan(plan: ProvisionPlan): Promise<Norm
   return null;
 }
 
-export async function loadManifestByRunId(runId: string): Promise<SandboxManifest> {
+async function loadManifestByRunId(runId: string): Promise<SandboxManifest> {
   const path = getRalphSandboxManifestPath(runId);
   return await readSandboxManifest(path);
 }

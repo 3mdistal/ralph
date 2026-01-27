@@ -20,7 +20,7 @@ export function getRalphHomeDir(): string {
   return join(resolveHomeDir(), ".ralph");
 }
 
-export function getRalphSandboxDir(): string {
+function getRalphSandboxDir(): string {
   return join(getRalphHomeDir(), "sandbox");
 }
 

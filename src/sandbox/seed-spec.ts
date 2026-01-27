@@ -1,9 +1,9 @@
 import { readFile } from "fs/promises";
 import { isAbsolute } from "path";
 
-export type SeedPreset = "baseline";
+type SeedPreset = "baseline";
 
-export type SeedSpecV1 = {
+type SeedSpecV1 = {
   schemaVersion: 1;
   issues?: SeedIssueSpec[];
   pullRequests?: SeedPullRequestSpec[];
