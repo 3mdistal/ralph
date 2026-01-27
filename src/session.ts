@@ -1021,6 +1021,13 @@ async function runSession(
 
       try {
         const event = JSON.parse(trimmed);
+        if (typeof options?.onEvent === "function") {
+          try {
+            options.onEvent(event);
+          } catch {
+            // ignore
+          }
+        }
         const eventSessionId = event.sessionID ?? event.sessionId;
         if (eventSessionId && !sessionId) {
           sessionId = String(eventSessionId);
@@ -1286,6 +1293,7 @@ export type RunSessionOptionsBase = {
     recentEventLimit?: number;
     context?: string;
   };
+  onEvent?: (event: any) => void;
 };
 
 export type RunSessionTestOverrides = {

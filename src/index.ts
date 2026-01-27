@@ -53,7 +53,7 @@ import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
-import { buildRalphEvent } from "./dashboard/events";
+import { publishDashboardEvent } from "./dashboard/publisher";
 import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
 import { startGitHubIssuePollers } from "./github-issues-sync";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
@@ -887,8 +887,8 @@ async function emitActivityUpdate(params: {
 
     if (!shouldEmitActivityUpdate({ sessionId, activity: snapshot.activity, now })) return;
 
-    ralphEventBus.publish(
-      buildRalphEvent({
+    publishDashboardEvent(
+      {
         type: "worker.activity.updated",
         level: "info",
         workerId: params.workerId,
@@ -896,7 +896,8 @@ async function emitActivityUpdate(params: {
         taskId: params.taskId,
         sessionId,
         data: { activity: snapshot.activity },
-      })
+      },
+      { sessionId, workerId: params.workerId }
     );
 
     recordActivityState({ sessionId, activity: snapshot.activity, now });
@@ -1122,13 +1123,17 @@ async function main(): Promise<void> {
     warn: (message) => console.warn(message),
   });
 
-  ralphEventBus.publish(
-    buildRalphEvent({
-      type: "daemon.started",
-      level: "info",
-      data: {},
-    })
-  );
+  publishDashboardEvent({
+    type: "daemon.started",
+    level: "info",
+    data: {},
+  });
+
+  publishDashboardEvent({
+    type: "log.ralph",
+    level: "info",
+    data: { message: "Daemon started" },
+  });
 
   console.log("[ralph] Configuration:");
   const backendTags = [
@@ -1365,13 +1370,17 @@ async function main(): Promise<void> {
       }
     }
     
-    ralphEventBus.publish(
-      buildRalphEvent({
-        type: "daemon.stopped",
-        level: "info",
-        data: { reason: signal },
-      })
-    );
+    publishDashboardEvent({
+      type: "daemon.stopped",
+      level: "info",
+      data: { reason: signal },
+    });
+
+    publishDashboardEvent({
+      type: "log.ralph",
+      level: "info",
+      data: { message: `Daemon stopping (${signal})` },
+    });
 
     if (dashboardEventPersistence) {
       const { flushed } = await dashboardEventPersistence.flush({ timeoutMs: 5000 });
