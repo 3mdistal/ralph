@@ -1,14 +1,11 @@
 import { $ } from "bun";
 import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
 import type { TaskPriority } from "./queue/priority";
-import { hasIdempotencyKey, initStateDb, recordAlertOccurrence, recordIdempotencyKey } from "./state";
+import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { appendBwrbNoteBody, buildEscalationPayload, buildIdeaPayload, createBwrbNote } from "./bwrb/artifacts";
-import { planAlertRecord } from "./alerts/core";
-import { GitHubClient } from "./github/client";
+import { recordIssueErrorAlert, recordRepoErrorAlert, recordRollupReadyAlert } from "./alerts/service";
 import { parseIssueRef } from "./github/issue-ref";
-import { writeAlertToGitHub } from "./github/alert-writeback";
-import { writeRollupReadyToGitHub } from "./github/rollup-ready-writeback";
 
 const sanitizeNoteTitle = sanitizeNoteName;
 
@@ -505,29 +502,11 @@ export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: 
   const prNumber = prNumberMatch ? Number(prNumberMatch[1]) : null;
 
   try {
-    initStateDb();
-    const details = [
-      `Rollup PR: ${prUrl}`,
-      mergedPRs.length ? "Included PRs:" : "",
-      ...mergedPRs.map((pr) => `- ${pr}`),
-    ]
-      .filter(Boolean)
-      .join("\n");
-    const planned = planAlertRecord({
-      kind: "rollup-ready",
-      targetType: "repo",
-      targetNumber: 0,
-      context: `Rollup ready (${repo})`,
-      error: details,
-    });
-    recordAlertOccurrence({
+    await recordRollupReadyAlert({
       repo,
-      targetType: planned.targetType,
-      targetNumber: planned.targetNumber,
-      kind: planned.kind,
-      fingerprint: planned.fingerprint,
-      summary: planned.summary,
-      details: planned.details,
+      prNumber: prNumber && Number.isFinite(prNumber) ? prNumber : null,
+      prUrl,
+      mergedPRs,
     });
   } catch (error: any) {
     console.warn(`[ralph:notify] Failed to record rollup-ready alert for ${repo}: ${error?.message ?? String(error)}`);
@@ -535,23 +514,6 @@ export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: 
 
   if (!prNumber || !Number.isFinite(prNumber)) {
     console.warn(`[ralph:notify] Unable to parse rollup PR number from ${prUrl}`);
-  } else {
-    try {
-      const github = new GitHubClient(repo);
-      await writeRollupReadyToGitHub(
-        {
-          repo,
-          prNumber,
-          prUrl,
-          mergedPRs,
-        },
-        { github }
-      );
-    } catch (error: any) {
-      console.warn(
-        `[ralph:notify] Failed to write rollup-ready comment for ${repo}#${prNumber}: ${error?.message ?? String(error)}`
-      );
-    }
   }
 
   const body = [
@@ -585,49 +547,13 @@ export async function notifyError(context: string, error: string, input?: ErrorN
 
   if (issueRef) {
     try {
-      initStateDb();
-      const planned = planAlertRecord({
-        kind: "error",
-        targetType: "issue",
-        targetNumber: issueRef.number,
+      await recordIssueErrorAlert({
+        repo: issueRef.repo,
+        issueNumber: issueRef.number,
+        taskName: taskName ?? undefined,
         context,
         error,
       });
-
-      const alert = recordAlertOccurrence({
-        repo: issueRef.repo,
-        targetType: planned.targetType,
-        targetNumber: planned.targetNumber,
-        kind: planned.kind,
-        fingerprint: planned.fingerprint,
-        summary: planned.summary,
-        details: planned.details,
-      });
-
-      try {
-        const github = new GitHubClient(issueRef.repo);
-        await writeAlertToGitHub(
-          {
-            repo: issueRef.repo,
-            issueNumber: issueRef.number,
-            taskName,
-            kind: planned.kind,
-            fingerprint: planned.fingerprint,
-            alertId: alert.id,
-            summary: alert.summary,
-            details: alert.details,
-            count: alert.count,
-            lastSeenAt: alert.lastSeenAt,
-          },
-          { github }
-        );
-      } catch (writeError: any) {
-        console.warn(
-          `[ralph:notify] Failed to write alert comment for ${issueRef.repo}#${issueRef.number}: ${
-            writeError?.message ?? String(writeError)
-          }`
-        );
-      }
     } catch (error: any) {
       console.warn(
         `[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
@@ -635,22 +561,10 @@ export async function notifyError(context: string, error: string, input?: ErrorN
     }
   } else if (normalizedInput?.repo) {
     try {
-      initStateDb();
-      const planned = planAlertRecord({
-        kind: "error",
-        targetType: "repo",
-        targetNumber: 0,
+      recordRepoErrorAlert({
+        repo: normalizedInput.repo,
         context,
         error,
-      });
-      recordAlertOccurrence({
-        repo: normalizedInput.repo,
-        targetType: planned.targetType,
-        targetNumber: planned.targetNumber,
-        kind: planned.kind,
-        fingerprint: planned.fingerprint,
-        summary: planned.summary,
-        details: planned.details,
       });
     } catch (recordError: any) {
       console.warn(

@@ -1,4 +1,4 @@
-import { sanitizeEscalationReason } from "../github/escalation-writeback";
+import { sanitizeExternalText } from "../util/sanitize-text";
 
 export type AlertKind = "error" | "rollup-ready";
 export type AlertTargetType = "issue" | "repo";
@@ -35,7 +35,7 @@ function normalizeWhitespace(text: string): string {
 }
 
 function sanitizeText(text: string): string {
-  return sanitizeEscalationReason(text).trim();
+  return sanitizeExternalText(text).trim();
 }
 
 function hashFNV1a(input: string): string {

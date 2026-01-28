@@ -7,7 +7,7 @@ import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./pa
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -43,6 +43,7 @@ export type AlertDeliveryRecord = {
   targetType: AlertTargetType;
   targetNumber: number;
   status: AlertDeliveryStatus;
+  commentId: number | null;
   commentUrl: string | null;
   attempts: number;
   lastAttemptAt: string;
@@ -262,6 +263,9 @@ function ensureSchema(database: Database): void {
           CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
         `);
       }
+      if (existingVersion < 11) {
+        database.exec("ALTER TABLE alert_deliveries ADD COLUMN comment_id INTEGER");
+      }
     })();
   }
 
@@ -453,6 +457,7 @@ function ensureSchema(database: Database): void {
       target_type TEXT NOT NULL,
       target_number INTEGER NOT NULL,
       status TEXT NOT NULL,
+      comment_id INTEGER,
       comment_url TEXT,
       attempts INTEGER NOT NULL DEFAULT 0,
       last_attempt_at TEXT NOT NULL,
@@ -752,9 +757,9 @@ export function getAlertDelivery(params: {
   const database = requireDb();
   const row = database
     .query(
-      `SELECT alert_id, channel, marker_id, target_type, target_number, status, comment_url, attempts, last_attempt_at, last_error
-       FROM alert_deliveries
-       WHERE alert_id = $alert_id AND channel = $channel AND marker_id = $marker_id`
+       `SELECT alert_id, channel, marker_id, target_type, target_number, status, comment_id, comment_url, attempts, last_attempt_at, last_error
+        FROM alert_deliveries
+        WHERE alert_id = $alert_id AND channel = $channel AND marker_id = $marker_id`
     )
     .get({
       $alert_id: params.alertId,
@@ -767,6 +772,7 @@ export function getAlertDelivery(params: {
     target_type?: AlertTargetType;
     target_number?: number;
     status?: AlertDeliveryStatus;
+    comment_id?: number | null;
     comment_url?: string | null;
     attempts?: number;
     last_attempt_at?: string;
@@ -781,6 +787,7 @@ export function getAlertDelivery(params: {
     targetType: row.target_type ?? "issue",
     targetNumber: typeof row.target_number === "number" ? row.target_number : 0,
     status: (row.status as AlertDeliveryStatus) ?? "failed",
+    commentId: typeof row.comment_id === "number" ? row.comment_id : null,
     commentUrl: row.comment_url ?? null,
     attempts: typeof row.attempts === "number" ? row.attempts : 0,
     lastAttemptAt: row.last_attempt_at ?? "",
@@ -795,6 +802,7 @@ export function recordAlertDeliveryAttempt(params: {
   targetType: AlertTargetType;
   targetNumber: number;
   status: AlertDeliveryStatus;
+  commentId?: number | null;
   commentUrl?: string | null;
   error?: string | null;
   at?: string;
@@ -811,6 +819,7 @@ export function recordAlertDeliveryAttempt(params: {
          target_type,
          target_number,
          status,
+         comment_id,
          comment_url,
          attempts,
          last_attempt_at,
@@ -824,6 +833,7 @@ export function recordAlertDeliveryAttempt(params: {
          $target_type,
          $target_number,
          $status,
+         $comment_id,
          $comment_url,
          1,
          $last_attempt_at,
@@ -834,6 +844,7 @@ export function recordAlertDeliveryAttempt(params: {
        ON CONFLICT(alert_id, channel, marker_id)
        DO UPDATE SET
          status = excluded.status,
+         comment_id = COALESCE(excluded.comment_id, alert_deliveries.comment_id),
          comment_url = COALESCE(excluded.comment_url, alert_deliveries.comment_url),
          attempts = alert_deliveries.attempts + 1,
          last_attempt_at = excluded.last_attempt_at,
@@ -847,7 +858,8 @@ export function recordAlertDeliveryAttempt(params: {
       $target_type: params.targetType,
       $target_number: params.targetNumber,
       $status: params.status,
-      $comment_url: params.commentUrl ?? null,
+       $comment_id: params.commentId ?? null,
+       $comment_url: params.commentUrl ?? null,
       $last_attempt_at: at,
       $last_error: params.error ?? null,
       $created_at: at,

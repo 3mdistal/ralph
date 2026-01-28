@@ -159,7 +159,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("10");
+      expect(meta.value).toBe("11");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -247,7 +247,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("10");
+      expect(meta.value).toBe("11");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -535,7 +535,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("10");
+      expect(meta.value).toBe("11");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -816,6 +816,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       targetType: "issue",
       targetNumber: 42,
       status: "success",
+      commentId: 1,
       commentUrl: "https://github.com/3mdistal/ralph/issues/42#issuecomment-1",
       at: "2026-01-11T00:00:13.000Z",
     });

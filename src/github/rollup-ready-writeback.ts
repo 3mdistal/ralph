@@ -32,7 +32,7 @@ type WritebackDeps = {
   deleteIdempotencyKey?: (key: string) => void;
 };
 
-type IssueComment = { body?: string | null };
+type IssueComment = { body?: string | null; databaseId?: number | null; url?: string | null };
 
 const ROLLUP_MARKER_PREFIX = "<!-- ralph-rollup-ready:id=";
 const ROLLUP_MARKER_REGEX = /<!--\s*ralph-rollup-ready:id=([a-f0-9]+)\s*-->/i;
@@ -53,6 +53,14 @@ function hashFNV1a(input: string): string {
     hash = Math.imul(hash, 16777619) >>> 0;
   }
   return hash.toString(16).padStart(8, "0");
+}
+
+function parseCommentIdFromUrl(url?: string | null): number | null {
+  if (!url) return null;
+  const match = url.match(/#issuecomment-(\d+)/);
+  if (!match) return null;
+  const id = Number(match[1]);
+  return Number.isFinite(id) ? id : null;
 }
 
 function buildMarkerId(params: { repo: string; prNumber: number }): string {
@@ -112,14 +120,16 @@ async function listRecentIssueComments(params: {
   const query = `query($owner: String!, $name: String!, $number: Int!, $last: Int!) {
   repository(owner: $owner, name: $name) {
     issue(number: $number) {
-      comments(last: $last) {
-        nodes {
-          body
+        comments(last: $last) {
+          nodes {
+            body
+            databaseId
+            url
+          }
+          pageInfo {
+            hasPreviousPage
+          }
         }
-        pageInfo {
-          hasPreviousPage
-        }
-      }
     }
   }
 }`;
@@ -127,7 +137,12 @@ async function listRecentIssueComments(params: {
   const response = await params.github.request<{
     data?: {
       repository?: {
-        issue?: { comments?: { nodes?: Array<{ body?: string | null }>; pageInfo?: { hasPreviousPage?: boolean } } };
+        issue?: {
+          comments?: {
+            nodes?: Array<{ body?: string | null; databaseId?: number | null; url?: string | null }>;
+            pageInfo?: { hasPreviousPage?: boolean };
+          };
+        };
       };
     };
   }>("/graphql", {
@@ -139,7 +154,11 @@ async function listRecentIssueComments(params: {
   });
 
   const nodes = response.data?.data?.repository?.issue?.comments?.nodes ?? [];
-  const comments = nodes.map((node) => ({ body: node?.body ?? "" }));
+  const comments = nodes.map((node) => ({
+    body: node?.body ?? "",
+    databaseId: typeof node?.databaseId === "number" ? node.databaseId : null,
+    url: node?.url ?? null,
+  }));
   const reachedMax = Boolean(response.data?.data?.repository?.issue?.comments?.pageInfo?.hasPreviousPage);
 
   return { comments, reachedMax };
@@ -150,12 +169,29 @@ async function createIssueComment(params: {
   repo: string;
   issueNumber: number;
   body: string;
-}): Promise<{ html_url?: string | null }> {
+}): Promise<{ html_url?: string | null; id?: number | null }> {
   const { owner, name } = splitRepoFullName(params.repo);
-  const response = await params.github.request<{ html_url?: string | null }>(
+  const response = await params.github.request<{ html_url?: string | null; id?: number | null }>(
     `/repos/${owner}/${name}/issues/${params.issueNumber}/comments`,
     {
       method: "POST",
+      body: { body: params.body },
+    }
+  );
+  return response.data ?? {};
+}
+
+async function updateIssueComment(params: {
+  github: GitHubClient;
+  repo: string;
+  commentId: number;
+  body: string;
+}): Promise<{ html_url?: string | null }> {
+  const { owner, name } = splitRepoFullName(params.repo);
+  const response = await params.github.request<{ html_url?: string | null }>(
+    `/repos/${owner}/${name}/issues/comments/${params.commentId}`,
+    {
+      method: "PATCH",
       body: { body: params.body },
     }
   );
@@ -205,31 +241,15 @@ export async function writeRollupReadyToGitHub(ctx: RollupReadyContext, deps: Wr
   }
 
   const markerId = plan.markerId.toLowerCase();
-  const markerFound =
-    listResult?.comments.some((comment) => {
+  const matchedComment =
+    listResult?.comments.find((comment) => {
       const body = comment.body ?? "";
       const found = extractExistingRollupMarker(body);
       return found ? found.toLowerCase() === markerId : body.includes(plan.marker);
-    }) ?? false;
-
-  if (hasKeyResult && markerFound) {
-    log(`${prefix} Rollup-ready comment already recorded (idempotency + marker); skipping.`);
-    return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: null };
-  }
-
-  const scanComplete = Boolean(listResult && !listResult.reachedMax);
-  if (hasKeyResult && scanComplete && !markerFound) {
-    ignoreExistingKey = true;
-    try {
-      deleteKey(plan.idempotencyKey);
-    } catch (error: any) {
-      log(`${prefix} Failed to clear stale idempotency key: ${error?.message ?? String(error)}`);
-    }
-  }
-  if (hasKeyResult && !scanComplete && !markerFound) {
-    ignoreExistingKey = true;
-    log(`${prefix} Idempotency key exists but marker scan incomplete; proceeding cautiously.`);
-  }
+    }) ?? null;
+  const markerFound = Boolean(matchedComment);
+  const markerCommentId = matchedComment?.databaseId ?? parseCommentIdFromUrl(matchedComment?.url);
+  const markerCommentUrl = matchedComment?.url ?? null;
 
   if (markerFound) {
     try {
@@ -237,8 +257,43 @@ export async function writeRollupReadyToGitHub(ctx: RollupReadyContext, deps: Wr
     } catch (error: any) {
       log(`${prefix} Failed to record idempotency after marker match: ${error?.message ?? String(error)}`);
     }
-    log(`${prefix} Existing rollup-ready marker found for PR #${ctx.prNumber}; skipping comment.`);
-    return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: null };
+
+    if (markerCommentId) {
+      try {
+        const updated = await updateIssueComment({
+          github: deps.github,
+          repo: ctx.repo,
+          commentId: markerCommentId,
+          body: plan.commentBody,
+        });
+        log(`${prefix} Updated rollup-ready comment for PR #${ctx.prNumber}.`);
+        return {
+          postedComment: false,
+          skippedComment: false,
+          markerFound: true,
+          commentUrl: updated?.html_url ?? markerCommentUrl,
+        };
+      } catch (error: any) {
+        log(`${prefix} Failed to update rollup-ready comment: ${error?.message ?? String(error)}`);
+      }
+    } else {
+      log(`${prefix} Existing rollup-ready marker found for PR #${ctx.prNumber}; missing comment id for update.`);
+    }
+    return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: markerCommentUrl };
+  }
+
+  const scanComplete = Boolean(listResult && !listResult.reachedMax);
+  if (hasKeyResult && !scanComplete) {
+    log(`${prefix} Idempotency key exists but marker scan incomplete; skipping to avoid duplicates.`);
+    return { postedComment: false, skippedComment: true, markerFound: false, commentUrl: null };
+  }
+  if (hasKeyResult && scanComplete) {
+    ignoreExistingKey = true;
+    try {
+      deleteKey(plan.idempotencyKey);
+    } catch (error: any) {
+      log(`${prefix} Failed to clear stale idempotency key: ${error?.message ?? String(error)}`);
+    }
   }
 
   let claimed = false;
