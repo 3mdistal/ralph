@@ -67,6 +67,14 @@ Note: `agent-run` frontmatter in `.bwrb/schema.json` is currently modeled as a c
 
 Rule of thumb: gates should be derived from observable artifacts (command output, CI checks, explicit review agent output), not "agent says it ran tests".
 
+## Gate State Query Surface
+
+Ralph exposes a minimal query surface for the latest persisted gate state:
+
+- `ralph gates <repo> <issueNumber> [--json]`
+
+This reads from `~/.ralph/state.sqlite` and returns the bounded/redacted artifacts stored with the gate records.
+
 ## Gate 1: Local Preflight (Fast, Deterministic)
 
 Default: required.

@@ -38,6 +38,7 @@ export type RalphEventEnvelope<TType extends RalphEventType, TData extends objec
   ts: string;
   type: TType;
   level: RalphEventLevel;
+  runId?: string;
   workerId?: string;
   repo?: string;
   taskId?: string;
@@ -130,6 +131,7 @@ export function isRalphEvent(value: unknown): value is RalphEvent {
   if (typeof type !== "string" || !EVENT_TYPES.has(type)) return false;
   if (typeof level !== "string" || !LEVELS.has(level)) return false;
 
+  if (!isStringOrUndefined(value.runId)) return false;
   if (!isStringOrUndefined(value.workerId)) return false;
   if (!isStringOrUndefined(value.repo)) return false;
   if (!isStringOrUndefined(value.taskId)) return false;

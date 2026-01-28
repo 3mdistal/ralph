@@ -1,4 +1,4 @@
-import { getConfig } from "../config";
+import { getConfig, getRepoAutoQueueConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
 import { GitHubClient, splitRepoFullName } from "../github/client";
 import { mutateIssueLabels } from "../github/label-mutation";
@@ -6,6 +6,7 @@ import { createRalphWorkflowLabelsEnsurer, type EnsureOutcome } from "../github/
 import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
 import { GitHubRelationshipProvider } from "../github/issue-relationships";
+import { resolveRelationshipSignals } from "../github/relationship-signals";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {
@@ -196,11 +197,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     const nowIso = getNowIso(deps);
 
     for (const repo of getConfig().repos.map((entry) => entry.name)) {
-      try {
-        await io.ensureWorkflowLabels(repo);
-      } catch {
-        // best-effort
-      }
       const opStateByIssue = buildTaskOpStateMap(repo);
       const issues = listIssueSnapshotsWithRalphLabels(repo);
 
@@ -216,46 +212,57 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         });
         if (!shouldRecover) continue;
 
-        releaseTaskSlot({
-          repo,
-          issueNumber: issue.number,
-          taskPath: `github:${repo}#${issue.number}`,
-          releasedReason: "stale-heartbeat",
-          status: "queued",
-        });
-
-        const delta = statusToRalphLabelDelta("queued", issue.labels);
-        const didMutate = await io.mutateIssueLabels({
-          repo,
-          issueNumber: issue.number,
-          issueNodeId: issue.githubNodeId,
-          add: delta.add,
-          remove: delta.remove,
-        });
-        if (!didMutate) {
-          const labelOps = await applyIssueLabelOps({
-            ops: [
-              ...delta.add.map((label) => ({ action: "add" as const, label })),
-              ...delta.remove.map((label) => ({ action: "remove" as const, label })),
-            ],
-            io: buildLabelOpsIo(io, repo, issue.number),
-            logLabel: `${repo}#${issue.number}`,
-            log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+        try {
+          releaseTaskSlot({
             repo,
-            ensureLabels: async () => await io.ensureWorkflowLabels(repo),
-            retryMissingLabelOnce: true,
+            issueNumber: issue.number,
+            taskPath: `github:${repo}#${issue.number}`,
+            releasedReason: "stale-heartbeat",
+            status: "queued",
           });
 
-          if (labelOps.ok) {
-            applyLabelDelta({ repo, issueNumber: issue.number, add: labelOps.add, remove: labelOps.remove, nowIso });
-          }
-        } else {
-          applyLabelDelta({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
-        }
+          const delta = statusToRalphLabelDelta("queued", issue.labels);
+          const didMutate = await io.mutateIssueLabels({
+            repo,
+            issueNumber: issue.number,
+            issueNodeId: issue.githubNodeId,
+            add: delta.add,
+            remove: delta.remove,
+          });
 
-        console.warn(
-          `[ralph:queue:github] Recovered stale in-progress issue ${repo}#${issue.number}; released locally`
-        );
+          if (!didMutate) {
+            const steps: LabelOp[] = [
+              ...delta.add.map((label) => ({ action: "add" as const, label })),
+              ...delta.remove.map((label) => ({ action: "remove" as const, label })),
+            ];
+
+            const labelOps = await applyIssueLabelOps({
+              ops: steps,
+              io: buildLabelOpsIo(io, repo, issue.number),
+              logLabel: `${repo}#${issue.number}`,
+              log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+              repo,
+              ensureLabels: async () => await io.ensureWorkflowLabels(repo),
+              retryMissingLabelOnce: true,
+            });
+
+            if (labelOps.ok) {
+              applyLabelDelta({ repo, issueNumber: issue.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+            } else if (labelOps.kind !== "transient") {
+              throw labelOps.error;
+            }
+          } else {
+            applyLabelDelta({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
+          }
+
+          console.warn(
+            `[ralph:queue:github] Recovered stale in-progress issue ${repo}#${issue.number}; released locally`
+          );
+        } catch (error: any) {
+          console.warn(
+            `[ralph:queue:github] Failed to recover stale in-progress ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+          );
+        }
       }
     }
   };
@@ -354,8 +361,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         return { claimed: false, task: opts.task, reason: "Issue is closed" };
       }
 
-      await io.ensureWorkflowLabels(issueRef.repo);
-
       const opStateByIssue = buildTaskOpStateMap(issueRef.repo);
       const opState = opStateByIssue.get(issueRef.number) ?? {
         repo: issueRef.repo,
@@ -367,22 +372,14 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         let plan = planClaim(issue.labels);
         try {
           const liveLabels = await io.listIssueLabels(issueRef.repo, issueRef.number);
-          if (liveLabels.includes("ralph:queued") && liveLabels.includes("ralph:blocked")) {
+          const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
+          const shouldCheckDependencies = liveLabels.includes("ralph:blocked") || autoQueueEnabled;
+          if (shouldCheckDependencies) {
             try {
               const relationships = new GitHubRelationshipProvider(issueRef.repo);
               const snapshot = await relationships.getSnapshot(issueRef);
-              if (!snapshot.coverage.githubDepsComplete || !snapshot.coverage.githubSubIssuesComplete) {
-                return {
-                  claimed: false,
-                  task: opts.task,
-                  reason: "Dependency coverage unknown; treating issue as blocked",
-                };
-              }
-              const ignoreBodyDeps = snapshot.coverage.githubDepsComplete && snapshot.coverage.githubSubIssuesComplete;
-              const signals = ignoreBodyDeps
-                ? snapshot.signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
-                : snapshot.signals;
-              const decision = computeBlockedDecision(signals);
+              const resolved = resolveRelationshipSignals(snapshot);
+              const decision = computeBlockedDecision(resolved.signals);
               if (decision.blocked || decision.confidence === "unknown") {
                 const reason =
                   decision.blocked && decision.reasons.length > 0
@@ -564,12 +561,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           at: nowIso,
         });
         return true;
-      }
-
-      try {
-        await io.ensureWorkflowLabels(issueRef.repo);
-      } catch {
-        // best-effort
       }
       const delta = statusToRalphLabelDelta(status, issue.labels);
       const steps: LabelOp[] = [

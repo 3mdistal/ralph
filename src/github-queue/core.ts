@@ -45,7 +45,11 @@ export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: 
   if (!target) return { add: [], remove: [] };
 
   const labelSet = new Set(currentLabels);
-  const add = labelSet.has(target) ? [] : [target];
+  const add: string[] = [];
+  if (!labelSet.has(target)) add.push(target);
+  if (status === "blocked" && !labelSet.has(RALPH_LABEL_QUEUED)) {
+    add.push(RALPH_LABEL_QUEUED);
+  }
   const preserved = new Set(PRESERVE_LABELS_BY_STATUS[status] ?? []);
   const remove = KNOWN_RALPH_LABELS.filter(
     (label) => label !== target && labelSet.has(label) && !preserved.has(label)
