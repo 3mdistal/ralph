@@ -961,6 +961,7 @@ export class RepoWorker {
         "completed-at": completedAt,
         "session-id": "",
         "watchdog-retries": "",
+        "stall-retries": "",
         ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
         ...(task["worker-id"] ? { "worker-id": "" } : {}),
         ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
@@ -1489,6 +1490,7 @@ export class RepoWorker {
         "completed-at": new Date().toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
+        "stall-retries": "",
         ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
       },
     });
@@ -2720,6 +2722,7 @@ ${guidance}`
           "daemon-id": "",
           "heartbeat-at": "",
           "watchdog-retries": "",
+          "stall-retries": "",
         });
         if (!updated) {
           throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
@@ -4806,6 +4809,7 @@ ${guidance}`
         stepTitle: `ci-debug attempt ${attemptNumber}`,
       },
       ...this.buildWatchdogOptions(params.task, `ci-debug-${attemptNumber}`),
+      ...this.buildStallOptions(params.task, `ci-debug-${attemptNumber}`),
       ...params.opencodeSessionOptions,
     });
 
@@ -4824,6 +4828,12 @@ ${guidance}`
         sessionResult,
         params.opencodeXdg
       );
+      return { status: "failed", run };
+    }
+
+    if (sessionResult.stallTimeout) {
+      await this.cleanupGitWorktree(worktreePath);
+      const run = await this.handleStallTimeout(params.task, params.cacheKey, `ci-debug-${attemptNumber}`, sessionResult);
       return { status: "failed", run };
     }
 
@@ -5169,11 +5179,16 @@ ${guidance}`
         stepTitle: "survey",
       },
       ...this.buildWatchdogOptions(task, "survey"),
+      ...this.buildStallOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    if (!surveyResult.success && surveyResult.stallTimeout) {
+      return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
 
     return {
@@ -5235,6 +5250,7 @@ ${guidance}`
             stepTitle: stage,
           },
           ...this.buildWatchdogOptions(task, stage),
+          ...this.buildStallOptions(task, stage),
           ...opencodeSessionOptions,
         })
       : await this.session.runAgent(taskRepoPath, "general", prompt, {
@@ -5249,6 +5265,7 @@ ${guidance}`
             stepTitle: stage,
           },
           ...this.buildWatchdogOptions(task, stage),
+          ...this.buildStallOptions(task, stage),
           ...opencodeSessionOptions,
         });
 
@@ -5258,6 +5275,10 @@ ${guidance}`
     if (!recoveryResult.success) {
       if (recoveryResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, stage, recoveryResult, opencodeXdg);
+      }
+
+      if (recoveryResult.stallTimeout) {
+        return await this.handleStallTimeout(task, cacheKey, stage, recoveryResult);
       }
 
       const details = summarizeBlockedDetails(recoveryResult.output);
@@ -5321,6 +5342,7 @@ ${guidance}`
         stepTitle: "survey",
       },
       ...this.buildWatchdogOptions(task, "survey"),
+      ...this.buildStallOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
 
@@ -5333,6 +5355,10 @@ ${guidance}`
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    if (!surveyResult.success && surveyResult.stallTimeout) {
+      return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
 
     return await this.finalizeTaskSuccess({
@@ -5404,6 +5430,7 @@ ${guidance}`
       "completed-at": endTime.toISOString().split("T")[0],
       "session-id": "",
       "watchdog-retries": "",
+      "stall-retries": "",
       ...(shouldClearWorktree ? { "worktree-path": "" } : {}),
       ...(shouldClearWorkerId ? { "worker-id": "" } : {}),
       ...(shouldClearRepoSlot ? { "repo-slot": "" } : {}),
@@ -5779,6 +5806,7 @@ ${guidance}`
           "completed-at": completedAt,
           "session-id": "",
           "watchdog-retries": "",
+          "stall-retries": "",
           ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
         },
       });
@@ -5828,6 +5856,7 @@ ${guidance}`
           "completed-at": completedAt,
           "session-id": "",
           "watchdog-retries": "",
+          "stall-retries": "",
           ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
         },
       });
@@ -6122,6 +6151,7 @@ ${guidance}`
       "completed-at": completedAt,
       "session-id": "",
       "watchdog-retries": "",
+      "stall-retries": "",
       ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
       ...(task["worker-id"] ? { "worker-id": "" } : {}),
       ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
@@ -6152,6 +6182,12 @@ ${guidance}`
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
   }
 
+  private getStallRetryCount(task: AgentTask): number {
+    const raw = task["stall-retries"];
+    const parsed = Number.parseInt(String(raw ?? "0"), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
   private buildWatchdogOptions(task: AgentTask, stage: string) {
     const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
@@ -6162,6 +6198,20 @@ ${guidance}`
         thresholdsMs: cfg?.thresholdsMs,
         softLogIntervalMs: cfg?.softLogIntervalMs,
         recentEventLimit: cfg?.recentEventLimit,
+        context,
+      },
+    };
+  }
+
+  private buildStallOptions(task: AgentTask, stage: string) {
+    const cfg = getConfig().stall;
+    const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
+    const idleMs = cfg?.nudgeAfterMs ?? cfg?.idleMs ?? 5 * 60_000;
+
+    return {
+      stall: {
+        enabled: cfg?.enabled ?? true,
+        idleMs,
         context,
       },
     };
@@ -6404,6 +6454,7 @@ ${guidance}`
           cacheKey,
           runLogPath,
           ...this.buildWatchdogOptions(task, `nudge-${stage}`),
+          ...this.buildStallOptions(task, `nudge-${stage}`),
           ...opencodeSessionOptions,
         });
         return { success: res.success, error: res.success ? undefined : res.output };
@@ -6567,6 +6618,126 @@ ${guidance}`
       outcome: "escalated",
       sessionId: result.sessionId || undefined,
       escalationReason: escalationReason,
+    };
+  }
+
+  private async handleStallTimeout(
+    task: AgentTask,
+    cacheKey: string,
+    stage: string,
+    result: SessionResult
+  ): Promise<AgentRun> {
+    const cfg = getConfig().stall;
+    const maxRestarts = cfg?.maxRestarts ?? 1;
+
+    const timeout = result.stallTimeout;
+    const retryCount = this.getStallRetryCount(task);
+    const nextRetryCount = retryCount + 1;
+    const sessionId = result.sessionId || task["session-id"]?.trim() || "";
+
+    const idleSeconds = timeout ? Math.round(timeout.lastActivityMsAgo / 1000) : 0;
+    const reason = timeout
+      ? `Session stalled: no activity for ${idleSeconds}s (${stage})`
+      : `Session stalled (${stage})`;
+
+    if (retryCount === 0 && sessionId) {
+      const nudgeReason = `${reason}; nudging session`;
+      console.warn(`[ralph:worker:${this.repo}] Stall detected; nudging by re-queuing for resume: ${nudgeReason}`);
+      await this.queue.updateTaskStatus(task, "queued", {
+        "session-id": sessionId,
+        "stall-retries": String(nextRetryCount),
+        "blocked-source": "stall",
+        "blocked-reason": nudgeReason,
+        "blocked-details": timeout?.context ? `Context: ${timeout.context}` : "",
+        "blocked-at": new Date().toISOString(),
+        "blocked-checked-at": new Date().toISOString(),
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: nudgeReason,
+      };
+    }
+
+    if (retryCount <= maxRestarts) {
+      console.warn(`[ralph:worker:${this.repo}] Stall repeated; restarting with fresh session: ${reason}`);
+      await this.queue.updateTaskStatus(task, "queued", {
+        "session-id": "",
+        "stall-retries": String(nextRetryCount),
+        "blocked-source": "",
+        "blocked-reason": "",
+        "blocked-details": "",
+        "blocked-at": "",
+        "blocked-checked-at": "",
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: reason,
+      };
+    }
+
+    console.log(`[ralph:worker:${this.repo}] Stall repeated after restart; escalating: ${reason}`);
+    const escalationFields: Record<string, string> = {
+      "stall-retries": String(nextRetryCount),
+    };
+    if (sessionId) escalationFields["session-id"] = sessionId;
+
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
+    if (escalated) {
+      applyTaskPatch(task, "escalated", escalationFields);
+    }
+
+    const details = [
+      timeout?.context ? `Context: ${timeout.context}` : null,
+      sessionId ? `Session: ${sessionId}` : null,
+      task["run-log-path"]?.trim() ? `Run log: ${task["run-log-path"]?.trim()}` : null,
+      sessionId ? `Events: ${getSessionEventsPath(sessionId)}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const githubCommentUrl = await this.writeEscalationWriteback(task, {
+      reason,
+      details: details || undefined,
+      escalationType: "other",
+    });
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      sessionId: sessionId || undefined,
+      reason,
+      escalationType: "other",
+      githubCommentUrl: githubCommentUrl ?? undefined,
+      planOutput: result.output,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        sessionId: sessionId || undefined,
+        details: result.output,
+      });
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: sessionId || undefined,
+      escalationReason: reason,
     };
   }
 
@@ -6736,6 +6907,7 @@ ${guidance}`
           stepTitle: "resume",
         },
         ...this.buildWatchdogOptions(task, "resume"),
+        ...this.buildStallOptions(task, "resume"),
         ...opencodeSessionOptions,
       });
 
@@ -6745,6 +6917,10 @@ ${guidance}`
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult, opencodeXdg);
+        }
+
+        if (buildResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "resume", buildResult);
         }
 
         const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
@@ -6877,6 +7053,7 @@ ${guidance}`
                 stepTitle: "resume loop-break",
               },
               ...this.buildWatchdogOptions(task, "resume-loop-break"),
+              ...this.buildStallOptions(task, "resume-loop-break"),
               ...opencodeSessionOptions,
             }
           );
@@ -6891,6 +7068,10 @@ ${guidance}`
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
+            }
+
+            if (buildResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "resume-loop-break", buildResult);
             }
             console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
             break;
@@ -6951,6 +7132,7 @@ ${guidance}`
             stepTitle: "continue",
           },
           ...this.buildWatchdogOptions(task, "resume-continue"),
+          ...this.buildStallOptions(task, "resume-continue"),
           ...opencodeSessionOptions,
         });
 
@@ -6964,6 +7146,10 @@ ${guidance}`
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult, opencodeXdg);
+          }
+
+          if (buildResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "resume-continue", buildResult);
           }
 
           // If the session ended without printing a URL, try to recover PR from git state.
@@ -7102,6 +7288,7 @@ ${guidance}`
         cacheKey,
         runLogPath: resumeSurveyRunLogPath,
         ...this.buildWatchdogOptions(task, "resume-survey"),
+        ...this.buildStallOptions(task, "resume-survey"),
         ...opencodeSessionOptions,
       });
 
@@ -7116,6 +7303,10 @@ ${guidance}`
       if (!surveyResult.success) {
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult, opencodeXdg);
+        }
+
+        if (surveyResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "resume-survey", surveyResult);
         }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
@@ -7327,6 +7518,7 @@ ${guidance}`
           stepTitle: "plan",
         },
         ...this.buildWatchdogOptions(task, "plan"),
+        ...this.buildStallOptions(task, "plan"),
         ...opencodeSessionOptions,
       });
 
@@ -7335,6 +7527,10 @@ ${guidance}`
 
       if (!planResult.success && planResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
+      }
+
+      if (!planResult.success && planResult.stallTimeout) {
+        return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
       }
 
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
@@ -7354,6 +7550,7 @@ ${guidance}`
             stepTitle: "plan (retry)",
           },
           ...this.buildWatchdogOptions(task, "plan-retry"),
+          ...this.buildStallOptions(task, "plan-retry"),
           ...opencodeSessionOptions,
         });
       }
@@ -7364,6 +7561,10 @@ ${guidance}`
       if (!planResult.success) {
         if (planResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
+        }
+
+        if (planResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
         }
 
         const reason = `planner failed: ${planResult.output}`;
@@ -7433,6 +7634,7 @@ ${guidance}`
             step: 2,
             stepTitle: "consult devex",
           },
+          ...this.buildStallOptions(task, "consult devex"),
           ...opencodeSessionOptions,
         });
 
@@ -7444,6 +7646,9 @@ ${guidance}`
         if (pausedAfterDevexConsult) return pausedAfterDevexConsult;
 
         if (!devexResult.success) {
+          if (devexResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "consult devex", devexResult);
+          }
           console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
           devexContext = {
             consulted: true,
@@ -7488,6 +7693,7 @@ ${guidance}`
               step: 3,
               stepTitle: "reroute after devex",
             },
+            ...this.buildStallOptions(task, "reroute after devex"),
             ...opencodeSessionOptions,
           });
 
@@ -7499,6 +7705,9 @@ ${guidance}`
           if (pausedAfterReroute) return pausedAfterReroute;
 
           if (!rerouteResult.success) {
+            if (rerouteResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "reroute after devex", rerouteResult);
+            }
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
             if (rerouteResult.sessionId) {
@@ -7627,6 +7836,7 @@ ${guidance}`
           stepTitle: "build",
         },
         ...this.buildWatchdogOptions(task, "build"),
+        ...this.buildStallOptions(task, "build"),
         ...opencodeSessionOptions,
       });
 
@@ -7636,6 +7846,10 @@ ${guidance}`
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult, opencodeXdg);
+        }
+
+        if (buildResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "build", buildResult);
         }
         throw new Error(`Build failed: ${buildResult.output}`);
       }
@@ -7760,6 +7974,7 @@ ${guidance}`
                 stepTitle: "build loop-break",
               },
               ...this.buildWatchdogOptions(task, "build-loop-break"),
+              ...this.buildStallOptions(task, "build-loop-break"),
               ...opencodeSessionOptions,
             }
           );
@@ -7770,6 +7985,10 @@ ${guidance}`
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
+            }
+
+            if (buildResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "build-loop-break", buildResult);
             }
             console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
             break;
@@ -7830,6 +8049,7 @@ ${guidance}`
             stepTitle: "build continue",
           },
           ...this.buildWatchdogOptions(task, "build-continue"),
+          ...this.buildStallOptions(task, "build-continue"),
           ...opencodeSessionOptions,
         });
 
@@ -7839,6 +8059,10 @@ ${guidance}`
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult, opencodeXdg);
+          }
+
+          if (buildResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "build-continue", buildResult);
           }
 
           // If the session ended without printing a URL, try to recover PR from git state.
@@ -7981,6 +8205,7 @@ ${guidance}`
           stepTitle: "survey",
         },
         ...this.buildWatchdogOptions(task, "survey"),
+        ...this.buildStallOptions(task, "survey"),
         ...opencodeSessionOptions,
       });
 
@@ -7990,6 +8215,10 @@ ${guidance}`
       if (!surveyResult.success) {
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+        }
+
+        if (surveyResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
         }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }

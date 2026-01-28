@@ -46,6 +46,8 @@ export interface QueueTask {
   "repo-slot"?: string;
   /** Watchdog recovery attempts (string in frontmatter) */
   "watchdog-retries"?: string;
+  /** Stall recovery attempts (string in frontmatter) */
+  "stall-retries"?: string;
   /** Blocked reason category */
   "blocked-source"?: BlockedSource;
   /** Short explanation of block reason */
