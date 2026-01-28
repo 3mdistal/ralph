@@ -28,8 +28,11 @@ function printGlobalHelp(): void {
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
+      "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
+      "  ralph sandbox seed                 Seed sandbox edge-case issues",
       "",
       "Options:",
       "  -h, --help                         Show help (also: ralph help [command])",
@@ -123,6 +126,29 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox:init":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:init [--no-seed]",
+          "",
+          "Creates a new sandbox repo from the configured template and writes a manifest.",
+          "Runs seeding unless --no-seed is provided.",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:seed":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:seed [--run-id <id>]",
+          "",
+          "Seeds a sandbox repo based on the manifest (defaults to newest manifest if omitted).",
+        ].join("\n")
+      );
+      return;
+
     case "rollup":
       console.log(
         [
@@ -152,6 +178,17 @@ function printCommandHelp(command: string): void {
           "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
           "",
           "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox seed --repo <owner/repo> [options]",
+          "",
+          "Seeds a sandbox repo with deterministic edge-case issues and relationships.",
         ].join("\n")
       );
       return;

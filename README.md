@@ -135,6 +135,26 @@ sandbox = {
 }
 ```
 
+Optional provisioning block (used by `sandbox:init` / `sandbox:seed`):
+
+```toml
+profile = "sandbox"
+sandbox = {
+  allowedOwners = ["3mdistal"],
+  repoNamePrefix = "ralph-sandbox-",
+  githubAuth = { tokenEnvVar = "GITHUB_SANDBOX_TOKEN" },
+  provisioning = {
+    templateRepo = "3mdistal/ralph-sandbox-template",
+    templateRef = "main",
+    repoVisibility = "private",
+    settingsPreset = "minimal",
+    seed = { preset = "baseline" }
+  }
+}
+```
+
+Canonical sandbox provisioning contract: `docs/product/sandbox-provisioning.md`.
+
 ### Sandbox repo lifecycle
 
 Sandbox run repos should be explicitly tagged with the `ralph-sandbox` topic before any automated teardown/prune. This is a hard safety invariant: teardown/prune refuses to mutate repos without the marker topic.
@@ -177,6 +197,12 @@ ralph sandbox tag --failed --apply
   - `githubAuth` (object): dedicated sandbox auth
     - `githubApp` (object): GitHub App installation auth for sandbox runs
     - `tokenEnvVar` (string): env var name for a fine-grained PAT restricted to sandbox repos
+  - `provisioning` (object, optional): sandbox repo provisioning
+    - `templateRepo` (string): required template repo (`owner/name`)
+    - `templateRef` (string): template ref/branch (default: `main`)
+    - `repoVisibility` (string): `private` (default; other values invalid)
+    - `settingsPreset` (string): `minimal` (default) or `parity`
+    - `seed` (object, optional): `{ preset = "baseline" }` or `{ file = "/abs/path/seed.json" }`
   - `retention` (object, optional): sandbox repo retention defaults
     - `keepLast` (number): keep last N repos (default: 10)
     - `keepFailedDays` (number): keep failed repos for N days (default: 14)
@@ -303,6 +329,26 @@ Machine-readable output:
 ralph repos --json
 ```
 
+### Sandbox provisioning
+
+```bash
+bun run sandbox:init
+```
+
+Skip seeding:
+
+```bash
+bun run sandbox:init --no-seed
+```
+
+Seed an existing sandbox repo (defaults to newest manifest if `--run-id` omitted):
+
+```bash
+bun run sandbox:seed --run-id <run-id>
+```
+
+Manifests are written to `~/.ralph/sandbox/manifests/<runId>.json`.
+
 ### Nudge an in-progress task
 
 ```bash
@@ -311,6 +357,22 @@ ralph nudge <taskRef> "Just implement it, stop asking questions"
 
 - Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
 - Success means the delivery attempt succeeded, not guaranteed agent compliance.
+
+
+### Seed sandbox edge cases
+
+```bash
+ralph sandbox seed --repo <owner/repo>
+```
+
+Seeds a sandbox repo with deterministic edge-case issues/relationships (dependency graphs, sub-issues, label drift, and collision tasks). This command requires `profile = "sandbox"` with a configured sandbox allowlist/prefix.
+
+Useful flags:
+
+```bash
+ralph sandbox seed --repo <owner/repo> --dry-run
+ralph sandbox seed --repo <owner/repo> --manifest sandbox/seed-manifest.v1.json --out sandbox/seed-ids.v1.json
+```
 
 
 ### Queue a task
@@ -343,7 +405,7 @@ orchestration/
   config.toml     # preferred config (if present)
   config.json     # fallback config
   state.sqlite    # durable metadata for idempotency + recovery (repos/issues/tasks/prs + sync/idempotency)
-  sessions/       # introspection logs per session
+  sessions/       # introspection logs per session (events.jsonl + summary.json)
 ```
 
 ## How it works
@@ -419,6 +481,8 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 ## Managed OpenCode config (daemon runs)
 
 Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `$HOME/.ralph/opencode`. This directory is owned by Ralph and overwritten on startup to match the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Override precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. Overrides must be absolute paths (no `~` expansion). For safety, Ralph refuses to manage non-managed directories unless they already contain the `.ralph-managed-opencode` marker file. This does not change OpenCode profile storage; profiles still control XDG roots for auth/storage/usage logs.
+
+Daemon runs do not rely on `~/.config/opencode` plugins. Ralph emits its own introspection artifacts at `~/.ralph/sessions/<sessionId>/events.jsonl` and `~/.ralph/sessions/<sessionId>/summary.json` for watchdog/anomaly detection.
 
 ## OpenCode profiles (multi-account)
 
@@ -576,7 +640,7 @@ In daemon mode, a single tool call can hang indefinitely. Ralph uses a watchdog 
 
 ### Configuration
 
-Configure via `~/.config/opencode/ralph/ralph.json` under `watchdog`:
+Configure via `~/.ralph/config.toml` or `~/.ralph/config.json` under `watchdog` (legacy `~/.config/opencode/ralph/ralph.json` is still supported):
 
 ```json
 {
