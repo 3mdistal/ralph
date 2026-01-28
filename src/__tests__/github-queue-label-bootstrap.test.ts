@@ -57,7 +57,9 @@ describe("GitHub queue label bootstrap", () => {
         },
         listIssueLabels: async () => [],
         addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
         removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async () => true,
       },
     });
 

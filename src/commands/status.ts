@@ -231,12 +231,13 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   const json = opts.args.includes("--json");
 
   const config = getConfig();
-  const queueState = getQueueBackendState();
 
   // Status reads from the durable SQLite state DB (GitHub issue snapshots, task op
   // state, idempotency). The daemon initializes this during startup, but CLI
   // subcommands need to do it explicitly.
   initStateDb();
+
+  const queueState = getQueueBackendStateWithLabelHealth();
 
   const daemonRecord = readDaemonRecord();
   const daemon = daemonRecord

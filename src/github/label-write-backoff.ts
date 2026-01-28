@@ -11,7 +11,7 @@ function isSecondaryRateLimitText(text: string): boolean {
   return value.includes("secondary rate limit") || value.includes("abuse detection") || value.includes("temporarily blocked");
 }
 
-export function isTransientLabelWriteError(error: unknown): boolean {
+function isTransientLabelWriteError(error: unknown): boolean {
   if (error instanceof GitHubApiError) {
     if (error.status === 429 || error.code === "rate_limit") return true;
     if (isSecondaryRateLimitText(error.responseText)) return true;
