@@ -107,10 +107,10 @@ We want a stable operator interface that works without the dashboard, but can be
   - optionally sets `pause_requested` for active workers
 - `ralphctl resume`
   - clears `draining/paused` and lets scheduling continue
-- `ralphctl restart [--grace 5m]`
+- `ralphctl restart [--grace 5m] [--start-cmd "<command>"]`
   - requests drain, waits for drained/timeout, terminates daemon, starts daemon
-- `ralphctl upgrade [--git-pull] [--grace 5m]`
-  - same as restart, but runs the upgrade step (implementation depends on how Ralph is installed)
+- `ralphctl upgrade [--grace 5m] [--start-cmd "<command>"] [--upgrade-cmd "<command>"]`
+  - same as restart, but runs the operator-provided upgrade step
 
 ### How the CLI talks to the daemon
 
@@ -120,6 +120,8 @@ Two phases:
   - CLI writes a control file, e.g. `$XDG_STATE_HOME/ralph/control.json` (fallback `~/.local/state/ralph/control.json`, last resort `/tmp/ralph/<uid>/control.json`).
   - Daemon watches/polls it, and creates it on startup with `{ "mode": "running" }` if missing (configurable).
   - Optional: CLI sends `SIGUSR1` to prompt immediate reload.
+  - Daemon writes a lease record at `$XDG_STATE_HOME/ralph/daemon.json` (same fallback rules) containing PID, daemonId, and the start command.
+    `ralphctl` uses this record to stop/start the daemon unless `--start-cmd` overrides it.
 
 - Phase 1 (dashboard/control plane):
   - Same semantics exposed as authenticated endpoints, e.g. `POST /v1/commands/daemon/drain`.

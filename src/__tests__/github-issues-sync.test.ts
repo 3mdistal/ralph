@@ -22,11 +22,12 @@ function buildIssue(params: {
   labels?: string[];
   nodeId?: string;
   isPr?: boolean;
+  state?: "open" | "closed";
 }) {
   return {
     number: params.number,
     title: `Issue ${params.number}`,
-    state: "open",
+    state: params.state ?? "open",
     html_url: `https://github.com/${repo}/issues/${params.number}`,
     updated_at: params.updatedAt,
     node_id: params.nodeId ?? `NODE_${params.number}`,
@@ -140,6 +141,35 @@ describe("github issue sync", () => {
     try {
       const labelCount = db.query("SELECT COUNT(*) as n FROM issue_labels").get() as { n: number };
       expect(labelCount.n).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("stores open issues when storeAllOpen is enabled", async () => {
+    const fetchMock: FetchLike = async () =>
+      new Response(
+        JSON.stringify([
+          buildIssue({ number: 10, updatedAt: "2026-01-11T00:00:01.000Z", labels: [] }),
+          buildIssue({ number: 11, updatedAt: "2026-01-11T00:00:02.000Z", labels: [], state: "closed" }),
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      storeAllOpen: true,
+      deps: { fetch: fetchMock, getToken: async () => "token" },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.stored).toBe(1);
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      const issueCount = db.query("SELECT COUNT(*) as n FROM issues").get() as { n: number };
+      expect(issueCount.n).toBe(1);
     } finally {
       db.close();
     }

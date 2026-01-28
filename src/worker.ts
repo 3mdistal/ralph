@@ -10,6 +10,7 @@ import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
   getOpencodeDefaultProfileName,
+  getRequestedOpencodeProfileName,
   getRepoBotBranch,
   getRepoConcurrencySlots,
   getRepoRequiredChecksOverride,
@@ -57,6 +58,7 @@ import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
+import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import {
   buildCiDebugCommentBody,
@@ -102,7 +104,9 @@ import { isSafeSessionId } from "./session-id";
 import {
   completeRalphRun,
   createRalphRun,
+  ensureRalphRunGateRows,
   getIdempotencyPayload,
+  recordRalphRunGateArtifact,
   upsertIdempotencyKey,
   recordIssueSnapshot,
   recordPrSnapshot,
@@ -112,6 +116,7 @@ import {
   type PrState,
   type RalphRunAttemptKind,
   type RalphRunDetails,
+  upsertRalphRunGateResult,
 } from "./state";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
@@ -919,6 +924,7 @@ export class RepoWorker {
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
+  private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -1054,6 +1060,7 @@ export class RepoWorker {
     run: () => Promise<AgentRun>
   ): Promise<AgentRun> {
     let runId: string | null = null;
+    const previousRunId = this.activeRunId;
 
     try {
       runId = createRalphRun({
@@ -1070,6 +1077,15 @@ export class RepoWorker {
 
     if (!runId) {
       return await run();
+    }
+
+    this.activeRunId = runId;
+    try {
+      ensureRalphRunGateRows({ runId });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to initialize gate rows for ${task.name}: ${error?.message ?? String(error)}`
+      );
     }
 
     const recordingBase = createRunRecordingSessionAdapter({
@@ -1111,6 +1127,7 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] Failed to complete run record for ${task.name}: ${error?.message ?? String(error)}`
         );
       }
+      this.activeRunId = previousRunId;
     }
   }
 
@@ -1606,6 +1623,12 @@ export class RepoWorker {
         console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
         return;
       }
+      if (result.kind === "transient") {
+        console.warn(
+          `[ralph:worker:${this.repo}] GitHub label write skipped (transient): ${String(result.error)}`
+        );
+        return;
+      }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
     }
   }
@@ -1625,6 +1648,12 @@ export class RepoWorker {
     if (!result.ok) {
       if (result.kind === "policy") {
         console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
+        return;
+      }
+      if (result.kind === "transient") {
+        console.warn(
+          `[ralph:worker:${this.repo}] GitHub label write skipped (transient): ${String(result.error)}`
+        );
         return;
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
@@ -2431,40 +2460,11 @@ ${guidance}`
   }
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
-    const resolved = this.resolveDependencySignals(snapshot);
+    const resolved = resolveRelationshipSignals(snapshot);
     if (resolved.ignoredBodyBlockers > 0) {
       this.logIgnoredBodyBlockers(snapshot.issue, resolved.ignoredBodyBlockers, resolved.ignoreReason);
     }
-
-    if (!snapshot.coverage.githubDepsComplete && !resolved.hasBodyDepsCoverage) {
-      resolved.signals.push({ source: "github", kind: "blocked_by", state: "unknown" });
-    }
-    if (!snapshot.coverage.githubSubIssuesComplete) {
-      resolved.signals.push({ source: "github", kind: "sub_issue", state: "unknown" });
-    }
     return resolved.signals;
-  }
-
-  private resolveDependencySignals(snapshot: IssueRelationshipSnapshot): {
-    signals: RelationshipSignal[];
-    hasBodyDepsCoverage: boolean;
-    ignoredBodyBlockers: number;
-    ignoreReason: "complete" | "partial";
-  } {
-    const signals = [...snapshot.signals];
-    const githubDepsSignals = signals.filter((signal) => signal.source === "github" && signal.kind === "blocked_by");
-    const bodyDepsSignals = signals.filter((signal) => signal.source === "body" && signal.kind === "blocked_by");
-    const hasGithubDepsSignals = githubDepsSignals.length > 0;
-    const hasGithubDepsCoverage = snapshot.coverage.githubDepsComplete;
-    const shouldIgnoreBodyDeps = hasGithubDepsCoverage || (!hasGithubDepsCoverage && hasGithubDepsSignals);
-    const filteredSignals = shouldIgnoreBodyDeps
-      ? signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
-      : signals;
-    const hasBodyDepsCoverage = snapshot.coverage.bodyDeps && !shouldIgnoreBodyDeps;
-    const ignoredBodyBlockers = shouldIgnoreBodyDeps ? bodyDepsSignals.length : 0;
-    const ignoreReason = hasGithubDepsCoverage ? "complete" : "partial";
-
-    return { signals: filteredSignals, hasBodyDepsCoverage, ignoredBodyBlockers, ignoreReason };
   }
 
   private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {
@@ -3229,10 +3229,12 @@ ${guidance}`
       last = { headSha, mergeStateStatus, baseRefName, summary, checks };
 
       if (mergeStateStatus === "DIRTY") {
+        this.recordCiGateSummary(prUrl, summary);
         return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false, stopReason: "merge-conflict" };
       }
 
       if (summary.status === "success" || summary.status === "failure") {
+        this.recordCiGateSummary(prUrl, summary);
         return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
       }
 
@@ -3261,16 +3263,19 @@ ${guidance}`
     }
 
     if (last) {
+      this.recordCiGateSummary(prUrl, last.summary);
       return { ...last, timedOut: true };
     }
 
     // Should be unreachable, but keep types happy.
     const fallback = await this.getPullRequestChecks(prUrl);
+    const fallbackSummary = summarizeRequiredChecks(fallback.checks, requiredChecks);
+    this.recordCiGateSummary(prUrl, fallbackSummary);
     return {
       headSha: fallback.headSha,
       mergeStateStatus: fallback.mergeStateStatus,
       baseRefName: fallback.baseRefName,
-      summary: summarizeRequiredChecks(fallback.checks, requiredChecks),
+      summary: fallbackSummary,
       checks: fallback.checks,
       timedOut: true,
     };
@@ -3364,6 +3369,50 @@ ${guidance}`
     return [...head, "...", ...tail].join("\n");
   }
 
+  private recordCiGateSummary(prUrl: string, summary: RequiredChecksSummary): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+    const status = summary.status === "success" ? "pass" : summary.status === "failure" ? "fail" : "pending";
+    const prNumber = extractPullRequestNumber(prUrl);
+    const ciUrl = summary.required.map((check) => check.detailsUrl).find(Boolean) ?? null;
+
+    try {
+      upsertRalphRunGateResult({
+        runId,
+        gate: "ci",
+        status,
+        url: ciUrl,
+        prNumber: prNumber ?? null,
+        prUrl,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist CI gate status for ${prUrl}: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
+  private recordCiFailureArtifacts(logs: FailedCheckLog[]): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    for (const entry of logs) {
+      if (!entry.logExcerpt) continue;
+      try {
+        recordRalphRunGateArtifact({
+          runId,
+          gate: "ci",
+          kind: "failure_excerpt",
+          content: entry.logExcerpt,
+        });
+      } catch (error: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to persist CI gate artifact: ${error?.message ?? String(error)}`
+        );
+      }
+    }
+  }
+
   private async getCheckLog(runId: string): Promise<CheckLogResult> {
     try {
       const result = await ghRead(this.repo)`gh run view ${runId} --repo ${this.repo} --log-failed`.quiet();
@@ -3412,6 +3461,10 @@ ${guidance}`
       }
 
       logs.push({ ...check, ...logResult, runUrl: check.detailsUrl ?? undefined });
+    }
+
+    if (opts.includeLogs) {
+      this.recordCiFailureArtifacts(logs);
     }
 
     return {
@@ -4593,6 +4646,7 @@ ${guidance}`
       baseRefName = prStatus.baseRefName;
       const prState = await this.getPullRequestMergeState(params.prUrl);
       headRefName = prState.headRefName || null;
+      this.recordCiGateSummary(params.prUrl, summary);
     } catch (error: any) {
       const reason = `CI-debug preflight failed for ${params.prUrl}: ${this.formatGhError(error)}`;
       console.warn(`[ralph:worker:${this.repo}] ${reason}`);
@@ -4750,7 +4804,7 @@ ${guidance}`
       const prStatus = await this.getPullRequestChecks(params.prUrl);
       summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
       headSha = prStatus.headSha;
-
+      this.recordCiGateSummary(params.prUrl, summary);
       attempt.headShaAfter = headSha;
       attempt.signatureAfter = this.formatCiDebugSignature(summary, false);
     } catch (error: any) {
@@ -6123,7 +6177,7 @@ ${guidance}`
 
     const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-    const requested = control.opencodeProfile?.trim() ?? "";
+    const requested = getRequestedOpencodeProfileName(control.opencodeProfile);
 
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
@@ -6158,7 +6212,15 @@ ${guidance}`
         `[ralph:worker:${this.repo}] Control opencode_profile=${JSON.stringify(requested)} does not match a configured profile; ` +
           `falling back to defaultProfile=${JSON.stringify(getOpencodeDefaultProfileName() ?? "")}`
       );
-      resolved = resolveOpencodeProfile(null);
+      const fallbackRequested = getRequestedOpencodeProfileName(null);
+      if (fallbackRequested === "auto") {
+        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+          getThrottleDecision: this.throttle.getThrottleDecision,
+        });
+        resolved = chosen ? resolveOpencodeProfile(chosen) : null;
+      } else {
+        resolved = fallbackRequested ? resolveOpencodeProfile(fallbackRequested) : null;
+      }
     }
 
     if (!resolved) {
@@ -6190,27 +6252,27 @@ ${guidance}`
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
       const defaults = getConfig().control;
-      const controlProfile =
-        readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
+      const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile;
+      const requestedProfile = getRequestedOpencodeProfileName(controlProfile);
 
-      if (controlProfile === "auto") {
+      if (requestedProfile === "auto") {
         const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
           getThrottleDecision: this.throttle.getThrottleDecision,
         });
 
         decision = await this.throttle.getThrottleDecision(Date.now(), {
-          opencodeProfile: chosen ?? getOpencodeDefaultProfileName(),
+          opencodeProfile: chosen ?? null,
         });
       } else if (!hasSession) {
         // Safe to fail over between profiles before starting a new session.
         decision = (
-          await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null, {
+          await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile || null, {
             getThrottleDecision: this.throttle.getThrottleDecision,
           })
         ).decision;
       } else {
         // Do not fail over while a session is in flight/resuming.
-        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
+        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: requestedProfile || null });
       }
     }
 

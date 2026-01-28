@@ -1,18 +1,6 @@
 #!/usr/bin/env bun
 
-import { readFileSync } from "fs";
-
-function getVersion(): string {
-  try {
-    const pkgPath = new URL("../package.json", import.meta.url);
-    const raw = readFileSync(pkgPath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.version === "string") return parsed.version;
-  } catch {
-    // ignore
-  }
-  return "unknown";
-}
+import { getRalphVersion } from "./version";
 
 function printGlobalHelp(): void {
   console.log(
@@ -23,6 +11,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph gates <repo> <issue> [--json] Show deterministic gate state",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
@@ -66,6 +55,20 @@ function printCommandHelp(command: string): void {
           "  ralph status [--json]",
           "",
           "Shows daemon mode plus starting, queued, in-progress, and throttled tasks, plus pending escalations.",
+          "",
+          "Options:",
+          "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "gates":
+      console.log(
+        [
+          "Usage:",
+          "  ralph gates <repo> <issueNumber> [--json]",
+          "",
+          "Shows the latest deterministic gate state for an issue.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -207,7 +210,7 @@ const hasVersionFlag = args.includes("--version") || args.includes("-v");
 
 // Fast-exit flags: handle before importing the orchestrator implementation.
 if (hasVersionFlag) {
-  console.log(getVersion());
+  console.log(getRalphVersion() ?? "unknown");
   process.exit(0);
 }
 
@@ -228,6 +231,7 @@ if (!cmd || cmd.startsWith("-")) {
 if (
   (cmd === "resume" ||
     cmd === "status" ||
+    cmd === "gates" ||
     cmd === "usage" ||
     cmd === "repos" ||
     cmd === "watch" ||

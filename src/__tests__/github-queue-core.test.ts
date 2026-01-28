@@ -188,6 +188,47 @@ describe("github queue core", () => {
 
     expect(recover).toBe(true);
   });
+
+  test("shouldRecoverStaleInProgress ignores released tasks", () => {
+    const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
+    const ttlMs = 60_000;
+
+    const recover = shouldRecoverStaleInProgress({
+      labels: ["ralph:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 64,
+        taskPath: "github:3mdistal/ralph#64",
+        heartbeatAt: "2026-01-11T00:00:00.000Z",
+        releasedAtMs: Date.parse("2026-01-11T00:05:00.000Z"),
+      },
+      nowMs,
+      ttlMs,
+    });
+
+    expect(recover).toBe(false);
+  });
+
+  test("deriveTaskView treats released tasks as queued", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 290,
+        title: "Released",
+        labels: ["ralph:in-progress"],
+      },
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 290,
+        taskPath: "github:3mdistal/ralph#290",
+        status: "in-progress",
+        releasedAtMs: Date.parse("2026-01-23T00:00:00.000Z"),
+      },
+      nowIso: "2026-01-23T00:10:00.000Z",
+    });
+
+    expect(task.status).toBe("queued");
+  });
 });
 
 describe("issue label io", () => {

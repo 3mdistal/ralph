@@ -105,4 +105,38 @@ describe("applyIssueLabelOps", () => {
       "remove:ralph:queued",
     ]);
   });
+
+  test("skips rollback on transient failures", async () => {
+    const calls: string[] = [];
+    const io = {
+      addLabel: async (label: string) => {
+        calls.push(`add:${label}`);
+      },
+      removeLabel: async (label: string) => {
+        calls.push(`remove:${label}`);
+        throw new GitHubApiError({
+          message: "Rate limit",
+          code: "rate_limit",
+          status: 429,
+          requestId: "req-3",
+          responseText: "secondary rate limit",
+        });
+      },
+    };
+
+    const result = await applyIssueLabelOps({
+      ops: [
+        { action: "add", label: "ralph:queued" },
+        { action: "remove", label: "ralph:in-progress" },
+      ],
+      io,
+      repo: "3mdistal/ralph",
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.kind).toBe("transient");
+    }
+    expect(calls).toEqual(["add:ralph:queued", "remove:ralph:in-progress"]);
+  });
 });

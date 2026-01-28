@@ -28,6 +28,16 @@ The label descriptions and colors are enforced to match `src/github-labels.ts` (
 | `ralph:done` | Task merged to default branch | `1A7F37` |
 | `ralph:escalated` | Waiting on human input | `B60205` |
 
+### Degraded mode: label writes unavailable
+
+GitHub label writes are best-effort. When label mutations are throttled or blocked by GitHub (secondary rate limits, abuse detection, or temporary blocks), Ralph continues scheduling based on local SQLite ownership/heartbeat state and records a label-write backoff window.
+
+Behavior:
+- GitHub labels may temporarily drift from local truth (for example, `ralph:in-progress` may remain visible while the local slot is released).
+- Scheduling and slot release must not depend on GitHub label writes.
+- Ralph emits a degraded-mode signal in logs/status: `Queue backend: github (degraded)` with diagnostics like `label writes blocked until <iso>`.
+- Labels converge via best-effort reconciliation once GitHub writes resume.
+
 ## Operator-owned priority labels
 
 Operators can influence queue ordering by applying `p0`-`p4` labels on GitHub issues. Ralph infers task priority from
@@ -54,6 +64,21 @@ Note: scheduler "priority tasks" are reserved for resume work and are separate f
 - Stale recovery: Ralph only re-queues `ralph:in-progress` issues when the stored `heartbeat-at` exists and is stale beyond `ownershipTtlMs`.
   Missing or invalid heartbeats do not trigger automatic recovery.
 - Orphan PR reconciliation: if an issue is `ralph:queued` but already has an open PR authored by the configured Ralph GitHub App that closes the issue (e.g. `Fixes #123`) and is mergeable into `bot/integration`, Ralph merges it and applies `ralph:in-bot`.
+
+## Auto-queue (optional)
+
+Auto-queue is opt-in per repo and reconciles GitHub issues into the Ralph workflow based on dependency state.
+
+Config (`repos[].autoQueue`):
+- `enabled` (boolean): enable auto-queue reconciliation (default: false)
+- `scope` (string): `labeled-only` or `all-open` (default: `labeled-only`)
+- `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
+- `dryRun` (boolean): compute decisions without mutating labels (default: false)
+
+Behavior (when enabled):
+- Evaluates open issues for dependency/sub-issue blockers using GitHub-native relationships (body parsing is fallback).
+- Adds/removes `ralph:blocked` and `ralph:queued` labels based on blocked state.
+- Skips issues already in `ralph:in-progress`, `ralph:escalated`, or `ralph:done` states.
 
 ## Dependency encoding
 
