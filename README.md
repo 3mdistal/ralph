@@ -240,12 +240,12 @@ Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derive
 Note: `repos[].setup` commands run in the task worktree before any OpenCode agent execution. Setup is cached per worktree by `(commands hash + lockfile signature)`; if commands or lockfiles change, setup runs again.
 
 
-When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
+When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections. If required check contexts are missing (including when no check contexts exist yet), Ralph logs a warning, proceeds without protection for now, and retries after a short delay.
 Setting `repos[].requiredChecks` to `[]` disables Ralph's merge gating but does not clear existing GitHub branch protection rules.
 
 Ralph refuses to auto-merge PRs targeting `main` unless the issue has the `allow-main` label. This guardrail only affects Ralph automation; humans can still merge to `main` normally.
 
-If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names.
+If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names. Ralph will retry branch protection after the defer window.
 
 ### GitHub auth precedence
 
