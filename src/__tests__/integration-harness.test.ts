@@ -58,7 +58,7 @@ async function writeTestConfig(): Promise<void> {
 const updateTaskStatusMock = mock(async () => true);
 
 const notifyEscalationMock = mock(async () => true);
-const notifyErrorMock = mock(async () => {});
+const notifyErrorMock = mock(async (_title: string, _body: string, _context?: unknown) => {});
 const notifyTaskCompleteMock = mock(async () => {});
 
 const runAgentMock = mock(async () => ({
@@ -774,6 +774,81 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(mergePullRequestMock.mock.calls[0][1]).toBe("deadbeef");
     expect(mergePullRequestMock.mock.calls[1][1]).toBe("beadfeed");
   }, lifecycleTimeoutMs);
+
+  test("merge retries after updating when GitHub expects required status checks", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ kind: "ok", repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+
+    const waitForRequiredChecksMock = mock()
+      .mockImplementationOnce(async () => ({
+        headSha: "deadbeef",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
+        summary: {
+          status: "success",
+          required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+          available: ["ci"],
+        },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        timedOut: false,
+      }))
+      .mockImplementationOnce(async () => ({
+        headSha: "beadfeed",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
+        summary: {
+          status: "success",
+          required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+          available: ["ci"],
+        },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        timedOut: false,
+      }));
+
+    const mergePullRequestMock = mock()
+      .mockImplementationOnce(async () => {
+        const err: any = new Error("gh: 3 of 3 required status checks are expected. (HTTP 405)");
+        err.stderr = "gh: 3 of 3 required status checks are expected. (HTTP 405)";
+        throw err;
+      })
+      .mockImplementationOnce(async () => {});
+
+    const updatePullRequestBranchMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
+
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
+    (worker as any).isPrBehind = isPrBehindMock;
+
+    (worker as any).createAgentRun = async () => {};
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("success");
+    expect(updatePullRequestBranchMock).toHaveBeenCalledTimes(1);
+    expect(waitForRequiredChecksMock).toHaveBeenCalledTimes(2);
+    expect(mergePullRequestMock).toHaveBeenCalledTimes(2);
+    expect(mergePullRequestMock.mock.calls[0][1]).toBe("deadbeef");
+    expect(mergePullRequestMock.mock.calls[1][1]).toBe("beadfeed");
+  });
 
   test("merge escalates when update-branch fails", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });

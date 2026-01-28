@@ -9,6 +9,7 @@ function createSnapshot(): StatusSnapshot {
   return {
     mode: "running",
     queue: { backend: "github", health: "ok", fallback: false, diagnostics: null },
+    daemon: null,
     controlProfile: null,
     activeProfile: null,
     throttle: { state: "ok" },

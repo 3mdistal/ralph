@@ -265,6 +265,52 @@ describe("Scheduler invariants", () => {
     expect(started[0]).toBe("resume:t1");
   });
 
+  test("legacy order preserved when priorities are unset", async () => {
+    const inFlightTasks = new Set<string>();
+    const started: string[] = [];
+
+    const globalSemaphore = new Semaphore(3);
+
+    const perRepo = new Map<string, Semaphore>();
+    const getRepoSemaphore = (repo: string) => {
+      let sem = perRepo.get(repo);
+      if (!sem) {
+        sem = new Semaphore(1);
+        perRepo.set(repo, sem);
+      }
+      return sem;
+    };
+
+    const startTask = ({ task }: { task: TestTask }) => {
+      started.push(task.repo);
+      return true;
+    };
+
+    const tasks = [
+      { repo: "a", _path: "t-a", name: "t-a" },
+      { repo: "b", _path: "t-b", name: "t-b" },
+      { repo: "c", _path: "t-c", name: "t-c" },
+    ];
+
+    const startedCount = await startQueuedTasks<TestTask>({
+      gate: "running",
+      tasks,
+      inFlightTasks,
+      getTaskKey: (t) => t._path || t.name,
+      groupByRepo,
+      globalSemaphore,
+      getRepoSemaphore,
+      rrCursor: { value: 0 },
+      priorityEnabled: false,
+      shouldLog: () => false,
+      log: () => {},
+      startTask: startTask as any,
+    });
+
+    expect(startedCount).toBe(3);
+    expect(started).toEqual(["a", "b", "c"]);
+  });
+
   test("resume scheduling does not block queued tasks", async () => {
     const inFlightTasks = new Set<string>();
     const started: string[] = [];
