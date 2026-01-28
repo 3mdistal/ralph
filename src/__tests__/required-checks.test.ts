@@ -128,7 +128,8 @@ describe("requiredChecks semantics", () => {
       const result = await (worker as any).ensureBranchProtectionForBranch("main", ["ci"]);
       expect(result).toBe("defer");
       expect(warnMock).toHaveBeenCalled();
-      const message = String(warnMock.mock.calls[0]?.[0] ?? "");
+      const warnCalls = (warnMock as any).mock.calls as unknown[][];
+      const message = String(warnCalls[0]?.[0] ?? "");
       expect(message).toContain("RALPH_BRANCH_PROTECTION_SKIPPED_MISSING_CHECKS");
       expect(message).toContain("acme/rocket@main");
       expect(message).toContain("Required checks: ci");
@@ -182,7 +183,8 @@ describe("requiredChecks semantics", () => {
 
       await expect((worker as any).ensureBranchProtectionForBranch("main", ["ci"])).resolves.toBe("defer");
       expect(warnMock).toHaveBeenCalled();
-      const message = String(warnMock.mock.calls[0]?.[0] ?? "");
+      const warnCalls = (warnMock as any).mock.calls as unknown[][];
+      const message = String(warnCalls[0]?.[0] ?? "");
       expect(message).toContain("RALPH_BRANCH_PROTECTION_SKIPPED_MISSING_CHECKS");
       expect(message).toContain("acme/rocket@main");
       expect(message).toContain("Required checks: ci");
