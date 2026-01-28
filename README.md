@@ -634,6 +634,7 @@ Shows active profile, throttle state, pending escalations, and per-task profile 
 
 - Paths must be absolute (no `~` expansion).
 - New tasks start under the active `opencode_profile` from the control file (or `defaultProfile` when unset).
+- `defaultProfile` may be set to `"auto"` to auto-select a profile for new work when no control profile is set.
 - Tasks persist `opencode-profile` in frontmatter and always resume under the same profile.
 - Throttle is computed per profile—a throttled profile won't affect tasks on other profiles.
 

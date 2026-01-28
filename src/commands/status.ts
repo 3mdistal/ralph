@@ -1,4 +1,4 @@
-import { getConfig, getOpencodeDefaultProfileName, isOpencodeProfilesEnabled, listOpencodeProfileNames } from "../config";
+import { getConfig, getRequestedOpencodeProfileName, isOpencodeProfilesEnabled, listOpencodeProfileNames } from "../config";
 import { readControlStateSnapshot, type DaemonMode } from "../drain";
 import { getEscalationsByStatus } from "../escalation-notes";
 import { getSessionNowDoing } from "../live-status";
@@ -14,6 +14,7 @@ import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
 import { parseIssueRef } from "../github/issue-ref";
 import {
+  formatActiveOpencodeProfileLine,
   formatBlockedIdleSuffix,
   formatTaskLabel,
   getTaskNowDoingLine,
@@ -48,8 +49,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
   const controlProfile = control.opencodeProfile?.trim() || "";
 
-  const requestedProfile =
-    controlProfile === "auto" ? "auto" : controlProfile || getOpencodeDefaultProfileName() || null;
+  const requestedProfile = getRequestedOpencodeProfileName(control.opencodeProfile);
 
   const now = Date.now();
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
@@ -247,13 +247,12 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       `Pause requested: true${opts.drain.pauseAtCheckpoint ? ` (checkpoint: ${opts.drain.pauseAtCheckpoint})` : ""}`
     );
   }
-  if (controlProfile === "auto") {
-    console.log(`Active OpenCode profile: auto (resolved: ${resolvedProfile ?? "ambient"})`);
-  } else if (selection.source === "failover") {
-    console.log(`Active OpenCode profile: ${resolvedProfile ?? "ambient"} (failover from: ${requestedProfile ?? "default"})`);
-  } else if (resolvedProfile) {
-    console.log(`Active OpenCode profile: ${resolvedProfile}`);
-  }
+  const activeProfileLine = formatActiveOpencodeProfileLine({
+    requestedProfile,
+    resolvedProfile,
+    selectionSource: selection.source,
+  });
+  if (activeProfileLine) console.log(activeProfileLine);
 
   const usageLines = formatStatusUsageSection(usageRows);
   for (const line of usageLines) console.log(line);

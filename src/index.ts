@@ -16,6 +16,7 @@ import {
   getConfig,
   getDashboardEventsRetentionDays,
   getOpencodeDefaultProfileName,
+  getRequestedOpencodeProfileName,
   listOpencodeProfileNames,
   getRepoConcurrencySlots,
   getRepoSchedulerPriority,
@@ -168,10 +169,7 @@ function getActiveOpencodeProfileName(defaults?: Partial<ControlConfig>): string
     ? drainMonitor.getState()
     : readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
 
-  const fromControl = control.opencodeProfile?.trim() ?? "";
-  if (fromControl) return fromControl;
-
-  return getOpencodeDefaultProfileName();
+  return getRequestedOpencodeProfileName(control.opencodeProfile);
 }
 
 async function resolveEffectiveOpencodeProfileNameForNewTasks(
@@ -1908,11 +1906,7 @@ if (args[0] === "usage") {
   const now = Date.now();
   const config = getConfig();
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
-  const controlProfile = control.opencodeProfile?.trim() || "";
-
-  const requestedProfile =
-    profileOverride ||
-    (controlProfile === "auto" ? "auto" : controlProfile || getOpencodeDefaultProfileName() || null);
+  const requestedProfile = profileOverride || getRequestedOpencodeProfileName(control.opencodeProfile);
 
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
   const chosenProfile = selection.profileName;

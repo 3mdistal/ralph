@@ -42,3 +42,23 @@ export function getTaskOpencodeProfileName(task: Pick<AgentTask, "opencode-profi
   const trimmed = typeof raw === "string" ? raw.trim() : "";
   return trimmed ? trimmed : null;
 }
+
+export function formatActiveOpencodeProfileLine(params: {
+  requestedProfile: string | null;
+  resolvedProfile: string | null;
+  selectionSource: "requested" | "auto" | "failover";
+}): string | null {
+  if (params.requestedProfile === "auto") {
+    return `Active OpenCode profile: auto (resolved: ${params.resolvedProfile ?? "ambient"})`;
+  }
+
+  if (params.selectionSource === "failover") {
+    return `Active OpenCode profile: ${params.resolvedProfile ?? "ambient"} (failover from: ${params.requestedProfile ?? "default"})`;
+  }
+
+  if (params.resolvedProfile) {
+    return `Active OpenCode profile: ${params.resolvedProfile}`;
+  }
+
+  return null;
+}
