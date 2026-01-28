@@ -106,4 +106,22 @@ describe("sandbox github client", () => {
     ).rejects.toThrow(/SANDBOX TRIPWIRE/i);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  test("allows template generation when target repo is within sandbox", async () => {
+    const fetchMock = mock(async (_input: RequestInfo | URL) => {
+      return new Response(JSON.stringify({ ok: true, default_branch: "main", full_name: "3mdistal/ralph-sandbox-abc" }), {
+        status: 201,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const client = new GitHubClient("3mdistal/ralph-sandbox-demo");
+    const result = await client.request("/repos/3mdistal/template-repo/generate", {
+      method: "POST",
+      body: { name: "ralph-sandbox-demo", owner: "3mdistal", private: true },
+    });
+    expect(result.status).toBe(201);
+    expect(fetchMock).toHaveBeenCalled();
+  });
 });

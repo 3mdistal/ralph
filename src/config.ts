@@ -156,6 +156,13 @@ export interface SandboxGithubAuthConfig {
   tokenEnvVar?: string;
 }
 
+export interface SandboxRetentionConfig {
+  /** Keep the last N sandbox run repos (default: 10). */
+  keepLast?: number;
+  /** Keep failed sandbox run repos for N days (default: 14). */
+  keepFailedDays?: number;
+}
+
 export interface SandboxProfileConfig {
   /** Allowed repo owners for sandbox runs (non-empty). */
   allowedOwners: string[];
@@ -163,6 +170,24 @@ export interface SandboxProfileConfig {
   repoNamePrefix: string;
   /** Dedicated GitHub auth for sandbox runs. */
   githubAuth: SandboxGithubAuthConfig;
+  /** Optional retention policy for sandbox run repos. */
+  retention?: SandboxRetentionConfig;
+  /** Optional sandbox provisioning configuration. */
+  provisioning?: SandboxProvisioningConfig;
+}
+
+export type SandboxProvisioningSettingsPreset = "minimal" | "parity";
+
+export type SandboxProvisioningSeedConfig =
+  | { preset: "baseline"; file?: undefined }
+  | { file: string; preset?: undefined };
+
+export interface SandboxProvisioningConfig {
+  templateRepo: string;
+  templateRef?: string;
+  repoVisibility?: "private";
+  settingsPreset?: SandboxProvisioningSettingsPreset;
+  seed?: SandboxProvisioningSeedConfig;
 }
 
 export interface DashboardConfig {
@@ -229,6 +254,8 @@ const DEFAULT_THROTTLE_MIN_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_THROTTLE_BUDGET_5H_TOKENS = 16_987_015;
 const DEFAULT_THROTTLE_BUDGET_WEEKLY_TOKENS = 55_769_305;
 const DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS = 14;
+const DEFAULT_SANDBOX_KEEP_LAST = 10;
+const DEFAULT_SANDBOX_KEEP_FAILED_DAYS = 14;
 
 function detectDefaultBwrbVault(): string {
   const start = process.cwd();
@@ -585,6 +612,123 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       }
     }
 
+    let retention: SandboxRetentionConfig | undefined;
+    const rawRetention = (rawSandbox as any).retention;
+    if (rawRetention !== undefined) {
+      if (!rawRetention || typeof rawRetention !== "object" || Array.isArray(rawRetention)) {
+        console.warn(`[ralph] Invalid config sandbox.retention=${JSON.stringify(rawRetention)}; ignoring`);
+      } else {
+        const keepLast = toNonNegativeIntOrNull((rawRetention as any).keepLast);
+        const keepFailedDays = toNonNegativeIntOrNull((rawRetention as any).keepFailedDays);
+        if ((rawRetention as any).keepLast !== undefined && keepLast === null) {
+          console.warn(
+            `[ralph] Invalid config sandbox.retention.keepLast=${JSON.stringify((rawRetention as any).keepLast)}; ignoring`
+          );
+        }
+        if ((rawRetention as any).keepFailedDays !== undefined && keepFailedDays === null) {
+          console.warn(
+            `[ralph] Invalid config sandbox.retention.keepFailedDays=${JSON.stringify(
+              (rawRetention as any).keepFailedDays
+            )}; ignoring`
+          );
+        }
+        if (keepLast !== null || keepFailedDays !== null) {
+          retention = {
+            ...(keepLast !== null ? { keepLast } : {}),
+            ...(keepFailedDays !== null ? { keepFailedDays } : {}),
+          };
+        }
+      }
+    }
+
+    let provisioning: SandboxProvisioningConfig | undefined;
+    const rawProvisioning = (rawSandbox as any).provisioning;
+    if (rawProvisioning !== undefined) {
+      if (!rawProvisioning || typeof rawProvisioning !== "object" || Array.isArray(rawProvisioning)) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning must be an object when provided."
+        );
+      }
+
+      const templateRepo = toNonEmptyStringOrNull((rawProvisioning as any).templateRepo);
+      if (!templateRepo) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning requires provisioning.templateRepo (non-empty string)."
+        );
+      }
+
+      const templateRef = toNonEmptyStringOrNull((rawProvisioning as any).templateRef) ?? "main";
+      const repoVisibility = toNonEmptyStringOrNull((rawProvisioning as any).repoVisibility) ?? "private";
+      if (repoVisibility !== "private") {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning repoVisibility must be \"private\"."
+        );
+      }
+
+      const settingsPreset =
+        (toNonEmptyStringOrNull((rawProvisioning as any).settingsPreset) as SandboxProvisioningSettingsPreset | null) ??
+        "minimal";
+      if (settingsPreset !== "minimal" && settingsPreset !== "parity") {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning settingsPreset must be \"minimal\" or \"parity\"."
+        );
+      }
+
+      const rawSeed = (rawProvisioning as any).seed;
+      let seed: SandboxProvisioningSeedConfig | undefined;
+      if (rawSeed !== undefined) {
+        if (!rawSeed || typeof rawSeed !== "object" || Array.isArray(rawSeed)) {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed must be an object."
+          );
+        }
+        const preset = toNonEmptyStringOrNull((rawSeed as any).preset);
+        const file = toNonEmptyStringOrNull((rawSeed as any).file);
+
+        if (preset && file) {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed cannot set both preset and file."
+          );
+        }
+        if (preset) {
+          if (preset !== "baseline") {
+            throw new RalphConfigError(
+              "RALPH_CONFIG_SANDBOX_INVALID",
+              "[ralph] Sandbox provisioning seed preset must be \"baseline\"."
+            );
+          }
+          seed = { preset: "baseline" };
+        } else if (file) {
+          if (!isAbsolute(file)) {
+            throw new RalphConfigError(
+              "RALPH_CONFIG_SANDBOX_INVALID",
+              "[ralph] Sandbox provisioning seed file must be an absolute path."
+            );
+          }
+          seed = { file };
+        } else {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed must include preset or file."
+          );
+        }
+      }
+
+      provisioning = {
+        templateRepo,
+        templateRef,
+        repoVisibility: "private",
+        settingsPreset,
+        seed,
+      };
+    }
+
     loaded.sandbox = {
       allowedOwners,
       repoNamePrefix,
@@ -592,6 +736,8 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
         ...(hasValidApp ? { githubApp: rawSandboxApp } : {}),
         ...(tokenEnvVar ? { tokenEnvVar } : {}),
       },
+      ...(retention ? { retention } : {}),
+      ...(provisioning ? { provisioning } : {}),
     };
   }
 
@@ -1230,6 +1376,11 @@ export function getSandboxProfileConfig(): SandboxProfileConfig | null {
   return cfg.profile === "sandbox" ? (cfg.sandbox ?? null) : null;
 }
 
+export function getSandboxProvisioningConfig(): SandboxProvisioningConfig | null {
+  const sandbox = getSandboxProfileConfig();
+  return sandbox?.provisioning ?? null;
+}
+
 export function getRepoPath(repoName: string): string {
   const cfg = getConfig();
   
@@ -1278,6 +1429,13 @@ export function getDashboardEventsRetentionDays(): number {
   const raw = cfg.dashboard?.eventsRetentionDays;
   const parsed = toPositiveIntOrNull(raw);
   return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
+}
+
+export function getSandboxRetentionPolicy(): { keepLast: number; keepFailedDays: number } {
+  const sandbox = getSandboxProfileConfig();
+  const keepLast = toNonNegativeIntOrNull(sandbox?.retention?.keepLast) ?? DEFAULT_SANDBOX_KEEP_LAST;
+  const keepFailedDays = toNonNegativeIntOrNull(sandbox?.retention?.keepFailedDays) ?? DEFAULT_SANDBOX_KEEP_FAILED_DAYS;
+  return { keepLast, keepFailedDays };
 }
 
 export function getRepoConcurrencySlots(repoName: string): number {
