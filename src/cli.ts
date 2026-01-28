@@ -27,6 +27,7 @@ function printGlobalHelp(): void {
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
@@ -159,6 +160,17 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox <tag|teardown|prune> [options]",
+          "",
+          "Sandbox repo lifecycle helpers.",
+        ].join("\n")
+      );
+      return;
+
     case "worktrees":
       console.log(
         [
@@ -220,6 +232,7 @@ if (
     cmd === "repos" ||
     cmd === "watch" ||
     cmd === "nudge" ||
+    cmd === "sandbox" ||
     cmd === "worktrees" ||
     cmd === "rollup") &&
   hasHelpFlag
