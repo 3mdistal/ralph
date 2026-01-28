@@ -14,6 +14,8 @@ import { initStateDb, listIssueAlertSummaries } from "../state";
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
 import { parseIssueRef } from "../github/issue-ref";
+import { formatDuration } from "../logging";
+import { isHeartbeatStale, parseHeartbeatMs } from "../ownership";
 import {
   formatActiveOpencodeProfileLine,
   formatBlockedIdleSuffix,
@@ -474,6 +476,18 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
 
   console.log(`In-progress tasks: ${inProgress.length}`);
   for (const task of inProgress) {
+    const ttlMs = config.ownershipTtlMs;
+    const sessionId = task["session-id"]?.trim() ?? "";
+    const heartbeatAt = task["heartbeat-at"]?.trim() ?? "";
+    const owner = task["daemon-id"]?.trim() ?? "";
+    const heartbeatMs = parseHeartbeatMs(heartbeatAt);
+    const heartbeatAge = heartbeatMs ? formatDuration(Date.now() - heartbeatMs) : heartbeatAt ? "invalid" : "missing";
+    const orphanReason = !sessionId
+      ? "missing-session-id"
+      : isHeartbeatStale(heartbeatAt, Date.now(), ttlMs)
+        ? "stale-heartbeat"
+        : null;
+
     const opencodeProfile = getTaskOpencodeProfileName(task);
     const tokens = await readRunTokenTotals({
       repo: task.repo,
@@ -484,7 +498,14 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       budgetMs: STATUS_TOKEN_BUDGET_MS,
     });
     const tokensLabel = tokens.tokensComplete && typeof tokens.tokensTotal === "number" ? tokens.tokensTotal : "?";
-    console.log(`  - ${await getTaskNowDoingLine(task)} tokens=${tokensLabel}`);
+
+    const statusBits: string[] = [];
+    if (owner) statusBits.push(`owner=${owner}`);
+    statusBits.push(`hb=${heartbeatAge}`);
+    if (orphanReason) statusBits.push(`orphan=${orphanReason}`);
+    const statusSuffix = statusBits.length > 0 ? ` ${statusBits.join(" ")}` : "";
+
+    console.log(`  - ${await getTaskNowDoingLine(task)} tokens=${tokensLabel}${statusSuffix}`);
   }
 
   console.log(`Blocked tasks: ${blockedSorted.length}`);
