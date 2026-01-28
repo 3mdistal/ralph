@@ -51,7 +51,6 @@ export async function applyMidpointLabelsBestEffort(input: MidpointLabelerInput)
     }
   }
 
-
   // Avoid blocking midpoint label cleanup on fetching the repo default branch.
   // The default-branch lookup is network-bound and may be rate-limited; when it fails
   // we prefer a conservative heuristic over stalling merges.
