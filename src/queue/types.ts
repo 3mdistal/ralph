@@ -58,8 +58,12 @@ export interface QueueTask {
   "blocked-checked-at"?: string;
   /** Last checkpoint reached by worker */
   checkpoint?: string;
+  /** Monotonic checkpoint sequence for dedupe */
+  "checkpoint-seq"?: string;
   /** Pause requested at next checkpoint */
   "pause-requested"?: string;
+  /** Checkpoint where the worker is currently paused */
+  "paused-at-checkpoint"?: string;
 }
 
 export type AgentTask = QueueTask;
