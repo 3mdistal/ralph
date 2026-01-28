@@ -5,6 +5,7 @@ export const BLOCKED_SOURCES = [
   "merge-target",
   "ci-only",
   "merge-conflict",
+  "stall",
   "auto-update",
   "ci-failure",
   "runtime-error",

@@ -6,8 +6,7 @@ import { ensureBwrbVaultLayout, getConfig, getRepoBotBranch, getRepoPath } from 
 import { parseIssueRef } from "./github/issue-ref";
 import { shouldLog } from "./logging";
 import { recordRepoSync, recordTaskSnapshot } from "./state";
-import { ralphEventBus } from "./dashboard/bus";
-import { buildRalphEvent } from "./dashboard/events";
+import { publishDashboardEvent } from "./dashboard/publisher";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { canActOnTask, isHeartbeatStale } from "./ownership";
 import { normalizeTaskPriority, priorityRank } from "./queue/priority";
@@ -52,6 +51,7 @@ const TASK_FINGERPRINT_FIELDS = [
   "worker-id",
   "repo-slot",
   "watchdog-retries",
+  "stall-retries",
   "blocked-source",
   "blocked-reason",
   "blocked-at",
@@ -530,8 +530,8 @@ export async function updateTaskStatus(
       const sessionId: string | undefined = getOptionalField(normalizedExtraFields, taskObj, "session-id");
 
       if (fromStatus !== status) {
-        ralphEventBus.publish(
-          buildRalphEvent({
+        publishDashboardEvent(
+          {
             type: "task.status_changed",
             level: "info",
             ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
@@ -539,13 +539,14 @@ export async function updateTaskStatus(
             taskId,
             sessionId,
             data: { from: fromStatus, to: status },
-          })
+          },
+          { sessionId, workerId: eventWorkerId }
         );
       }
 
       if (status === "starting" && fromStatus !== status) {
-        ralphEventBus.publish(
-          buildRalphEvent({
+        publishDashboardEvent(
+          {
             type: "task.assigned",
             level: "info",
             ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
@@ -556,13 +557,14 @@ export async function updateTaskStatus(
               taskName: typeof taskObj.name === "string" ? taskObj.name : undefined,
               issue: typeof taskObj.issue === "string" ? taskObj.issue : undefined,
             },
-          })
+          },
+          { sessionId, workerId: eventWorkerId }
         );
       }
 
       if (status === "done" && fromStatus !== status) {
-        ralphEventBus.publish(
-          buildRalphEvent({
+        publishDashboardEvent(
+          {
             type: "task.completed",
             level: "info",
             ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
@@ -570,13 +572,14 @@ export async function updateTaskStatus(
             taskId,
             sessionId,
             data: {},
-          })
+          },
+          { sessionId, workerId: eventWorkerId }
         );
       }
 
       if (status === "escalated" && fromStatus !== status) {
-        ralphEventBus.publish(
-          buildRalphEvent({
+        publishDashboardEvent(
+          {
             type: "task.escalated",
             level: "warn",
             ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
@@ -584,13 +587,14 @@ export async function updateTaskStatus(
             taskId,
             sessionId,
             data: {},
-          })
+          },
+          { sessionId, workerId: eventWorkerId }
         );
       }
 
       if (status === "blocked" && fromStatus !== status) {
-        ralphEventBus.publish(
-          buildRalphEvent({
+        publishDashboardEvent(
+          {
             type: "task.blocked",
             level: "warn",
             ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
@@ -598,7 +602,8 @@ export async function updateTaskStatus(
             taskId,
             sessionId,
             data: {},
-          })
+          },
+          { sessionId, workerId: eventWorkerId }
         );
       }
     } catch {

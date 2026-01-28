@@ -10,7 +10,11 @@ import {
   createRalphRun,
   createNewRollupBatch,
   deleteIdempotencyKey,
+  ensureRalphRunGateRows,
   getIdempotencyPayload,
+  getLatestRunGateStateForIssue,
+  getLatestRunGateStateForPr,
+  getRalphRunGateState,
   getActiveRalphRunId,
   getOrCreateRollupBatch,
   initStateDb,
@@ -20,6 +24,7 @@ import {
   listRalphRunSessionIds,
   listRollupBatchEntries,
   markRollupBatchRolledUp,
+  recordRalphRunGateArtifact,
   recordIdempotencyKey,
   hasIdempotencyKey,
   recordRepoSync,
@@ -31,9 +36,13 @@ import {
   recordRalphRunSessionUse,
   recordTaskSnapshot,
   recordPrSnapshot,
+  recordAlertOccurrence,
+  recordAlertDeliveryAttempt,
+  listIssueAlertSummaries,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
   recordRollupMerge,
+  upsertRalphRunGateResult,
   upsertIdempotencyKey,
 } from "../state";
 import { getRalphStateDbPath } from "../paths";
@@ -156,7 +165,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("9");
+      expect(meta.value).toBe("12");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -187,10 +196,30 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .get() as { name?: string } | undefined;
       expect(runSessionsTable?.name).toBe("ralph_run_sessions");
 
+      const runSessionTokensTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_session_token_totals'")
+        .get() as { name?: string } | undefined;
+      expect(runSessionTokensTable?.name).toBe("ralph_run_session_token_totals");
+
+      const runTokensTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_token_totals'")
+        .get() as { name?: string } | undefined;
+      expect(runTokensTable?.name).toBe("ralph_run_token_totals");
+
       const doneCursorTable = migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_done_reconcile_cursor'")
         .get() as { name?: string } | undefined;
       expect(doneCursorTable?.name).toBe("repo_github_done_reconcile_cursor");
+
+      const alertsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alerts'")
+        .get() as { name?: string } | undefined;
+      expect(alertsTable?.name).toBe("alerts");
+
+      const deliveriesTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alert_deliveries'")
+        .get() as { name?: string } | undefined;
+      expect(deliveriesTable?.name).toBe("alert_deliveries");
     } finally {
       migrated.close();
     }
@@ -234,7 +263,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("9");
+      expect(meta.value).toBe("12");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -249,6 +278,25 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_sessions'")
         .get() as { name?: string } | undefined;
       expect(runSessionsTable?.name).toBe("ralph_run_sessions");
+
+      const gateResultsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_results'")
+        .get() as { name?: string } | undefined;
+      expect(gateResultsTable?.name).toBe("ralph_run_gate_results");
+
+      const gateArtifactsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_artifacts'")
+        .get() as { name?: string } | undefined;
+      expect(gateArtifactsTable?.name).toBe("ralph_run_gate_artifacts");
+      const alertsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alerts'")
+        .get() as { name?: string } | undefined;
+      expect(alertsTable?.name).toBe("alerts");
+
+      const deliveriesTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alert_deliveries'")
+        .get() as { name?: string } | undefined;
+      expect(deliveriesTable?.name).toBe("alert_deliveries");
     } finally {
       migrated.close();
     }
@@ -341,6 +389,193 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("persists gate state across restarts", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#232",
+      taskPath: "github:3mdistal/ralph#232",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:00:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:00:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "fail",
+      url: "https://github.com/3mdistal/ralph/actions/runs/999",
+      prNumber: 232,
+      prUrl: "https://github.com/3mdistal/ralph/pull/232",
+      at: "2026-01-20T12:00:02.000Z",
+    });
+
+    const noisyLog = [
+      ...Array.from({ length: 210 }, (_, index) => `line-${index}`),
+      "ghp_abcdefghijklmnopqrstuv",
+    ].join("\n");
+
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "failure_excerpt",
+      content: noisyLog,
+      at: "2026-01-20T12:00:03.000Z",
+    });
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const state = getRalphRunGateState(runId);
+    expect(state.results.length).toBe(4);
+    const ciGate = state.results.find((result) => result.gate === "ci");
+    expect(ciGate?.status).toBe("fail");
+    expect(ciGate?.url).toContain("actions/runs/999");
+    expect(ciGate?.prNumber).toBe(232);
+    expect(ciGate?.prUrl).toContain("pull/232");
+
+    const artifact = state.artifacts[0];
+    expect(artifact?.kind).toBe("failure_excerpt");
+    expect(artifact?.truncated).toBe(true);
+    expect(artifact?.content).not.toContain("ghp_abcdefghijklmnopqrstuv");
+    expect(artifact?.content.split("\n").length).toBeLessThanOrEqual(200);
+
+    const latest = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 232 });
+    expect(latest?.results.find((result) => result.gate === "ci")?.status).toBe("fail");
+  });
+
+  test("gate updates do not clobber existing fields", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#233",
+      taskPath: "github:3mdistal/ralph#233",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:10:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:10:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "fail",
+      url: "https://github.com/3mdistal/ralph/actions/runs/1001",
+      at: "2026-01-20T12:10:02.000Z",
+    });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      prNumber: 233,
+      prUrl: "https://github.com/3mdistal/ralph/pull/233",
+      at: "2026-01-20T12:10:03.000Z",
+    });
+
+    const state = getRalphRunGateState(runId);
+    const ciGate = state.results.find((result) => result.gate === "ci");
+    expect(ciGate?.status).toBe("fail");
+    expect(ciGate?.url).toContain("runs/1001");
+    expect(ciGate?.prNumber).toBe(233);
+    expect(ciGate?.prUrl).toContain("pull/233");
+  });
+
+  test("gate artifacts enforce retention cap", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#234",
+      taskPath: "github:3mdistal/ralph#234",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:20:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:20:01.000Z" });
+
+    for (let i = 0; i < 12; i += 1) {
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "ci",
+        kind: "failure_excerpt",
+        content: `artifact-${i}`,
+        at: `2026-01-20T12:20:${String(i).padStart(2, "0")}.000Z`,
+      });
+    }
+
+    const state = getRalphRunGateState(runId);
+    const artifacts = state.artifacts.filter(
+      (artifact) => artifact.gate === "ci" && artifact.kind === "failure_excerpt"
+    );
+    expect(artifacts).toHaveLength(10);
+    expect(artifacts.some((artifact) => artifact.content === "artifact-0")).toBe(false);
+    expect(artifacts.some((artifact) => artifact.content === "artifact-1")).toBe(false);
+    expect(artifacts.some((artifact) => artifact.content.includes("artifact-11"))).toBe(true);
+  });
+
+  test("latest gate selection is deterministic with ties", () => {
+    initStateDb();
+
+    const runIdOne = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#235",
+      taskPath: "github:3mdistal/ralph#235",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:30:00.000Z",
+    });
+    const runIdTwo = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#235",
+      taskPath: "github:3mdistal/ralph#235",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:30:10.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId: runIdOne, at: "2026-01-20T12:30:05.000Z" });
+    ensureRalphRunGateRows({ runId: runIdTwo, at: "2026-01-20T12:30:05.000Z" });
+
+    upsertRalphRunGateResult({
+      runId: runIdOne,
+      gate: "ci",
+      status: "fail",
+      at: "2026-01-20T12:30:06.000Z",
+    });
+    upsertRalphRunGateResult({
+      runId: runIdTwo,
+      gate: "ci",
+      status: "fail",
+      at: "2026-01-20T12:30:06.000Z",
+    });
+
+    const latest = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 235 });
+    expect(latest?.results[0]?.runId).toBe(runIdTwo);
+  });
+
+  test("latest gate selection by PR number", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#236",
+      taskPath: "github:3mdistal/ralph#236",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:40:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:40:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "pass",
+      prNumber: 236,
+      prUrl: "https://github.com/3mdistal/ralph/pull/236",
+      at: "2026-01-20T12:40:02.000Z",
+    });
+
+    const latest = getLatestRunGateStateForPr({ repo: "3mdistal/ralph", prNumber: 236 });
+    expect(latest?.results[0]?.runId).toBe(runId);
   });
 
   test("selects active run and lists session ids", () => {
@@ -512,7 +747,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("9");
+      expect(meta.value).toBe("12");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -748,5 +983,65 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const openBatches = listOpenRollupBatches();
     expect(openBatches).toHaveLength(1);
     expect(openBatches[0].id).toBe(newBatch.id);
+  });
+
+  test("records alert occurrences and summaries", () => {
+    initStateDb();
+
+    const first = recordAlertOccurrence({
+      repo: "3mdistal/ralph",
+      targetType: "issue",
+      targetNumber: 42,
+      kind: "error",
+      fingerprint: "abc",
+      summary: "Error: build failed",
+      details: "build failed",
+      at: "2026-01-11T00:00:10.000Z",
+    });
+
+    const second = recordAlertOccurrence({
+      repo: "3mdistal/ralph",
+      targetType: "issue",
+      targetNumber: 42,
+      kind: "error",
+      fingerprint: "abc",
+      summary: "Error: build failed",
+      details: "build failed again",
+      at: "2026-01-11T00:00:11.000Z",
+    });
+
+    const third = recordAlertOccurrence({
+      repo: "3mdistal/ralph",
+      targetType: "issue",
+      targetNumber: 42,
+      kind: "error",
+      fingerprint: "def",
+      summary: "Error: test failed",
+      details: "test failed",
+      at: "2026-01-11T00:00:12.000Z",
+    });
+
+    recordAlertDeliveryAttempt({
+      alertId: third.id,
+      channel: "github-issue-comment",
+      markerId: "marker-1",
+      targetType: "issue",
+      targetNumber: 42,
+      status: "success",
+      commentId: 1,
+      commentUrl: "https://github.com/3mdistal/ralph/issues/42#issuecomment-1",
+      at: "2026-01-11T00:00:13.000Z",
+    });
+
+    const summaries = listIssueAlertSummaries({ repo: "3mdistal/ralph", issueNumbers: [42, 99] });
+    const summary = summaries.find((row) => row.issueNumber === 42);
+
+    expect(first.id).toBeGreaterThan(0);
+    expect(second.id).toBe(first.id);
+    expect(third.id).not.toBe(first.id);
+    expect(summary?.totalCount).toBe(3);
+    expect(summary?.latestSummary).toBe("Error: test failed");
+    expect(summary?.latestAt).toBe("2026-01-11T00:00:12.000Z");
+    expect(summary?.latestCommentUrl).toBe("https://github.com/3mdistal/ralph/issues/42#issuecomment-1");
   });
 });

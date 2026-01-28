@@ -104,4 +104,107 @@ describe("sandbox config validation", () => {
     if (priorToken === undefined) delete process.env.GITHUB_SANDBOX_TOKEN;
     else process.env.GITHUB_SANDBOX_TOKEN = priorToken;
   });
+
+  test("accepts sandbox provisioning config", async () => {
+    const priorToken = process.env.GITHUB_SANDBOX_TOKEN;
+    process.env.GITHUB_SANDBOX_TOKEN = "token";
+
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+      profile: "sandbox",
+      sandbox: {
+        allowedOwners: ["3mdistal"],
+        repoNamePrefix: "ralph-sandbox-",
+        githubAuth: { tokenEnvVar: "GITHUB_SANDBOX_TOKEN" },
+        provisioning: {
+          templateRepo: "3mdistal/ralph-template",
+          templateRef: "main",
+          repoVisibility: "private",
+          settingsPreset: "minimal",
+          seed: { preset: "baseline" },
+        },
+      },
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+    const cfg = cfgMod.loadConfig().config;
+    expect(cfg.sandbox?.provisioning?.templateRepo).toBe("3mdistal/ralph-template");
+
+    if (priorToken === undefined) delete process.env.GITHUB_SANDBOX_TOKEN;
+    else process.env.GITHUB_SANDBOX_TOKEN = priorToken;
+  });
+
+  test("rejects sandbox provisioning with non-private visibility", async () => {
+    const priorToken = process.env.GITHUB_SANDBOX_TOKEN;
+    process.env.GITHUB_SANDBOX_TOKEN = "token";
+
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+      profile: "sandbox",
+      sandbox: {
+        allowedOwners: ["3mdistal"],
+        repoNamePrefix: "ralph-sandbox-",
+        githubAuth: { tokenEnvVar: "GITHUB_SANDBOX_TOKEN" },
+        provisioning: {
+          templateRepo: "3mdistal/ralph-template",
+          repoVisibility: "public",
+        },
+      },
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+    expect(() => cfgMod.loadConfig()).toThrow(/repoVisibility/i);
+
+    if (priorToken === undefined) delete process.env.GITHUB_SANDBOX_TOKEN;
+    else process.env.GITHUB_SANDBOX_TOKEN = priorToken;
+  });
+
+  test("rejects sandbox provisioning seed with relative file path", async () => {
+    const priorToken = process.env.GITHUB_SANDBOX_TOKEN;
+    process.env.GITHUB_SANDBOX_TOKEN = "token";
+
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+      profile: "sandbox",
+      sandbox: {
+        allowedOwners: ["3mdistal"],
+        repoNamePrefix: "ralph-sandbox-",
+        githubAuth: { tokenEnvVar: "GITHUB_SANDBOX_TOKEN" },
+        provisioning: {
+          templateRepo: "3mdistal/ralph-template",
+          seed: { file: "seed.json" },
+        },
+      },
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+    expect(() => cfgMod.loadConfig()).toThrow(/absolute path/i);
+
+    if (priorToken === undefined) delete process.env.GITHUB_SANDBOX_TOKEN;
+    else process.env.GITHUB_SANDBOX_TOKEN = priorToken;
+  });
 });

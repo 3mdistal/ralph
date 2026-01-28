@@ -15,16 +15,23 @@ import {
   ensureBwrbVaultLayout,
   getConfig,
   getDashboardEventsRetentionDays,
+  getDashboardControlPlaneConfig,
   getOpencodeDefaultProfileName,
+  getRequestedOpencodeProfileName,
   listOpencodeProfileNames,
   getRepoConcurrencySlots,
+  getRepoSchedulerPriority,
+  DEFAULT_REPO_SCHEDULER_PRIORITY,
   getRepoPath,
+  getSandboxProfileConfig,
+  getSandboxProvisioningConfig,
   type ControlConfig,
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
   getBwrbVaultIfValid,
   getQueueBackendState,
+  getQueueBackendStateWithLabelHealth,
   initialPoll,
   startWatching,
   stopWatching,
@@ -41,22 +48,34 @@ import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
+import { createPrioritySelectorState } from "./scheduler/priority-policy";
+import { issuePriorityWeight, normalizeTaskPriority, type TaskPriority } from "./queue/priority";
 
-import { DrainMonitor, readControlStateSnapshot, type DaemonMode } from "./drain";
+import { DrainMonitor, readControlStateSnapshot, resolveControlFilePath, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
 import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
-import { getRalphSessionLockPath } from "./paths";
+import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessionLockPath } from "./paths";
+import { removeDaemonRecord, writeDaemonRecord } from "./daemon-record";
+import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
+import { releaseTaskSlot } from "./state";
+import { updateControlFile } from "./control-file";
 import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
-import { buildRalphEvent } from "./dashboard/events";
+import { publishDashboardEvent } from "./dashboard/publisher";
 import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
 import { startGitHubIssuePollers } from "./github-issues-sync";
+import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
+import { startGitHubLabelReconciler } from "./github/label-reconciler";
+import { resolveGitHubToken } from "./github-auth";
+import { GitHubClient } from "./github/client";
+import { parseIssueRef } from "./github/issue-ref";
+import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -71,10 +90,25 @@ import {
 } from "./escalation-resume";
 import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 import { computeDaemonGate } from "./daemon-gate";
-import { runStatusCommand } from "./commands/status";
+import { runGatesCommand } from "./commands/gates";
+import { collectStatusSnapshot, runStatusCommand, type StatusDrainState } from "./commands/status";
 import { runWorktreesCommand } from "./commands/worktrees";
+import { runSandboxCommand } from "./commands/sandbox";
+import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
+import { createEscalationConsultantScheduler } from "./escalation-consultant/scheduler";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
+import { isLoopbackHost, startControlPlaneServer, type ControlPlaneServer } from "./dashboard/control-plane-server";
+import { toControlPlaneStateV1 } from "./dashboard/control-plane-state";
+import { buildProvisionPlan } from "./sandbox/provisioning-core";
+import {
+  applySeedFromSpec,
+  executeProvisionPlan,
+  findLatestManifestPath,
+  readManifestOrNull,
+} from "./sandbox/provisioning-io";
+import { writeSandboxManifest } from "./sandbox/manifest";
+import { getBaselineSeedSpec, loadSeedSpecFromFile } from "./sandbox/seed-spec";
 
 // --- State ---
 
@@ -88,15 +122,22 @@ let drainMonitor: DrainMonitor | null = null;
 let drainRequestedAt: number | null = null;
 let drainTimeoutMs: number | null = null;
 let dashboardEventPersistence: DashboardEventPersistence | null = null;
+let controlPlaneServer: ControlPlaneServer | null = null;
 let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
 let githubDoneReconciler: { stop: () => void } | null = null;
+let githubLabelReconciler: { stop: () => void } | null = null;
+let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
+const daemonStartedAt = new Date().toISOString();
+const daemonCommand = [process.execPath, ...process.argv.slice(1)];
+const daemonVersion = getRalphVersion();
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
+const ESCALATION_CONSULTANT_INTERVAL_MS = 60_000;
 
 const idleState = new Map<
   string,
@@ -111,6 +152,15 @@ const idleState = new Map<
 function getDaemonMode(defaults?: Partial<ControlConfig>): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
   return readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).mode;
+}
+
+function getDrainSnapshotState(): StatusDrainState {
+  return {
+    requestedAt: drainRequestedAt,
+    timeoutMs: drainTimeoutMs,
+    pauseRequested: pauseRequestedByControl,
+    pauseAtCheckpoint,
+  };
 }
 
 function applyControlState(control: {
@@ -147,10 +197,7 @@ function getActiveOpencodeProfileName(defaults?: Partial<ControlConfig>): string
     ? drainMonitor.getState()
     : readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
 
-  const fromControl = control.opencodeProfile?.trim() ?? "";
-  if (fromControl) return fromControl;
-
-  return getOpencodeDefaultProfileName();
+  return getRequestedOpencodeProfileName(control.opencodeProfile);
 }
 
 async function resolveEffectiveOpencodeProfileNameForNewTasks(
@@ -240,6 +287,7 @@ let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
 const rrCursor = { value: 0 };
+const schedulerPriorityState = { value: createPrioritySelectorState() };
 
 function requireBwrbQueueOrExit(action: string): void {
   const state = getQueueBackendState();
@@ -271,6 +319,48 @@ function getRepoSemaphore(repo: string): Semaphore {
     repoSemaphores.set(repo, sem);
   }
   return sem;
+}
+
+function buildRepoOrderForTasks(tasks: AgentTask[], priorityTasks: AgentTask[]): string[] {
+  const repoSet = new Set<string>();
+  for (const task of tasks) repoSet.add(task.repo);
+  for (const task of priorityTasks) repoSet.add(task.repo);
+  if (repoSet.size === 0) return [];
+
+  const cfg = getConfig();
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+
+  for (const repo of cfg.repos.map((entry) => entry.name)) {
+    if (!repoSet.has(repo)) continue;
+    ordered.push(repo);
+    seen.add(repo);
+  }
+
+  const extras = Array.from(repoSet)
+    .filter((repo) => !seen.has(repo))
+    .sort((a, b) => a.localeCompare(b));
+
+  return ordered.concat(extras);
+}
+
+function buildSchedulerPriorityConfig(repoOrder: string[]): { enabled: boolean; priorities: Map<string, number> } {
+  const cfg = getConfig();
+  const explicit = new Map<string, number>();
+
+  for (const repo of cfg.repos) {
+    const priority = getRepoSchedulerPriority(repo.name);
+    if (priority !== null) explicit.set(repo.name, priority);
+  }
+
+  const enabled = explicit.size > 0;
+  const priorities = new Map<string, number>();
+
+  for (const repo of repoOrder) {
+    priorities.set(repo, explicit.get(repo) ?? DEFAULT_REPO_SCHEDULER_PRIORITY);
+  }
+
+  return { enabled, priorities };
 }
 
 async function checkIdleRollups(): Promise<void> {
@@ -471,6 +561,9 @@ const schedulerController = createSchedulerController({
     ensureSemaphores();
     if (!globalSemaphore) return;
 
+    const repoOrder = buildRepoOrderForTasks([], priorityTasks);
+    const priorityConfig = buildSchedulerPriorityConfig(repoOrder);
+
     void startQueuedTasks({
       gate: "running",
       tasks: [],
@@ -481,6 +574,11 @@ const schedulerController = createSchedulerController({
       globalSemaphore,
       getRepoSemaphore,
       rrCursor,
+      repoOrder,
+      repoPriorities: priorityConfig.priorities,
+      priorityEnabled: priorityConfig.enabled,
+      priorityState: schedulerPriorityState,
+      getTaskPriorityWeight: (task: AgentTask) => issuePriorityWeight(task.priority),
       shouldLog,
       log: (message) => console.log(message),
       startTask,
@@ -718,6 +816,31 @@ async function startTask(opts: {
       inFlightTasks.add(key);
     }
 
+    const reconcile = await getOrCreateWorker(repo).tryReconcileMergeablePrForQueuedTask(claimedTask);
+    if (reconcile.handled) {
+      if (reconcile.merged) {
+        try {
+          recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: reconcile.prUrl, state: PR_STATE_MERGED });
+        } catch {
+          // best-effort
+        }
+        await rollupMonitor.recordMerge(repo, reconcile.prUrl);
+        console.log(`[ralph] Reconciled mergeable PR for ${claimedTask.issue}: ${reconcile.prUrl}`);
+      } else {
+        console.warn(`[ralph] Reconcile merge attempt failed for ${claimedTask.issue}: ${reconcile.reason}`);
+      }
+
+      inFlightTasks.delete(key);
+      forgetOwnedTask(claimedTask);
+      releaseGlobal();
+      releaseRepo();
+      if (!isShuttingDown) {
+        scheduleQueuedTasksSoon();
+        void checkIdleRollups();
+      }
+      return true;
+    }
+
     try {
       const reservation = reserveRepoSlotForTask(claimedTask);
       if (!reservation) {
@@ -735,6 +858,7 @@ async function startTask(opts: {
       const blockedSource = claimedTask["blocked-source"]?.trim() || "";
       const sessionId = claimedTask["session-id"]?.trim() || "";
       const shouldResumeMergeConflict = sessionId && blockedSource === "merge-conflict";
+      const shouldResumeStall = sessionId && blockedSource === "stall";
 
       if (shouldResumeMergeConflict) {
         console.log(
@@ -758,6 +882,61 @@ async function startTask(opts: {
           .resumeTask(claimedTask, {
             resumeMessage:
               "This task already has an open PR with merge conflicts blocking CI. Resolve the merge conflicts by rebasing/merging the base branch into the PR branch, push updates, and continue with the existing PR only.",
+            repoSlot: slot,
+          })
+          .then(async (run: AgentRun) => {
+            if (run.outcome === "success" && run.pr) {
+              try {
+                recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: PR_STATE_MERGED });
+              } catch {
+                // best-effort
+              }
+
+              await rollupMonitor.recordMerge(repo, run.pr);
+            }
+          })
+          .catch((e) => {
+            console.error(`[ralph] Error resuming task ${claimedTask.name}:`, e);
+          })
+          .finally(() => {
+            inFlightTasks.delete(key);
+            forgetOwnedTask(claimedTask);
+            releaseSlot?.();
+            releaseGlobal();
+            releaseRepo();
+            if (!isShuttingDown) {
+              scheduleQueuedTasksSoon();
+              void checkIdleRollups();
+            }
+          });
+
+        return true;
+      }
+
+      if (shouldResumeStall) {
+        const cfg = getConfig().stall;
+        const idleMs = cfg?.nudgeAfterMs ?? cfg?.idleMs ?? 5 * 60_000;
+        const idleMinutes = Math.round(idleMs / 60_000);
+
+        console.log(`[ralph] Requeued stalled task ${claimedTask.name}; nudging session ${sessionId} to resume work`);
+
+        await updateTaskStatus(claimedTask, "in-progress", {
+          "assigned-at": new Date().toISOString().split("T")[0],
+          "session-id": sessionId,
+          "throttled-at": "",
+          "resume-at": "",
+          "usage-snapshot": "",
+          "blocked-source": "",
+          "blocked-reason": "",
+          "blocked-details": "",
+          "blocked-at": "",
+          "blocked-checked-at": "",
+        });
+
+        void getOrCreateWorkerForSlot(repo, slot)
+          .resumeTask(claimedTask, {
+            resumeMessage:
+              `You have been idle for ~${idleMinutes}m. Decide next action: continue, rerun the last command, or escalate with a question. Then proceed.`,
             repoSlot: slot,
           })
           .then(async (run: AgentRun) => {
@@ -932,6 +1111,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
 
   const unblockedTasks = tasks.filter((task) => !(task._path && blockedPaths.has(task._path)));
   const queueTasks = isDraining ? [] : unblockedTasks;
+  const pendingResumes = Array.from(pendingResumeTasks.values());
 
   if (queueTasks.length > 0) {
     resetIdleState(queueTasks);
@@ -939,16 +1119,24 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     resetIdleState(tasks);
   }
 
+  const repoOrder = buildRepoOrderForTasks(queueTasks, pendingResumes);
+  const priorityConfig = buildSchedulerPriorityConfig(repoOrder);
+
   const startedCount = await startQueuedTasks({
     gate: "running",
     tasks: queueTasks,
-    priorityTasks: Array.from(pendingResumeTasks.values()),
+    priorityTasks: pendingResumes,
     inFlightTasks,
     getTaskKey: (t) => getTaskKey(t),
     groupByRepo,
     globalSemaphore,
     getRepoSemaphore,
     rrCursor,
+    repoOrder,
+    repoPriorities: priorityConfig.priorities,
+    priorityEnabled: priorityConfig.enabled,
+    priorityState: schedulerPriorityState,
+    getTaskPriorityWeight: (task: AgentTask) => issuePriorityWeight(task.priority),
     shouldLog,
     log: (message) => console.log(message),
     startTask,
@@ -980,8 +1168,8 @@ async function emitActivityUpdate(params: {
 
     if (!shouldEmitActivityUpdate({ sessionId, activity: snapshot.activity, now })) return;
 
-    ralphEventBus.publish(
-      buildRalphEvent({
+    publishDashboardEvent(
+      {
         type: "worker.activity.updated",
         level: "info",
         workerId: params.workerId,
@@ -989,7 +1177,8 @@ async function emitActivityUpdate(params: {
         taskId: params.taskId,
         sessionId,
         data: { activity: snapshot.activity },
-      })
+      },
+      { sessionId, workerId: params.workerId }
     );
 
     recordActivityState({ sessionId, activity: snapshot.activity, now });
@@ -1177,7 +1366,9 @@ async function main(): Promise<void> {
 
   // Load config
   const config = getConfig();
-  const queueState = getQueueBackendState();
+  // Initialize durable local state (SQLite)
+  initStateDb();
+  const queueState = getQueueBackendStateWithLabelHealth();
 
   if (queueState.health === "unavailable") {
     const reason = queueState.diagnostics ? ` ${queueState.diagnostics}` : "";
@@ -1189,9 +1380,20 @@ async function main(): Promise<void> {
     if (!ensureBwrbVaultLayout(config.bwrbVault)) process.exit(1);
   }
 
-  // Initialize durable local state (SQLite)
-  initStateDb();
-
+  try {
+    writeDaemonRecord({
+      version: 1,
+      daemonId,
+      pid: process.pid,
+      startedAt: daemonStartedAt,
+      ralphVersion: daemonVersion,
+      command: daemonCommand,
+      cwd: process.cwd(),
+      controlFilePath: resolveControlFilePath(),
+    });
+  } catch (e: any) {
+    console.warn(`[ralph] Failed to write daemon record: ${e?.message ?? String(e)}`);
+  }
   if (queueState.backend !== "none") {
     await seedRepoSlotReservations();
   }
@@ -1203,15 +1405,212 @@ async function main(): Promise<void> {
     retentionDays,
   });
 
+  autoQueueRunner = createAutoQueueRunner({
+    scheduleQueuedTasksSoon,
+  });
+
+  const controlPlaneConfig = getDashboardControlPlaneConfig();
+  if (controlPlaneConfig.enabled) {
+    if (!controlPlaneConfig.token) {
+      console.warn(`${"[ralph:control-plane]"} Enabled but no token configured; skipping startup`);
+    } else if (!controlPlaneConfig.allowRemote && !isLoopbackHost(controlPlaneConfig.host)) {
+      console.warn(
+        `${"[ralph:control-plane]"} Host ${controlPlaneConfig.host} is not loopback. ` +
+          `Set dashboard.controlPlane.allowRemote=true to override.`
+      );
+    } else {
+      const signalControlReload = (): void => {
+        try {
+          process.kill(process.pid, "SIGUSR1");
+        } catch {
+          // ignore
+        }
+      };
+
+      const resolveSessionIdForWorkerId = (workerId: string | null): string | null => {
+        const needle = workerId?.trim();
+        if (!needle) return null;
+        for (const [sessionId, payload] of activeSessionTasks) {
+          if (payload.workerId === needle) return sessionId;
+        }
+        return null;
+      };
+
+      controlPlaneServer = startControlPlaneServer({
+        bus: ralphEventBus,
+        getStateSnapshot: async () =>
+          toControlPlaneStateV1(await collectStatusSnapshot({ drain: getDrainSnapshotState(), initStateDb: false })),
+        token: controlPlaneConfig.token,
+        host: controlPlaneConfig.host,
+        port: controlPlaneConfig.port,
+        exposeRawOpencodeEvents: controlPlaneConfig.exposeRawOpencodeEvents,
+        replayLastDefault: controlPlaneConfig.replayLastDefault,
+        replayLastMax: controlPlaneConfig.replayLastMax,
+        commands: {
+          pause: async ({ workerId, reason, checkpoint }) => {
+            const patch = {
+              mode: "paused" as const,
+              pauseRequested: checkpoint ? true : undefined,
+              pauseAtCheckpoint: checkpoint ?? undefined,
+            };
+            updateControlFile({ patch });
+            signalControlReload();
+
+            const sessionId = resolveSessionIdForWorkerId(workerId ?? null);
+            publishDashboardEvent(
+              {
+                type: "worker.pause.requested",
+                level: "info",
+                ...(workerId ? { workerId } : {}),
+                ...(sessionId ? { sessionId } : {}),
+                data: reason ? { reason } : {},
+              },
+              { workerId: workerId ?? undefined, sessionId: sessionId ?? undefined }
+            );
+          },
+          resume: async ({ workerId, reason }) => {
+            const patch = {
+              mode: "running" as const,
+              pauseRequested: null,
+              pauseAtCheckpoint: null,
+              drainTimeoutMs: null,
+            };
+            updateControlFile({ patch });
+            signalControlReload();
+
+            const sessionId = resolveSessionIdForWorkerId(workerId ?? null);
+            publishDashboardEvent(
+              {
+                type: "worker.pause.cleared",
+                level: "info",
+                ...(workerId ? { workerId } : {}),
+                ...(sessionId ? { sessionId } : {}),
+                data: reason ? { reason } : {},
+              },
+              { workerId: workerId ?? undefined, sessionId: sessionId ?? undefined }
+            );
+          },
+          enqueueMessage: async ({ workerId, sessionId, text }) => {
+            const resolvedSessionId = sessionId?.trim() || resolveSessionIdForWorkerId(workerId ?? null);
+            if (!resolvedSessionId) {
+              throw new Error("Unable to resolve session; provide sessionId or an active workerId");
+            }
+
+            const payload = activeSessionTasks.get(resolvedSessionId);
+            const id = await queueNudge(resolvedSessionId, text, {
+              repo: payload?.task.repo,
+              taskRef: payload?.task.issue,
+              taskPath: payload?.task._path,
+            });
+
+            publishDashboardEvent(
+              {
+                type: "log.ralph",
+                level: "info",
+                ...(payload?.workerId ? { workerId: payload.workerId } : {}),
+                ...(payload?.task.repo ? { repo: payload.task.repo } : {}),
+                ...(payload?.taskId ? { taskId: payload.taskId } : {}),
+                sessionId: resolvedSessionId,
+                data: { message: `Queued nudge ${id}` },
+              },
+              { sessionId: resolvedSessionId, workerId: payload?.workerId }
+            );
+
+            return { id };
+          },
+          setTaskPriority: async ({ taskId, priority }) => {
+            const normalized = normalizeTaskPriority(priority);
+            const raw = taskId.startsWith("github:") ? taskId.slice("github:".length) : taskId;
+            const issueRef = parseIssueRef(raw, "");
+
+            if (issueRef) {
+              const token = await resolveGitHubToken();
+              if (!token) throw new Error("GitHub auth is not configured");
+
+              const github = new GitHubClient(issueRef.repo, { getToken: resolveGitHubToken });
+              const priorityLabels: TaskPriority[] = [
+                "p0-critical",
+                "p1-high",
+                "p2-medium",
+                "p3-low",
+                "p4-backlog",
+              ];
+
+              const ops = planIssueLabelOps({
+                add: [normalized],
+                remove: priorityLabels.filter((label) => label !== normalized),
+                allowNonRalph: true,
+              });
+
+              const result = await executeIssueLabelOps({
+                github,
+                repo: issueRef.repo,
+                issueNumber: issueRef.number,
+                ops,
+                allowNonRalph: true,
+              });
+
+              if (!result.ok) {
+                const message = result.error instanceof Error ? result.error.message : String(result.error);
+                throw new Error(`Failed to update issue priority: ${message}`);
+              }
+
+              publishDashboardEvent({
+                type: "log.ralph",
+                level: "info",
+                repo: issueRef.repo,
+                taskId,
+                data: { message: `Set priority ${normalized} on ${issueRef.repo}#${issueRef.number}` },
+              });
+
+              return;
+            }
+
+            const task = await getTaskByPath(taskId);
+            if (!task) {
+              throw new Error(`Unknown taskId: ${taskId}`);
+            }
+
+            const updated = await updateTaskStatus(task, task.status, { priority: normalized });
+            if (!updated) {
+              throw new Error(`Failed to update task priority for ${taskId}`);
+            }
+
+            publishDashboardEvent({
+              type: "log.ralph",
+              level: "info",
+              repo: task.repo,
+              taskId,
+              sessionId: task["session-id"],
+              data: { message: `Set priority ${normalized} for ${taskId}` },
+            });
+          },
+        },
+      });
+      console.log(`${"[ralph:control-plane]"} Listening on ${controlPlaneServer.url}`);
+    }
+  }
+
   githubIssuePollers = startGitHubIssuePollers({
     repos: config.repos,
     baseIntervalMs: config.pollInterval,
     log: (message) => console.log(message),
-    onSync: ({ result }) => {
-      if (!result.hadChanges || isShuttingDown || queueState.backend !== "github") return;
+    onSync: ({ repo, result }) => {
+      if (isShuttingDown || queueState.backend !== "github") return;
+      const repoConfig = config.repos.find((entry) => entry.name === repo);
+      if (repoConfig && autoQueueRunner) {
+        autoQueueRunner.schedule(repoConfig, "sync");
+      }
+      if (!result.hadChanges) return;
       scheduleQueuedTasksSoon();
     },
   });
+
+  if (queueState.backend === "github") {
+    for (const repo of config.repos) {
+      autoQueueRunner?.schedule(repo, "startup");
+    }
+  }
 
   githubDoneReconciler = startGitHubDoneReconciler({
     repos: config.repos,
@@ -1220,13 +1619,24 @@ async function main(): Promise<void> {
     warn: (message) => console.warn(message),
   });
 
-  ralphEventBus.publish(
-    buildRalphEvent({
-      type: "daemon.started",
-      level: "info",
-      data: {},
-    })
-  );
+  if (queueState.backend === "github") {
+    githubLabelReconciler = startGitHubLabelReconciler({
+      intervalMs: 60_000,
+      log: (message) => console.log(message),
+    });
+  }
+
+  publishDashboardEvent({
+    type: "daemon.started",
+    level: "info",
+    data: {},
+  });
+
+  publishDashboardEvent({
+    type: "log.ralph",
+    level: "info",
+    data: { message: "Daemon started" },
+  });
 
   console.log("[ralph] Configuration:");
   const backendTags = [
@@ -1344,6 +1754,28 @@ async function main(): Promise<void> {
     resetIdleState([]);
   }
 
+  const escalationConsultantScheduler = createEscalationConsultantScheduler({
+    getEscalationsByStatus,
+    getVaultPath: () => getBwrbVaultIfValid(),
+    isShuttingDown: () => isShuttingDown,
+    allowModelSend: async () => {
+      const controlProfile = getActiveOpencodeProfileName(config.control ?? {});
+      const decision = await getThrottleDecision(Date.now(), {
+        opencodeProfile: controlProfile || getOpencodeDefaultProfileName() || null,
+      });
+      const gate = computeDaemonGate({ mode: getDaemonMode(config.control), throttle: decision, isShuttingDown });
+      return gate.allowModelSend;
+    },
+    repoPath: () => ".",
+    log: (message) => console.log(message),
+  });
+  void escalationConsultantScheduler.tick();
+  const escalationConsultantTimer = setInterval(() => {
+    escalationConsultantScheduler.tick().catch(() => {
+      // ignore
+    });
+  }, ESCALATION_CONSULTANT_INTERVAL_MS);
+
   const ownershipTtlMs = getConfig().ownershipTtlMs;
   const heartbeatIntervalMs = computeHeartbeatIntervalMs(ownershipTtlMs);
   let heartbeatInFlight = false;
@@ -1419,6 +1851,8 @@ async function main(): Promise<void> {
     githubIssuePollers = null;
     githubDoneReconciler?.stop();
     githubDoneReconciler = null;
+    githubLabelReconciler?.stop();
+    githubLabelReconciler = null;
     if (escalationWatcher) {
       escalationWatcher.close();
       escalationWatcher = null;
@@ -1432,6 +1866,7 @@ async function main(): Promise<void> {
     clearInterval(heartbeatTimer);
     clearInterval(idleRollupTimer);
     clearInterval(throttleResumeTimer);
+    controlPlaneServer?.stop();
     
     // Terminate in-flight OpenCode runs spawned by Ralph.
     const termination = await terminateOpencodeRuns({ graceMs: 5000 });
@@ -1463,13 +1898,17 @@ async function main(): Promise<void> {
       }
     }
     
-    ralphEventBus.publish(
-      buildRalphEvent({
-        type: "daemon.stopped",
-        level: "info",
-        data: { reason: signal },
-      })
-    );
+    publishDashboardEvent({
+      type: "daemon.stopped",
+      level: "info",
+      data: { reason: signal },
+    });
+
+    publishDashboardEvent({
+      type: "log.ralph",
+      level: "info",
+      data: { message: `Daemon stopping (${signal})` },
+    });
 
     if (dashboardEventPersistence) {
       const { flushed } = await dashboardEventPersistence.flush({ timeoutMs: 5000 });
@@ -1477,6 +1916,12 @@ async function main(): Promise<void> {
         console.warn("[ralph] Dashboard event flush timed out; some tail events may be missing");
       }
       dashboardEventPersistence.unsubscribe();
+    }
+
+    try {
+      removeDaemonRecord();
+    } catch {
+      // ignore
     }
 
     console.log("[ralph] Goodbye!");
@@ -1498,12 +1943,21 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph gates <repo> <issue> [--json] Show deterministic gate state",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
+      "  ralph queue release --repo <owner/repo> --issue <n>  Release a stuck task slot locally",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
+      "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
+      "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
+      "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
+      "  ralph sandbox seed                 Seed sandbox edge-case issues",
       "",
       "Options:",
       "  -h, --help                         Show help (also: ralph help [command])",
@@ -1536,6 +1990,20 @@ function printCommandHelp(command: string): void {
           "  ralph status [--json]",
           "",
           "Shows daemon mode plus starting, queued, in-progress, and throttled tasks, plus pending escalations.",
+          "",
+          "Options:",
+          "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "gates":
+      console.log(
+        [
+          "Usage:",
+          "  ralph gates <repo> <issueNumber> [--json]",
+          "",
+          "Shows the latest deterministic gate state for an issue.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -1596,6 +2064,29 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox:init":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:init [--no-seed]",
+          "",
+          "Creates a new sandbox repo from the configured template and writes a manifest.",
+          "Runs seeding unless --no-seed is provided.",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:seed":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:seed [--run-id <id>]",
+          "",
+          "Seeds a sandbox repo based on the manifest (defaults to newest manifest if omitted).",
+        ].join("\n")
+      );
+      return;
+
     case "rollup":
       console.log(
         [
@@ -1607,6 +2098,17 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox <tag|teardown|prune> [options]",
+          "",
+          "Sandbox repo lifecycle helpers.",
+        ].join("\n")
+      );
+      return;
+
     case "worktrees":
       console.log(
         [
@@ -1614,6 +2116,28 @@ function printCommandHelp(command: string): void {
           "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
           "",
           "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
+        ].join("\n")
+      );
+      return;
+
+    case "queue":
+      console.log(
+        [
+          "Usage:",
+          "  ralph queue release --repo <owner/repo> --issue <n>",
+          "",
+          "Releases a stuck task slot locally (no GitHub writes).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox seed --repo <owner/repo> [options]",
+          "",
+          "Seeds a sandbox repo with deterministic edge-case issues and relationships.",
         ].join("\n")
       );
       return;
@@ -1673,21 +2197,66 @@ if (args[0] === "resume") {
   process.exit(0);
 }
 
+if (args[0] === "queue") {
+  if (hasHelpFlag || args[1] !== "release") {
+    printCommandHelp("queue");
+    process.exit(0);
+  }
+
+  const repoFlagIdx = args.findIndex((arg: string) => arg === "--repo");
+  const issueFlagIdx = args.findIndex((arg: string) => arg === "--issue");
+  const repo = repoFlagIdx >= 0 ? (args[repoFlagIdx + 1]?.trim() ?? "") : "";
+  const issueRaw = issueFlagIdx >= 0 ? (args[issueFlagIdx + 1]?.trim() ?? "") : "";
+  const issueNumber = Number.parseInt(issueRaw, 10);
+
+  if (!repo || !Number.isFinite(issueNumber)) {
+    console.error("Usage: ralph queue release --repo <owner/repo> --issue <n>");
+    process.exit(1);
+  }
+
+  initStateDb();
+  const ok = releaseTaskSlot({
+    repo,
+    issueNumber,
+    taskPath: `github:${repo}#${issueNumber}`,
+    releasedReason: "operator-release",
+    status: "queued",
+  });
+  if (!ok) {
+    console.error(`[ralph] Failed to release slot for ${repo}#${issueNumber}`);
+    process.exit(1);
+  }
+  console.log(`[ralph] Released slot for ${repo}#${issueNumber}`);
+  process.exit(0);
+}
+
 if (args[0] === "status") {
   if (hasHelpFlag) {
     printCommandHelp("status");
     process.exit(0);
   }
 
+  const statusControl = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: getConfig().control });
+
   await runStatusCommand({
     args,
     drain: {
       requestedAt: drainRequestedAt,
-      timeoutMs: drainTimeoutMs,
-      pauseRequested: pauseRequestedByControl,
-      pauseAtCheckpoint: pauseAtCheckpoint ?? null,
+      timeoutMs: drainTimeoutMs ?? statusControl.drainTimeoutMs ?? null,
+      pauseRequested: pauseRequestedByControl || statusControl.pauseRequested === true,
+      pauseAtCheckpoint: pauseAtCheckpoint ?? statusControl.pauseAtCheckpoint ?? null,
     },
   });
+  process.exit(0);
+}
+
+if (args[0] === "gates") {
+  if (hasHelpFlag) {
+    printCommandHelp("gates");
+    process.exit(0);
+  }
+
+  await runGatesCommand({ args });
   process.exit(0);
 }
 
@@ -1704,11 +2273,7 @@ if (args[0] === "usage") {
   const now = Date.now();
   const config = getConfig();
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
-  const controlProfile = control.opencodeProfile?.trim() || "";
-
-  const requestedProfile =
-    profileOverride ||
-    (controlProfile === "auto" ? "auto" : controlProfile || getOpencodeDefaultProfileName() || null);
+  const requestedProfile = profileOverride || getRequestedOpencodeProfileName(control.opencodeProfile);
 
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
   const chosenProfile = selection.profileName;
@@ -1842,6 +2407,146 @@ if (args[0] === "usage") {
     console.log(line.map((v, i) => fmt(v, widths[i]!)).join(" "));
   }
 
+  process.exit(0);
+}
+
+if (args[0] === "sandbox:init") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox:init");
+    process.exit(0);
+  }
+
+  const sandbox = getSandboxProfileConfig();
+  if (!sandbox) {
+    console.error("[ralph:sandbox] sandbox:init requires profile=\"sandbox\" with a sandbox config block.");
+    process.exit(1);
+  }
+
+  const owner = getConfig().owner;
+  const ownerAllowed = sandbox.allowedOwners.some((allowed) => allowed.toLowerCase() === owner.toLowerCase());
+  if (!ownerAllowed) {
+    console.error(`[ralph:sandbox] sandbox:init owner ${owner} is not in sandbox.allowedOwners.`);
+    process.exit(1);
+  }
+
+  const provisioning = getSandboxProvisioningConfig();
+  if (!provisioning) {
+    console.error("[ralph:sandbox] sandbox:init requires sandbox.provisioning config.");
+    process.exit(1);
+  }
+
+  const noSeed = args.includes("--no-seed");
+  const runId = `sandbox-${crypto.randomUUID()}`;
+
+  const plan = buildProvisionPlan({
+    runId,
+    owner,
+    botBranch: "bot/integration",
+    sandbox,
+    provisioning: {
+      templateRepo: provisioning.templateRepo,
+      templateRef: provisioning.templateRef ?? "main",
+      repoVisibility: "private",
+      settingsPreset: provisioning.settingsPreset ?? "minimal",
+      seed: provisioning.seed,
+    },
+  });
+
+  let manifest = await executeProvisionPlan(plan);
+  if (!noSeed && plan.seed) {
+    const seedSpec = plan.seed.preset === "baseline"
+      ? getBaselineSeedSpec()
+      : plan.seed.file
+        ? await loadSeedSpecFromFile(plan.seed.file)
+        : null;
+
+    if (!seedSpec) {
+      console.error("[ralph:sandbox] No seed spec resolved; pass --no-seed to skip.");
+      process.exit(1);
+    }
+
+    manifest = await applySeedFromSpec({
+      repoFullName: plan.repoFullName,
+      manifest,
+      seedSpec,
+      seedConfig: {
+        preset: plan.seed.preset,
+        file: plan.seed.file,
+      },
+    });
+    await writeSandboxManifest(getRalphSandboxManifestPath(plan.runId), manifest);
+  }
+
+  console.log(`[ralph:sandbox] Provisioned ${plan.repoFullName}`);
+  console.log(`[ralph:sandbox] Manifest: ${getRalphSandboxManifestPath(plan.runId)}`);
+  process.exit(0);
+}
+
+if (args[0] === "sandbox:seed") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox:seed");
+    process.exit(0);
+  }
+
+  const sandbox = getSandboxProfileConfig();
+  if (!sandbox) {
+    console.error("[ralph:sandbox] sandbox:seed requires profile=\"sandbox\" with a sandbox config block.");
+    process.exit(1);
+  }
+
+  const provisioning = getSandboxProvisioningConfig();
+
+  const runIdFlag = args.findIndex((arg) => arg === "--run-id");
+  const runId = runIdFlag >= 0 ? args[runIdFlag + 1] : null;
+  if (runIdFlag >= 0 && (!runId || runId.startsWith("-"))) {
+    console.error("[ralph:sandbox] --run-id requires a value.");
+    process.exit(1);
+  }
+  let manifestPath = runId ? getRalphSandboxManifestPath(runId) : null;
+
+  if (!manifestPath) {
+    manifestPath = await findLatestManifestPath(getRalphSandboxManifestsDir());
+  }
+
+  if (!manifestPath) {
+    console.error("[ralph:sandbox] No manifest found. Provide --run-id or run sandbox:init.");
+    process.exit(1);
+  }
+
+  const manifest = await readManifestOrNull(manifestPath);
+  if (!manifest) {
+    console.error(`[ralph:sandbox] Failed to load manifest: ${manifestPath}`);
+    process.exit(1);
+  }
+
+  const seedFile = manifest.seed?.file ?? provisioning?.seed?.file;
+  const seedPreset = manifest.seed?.preset ?? provisioning?.seed?.preset;
+
+  let seedSpec: any = null;
+  if (seedFile) {
+    seedSpec = await loadSeedSpecFromFile(seedFile);
+  } else if (seedPreset === "baseline") {
+    seedSpec = getBaselineSeedSpec();
+  }
+
+  if (!seedSpec) {
+    console.error("[ralph:sandbox] No seed spec resolved. Configure sandbox.provisioning.seed or update the manifest.");
+    process.exit(1);
+  }
+
+  const updated = await applySeedFromSpec({
+    repoFullName: manifest.repo.fullName,
+    manifest,
+    seedSpec,
+    seedConfig: {
+      preset: seedPreset,
+      file: seedFile,
+    },
+  });
+  await writeSandboxManifest(manifestPath, updated);
+
+  console.log(`[ralph:sandbox] Seeded ${manifest.repo.fullName}`);
+  console.log(`[ralph:sandbox] Manifest: ${manifestPath}`);
   process.exit(0);
 }
 
@@ -2004,7 +2709,6 @@ if (args[0] === "watch") {
   });
 }
 
-
 if (args[0] === "rollup") {
   if (hasHelpFlag) {
     printCommandHelp("rollup");
@@ -2032,6 +2736,21 @@ if (args[0] === "worktrees") {
   }
 
   await runWorktreesCommand(args);
+  process.exit(0);
+}
+
+if (args[0] === "sandbox") {
+  if (hasHelpFlag || args[1] === "help") {
+    printCommandHelp("sandbox");
+    process.exit(0);
+  }
+
+  if (args[1] === "seed") {
+    await runSandboxSeedCommand(args.slice(2));
+    process.exit(0);
+  }
+
+  await runSandboxCommand(args);
   process.exit(0);
 }
 

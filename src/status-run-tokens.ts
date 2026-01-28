@@ -1,19 +1,10 @@
-import { getActiveRalphRunId, listRalphRunSessionIds } from "./state";
-import {
-  readOpencodeSessionTokenTotalsWithQuality,
-  type OpencodeSessionTokenReadResult,
-} from "./opencode-session-tokens";
-import { resolveOpencodeMessagesRootDir } from "./opencode-messages-root";
+import { getActiveRalphRunId, getRalphRunTokenTotals } from "./state";
+import { refreshRalphRunTokenTotals } from "./run-token-accounting";
 
 export type RunTokenTotals = {
   tokensTotal: number | null;
   tokensComplete: boolean;
   sessionCount: number;
-};
-
-export type SessionTokenReadResult = {
-  total: number | null;
-  quality: "ok" | "missing" | "unreadable" | "timeout" | "error";
 };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -44,88 +35,6 @@ export function computeAggregateTokens(sessionTotals: Array<{ total: number | nu
   return { tokensTotal: total, tokensComplete: true };
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return promise;
-
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`Timeout after ${timeoutMs}ms (${label})`)), timeoutMs);
-  });
-
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
-}
-
-async function readSessionTotals(params: {
-  sessionId: string;
-  messagesRootDir: string;
-  timeoutMs: number;
-}): Promise<SessionTokenReadResult> {
-  try {
-    const result = await withTimeout(
-      readOpencodeSessionTokenTotalsWithQuality({ sessionId: params.sessionId, messagesRootDir: params.messagesRootDir }),
-      params.timeoutMs,
-      params.sessionId
-    );
-
-    if (result.quality !== "ok") {
-      return { total: null, quality: result.quality };
-    }
-
-    return { total: result.totals.total, quality: "ok" };
-  } catch {
-    return { total: null, quality: "timeout" };
-  }
-}
-
-async function collectSessionTotals(opts: {
-  sessionIds: string[];
-  messagesRootDir: string;
-  timeoutMs: number;
-  concurrency: number;
-  cache?: Map<string, Promise<SessionTokenReadResult>>;
-}): Promise<SessionTokenReadResult[]> {
-  const concurrency = Math.max(1, Math.floor(opts.concurrency));
-  const results: SessionTokenReadResult[] = [];
-  let idx = 0;
-
-  const cache = opts.cache ?? new Map<string, Promise<SessionTokenReadResult>>();
-
-  const readCached = (sessionId: string): Promise<SessionTokenReadResult> => {
-    const existing = cache.get(sessionId);
-    if (existing) return existing;
-    const promise = readSessionTotals({ sessionId, messagesRootDir: opts.messagesRootDir, timeoutMs: opts.timeoutMs });
-    cache.set(sessionId, promise);
-    return promise;
-  };
-
-  const next = async (): Promise<void> => {
-    const current = idx;
-    idx += 1;
-    if (current >= opts.sessionIds.length) return;
-
-    const sessionId = opts.sessionIds[current]!;
-    results[current] = await readCached(sessionId);
-    await next();
-  };
-
-  const workers = Array.from({ length: Math.min(concurrency, opts.sessionIds.length) }, () => next());
-  await Promise.all(workers);
-  return results;
-}
-
-function dedupeSessionIds(sessionIds: string[]): string[] {
-  const seen = new Set<string>();
-  const unique: string[] = [];
-  for (const sessionId of sessionIds) {
-    if (seen.has(sessionId)) continue;
-    seen.add(sessionId);
-    unique.push(sessionId);
-  }
-  return unique;
-}
-
 export async function readRunTokenTotals(params: {
   repo: string;
   issue: string;
@@ -133,7 +42,6 @@ export async function readRunTokenTotals(params: {
   timeoutMs?: number;
   concurrency?: number;
   budgetMs?: number;
-  cache?: Map<string, Promise<SessionTokenReadResult>>;
 }): Promise<RunTokenTotals> {
   const issueNumber = parseIssueNumber(params.issue);
   if (!issueNumber) return { tokensTotal: null, tokensComplete: false, sessionCount: 0 };
@@ -146,25 +54,24 @@ export async function readRunTokenTotals(params: {
     const runId = getActiveRalphRunId({ repo: params.repo, issueNumber });
     if (!runId) return { tokensTotal: null, tokensComplete: false, sessionCount: 0 };
 
-    const sessionIds = dedupeSessionIds(listRalphRunSessionIds(runId));
-    if (sessionIds.length === 0) return { tokensTotal: null, tokensComplete: false, sessionCount: 0 };
+    const stored = getRalphRunTokenTotals(runId);
+    if (stored && stored.tokensComplete && typeof stored.tokensTotal === "number") {
+      return { tokensTotal: stored.tokensTotal, tokensComplete: true, sessionCount: stored.sessionCount };
+    }
 
-    const messagesRootDir = resolveOpencodeMessagesRootDir(params.opencodeProfile).messagesRootDir;
-
-    const sessionTotals = await withTimeout(
-      collectSessionTotals({
-        sessionIds,
-        messagesRootDir,
-        timeoutMs,
-        concurrency,
-        cache: params.cache,
-      }),
+    const refreshed = await refreshRalphRunTokenTotals({
+      runId,
+      opencodeProfile: params.opencodeProfile,
+      timeoutMs,
+      concurrency,
       budgetMs,
-      `${params.repo}#${issueNumber}`
-    );
+    });
 
-    const aggregate = computeAggregateTokens(sessionTotals.map((entry) => ({ total: entry.total })));
-    return { tokensTotal: aggregate.tokensTotal, tokensComplete: aggregate.tokensComplete, sessionCount: sessionTotals.length };
+    return {
+      tokensTotal: refreshed.tokensTotal,
+      tokensComplete: refreshed.tokensComplete,
+      sessionCount: refreshed.sessionCount,
+    };
   } catch {
     return { tokensTotal: null, tokensComplete: false, sessionCount: 0 };
   }

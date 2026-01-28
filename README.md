@@ -26,6 +26,11 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 - Canonical spec: `docs/product/dashboard-mvp-control-plane-tui.md`
 - Issue map: https://github.com/3mdistal/ralph/issues/22 (MVP epic) and https://github.com/3mdistal/ralph/issues/23 (docs/scope)
 
+Control plane API (MVP):
+
+- `GET /v1/state` (requires `Authorization: Bearer <token>`)
+- `WS /v1/events` with auth via `Authorization` header, `Sec-WebSocket-Protocol: ralph.bearer.<token>`, or `?access_token=`
+
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.0.0
@@ -135,6 +140,55 @@ sandbox = {
 }
 ```
 
+Optional provisioning block (used by `sandbox:init` / `sandbox:seed`):
+
+```toml
+profile = "sandbox"
+sandbox = {
+  allowedOwners = ["3mdistal"],
+  repoNamePrefix = "ralph-sandbox-",
+  githubAuth = { tokenEnvVar = "GITHUB_SANDBOX_TOKEN" },
+  provisioning = {
+    templateRepo = "3mdistal/ralph-sandbox-template",
+    templateRef = "main",
+    repoVisibility = "private",
+    settingsPreset = "minimal",
+    seed = { preset = "baseline" }
+  }
+}
+```
+
+Canonical sandbox provisioning contract: `docs/product/sandbox-provisioning.md`.
+
+### Sandbox repo lifecycle
+
+Sandbox run repos should be explicitly tagged with the `ralph-sandbox` topic before any automated teardown/prune. This is a hard safety invariant: teardown/prune refuses to mutate repos without the marker topic.
+
+Commands (dry-run by default):
+
+```bash
+ralph sandbox tag --apply
+ralph sandbox teardown --repo <owner/repo> --apply
+ralph sandbox prune --apply
+```
+
+Defaults (override via flags or `sandbox.retention`):
+
+- keep last 10 repos
+- keep failed repos (topic `run-failed`) for 14 days
+- default action is archive (reversible); delete requires `--delete --yes`
+
+Notes:
+
+- `ralph sandbox prune` skips repos that are already archived when action is `archive`.
+- `ralph sandbox tag --failed` adds the `run-failed` topic even if `ralph-sandbox` is already present.
+
+You can add the failed marker when tagging:
+
+```bash
+ralph sandbox tag --failed --apply
+```
+
 ### Supported settings
 
 - `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
@@ -148,26 +202,42 @@ sandbox = {
   - `githubAuth` (object): dedicated sandbox auth
     - `githubApp` (object): GitHub App installation auth for sandbox runs
     - `tokenEnvVar` (string): env var name for a fine-grained PAT restricted to sandbox repos
+  - `provisioning` (object, optional): sandbox repo provisioning
+    - `templateRepo` (string): required template repo (`owner/name`)
+    - `templateRef` (string): template ref/branch (default: `main`)
+    - `repoVisibility` (string): `private` (default; other values invalid)
+    - `settingsPreset` (string): `minimal` (default) or `parity`
+    - `seed` (object, optional): `{ preset = "baseline" }` or `{ file = "/abs/path/seed.json" }`
+  - `retention` (object, optional): sandbox repo retention defaults
+    - `keepLast` (number): keep last N repos (default: 10)
+    - `keepFailedDays` (number): keep failed repos for N days (default: 14)
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
 - `githubApp` (object, optional): GitHub App installation auth for `gh` + REST (tokens cached in memory)
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `concurrencySlots`, optional `maxWorkers` (deprecated), optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `concurrencySlots`, optional `maxWorkers` (deprecated), optional `schedulerPriority`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `repos[].concurrencySlots` (number): per-repo concurrency slots (defaults to 1; overrides `repos[].maxWorkers`)
 - `repos[].rollupBatchSize` (number): per-repo override for rollup batch size (defaults to `batchSize`)
+- `repos[].schedulerPriority` (number): per-repo scheduler priority weighting (default: 1 when enabled; clamped to 0.1..10). Effective weight = `schedulerPriority * issuePriorityWeight` (p0..p4 => 5..1). Scheduling switches to weighted selection when any repo sets this field; otherwise legacy round-robin remains.
 - `ownershipTtlMs` (number): task ownership TTL in milliseconds (defaults to 60000)
 - `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
 - `repos[].autoUpdateBehindLabel` (string): optional label gate required for proactive update-branch
 - `repos[].autoUpdateBehindMinMinutes` (number): minimum minutes between updates per PR (default: 30)
+- `repos[].autoQueue` (object, optional): auto-queue configuration
+  - `enabled` (boolean): enable auto-queue reconciliation (default: false)
+  - `scope` (string): `labeled-only` or `all-open` (default: `labeled-only`)
+  - `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
+  - `dryRun` (boolean): compute decisions without mutating labels (default: false)
 - `repos[].setup` (array): optional setup commands to run in the task worktree before any agent execution (operator-owned)
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
 - Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `doneReconcileIntervalMs` (number): ms between GitHub done reconciliation checks (defaults to 300000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
+- `stall` (object, optional): idle session stall detector + recovery ladder (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 - `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
   - `managedConfigDir` (string, optional): absolute path for Ralph-managed OpenCode config (default: `$HOME/.ralph/opencode`)
@@ -176,18 +246,27 @@ sandbox = {
   - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
 - `dashboard` (object, optional): control plane event persistence
   - `eventsRetentionDays` (number): days to keep `~/.ralph/events/YYYY-MM-DD.jsonl` logs (default: 14; UTC bucketing; cleanup on daemon startup)
+  - `controlPlane` (object, optional): local control plane server
+    - `enabled` (boolean): start the control plane server (default: false)
+    - `host` (string): bind host (default: `127.0.0.1`)
+    - `port` (number): bind port (default: `8787`)
+    - `token` (string): Bearer token required for all endpoints (server will not start without it)
+    - `allowRemote` (boolean): allow binding to non-loopback hosts (default: false)
+    - `exposeRawOpencodeEvents` (boolean): stream `log.opencode.event` payloads (default: false)
+    - `replayLastDefault` (number): default replay count for `/v1/events` (default: 50)
+    - `replayLastMax` (number): max replay count for `/v1/events` (default: 250)
 
 Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derives required checks from GitHub branch protection on `bot/integration` (or `repos[].botBranch`), falling back to the repository default branch (usually `main`). If branch protection is missing or unreadable, Ralph does not gate merges. Ralph considers both check runs and legacy status contexts when matching available check names. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
 Note: `repos[].setup` commands run in the task worktree before any OpenCode agent execution. Setup is cached per worktree by `(commands hash + lockfile signature)`; if commands or lockfiles change, setup runs again.
 
 
-When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
+When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections. If required check contexts are missing (including when no check contexts exist yet), Ralph logs a warning, proceeds without protection for now, and retries after a short delay.
 Setting `repos[].requiredChecks` to `[]` disables Ralph's merge gating but does not clear existing GitHub branch protection rules.
 
 Ralph refuses to auto-merge PRs targeting `main` unless the issue has the `allow-main` label. This guardrail only affects Ralph automation; humans can still merge to `main` normally.
 
-If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names.
+If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names. Ralph will retry branch protection after the defer window.
 
 ### GitHub auth precedence
 
@@ -207,6 +286,12 @@ Only these env vars are currently supported (unless noted otherwise):
 | Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
 | Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
 | CI remediation attempts | `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` | `2` |
+| Control plane enabled | `RALPH_DASHBOARD_ENABLED` | `false` |
+| Control plane host | `RALPH_DASHBOARD_HOST` | `127.0.0.1` |
+| Control plane port | `RALPH_DASHBOARD_PORT` | `8787` |
+| Control plane token | `RALPH_DASHBOARD_TOKEN` | (none) |
+| Control plane replay default | `RALPH_DASHBOARD_REPLAY_DEFAULT` | `50` |
+| Control plane replay max | `RALPH_DASHBOARD_REPLAY_MAX` | `250` |
 
 Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
@@ -241,7 +326,7 @@ bun dev
 bun run status
 ```
 
-Status output includes blocked tasks with reasons and idle age.
+Status output includes blocked tasks with reasons/idle age and recent alert summaries (when available).
 
 Machine-readable output:
 
@@ -249,7 +334,7 @@ Machine-readable output:
 bun run status --json
 ```
 
-JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, and a short `blockedDetailsSnippet`.
+JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, a short `blockedDetailsSnippet`, and per-task `alerts` summaries when present.
 
 Live updates (prints when status changes):
 
@@ -271,6 +356,26 @@ Machine-readable output:
 ralph repos --json
 ```
 
+### Sandbox provisioning
+
+```bash
+bun run sandbox:init
+```
+
+Skip seeding:
+
+```bash
+bun run sandbox:init --no-seed
+```
+
+Seed an existing sandbox repo (defaults to newest manifest if `--run-id` omitted):
+
+```bash
+bun run sandbox:seed --run-id <run-id>
+```
+
+Manifests are written to `~/.ralph/sandbox/manifests/<runId>.json`.
+
 ### Nudge an in-progress task
 
 ```bash
@@ -279,6 +384,31 @@ ralph nudge <taskRef> "Just implement it, stop asking questions"
 
 - Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
 - Success means the delivery attempt succeeded, not guaranteed agent compliance.
+
+### Release a stuck task slot (local-only)
+
+```bash
+ralph queue release --repo <owner/repo> --issue <n>
+```
+
+- Clears the local slot reservation and marks the task released in SQLite.
+- Does not attempt GitHub label writes; labels converge later via reconciliation.
+
+
+### Seed sandbox edge cases
+
+```bash
+ralph sandbox seed --repo <owner/repo>
+```
+
+Seeds a sandbox repo with deterministic edge-case issues/relationships (dependency graphs, sub-issues, label drift, and collision tasks). This command requires `profile = "sandbox"` with a configured sandbox allowlist/prefix.
+
+Useful flags:
+
+```bash
+ralph sandbox seed --repo <owner/repo> --dry-run
+ralph sandbox seed --repo <owner/repo> --manifest sandbox/seed-manifest.v1.json --out sandbox/seed-ids.v1.json
+```
 
 
 ### Queue a task
@@ -311,7 +441,7 @@ orchestration/
   config.toml     # preferred config (if present)
   config.json     # fallback config
   state.sqlite    # durable metadata for idempotency + recovery (repos/issues/tasks/prs + sync/idempotency)
-  sessions/       # introspection logs per session
+  sessions/       # introspection logs per session (events.jsonl + summary.json)
 ```
 
 ## How it works
@@ -384,9 +514,29 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
 
+### ralphctl (operator CLI)
+
+`ralphctl` wraps the control file and restart flow:
+
+- `ralphctl status [--json]`
+- `ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]`
+- `ralphctl resume`
+- `ralphctl restart [--grace 5m] [--start-cmd "<command>"]`
+- `ralphctl upgrade [--grace 5m] [--start-cmd "<command>"] [--upgrade-cmd "<command>"]`
+
+Daemon discovery for restart/upgrade uses a lease record at:
+
+- `$XDG_STATE_HOME/ralph/daemon.json`
+- Fallback: `~/.local/state/ralph/daemon.json`
+- Last resort: `/tmp/ralph/<uid>/daemon.json`
+
+The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
+
 ## Managed OpenCode config (daemon runs)
 
 Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `$HOME/.ralph/opencode`. This directory is owned by Ralph and overwritten on startup to match the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Override precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. Overrides must be absolute paths (no `~` expansion). For safety, Ralph refuses to manage non-managed directories unless they already contain the `.ralph-managed-opencode` marker file. This does not change OpenCode profile storage; profiles still control XDG roots for auth/storage/usage logs.
+
+Daemon runs do not rely on `~/.config/opencode` plugins. Ralph emits its own introspection artifacts at `~/.ralph/sessions/<sessionId>/events.jsonl` and `~/.ralph/sessions/<sessionId>/summary.json` for watchdog/anomaly detection.
 
 ## OpenCode profiles (multi-account)
 
@@ -528,10 +678,19 @@ ralph status --json | jq '{mode, activeProfile, throttle: .throttle.state, pendi
 
 Shows active profile, throttle state, pending escalations, and per-task profile assignments.
 
+### Checking gate state
+
+```bash
+ralph gates 3mdistal/ralph 232 --json | jq '.gates'
+```
+
+Shows the latest persisted deterministic gate state and any bounded artifacts for the issue.
+
 ### Notes
 
 - Paths must be absolute (no `~` expansion).
 - New tasks start under the active `opencode_profile` from the control file (or `defaultProfile` when unset).
+- `defaultProfile` may be set to `"auto"` to auto-select a profile for new work when no control profile is set.
 - Tasks persist `opencode-profile` in frontmatter and always resume under the same profile.
 - Throttle is computed per profile—a throttled profile won't affect tasks on other profiles.
 
@@ -544,7 +703,7 @@ In daemon mode, a single tool call can hang indefinitely. Ralph uses a watchdog 
 
 ### Configuration
 
-Configure via `~/.config/opencode/ralph/ralph.json` under `watchdog`:
+Configure via `~/.ralph/config.toml` or `~/.ralph/config.json` under `watchdog` (legacy `~/.config/opencode/ralph/ralph.json` is still supported):
 
 ```json
 {
@@ -559,6 +718,28 @@ Configure via `~/.config/opencode/ralph/ralph.json` under `watchdog`:
       "task": { "softMs": 180000, "hardMs": 600000 },
       "bash": { "softMs": 300000, "hardMs": 1800000 }
     }
+  }
+}
+```
+
+## Stall Detection (Idle Sessions)
+
+In daemon mode, an OpenCode run can wedge without tripping per-tool watchdog thresholds (e.g. stuck between tool calls). Ralph also detects run-level stalls by watching session activity and applying a deterministic recovery ladder:
+
+- **Nudge**: after `stall.nudgeAfterMs` of inactivity, re-queue the task to resume the same session with a nudge prompt
+- **Restart** (once): if it stalls again, re-queue with a cleared `session-id` to start a fresh session
+- **Escalate**: if it stalls again after the restart, escalate with trace pointers
+
+### Configuration
+
+```json
+{
+  "stall": {
+    "enabled": true,
+    "idleMs": 300000,
+    "nudgeAfterMs": 300000,
+    "restartAfterMs": 600000,
+    "maxRestarts": 1
   }
 }
 ```

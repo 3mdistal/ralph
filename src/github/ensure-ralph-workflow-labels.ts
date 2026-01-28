@@ -1,6 +1,7 @@
 import { computeRalphLabelSync } from "../github-labels";
 import { shouldLog } from "../logging";
 import { GitHubApiError, GitHubClient } from "./client";
+import { canAttemptLabelWrite, recordLabelWriteFailure, recordLabelWriteSuccess } from "./label-write-backoff";
 
 export type EnsureOutcome =
   | { ok: true; created: string[]; updated: string[] }
@@ -132,6 +133,9 @@ export function createRalphWorkflowLabelsEnsurer(params: EnsureFactoryParams): {
   };
 
   const ensure = async (repo: string): Promise<EnsureOutcome> => {
+    if (!canAttemptLabelWrite(repo)) {
+      return { ok: false, kind: "transient", error: new Error("GitHub label writes temporarily blocked") };
+    }
     const cached = cache.get(repo);
     if (cached) return cached;
 
@@ -150,6 +154,7 @@ export function createRalphWorkflowLabelsEnsurer(params: EnsureFactoryParams): {
       const outcome = await ensureRalphWorkflowLabelsOnce({ repo, github: params.githubFactory(repo) });
 
       if (outcome.ok) {
+        recordLabelWriteSuccess(repo);
         if (outcome.created.length > 0) {
           log(`[ralph:labels:${repo}] Created GitHub label(s): ${outcome.created.join(", ")}`);
         }
@@ -163,6 +168,7 @@ export function createRalphWorkflowLabelsEnsurer(params: EnsureFactoryParams): {
         cache.set(repo, outcome);
         transientCache.delete(repo);
       } else {
+        recordLabelWriteFailure(repo, outcome.error);
         warnTransient(repo, outcome.error);
         transientCache.set(repo, {
           outcome,

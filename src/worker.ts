@@ -10,6 +10,7 @@ import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
   getOpencodeDefaultProfileName,
+  getRequestedOpencodeProfileName,
   getRepoBotBranch,
   getRepoConcurrencySlots,
   getRepoRequiredChecksOverride,
@@ -22,7 +23,7 @@ import {
 import { normalizeGitRef } from "./midpoint-labels";
 import { computeHeadBranchDeletionDecision } from "./pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
-import { getAllowedOwners, isRepoAllowed } from "./github-app-auth";
+import { getAllowedOwners, getConfiguredGitHubAppSlug, isRepoAllowed } from "./github-app-auth";
 import {
   continueCommand,
   continueSession,
@@ -36,7 +37,7 @@ import { getThrottleDecision } from "./throttle";
 import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
 import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
 import { ensureWorktreeSetup, type SetupFailure } from "./worktree-setup";
-import { LogLimiter } from "./logging";
+import { LogLimiter, formatDuration } from "./logging";
 import { buildWorktreePath } from "./worktree-paths";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
@@ -59,6 +60,7 @@ import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
+import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import {
   buildCiDebugCommentBody,
@@ -95,15 +97,22 @@ import {
 } from "./github/issue-relationships";
 import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
 import { ralphEventBus } from "./dashboard/bus";
-import { buildRalphEvent, isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "./dashboard/events";
+import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "./dashboard/events";
+import { publishDashboardEvent, type DashboardEventContext } from "./dashboard/publisher";
 import { cleanupSessionArtifacts } from "./introspection-traces";
+import { isIntrospectionSummary, type IntrospectionSummary } from "./introspection/summary";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "./run-recording-session-adapter";
 import { redactHomePathForDisplay } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import {
   completeRalphRun,
   createRalphRun,
+  ensureRalphRunGateRows,
+  getLatestRunIdForSession,
+  getRalphRunTokenTotals,
   getIdempotencyPayload,
+  listRalphRunSessionTokenTotals,
+  recordRalphRunGateArtifact,
   upsertIdempotencyKey,
   recordIssueSnapshot,
   recordPrSnapshot,
@@ -113,7 +122,9 @@ import {
   type PrState,
   type RalphRunAttemptKind,
   type RalphRunDetails,
+  upsertRalphRunGateResult,
 } from "./state";
+import { refreshRalphRunTokenTotals } from "./run-token-accounting";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
   detectLegacyWorktrees,
@@ -128,8 +139,19 @@ import {
   normalizePrUrl,
   searchOpenPullRequestsByIssueLink,
   viewPullRequest,
+  viewPullRequestMergeCandidate,
   type PullRequestSearchResult,
 } from "./github/pr";
+
+function prBodyClosesIssue(body: string, issueNumber: string): boolean {
+  const normalized = body.replace(/\r\n/g, "\n");
+  const re = new RegExp(`(^|\\n)\\s*(fixes|closes|resolves)\\s+#${issueNumber}\\b`, "i");
+  return re.test(normalized);
+}
+
+export function __prBodyClosesIssueForTests(body: string, issueNumber: string): boolean {
+  return prBodyClosesIssue(body, issueNumber);
+}
 
 const ghRead = (repo: string) => createGhRunner({ repo, mode: "read" });
 const ghWrite = (repo: string) => createGhRunner({ repo, mode: "write" });
@@ -228,17 +250,6 @@ const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 const CHECKPOINT_SEQ_FIELD = "checkpoint-seq";
 const PAUSE_REQUESTED_FIELD = "pause-requested";
 const PAUSED_AT_CHECKPOINT_FIELD = "paused-at-checkpoint";
-
-interface IntrospectionSummary {
-  sessionId: string;
-  endTime: number;
-  toolResultAsTextCount: number;
-  totalToolCalls: number;
-  stepCount: number;
-  hasAnomalies: boolean;
-  recentTools: string[];
-}
-
 interface LiveAnomalyCount {
   total: number;
   recentBurst: boolean;
@@ -251,7 +262,8 @@ async function readIntrospectionSummary(sessionId: string): Promise<Introspectio
   
   try {
     const content = await readFile(summaryPath, "utf8");
-    return JSON.parse(content);
+    const parsed = JSON.parse(content);
+    return isIntrospectionSummary(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -850,6 +862,13 @@ type RequiredChecksGuidanceInput = {
   availableChecks: string[];
 };
 
+type BranchProtectionDecisionKind = "ok" | "defer" | "fail";
+
+type BranchProtectionDecision = {
+  kind: BranchProtectionDecisionKind;
+  missingChecks: string[];
+};
+
 type CheckLogResult = {
   runId?: string;
   runUrl?: string;
@@ -877,6 +896,26 @@ function formatRequiredChecksGuidance(input: RequiredChecksGuidanceInput): strin
   return lines.join("\n");
 }
 
+const REQUIRED_CHECKS_DEFER_RETRY_MS = 60_000;
+const REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS = 60_000;
+
+function decideBranchProtection(input: {
+  requiredChecks: string[];
+  availableChecks: string[];
+}): BranchProtectionDecision {
+  const missingChecks = input.requiredChecks.filter((check) => !input.availableChecks.includes(check));
+
+  if (input.requiredChecks.length === 0) {
+    return { kind: "ok", missingChecks: [] };
+  }
+
+  if (missingChecks.length > 0) {
+    return { kind: "defer", missingChecks };
+  }
+
+  return { kind: "ok", missingChecks: [] };
+}
+
 const MAIN_MERGE_OVERRIDE_LABEL = "allow-main";
 
 function isMainMergeOverride(labels: string[]): boolean {
@@ -893,6 +932,13 @@ function isMainMergeAllowed(baseBranch: string | null, botBranch: string, labels
 
 export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuidanceInput): string {
   return formatRequiredChecksGuidance(input);
+}
+
+export function __decideBranchProtectionForTests(input: {
+  requiredChecks: string[];
+  availableChecks: string[];
+}): BranchProtectionDecision {
+  return decideBranchProtection(input);
 }
 
 export class RepoWorker {
@@ -930,6 +976,7 @@ export class RepoWorker {
   }
 
   private ensureBranchProtectionPromise: Promise<void> | null = null;
+  private ensureBranchProtectionDeferUntil = 0;
   private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
   private relationships: IssueRelationshipProvider;
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
@@ -940,6 +987,8 @@ export class RepoWorker {
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
   private checkpointEvents = new CheckpointEventDeduper();
+  private activeRunId: string | null = null;
+  private activeDashboardContext: DashboardEventContext | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -971,6 +1020,7 @@ export class RepoWorker {
         "completed-at": completedAt,
         "session-id": "",
         "watchdog-retries": "",
+        "stall-retries": "",
         ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
         ...(task["worker-id"] ? { "worker-id": "" } : {}),
         ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
@@ -1016,12 +1066,65 @@ export class RepoWorker {
     }
   }
 
+  private buildDashboardContext(task: AgentTask, runId?: string | null): DashboardEventContext {
+    const taskId = task._path || task._name || task.name || undefined;
+    const workerId = task["worker-id"]?.trim() || (taskId ? `${this.repo}#${taskId}` : undefined);
+    const sessionId = task["session-id"]?.trim() || undefined;
+    return {
+      runId: runId ?? undefined,
+      workerId,
+      repo: this.repo,
+      taskId,
+      sessionId,
+    };
+  }
+
+  private withDashboardContext<T>(context: DashboardEventContext, run: () => Promise<T>): Promise<T> {
+    const prev = this.activeDashboardContext;
+    this.activeDashboardContext = context;
+    return Promise.resolve(run()).finally(() => {
+      this.activeDashboardContext = prev;
+    });
+  }
+
+  private publishDashboardEvent(
+    event: Omit<RalphEvent, "ts"> & { ts?: string },
+    overrides?: Partial<DashboardEventContext>
+  ): void {
+    const context = this.activeDashboardContext ? { ...this.activeDashboardContext, ...overrides } : overrides;
+    publishDashboardEvent(event, context);
+  }
+
+  private publishCheckpoint(checkpoint: RalphCheckpoint, overrides?: Partial<DashboardEventContext>): void {
+    this.publishDashboardEvent(
+      {
+        type: "worker.checkpoint.reached",
+        level: "info",
+        data: { checkpoint },
+      },
+      overrides
+    );
+  }
+
+  private logWorker(message: string, overrides?: Partial<DashboardEventContext>): void {
+    console.log(`[ralph:worker:${this.repo}] ${message}`);
+    this.publishDashboardEvent(
+      {
+        type: "log.worker",
+        level: "info",
+        data: { message },
+      },
+      overrides
+    );
+  }
+
   private async withRunContext(
     task: AgentTask,
     attemptKind: RalphRunAttemptKind,
     run: () => Promise<AgentRun>
   ): Promise<AgentRun> {
     let runId: string | null = null;
+    const previousRunId = this.activeRunId;
 
     try {
       runId = createRalphRun({
@@ -1040,6 +1143,15 @@ export class RepoWorker {
       return await run();
     }
 
+    this.activeRunId = runId;
+    try {
+      ensureRalphRunGateRows({ runId });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to initialize gate rows for ${task.name}: ${error?.message ?? String(error)}`
+      );
+    }
+
     const recordingBase = createRunRecordingSessionAdapter({
       base: this.baseSession,
       runId,
@@ -1049,11 +1161,25 @@ export class RepoWorker {
     const recordingSession = this.createContextRecoveryAdapter(recordingBase);
 
     let result: AgentRun | null = null;
+    const context = this.buildDashboardContext(task, runId);
 
     try {
-      result = await this.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, run);
+      result = await this.withDashboardContext(context, async () => {
+        this.publishDashboardEvent({
+          type: "worker.became_busy",
+          level: "info",
+          data: { taskName: task.name, issue: task.issue },
+        });
+        return await this.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, run);
+      });
       return result;
     } finally {
+      this.publishDashboardEvent({
+        type: "worker.became_idle",
+        level: "info",
+        data: { reason: result?.outcome },
+      });
+
       try {
         completeRalphRun({
           runId,
@@ -1065,6 +1191,35 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] Failed to complete run record for ${task.name}: ${error?.message ?? String(error)}`
         );
       }
+
+      // Best-effort: persist token totals + append to the latest run log.
+      try {
+        const opencodeProfile = this.getPinnedOpencodeProfileName(task);
+        await refreshRalphRunTokenTotals({ runId, opencodeProfile });
+        const totals = getRalphRunTokenTotals(runId);
+        const runLogPath = task["run-log-path"]?.trim() || "";
+        if (totals && runLogPath && existsSync(runLogPath)) {
+          const totalLabel = totals.tokensComplete && typeof totals.tokensTotal === "number" ? totals.tokensTotal : "?";
+          const perSession = listRalphRunSessionTokenTotals(runId);
+          const missingCount = perSession.filter((s) => s.quality !== "ok").length;
+          const suffix = missingCount > 0 ? ` missingSessions=${missingCount}` : "";
+
+          await appendFile(
+            runLogPath,
+            "\n" +
+              [
+                "-----",
+                `Token usage: total=${totalLabel} complete=${totals.tokensComplete ? "true" : "false"} sessions=${totals.sessionCount}${suffix}`,
+              ].join("\n") +
+              "\n",
+            "utf8"
+          );
+        }
+      } catch {
+        // best-effort token accounting
+      }
+
+      this.activeRunId = previousRunId;
     }
   }
 
@@ -1171,38 +1326,88 @@ export class RepoWorker {
   private createContextRecoveryAdapter(base: SessionAdapter): SessionAdapter {
     return {
       runAgent: async (repoPath, agent, message, options, testOverrides) => {
-        const result = await base.runAgent(repoPath, agent, message, options, testOverrides);
+        const dashboardOptions = this.withDashboardSessionOptions(options);
+        const result = await base.runAgent(repoPath, agent, message, dashboardOptions, testOverrides);
         return this.maybeRecoverFromContextLengthExceeded({
           repoPath,
           sessionId: result.sessionId,
           stepKey: options?.introspection?.stepTitle ?? `agent:${agent}`,
           result,
-          options,
+          options: dashboardOptions,
         });
       },
       continueSession: async (repoPath, sessionId, message, options) => {
-        const result = await base.continueSession(repoPath, sessionId, message, options);
+        const dashboardOptions = this.withDashboardSessionOptions(options, { sessionId });
+        const result = await base.continueSession(repoPath, sessionId, message, dashboardOptions);
         return this.maybeRecoverFromContextLengthExceeded({
           repoPath,
           sessionId,
           stepKey: options?.introspection?.stepTitle ?? `session:${sessionId}`,
           result,
-          options,
+          options: dashboardOptions,
         });
       },
       continueCommand: async (repoPath, sessionId, command, args, options) => {
-        const result = await base.continueCommand(repoPath, sessionId, command, args, options);
+        const dashboardOptions = this.withDashboardSessionOptions(options, { sessionId });
+        const result = await base.continueCommand(repoPath, sessionId, command, args, dashboardOptions);
         return this.maybeRecoverFromContextLengthExceeded({
           repoPath,
           sessionId,
           stepKey: options?.introspection?.stepTitle ?? `command:${command}`,
           result,
-          options,
+          options: dashboardOptions,
           command,
         });
       },
       getRalphXdgCacheHome: base.getRalphXdgCacheHome,
     };
+  }
+
+  private withDashboardSessionOptions(
+    options?: RunSessionOptionsBase,
+    overrides?: Partial<DashboardEventContext>
+  ): RunSessionOptionsBase | undefined {
+    const context = this.activeDashboardContext ? { ...this.activeDashboardContext, ...overrides } : overrides;
+    if (!context) return options;
+
+    const existingOnEvent = options?.onEvent;
+    const onEvent = (event: any) => {
+      if (!event) return;
+      const eventSessionId = event.sessionID ?? event.sessionId;
+      const sessionId = typeof eventSessionId === "string" ? eventSessionId : context.sessionId;
+
+      this.publishDashboardEvent(
+        {
+          type: "log.opencode.event",
+          level: "info",
+          repo: context.repo,
+          taskId: context.taskId,
+          workerId: context.workerId,
+          sessionId,
+          data: { event },
+        },
+        { ...context, sessionId }
+      );
+
+      if (event.type === "text" && event.part?.text) {
+        this.publishDashboardEvent(
+          {
+            type: "log.opencode.text",
+            level: "info",
+            repo: context.repo,
+            taskId: context.taskId,
+            workerId: context.workerId,
+            sessionId,
+            data: { text: String(event.part.text) },
+          },
+          { ...context, sessionId }
+        );
+      }
+
+      existingOnEvent?.(event);
+    };
+
+    return { ...(options ?? {}), onEvent };
   }
 
   private recordContextCompactAttempt(task: AgentTask, stepKey: string): { allowed: boolean; attempt: number } {
@@ -1277,8 +1482,8 @@ export class RepoWorker {
       compactOptions,
       resumeOptions,
       onEvent: (event) => {
-        ralphEventBus.publish(
-          buildRalphEvent({
+        this.publishDashboardEvent(
+          {
             type: "worker.context_compact.triggered",
             level: "info",
             repo: this.repo,
@@ -1288,7 +1493,8 @@ export class RepoWorker {
               stepTitle: event.stepKey,
               attempt: event.attempt,
             },
-          })
+          },
+          { sessionId: event.sessionId }
         );
       },
     });
@@ -1343,6 +1549,7 @@ export class RepoWorker {
         "completed-at": new Date().toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
+        "stall-retries": "",
         ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
       },
     });
@@ -1363,7 +1570,11 @@ export class RepoWorker {
       ].join("\n"),
     });
 
-    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, task.name);
+    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, {
+      taskName: task.name,
+      repo: task.repo,
+      issue: task.issue,
+    });
 
     const error = new Error(reason) as Error & { ralphRootDirty?: boolean };
     error.ralphRootDirty = true;
@@ -1505,6 +1716,12 @@ export class RepoWorker {
         console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
         return;
       }
+      if (result.kind === "transient") {
+        console.warn(
+          `[ralph:worker:${this.repo}] GitHub label write skipped (transient): ${String(result.error)}`
+        );
+        return;
+      }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
     }
   }
@@ -1524,6 +1741,12 @@ export class RepoWorker {
     if (!result.ok) {
       if (result.kind === "policy") {
         console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
+        return;
+      }
+      if (result.kind === "transient") {
+        console.warn(
+          `[ralph:worker:${this.repo}] GitHub label write skipped (transient): ${String(result.error)}`
+        );
         return;
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
@@ -1557,6 +1780,104 @@ export class RepoWorker {
     });
     this.prResolutionCache.set(cacheKey, promise);
     return promise;
+  }
+
+  /**
+   * Reconciliation lane: if a queued issue already has a Ralph-authored PR that is mergeable,
+   * merge it and apply midpoint labels. This avoids "orphan" PRs when the daemon restarts
+   * between PR creation and merge.
+   */
+  public async tryReconcileMergeablePrForQueuedTask(task: AgentTask): Promise<
+    | { handled: false }
+    | { handled: true; merged: true; prUrl: string }
+    | { handled: true; merged: false; reason: string }
+  > {
+    const issueMatch = task.issue.match(/^([^#]+)#(\d+)$/);
+    if (!issueMatch) return { handled: false };
+    const issueNumber = issueMatch[2];
+    if (!issueNumber) return { handled: false };
+
+    const botBranch = getRepoBotBranch(this.repo);
+
+    const resolved = await this.getIssuePrResolution(issueNumber);
+    const prUrl = resolved.selectedUrl;
+    if (!prUrl) return { handled: false };
+
+    let pr: Awaited<ReturnType<typeof viewPullRequestMergeCandidate>> | null = null;
+    try {
+      pr = await viewPullRequestMergeCandidate(this.repo, prUrl);
+    } catch {
+      return { handled: false };
+    }
+    if (!pr) return { handled: false };
+
+    const prState = String(pr.state ?? "").toUpperCase();
+    if (prState !== "OPEN") return { handled: false };
+    if (pr.isDraft) return { handled: false };
+
+    const baseBranch = pr.baseRefName ? this.normalizeGitRef(pr.baseRefName) : "";
+    const normalizedBot = this.normalizeGitRef(botBranch);
+    if (!baseBranch || baseBranch !== normalizedBot) return { handled: false };
+
+    const mergeable = String(pr.mergeable ?? "").toUpperCase();
+    if (mergeable !== "MERGEABLE") return { handled: false };
+
+    const mergeStateStatus = normalizeMergeStateStatus(pr.mergeStateStatus);
+    if (mergeStateStatus === "DIRTY" || mergeStateStatus === "DRAFT") return { handled: false };
+
+    const body = pr.body ?? "";
+    if (!body || !prBodyClosesIssue(body, issueNumber)) return { handled: false };
+
+    let appSlug: string | null = null;
+    try {
+      appSlug = await getConfiguredGitHubAppSlug();
+    } catch {
+      appSlug = null;
+    }
+
+    const expectedAuthor = appSlug ? `app/${appSlug}` : null;
+    if (!expectedAuthor) return { handled: false };
+    if (!pr.authorIsBot || pr.authorLogin !== expectedAuthor) return { handled: false };
+
+    const issueMeta = await this.getIssueMetadata(task.issue);
+    const cacheKey = `reconcile-merge-${issueNumber}`;
+    const sessionId = task["session-id"]?.trim() ?? "";
+    const notifyTitle = `${this.repo}#${issueNumber} reconcile merge`;
+
+    const merged = await this.mergePrWithRequiredChecks({
+      task,
+      repoPath: this.repoPath,
+      cacheKey,
+      botBranch,
+      prUrl,
+      sessionId,
+      issueMeta,
+      watchdogStagePrefix: "reconcile-merge",
+      notifyTitle,
+    });
+
+    if (!merged.ok) {
+      return { handled: true, merged: false, reason: merged.run.escalationReason ?? "Merge failed" };
+    }
+
+    const completedAt = new Date().toISOString().split("T")[0];
+    await this.queue.updateTaskStatus(task, "done", {
+      "completed-at": completedAt,
+      "session-id": "",
+      "worktree-path": "",
+      "worker-id": "",
+      "repo-slot": "",
+      "daemon-id": "",
+      "heartbeat-at": "",
+      "watchdog-retries": "",
+      "blocked-source": "",
+      "blocked-reason": "",
+      "blocked-details": "",
+      "blocked-at": "",
+      "blocked-checked-at": "",
+    });
+
+    return { handled: true, merged: true, prUrl: merged.prUrl };
   }
 
   private async findExistingOpenPrForIssue(issueNumber: string): Promise<ResolvedIssuePr> {
@@ -1710,7 +2031,12 @@ export class RepoWorker {
       fetchBaseBranch: async (prUrl) => this.getPullRequestBaseBranch(prUrl),
       addIssueLabel: async (issue, label) => this.addIssueLabel(issue, label),
       removeIssueLabel: async (issue, label) => this.removeIssueLabel(issue, label),
-      notifyError: async (title, body, taskName) => this.notify.notifyError(title, body, taskName ?? undefined),
+      notifyError: async (title, body, context) =>
+        this.notify.notifyError(title, body, {
+          taskName: context?.taskName ?? params.task.name,
+          repo: context?.repo ?? params.task.repo,
+          issue: context?.issue ?? params.task.issue,
+        }),
       warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
     });
   }
@@ -1981,8 +2307,8 @@ export class RepoWorker {
     return "main";
   }
 
-  private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
-    if (requiredChecks.length === 0) return;
+  private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<"ok" | "defer"> {
+    if (requiredChecks.length === 0) return "ok";
 
     const botBranch = getRepoBotBranch(this.repo);
     if (branch === botBranch) {
@@ -2001,22 +2327,30 @@ export class RepoWorker {
       }
     }
 
-    const missingChecks = requiredChecks.filter((check) => !availableChecks.includes(check));
-    if (missingChecks.length > 0) {
+    const decision = decideBranchProtection({ requiredChecks, availableChecks });
+    if (decision.kind !== "ok") {
       const guidance = formatRequiredChecksGuidance({
         repo: this.repo,
         branch,
         requiredChecks,
-        missingChecks,
+        missingChecks: decision.missingChecks,
         availableChecks,
       });
-      if (availableChecks.length === 0) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Required checks not yet available for ${branch}. ` +
-            `Proceeding without branch protection until CI runs.
+      if (decision.kind === "defer") {
+        const logKey = `branch-protection-defer:${this.repo}:${branch}:${decision.missingChecks.join(",") || "none"}::${availableChecks.join(",") || "none"}`;
+        if (this.requiredChecksLogLimiter.shouldLog(logKey, REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS)) {
+          console.warn(
+            `[ralph:worker:${this.repo}] RALPH_BRANCH_PROTECTION_SKIPPED_MISSING_CHECKS ` +
+              `Required checks missing for ${this.repo}@${branch} ` +
+              `(required: ${requiredChecks.join(", ") || "(none)"}; ` +
+              `missing: ${decision.missingChecks.join(", ") || "(none)"}). ` +
+              `Proceeding without branch protection for now; will retry in ${formatDuration(
+                REQUIRED_CHECKS_DEFER_RETRY_MS
+              )}.
 ${guidance}`
-        );
-        return;
+          );
+        }
+        return "defer";
       }
 
       throw new Error(
@@ -2072,10 +2406,15 @@ ${guidance}`
         `[ralph:worker:${this.repo}] Ensured branch protection for ${branch} (required checks: ${requiredChecks.join(", ")})`
       );
     }
+
+    return "ok";
   }
 
   private async ensureBranchProtectionOnce(): Promise<void> {
     if (this.ensureBranchProtectionPromise) return this.ensureBranchProtectionPromise;
+
+    const now = Date.now();
+    if (now < this.ensureBranchProtectionDeferUntil) return;
 
     this.ensureBranchProtectionPromise = (async () => {
       const botBranch = getRepoBotBranch(this.repo);
@@ -2088,10 +2427,20 @@ ${guidance}`
       const fallbackBranch = await this.resolveFallbackBranch(botBranch);
       const branches = Array.from(new Set([botBranch, fallbackBranch]));
 
+      let deferred = false;
+
       for (const branch of branches) {
-        await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
+        const result = await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
+        if (result === "defer") deferred = true;
       }
-    })();
+
+      return deferred;
+    })().then((deferred) => {
+      if (deferred) {
+        this.ensureBranchProtectionDeferUntil = Date.now() + REQUIRED_CHECKS_DEFER_RETRY_MS;
+        this.ensureBranchProtectionPromise = null;
+      }
+    });
 
     return this.ensureBranchProtectionPromise;
   }
@@ -2204,40 +2553,11 @@ ${guidance}`
   }
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
-    const resolved = this.resolveDependencySignals(snapshot);
+    const resolved = resolveRelationshipSignals(snapshot);
     if (resolved.ignoredBodyBlockers > 0) {
       this.logIgnoredBodyBlockers(snapshot.issue, resolved.ignoredBodyBlockers, resolved.ignoreReason);
     }
-
-    if (!snapshot.coverage.githubDepsComplete && !resolved.hasBodyDepsCoverage) {
-      resolved.signals.push({ source: "github", kind: "blocked_by", state: "unknown" });
-    }
-    if (!snapshot.coverage.githubSubIssuesComplete) {
-      resolved.signals.push({ source: "github", kind: "sub_issue", state: "unknown" });
-    }
     return resolved.signals;
-  }
-
-  private resolveDependencySignals(snapshot: IssueRelationshipSnapshot): {
-    signals: RelationshipSignal[];
-    hasBodyDepsCoverage: boolean;
-    ignoredBodyBlockers: number;
-    ignoreReason: "complete" | "partial";
-  } {
-    const signals = [...snapshot.signals];
-    const githubDepsSignals = signals.filter((signal) => signal.source === "github" && signal.kind === "blocked_by");
-    const bodyDepsSignals = signals.filter((signal) => signal.source === "body" && signal.kind === "blocked_by");
-    const hasGithubDepsSignals = githubDepsSignals.length > 0;
-    const hasGithubDepsCoverage = snapshot.coverage.githubDepsComplete;
-    const shouldIgnoreBodyDeps = hasGithubDepsCoverage || (!hasGithubDepsCoverage && hasGithubDepsSignals);
-    const filteredSignals = shouldIgnoreBodyDeps
-      ? signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
-      : signals;
-    const hasBodyDepsCoverage = snapshot.coverage.bodyDeps && !shouldIgnoreBodyDeps;
-    const ignoredBodyBlockers = shouldIgnoreBodyDeps ? bodyDepsSignals.length : 0;
-    const ignoreReason = hasGithubDepsCoverage ? "complete" : "partial";
-
-    return { signals: filteredSignals, hasBodyDepsCoverage, ignoredBodyBlockers, ignoreReason };
   }
 
   private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {
@@ -2461,6 +2781,7 @@ ${guidance}`
           "daemon-id": "",
           "heartbeat-at": "",
           "watchdog-retries": "",
+          "stall-retries": "",
         });
         if (!updated) {
           throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
@@ -3002,10 +3323,12 @@ ${guidance}`
       last = { headSha, mergeStateStatus, baseRefName, summary, checks };
 
       if (mergeStateStatus === "DIRTY") {
+        this.recordCiGateSummary(prUrl, summary);
         return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false, stopReason: "merge-conflict" };
       }
 
       if (summary.status === "success" || summary.status === "failure") {
+        this.recordCiGateSummary(prUrl, summary);
         return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
       }
 
@@ -3034,24 +3357,37 @@ ${guidance}`
     }
 
     if (last) {
+      this.recordCiGateSummary(prUrl, last.summary);
       return { ...last, timedOut: true };
     }
 
     // Should be unreachable, but keep types happy.
     const fallback = await this.getPullRequestChecks(prUrl);
+    const fallbackSummary = summarizeRequiredChecks(fallback.checks, requiredChecks);
+    this.recordCiGateSummary(prUrl, fallbackSummary);
     return {
       headSha: fallback.headSha,
       mergeStateStatus: fallback.mergeStateStatus,
       baseRefName: fallback.baseRefName,
-      summary: summarizeRequiredChecks(fallback.checks, requiredChecks),
+      summary: fallbackSummary,
       checks: fallback.checks,
       timedOut: true,
     };
   }
 
   private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+
     // Never pass --admin or -d (delete branch). Branch cleanup is handled separately with guardrails.
-    await ghWrite(this.repo)`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
+    // Use the merge REST API to avoid interactive gh pr merge behavior in daemon mode.
+    await ghWrite(this.repo)`gh api -X PUT /repos/${owner}/${name}/pulls/${prNumber}/merge -f merge_method=merge -f sha=${headSha}`
+      .cwd(cwd)
+      .quiet();
   }
 
   private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
@@ -3127,6 +3463,50 @@ ${guidance}`
     return [...head, "...", ...tail].join("\n");
   }
 
+  private recordCiGateSummary(prUrl: string, summary: RequiredChecksSummary): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+    const status = summary.status === "success" ? "pass" : summary.status === "failure" ? "fail" : "pending";
+    const prNumber = extractPullRequestNumber(prUrl);
+    const ciUrl = summary.required.map((check) => check.detailsUrl).find(Boolean) ?? null;
+
+    try {
+      upsertRalphRunGateResult({
+        runId,
+        gate: "ci",
+        status,
+        url: ciUrl,
+        prNumber: prNumber ?? null,
+        prUrl,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist CI gate status for ${prUrl}: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
+  private recordCiFailureArtifacts(logs: FailedCheckLog[]): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    for (const entry of logs) {
+      if (!entry.logExcerpt) continue;
+      try {
+        recordRalphRunGateArtifact({
+          runId,
+          gate: "ci",
+          kind: "failure_excerpt",
+          content: entry.logExcerpt,
+        });
+      } catch (error: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to persist CI gate artifact: ${error?.message ?? String(error)}`
+        );
+      }
+    }
+  }
+
   private async getCheckLog(runId: string): Promise<CheckLogResult> {
     try {
       const result = await ghRead(this.repo)`gh run view ${runId} --repo ${this.repo} --log-failed`.quiet();
@@ -3175,6 +3555,10 @@ ${guidance}`
       }
 
       logs.push({ ...check, ...logResult, runUrl: check.detailsUrl ?? undefined });
+    }
+
+    if (opts.includeLogs) {
+      this.recordCiFailureArtifacts(logs);
     }
 
     return {
@@ -3267,6 +3651,12 @@ ${guidance}`
     return /not up to date with the base branch/i.test(message);
   }
 
+  private isRequiredChecksExpectedMergeError(error: any): boolean {
+    const message = String(error?.stderr ?? error?.message ?? "");
+    if (!message) return false;
+    return /required status checks are expected/i.test(message);
+  }
+
   private shouldFallbackToWorktreeUpdate(message: string): boolean {
     const lowered = message.toLowerCase();
     if (!lowered) return false;
@@ -3339,7 +3729,12 @@ ${guidance}`
   }): string {
     const base = params.baseRefName || "(unknown)";
     const head = params.headRefName || "(unknown)";
+    const normalizedHead = params.headRefName ? this.normalizeGitRef(params.headRefName) : "";
     const timedOutLine = params.timedOut ? "Timed out waiting for required checks to complete." : "";
+
+    const pushLine = normalizedHead
+      ? `git push origin HEAD:${normalizedHead}`
+      : "# If head ref is unknown, resolve it and push: gh pr view --json headRefName -q .headRefName";
 
     return [
       "CI-debug run for an existing PR with failing required checks.",
@@ -3357,8 +3752,11 @@ ${guidance}`
       "Commands (run in the CI-debug worktree):",
       "```bash",
       "git fetch origin",
-      `gh pr checkout ${params.prUrl}`,
+      `gh pr checkout --detach ${params.prUrl}`,
       "git status",
+      "",
+      "# After making a deterministic fix and committing it:",
+      pushLine,
       "```",
     ]
       .filter(Boolean)
@@ -4342,6 +4740,7 @@ ${guidance}`
       baseRefName = prStatus.baseRefName;
       const prState = await this.getPullRequestMergeState(params.prUrl);
       headRefName = prState.headRefName || null;
+      this.recordCiGateSummary(params.prUrl, summary);
     } catch (error: any) {
       const reason = `CI-debug preflight failed for ${params.prUrl}: ${this.formatGhError(error)}`;
       console.warn(`[ralph:worker:${this.repo}] ${reason}`);
@@ -4469,6 +4868,7 @@ ${guidance}`
         stepTitle: `ci-debug attempt ${attemptNumber}`,
       },
       ...this.buildWatchdogOptions(params.task, `ci-debug-${attemptNumber}`),
+      ...this.buildStallOptions(params.task, `ci-debug-${attemptNumber}`),
       ...params.opencodeSessionOptions,
     });
 
@@ -4490,6 +4890,12 @@ ${guidance}`
       return { status: "failed", run };
     }
 
+    if (sessionResult.stallTimeout) {
+      await this.cleanupGitWorktree(worktreePath);
+      const run = await this.handleStallTimeout(params.task, params.cacheKey, `ci-debug-${attemptNumber}`, sessionResult);
+      return { status: "failed", run };
+    }
+
     const completedAt = new Date().toISOString();
     if (sessionResult.sessionId) {
       await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": sessionResult.sessionId });
@@ -4499,7 +4905,7 @@ ${guidance}`
       const prStatus = await this.getPullRequestChecks(params.prUrl);
       summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
       headSha = prStatus.headSha;
-
+      this.recordCiGateSummary(params.prUrl, summary);
       attempt.headShaAfter = headSha;
       attempt.signatureAfter = this.formatCiDebugSignature(summary, false);
     } catch (error: any) {
@@ -4836,6 +5242,7 @@ ${guidance}`
         stepTitle: "survey",
       },
       ...this.buildWatchdogOptions(task, "survey"),
+      ...this.buildStallOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
 
@@ -4843,6 +5250,10 @@ ${guidance}`
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    if (!surveyResult.success && surveyResult.stallTimeout) {
+      return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
 
     await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
@@ -4906,6 +5317,7 @@ ${guidance}`
             stepTitle: stage,
           },
           ...this.buildWatchdogOptions(task, stage),
+          ...this.buildStallOptions(task, stage),
           ...opencodeSessionOptions,
         })
       : await this.session.runAgent(taskRepoPath, "general", prompt, {
@@ -4920,6 +5332,7 @@ ${guidance}`
             stepTitle: stage,
           },
           ...this.buildWatchdogOptions(task, stage),
+          ...this.buildStallOptions(task, stage),
           ...opencodeSessionOptions,
         });
 
@@ -4935,13 +5348,21 @@ ${guidance}`
         return await this.handleWatchdogTimeout(task, cacheKey, stage, recoveryResult, opencodeXdg);
       }
 
+      if (recoveryResult.stallTimeout) {
+        return await this.handleStallTimeout(task, cacheKey, stage, recoveryResult);
+      }
+
       const details = summarizeBlockedDetails(recoveryResult.output);
       await this.markTaskBlocked(task, blocked.source, {
         reason: blocked.reason,
         details,
         sessionId: recoveryResult.sessionId ?? task["session-id"]?.trim(),
       });
-      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, task.name);
+      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, {
+        taskName: task.name,
+        repo: task.repo,
+        issue: task.issue,
+      });
 
       return {
         taskName: task.name,
@@ -4992,6 +5413,7 @@ ${guidance}`
         stepTitle: "survey",
       },
       ...this.buildWatchdogOptions(task, "survey"),
+      ...this.buildStallOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
 
@@ -5006,6 +5428,10 @@ ${guidance}`
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    if (!surveyResult.success && surveyResult.stallTimeout) {
+      return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
 
     await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
@@ -5074,11 +5500,13 @@ ${guidance}`
     });
 
     await this.recordCheckpoint(task, "recorded", sessionId);
+    this.publishCheckpoint("recorded", { sessionId });
 
     await this.queue.updateTaskStatus(task, "done", {
       "completed-at": endTime.toISOString().split("T")[0],
       "session-id": "",
       "watchdog-retries": "",
+      "stall-retries": "",
       ...(shouldClearWorktree ? { "worktree-path": "" } : {}),
       ...(shouldClearWorkerId ? { "worker-id": "" } : {}),
       ...(shouldClearRepoSlot ? { "repo-slot": "" } : {}),
@@ -5456,11 +5884,16 @@ ${guidance}`
           "completed-at": completedAt,
           "session-id": "",
           "watchdog-retries": "",
+          "stall-retries": "",
           ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
         },
       });
 
-      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+      await this.notify.notifyError(params.notifyTitle, reason, {
+        taskName: params.task.name,
+        repo: params.task.repo,
+        issue: params.task.issue,
+      });
 
       return {
         ok: false,
@@ -5501,11 +5934,16 @@ ${guidance}`
           "completed-at": completedAt,
           "session-id": "",
           "watchdog-retries": "",
+          "stall-retries": "",
           ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
         },
       });
 
-      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+      await this.notify.notifyError(params.notifyTitle, reason, {
+        taskName: params.task.name,
+        repo: params.task.repo,
+        issue: params.task.issue,
+      });
 
       return {
         ok: false,
@@ -5551,8 +5989,14 @@ ${guidance}`
         await this.recordCheckpoint(params.task, "merge_step_complete", sessionId);
         return { ok: true, prUrl, sessionId };
       } catch (error: any) {
-        if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
-          console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
+        const shouldUpdateBeforeRetry =
+          !didUpdateBranch && (this.isOutOfDateMergeError(error) || this.isRequiredChecksExpectedMergeError(error));
+
+        if (shouldUpdateBeforeRetry) {
+          const why = this.isRequiredChecksExpectedMergeError(error)
+            ? "required checks expected"
+            : "out of date with base";
+          console.log(`[ralph:worker:${this.repo}] PR ${why}; updating branch ${prUrl}`);
           didUpdateBranch = true;
           try {
             await this.updatePullRequestBranch(prUrl, params.repoPath);
@@ -5560,7 +6004,11 @@ ${guidance}`
             const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
             console.warn(`[ralph:worker:${this.repo}] ${reason}`);
             await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-            await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+            await this.notify.notifyError(params.notifyTitle, reason, {
+              taskName: params.task.name,
+              repo: params.task.repo,
+              issue: params.task.issue,
+            });
 
             return {
               ok: false,
@@ -5680,7 +6128,11 @@ ${guidance}`
           // best-effort
         }
         await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-        await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+        await this.notify.notifyError(params.notifyTitle, reason, {
+          taskName: params.task.name,
+          repo: params.task.repo,
+          issue: params.task.issue,
+        });
 
         return {
           ok: false,
@@ -5778,6 +6230,7 @@ ${guidance}`
       "completed-at": completedAt,
       "session-id": "",
       "watchdog-retries": "",
+      "stall-retries": "",
       ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
       ...(task["worker-id"] ? { "worker-id": "" } : {}),
       ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
@@ -5808,6 +6261,12 @@ ${guidance}`
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
   }
 
+  private getStallRetryCount(task: AgentTask): number {
+    const raw = task["stall-retries"];
+    const parsed = Number.parseInt(String(raw ?? "0"), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
   private buildWatchdogOptions(task: AgentTask, stage: string) {
     const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
@@ -5818,6 +6277,20 @@ ${guidance}`
         thresholdsMs: cfg?.thresholdsMs,
         softLogIntervalMs: cfg?.softLogIntervalMs,
         recentEventLimit: cfg?.recentEventLimit,
+        context,
+      },
+    };
+  }
+
+  private buildStallOptions(task: AgentTask, stage: string) {
+    const cfg = getConfig().stall;
+    const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
+    const idleMs = cfg?.nudgeAfterMs ?? cfg?.idleMs ?? 5 * 60_000;
+
+    return {
+      stall: {
+        enabled: cfg?.enabled ?? true,
+        idleMs,
         context,
       },
     };
@@ -5865,7 +6338,7 @@ ${guidance}`
 
     const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-    const requested = control.opencodeProfile?.trim() ?? "";
+    const requested = getRequestedOpencodeProfileName(control.opencodeProfile);
 
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
@@ -5900,7 +6373,15 @@ ${guidance}`
         `[ralph:worker:${this.repo}] Control opencode_profile=${JSON.stringify(requested)} does not match a configured profile; ` +
           `falling back to defaultProfile=${JSON.stringify(getOpencodeDefaultProfileName() ?? "")}`
       );
-      resolved = resolveOpencodeProfile(null);
+      const fallbackRequested = getRequestedOpencodeProfileName(null);
+      if (fallbackRequested === "auto") {
+        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+          getThrottleDecision: this.throttle.getThrottleDecision,
+        });
+        resolved = chosen ? resolveOpencodeProfile(chosen) : null;
+      } else {
+        resolved = fallbackRequested ? resolveOpencodeProfile(fallbackRequested) : null;
+      }
     }
 
     if (!resolved) {
@@ -6026,27 +6507,27 @@ ${guidance}`
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
       const defaults = getConfig().control;
-      const controlProfile =
-        readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
+      const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile;
+      const requestedProfile = getRequestedOpencodeProfileName(controlProfile);
 
-      if (controlProfile === "auto") {
+      if (requestedProfile === "auto") {
         const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
           getThrottleDecision: this.throttle.getThrottleDecision,
         });
 
         decision = await this.throttle.getThrottleDecision(Date.now(), {
-          opencodeProfile: chosen ?? getOpencodeDefaultProfileName(),
+          opencodeProfile: chosen ?? null,
         });
       } else if (!hasSession) {
         // Safe to fail over between profiles before starting a new session.
         decision = (
-          await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null, {
+          await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile || null, {
             getThrottleDecision: this.throttle.getThrottleDecision,
           })
         ).decision;
       } else {
         // Do not fail over while a session is in flight/resuming.
-        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
+        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: requestedProfile || null });
       }
     }
 
@@ -6054,6 +6535,15 @@ ${guidance}`
 
     const throttledAt = new Date().toISOString();
     const resumeAt = decision.resumeAtTs ? new Date(decision.resumeAtTs).toISOString() : "";
+
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.requested",
+        level: "warn",
+        data: { reason: `hard-throttle:${stage}` },
+      },
+      { sessionId: sid || undefined }
+    );
 
     const extraFields: Record<string, string> = {
       "throttled-at": throttledAt,
@@ -6092,6 +6582,15 @@ ${guidance}`
       `[ralph:worker:${this.repo}] Hard throttle active; pausing at checkpoint stage=${stage} resumeAt=${resumeAt || "unknown"}`
     );
 
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.reached",
+        level: "warn",
+        data: {},
+      },
+      { sessionId: sid || undefined }
+    );
+
     return {
       taskName: task.name,
       repo: this.repo,
@@ -6128,6 +6627,7 @@ ${guidance}`
           cacheKey,
           runLogPath,
           ...this.buildWatchdogOptions(task, `nudge-${stage}`),
+          ...this.buildStallOptions(task, `nudge-${stage}`),
           ...opencodeSessionOptions,
         });
         await this.recordImplementationCheckpoint(task, res.sessionId || sid);
@@ -6295,9 +6795,128 @@ ${guidance}`
     };
   }
 
+  private async handleStallTimeout(
+    task: AgentTask,
+    cacheKey: string,
+    stage: string,
+    result: SessionResult
+  ): Promise<AgentRun> {
+    const cfg = getConfig().stall;
+    const maxRestarts = cfg?.maxRestarts ?? 1;
+
+    const timeout = result.stallTimeout;
+    const retryCount = this.getStallRetryCount(task);
+    const nextRetryCount = retryCount + 1;
+    const sessionId = result.sessionId || task["session-id"]?.trim() || "";
+
+    const idleSeconds = timeout ? Math.round(timeout.lastActivityMsAgo / 1000) : 0;
+    const reason = timeout
+      ? `Session stalled: no activity for ${idleSeconds}s (${stage})`
+      : `Session stalled (${stage})`;
+
+    if (retryCount === 0 && sessionId) {
+      const nudgeReason = `${reason}; nudging session`;
+      console.warn(`[ralph:worker:${this.repo}] Stall detected; nudging by re-queuing for resume: ${nudgeReason}`);
+      await this.queue.updateTaskStatus(task, "queued", {
+        "session-id": sessionId,
+        "stall-retries": String(nextRetryCount),
+        "blocked-source": "stall",
+        "blocked-reason": nudgeReason,
+        "blocked-details": timeout?.context ? `Context: ${timeout.context}` : "",
+        "blocked-at": new Date().toISOString(),
+        "blocked-checked-at": new Date().toISOString(),
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: nudgeReason,
+      };
+    }
+
+    if (retryCount <= maxRestarts) {
+      console.warn(`[ralph:worker:${this.repo}] Stall repeated; restarting with fresh session: ${reason}`);
+      await this.queue.updateTaskStatus(task, "queued", {
+        "session-id": "",
+        "stall-retries": String(nextRetryCount),
+        "blocked-source": "",
+        "blocked-reason": "",
+        "blocked-details": "",
+        "blocked-at": "",
+        "blocked-checked-at": "",
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: reason,
+      };
+    }
+
+    console.log(`[ralph:worker:${this.repo}] Stall repeated after restart; escalating: ${reason}`);
+    const escalationFields: Record<string, string> = {
+      "stall-retries": String(nextRetryCount),
+    };
+    if (sessionId) escalationFields["session-id"] = sessionId;
+
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
+    if (escalated) {
+      applyTaskPatch(task, "escalated", escalationFields);
+    }
+
+    const details = [
+      timeout?.context ? `Context: ${timeout.context}` : null,
+      sessionId ? `Session: ${sessionId}` : null,
+      task["run-log-path"]?.trim() ? `Run log: ${task["run-log-path"]?.trim()}` : null,
+      sessionId ? `Events: ${getSessionEventsPath(sessionId)}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const githubCommentUrl = await this.writeEscalationWriteback(task, {
+      reason,
+      details: details || undefined,
+      escalationType: "other",
+    });
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      sessionId: sessionId || undefined,
+      reason,
+      escalationType: "other",
+      githubCommentUrl: githubCommentUrl ?? undefined,
+      planOutput: result.output,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        sessionId: sessionId || undefined,
+        details: result.output,
+      });
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: sessionId || undefined,
+      escalationReason: reason,
+    };
+  }
+
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string; repoSlot?: number | null }): Promise<AgentRun> {
     const startTime = new Date();
-    console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
 
     if (!isRepoAllowed(task.repo)) {
       return await this.blockDisallowedRepo(task, startTime, "resume");
@@ -6365,21 +6984,6 @@ ${guidance}`
 
       const eventWorkerId = task["worker-id"]?.trim();
 
-      ralphEventBus.publish(
-        buildRalphEvent({
-          type: "worker.created",
-          level: "info",
-          ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
-          repo: this.repo,
-          taskId: task._path,
-          sessionId: existingSessionId,
-          data: {
-            ...(worktreePath ? { worktreePath } : {}),
-            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
-          },
-        })
-      );
-
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
 
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
@@ -6445,6 +7049,24 @@ ${guidance}`
       if (pausedBefore) return pausedBefore;
 
       return await this.withRunContext(task, "resume", async () => {
+      this.publishDashboardEvent(
+        {
+          type: "worker.created",
+          level: "info",
+          ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
+          repo: this.repo,
+          taskId: task._path,
+          sessionId: existingSessionId,
+          data: {
+            ...(worktreePath ? { worktreePath } : {}),
+            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
+          },
+        },
+        { sessionId: existingSessionId, workerId: eventWorkerId }
+      );
+
+      this.logWorker(`Resuming task: ${task.name}`, { sessionId: existingSessionId, workerId: eventWorkerId });
+
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
       let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
@@ -6459,6 +7081,7 @@ ${guidance}`
           stepTitle: "resume",
         },
         ...this.buildWatchdogOptions(task, "resume"),
+        ...this.buildStallOptions(task, "resume"),
         ...opencodeSessionOptions,
       });
 
@@ -6470,6 +7093,10 @@ ${guidance}`
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult, opencodeXdg);
+        }
+
+        if (buildResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "resume", buildResult);
         }
 
         const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
@@ -6486,6 +7113,10 @@ ${guidance}`
           escalationReason: reason,
         };
       }
+
+      this.publishCheckpoint("implementation_step_complete", {
+        sessionId: buildResult.sessionId || existingSessionId || undefined,
+      });
 
       if (buildResult.sessionId) {
         await this.queue.updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
@@ -6598,6 +7229,7 @@ ${guidance}`
                 stepTitle: "resume loop-break",
               },
               ...this.buildWatchdogOptions(task, "resume-loop-break"),
+              ...this.buildStallOptions(task, "resume-loop-break"),
               ...opencodeSessionOptions,
             }
           );
@@ -6615,9 +7247,17 @@ ${guidance}`
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
             }
+
+            if (buildResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "resume-loop-break", buildResult);
+            }
             console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
             break;
           }
+
+          this.publishCheckpoint("implementation_step_complete", {
+            sessionId: buildResult.sessionId || existingSessionId || undefined,
+          });
 
           lastAnomalyCount = anomalyStatus.total;
           prUrl = this.updateOpenPrSnapshot(
@@ -6670,6 +7310,7 @@ ${guidance}`
             stepTitle: "continue",
           },
           ...this.buildWatchdogOptions(task, "resume-continue"),
+          ...this.buildStallOptions(task, "resume-continue"),
           ...opencodeSessionOptions,
         });
 
@@ -6687,6 +7328,10 @@ ${guidance}`
             return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult, opencodeXdg);
           }
 
+          if (buildResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "resume-continue", buildResult);
+          }
+
           // If the session ended without printing a URL, try to recover PR from git state.
           const recovered = await this.tryEnsurePrFromWorktree({
             task,
@@ -6702,6 +7347,9 @@ ${guidance}`
             break;
           }
         } else {
+          this.publishCheckpoint("implementation_step_complete", {
+            sessionId: buildResult.sessionId || existingSessionId || undefined,
+          });
           prUrl = this.updateOpenPrSnapshot(
             task,
             prUrl,
@@ -6773,6 +7421,8 @@ ${guidance}`
         prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
       }
 
+      this.publishCheckpoint("pr_ready", { sessionId: buildResult.sessionId || existingSessionId || undefined });
+
       const pausedMerge = await this.pauseIfHardThrottled(task, "resume merge", buildResult.sessionId || existingSessionId);
       if (pausedMerge) return pausedMerge;
 
@@ -6799,6 +7449,10 @@ ${guidance}`
       );
       if (pausedMergeAfter) return pausedMergeAfter;
 
+      this.publishCheckpoint("merge_step_complete", {
+        sessionId: mergeGate.sessionId || buildResult.sessionId || existingSessionId || undefined,
+      });
+
       prUrl = mergeGate.prUrl;
       buildResult.sessionId = mergeGate.sessionId;
 
@@ -6814,6 +7468,7 @@ ${guidance}`
         cacheKey,
         runLogPath: resumeSurveyRunLogPath,
         ...this.buildWatchdogOptions(task, "resume-survey"),
+        ...this.buildStallOptions(task, "resume-survey"),
         ...opencodeSessionOptions,
       });
 
@@ -6831,6 +7486,10 @@ ${guidance}`
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult, opencodeXdg);
         }
+
+        if (surveyResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "resume-survey", surveyResult);
+        }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
@@ -6839,6 +7498,9 @@ ${guidance}`
         "survey_complete",
         surveyResult.sessionId || buildResult.sessionId || existingSessionId
       );
+      this.publishCheckpoint("survey_complete", {
+        sessionId: surveyResult.sessionId || buildResult.sessionId || existingSessionId || undefined,
+      });
 
       return await this.finalizeTaskSuccess({
         task,
@@ -6862,7 +7524,11 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), {
+          taskName: task.name,
+          repo: task.repo,
+          issue: task.issue,
+        });
       }
 
       return {
@@ -6878,7 +7544,6 @@ ${guidance}`
 
   async processTask(task: AgentTask, opts?: { repoSlot?: number | null }): Promise<AgentRun> {
     const startTime = new Date();
-    console.log(`[ralph:worker:${this.repo}] Starting task: ${task.name}`);
 
     let workerId: string | undefined;
     let allocatedSlot: number | null = null;
@@ -6951,8 +7616,11 @@ ${guidance}`
 
       await this.prepareContextRecovery(task, taskRepoPath);
 
-      ralphEventBus.publish(
-        buildRalphEvent({
+      await this.assertRepoRootClean(task, "start");
+
+      return await this.withRunContext(task, "process", async () => {
+      this.publishDashboardEvent(
+        {
           type: "worker.created",
           level: "info",
           ...(workerId ? { workerId } : {}),
@@ -6963,12 +7631,12 @@ ${guidance}`
             ...(worktreePath ? { worktreePath } : {}),
             ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
           },
-        })
+        },
+        { sessionId: task["session-id"]?.trim() || undefined, workerId }
       );
 
-      await this.assertRepoRootClean(task, "start");
+      this.logWorker(`Starting task: ${task.name}`, { workerId });
 
-      return await this.withRunContext(task, "process", async () => {
       const pausedSetup = await this.pauseIfHardThrottled(task, "setup");
       if (pausedSetup) return pausedSetup;
 
@@ -7037,6 +7705,7 @@ ${guidance}`
           stepTitle: "plan",
         },
         ...this.buildWatchdogOptions(task, "plan"),
+        ...this.buildStallOptions(task, "plan"),
         ...opencodeSessionOptions,
       });
 
@@ -7045,6 +7714,10 @@ ${guidance}`
 
       if (!planResult.success && planResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
+      }
+
+      if (!planResult.success && planResult.stallTimeout) {
+        return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
       }
 
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
@@ -7064,6 +7737,7 @@ ${guidance}`
             stepTitle: "plan (retry)",
           },
           ...this.buildWatchdogOptions(task, "plan-retry"),
+          ...this.buildStallOptions(task, "plan-retry"),
           ...opencodeSessionOptions,
         });
       }
@@ -7075,7 +7749,29 @@ ${guidance}`
         if (planResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
         }
-        throw new Error(`planner failed: ${planResult.output}`);
+
+        if (planResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
+        }
+
+        const reason = `planner failed: ${planResult.output}`;
+        const details = planResult.output;
+
+        await this.markTaskBlocked(task, "runtime-error", {
+          reason,
+          details,
+          sessionId: planResult.sessionId,
+          runLogPath: planRunLogPath,
+        });
+        await this.notify.notifyError(`Processing ${task.name}`, reason, task.name);
+
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: planResult.sessionId,
+          escalationReason: reason,
+        };
       }
 
       // Persist OpenCode session ID for crash recovery
@@ -7088,6 +7784,7 @@ ${guidance}`
       }
 
       await this.recordCheckpoint(task, "planned", planResult.sessionId);
+      this.publishCheckpoint("planned", { sessionId: planResult.sessionId || undefined });
 
       // 5. Parse routing decision
       let routing = parseRoutingDecision(planResult.output);
@@ -7127,6 +7824,7 @@ ${guidance}`
             step: 2,
             stepTitle: "consult devex",
           },
+          ...this.buildStallOptions(task, "consult devex"),
           ...opencodeSessionOptions,
         });
 
@@ -7140,6 +7838,9 @@ ${guidance}`
         if (pausedAfterDevexConsult) return pausedAfterDevexConsult;
 
         if (!devexResult.success) {
+          if (devexResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "consult devex", devexResult);
+          }
           console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
           devexContext = {
             consulted: true,
@@ -7184,6 +7885,7 @@ ${guidance}`
               step: 3,
               stepTitle: "reroute after devex",
             },
+            ...this.buildStallOptions(task, "reroute after devex"),
             ...opencodeSessionOptions,
           });
 
@@ -7197,6 +7899,9 @@ ${guidance}`
           if (pausedAfterReroute) return pausedAfterReroute;
 
           if (!rerouteResult.success) {
+            if (rerouteResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "reroute after devex", rerouteResult);
+            }
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
             if (rerouteResult.sessionId) {
@@ -7214,6 +7919,7 @@ ${guidance}`
       }
 
       // 7. Decide whether to escalate
+      this.publishCheckpoint("routed", { sessionId: planResult.sessionId || undefined });
       const shouldEscalate = this.shouldEscalate(routing, hasGap, isImplementationTask);
       
       if (shouldEscalate) {
@@ -7324,6 +8030,7 @@ ${guidance}`
           stepTitle: "build",
         },
         ...this.buildWatchdogOptions(task, "build"),
+        ...this.buildStallOptions(task, "build"),
         ...opencodeSessionOptions,
       });
 
@@ -7336,8 +8043,16 @@ ${guidance}`
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult, opencodeXdg);
         }
+
+        if (buildResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "build", buildResult);
+        }
         throw new Error(`Build failed: ${buildResult.output}`);
       }
+
+      this.publishCheckpoint("implementation_step_complete", {
+        sessionId: buildResult.sessionId || planResult.sessionId || undefined,
+      });
 
       // Keep the latest session ID persisted
       if (buildResult.sessionId) {
@@ -7455,6 +8170,7 @@ ${guidance}`
                 stepTitle: "build loop-break",
               },
               ...this.buildWatchdogOptions(task, "build-loop-break"),
+              ...this.buildStallOptions(task, "build-loop-break"),
               ...opencodeSessionOptions,
             }
           );
@@ -7468,9 +8184,17 @@ ${guidance}`
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
             }
+
+            if (buildResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "build-loop-break", buildResult);
+            }
             console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
             break;
           }
+
+          this.publishCheckpoint("implementation_step_complete", {
+            sessionId: buildResult.sessionId || planResult.sessionId || undefined,
+          });
 
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
@@ -7523,6 +8247,7 @@ ${guidance}`
             stepTitle: "build continue",
           },
           ...this.buildWatchdogOptions(task, "build-continue"),
+          ...this.buildStallOptions(task, "build-continue"),
           ...opencodeSessionOptions,
         });
 
@@ -7534,6 +8259,10 @@ ${guidance}`
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult, opencodeXdg);
+          }
+
+          if (buildResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "build-continue", buildResult);
           }
 
           // If the session ended without printing a URL, try to recover PR from git state.
@@ -7551,6 +8280,9 @@ ${guidance}`
             break;
           }
         } else {
+          this.publishCheckpoint("implementation_step_complete", {
+            sessionId: buildResult.sessionId || planResult.sessionId || undefined,
+          });
           prUrl = this.updateOpenPrSnapshot(
             task,
             prUrl,
@@ -7623,6 +8355,8 @@ ${guidance}`
         prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
       }
 
+      this.publishCheckpoint("pr_ready", { sessionId: buildResult.sessionId || planResult.sessionId || undefined });
+
       const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);
       if (pausedMerge) return pausedMerge;
 
@@ -7643,6 +8377,10 @@ ${guidance}`
 
       const pausedMergeAfter = await this.pauseIfHardThrottled(task, "merge (post)", mergeGate.sessionId || buildResult.sessionId);
       if (pausedMergeAfter) return pausedMergeAfter;
+
+      this.publishCheckpoint("merge_step_complete", {
+        sessionId: mergeGate.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
+      });
 
       prUrl = mergeGate.prUrl;
       buildResult.sessionId = mergeGate.sessionId;
@@ -7667,6 +8405,7 @@ ${guidance}`
           stepTitle: "survey",
         },
         ...this.buildWatchdogOptions(task, "survey"),
+        ...this.buildStallOptions(task, "survey"),
         ...opencodeSessionOptions,
       });
 
@@ -7679,10 +8418,17 @@ ${guidance}`
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
         }
+
+        if (surveyResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
+        }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
       await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || buildResult.sessionId);
+      this.publishCheckpoint("survey_complete", {
+        sessionId: surveyResult.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
+      });
 
       return await this.finalizeTaskSuccess({
         task,
@@ -7707,7 +8453,11 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), {
+          taskName: task.name,
+          repo: task.repo,
+          issue: task.issue,
+        });
       }
 
       return {
@@ -7735,6 +8485,9 @@ ${guidance}`
       bodyPrefix?: string;
     }
   ): Promise<void> {
+    if (this.isGitHubQueueTask(task)) {
+      return;
+    }
     const vault = getBwrbVaultForStorage("create agent-run note");
     if (!vault) {
       return;
@@ -7796,6 +8549,46 @@ ${guidance}`
             `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
             ""
           );
+        }
+      }
+
+      // Add token totals (best-effort). GitHub queue tasks skip agent-run notes.
+      const tokenRunId = this.activeRunId ?? (data.sessionId ? getLatestRunIdForSession(data.sessionId) : null);
+      if (tokenRunId) {
+        try {
+          const opencodeProfile = this.getPinnedOpencodeProfileName(task);
+          let tokenTotals = getRalphRunTokenTotals(tokenRunId);
+          let sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
+          if (!tokenTotals || !tokenTotals.tokensComplete) {
+            await refreshRalphRunTokenTotals({ runId: tokenRunId, opencodeProfile });
+            tokenTotals = getRalphRunTokenTotals(tokenRunId);
+            sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
+          }
+
+          if (tokenTotals) {
+            const totalLabel = tokenTotals.tokensComplete && typeof tokenTotals.tokensTotal === "number" ? tokenTotals.tokensTotal : "?";
+            const showSessions = sessionTotals.length > 1;
+            bodySections.push(
+              "## Token Usage",
+              "",
+              `- **Total:** ${totalLabel}`,
+              `- **Complete:** ${tokenTotals.tokensComplete ? "Yes" : "No"}`,
+              `- **Sessions:** ${tokenTotals.sessionCount}`,
+              ""
+            );
+
+            if (showSessions) {
+              const lines = sessionTotals.slice(0, 10).map((s) => {
+                const label = typeof s.tokensTotal === "number" ? s.tokensTotal : "?";
+                return `- ${s.sessionId}: ${label} (${s.quality})`;
+              });
+              if (lines.length > 0) {
+                bodySections.push("### Sessions", "", ...lines, "");
+              }
+            }
+          }
+        } catch {
+          // best-effort token accounting
         }
       }
 

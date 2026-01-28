@@ -1,18 +1,6 @@
 #!/usr/bin/env bun
 
-import { readFileSync } from "fs";
-
-function getVersion(): string {
-  try {
-    const pkgPath = new URL("../package.json", import.meta.url);
-    const raw = readFileSync(pkgPath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.version === "string") return parsed.version;
-  } catch {
-    // ignore
-  }
-  return "unknown";
-}
+import { getRalphVersion } from "./version";
 
 function printGlobalHelp(): void {
   console.log(
@@ -23,12 +11,17 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph gates <repo> <issue> [--json] Show deterministic gate state",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
+      "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
+      "  ralph sandbox seed                 Seed sandbox edge-case issues",
       "",
       "Options:",
       "  -h, --help                         Show help (also: ralph help [command])",
@@ -63,6 +56,20 @@ function printCommandHelp(command: string): void {
           "  ralph status [--json]",
           "",
           "Shows daemon mode plus starting, queued, in-progress, and throttled tasks, plus pending escalations.",
+          "",
+          "Options:",
+          "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "gates":
+      console.log(
+        [
+          "Usage:",
+          "  ralph gates <repo> <issueNumber> [--json]",
+          "",
+          "Shows the latest deterministic gate state for an issue.",
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
@@ -123,6 +130,29 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox:init":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:init [--no-seed]",
+          "",
+          "Creates a new sandbox repo from the configured template and writes a manifest.",
+          "Runs seeding unless --no-seed is provided.",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:seed":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:seed [--run-id <id>]",
+          "",
+          "Seeds a sandbox repo based on the manifest (defaults to newest manifest if omitted).",
+        ].join("\n")
+      );
+      return;
+
     case "rollup":
       console.log(
         [
@@ -134,6 +164,17 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox <tag|teardown|prune> [options]",
+          "",
+          "Sandbox repo lifecycle helpers.",
+        ].join("\n")
+      );
+      return;
+
     case "worktrees":
       console.log(
         [
@@ -141,6 +182,17 @@ function printCommandHelp(command: string): void {
           "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
           "",
           "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox seed --repo <owner/repo> [options]",
+          "",
+          "Seeds a sandbox repo with deterministic edge-case issues and relationships.",
         ].join("\n")
       );
       return;
@@ -159,7 +211,7 @@ const hasVersionFlag = args.includes("--version") || args.includes("-v");
 
 // Fast-exit flags: handle before importing the orchestrator implementation.
 if (hasVersionFlag) {
-  console.log(getVersion());
+  console.log(getRalphVersion() ?? "unknown");
   process.exit(0);
 }
 
@@ -180,10 +232,12 @@ if (!cmd || cmd.startsWith("-")) {
 if (
   (cmd === "resume" ||
     cmd === "status" ||
+    cmd === "gates" ||
     cmd === "usage" ||
     cmd === "repos" ||
     cmd === "watch" ||
     cmd === "nudge" ||
+    cmd === "sandbox" ||
     cmd === "worktrees" ||
     cmd === "rollup") &&
   hasHelpFlag
