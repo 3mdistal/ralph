@@ -155,6 +155,35 @@ sandbox = {
 
 Canonical sandbox provisioning contract: `docs/product/sandbox-provisioning.md`.
 
+### Sandbox repo lifecycle
+
+Sandbox run repos should be explicitly tagged with the `ralph-sandbox` topic before any automated teardown/prune. This is a hard safety invariant: teardown/prune refuses to mutate repos without the marker topic.
+
+Commands (dry-run by default):
+
+```bash
+ralph sandbox tag --apply
+ralph sandbox teardown --repo <owner/repo> --apply
+ralph sandbox prune --apply
+```
+
+Defaults (override via flags or `sandbox.retention`):
+
+- keep last 10 repos
+- keep failed repos (topic `run-failed`) for 14 days
+- default action is archive (reversible); delete requires `--delete --yes`
+
+Notes:
+
+- `ralph sandbox prune` skips repos that are already archived when action is `archive`.
+- `ralph sandbox tag --failed` adds the `run-failed` topic even if `ralph-sandbox` is already present.
+
+You can add the failed marker when tagging:
+
+```bash
+ralph sandbox tag --failed --apply
+```
+
 ### Supported settings
 
 - `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
@@ -174,6 +203,9 @@ Canonical sandbox provisioning contract: `docs/product/sandbox-provisioning.md`.
     - `repoVisibility` (string): `private` (default; other values invalid)
     - `settingsPreset` (string): `minimal` (default) or `parity`
     - `seed` (object, optional): `{ preset = "baseline" }` or `{ file = "/abs/path/seed.json" }`
+  - `retention` (object, optional): sandbox repo retention defaults
+    - `keepLast` (number): keep last N repos (default: 10)
+    - `keepFailedDays` (number): keep failed repos for N days (default: 14)
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
 - `githubApp` (object, optional): GitHub App installation auth for `gh` + REST (tokens cached in memory)
   - `appId` (number|string)
@@ -208,12 +240,12 @@ Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derive
 Note: `repos[].setup` commands run in the task worktree before any OpenCode agent execution. Setup is cached per worktree by `(commands hash + lockfile signature)`; if commands or lockfiles change, setup runs again.
 
 
-When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
+When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections. If required check contexts are missing (including when no check contexts exist yet), Ralph logs a warning, proceeds without protection for now, and retries after a short delay.
 Setting `repos[].requiredChecks` to `[]` disables Ralph's merge gating but does not clear existing GitHub branch protection rules.
 
 Ralph refuses to auto-merge PRs targeting `main` unless the issue has the `allow-main` label. This guardrail only affects Ralph automation; humans can still merge to `main` normally.
 
-If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names.
+If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names. Ralph will retry branch protection after the defer window.
 
 ### GitHub auth precedence
 
@@ -325,6 +357,22 @@ ralph nudge <taskRef> "Just implement it, stop asking questions"
 
 - Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
 - Success means the delivery attempt succeeded, not guaranteed agent compliance.
+
+
+### Seed sandbox edge cases
+
+```bash
+ralph sandbox seed --repo <owner/repo>
+```
+
+Seeds a sandbox repo with deterministic edge-case issues/relationships (dependency graphs, sub-issues, label drift, and collision tasks). This command requires `profile = "sandbox"` with a configured sandbox allowlist/prefix.
+
+Useful flags:
+
+```bash
+ralph sandbox seed --repo <owner/repo> --dry-run
+ralph sandbox seed --repo <owner/repo> --manifest sandbox/seed-manifest.v1.json --out sandbox/seed-ids.v1.json
+```
 
 
 ### Queue a task

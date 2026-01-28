@@ -76,6 +76,8 @@ import { computeDaemonGate } from "./daemon-gate";
 import { runGatesCommand } from "./commands/gates";
 import { runStatusCommand } from "./commands/status";
 import { runWorktreesCommand } from "./commands/worktrees";
+import { runSandboxCommand } from "./commands/sandbox";
+import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 import { buildProvisionPlan } from "./sandbox/provisioning-core";
@@ -1524,10 +1526,15 @@ function printGlobalHelp(): void {
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
+      "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
+      "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
+      "  ralph sandbox seed                 Seed sandbox edge-case issues",
       "",
       "Options:",
       "  -h, --help                         Show help (also: ralph help [command])",
@@ -1668,6 +1675,17 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox <tag|teardown|prune> [options]",
+          "",
+          "Sandbox repo lifecycle helpers.",
+        ].join("\n")
+      );
+      return;
+
     case "worktrees":
       console.log(
         [
@@ -1675,6 +1693,17 @@ function printCommandHelp(command: string): void {
           "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
           "",
           "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox seed --repo <owner/repo> [options]",
+          "",
+          "Seeds a sandbox repo with deterministic edge-case issues and relationships.",
         ].join("\n")
       );
       return;
@@ -2215,7 +2244,6 @@ if (args[0] === "watch") {
   });
 }
 
-
 if (args[0] === "rollup") {
   if (hasHelpFlag) {
     printCommandHelp("rollup");
@@ -2243,6 +2271,21 @@ if (args[0] === "worktrees") {
   }
 
   await runWorktreesCommand(args);
+  process.exit(0);
+}
+
+if (args[0] === "sandbox") {
+  if (hasHelpFlag || args[1] === "help") {
+    printCommandHelp("sandbox");
+    process.exit(0);
+  }
+
+  if (args[1] === "seed") {
+    await runSandboxSeedCommand(args.slice(2));
+    process.exit(0);
+  }
+
+  await runSandboxCommand(args);
   process.exit(0);
 }
 

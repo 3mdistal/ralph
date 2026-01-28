@@ -63,6 +63,8 @@ describe("escalation resolution reconciliation", () => {
               ? [
                   {
                     body: "RALPH RESOLVED: proceed",
+                    databaseId: 101,
+                    createdAt: "2026-01-11T00:00:00.000Z",
                     author: { login: "3mdistal" },
                     authorAssociation: "OWNER",
                   },
@@ -120,7 +122,15 @@ describe("escalation resolution reconciliation", () => {
       return true;
     };
 
-    const checkStates = new Map<number, { lastCheckedAt: string | null; lastSeenUpdatedAt: string | null }>();
+    const checkStates = new Map<
+      number,
+      {
+        lastCheckedAt: string | null;
+        lastSeenUpdatedAt: string | null;
+        lastResolvedCommentId: number | null;
+        lastResolvedCommentAt: string | null;
+      }
+    >();
     await reconcileEscalationResolutions({
       repo: "3mdistal/ralph",
       deps: {
@@ -138,9 +148,20 @@ describe("escalation resolution reconciliation", () => {
           githubUpdatedAt: "2026-01-11T00:00:00.000Z",
           labels: [],
         }),
-        getEscalationCommentCheckState: (repo, issueNumber) => checkStates.get(issueNumber) ?? null,
-        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt }) => {
-          checkStates.set(issueNumber, { lastCheckedAt, lastSeenUpdatedAt: lastSeenUpdatedAt ?? null });
+        getEscalationCommentCheckState: (_repo, issueNumber) => checkStates.get(issueNumber) ?? null,
+        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt, lastResolvedCommentId, lastResolvedCommentAt }) => {
+          const prior = checkStates.get(issueNumber) ?? {
+            lastCheckedAt: null,
+            lastSeenUpdatedAt: null,
+            lastResolvedCommentId: null,
+            lastResolvedCommentAt: null,
+          };
+          checkStates.set(issueNumber, {
+            lastCheckedAt,
+            lastSeenUpdatedAt: lastSeenUpdatedAt ?? null,
+            lastResolvedCommentId: lastResolvedCommentId ?? prior.lastResolvedCommentId,
+            lastResolvedCommentAt: lastResolvedCommentAt ?? prior.lastResolvedCommentAt,
+          });
         },
       },
       log: () => {},
@@ -170,6 +191,8 @@ describe("escalation resolution reconciliation", () => {
           const nodes = [
             {
               body: "RALPH RESOLVED: attempt without operator",
+              databaseId: 200,
+              createdAt: "2026-01-11T00:00:00.000Z",
               author: { login: "someone" },
               authorAssociation: "CONTRIBUTOR",
             },
@@ -221,7 +244,15 @@ describe("escalation resolution reconciliation", () => {
       return true;
     };
 
-    const checkStates = new Map<number, { lastCheckedAt: string | null; lastSeenUpdatedAt: string | null }>();
+    const checkStates = new Map<
+      number,
+      {
+        lastCheckedAt: string | null;
+        lastSeenUpdatedAt: string | null;
+        lastResolvedCommentId: number | null;
+        lastResolvedCommentAt: string | null;
+      }
+    >();
     await reconcileEscalationResolutions({
       repo: "3mdistal/ralph",
       deps: {
@@ -239,9 +270,20 @@ describe("escalation resolution reconciliation", () => {
           githubUpdatedAt: "2026-01-11T00:00:00.000Z",
           labels: [],
         }),
-        getEscalationCommentCheckState: (repo, issueNumber) => checkStates.get(issueNumber) ?? null,
-        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt }) => {
-          checkStates.set(issueNumber, { lastCheckedAt, lastSeenUpdatedAt: lastSeenUpdatedAt ?? null });
+        getEscalationCommentCheckState: (_repo, issueNumber) => checkStates.get(issueNumber) ?? null,
+        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt, lastResolvedCommentId, lastResolvedCommentAt }) => {
+          const prior = checkStates.get(issueNumber) ?? {
+            lastCheckedAt: null,
+            lastSeenUpdatedAt: null,
+            lastResolvedCommentId: null,
+            lastResolvedCommentAt: null,
+          };
+          checkStates.set(issueNumber, {
+            lastCheckedAt,
+            lastSeenUpdatedAt: lastSeenUpdatedAt ?? null,
+            lastResolvedCommentId: lastResolvedCommentId ?? prior.lastResolvedCommentId,
+            lastResolvedCommentAt: lastResolvedCommentAt ?? prior.lastResolvedCommentAt,
+          });
         },
       },
       log: () => {},
@@ -264,8 +306,21 @@ describe("escalation resolution reconciliation", () => {
       return [{ repo: "3mdistal/ralph", number: 42 }];
     };
 
-    const checkStates = new Map<number, { lastCheckedAt: string | null; lastSeenUpdatedAt: string | null }>();
-    checkStates.set(42, { lastCheckedAt: "2026-01-11T00:00:00.000Z", lastSeenUpdatedAt: "2026-01-11T00:00:00.000Z" });
+    const checkStates = new Map<
+      number,
+      {
+        lastCheckedAt: string | null;
+        lastSeenUpdatedAt: string | null;
+        lastResolvedCommentId: number | null;
+        lastResolvedCommentAt: string | null;
+      }
+    >();
+    checkStates.set(42, {
+      lastCheckedAt: "2026-01-11T00:00:00.000Z",
+      lastSeenUpdatedAt: "2026-01-11T00:00:00.000Z",
+      lastResolvedCommentId: null,
+      lastResolvedCommentAt: null,
+    });
 
     await reconcileEscalationResolutions({
       repo: "3mdistal/ralph",
@@ -286,9 +341,20 @@ describe("escalation resolution reconciliation", () => {
           githubUpdatedAt: "2026-01-11T00:00:00.000Z",
           labels: [],
         }),
-        getEscalationCommentCheckState: (repo, issueNumber) => checkStates.get(issueNumber) ?? null,
-        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt }) => {
-          checkStates.set(issueNumber, { lastCheckedAt, lastSeenUpdatedAt: lastSeenUpdatedAt ?? null });
+        getEscalationCommentCheckState: (_repo, issueNumber) => checkStates.get(issueNumber) ?? null,
+        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt, lastResolvedCommentId, lastResolvedCommentAt }) => {
+          const prior = checkStates.get(issueNumber) ?? {
+            lastCheckedAt: null,
+            lastSeenUpdatedAt: null,
+            lastResolvedCommentId: null,
+            lastResolvedCommentAt: null,
+          };
+          checkStates.set(issueNumber, {
+            lastCheckedAt,
+            lastSeenUpdatedAt: lastSeenUpdatedAt ?? null,
+            lastResolvedCommentId: lastResolvedCommentId ?? prior.lastResolvedCommentId,
+            lastResolvedCommentAt: lastResolvedCommentAt ?? prior.lastResolvedCommentAt,
+          });
         },
       },
       log: () => {},
@@ -345,6 +411,126 @@ describe("escalation resolution reconciliation", () => {
     });
 
     expect(requests).toEqual([]);
+  });
+
+  test("does not re-resolve the same RALPH RESOLVED comment", async () => {
+    const requests: Array<{ path: string; method: string }> = [];
+    const github = {
+      request: async (path: string, opts: { method?: string; body?: any } = {}) => {
+        requests.push({ path, method: opts.method ?? "GET" });
+        if (path.startsWith("/repos/3mdistal/ralph/labels")) {
+          return { data: [] };
+        }
+        if (path === "/graphql") {
+          return {
+            data: {
+              data: {
+                repository: {
+                  issue: {
+                    comments: {
+                      nodes: [
+                        {
+                          body: "RALPH RESOLVED: proceed",
+                          databaseId: 555,
+                          createdAt: "2026-01-11T00:00:00.000Z",
+                          author: { login: "3mdistal" },
+                          authorAssociation: "OWNER",
+                        },
+                      ],
+                    },
+                  },
+                },
+              },
+            },
+          };
+        }
+        return { data: {} };
+      },
+    } as any;
+
+    const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
+      if (labels.includes("ralph:queued")) return [];
+      return [{ repo: "3mdistal/ralph", number: 99 }];
+    };
+
+    const task = {
+      _path: "orchestration/tasks/3mdistal-ralph-99.md",
+      _name: "3mdistal/ralph#99",
+      type: "agent-task" as const,
+      "creation-date": "2026-01-11",
+      scope: "builder",
+      issue: "3mdistal/ralph#99",
+      repo: "3mdistal/ralph",
+      status: "escalated" as const,
+      name: "Task 99",
+    };
+
+    const updated: string[] = [];
+    const resolveAgentTaskByIssue = async () => task;
+    const updateTaskStatus = async (_task: any, status: string) => {
+      updated.push(status);
+      return true;
+    };
+
+    const checkStates = new Map<
+      number,
+      {
+        lastCheckedAt: string | null;
+        lastSeenUpdatedAt: string | null;
+        lastResolvedCommentId: number | null;
+        lastResolvedCommentAt: string | null;
+      }
+    >();
+    checkStates.set(99, {
+      lastCheckedAt: "2026-01-11T00:00:00.000Z",
+      lastSeenUpdatedAt: "2026-01-11T00:00:00.000Z",
+      lastResolvedCommentId: 555,
+      lastResolvedCommentAt: "2026-01-11T00:00:00.000Z",
+    });
+
+    await reconcileEscalationResolutions({
+      repo: "3mdistal/ralph",
+      deps: {
+        github,
+        listIssuesWithAllLabels,
+        resolveAgentTaskByIssue,
+        updateTaskStatus,
+        getIssueSnapshotByNumber: (_repo, issueNumber) => ({
+          repo: "3mdistal/ralph",
+          number: issueNumber,
+          title: null,
+          state: null,
+          url: null,
+          githubNodeId: null,
+          githubUpdatedAt: "2026-01-11T00:00:00.000Z",
+          labels: [],
+        }),
+        getEscalationCommentCheckState: (_repo, issueNumber) => checkStates.get(issueNumber) ?? null,
+        recordEscalationCommentCheckState: ({ issueNumber, lastCheckedAt, lastSeenUpdatedAt, lastResolvedCommentId, lastResolvedCommentAt }) => {
+          const prior = checkStates.get(issueNumber) ?? {
+            lastCheckedAt: null,
+            lastSeenUpdatedAt: null,
+            lastResolvedCommentId: null,
+            lastResolvedCommentAt: null,
+          };
+          checkStates.set(issueNumber, {
+            lastCheckedAt,
+            lastSeenUpdatedAt: lastSeenUpdatedAt ?? null,
+            lastResolvedCommentId: lastResolvedCommentId ?? prior.lastResolvedCommentId,
+            lastResolvedCommentAt: lastResolvedCommentAt ?? prior.lastResolvedCommentAt,
+          });
+        },
+      },
+      log: () => {},
+      // Force a fetch so we exercise the skip logic.
+      minRecheckIntervalMs: 0,
+    });
+
+    expect(updated).toEqual([]);
+    const labelMutations = requests
+      .filter((req) => req.method === "DELETE" || req.method === "POST")
+      .filter((req) => req.path.includes("/repos/3mdistal/ralph/issues/") && req.path.includes("/labels"));
+    expect(labelMutations).toEqual([]);
   });
 
   test("allows fetch when issue updated", () => {
