@@ -3,10 +3,14 @@ import { splitRepoFullName, type GitHubClient } from "./client";
 export type CiDebugAttempt = {
   attempt: number;
   signature: string;
+  signatureAfter?: string;
   startedAt: string;
   completedAt?: string;
   status?: "running" | "failed" | "succeeded";
   runUrls?: string[];
+  headShaBefore?: string;
+  headShaAfter?: string;
+  backoffMs?: number;
 };
 
 export type CiDebugLease = {

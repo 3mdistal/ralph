@@ -25,7 +25,9 @@ export interface RepoConfig {
    * Commands are operator-owned and defined in ~/.ralph/config.toml|json.
    */
   setup?: string[];
-  /** Max concurrent tasks for this repo (default: 1) */
+  /** Per-repo concurrency slots for this repo (default: 1). */
+  concurrencySlots?: number;
+  /** Max concurrent tasks for this repo (default: 1). Deprecated: use concurrencySlots. */
   maxWorkers?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
@@ -160,6 +162,22 @@ export interface SandboxProfileConfig {
   repoNamePrefix: string;
   /** Dedicated GitHub auth for sandbox runs. */
   githubAuth: SandboxGithubAuthConfig;
+  /** Optional sandbox provisioning configuration. */
+  provisioning?: SandboxProvisioningConfig;
+}
+
+export type SandboxProvisioningSettingsPreset = "minimal" | "parity";
+
+export type SandboxProvisioningSeedConfig =
+  | { preset: "baseline"; file?: undefined }
+  | { file: string; preset?: undefined };
+
+export interface SandboxProvisioningConfig {
+  templateRepo: string;
+  templateRef?: string;
+  repoVisibility?: "private";
+  settingsPreset?: SandboxProvisioningSettingsPreset;
+  seed?: SandboxProvisioningSeedConfig;
 }
 
 export interface DashboardConfig {
@@ -213,6 +231,7 @@ export interface RalphConfig {
 
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
+const DEFAULT_REPO_CONCURRENCY_SLOTS = DEFAULT_REPO_MAX_WORKERS;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
@@ -431,12 +450,21 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     );
   }
 
-  // Validate per-repo maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
+  // Validate per-repo concurrencySlots/maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
+    const slots = toPositiveIntOrNull((repo as any).concurrencySlots);
     const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
     const autoUpdateMin = toPositiveIntOrNull((repo as any).autoUpdateBehindMinMinutes);
     const updates: Partial<RepoConfig> = {};
+
+    if ((repo as any).concurrencySlots !== undefined && !slots) {
+      console.warn(
+        `[ralph] Invalid config concurrencySlots for repo ${repo.name}: ${JSON.stringify((repo as any).concurrencySlots)}; ` +
+          `falling back to default ${DEFAULT_REPO_CONCURRENCY_SLOTS}`
+      );
+      updates.concurrencySlots = DEFAULT_REPO_CONCURRENCY_SLOTS;
+    }
 
     if ((repo as any).maxWorkers !== undefined && !mw) {
       console.warn(
@@ -572,6 +600,94 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       }
     }
 
+    let provisioning: SandboxProvisioningConfig | undefined;
+    const rawProvisioning = (rawSandbox as any).provisioning;
+    if (rawProvisioning !== undefined) {
+      if (!rawProvisioning || typeof rawProvisioning !== "object" || Array.isArray(rawProvisioning)) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning must be an object when provided."
+        );
+      }
+
+      const templateRepo = toNonEmptyStringOrNull((rawProvisioning as any).templateRepo);
+      if (!templateRepo) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning requires provisioning.templateRepo (non-empty string)."
+        );
+      }
+
+      const templateRef = toNonEmptyStringOrNull((rawProvisioning as any).templateRef) ?? "main";
+      const repoVisibility = toNonEmptyStringOrNull((rawProvisioning as any).repoVisibility) ?? "private";
+      if (repoVisibility !== "private") {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning repoVisibility must be \"private\"."
+        );
+      }
+
+      const settingsPreset =
+        (toNonEmptyStringOrNull((rawProvisioning as any).settingsPreset) as SandboxProvisioningSettingsPreset | null) ??
+        "minimal";
+      if (settingsPreset !== "minimal" && settingsPreset !== "parity") {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_SANDBOX_INVALID",
+          "[ralph] Sandbox provisioning settingsPreset must be \"minimal\" or \"parity\"."
+        );
+      }
+
+      const rawSeed = (rawProvisioning as any).seed;
+      let seed: SandboxProvisioningSeedConfig | undefined;
+      if (rawSeed !== undefined) {
+        if (!rawSeed || typeof rawSeed !== "object" || Array.isArray(rawSeed)) {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed must be an object."
+          );
+        }
+        const preset = toNonEmptyStringOrNull((rawSeed as any).preset);
+        const file = toNonEmptyStringOrNull((rawSeed as any).file);
+
+        if (preset && file) {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed cannot set both preset and file."
+          );
+        }
+        if (preset) {
+          if (preset !== "baseline") {
+            throw new RalphConfigError(
+              "RALPH_CONFIG_SANDBOX_INVALID",
+              "[ralph] Sandbox provisioning seed preset must be \"baseline\"."
+            );
+          }
+          seed = { preset: "baseline" };
+        } else if (file) {
+          if (!isAbsolute(file)) {
+            throw new RalphConfigError(
+              "RALPH_CONFIG_SANDBOX_INVALID",
+              "[ralph] Sandbox provisioning seed file must be an absolute path."
+            );
+          }
+          seed = { file };
+        } else {
+          throw new RalphConfigError(
+            "RALPH_CONFIG_SANDBOX_INVALID",
+            "[ralph] Sandbox provisioning seed must include preset or file."
+          );
+        }
+      }
+
+      provisioning = {
+        templateRepo,
+        templateRef,
+        repoVisibility: "private",
+        settingsPreset,
+        seed,
+      };
+    }
+
     loaded.sandbox = {
       allowedOwners,
       repoNamePrefix,
@@ -579,6 +695,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
         ...(hasValidApp ? { githubApp: rawSandboxApp } : {}),
         ...(tokenEnvVar ? { tokenEnvVar } : {}),
       },
+      ...(provisioning ? { provisioning } : {}),
     };
   }
 
@@ -1215,6 +1332,11 @@ export function getSandboxProfileConfig(): SandboxProfileConfig | null {
   return cfg.profile === "sandbox" ? (cfg.sandbox ?? null) : null;
 }
 
+export function getSandboxProvisioningConfig(): SandboxProvisioningConfig | null {
+  const sandbox = getSandboxProfileConfig();
+  return sandbox?.provisioning ?? null;
+}
+
 export function getRepoPath(repoName: string): string {
   const cfg = getConfig();
   
@@ -1265,11 +1387,17 @@ export function getDashboardEventsRetentionDays(): number {
   return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
 }
 
-export function getRepoMaxWorkers(repoName: string): number {
+export function getRepoConcurrencySlots(repoName: string): number {
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
+  const slots = toPositiveIntOrNull(explicit?.concurrencySlots);
+  if (slots) return slots;
   const maxWorkers = toPositiveIntOrNull(explicit?.maxWorkers);
-  return maxWorkers ?? DEFAULT_REPO_MAX_WORKERS;
+  return maxWorkers ?? DEFAULT_REPO_CONCURRENCY_SLOTS;
+}
+
+export function getRepoMaxWorkers(repoName: string): number {
+  return getRepoConcurrencySlots(repoName);
 }
 
 export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {

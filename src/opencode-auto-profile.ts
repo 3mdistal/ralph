@@ -64,9 +64,14 @@ function chooseBest(candidates: Candidate[], now: number): Candidate {
   const nonHard = candidates.filter((c) => c.state !== "hard");
   const pool = nonHard.length > 0 ? nonHard : candidates;
 
-  const withReset = pool.filter((c) => typeof c.weeklyNextResetTs === "number");
+  // If any profile is fully available, never choose a soft-throttled one.
+  // Soft throttling blocks dequeuing new tasks, so selecting it for "auto" can stall the daemon.
+  const okOnly = pool.filter((c) => c.state === "ok");
+  const activePool = okOnly.length > 0 ? okOnly : pool;
 
-  const byRemaining = [...pool].sort((a, b) => {
+  const withReset = activePool.filter((c) => typeof c.weeklyNextResetTs === "number");
+
+  const byRemaining = [...activePool].sort((a, b) => {
     if (a.state !== b.state) return a.state === "ok" ? -1 : b.state === "ok" ? 1 : 0;
     return b.weeklyRemainingToHard - a.weeklyRemainingToHard;
   });
@@ -94,7 +99,7 @@ function chooseBest(candidates: Candidate[], now: number): Candidate {
 
   // If we're already very close to switching, don't flap.
   if (lastAutoChoice && now - lastAutoChoice.chosenAt < MIN_SWITCH_INTERVAL_MS) {
-    const prev = pool.find((c) => c.name === lastAutoChoice?.profile);
+    const prev = activePool.find((c) => c.name === lastAutoChoice?.profile);
     if (prev && prev.state !== "hard") return prev;
   }
 
