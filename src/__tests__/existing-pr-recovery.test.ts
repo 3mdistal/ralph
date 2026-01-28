@@ -113,4 +113,29 @@ describe("existing PR recovery", () => {
     expect(observedStage as unknown as string).toBe("ci-debug");
     expect(result?.outcome).toBe("failed");
   });
+
+  test("skips CI failure recovery when issue is escalated", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const task = { ...baseTask };
+
+    let ciDebugCalled = false;
+    (worker as any).runCiDebugRecovery = async () => {
+      ciDebugCalled = true;
+      return { status: "failed", run: { taskName: task.name, repo: task.repo, outcome: "failed" } };
+    };
+
+    const result = await (worker as any).maybeHandleQueuedCiFailure({
+      task,
+      issueNumber: "1",
+      taskRepoPath: "/tmp",
+      cacheKey: "1",
+      botBranch: "bot/integration",
+      issueMeta: { labels: ["ralph:escalated"], title: task.name },
+      startTime: new Date(),
+      opencodeSessionOptions: {},
+    });
+
+    expect(ciDebugCalled).toBe(false);
+    expect(result).toBe(null);
+  });
 });
