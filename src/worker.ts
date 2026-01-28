@@ -7082,7 +7082,25 @@ ${guidance}`
         if (planResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
         }
-        throw new Error(`planner failed: ${planResult.output}`);
+
+        const reason = `planner failed: ${planResult.output}`;
+        const details = planResult.output;
+
+        await this.markTaskBlocked(task, "runtime-error", {
+          reason,
+          details,
+          sessionId: planResult.sessionId,
+          runLogPath: planRunLogPath,
+        });
+        await this.notify.notifyError(`Processing ${task.name}`, reason, task.name);
+
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: planResult.sessionId,
+          escalationReason: reason,
+        };
       }
 
       // Persist OpenCode session ID for crash recovery
