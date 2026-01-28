@@ -1410,8 +1410,24 @@ export type TaskOpState = {
   heartbeatAt?: string | null;
 };
 
-export function listIssueSnapshotsWithRalphLabels(repo: string): IssueSnapshot[] {
+type IssueSnapshotQueryParams = {
+  repo: string;
+  includeClosed?: boolean;
+  onlyRalph?: boolean;
+};
+
+function listIssueSnapshotsInternal(params: IssueSnapshotQueryParams): IssueSnapshot[] {
   const database = requireDb();
+  const includeClosed = params.includeClosed ?? false;
+  const onlyRalph = params.onlyRalph ?? false;
+  const conditions: string[] = ["r.name = $name"];
+  if (!includeClosed) {
+    conditions.push("(i.state IS NULL OR UPPER(i.state) != 'CLOSED')");
+  }
+  if (onlyRalph) {
+    conditions.push("EXISTS (SELECT 1 FROM issue_labels l2 WHERE l2.issue_id = i.id AND l2.name LIKE 'ralph:%')");
+  }
+
   const rows = database
     .query(
       `SELECT i.id as id, i.number as number, i.title as title, i.state as state, i.url as url,
@@ -1420,15 +1436,11 @@ export function listIssueSnapshotsWithRalphLabels(repo: string): IssueSnapshot[]
        FROM issues i
        JOIN repos r ON r.id = i.repo_id
        LEFT JOIN issue_labels l ON l.issue_id = i.id
-       WHERE r.name = $name
-         AND (i.state IS NULL OR UPPER(i.state) != 'CLOSED')
-         AND EXISTS (
-           SELECT 1 FROM issue_labels l2 WHERE l2.issue_id = i.id AND l2.name LIKE 'ralph:%'
-         )
+       WHERE ${conditions.join(" AND ")}
        GROUP BY i.id
        ORDER BY i.number ASC`
     )
-    .all({ $name: repo }) as Array<{
+    .all({ $name: params.repo }) as Array<{
     number: number;
     title?: string | null;
     state?: string | null;
@@ -1439,7 +1451,7 @@ export function listIssueSnapshotsWithRalphLabels(repo: string): IssueSnapshot[]
   }>;
 
   return rows.map((row) => ({
-    repo,
+    repo: params.repo,
     number: row.number,
     title: row.title ?? null,
     state: row.state ?? null,
@@ -1448,6 +1460,14 @@ export function listIssueSnapshotsWithRalphLabels(repo: string): IssueSnapshot[]
     githubUpdatedAt: row.github_updated_at ?? null,
     labels: parseLabelList(row.labels),
   }));
+}
+
+export function listIssueSnapshots(repo: string, opts?: { includeClosed?: boolean; onlyRalph?: boolean }): IssueSnapshot[] {
+  return listIssueSnapshotsInternal({ repo, includeClosed: opts?.includeClosed, onlyRalph: opts?.onlyRalph });
+}
+
+export function listIssueSnapshotsWithRalphLabels(repo: string): IssueSnapshot[] {
+  return listIssueSnapshotsInternal({ repo, includeClosed: false, onlyRalph: true });
 }
 
 export function getIssueSnapshotByNumber(repo: string, issueNumber: number): IssueSnapshot | null {

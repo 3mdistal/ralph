@@ -62,6 +62,7 @@ import { ralphEventBus } from "./dashboard/bus";
 import { publishDashboardEvent } from "./dashboard/publisher";
 import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
 import { startGitHubIssuePollers } from "./github-issues-sync";
+import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
@@ -82,6 +83,7 @@ import { runWorktreesCommand } from "./commands/worktrees";
 import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
+import { createEscalationConsultantScheduler } from "./escalation-consultant/scheduler";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 import { buildProvisionPlan } from "./sandbox/provisioning-core";
 import {
@@ -109,11 +111,13 @@ let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
 let githubDoneReconciler: { stop: () => void } | null = null;
+let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
+const ESCALATION_CONSULTANT_INTERVAL_MS = 60_000;
 
 const idleState = new Map<
   string,
@@ -1306,15 +1310,30 @@ async function main(): Promise<void> {
     retentionDays,
   });
 
+  autoQueueRunner = createAutoQueueRunner({
+    scheduleQueuedTasksSoon,
+  });
+
   githubIssuePollers = startGitHubIssuePollers({
     repos: config.repos,
     baseIntervalMs: config.pollInterval,
     log: (message) => console.log(message),
-    onSync: ({ result }) => {
-      if (!result.hadChanges || isShuttingDown || queueState.backend !== "github") return;
+    onSync: ({ repo, result }) => {
+      if (isShuttingDown || queueState.backend !== "github") return;
+      const repoConfig = config.repos.find((entry) => entry.name === repo);
+      if (repoConfig && autoQueueRunner) {
+        autoQueueRunner.schedule(repoConfig, "sync");
+      }
+      if (!result.hadChanges) return;
       scheduleQueuedTasksSoon();
     },
   });
+
+  if (queueState.backend === "github") {
+    for (const repo of config.repos) {
+      autoQueueRunner?.schedule(repo, "startup");
+    }
+  }
 
   githubDoneReconciler = startGitHubDoneReconciler({
     repos: config.repos,
@@ -1450,6 +1469,28 @@ async function main(): Promise<void> {
     console.log(`[ralph] Queue backend disabled; running without queued tasks.${detail}`);
     resetIdleState([]);
   }
+
+  const escalationConsultantScheduler = createEscalationConsultantScheduler({
+    getEscalationsByStatus,
+    getVaultPath: () => getBwrbVaultIfValid(),
+    isShuttingDown: () => isShuttingDown,
+    allowModelSend: async () => {
+      const controlProfile = getActiveOpencodeProfileName(config.control ?? {});
+      const decision = await getThrottleDecision(Date.now(), {
+        opencodeProfile: controlProfile || getOpencodeDefaultProfileName() || null,
+      });
+      const gate = computeDaemonGate({ mode: getDaemonMode(config.control), throttle: decision, isShuttingDown });
+      return gate.allowModelSend;
+    },
+    repoPath: () => ".",
+    log: (message) => console.log(message),
+  });
+  void escalationConsultantScheduler.tick();
+  const escalationConsultantTimer = setInterval(() => {
+    escalationConsultantScheduler.tick().catch(() => {
+      // ignore
+    });
+  }, ESCALATION_CONSULTANT_INTERVAL_MS);
 
   const ownershipTtlMs = getConfig().ownershipTtlMs;
   const heartbeatIntervalMs = computeHeartbeatIntervalMs(ownershipTtlMs);
