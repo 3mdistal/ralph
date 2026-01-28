@@ -3,8 +3,8 @@ import { timingSafeEqual } from "crypto";
 import { redactSensitiveText } from "../redaction";
 import { safeJsonStringifyRalphEvent, type RalphEvent } from "./events";
 
-export const AUTH_PREFIX = "Bearer ";
-export const WS_PROTOCOL_PREFIX = "ralph.bearer.";
+const AUTH_PREFIX = "Bearer ";
+const WS_PROTOCOL_PREFIX = "ralph.bearer.";
 
 export type ParsedProtocolToken = { token: string | null; protocol: string | null };
 export type TokenMatchResult = { authorized: boolean; protocol: string | null };
