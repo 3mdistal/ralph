@@ -1,4 +1,4 @@
-import { splitRepoFullName, type GitHubClient } from "./client";
+import { GitHubClient, splitRepoFullName } from "./client";
 import { sanitizeEscalationReason } from "./escalation-writeback";
 import { initStateDb, hasIdempotencyKey, recordIdempotencyKey, deleteIdempotencyKey } from "../state";
 

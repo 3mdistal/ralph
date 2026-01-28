@@ -1,5 +1,4 @@
 import { sanitizeExternalText } from "../util/sanitize-text";
-
 export type AlertKind = "error" | "rollup-ready";
 export type AlertTargetType = "issue" | "repo";
 
