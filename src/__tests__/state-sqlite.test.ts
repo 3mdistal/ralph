@@ -165,7 +165,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("12");
+      expect(meta.value).toBe("13");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -175,6 +175,10 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const taskColumns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const taskColumnNames = taskColumns.map((column) => column.name);
       expect(taskColumnNames).toContain("session_events_path");
+      expect(taskColumnNames).toContain("checkpoint");
+      expect(taskColumnNames).toContain("checkpoint_seq");
+      expect(taskColumnNames).toContain("pause_requested");
+      expect(taskColumnNames).toContain("paused_at_checkpoint");
 
       const issueLabelsTable = migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'issue_labels'")
@@ -263,11 +267,15 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("12");
+      expect(meta.value).toBe("13");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
       expect(columnNames).toContain("session_events_path");
+      expect(columnNames).toContain("checkpoint");
+      expect(columnNames).toContain("checkpoint_seq");
+      expect(columnNames).toContain("pause_requested");
+      expect(columnNames).toContain("paused_at_checkpoint");
 
       const runsTable = migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_runs'")
@@ -747,7 +755,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("12");
+      expect(meta.value).toBe("13");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);

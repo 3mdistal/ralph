@@ -557,6 +557,10 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           repoSlot: normalizeOptionalString(extraFields?.["repo-slot"]),
           daemonId: normalizeOptionalString(extraFields?.["daemon-id"]),
           heartbeatAt: normalizeOptionalString(extraFields?.["heartbeat-at"]),
+          checkpoint: normalizeOptionalString(extraFields?.checkpoint),
+          checkpointSeq: normalizeOptionalString(extraFields?.["checkpoint-seq"]),
+          pauseRequested: normalizeOptionalString(extraFields?.["pause-requested"]),
+          pausedAtCheckpoint: normalizeOptionalString(extraFields?.["paused-at-checkpoint"]),
           at: nowIso,
         });
         return true;
@@ -615,6 +619,10 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         repoSlot: normalizeOptionalString(normalizedExtra["repo-slot"]),
         daemonId: normalizeOptionalString(normalizedExtra["daemon-id"]),
         heartbeatAt: normalizeOptionalString(normalizedExtra["heartbeat-at"]),
+        checkpoint: normalizeOptionalString(normalizedExtra.checkpoint),
+        checkpointSeq: normalizeOptionalString(normalizedExtra["checkpoint-seq"]),
+        pauseRequested: normalizeOptionalString(normalizedExtra["pause-requested"]),
+        pausedAtCheckpoint: normalizeOptionalString(normalizedExtra["paused-at-checkpoint"]),
         releasedAtMs: status === "in-progress" || status === "starting" || status === "throttled" ? null : undefined,
         releasedReason: status === "in-progress" || status === "starting" || status === "throttled" ? null : undefined,
         at: nowIso,

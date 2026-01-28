@@ -201,6 +201,9 @@ export function startControlPlaneServer<TSnapshot>(
             const workerId = typeof body?.workerId === "string" ? body.workerId : null;
             const reason = typeof body?.reason === "string" ? body.reason : null;
             const checkpoint = typeof body?.checkpoint === "string" ? body.checkpoint : null;
+            if (!workerId || !workerId.trim()) {
+              return jsonError(400, "bad_request", "Missing workerId");
+            }
 
             await commands.pause({ workerId, reason, checkpoint });
             return jsonResponse(200, { ok: true });
@@ -213,6 +216,9 @@ export function startControlPlaneServer<TSnapshot>(
 
             const workerId = typeof body?.workerId === "string" ? body.workerId : null;
             const reason = typeof body?.reason === "string" ? body.reason : null;
+            if (!workerId || !workerId.trim()) {
+              return jsonError(400, "bad_request", "Missing workerId");
+            }
 
             await commands.resume({ workerId, reason });
             return jsonResponse(200, { ok: true });

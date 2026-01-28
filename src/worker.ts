@@ -4,7 +4,13 @@ import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
 
-import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "./queue-backend";
+import {
+  type AgentTask,
+  getBwrbVaultForStorage,
+  getBwrbVaultIfValid,
+  getTaskByPath,
+  updateTaskStatus,
+} from "./queue-backend";
 import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "./bwrb/artifacts";
 import {
   getAutoUpdateBehindLabelGate,
@@ -6402,18 +6408,33 @@ ${guidance}`
     };
   }
 
-  private readPauseRequested(): boolean {
-    const defaults = getConfig().control;
-    const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-    return control.pauseRequested === true;
+  private async refreshCheckpointTaskState(task: AgentTask): Promise<void> {
+    const path = task._path?.trim() ?? "";
+    if (!path) return;
+    try {
+      const refreshed = await getTaskByPath(path);
+      if (!refreshed) return;
+      task.checkpoint = refreshed.checkpoint;
+      task[CHECKPOINT_SEQ_FIELD] = refreshed[CHECKPOINT_SEQ_FIELD];
+      task[PAUSE_REQUESTED_FIELD] = refreshed[PAUSE_REQUESTED_FIELD];
+      task[PAUSED_AT_CHECKPOINT_FIELD] = refreshed[PAUSED_AT_CHECKPOINT_FIELD];
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to refresh checkpoint state (task=${task.issue}): ${error?.message ?? String(error)}`
+      );
+    }
   }
 
-  private async waitForPauseCleared(opts?: { signal?: AbortSignal }): Promise<void> {
+  private async waitForTaskPauseCleared(
+    task: AgentTask,
+    state: { pauseRequested: boolean },
+    opts?: { signal?: AbortSignal }
+  ): Promise<void> {
     const minMs = 250;
     const maxMs = 2000;
     let delayMs = minMs;
 
-    while (this.readPauseRequested()) {
+    while (state.pauseRequested) {
       if (opts?.signal?.aborted) return;
 
       await new Promise<void>((resolve) => {
@@ -6426,6 +6447,9 @@ ${guidance}`
           opts.signal.addEventListener("abort", onAbort, { once: true });
         }
       });
+
+      await this.refreshCheckpointTaskState(task);
+      state.pauseRequested = parsePauseRequested(task[PAUSE_REQUESTED_FIELD]);
 
       const jitter = Math.floor(Math.random() * 125);
       delayMs = Math.min(maxMs, Math.floor(delayMs * 1.6) + jitter);
@@ -6442,8 +6466,10 @@ ${guidance}`
   }
 
   private async recordCheckpoint(task: AgentTask, checkpoint: RalphCheckpoint, sessionId?: string): Promise<void> {
+    await this.refreshCheckpointTaskState(task);
     const workerId = await this.formatWorkerId(task, task._path);
     const state = this.getCheckpointState(task);
+    const pauseState = { pauseRequested: parsePauseRequested(task[PAUSE_REQUESTED_FIELD]) };
 
     const store = {
       persist: async (nextState: CheckpointState) => {
@@ -6468,8 +6494,8 @@ ${guidance}`
     };
 
     const pauseSource = {
-      isPauseRequested: () => this.readPauseRequested(),
-      waitUntilCleared: (opts?: { signal?: AbortSignal }) => this.waitForPauseCleared(opts),
+      isPauseRequested: () => pauseState.pauseRequested,
+      waitUntilCleared: (opts?: { signal?: AbortSignal }) => this.waitForTaskPauseCleared(task, pauseState, opts),
     };
 
     const emitter = {
@@ -6489,6 +6515,7 @@ ${guidance}`
       store,
       pauseSource,
       emitter,
+      emitPauseCleared: false,
     });
   }
 

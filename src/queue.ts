@@ -56,6 +56,10 @@ const TASK_FINGERPRINT_FIELDS = [
   "blocked-reason",
   "blocked-at",
   "blocked-checked-at",
+  "checkpoint",
+  "checkpoint-seq",
+  "pause-requested",
+  "paused-at-checkpoint",
 ] as const;
 
 export function __setBwrbRunnerForTests(runner: BwrbRunner): void {
@@ -187,6 +191,10 @@ function recordQueueStateSnapshot(tasks: AgentTask[]): void {
         repoSlot: task["repo-slot"],
         daemonId: task["daemon-id"],
         heartbeatAt: task["heartbeat-at"],
+        checkpoint: task.checkpoint,
+        checkpointSeq: task["checkpoint-seq"],
+        pauseRequested: task["pause-requested"],
+        pausedAtCheckpoint: task["paused-at-checkpoint"],
         at,
       });
     } catch {
@@ -508,6 +516,10 @@ export async function updateTaskStatus(
         repoSlot: getOptionalField(normalizedExtraFields, taskObj, "repo-slot"),
         daemonId: getOptionalField(normalizedExtraFields, taskObj, "daemon-id"),
         heartbeatAt: getOptionalField(normalizedExtraFields, taskObj, "heartbeat-at"),
+        checkpoint: getOptionalField(normalizedExtraFields, taskObj, "checkpoint"),
+        checkpointSeq: getOptionalField(normalizedExtraFields, taskObj, "checkpoint-seq"),
+        pauseRequested: getOptionalField(normalizedExtraFields, taskObj, "pause-requested"),
+        pausedAtCheckpoint: getOptionalField(normalizedExtraFields, taskObj, "paused-at-checkpoint"),
       });
     } catch {
       // best-effort

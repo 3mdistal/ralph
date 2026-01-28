@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -433,6 +433,22 @@ function ensureSchema(database: Database): void {
           );
         `);
       }
+      if (existingVersion < 13) {
+        if (tableExists("tasks")) {
+          try {
+            database.exec("ALTER TABLE tasks ADD COLUMN checkpoint TEXT");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE tasks ADD COLUMN checkpoint_seq TEXT");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE tasks ADD COLUMN pause_requested TEXT");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE tasks ADD COLUMN paused_at_checkpoint TEXT");
+          } catch {}
+        }
+      }
     })();
   }
 
@@ -499,6 +515,10 @@ function ensureSchema(database: Database): void {
       repo_slot TEXT,
       daemon_id TEXT,
       heartbeat_at TEXT,
+      checkpoint TEXT,
+      checkpoint_seq TEXT,
+      pause_requested TEXT,
+      paused_at_checkpoint TEXT,
       released_at_ms INTEGER,
       released_reason TEXT,
       created_at TEXT NOT NULL,
@@ -1363,6 +1383,10 @@ export function recordTaskSnapshot(input: {
   repoSlot?: string;
   daemonId?: string;
   heartbeatAt?: string;
+  checkpoint?: string | null;
+  checkpointSeq?: string | null;
+  pauseRequested?: string | null;
+  pausedAtCheckpoint?: string | null;
   releasedAtMs?: number | null;
   releasedReason?: string | null;
   at?: string;
@@ -1396,10 +1420,10 @@ export function recordTaskSnapshot(input: {
 
   database
     .query(
-      `INSERT INTO tasks(
-         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, released_at_ms, released_reason, created_at, updated_at
+       `INSERT INTO tasks(
+         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, checkpoint, checkpoint_seq, pause_requested, paused_at_checkpoint, released_at_ms, released_reason, created_at, updated_at
        ) VALUES (
-          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $released_at_ms, $released_reason, $created_at, $updated_at
+          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $checkpoint, $checkpoint_seq, $pause_requested, $paused_at_checkpoint, $released_at_ms, $released_reason, $created_at, $updated_at
        )
        ON CONFLICT(repo_id, task_path) DO UPDATE SET
           issue_number = COALESCE(excluded.issue_number, tasks.issue_number),
@@ -1412,6 +1436,10 @@ export function recordTaskSnapshot(input: {
           repo_slot = COALESCE(excluded.repo_slot, tasks.repo_slot),
           daemon_id = COALESCE(excluded.daemon_id, tasks.daemon_id),
           heartbeat_at = COALESCE(excluded.heartbeat_at, tasks.heartbeat_at),
+          checkpoint = COALESCE(excluded.checkpoint, tasks.checkpoint),
+          checkpoint_seq = COALESCE(excluded.checkpoint_seq, tasks.checkpoint_seq),
+          pause_requested = COALESCE(excluded.pause_requested, tasks.pause_requested),
+          paused_at_checkpoint = COALESCE(excluded.paused_at_checkpoint, tasks.paused_at_checkpoint),
           released_at_ms = excluded.released_at_ms,
           released_reason = excluded.released_reason,
           updated_at = excluded.updated_at`
@@ -1429,6 +1457,10 @@ export function recordTaskSnapshot(input: {
       $repo_slot: input.repoSlot ?? null,
       $daemon_id: input.daemonId ?? null,
       $heartbeat_at: input.heartbeatAt ?? null,
+      $checkpoint: input.checkpoint ?? null,
+      $checkpoint_seq: input.checkpointSeq ?? null,
+      $pause_requested: input.pauseRequested ?? null,
+      $paused_at_checkpoint: input.pausedAtCheckpoint ?? null,
       $released_at_ms: typeof input.releasedAtMs === "number" ? input.releasedAtMs : null,
       $released_reason: input.releasedReason ?? null,
       $created_at: at,
@@ -2303,6 +2335,10 @@ export type TaskOpState = {
   repoSlot?: string | null;
   daemonId?: string | null;
   heartbeatAt?: string | null;
+  checkpoint?: string | null;
+  checkpointSeq?: string | null;
+  pauseRequested?: string | null;
+  pausedAtCheckpoint?: string | null;
   releasedAtMs?: number | null;
   releasedReason?: string | null;
 };
@@ -2535,6 +2571,8 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
               t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
               t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at,
+              t.checkpoint as checkpoint, t.checkpoint_seq as checkpoint_seq, t.pause_requested as pause_requested,
+              t.paused_at_checkpoint as paused_at_checkpoint,
               t.released_at_ms as released_at_ms, t.released_reason as released_reason
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
@@ -2552,6 +2590,10 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     repo_slot?: string | null;
     daemon_id?: string | null;
     heartbeat_at?: string | null;
+    checkpoint?: string | null;
+    checkpoint_seq?: string | null;
+    pause_requested?: string | null;
+    paused_at_checkpoint?: string | null;
     released_at_ms?: number | null;
     released_reason?: string | null;
   }>;
@@ -2568,6 +2610,10 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     repoSlot: row.repo_slot ?? null,
     daemonId: row.daemon_id ?? null,
     heartbeatAt: row.heartbeat_at ?? null,
+    checkpoint: row.checkpoint ?? null,
+    checkpointSeq: row.checkpoint_seq ?? null,
+    pauseRequested: row.pause_requested ?? null,
+    pausedAtCheckpoint: row.paused_at_checkpoint ?? null,
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
   }));
@@ -2580,6 +2626,8 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
               t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
               t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at,
+              t.checkpoint as checkpoint, t.checkpoint_seq as checkpoint_seq, t.pause_requested as pause_requested,
+              t.paused_at_checkpoint as paused_at_checkpoint,
               t.released_at_ms as released_at_ms, t.released_reason as released_reason
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
@@ -2597,6 +2645,10 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
         repo_slot?: string | null;
         daemon_id?: string | null;
         heartbeat_at?: string | null;
+        checkpoint?: string | null;
+        checkpoint_seq?: string | null;
+        pause_requested?: string | null;
+        paused_at_checkpoint?: string | null;
         released_at_ms?: number | null;
         released_reason?: string | null;
       }
@@ -2615,6 +2667,10 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     repoSlot: row.repo_slot ?? null,
     daemonId: row.daemon_id ?? null,
     heartbeatAt: row.heartbeat_at ?? null,
+    checkpoint: row.checkpoint ?? null,
+    checkpointSeq: row.checkpoint_seq ?? null,
+    pauseRequested: row.pause_requested ?? null,
+    pausedAtCheckpoint: row.paused_at_checkpoint ?? null,
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
   };

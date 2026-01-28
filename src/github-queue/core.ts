@@ -177,5 +177,9 @@ export function deriveTaskView(params: {
     "repo-slot": params.opState?.repoSlot ?? undefined,
     "daemon-id": params.opState?.daemonId ?? undefined,
     "heartbeat-at": params.opState?.heartbeatAt ?? undefined,
+    checkpoint: params.opState?.checkpoint ?? undefined,
+    "checkpoint-seq": params.opState?.checkpointSeq ?? undefined,
+    "pause-requested": params.opState?.pauseRequested ?? undefined,
+    "paused-at-checkpoint": params.opState?.pausedAtCheckpoint ?? undefined,
   };
 }

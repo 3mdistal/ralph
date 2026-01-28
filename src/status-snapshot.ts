@@ -18,6 +18,10 @@ export type StatusTaskBase = {
   issue: string;
   priority: string;
   opencodeProfile: string | null;
+  workerId?: string | null;
+  checkpoint?: string | null;
+  pauseRequested?: boolean;
+  pausedAtCheckpoint?: string | null;
   alerts?: StatusTaskAlerts | null;
 };
 
@@ -95,6 +99,10 @@ const normalizeAlerts = (alerts?: StatusTaskAlerts | null): StatusTaskAlerts | n
 
 const normalizeTaskBase = <T extends StatusTaskBase>(task: T): T => ({
   ...task,
+  workerId: normalizeOptionalString(task.workerId),
+  checkpoint: normalizeOptionalString(task.checkpoint),
+  pauseRequested: typeof task.pauseRequested === "boolean" ? task.pauseRequested : undefined,
+  pausedAtCheckpoint: normalizeOptionalString(task.pausedAtCheckpoint),
   alerts: normalizeAlerts(task.alerts),
 });
 

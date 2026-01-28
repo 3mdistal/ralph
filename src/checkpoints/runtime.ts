@@ -37,6 +37,7 @@ export async function applyCheckpointReached(params: {
   pauseSource: PauseSource;
   emitter: CheckpointEventEmitter;
   signal?: AbortSignal;
+  emitPauseCleared?: boolean;
 }): Promise<CheckpointState> {
   const pauseRequested = params.pauseSource.isPauseRequested();
   const result = onCheckpointReached({
@@ -62,8 +63,15 @@ export async function applyCheckpointReached(params: {
       workerId: params.context.workerId,
     });
 
+    const emitPauseCleared = params.emitPauseCleared ?? true;
+    const effects = emitPauseCleared
+      ? cleared.effects
+      : cleared.effects.filter(
+          (effect) => !(effect.kind === "emit" && effect.eventType === "worker.pause.cleared")
+        );
+
     await applyCheckpointEffects({
-      effects: cleared.effects,
+      effects,
       context: params.context,
       store: params.store,
       emitter: params.emitter,

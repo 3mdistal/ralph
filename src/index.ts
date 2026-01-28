@@ -62,7 +62,6 @@ import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { releaseTaskSlot } from "./state";
-import { updateControlFile } from "./control-file";
 import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
@@ -1419,19 +1418,33 @@ async function main(): Promise<void> {
           `Set dashboard.controlPlane.allowRemote=true to override.`
       );
     } else {
-      const signalControlReload = (): void => {
-        try {
-          process.kill(process.pid, "SIGUSR1");
-        } catch {
-          // ignore
-        }
-      };
-
       const resolveSessionIdForWorkerId = (workerId: string | null): string | null => {
         const needle = workerId?.trim();
         if (!needle) return null;
         for (const [sessionId, payload] of activeSessionTasks) {
           if (payload.workerId === needle) return sessionId;
+        }
+        return null;
+      };
+
+      const resolveActiveTaskForWorkerId = async (workerId: string | null): Promise<{
+        task: AgentTask;
+        sessionId: string | null;
+        workerId: string | null;
+        taskId: string | null;
+      } | null> => {
+        const needle = workerId?.trim();
+        if (!needle) return null;
+        for (const [sessionId, payload] of activeSessionTasks) {
+          if (payload.workerId !== needle) continue;
+          const taskPath = payload.task._path?.trim() ?? "";
+          const refreshed = taskPath ? await getTaskByPath(taskPath) : null;
+          return {
+            task: refreshed ?? payload.task,
+            sessionId,
+            workerId: payload.workerId ?? null,
+            taskId: payload.taskId ?? payload.task._path ?? null,
+          };
         }
         return null;
       };
@@ -1447,48 +1460,62 @@ async function main(): Promise<void> {
         replayLastDefault: controlPlaneConfig.replayLastDefault,
         replayLastMax: controlPlaneConfig.replayLastMax,
         commands: {
-          pause: async ({ workerId, reason, checkpoint }) => {
-            const patch = {
-              mode: "paused" as const,
-              pauseRequested: checkpoint ? true : undefined,
-              pauseAtCheckpoint: checkpoint ?? undefined,
-            };
-            updateControlFile({ patch });
-            signalControlReload();
+          pause: async ({ workerId, reason }) => {
+            const resolved = await resolveActiveTaskForWorkerId(workerId ?? null);
+            if (!resolved) throw new Error("Unable to resolve worker; provide an active workerId");
 
-            const sessionId = resolveSessionIdForWorkerId(workerId ?? null);
-            publishDashboardEvent(
-              {
-                type: "worker.pause.requested",
-                level: "info",
-                ...(workerId ? { workerId } : {}),
-                ...(sessionId ? { sessionId } : {}),
-                data: reason ? { reason } : {},
-              },
-              { workerId: workerId ?? undefined, sessionId: sessionId ?? undefined }
-            );
+            const pauseRequested = resolved.task["pause-requested"]?.trim() === "true";
+            if (!pauseRequested) {
+              const updated = await updateTaskStatus(resolved.task, resolved.task.status, {
+                "pause-requested": "true",
+              });
+              if (!updated) {
+                throw new Error("Failed to persist pause request");
+              }
+
+              publishDashboardEvent(
+                {
+                  type: "worker.pause.requested",
+                  level: "info",
+                  ...(resolved.workerId ? { workerId: resolved.workerId } : {}),
+                  ...(resolved.sessionId ? { sessionId: resolved.sessionId } : {}),
+                  ...(resolved.task.repo ? { repo: resolved.task.repo } : {}),
+                  ...(resolved.taskId ? { taskId: resolved.taskId } : {}),
+                  data: reason ? { reason } : { reason: "control-plane" },
+                },
+                { workerId: resolved.workerId ?? undefined, sessionId: resolved.sessionId ?? undefined }
+              );
+            }
           },
           resume: async ({ workerId, reason }) => {
-            const patch = {
-              mode: "running" as const,
-              pauseRequested: null,
-              pauseAtCheckpoint: null,
-              drainTimeoutMs: null,
-            };
-            updateControlFile({ patch });
-            signalControlReload();
+            const resolved = await resolveActiveTaskForWorkerId(workerId ?? null);
+            if (!resolved) throw new Error("Unable to resolve worker; provide an active workerId");
 
-            const sessionId = resolveSessionIdForWorkerId(workerId ?? null);
-            publishDashboardEvent(
-              {
-                type: "worker.pause.cleared",
-                level: "info",
-                ...(workerId ? { workerId } : {}),
-                ...(sessionId ? { sessionId } : {}),
-                data: reason ? { reason } : {},
-              },
-              { workerId: workerId ?? undefined, sessionId: sessionId ?? undefined }
-            );
+            const pauseRequested = resolved.task["pause-requested"]?.trim() === "true";
+            const pausedAtCheckpoint = resolved.task["paused-at-checkpoint"]?.trim() ?? "";
+
+            const updated = await updateTaskStatus(resolved.task, resolved.task.status, {
+              "pause-requested": "",
+              "paused-at-checkpoint": "",
+            });
+            if (!updated) {
+              throw new Error("Failed to clear pause request");
+            }
+
+            if (pauseRequested || pausedAtCheckpoint) {
+              publishDashboardEvent(
+                {
+                  type: "worker.pause.cleared",
+                  level: "info",
+                  ...(resolved.workerId ? { workerId: resolved.workerId } : {}),
+                  ...(resolved.sessionId ? { sessionId: resolved.sessionId } : {}),
+                  ...(resolved.task.repo ? { repo: resolved.task.repo } : {}),
+                  ...(resolved.taskId ? { taskId: resolved.taskId } : {}),
+                  data: reason ? { reason } : { reason: "control-plane" },
+                },
+                { workerId: resolved.workerId ?? undefined, sessionId: resolved.sessionId ?? undefined }
+              );
+            }
           },
           enqueueMessage: async ({ workerId, sessionId, text }) => {
             const resolvedSessionId = sessionId?.trim() || resolveSessionIdForWorkerId(workerId ?? null);
