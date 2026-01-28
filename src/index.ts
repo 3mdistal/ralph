@@ -15,6 +15,7 @@ import {
   ensureBwrbVaultLayout,
   getConfig,
   getDashboardEventsRetentionDays,
+  getOpencodeDefaultProfileName,
   getRequestedOpencodeProfileName,
   listOpencodeProfileNames,
   getRepoConcurrencySlots,
