@@ -39,6 +39,8 @@ type IssueCommentNode = {
   body?: string | null;
   author?: { login?: string | null } | null;
   authorAssociation?: string | null;
+  databaseId?: number | null;
+  createdAt?: string | null;
 };
 
 type IssueCommentsResponse = {
@@ -87,7 +89,15 @@ async function listRecentIssueComments(params: {
   repo: string;
   issueNumber: number;
   limit: number;
-}): Promise<Array<{ body: string; authorLogin: string | null; authorAssociation: string | null }>> {
+}): Promise<
+  Array<{
+    body: string;
+    authorLogin: string | null;
+    authorAssociation: string | null;
+    databaseId: number | null;
+    createdAt: string | null;
+  }>
+> {
   const { owner, name } = splitRepoFullName(params.repo);
   const query = `query($owner: String!, $name: String!, $number: Int!, $last: Int!) {
   repository(owner: $owner, name: $name) {
@@ -95,6 +105,8 @@ async function listRecentIssueComments(params: {
       comments(last: $last) {
         nodes {
           body
+          databaseId
+          createdAt
           author {
             login
           }
@@ -118,6 +130,8 @@ async function listRecentIssueComments(params: {
     body: node?.body ?? "",
     authorLogin: node?.author?.login ?? null,
     authorAssociation: node?.authorAssociation ?? null,
+    databaseId: typeof node?.databaseId === "number" ? node.databaseId : null,
+    createdAt: node?.createdAt ?? null,
   }));
 }
 
@@ -245,6 +259,8 @@ export async function reconcileEscalationResolutions(params: {
     const checkState = deps.getEscalationCommentCheckState(params.repo, issue.number) ?? {
       lastCheckedAt: null,
       lastSeenUpdatedAt: null,
+      lastResolvedCommentId: null,
+      lastResolvedCommentAt: null,
     };
     const decision = shouldFetchEscalationComments({
       nowMs,
@@ -265,7 +281,13 @@ export async function reconcileEscalationResolutions(params: {
       }
       continue;
     }
-    let bodies: Array<{ body: string; authorLogin: string | null; authorAssociation: string | null }> = [];
+    let bodies: Array<{
+      body: string;
+      authorLogin: string | null;
+      authorAssociation: string | null;
+      databaseId: number | null;
+      createdAt: string | null;
+    }> = [];
     try {
       bodies = await listRecentIssueComments({
         github: deps.github,
@@ -293,14 +315,29 @@ export async function reconcileEscalationResolutions(params: {
       lastCheckedAt: nowIso,
       lastSeenUpdatedAt: githubUpdatedAt ?? checkState.lastSeenUpdatedAt,
     });
-    const hasResolution = bodies.some((entry) => {
+    let resolution:
+      | {
+          databaseId: number | null;
+          createdAt: string | null;
+          body: string;
+        }
+      | null = null;
+    for (let i = bodies.length - 1; i >= 0; i -= 1) {
+      const entry = bodies[i];
       const author = entry.authorLogin?.toLowerCase() ?? "";
       const association = entry.authorAssociation?.toUpperCase() ?? "";
       const isAuthorized = (repoOwner && author === repoOwner) || AUTHORIZED_ASSOCIATIONS.has(association);
-      if (!isAuthorized) return false;
-      return RALPH_RESOLVED_REGEX.test(entry.body) && !entry.body.includes(RALPH_ESCALATION_MARKER_PREFIX);
-    });
-    if (!hasResolution) continue;
+      if (!isAuthorized) continue;
+      if (!RALPH_RESOLVED_REGEX.test(entry.body)) continue;
+      if (entry.body.includes(RALPH_ESCALATION_MARKER_PREFIX)) continue;
+      resolution = { databaseId: entry.databaseId ?? null, createdAt: entry.createdAt ?? null, body: entry.body };
+      break;
+    }
+
+    if (!resolution) continue;
+    if (typeof resolution.databaseId === "number" && checkState.lastResolvedCommentId === resolution.databaseId) {
+      continue;
+    }
 
     try {
       await resolveEscalation({
@@ -310,6 +347,15 @@ export async function reconcileEscalationResolutions(params: {
         ensureQueued: true,
         log,
         reason: "RALPH RESOLVED comment",
+      });
+
+      deps.recordEscalationCommentCheckState({
+        repo: params.repo,
+        issueNumber: issue.number,
+        lastCheckedAt: nowIso,
+        lastSeenUpdatedAt: githubUpdatedAt ?? checkState.lastSeenUpdatedAt,
+        lastResolvedCommentId: resolution.databaseId ?? null,
+        lastResolvedCommentAt: resolution.createdAt ?? null,
       });
     } catch (error: any) {
       log(
