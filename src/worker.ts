@@ -22,7 +22,7 @@ import {
 import { normalizeGitRef } from "./midpoint-labels";
 import { computeHeadBranchDeletionDecision } from "./pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "./midpoint-labeler";
-import { getAllowedOwners, isRepoAllowed } from "./github-app-auth";
+import { getAllowedOwners, getConfiguredGitHubAppSlug, isRepoAllowed } from "./github-app-auth";
 import {
   continueCommand,
   continueSession,
@@ -127,8 +127,19 @@ import {
   normalizePrUrl,
   searchOpenPullRequestsByIssueLink,
   viewPullRequest,
+  viewPullRequestMergeCandidate,
   type PullRequestSearchResult,
 } from "./github/pr";
+
+function prBodyClosesIssue(body: string, issueNumber: string): boolean {
+  const normalized = body.replace(/\r\n/g, "\n");
+  const re = new RegExp(`(^|\\n)\\s*(fixes|closes|resolves)\\s+#${issueNumber}\\b`, "i");
+  return re.test(normalized);
+}
+
+export function __prBodyClosesIssueForTests(body: string, issueNumber: string): boolean {
+  return prBodyClosesIssue(body, issueNumber);
+}
 
 const ghRead = (repo: string) => createGhRunner({ repo, mode: "read" });
 const ghWrite = (repo: string) => createGhRunner({ repo, mode: "write" });
@@ -1608,6 +1619,104 @@ export class RepoWorker {
     });
     this.prResolutionCache.set(cacheKey, promise);
     return promise;
+  }
+
+  /**
+   * Reconciliation lane: if a queued issue already has a Ralph-authored PR that is mergeable,
+   * merge it and apply midpoint labels. This avoids "orphan" PRs when the daemon restarts
+   * between PR creation and merge.
+   */
+  public async tryReconcileMergeablePrForQueuedTask(task: AgentTask): Promise<
+    | { handled: false }
+    | { handled: true; merged: true; prUrl: string }
+    | { handled: true; merged: false; reason: string }
+  > {
+    const issueMatch = task.issue.match(/^([^#]+)#(\d+)$/);
+    if (!issueMatch) return { handled: false };
+    const issueNumber = issueMatch[2];
+    if (!issueNumber) return { handled: false };
+
+    const botBranch = getRepoBotBranch(this.repo);
+
+    const resolved = await this.getIssuePrResolution(issueNumber);
+    const prUrl = resolved.selectedUrl;
+    if (!prUrl) return { handled: false };
+
+    let pr: Awaited<ReturnType<typeof viewPullRequestMergeCandidate>> | null = null;
+    try {
+      pr = await viewPullRequestMergeCandidate(this.repo, prUrl);
+    } catch {
+      return { handled: false };
+    }
+    if (!pr) return { handled: false };
+
+    const prState = String(pr.state ?? "").toUpperCase();
+    if (prState !== "OPEN") return { handled: false };
+    if (pr.isDraft) return { handled: false };
+
+    const baseBranch = pr.baseRefName ? this.normalizeGitRef(pr.baseRefName) : "";
+    const normalizedBot = this.normalizeGitRef(botBranch);
+    if (!baseBranch || baseBranch !== normalizedBot) return { handled: false };
+
+    const mergeable = String(pr.mergeable ?? "").toUpperCase();
+    if (mergeable !== "MERGEABLE") return { handled: false };
+
+    const mergeStateStatus = normalizeMergeStateStatus(pr.mergeStateStatus);
+    if (mergeStateStatus === "DIRTY" || mergeStateStatus === "DRAFT") return { handled: false };
+
+    const body = pr.body ?? "";
+    if (!body || !prBodyClosesIssue(body, issueNumber)) return { handled: false };
+
+    let appSlug: string | null = null;
+    try {
+      appSlug = await getConfiguredGitHubAppSlug();
+    } catch {
+      appSlug = null;
+    }
+
+    const expectedAuthor = appSlug ? `app/${appSlug}` : null;
+    if (!expectedAuthor) return { handled: false };
+    if (!pr.authorIsBot || pr.authorLogin !== expectedAuthor) return { handled: false };
+
+    const issueMeta = await this.getIssueMetadata(task.issue);
+    const cacheKey = `reconcile-merge-${issueNumber}`;
+    const sessionId = task["session-id"]?.trim() ?? "";
+    const notifyTitle = `${this.repo}#${issueNumber} reconcile merge`;
+
+    const merged = await this.mergePrWithRequiredChecks({
+      task,
+      repoPath: this.repoPath,
+      cacheKey,
+      botBranch,
+      prUrl,
+      sessionId,
+      issueMeta,
+      watchdogStagePrefix: "reconcile-merge",
+      notifyTitle,
+    });
+
+    if (!merged.ok) {
+      return { handled: true, merged: false, reason: merged.run.escalationReason ?? "Merge failed" };
+    }
+
+    const completedAt = new Date().toISOString().split("T")[0];
+    await this.queue.updateTaskStatus(task, "done", {
+      "completed-at": completedAt,
+      "session-id": "",
+      "worktree-path": "",
+      "worker-id": "",
+      "repo-slot": "",
+      "daemon-id": "",
+      "heartbeat-at": "",
+      "watchdog-retries": "",
+      "blocked-source": "",
+      "blocked-reason": "",
+      "blocked-details": "",
+      "blocked-at": "",
+      "blocked-checked-at": "",
+    });
+
+    return { handled: true, merged: true, prUrl: merged.prUrl };
   }
 
   private async findExistingOpenPrForIssue(issueNumber: string): Promise<ResolvedIssuePr> {
