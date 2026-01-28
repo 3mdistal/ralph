@@ -75,6 +75,7 @@ describe("dashboard event persistence integration", () => {
           type: "log.ralph",
           level: "info",
           ts: "2026-01-20T10:00:00.000Z",
+          runId: "run-123",
           data: { message: `event-${i}` },
         })
       );
@@ -87,6 +88,9 @@ describe("dashboard event persistence integration", () => {
     const contents = await readFile(logPath, "utf8");
     const lines = contents.trim().split("\n").filter(Boolean);
     expect(lines.length).toBe(3);
+
+    const parsed = JSON.parse(lines[0]);
+    expect(parsed.runId).toBe("run-123");
 
     persistence.unsubscribe();
   });
