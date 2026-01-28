@@ -17,8 +17,10 @@ import {
   getDashboardEventsRetentionDays,
   getOpencodeDefaultProfileName,
   listOpencodeProfileNames,
-  getRepoMaxWorkers,
+  getRepoConcurrencySlots,
   getRepoPath,
+  getSandboxProfileConfig,
+  getSandboxProvisioningConfig,
   type ControlConfig,
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
@@ -47,7 +49,7 @@ import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
 import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
-import { getRalphSessionLockPath } from "./paths";
+import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessionLockPath } from "./paths";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { queueNudge } from "./nudge";
@@ -72,11 +74,25 @@ import {
 import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 import { computeDaemonGate } from "./daemon-gate";
 import { runStatusCommand } from "./commands/status";
+import { runWorktreesCommand } from "./commands/worktrees";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
+import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
+import { buildProvisionPlan } from "./sandbox/provisioning-core";
+import {
+  applySeedFromSpec,
+  executeProvisionPlan,
+  findLatestManifestPath,
+  readManifestOrNull,
+} from "./sandbox/provisioning-io";
+import { writeSandboxManifest } from "./sandbox/manifest";
+import { getBaselineSeedSpec, loadSeedSpecFromFile } from "./sandbox/seed-spec";
 
 // --- State ---
 
 const workers = new Map<string, RepoWorker>();
+const workersBySlot = new Map<string, RepoWorker>();
+const repoSlotManager = new RepoSlotManager(getRepoConcurrencySlots);
+const repoStartupCleanup = new Set<string>();
 let rollupMonitor: RollupMonitor;
 let isShuttingDown = false;
 let drainMonitor: DrainMonitor | null = null;
@@ -262,7 +278,7 @@ function ensureSemaphores(): void {
 function getRepoSemaphore(repo: string): Semaphore {
   let sem = repoSemaphores.get(repo);
   if (!sem) {
-    sem = new Semaphore(getRepoMaxWorkers(repo));
+    sem = new Semaphore(getRepoConcurrencySlots(repo));
     repoSemaphores.set(repo, sem);
   }
   return sem;
@@ -370,8 +386,68 @@ function getOrCreateWorker(repo: string): RepoWorker {
   const created = new RepoWorker(repo, repoPath);
   workers.set(repo, created);
   console.log(`[ralph] Created worker for ${repo} -> ${repoPath}`);
-  void created.runStartupCleanup();
+  ensureRepoStartupCleanup(repo, created);
   return created;
+}
+
+function getWorkerSlotKey(repo: string, repoSlot: number): string {
+  return `${repo}::${repoSlot}`;
+}
+
+function ensureRepoStartupCleanup(repo: string, worker: RepoWorker): void {
+  if (repoStartupCleanup.has(repo)) return;
+  repoStartupCleanup.add(repo);
+  void worker.runStartupCleanup();
+}
+
+function getOrCreateWorkerForSlot(repo: string, repoSlot: number): RepoWorker {
+  const key = getWorkerSlotKey(repo, repoSlot);
+  let worker = workersBySlot.get(key);
+  if (worker) return worker;
+
+  const repoPath = getRepoPath(repo);
+  const created = new RepoWorker(repo, repoPath);
+  workersBySlot.set(key, created);
+  console.log(`[ralph] Created worker slot ${repoSlot} for ${repo} -> ${repoPath}`);
+  ensureRepoStartupCleanup(repo, created);
+  return created;
+}
+
+function getTaskRepoSlotHint(task: AgentTask): number | null {
+  const explicit = parseRepoSlot(task["repo-slot"]);
+  if (explicit !== null) return explicit;
+  return parseRepoSlotFromWorktreePath(task["worktree-path"]?.trim());
+}
+
+function reserveRepoSlotForTask(task: AgentTask): { slot: number; release: () => void } | null {
+  const taskKey = getTaskKey(task);
+  const preferred = getTaskRepoSlotHint(task);
+  const reservation = repoSlotManager.reserveSlotForTask(task.repo, taskKey, { preferred });
+  if (!reservation) return null;
+  return { slot: reservation.slot, release: reservation.release };
+}
+
+async function seedRepoSlotReservations(): Promise<void> {
+  const statuses: AgentTask["status"][] = ["starting", "in-progress", "throttled"];
+  const tasks = (await Promise.all(statuses.map((status) => getTasksByStatus(status)))).flat();
+  if (tasks.length === 0) return;
+
+  for (const task of tasks) {
+    const taskKey = getTaskKey(task);
+    const preferred = getTaskRepoSlotHint(task);
+    const reservation = repoSlotManager.reserveSlotForTask(task.repo, taskKey, { preferred });
+    if (!reservation) {
+      console.warn(
+        `[scheduler] repoSlot reservation failed on startup (repo=${task.repo}, task=${task._path ?? task.name})`
+      );
+      continue;
+    }
+
+    if (preferred === null || preferred !== reservation.slot) {
+      await updateTaskStatus(task, task.status, { "repo-slot": String(reservation.slot) });
+      task["repo-slot"] = String(reservation.slot);
+    }
+  }
 }
 
 async function getRunnableTasks(): Promise<AgentTask[]> {
@@ -629,6 +705,8 @@ async function startTask(opts: {
   const initialKey = getTaskKey(task);
   inFlightTasks.add(initialKey);
 
+  let releaseSlot: (() => void) | null = null;
+
   try {
     const nowMs = Date.now();
     const claim = await tryClaimTask({ task, daemonId, nowMs });
@@ -652,6 +730,19 @@ async function startTask(opts: {
     }
 
     try {
+      const reservation = reserveRepoSlotForTask(claimedTask);
+      if (!reservation) {
+        if (shouldLog(`scheduler:repo-slot:${claimedTask.repo}`, 30_000)) {
+          console.warn(`[scheduler] Repo concurrency slots full; deferring ${claimedTask.name}`);
+        }
+        inFlightTasks.delete(key);
+        forgetOwnedTask(claimedTask);
+        if (!isShuttingDown) scheduleQueuedTasksSoon();
+        return false;
+      }
+      releaseSlot = reservation.release;
+      const slot = reservation.slot;
+
       const blockedSource = claimedTask["blocked-source"]?.trim() || "";
       const sessionId = claimedTask["session-id"]?.trim() || "";
       const shouldResumeMergeConflict = sessionId && blockedSource === "merge-conflict";
@@ -674,10 +765,11 @@ async function startTask(opts: {
           "blocked-checked-at": "",
         });
 
-        void getOrCreateWorker(repo)
+        void getOrCreateWorkerForSlot(repo, slot)
           .resumeTask(claimedTask, {
             resumeMessage:
               "This task already has an open PR with merge conflicts blocking CI. Resolve the merge conflicts by rebasing/merging the base branch into the PR branch, push updates, and continue with the existing PR only.",
+            repoSlot: slot,
           })
           .then(async (run: AgentRun) => {
             if (run.outcome === "success" && run.pr) {
@@ -696,6 +788,7 @@ async function startTask(opts: {
           .finally(() => {
             inFlightTasks.delete(key);
             forgetOwnedTask(claimedTask);
+            releaseSlot?.();
             releaseGlobal();
             releaseRepo();
             if (!isShuttingDown) {
@@ -707,8 +800,8 @@ async function startTask(opts: {
         return true;
       }
 
-      void getOrCreateWorker(repo)
-        .processTask(claimedTask)
+      void getOrCreateWorkerForSlot(repo, slot)
+        .processTask(claimedTask, { repoSlot: slot })
         .then(async (run: AgentRun) => {
           if (run.outcome === "success" && run.pr) {
             try {
@@ -726,6 +819,7 @@ async function startTask(opts: {
         .finally(() => {
           inFlightTasks.delete(key);
           forgetOwnedTask(claimedTask);
+          releaseSlot?.();
           releaseGlobal();
           releaseRepo();
           if (!isShuttingDown) {
@@ -737,6 +831,7 @@ async function startTask(opts: {
       console.error(`[ralph] Error starting task ${claimedTask.name}:`, error);
       inFlightTasks.delete(key);
       forgetOwnedTask(claimedTask);
+      releaseSlot?.();
       if (!isShuttingDown) scheduleQueuedTasksSoon();
       return false;
     }
@@ -758,11 +853,19 @@ function startResumeTask(opts: {
   const { repo, task, releaseGlobal, releaseRepo } = opts;
   const key = getTaskKey(task);
 
+  const reservation = reserveRepoSlotForTask(task);
+  if (!reservation) {
+    if (shouldLog(`scheduler:repo-slot:${task.repo}`, 30_000)) {
+      console.warn(`[scheduler] Repo concurrency slots full; deferring resume for ${task.name}`);
+    }
+    return false;
+  }
+
   pendingResumeTasks.delete(key);
   inFlightTasks.add(key);
 
-  void getOrCreateWorker(repo)
-    .resumeTask(task)
+  void getOrCreateWorkerForSlot(repo, reservation.slot)
+    .resumeTask(task, { repoSlot: reservation.slot })
     .then(() => {
       // ignore
     })
@@ -772,6 +875,7 @@ function startResumeTask(opts: {
     .finally(() => {
       inFlightTasks.delete(key);
       forgetOwnedTask(task);
+      reservation.release();
       releaseGlobal();
       releaseRepo();
       resolveResumeCompletion(key);
@@ -1032,7 +1136,7 @@ async function resumeTasksOnStartup(opts?: {
       const repoTasks = withSessionByRepo.get(repo);
       if (!repoTasks || repoTasks.length === 0) continue;
 
-      const limit = getRepoMaxWorkers(repo);
+      const limit = getRepoConcurrencySlots(repo);
       const already = perRepoResumed.get(repo) ?? 0;
       if (already >= limit) continue;
 
@@ -1057,6 +1161,7 @@ async function resumeTasksOnStartup(opts?: {
     console.warn(
       `[ralph] Concurrency limits exceeded on startup; resetting in-progress task to queued: ${task.name} (${task.repo})`
     );
+    repoSlotManager.releaseSlotForTask(task.repo, getTaskKey(task));
     await updateTaskStatus(task, "queued", { "session-id": "" });
   }
 
@@ -1098,6 +1203,10 @@ async function main(): Promise<void> {
 
   // Initialize durable local state (SQLite)
   initStateDb();
+
+  if (queueState.backend !== "none") {
+    await seedRepoSlotReservations();
+  }
 
   const retentionDays = getDashboardEventsRetentionDays();
   await cleanupDashboardEventLogs({ retentionDays });
@@ -1413,6 +1522,9 @@ function printGlobalHelp(): void {
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
+      "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "",
       "Options:",
@@ -1506,6 +1618,29 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox:init":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:init [--no-seed]",
+          "",
+          "Creates a new sandbox repo from the configured template and writes a manifest.",
+          "Runs seeding unless --no-seed is provided.",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:seed":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:seed [--run-id <id>]",
+          "",
+          "Seeds a sandbox repo based on the manifest (defaults to newest manifest if omitted).",
+        ].join("\n")
+      );
+      return;
+
     case "rollup":
       console.log(
         [
@@ -1513,6 +1648,17 @@ function printCommandHelp(command: string): void {
           "  ralph rollup <repo>",
           "",
           "Rollup helpers. (Currently prints guidance; rollup is typically done via gh.)",
+        ].join("\n")
+      );
+      return;
+
+    case "worktrees":
+      console.log(
+        [
+          "Usage:",
+          "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
+          "",
+          "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
         ].join("\n")
       );
       return;
@@ -1744,6 +1890,146 @@ if (args[0] === "usage") {
   process.exit(0);
 }
 
+if (args[0] === "sandbox:init") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox:init");
+    process.exit(0);
+  }
+
+  const sandbox = getSandboxProfileConfig();
+  if (!sandbox) {
+    console.error("[ralph:sandbox] sandbox:init requires profile=\"sandbox\" with a sandbox config block.");
+    process.exit(1);
+  }
+
+  const owner = getConfig().owner;
+  const ownerAllowed = sandbox.allowedOwners.some((allowed) => allowed.toLowerCase() === owner.toLowerCase());
+  if (!ownerAllowed) {
+    console.error(`[ralph:sandbox] sandbox:init owner ${owner} is not in sandbox.allowedOwners.`);
+    process.exit(1);
+  }
+
+  const provisioning = getSandboxProvisioningConfig();
+  if (!provisioning) {
+    console.error("[ralph:sandbox] sandbox:init requires sandbox.provisioning config.");
+    process.exit(1);
+  }
+
+  const noSeed = args.includes("--no-seed");
+  const runId = `sandbox-${crypto.randomUUID()}`;
+
+  const plan = buildProvisionPlan({
+    runId,
+    owner,
+    botBranch: "bot/integration",
+    sandbox,
+    provisioning: {
+      templateRepo: provisioning.templateRepo,
+      templateRef: provisioning.templateRef ?? "main",
+      repoVisibility: "private",
+      settingsPreset: provisioning.settingsPreset ?? "minimal",
+      seed: provisioning.seed,
+    },
+  });
+
+  let manifest = await executeProvisionPlan(plan);
+  if (!noSeed && plan.seed) {
+    const seedSpec = plan.seed.preset === "baseline"
+      ? getBaselineSeedSpec()
+      : plan.seed.file
+        ? await loadSeedSpecFromFile(plan.seed.file)
+        : null;
+
+    if (!seedSpec) {
+      console.error("[ralph:sandbox] No seed spec resolved; pass --no-seed to skip.");
+      process.exit(1);
+    }
+
+    manifest = await applySeedFromSpec({
+      repoFullName: plan.repoFullName,
+      manifest,
+      seedSpec,
+      seedConfig: {
+        preset: plan.seed.preset,
+        file: plan.seed.file,
+      },
+    });
+    await writeSandboxManifest(getRalphSandboxManifestPath(plan.runId), manifest);
+  }
+
+  console.log(`[ralph:sandbox] Provisioned ${plan.repoFullName}`);
+  console.log(`[ralph:sandbox] Manifest: ${getRalphSandboxManifestPath(plan.runId)}`);
+  process.exit(0);
+}
+
+if (args[0] === "sandbox:seed") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox:seed");
+    process.exit(0);
+  }
+
+  const sandbox = getSandboxProfileConfig();
+  if (!sandbox) {
+    console.error("[ralph:sandbox] sandbox:seed requires profile=\"sandbox\" with a sandbox config block.");
+    process.exit(1);
+  }
+
+  const provisioning = getSandboxProvisioningConfig();
+
+  const runIdFlag = args.findIndex((arg) => arg === "--run-id");
+  const runId = runIdFlag >= 0 ? args[runIdFlag + 1] : null;
+  if (runIdFlag >= 0 && (!runId || runId.startsWith("-"))) {
+    console.error("[ralph:sandbox] --run-id requires a value.");
+    process.exit(1);
+  }
+  let manifestPath = runId ? getRalphSandboxManifestPath(runId) : null;
+
+  if (!manifestPath) {
+    manifestPath = await findLatestManifestPath(getRalphSandboxManifestsDir());
+  }
+
+  if (!manifestPath) {
+    console.error("[ralph:sandbox] No manifest found. Provide --run-id or run sandbox:init.");
+    process.exit(1);
+  }
+
+  const manifest = await readManifestOrNull(manifestPath);
+  if (!manifest) {
+    console.error(`[ralph:sandbox] Failed to load manifest: ${manifestPath}`);
+    process.exit(1);
+  }
+
+  const seedFile = manifest.seed?.file ?? provisioning?.seed?.file;
+  const seedPreset = manifest.seed?.preset ?? provisioning?.seed?.preset;
+
+  let seedSpec: any = null;
+  if (seedFile) {
+    seedSpec = await loadSeedSpecFromFile(seedFile);
+  } else if (seedPreset === "baseline") {
+    seedSpec = getBaselineSeedSpec();
+  }
+
+  if (!seedSpec) {
+    console.error("[ralph:sandbox] No seed spec resolved. Configure sandbox.provisioning.seed or update the manifest.");
+    process.exit(1);
+  }
+
+  const updated = await applySeedFromSpec({
+    repoFullName: manifest.repo.fullName,
+    manifest,
+    seedSpec,
+    seedConfig: {
+      preset: seedPreset,
+      file: seedFile,
+    },
+  });
+  await writeSandboxManifest(manifestPath, updated);
+
+  console.log(`[ralph:sandbox] Seeded ${manifest.repo.fullName}`);
+  console.log(`[ralph:sandbox] Manifest: ${manifestPath}`);
+  process.exit(0);
+}
+
 if (args[0] === "repos") {
   if (hasHelpFlag) {
     printCommandHelp("repos");
@@ -1921,6 +2207,16 @@ if (args[0] === "rollup") {
   // Note: This won't work well since we don't persist merge counts
   // For now, just create a PR from current bot/integration state
   console.log(`Force rollup not yet implemented. Use 'gh pr create --base main --head bot/integration' manually.`);
+  process.exit(0);
+}
+
+if (args[0] === "worktrees") {
+  if (hasHelpFlag) {
+    printCommandHelp("worktrees");
+    process.exit(0);
+  }
+
+  await runWorktreesCommand(args);
   process.exit(0);
 }
 

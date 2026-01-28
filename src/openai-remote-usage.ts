@@ -68,7 +68,11 @@ function normalizeUsedPct(raw: number | null): { usedPct: number; usedPercentRaw
   if (raw == null) return { usedPct: 0, usedPercentRaw: null };
   const usedPercentRaw = raw;
   // Some responses return 0..1, others return 0..100.
-  const frac = raw <= 1 ? raw : raw / 100;
+  // Important: some responses use integer percents like 0 or 1 (meaning 0%/1%),
+  // while others use 0..1 fractions (e.g. 0.12 meaning 12%).
+  const frac = raw <= 1
+    ? (Number.isInteger(raw) ? raw / 100 : raw)
+    : raw / 100;
   const clamped = Math.max(0, Math.min(1, frac));
   return { usedPct: clamped, usedPercentRaw };
 }
