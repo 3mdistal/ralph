@@ -175,6 +175,28 @@ describe("auto opencode profile selection", () => {
     expect(chosen).toBe("apple");
   });
 
+  test("does not select a soft-throttled profile when an ok profile exists", async () => {
+    const now = Date.parse("2026-01-13T12:00:00Z");
+
+    getThrottleDecisionMock.mockImplementation(async (_now: number, opts?: GetThrottleArgs) => {
+      const name = (opts?.opencodeProfile ?? "").trim();
+      const base = await defaultGetThrottleDecisionImpl(_now, opts);
+
+      if (name === "google") {
+        return {
+          ...base,
+          state: "soft",
+          snapshot: { ...base.snapshot, state: "soft" },
+        } as any;
+      }
+
+      return base;
+    });
+
+    const chosen = await resolveAutoOpencodeProfileName(now);
+    expect(chosen).toBe("apple");
+  });
+
   test("fails over from a hard-throttled requested profile for new work", async () => {
     const now = Date.parse("2026-01-13T12:00:00Z");
 

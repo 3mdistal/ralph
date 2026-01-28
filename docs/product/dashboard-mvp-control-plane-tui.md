@@ -150,6 +150,7 @@ All events are JSON objects with:
   "ts": "2026-01-10T12:34:56.789Z",
   "type": "worker.checkpoint.reached",
   "level": "info",
+  "runId": "run_abc123",
   "workerId": "3mdistal/bwrb#orchestration/tasks/...",
   "repo": "3mdistal/bwrb",
   "taskId": "orchestration/tasks/...",
@@ -157,6 +158,10 @@ All events are JSON objects with:
   "data": { "checkpoint": "pr_ready" }
 }
 ```
+
+`runId` is a **per-task-attempt** identifier (stable for one agent-run / one work session). It is emitted on every dashboard log/state event and is **not** a daemon-global id.
+
+Dashboard events are distinct from OpenCode session `events.jsonl` streams; the control-plane envelope uses ISO timestamps and Ralph event types, while session events use their own schema (numeric timestamps, tool/run events). Do not assume they are interchangeable.
 
 ### Event types (MVP)
 
