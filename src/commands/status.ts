@@ -3,7 +3,7 @@ import { readControlStateSnapshot, type DaemonMode } from "../drain";
 import { getEscalationsByStatus } from "../escalation-notes";
 import { getSessionNowDoing } from "../live-status";
 import { resolveOpencodeProfileForNewWork } from "../opencode-auto-profile";
-import { getQueueBackendState, getQueuedTasks, getTasksByStatus } from "../queue-backend";
+import { getQueueBackendStateWithLabelHealth, getQueuedTasks, getTasksByStatus } from "../queue-backend";
 import { priorityRank } from "../queue/priority";
 import { buildStatusSnapshot } from "../status-snapshot";
 import { collectStatusUsageRows, formatStatusUsageSection } from "../status-usage";
@@ -37,12 +37,12 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   const json = opts.args.includes("--json");
 
   const config = getConfig();
-  const queueState = getQueueBackendState();
 
   // Status reads from the durable SQLite state DB (GitHub issue snapshots, task op
   // state, idempotency). The daemon initializes this during startup, but CLI
   // subcommands need to do it explicitly.
   initStateDb();
+  const queueState = getQueueBackendStateWithLabelHealth();
 
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
   const controlProfile = control.opencodeProfile?.trim() || "";

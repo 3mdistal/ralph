@@ -1446,6 +1446,12 @@ export class RepoWorker {
         console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
         return;
       }
+      if (result.kind === "transient") {
+        console.warn(
+          `[ralph:worker:${this.repo}] GitHub label write skipped (transient): ${String(result.error)}`
+        );
+        return;
+      }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
     }
   }
@@ -1465,6 +1471,12 @@ export class RepoWorker {
     if (!result.ok) {
       if (result.kind === "policy") {
         console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
+        return;
+      }
+      if (result.kind === "transient") {
+        console.warn(
+          `[ralph:worker:${this.repo}] GitHub label write skipped (transient): ${String(result.error)}`
+        );
         return;
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));

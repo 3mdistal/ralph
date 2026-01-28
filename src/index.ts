@@ -25,6 +25,7 @@ import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-au
 import {
   getBwrbVaultIfValid,
   getQueueBackendState,
+  getQueueBackendStateWithLabelHealth,
   initialPoll,
   startWatching,
   stopWatching,
@@ -50,6 +51,7 @@ import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from
 import { getRalphSessionLockPath } from "./paths";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
+import { releaseTaskSlot } from "./state";
 import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
@@ -57,6 +59,7 @@ import { buildRalphEvent } from "./dashboard/events";
 import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
 import { startGitHubIssuePollers } from "./github-issues-sync";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
+import { startGitHubLabelReconciler } from "./github/label-reconciler";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -92,6 +95,7 @@ let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
 let githubDoneReconciler: { stop: () => void } | null = null;
+let githubLabelReconciler: { stop: () => void } | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
 
@@ -1177,7 +1181,9 @@ async function main(): Promise<void> {
 
   // Load config
   const config = getConfig();
-  const queueState = getQueueBackendState();
+  // Initialize durable local state (SQLite)
+  initStateDb();
+  const queueState = getQueueBackendStateWithLabelHealth();
 
   if (queueState.health === "unavailable") {
     const reason = queueState.diagnostics ? ` ${queueState.diagnostics}` : "";
@@ -1188,9 +1194,6 @@ async function main(): Promise<void> {
   if (queueState.backend === "bwrb") {
     if (!ensureBwrbVaultLayout(config.bwrbVault)) process.exit(1);
   }
-
-  // Initialize durable local state (SQLite)
-  initStateDb();
 
   if (queueState.backend !== "none") {
     await seedRepoSlotReservations();
@@ -1219,6 +1222,13 @@ async function main(): Promise<void> {
     log: (message) => console.log(message),
     warn: (message) => console.warn(message),
   });
+
+  if (queueState.backend === "github") {
+    githubLabelReconciler = startGitHubLabelReconciler({
+      intervalMs: 60_000,
+      log: (message) => console.log(message),
+    });
+  }
 
   ralphEventBus.publish(
     buildRalphEvent({
@@ -1419,6 +1429,8 @@ async function main(): Promise<void> {
     githubIssuePollers = null;
     githubDoneReconciler?.stop();
     githubDoneReconciler = null;
+    githubLabelReconciler?.stop();
+    githubLabelReconciler = null;
     if (escalationWatcher) {
       escalationWatcher.close();
       escalationWatcher = null;
@@ -1500,6 +1512,7 @@ function printGlobalHelp(): void {
       "  ralph status [--json]              Show daemon/task status",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
+      "  ralph queue release --repo <owner/repo> --issue <n>  Release a stuck task slot locally",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
@@ -1618,6 +1631,17 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "queue":
+      console.log(
+        [
+          "Usage:",
+          "  ralph queue release --repo <owner/repo> --issue <n>",
+          "",
+          "Releases a stuck task slot locally (no GitHub writes).",
+        ].join("\n")
+      );
+      return;
+
     default:
       printGlobalHelp();
       return;
@@ -1670,6 +1694,39 @@ if (args[0] === "resume") {
   // Resume any orphaned in-progress tasks and exit
   resumeSchedulingMode = "resume-only";
   await resumeTasksOnStartup({ schedulingMode: "resume-only" });
+  process.exit(0);
+}
+
+if (args[0] === "queue") {
+  if (hasHelpFlag || args[1] !== "release") {
+    printCommandHelp("queue");
+    process.exit(0);
+  }
+
+  const repoFlagIdx = args.findIndex((arg: string) => arg === "--repo");
+  const issueFlagIdx = args.findIndex((arg: string) => arg === "--issue");
+  const repo = repoFlagIdx >= 0 ? (args[repoFlagIdx + 1]?.trim() ?? "") : "";
+  const issueRaw = issueFlagIdx >= 0 ? (args[issueFlagIdx + 1]?.trim() ?? "") : "";
+  const issueNumber = Number.parseInt(issueRaw, 10);
+
+  if (!repo || !Number.isFinite(issueNumber)) {
+    console.error("Usage: ralph queue release --repo <owner/repo> --issue <n>");
+    process.exit(1);
+  }
+
+  initStateDb();
+  const ok = releaseTaskSlot({
+    repo,
+    issueNumber,
+    taskPath: `github:${repo}#${issueNumber}`,
+    releasedReason: "operator-release",
+    status: "queued",
+  });
+  if (!ok) {
+    console.error(`[ralph] Failed to release slot for ${repo}#${issueNumber}`);
+    process.exit(1);
+  }
+  console.log(`[ralph] Released slot for ${repo}#${issueNumber}`);
   process.exit(0);
 }
 

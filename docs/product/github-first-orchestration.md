@@ -28,6 +28,16 @@ The label descriptions and colors are enforced to match `src/github-labels.ts` (
 | `ralph:done` | Task merged to default branch | `1A7F37` |
 | `ralph:escalated` | Waiting on human input | `B60205` |
 
+### Degraded mode: label writes unavailable
+
+GitHub label writes are best-effort. When label mutations are throttled or blocked by GitHub (secondary rate limits, abuse detection, or temporary blocks), Ralph continues scheduling based on local SQLite ownership/heartbeat state and records a label-write backoff window.
+
+Behavior:
+- GitHub labels may temporarily drift from local truth (for example, `ralph:in-progress` may remain visible while the local slot is released).
+- Scheduling and slot release must not depend on GitHub label writes.
+- Ralph emits a degraded-mode signal in logs/status: `Queue backend: github (degraded)` with diagnostics like `label writes blocked until <iso>`.
+- Labels converge via best-effort reconciliation once GitHub writes resume.
+
 ## Operator-owned priority labels
 
 Operators can influence queue ordering by applying `p0`-`p4` labels on GitHub issues. Ralph infers task priority from

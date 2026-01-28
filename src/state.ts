@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
 import { isSafeSessionId } from "./session-id";
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -102,6 +102,13 @@ function ensureSchema(database: Database): void {
     );
   }
 
+  const tableExists = (name: string): boolean => {
+    const row = database
+      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = $name")
+      .get({ $name: name }) as { name?: string } | undefined;
+    return row?.name === name;
+  };
+
   if (existingVersion && existingVersion < SCHEMA_VERSION) {
     database.transaction(() => {
       if (existingVersion < 3) {
@@ -182,6 +189,16 @@ function ensureSchema(database: Database): void {
             ON ralph_runs(repo_id, issue_number, started_at);
         `);
       }
+      if (existingVersion < 10) {
+        if (tableExists("repos")) {
+          database.exec("ALTER TABLE repos ADD COLUMN label_write_blocked_until_ms INTEGER");
+          database.exec("ALTER TABLE repos ADD COLUMN label_write_last_error TEXT");
+        }
+        if (tableExists("tasks")) {
+          database.exec("ALTER TABLE tasks ADD COLUMN released_at_ms INTEGER");
+          database.exec("ALTER TABLE tasks ADD COLUMN released_reason TEXT");
+        }
+      }
     })();
   }
 
@@ -196,6 +213,8 @@ function ensureSchema(database: Database): void {
       name TEXT NOT NULL UNIQUE,
       local_path TEXT,
       bot_branch TEXT,
+      label_write_blocked_until_ms INTEGER,
+      label_write_last_error TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -244,6 +263,8 @@ function ensureSchema(database: Database): void {
       repo_slot TEXT,
       daemon_id TEXT,
       heartbeat_at TEXT,
+      released_at_ms INTEGER,
+      released_reason TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(repo_id, task_path),
@@ -374,6 +395,10 @@ export function initStateDb(): void {
   ensureSchema(database);
 
   db = database;
+}
+
+export function isStateDbInitialized(): boolean {
+  return Boolean(db);
 }
 
 export function closeStateDbForTests(): void {
@@ -692,6 +717,8 @@ export function recordTaskSnapshot(input: {
   repoSlot?: string;
   daemonId?: string;
   heartbeatAt?: string;
+  releasedAtMs?: number | null;
+  releasedReason?: string | null;
   at?: string;
 }): void {
   const database = requireDb();
@@ -724,9 +751,9 @@ export function recordTaskSnapshot(input: {
   database
     .query(
       `INSERT INTO tasks(
-         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, created_at, updated_at
+         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, released_at_ms, released_reason, created_at, updated_at
        ) VALUES (
-          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $created_at, $updated_at
+          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $released_at_ms, $released_reason, $created_at, $updated_at
        )
        ON CONFLICT(repo_id, task_path) DO UPDATE SET
           issue_number = COALESCE(excluded.issue_number, tasks.issue_number),
@@ -739,6 +766,8 @@ export function recordTaskSnapshot(input: {
           repo_slot = COALESCE(excluded.repo_slot, tasks.repo_slot),
           daemon_id = COALESCE(excluded.daemon_id, tasks.daemon_id),
           heartbeat_at = COALESCE(excluded.heartbeat_at, tasks.heartbeat_at),
+          released_at_ms = excluded.released_at_ms,
+          released_reason = excluded.released_reason,
           updated_at = excluded.updated_at`
     )
     .run({
@@ -754,9 +783,126 @@ export function recordTaskSnapshot(input: {
       $repo_slot: input.repoSlot ?? null,
       $daemon_id: input.daemonId ?? null,
       $heartbeat_at: input.heartbeatAt ?? null,
+      $released_at_ms: typeof input.releasedAtMs === "number" ? input.releasedAtMs : null,
+      $released_reason: input.releasedReason ?? null,
       $created_at: at,
       $updated_at: at,
     });
+}
+
+export function releaseTaskSlot(params: {
+  repo: string;
+  issueNumber: number;
+  taskPath?: string;
+  releasedAtMs?: number;
+  releasedReason?: string | null;
+  status?: string;
+}): boolean {
+  const database = requireDb();
+  const atIso = nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const taskPath = params.taskPath ?? `github:${params.repo}#${params.issueNumber}`;
+  const releasedAtMs = typeof params.releasedAtMs === "number" ? params.releasedAtMs : Date.now();
+
+  recordTaskSnapshot({
+    repo: params.repo,
+    issue: `${params.repo}#${params.issueNumber}`,
+    taskPath,
+    status: params.status ?? "queued",
+    releasedAtMs,
+    releasedReason: params.releasedReason ?? null,
+    at: atIso,
+  });
+
+  const result = database
+    .query(
+      `UPDATE tasks
+         SET status = COALESCE($status, status),
+             repo_slot = NULL,
+             worker_id = NULL,
+             daemon_id = NULL,
+             heartbeat_at = NULL,
+             released_at_ms = $released_at_ms,
+             released_reason = $released_reason,
+             updated_at = $updated_at
+       WHERE repo_id = $repo_id AND task_path = $task_path`
+    )
+    .run({
+      $repo_id: repoId,
+      $task_path: taskPath,
+      $status: params.status ?? "queued",
+      $released_at_ms: releasedAtMs,
+      $released_reason: params.releasedReason ?? null,
+      $updated_at: atIso,
+    });
+
+  return result.changes > 0;
+}
+
+export type RepoLabelWriteState = {
+  repo: string;
+  blockedUntilMs: number | null;
+  lastError: string | null;
+};
+
+export function getRepoLabelWriteState(repo: string): RepoLabelWriteState {
+  const database = requireDb();
+  const row = database
+    .query("SELECT label_write_blocked_until_ms as blocked_until_ms, label_write_last_error as last_error FROM repos WHERE name = $name")
+    .get({ $name: repo }) as { blocked_until_ms?: number | null; last_error?: string | null } | undefined;
+
+  return {
+    repo,
+    blockedUntilMs: typeof row?.blocked_until_ms === "number" ? row.blocked_until_ms : null,
+    lastError: row?.last_error ?? null,
+  };
+}
+
+export function setRepoLabelWriteState(params: {
+  repo: string;
+  blockedUntilMs: number | null;
+  lastError?: string | null;
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+
+  database
+    .query(
+      `UPDATE repos
+          SET label_write_blocked_until_ms = $blocked_until_ms,
+              label_write_last_error = $last_error,
+              updated_at = $updated_at
+        WHERE id = $repo_id`
+    )
+    .run({
+      $repo_id: repoId,
+      $blocked_until_ms: params.blockedUntilMs,
+      $last_error: params.lastError ?? null,
+      $updated_at: at,
+    });
+}
+
+export function listRepoLabelWriteStates(): RepoLabelWriteState[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      "SELECT name, label_write_blocked_until_ms as blocked_until_ms, label_write_last_error as last_error FROM repos"
+    )
+    .all() as Array<{ name?: string | null; blocked_until_ms?: number | null; last_error?: string | null }>;
+
+  return rows
+    .map((row) => {
+      const repo = row?.name ?? "";
+      if (!repo) return null;
+      return {
+        repo,
+        blockedUntilMs: typeof row.blocked_until_ms === "number" ? row.blocked_until_ms : null,
+        lastError: row.last_error ?? null,
+      };
+    })
+    .filter((row): row is RepoLabelWriteState => Boolean(row));
 }
 
 export function createRalphRun(params: {
@@ -952,6 +1098,8 @@ export type TaskOpState = {
   repoSlot?: string | null;
   daemonId?: string | null;
   heartbeatAt?: string | null;
+  releasedAtMs?: number | null;
+  releasedReason?: string | null;
 };
 
 export function listIssueSnapshotsWithRalphLabels(repo: string): IssueSnapshot[] {
@@ -1119,7 +1267,8 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     .query(
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
               t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
-              t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
+              t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at,
+              t.released_at_ms as released_at_ms, t.released_reason as released_reason
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
        WHERE r.name = $name AND t.issue_number IS NOT NULL AND t.task_path LIKE 'github:%'
@@ -1136,6 +1285,8 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     repo_slot?: string | null;
     daemon_id?: string | null;
     heartbeat_at?: string | null;
+    released_at_ms?: number | null;
+    released_reason?: string | null;
   }>;
 
   return rows.map((row) => ({
@@ -1150,6 +1301,8 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     repoSlot: row.repo_slot ?? null,
     daemonId: row.daemon_id ?? null,
     heartbeatAt: row.heartbeat_at ?? null,
+    releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
+    releasedReason: row.released_reason ?? null,
   }));
 }
 
@@ -1159,7 +1312,8 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     .query(
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
               t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
-              t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at
+              t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at,
+              t.released_at_ms as released_at_ms, t.released_reason as released_reason
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
        WHERE r.name = $name AND t.task_path = $task_path`
@@ -1176,6 +1330,8 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
         repo_slot?: string | null;
         daemon_id?: string | null;
         heartbeat_at?: string | null;
+        released_at_ms?: number | null;
+        released_reason?: string | null;
       }
     | undefined;
 
@@ -1192,6 +1348,8 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     repoSlot: row.repo_slot ?? null,
     daemonId: row.daemon_id ?? null,
     heartbeatAt: row.heartbeat_at ?? null,
+    releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
+    releasedReason: row.released_reason ?? null,
   };
 }
 
