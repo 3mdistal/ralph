@@ -502,6 +502,35 @@ export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: 
   const prNumberMatch = prUrl.match(/\/pull\/(\d+)(?:$|\?)/);
   const prNumber = prNumberMatch ? Number(prNumberMatch[1]) : null;
 
+  try {
+    initStateDb();
+    const details = [
+      `Rollup PR: ${prUrl}`,
+      mergedPRs.length ? "Included PRs:" : "",
+      ...mergedPRs.map((pr) => `- ${pr}`),
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const planned = planAlertRecord({
+      kind: "rollup-ready",
+      targetType: "repo",
+      targetNumber: 0,
+      context: `Rollup ready (${repo})`,
+      error: details,
+    });
+    recordAlertOccurrence({
+      repo,
+      targetType: planned.targetType,
+      targetNumber: planned.targetNumber,
+      kind: planned.kind,
+      fingerprint: planned.fingerprint,
+      summary: planned.summary,
+      details: planned.details,
+    });
+  } catch (error: any) {
+    console.warn(`[ralph:notify] Failed to record rollup-ready alert for ${repo}: ${error?.message ?? String(error)}`);
+  }
+
   if (!prNumber || !Number.isFinite(prNumber)) {
     console.warn(`[ralph:notify] Unable to parse rollup PR number from ${prUrl}`);
   } else {
@@ -596,12 +625,36 @@ export async function notifyError(context: string, error: string, input?: ErrorN
         );
       }
     } catch (error: any) {
-      console.warn(`[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`);
+      console.warn(
+        `[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
+      );
     }
-  } else if (input?.repo || input?.issue) {
-    console.warn(
-      `[ralph:notify] Unable to resolve issue ref for alert (repo=${input?.repo ?? ""} issue=${input?.issue ?? ""})`
-    );
+  } else if (input?.repo) {
+    try {
+      initStateDb();
+      const planned = planAlertRecord({
+        kind: "error",
+        targetType: "repo",
+        targetNumber: 0,
+        context,
+        error,
+      });
+      recordAlertOccurrence({
+        repo: input.repo,
+        targetType: planned.targetType,
+        targetNumber: planned.targetNumber,
+        kind: planned.kind,
+        fingerprint: planned.fingerprint,
+        summary: planned.summary,
+        details: planned.details,
+      });
+    } catch (recordError: any) {
+      console.warn(
+        `[ralph:notify] Failed to record repo alert for ${input.repo}: ${recordError?.message ?? String(recordError)}`
+      );
+    }
+  } else if (input?.issue) {
+    console.warn(`[ralph:notify] Unable to resolve issue ref for alert (issue=${input?.issue ?? ""})`);
   }
 
   const body = [

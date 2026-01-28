@@ -1,6 +1,6 @@
 import { sanitizeEscalationReason } from "../github/escalation-writeback";
 
-export type AlertKind = "error";
+export type AlertKind = "error" | "rollup-ready";
 export type AlertTargetType = "issue" | "repo";
 
 export type AlertRecordPlanInput = {

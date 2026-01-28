@@ -267,7 +267,7 @@ bun dev
 bun run status
 ```
 
-Status output includes blocked tasks with reasons and idle age.
+Status output includes blocked tasks with reasons/idle age and recent alert summaries (when available).
 
 Machine-readable output:
 
@@ -275,7 +275,7 @@ Machine-readable output:
 bun run status --json
 ```
 
-JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, and a short `blockedDetailsSnippet`.
+JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, a short `blockedDetailsSnippet`, and per-task `alerts` summaries when present.
 
 Live updates (prints when status changes):
 
