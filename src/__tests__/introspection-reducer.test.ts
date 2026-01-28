@@ -1,3 +1,5 @@
+import { describe, expect, test } from "bun:test";
+
 import { buildIntrospectionSummary, createIntrospectionState, reduceIntrospectionEvent } from "../introspection/reducer";
 
 describe("introspection reducer", () => {
