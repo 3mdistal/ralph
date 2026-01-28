@@ -81,7 +81,7 @@ describe("agent-run note warnings", () => {
     __resetConfigForTests();
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
-    const warnMock = mock(() => {});
+    const warnMock = mock((..._args: unknown[]) => {});
     const priorWarn = console.warn;
     console.warn = warnMock;
 
@@ -115,7 +115,7 @@ describe("agent-run note warnings", () => {
     __resetConfigForTests();
 
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
-    const warnMock = mock(() => {});
+    const warnMock = mock((..._args: unknown[]) => {});
     const priorWarn = console.warn;
     console.warn = warnMock;
 
