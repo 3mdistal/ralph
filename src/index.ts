@@ -49,12 +49,14 @@ import { createSchedulerController, startQueuedTasks } from "./scheduler";
 import { createPrioritySelectorState } from "./scheduler/priority-policy";
 import { issuePriorityWeight } from "./queue/priority";
 
-import { DrainMonitor, readControlStateSnapshot, type DaemonMode } from "./drain";
+import { DrainMonitor, readControlStateSnapshot, resolveControlFilePath, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
 import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessionLockPath } from "./paths";
+import { removeDaemonRecord, writeDaemonRecord } from "./daemon-record";
+import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { queueNudge } from "./nudge";
@@ -115,6 +117,9 @@ let githubDoneReconciler: { stop: () => void } | null = null;
 let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
+const daemonStartedAt = new Date().toISOString();
+const daemonCommand = [process.execPath, ...process.argv.slice(1)];
+const daemonVersion = getRalphVersion();
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
@@ -1297,6 +1302,21 @@ async function main(): Promise<void> {
   // Initialize durable local state (SQLite)
   initStateDb();
 
+  try {
+    writeDaemonRecord({
+      version: 1,
+      daemonId,
+      pid: process.pid,
+      startedAt: daemonStartedAt,
+      ralphVersion: daemonVersion,
+      command: daemonCommand,
+      cwd: process.cwd(),
+      controlFilePath: resolveControlFilePath(),
+    });
+  } catch (e: any) {
+    console.warn(`[ralph] Failed to write daemon record: ${e?.message ?? String(e)}`);
+  }
+
   if (queueState.backend !== "none") {
     await seedRepoSlotReservations();
   }
@@ -1629,6 +1649,12 @@ async function main(): Promise<void> {
       dashboardEventPersistence.unsubscribe();
     }
 
+    try {
+      removeDaemonRecord();
+    } catch {
+      // ignore
+    }
+
     console.log("[ralph] Goodbye!");
     process.exit(0);
   };
@@ -1881,13 +1907,15 @@ if (args[0] === "status") {
     process.exit(0);
   }
 
+  const statusControl = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: getConfig().control });
+
   await runStatusCommand({
     args,
     drain: {
       requestedAt: drainRequestedAt,
-      timeoutMs: drainTimeoutMs,
-      pauseRequested: pauseRequestedByControl,
-      pauseAtCheckpoint: pauseAtCheckpoint ?? null,
+      timeoutMs: drainTimeoutMs ?? statusControl.drainTimeoutMs ?? null,
+      pauseRequested: pauseRequestedByControl || statusControl.pauseRequested === true,
+      pauseAtCheckpoint: pauseAtCheckpoint ?? statusControl.pauseAtCheckpoint ?? null,
     },
   });
   process.exit(0);

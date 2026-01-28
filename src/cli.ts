@@ -1,18 +1,6 @@
 #!/usr/bin/env bun
 
-import { readFileSync } from "fs";
-
-function getVersion(): string {
-  try {
-    const pkgPath = new URL("../package.json", import.meta.url);
-    const raw = readFileSync(pkgPath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed.version === "string") return parsed.version;
-  } catch {
-    // ignore
-  }
-  return "unknown";
-}
+import { getRalphVersion } from "./version";
 
 function printGlobalHelp(): void {
   console.log(
@@ -207,7 +195,7 @@ const hasVersionFlag = args.includes("--version") || args.includes("-v");
 
 // Fast-exit flags: handle before importing the orchestrator implementation.
 if (hasVersionFlag) {
-  console.log(getVersion());
+  console.log(getRalphVersion() ?? "unknown");
   process.exit(0);
 }
 
