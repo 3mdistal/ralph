@@ -18,6 +18,8 @@ import {
   getOpencodeDefaultProfileName,
   listOpencodeProfileNames,
   getRepoConcurrencySlots,
+  getRepoSchedulerPriority,
+  DEFAULT_REPO_SCHEDULER_PRIORITY,
   getRepoPath,
   getSandboxProfileConfig,
   getSandboxProvisioningConfig,
@@ -43,6 +45,8 @@ import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
+import { createPrioritySelectorState } from "./scheduler/priority-policy";
+import { issuePriorityWeight } from "./queue/priority";
 
 import { DrainMonitor, readControlStateSnapshot, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
@@ -257,6 +261,7 @@ let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
 const rrCursor = { value: 0 };
+const schedulerPriorityState = { value: createPrioritySelectorState() };
 
 function requireBwrbQueueOrExit(action: string): void {
   const state = getQueueBackendState();
@@ -288,6 +293,48 @@ function getRepoSemaphore(repo: string): Semaphore {
     repoSemaphores.set(repo, sem);
   }
   return sem;
+}
+
+function buildRepoOrderForTasks(tasks: AgentTask[], priorityTasks: AgentTask[]): string[] {
+  const repoSet = new Set<string>();
+  for (const task of tasks) repoSet.add(task.repo);
+  for (const task of priorityTasks) repoSet.add(task.repo);
+  if (repoSet.size === 0) return [];
+
+  const cfg = getConfig();
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+
+  for (const repo of cfg.repos.map((entry) => entry.name)) {
+    if (!repoSet.has(repo)) continue;
+    ordered.push(repo);
+    seen.add(repo);
+  }
+
+  const extras = Array.from(repoSet)
+    .filter((repo) => !seen.has(repo))
+    .sort((a, b) => a.localeCompare(b));
+
+  return ordered.concat(extras);
+}
+
+function buildSchedulerPriorityConfig(repoOrder: string[]): { enabled: boolean; priorities: Map<string, number> } {
+  const cfg = getConfig();
+  const explicit = new Map<string, number>();
+
+  for (const repo of cfg.repos) {
+    const priority = getRepoSchedulerPriority(repo.name);
+    if (priority !== null) explicit.set(repo.name, priority);
+  }
+
+  const enabled = explicit.size > 0;
+  const priorities = new Map<string, number>();
+
+  for (const repo of repoOrder) {
+    priorities.set(repo, explicit.get(repo) ?? DEFAULT_REPO_SCHEDULER_PRIORITY);
+  }
+
+  return { enabled, priorities };
 }
 
 async function checkIdleRollups(): Promise<void> {
@@ -488,6 +535,9 @@ const schedulerController = createSchedulerController({
     ensureSemaphores();
     if (!globalSemaphore) return;
 
+    const repoOrder = buildRepoOrderForTasks([], priorityTasks);
+    const priorityConfig = buildSchedulerPriorityConfig(repoOrder);
+
     void startQueuedTasks({
       gate: "running",
       tasks: [],
@@ -498,6 +548,11 @@ const schedulerController = createSchedulerController({
       globalSemaphore,
       getRepoSemaphore,
       rrCursor,
+      repoOrder,
+      repoPriorities: priorityConfig.priorities,
+      priorityEnabled: priorityConfig.enabled,
+      priorityState: schedulerPriorityState,
+      getTaskPriorityWeight: (task: AgentTask) => issuePriorityWeight(task.priority),
       shouldLog,
       log: (message) => console.log(message),
       startTask,
@@ -974,6 +1029,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
 
   const unblockedTasks = tasks.filter((task) => !(task._path && blockedPaths.has(task._path)));
   const queueTasks = isDraining ? [] : unblockedTasks;
+  const pendingResumes = Array.from(pendingResumeTasks.values());
 
   if (queueTasks.length > 0) {
     resetIdleState(queueTasks);
@@ -981,16 +1037,24 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     resetIdleState(tasks);
   }
 
+  const repoOrder = buildRepoOrderForTasks(queueTasks, pendingResumes);
+  const priorityConfig = buildSchedulerPriorityConfig(repoOrder);
+
   const startedCount = await startQueuedTasks({
     gate: "running",
     tasks: queueTasks,
-    priorityTasks: Array.from(pendingResumeTasks.values()),
+    priorityTasks: pendingResumes,
     inFlightTasks,
     getTaskKey: (t) => getTaskKey(t),
     groupByRepo,
     globalSemaphore,
     getRepoSemaphore,
     rrCursor,
+    repoOrder,
+    repoPriorities: priorityConfig.priorities,
+    priorityEnabled: priorityConfig.enabled,
+    priorityState: schedulerPriorityState,
+    getTaskPriorityWeight: (task: AgentTask) => issuePriorityWeight(task.priority),
     shouldLog,
     log: (message) => console.log(message),
     startTask,
