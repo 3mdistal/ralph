@@ -36,7 +36,7 @@ import { getThrottleDecision } from "./throttle";
 import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
 import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
 import { ensureWorktreeSetup, type SetupFailure } from "./worktree-setup";
-import { LogLimiter } from "./logging";
+import { LogLimiter, formatDuration } from "./logging";
 import { buildWorktreePath } from "./worktree-paths";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
@@ -795,6 +795,13 @@ type RequiredChecksGuidanceInput = {
   availableChecks: string[];
 };
 
+type BranchProtectionDecisionKind = "ok" | "defer" | "fail";
+
+type BranchProtectionDecision = {
+  kind: BranchProtectionDecisionKind;
+  missingChecks: string[];
+};
+
 type CheckLogResult = {
   runId?: string;
   runUrl?: string;
@@ -822,6 +829,26 @@ function formatRequiredChecksGuidance(input: RequiredChecksGuidanceInput): strin
   return lines.join("\n");
 }
 
+const REQUIRED_CHECKS_DEFER_RETRY_MS = 60_000;
+const REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS = 60_000;
+
+function decideBranchProtection(input: {
+  requiredChecks: string[];
+  availableChecks: string[];
+}): BranchProtectionDecision {
+  const missingChecks = input.requiredChecks.filter((check) => !input.availableChecks.includes(check));
+
+  if (input.requiredChecks.length === 0) {
+    return { kind: "ok", missingChecks: [] };
+  }
+
+  if (missingChecks.length > 0) {
+    return { kind: "defer", missingChecks };
+  }
+
+  return { kind: "ok", missingChecks: [] };
+}
+
 const MAIN_MERGE_OVERRIDE_LABEL = "allow-main";
 
 function isMainMergeOverride(labels: string[]): boolean {
@@ -838,6 +865,13 @@ function isMainMergeAllowed(baseBranch: string | null, botBranch: string, labels
 
 export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuidanceInput): string {
   return formatRequiredChecksGuidance(input);
+}
+
+export function __decideBranchProtectionForTests(input: {
+  requiredChecks: string[];
+  availableChecks: string[];
+}): BranchProtectionDecision {
+  return decideBranchProtection(input);
 }
 
 export class RepoWorker {
@@ -875,6 +909,7 @@ export class RepoWorker {
   }
 
   private ensureBranchProtectionPromise: Promise<void> | null = null;
+  private ensureBranchProtectionDeferUntil = 0;
   private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
   private relationships: IssueRelationshipProvider;
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
@@ -1425,7 +1460,11 @@ export class RepoWorker {
       ].join("\n"),
     });
 
-    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, task.name);
+    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, {
+      taskName: task.name,
+      repo: task.repo,
+      issue: task.issue,
+    });
 
     const error = new Error(reason) as Error & { ralphRootDirty?: boolean };
     error.ralphRootDirty = true;
@@ -1870,7 +1909,12 @@ export class RepoWorker {
       fetchBaseBranch: async (prUrl) => this.getPullRequestBaseBranch(prUrl),
       addIssueLabel: async (issue, label) => this.addIssueLabel(issue, label),
       removeIssueLabel: async (issue, label) => this.removeIssueLabel(issue, label),
-      notifyError: async (title, body, taskName) => this.notify.notifyError(title, body, taskName ?? undefined),
+      notifyError: async (title, body, context) =>
+        this.notify.notifyError(title, body, {
+          taskName: context?.taskName ?? params.task.name,
+          repo: context?.repo ?? params.task.repo,
+          issue: context?.issue ?? params.task.issue,
+        }),
       warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
     });
   }
@@ -2141,8 +2185,8 @@ export class RepoWorker {
     return "main";
   }
 
-  private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<void> {
-    if (requiredChecks.length === 0) return;
+  private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<"ok" | "defer"> {
+    if (requiredChecks.length === 0) return "ok";
 
     const botBranch = getRepoBotBranch(this.repo);
     if (branch === botBranch) {
@@ -2161,22 +2205,30 @@ export class RepoWorker {
       }
     }
 
-    const missingChecks = requiredChecks.filter((check) => !availableChecks.includes(check));
-    if (missingChecks.length > 0) {
+    const decision = decideBranchProtection({ requiredChecks, availableChecks });
+    if (decision.kind !== "ok") {
       const guidance = formatRequiredChecksGuidance({
         repo: this.repo,
         branch,
         requiredChecks,
-        missingChecks,
+        missingChecks: decision.missingChecks,
         availableChecks,
       });
-      if (availableChecks.length === 0) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Required checks not yet available for ${branch}. ` +
-            `Proceeding without branch protection until CI runs.
+      if (decision.kind === "defer") {
+        const logKey = `branch-protection-defer:${this.repo}:${branch}:${decision.missingChecks.join(",") || "none"}::${availableChecks.join(",") || "none"}`;
+        if (this.requiredChecksLogLimiter.shouldLog(logKey, REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS)) {
+          console.warn(
+            `[ralph:worker:${this.repo}] RALPH_BRANCH_PROTECTION_SKIPPED_MISSING_CHECKS ` +
+              `Required checks missing for ${this.repo}@${branch} ` +
+              `(required: ${requiredChecks.join(", ") || "(none)"}; ` +
+              `missing: ${decision.missingChecks.join(", ") || "(none)"}). ` +
+              `Proceeding without branch protection for now; will retry in ${formatDuration(
+                REQUIRED_CHECKS_DEFER_RETRY_MS
+              )}.
 ${guidance}`
-        );
-        return;
+          );
+        }
+        return "defer";
       }
 
       throw new Error(
@@ -2232,10 +2284,15 @@ ${guidance}`
         `[ralph:worker:${this.repo}] Ensured branch protection for ${branch} (required checks: ${requiredChecks.join(", ")})`
       );
     }
+
+    return "ok";
   }
 
   private async ensureBranchProtectionOnce(): Promise<void> {
     if (this.ensureBranchProtectionPromise) return this.ensureBranchProtectionPromise;
+
+    const now = Date.now();
+    if (now < this.ensureBranchProtectionDeferUntil) return;
 
     this.ensureBranchProtectionPromise = (async () => {
       const botBranch = getRepoBotBranch(this.repo);
@@ -2248,10 +2305,20 @@ ${guidance}`
       const fallbackBranch = await this.resolveFallbackBranch(botBranch);
       const branches = Array.from(new Set([botBranch, fallbackBranch]));
 
+      let deferred = false;
+
       for (const branch of branches) {
-        await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
+        const result = await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
+        if (result === "defer") deferred = true;
       }
-    })();
+
+      return deferred;
+    })().then((deferred) => {
+      if (deferred) {
+        this.ensureBranchProtectionDeferUntil = Date.now() + REQUIRED_CHECKS_DEFER_RETRY_MS;
+        this.ensureBranchProtectionPromise = null;
+      }
+    });
 
     return this.ensureBranchProtectionPromise;
   }
@@ -5113,7 +5180,11 @@ ${guidance}`
         details,
         sessionId: recoveryResult.sessionId ?? task["session-id"]?.trim(),
       });
-      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, task.name);
+      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, {
+        taskName: task.name,
+        repo: task.repo,
+        issue: task.issue,
+      });
 
       return {
         taskName: task.name,
@@ -5626,7 +5697,11 @@ ${guidance}`
         },
       });
 
-      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+      await this.notify.notifyError(params.notifyTitle, reason, {
+        taskName: params.task.name,
+        repo: params.task.repo,
+        issue: params.task.issue,
+      });
 
       return {
         ok: false,
@@ -5671,7 +5746,11 @@ ${guidance}`
         },
       });
 
-      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+      await this.notify.notifyError(params.notifyTitle, reason, {
+        taskName: params.task.name,
+        repo: params.task.repo,
+        issue: params.task.issue,
+      });
 
       return {
         ok: false,
@@ -5731,7 +5810,11 @@ ${guidance}`
             const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
             console.warn(`[ralph:worker:${this.repo}] ${reason}`);
             await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-            await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+            await this.notify.notifyError(params.notifyTitle, reason, {
+              taskName: params.task.name,
+              repo: params.task.repo,
+              issue: params.task.issue,
+            });
 
             return {
               ok: false,
@@ -5851,7 +5934,11 @@ ${guidance}`
           // best-effort
         }
         await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-        await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+        await this.notify.notifyError(params.notifyTitle, reason, {
+          taskName: params.task.name,
+          repo: params.task.repo,
+          issue: params.task.issue,
+        });
 
         return {
           ok: false,
@@ -6965,7 +7052,11 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), {
+          taskName: task.name,
+          repo: task.repo,
+          issue: task.issue,
+        });
       }
 
       return {
@@ -7836,7 +7927,11 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), {
+          taskName: task.name,
+          repo: task.repo,
+          issue: task.issue,
+        });
       }
 
       return {

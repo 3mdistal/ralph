@@ -4,10 +4,20 @@ import type { TaskPriority } from "./queue/priority";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { appendBwrbNoteBody, buildEscalationPayload, buildIdeaPayload, createBwrbNote } from "./bwrb/artifacts";
+import { recordIssueErrorAlert, recordRepoErrorAlert, recordRollupReadyAlert } from "./alerts/service";
+import { parseIssueRef } from "./github/issue-ref";
 
 const sanitizeNoteTitle = sanitizeNoteName;
 
 export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
+
+export type ErrorNotificationContext = {
+  repo?: string | null;
+  issue?: string | null;
+  taskName?: string | null;
+};
+
+type ErrorNotificationInput = ErrorNotificationContext | string | null | undefined;
 
 // Cache for terminal-notifier availability check
 let terminalNotifierAvailable: boolean | null = null;
@@ -488,6 +498,24 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
 }
 
 export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: string[]): Promise<void> {
+  const prNumberMatch = prUrl.match(/\/pull\/(\d+)(?:$|\?)/);
+  const prNumber = prNumberMatch ? Number(prNumberMatch[1]) : null;
+
+  try {
+    await recordRollupReadyAlert({
+      repo,
+      prNumber: prNumber && Number.isFinite(prNumber) ? prNumber : null,
+      prUrl,
+      mergedPRs,
+    });
+  } catch (error: any) {
+    console.warn(`[ralph:notify] Failed to record rollup-ready alert for ${repo}: ${error?.message ?? String(error)}`);
+  }
+
+  if (!prNumber || !Number.isFinite(prNumber)) {
+    console.warn(`[ralph:notify] Unable to parse rollup PR number from ${prUrl}`);
+  }
+
   const body = [
     `A rollup PR is ready for review in **${repo}**.`,
     "",
@@ -500,9 +528,53 @@ export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: 
   ].join("\n");
 
   await createNotification("rollup-ready", `Rollup for ${repo}`, body);
+
+  await sendDesktopNotification({
+    title: "Ralph: Rollup Ready",
+    subtitle: repo,
+    message: `Rollup PR ready: ${prUrl}`.slice(0, 120),
+    openUrl: prUrl,
+    sound: "Ping",
+  });
 }
 
-export async function notifyError(context: string, error: string, taskName?: string): Promise<void> {
+export async function notifyError(context: string, error: string, input?: ErrorNotificationInput): Promise<void> {
+  const normalizedInput: ErrorNotificationContext | undefined =
+    typeof input === "string" ? { taskName: input } : input ?? undefined;
+  const taskName = normalizedInput?.taskName ?? undefined;
+  const issueRaw = normalizedInput?.issue?.trim() ?? "";
+  const issueRef = issueRaw ? parseIssueRef(issueRaw, normalizedInput?.repo ?? "") : null;
+
+  if (issueRef) {
+    try {
+      await recordIssueErrorAlert({
+        repo: issueRef.repo,
+        issueNumber: issueRef.number,
+        taskName: taskName ?? undefined,
+        context,
+        error,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
+      );
+    }
+  } else if (normalizedInput?.repo) {
+    try {
+      recordRepoErrorAlert({
+        repo: normalizedInput.repo,
+        context,
+        error,
+      });
+    } catch (recordError: any) {
+      console.warn(
+        `[ralph:notify] Failed to record repo alert for ${normalizedInput.repo}: ${recordError?.message ?? String(recordError)}`
+      );
+    }
+  } else if (normalizedInput?.issue) {
+    console.warn(`[ralph:notify] Unable to resolve issue ref for alert (issue=${normalizedInput?.issue ?? ""})`);
+  }
+
   const body = [
     `An error occurred during: **${context}**`,
     "",
@@ -517,7 +589,6 @@ export async function notifyError(context: string, error: string, taskName?: str
 
   await createNotification("error", `Error: ${context}`, body, taskName);
 
-  // Send desktop notification
   await sendDesktopNotification({
     title: "Ralph: Error",
     subtitle: taskName ?? "Task Error",
