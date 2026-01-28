@@ -1,3 +1,4 @@
+import { test, expect, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
@@ -55,6 +56,8 @@ test("accepts opencode.defaultProfile=auto when profiles enabled", async () => {
     console.warn = priorWarn;
   }
 
-  const warned = warn.mock.calls.some((call) => String(call[0]).includes("Invalid config opencode.defaultProfile"));
+  const warned = warn.mock.calls.some((call: unknown[]) =>
+    String(call[0]).includes("Invalid config opencode.defaultProfile")
+  );
   expect(warned).toBe(false);
 });
