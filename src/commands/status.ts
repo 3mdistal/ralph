@@ -8,7 +8,7 @@ import { getQueueBackendStateWithLabelHealth, getQueuedTasks, getTasksByStatus }
 import { priorityRank } from "../queue/priority";
 import { buildStatusSnapshot, type StatusSnapshot } from "../status-snapshot";
 import { collectStatusUsageRows, formatStatusUsageSection } from "../status-usage";
-import { readRunTokenTotals, type SessionTokenReadResult } from "../status-run-tokens";
+import { readRunTokenTotals } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
 import { initStateDb, listIssueAlertSummaries } from "../state";
 import { getThrottleDecision } from "../throttle";
@@ -334,22 +334,20 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     timeoutMs: STATUS_USAGE_TIMEOUT_MS,
   });
 
-  if (json) {
-    const tokenReadCache = new Map<string, Promise<SessionTokenReadResult>>();
-    const inProgressWithStatus = await Promise.all(
-      inProgress.map(async (task) => {
+    if (json) {
+      const inProgressWithStatus = await Promise.all(
+        inProgress.map(async (task) => {
         const sessionId = task["session-id"]?.trim() || null;
         const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
         const opencodeProfile = getTaskOpencodeProfileName(task);
-        const tokens = await readRunTokenTotals({
-          repo: task.repo,
-          issue: task.issue,
-          opencodeProfile,
-          timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
-          concurrency: STATUS_TOKEN_CONCURRENCY,
-          budgetMs: STATUS_TOKEN_BUDGET_MS,
-          cache: tokenReadCache,
-        });
+          const tokens = await readRunTokenTotals({
+            repo: task.repo,
+            issue: task.issue,
+            opencodeProfile,
+            timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
+            concurrency: STATUS_TOKEN_CONCURRENCY,
+            budgetMs: STATUS_TOKEN_BUDGET_MS,
+          });
         return {
           name: task.name,
           repo: task.repo,
@@ -475,7 +473,6 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   }
 
   console.log(`In-progress tasks: ${inProgress.length}`);
-  const tokenReadCache = new Map<string, Promise<SessionTokenReadResult>>();
   for (const task of inProgress) {
     const opencodeProfile = getTaskOpencodeProfileName(task);
     const tokens = await readRunTokenTotals({
@@ -485,7 +482,6 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
       concurrency: STATUS_TOKEN_CONCURRENCY,
       budgetMs: STATUS_TOKEN_BUDGET_MS,
-      cache: tokenReadCache,
     });
     const tokensLabel = tokens.tokensComplete && typeof tokens.tokensTotal === "number" ? tokens.tokensTotal : "?";
     console.log(`  - ${await getTaskNowDoingLine(task)} tokens=${tokensLabel}`);
