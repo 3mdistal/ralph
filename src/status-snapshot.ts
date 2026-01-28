@@ -18,6 +18,14 @@ export type StatusTaskBase = {
   issue: string;
   priority: string;
   opencodeProfile: string | null;
+  alerts?: StatusTaskAlerts | null;
+};
+
+export type StatusTaskAlerts = {
+  totalCount: number;
+  latestSummary: string | null;
+  latestAt: string | null;
+  latestCommentUrl: string | null;
 };
 
 export type StatusInProgressTask = StatusTaskBase & {
@@ -65,8 +73,23 @@ const normalizeOptionalString = (value?: string | null): string | null => {
   return trimmed ? trimmed : null;
 };
 
-const normalizeBlockedTask = (task: StatusBlockedTask): StatusBlockedTask => ({
+const normalizeAlerts = (alerts?: StatusTaskAlerts | null): StatusTaskAlerts | null => {
+  if (!alerts || typeof alerts.totalCount !== "number" || alerts.totalCount <= 0) return null;
+  return {
+    totalCount: alerts.totalCount,
+    latestSummary: normalizeOptionalString(alerts.latestSummary),
+    latestAt: normalizeOptionalString(alerts.latestAt),
+    latestCommentUrl: normalizeOptionalString(alerts.latestCommentUrl),
+  };
+};
+
+const normalizeTaskBase = <T extends StatusTaskBase>(task: T): T => ({
   ...task,
+  alerts: normalizeAlerts(task.alerts),
+});
+
+const normalizeBlockedTask = (task: StatusBlockedTask): StatusBlockedTask => ({
+  ...normalizeTaskBase(task),
   sessionId: normalizeOptionalString(task.sessionId),
   blockedAt: normalizeOptionalString(task.blockedAt),
   blockedSource: normalizeOptionalString(task.blockedSource),
@@ -75,15 +98,24 @@ const normalizeBlockedTask = (task: StatusBlockedTask): StatusBlockedTask => ({
 });
 
 const normalizeThrottledTask = (task: StatusThrottledTask): StatusThrottledTask => ({
-  ...task,
+  ...normalizeTaskBase(task),
   sessionId: normalizeOptionalString(task.sessionId),
   resumeAt: normalizeOptionalString(task.resumeAt),
+});
+
+const normalizeInProgressTask = (task: StatusInProgressTask): StatusInProgressTask => ({
+  ...normalizeTaskBase(task),
+  sessionId: normalizeOptionalString(task.sessionId),
+  line: normalizeOptionalString(task.line),
 });
 
 export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
   return {
     ...input,
     blocked: input.blocked.map(normalizeBlockedTask),
+    inProgress: input.inProgress.map(normalizeInProgressTask),
+    starting: input.starting.map(normalizeTaskBase),
+    queued: input.queued.map(normalizeTaskBase),
     throttled: input.throttled.map(normalizeThrottledTask),
   };
 }
