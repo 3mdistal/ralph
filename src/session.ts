@@ -27,6 +27,13 @@ import { dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
+import {
+  buildIntrospectionSummary,
+  createIntrospectionState,
+  recordStepStart,
+  reduceIntrospectionEvent,
+  type ToolEventInfo,
+} from "./introspection/reducer";
 import { isSafeSessionId } from "./session-id";
 import { ensureManagedOpencodeConfigInstalled } from "./opencode-managed-config";
 import { registerOpencodeRun, unregisterOpencodeRun, updateOpencodeRun } from "./opencode-process-registry";
@@ -272,6 +279,26 @@ function sanitizeOpencodeLog(text: string): string {
   if (home) out = out.split(home).join("~");
 
   return out;
+}
+
+const TOOL_RESULT_FINGERPRINT_MIN_CHARS = 40;
+const TOOL_RESULT_FINGERPRINT_MAX_CHARS = 200;
+
+function hashFingerprint(value: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < value.length; i++) {
+    hash ^= value.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function fingerprintValue(value: string): string | null {
+  const sanitized = sanitizeOpencodeLog(value);
+  const trimmed = sanitized.trim();
+  if (trimmed.length < TOOL_RESULT_FINGERPRINT_MIN_CHARS) return null;
+  const truncated = trimmed.slice(0, TOOL_RESULT_FINGERPRINT_MAX_CHARS);
+  return `${hashFingerprint(truncated)}:${truncated.length}`;
 }
 
 const TOOL_OUTPUT_BUDGET = {
@@ -545,9 +572,7 @@ async function runSession(
     }
   };
 
-  const extractToolInfo = (event: any): { phase: "start" | "end" | "progress"; toolName: string; callId: string; argsPreview?: string } | null => {
-    const type = String(event?.type ?? event?.event ?? "").toLowerCase();
-
+  const extractToolIdentity = (event: any): { toolName?: string; callId?: string } => {
     const toolName =
       event?.tool?.name ??
       event?.toolName ??
@@ -568,6 +593,13 @@ async function runSession(
       event?.part?.tool_call?.callId ??
       undefined;
 
+    return { toolName, callId };
+  };
+
+  const extractToolInfo = (event: any): ToolEventInfo | null => {
+    const type = String(event?.type ?? event?.event ?? "").toLowerCase();
+    const { toolName, callId } = extractToolIdentity(event);
+
     const hasToolHints = Boolean(toolName || callId || type.includes("tool"));
     if (!hasToolHints) return null;
 
@@ -584,6 +616,27 @@ async function runSession(
       callId: String(callId ?? "unknown"),
       argsPreview: argsPreviewFromEvent(event),
     };
+  };
+
+  const extractToolResultText = (event: any): string | null => {
+    const candidate =
+      event?.tool?.result ??
+      event?.tool?.output ??
+      event?.part?.toolResult?.output ??
+      event?.part?.toolResult?.content ??
+      event?.part?.tool?.result ??
+      event?.part?.tool?.output ??
+      event?.part?.tool_result?.output ??
+      event?.part?.tool_result?.content ??
+      undefined;
+
+    if (candidate == null) return null;
+    if (typeof candidate === "string") return candidate;
+    try {
+      return JSON.stringify(candidate);
+    } catch {
+      return null;
+    }
   };
 
   const args: string[] = ["run"];
@@ -905,6 +958,7 @@ async function runSession(
   let prUrlFromEvents: string | null = null;
 
   const introspection = options?.introspection;
+  const introspectionState = createIntrospectionState();
 
   let eventStream: Writable | null = null;
   let bufferedEventLines: string[] = [];
@@ -971,6 +1025,23 @@ async function runSession(
     }
   };
 
+  const writeIntrospectionSummary = async (endTime: number): Promise<void> => {
+    if (!sessionId) return;
+    if (!isSafeSessionId(sessionId)) {
+      console.warn(`[ralph] Refusing to write summary for unsafe session id: ${sessionId}`);
+      return;
+    }
+
+    try {
+      const summary = buildIntrospectionSummary(introspectionState, { sessionId, endTime });
+      const dir = getSessionDirForRun(sessionId);
+      mkdirSync(dir, { recursive: true });
+      await writeFile(join(dir, "summary.json"), JSON.stringify(summary) + "\n");
+    } catch {
+      // ignore
+    }
+  };
+
   // Seed deterministic context before tool events begin.
   if (introspection?.step != null || introspection?.repo || introspection?.issue || introspection?.taskName) {
     if (typeof introspection?.step === "number") {
@@ -983,6 +1054,7 @@ async function runSession(
         issue: introspection.issue,
         taskName: introspection.taskName,
       });
+      recordStepStart(introspectionState);
     }
 
     writeEvent({
@@ -1038,6 +1110,13 @@ async function runSession(
 
       try {
         const event = JSON.parse(trimmed);
+        if (typeof options?.onEvent === "function") {
+          try {
+            options.onEvent(event);
+          } catch {
+            // ignore
+          }
+        }
         const eventSessionId = event.sessionID ?? event.sessionId;
         if (eventSessionId && !sessionId) {
           sessionId = String(eventSessionId);
@@ -1052,20 +1131,60 @@ async function runSession(
           if (extracted) prUrlFromEvents = extracted;
         }
 
-        if (event.type === "anomaly") {
-          writeEvent({
-            type: "anomaly",
-            ts: typeof event.ts === "number" ? event.ts : scheduler.now(),
-          });
-        }
-
-        if (event.type === "text" && event.part?.text) {
-          textOutput += event.part.text;
-        }
-
         const tool = extractToolInfo(event);
+        const toolResultText = extractToolResultText(event);
+        const { toolName: toolResultName, callId: toolResultCallId } = extractToolIdentity(event);
+        const textEventValue = event.type === "text" && typeof event.part?.text === "string" ? event.part.text : null;
+        if (textEventValue) {
+          textOutput += textEventValue;
+        }
+
+        const toolResultFingerprint = toolResultText ? fingerprintValue(toolResultText) : null;
+        const textFingerprint = textEventValue ? fingerprintValue(textEventValue) : null;
+
+        const reducerInput = { now: scheduler.now() } as Parameters<typeof reduceIntrospectionEvent>[1];
+        let shouldReduce = false;
+
+        if (event.type === "anomaly") {
+          reducerInput.opencodeAnomaly = {
+            ts: typeof event.ts === "number" ? event.ts : reducerInput.now,
+          };
+          shouldReduce = true;
+        }
+
         if (tool) {
-          const now = scheduler.now();
+          reducerInput.tool = tool;
+          shouldReduce = true;
+        }
+
+        if (toolResultFingerprint && toolResultCallId && toolResultName) {
+          const callId = String(toolResultCallId);
+          const toolName = String(toolResultName);
+          if (callId !== "unknown" && toolName !== "unknown") {
+            reducerInput.toolResult = {
+              fingerprint: toolResultFingerprint,
+              ts: reducerInput.now,
+              callId,
+              toolName,
+            };
+            shouldReduce = true;
+          }
+        }
+
+        if (textFingerprint) {
+          reducerInput.text = { fingerprint: textFingerprint, ts: reducerInput.now };
+          shouldReduce = true;
+        }
+
+        if (shouldReduce) {
+          const { events } = reduceIntrospectionEvent(introspectionState, reducerInput);
+          for (const event of events) {
+            writeEvent(event);
+          }
+        }
+
+        if (tool) {
+          const now = reducerInput.now;
 
           if (tool.phase === "start") {
             inFlight = {
@@ -1075,22 +1194,7 @@ async function runSession(
               lastProgressTs: now,
               argsPreview: tool.argsPreview,
             };
-
-            writeEvent({
-              type: "tool-start",
-              ts: now,
-              toolName: tool.toolName,
-              callId: tool.callId,
-              argsPreview: tool.argsPreview,
-            });
           } else if (tool.phase === "end") {
-            writeEvent({
-              type: "tool-end",
-              ts: now,
-              toolName: tool.toolName,
-              callId: tool.callId,
-            });
-
             if (inFlight && (inFlight.callId === tool.callId || inFlight.callId === "unknown" || tool.callId === "unknown")) {
               inFlight = null;
             }
@@ -1269,6 +1373,8 @@ async function runSession(
       }
     }
 
+    await writeIntrospectionSummary(scheduler.now());
+
     if (sessionId) {
       await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
     }
@@ -1314,6 +1420,8 @@ async function runSession(
       }
     }
 
+    await writeIntrospectionSummary(scheduler.now());
+
     if (sessionId) {
       await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
     }
@@ -1332,6 +1440,8 @@ async function runSession(
       // ignore
     }
   }
+
+  await writeIntrospectionSummary(scheduler.now());
 
   if (sessionId) {
     await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
@@ -1371,6 +1481,7 @@ export type RunSessionOptionsBase = {
     idleMs?: number;
     context?: string;
   };
+  onEvent?: (event: any) => void;
 };
 
 export type RunSessionTestOverrides = {

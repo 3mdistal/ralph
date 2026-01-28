@@ -1,5 +1,6 @@
 import { GitHubApiError, splitRepoFullName, type GitHubClient, type GitHubResponse } from "./client";
 import type { EnsureOutcome } from "./ensure-ralph-workflow-labels";
+import { canAttemptLabelWrite, recordLabelWriteFailure, recordLabelWriteSuccess } from "./label-write-backoff";
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
@@ -22,6 +23,7 @@ type LabelMutationOptions = {
 
 type LabelOpsIo = {
   addLabel: (label: string) => Promise<void>;
+  addLabels?: (labels: string[]) => Promise<void>;
   removeLabel: (label: string) => Promise<{ removed?: boolean } | void>;
 };
 
@@ -30,13 +32,14 @@ type ApplyIssueLabelOpsParams = {
   io: LabelOpsIo;
   log?: (message: string) => void;
   logLabel?: string;
+  repo?: string;
   allowNonRalph?: boolean;
   ensureLabels?: () => Promise<EnsureOutcome>;
   retryMissingLabelOnce?: boolean;
   ensureBefore?: boolean;
 };
 
-function normalizeLabel(label: string): string | null {
+export function normalizeLabel(label: string): string | null {
   if (typeof label !== "string") return null;
   const trimmed = label.trim();
   return trimmed ? trimmed : null;
@@ -124,6 +127,22 @@ export async function addIssueLabel(params: {
   });
 }
 
+export async function addIssueLabels(params: {
+  github: GitHubRequester;
+  repo: string;
+  issueNumber: number;
+  labels: string[];
+  allowNonRalph?: boolean;
+}): Promise<void> {
+  const labels = uniqueOrderedLabels(params.labels, { allowNonRalph: params.allowNonRalph });
+  if (labels.length === 0) return;
+  const { owner, name } = splitRepoFullName(params.repo);
+  await params.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/labels`, {
+    method: "POST",
+    body: { labels },
+  });
+}
+
 export async function removeIssueLabel(params: {
   github: GitHubRequester;
   repo: string;
@@ -161,6 +180,14 @@ export async function executeIssueLabelOps(params: {
   return await applyIssueLabelOps({
     ops: params.ops,
     io: {
+      addLabels: async (labels) =>
+        await addIssueLabels({
+          github: params.github,
+          repo: params.repo,
+          issueNumber: params.issueNumber,
+          labels,
+          allowNonRalph: params.allowNonRalph,
+        }),
       addLabel: async (label) =>
         await addIssueLabel({
           github: params.github,
@@ -181,6 +208,7 @@ export async function executeIssueLabelOps(params: {
     },
     log: params.log,
     logLabel: params.logLabel ?? `${params.repo}#${params.issueNumber}`,
+    repo: params.repo,
     allowNonRalph: params.allowNonRalph,
     ensureLabels: params.ensureLabels,
     retryMissingLabelOnce: params.retryMissingLabelOnce,
@@ -198,6 +226,17 @@ export async function applyIssueLabelOps(params: ApplyIssueLabelOpsParams): Prom
   const retryMissingLabelOnce = params.retryMissingLabelOnce ?? Boolean(params.ensureLabels);
   let lastEnsureOutcome: EnsureOutcome | null = null;
 
+  if (params.repo && !canAttemptLabelWrite(params.repo)) {
+    return {
+      ok: false,
+      add: added,
+      remove: removed,
+      didRetry: false,
+      kind: "transient",
+      error: new Error("GitHub label writes temporarily blocked"),
+    };
+  }
+
   if (!allowNonRalph) {
     for (const step of params.ops) {
       if (!isRalphLabel(step.label)) {
@@ -213,41 +252,29 @@ export async function applyIssueLabelOps(params: ApplyIssueLabelOpsParams): Prom
     } catch (error) {
       lastEnsureOutcome = { ok: false, kind: "transient", error };
     }
+    if (lastEnsureOutcome && !lastEnsureOutcome.ok && lastEnsureOutcome.kind === "transient" && params.repo) {
+      recordLabelWriteFailure(params.repo, lastEnsureOutcome.error);
+    }
   }
 
   const applyOnce = async (didRetry: boolean): Promise<ApplyIssueLabelOpsResult> => {
-    for (const step of params.ops) {
+    const addSteps = params.ops.filter((step) => step.action === "add");
+    const removeSteps = params.ops.filter((step) => step.action === "remove");
+
+    const addLabels = addSteps.map((step) => step.label);
+    if (addLabels.length > 1 && params.io.addLabels) {
       try {
-        if (step.action === "add") {
-          await params.io.addLabel(step.label);
-          added.push(step.label);
-          applied.push(step);
-        } else {
-          const result = await params.io.removeLabel(step.label);
-          if (result && "removed" in result && !result.removed) {
-            continue;
-          }
-          removed.push(step.label);
+        await params.io.addLabels(addLabels);
+        for (const label of addLabels) {
+          added.push(label);
+        }
+        for (const step of addSteps) {
           applied.push(step);
         }
       } catch (error: any) {
         log(
-          `[ralph:github:labels] Failed to ${step.action} ${step.label} for ${logLabel}: ${
-            error?.message ?? String(error)
-          }`
+          `[ralph:github:labels] Failed to add labels for ${logLabel}: ${error?.message ?? String(error)}`
         );
-        for (const rollback of [...applied].reverse()) {
-          try {
-            if (rollback.action === "add") {
-              await params.io.removeLabel(rollback.label);
-            } else {
-              await params.io.addLabel(rollback.label);
-            }
-          } catch {
-            // best-effort rollback
-          }
-        }
-
         if (!didRetry && retryMissingLabelOnce && isMissingLabelError(error) && params.ensureLabels) {
           if (lastEnsureOutcome && !lastEnsureOutcome.ok && lastEnsureOutcome.kind === "auth") {
             return { ok: false, add: added, remove: removed, didRetry: true, kind: "auth", error: lastEnsureOutcome.error };
@@ -266,17 +293,123 @@ export async function applyIssueLabelOps(params: ApplyIssueLabelOpsParams): Prom
           return await applyOnce(true);
         }
 
+        const kind = classifyLabelOpError(error);
+        if (params.repo && kind === "transient") {
+          recordLabelWriteFailure(params.repo, error);
+        }
         return {
           ok: false,
           add: added,
           remove: removed,
           didRetry,
-          kind: classifyLabelOpError(error),
+          kind,
+          error,
+        };
+      }
+    } else {
+      for (const step of addSteps) {
+        try {
+          await params.io.addLabel(step.label);
+          added.push(step.label);
+          applied.push(step);
+        } catch (error: any) {
+          log(
+            `[ralph:github:labels] Failed to ${step.action} ${step.label} for ${logLabel}: ${
+              error?.message ?? String(error)
+            }`
+          );
+          if (!didRetry && retryMissingLabelOnce && isMissingLabelError(error) && params.ensureLabels) {
+            if (lastEnsureOutcome && !lastEnsureOutcome.ok && lastEnsureOutcome.kind === "auth") {
+              return { ok: false, add: added, remove: removed, didRetry: true, kind: "auth", error: lastEnsureOutcome.error };
+            }
+            lastEnsureOutcome = await params.ensureLabels();
+            if (!lastEnsureOutcome.ok) {
+              return {
+                ok: false,
+                add: added,
+                remove: removed,
+                didRetry: true,
+                kind: lastEnsureOutcome.kind,
+                error: lastEnsureOutcome.error,
+              };
+            }
+            return await applyOnce(true);
+          }
+
+          const kind = classifyLabelOpError(error);
+          if (params.repo && kind === "transient") {
+            recordLabelWriteFailure(params.repo, error);
+          } else if (kind !== "transient") {
+            for (const rollback of [...applied].reverse()) {
+              try {
+                if (rollback.action === "add") {
+                  await params.io.removeLabel(rollback.label);
+                } else {
+                  await params.io.addLabel(rollback.label);
+                }
+              } catch {
+                // best-effort rollback
+              }
+            }
+          }
+
+          return {
+            ok: false,
+            add: added,
+            remove: removed,
+            didRetry,
+            kind,
+            error,
+          };
+        }
+      }
+    }
+
+    for (const step of removeSteps) {
+      try {
+        const result = await params.io.removeLabel(step.label);
+        if (result && "removed" in result && !result.removed) {
+          continue;
+        }
+        removed.push(step.label);
+        applied.push(step);
+      } catch (error: any) {
+        log(
+          `[ralph:github:labels] Failed to ${step.action} ${step.label} for ${logLabel}: ${
+            error?.message ?? String(error)
+          }`
+        );
+        const kind = classifyLabelOpError(error);
+        if (params.repo && kind === "transient") {
+          recordLabelWriteFailure(params.repo, error);
+        } else if (kind !== "transient") {
+          for (const rollback of [...applied].reverse()) {
+            try {
+              if (rollback.action === "add") {
+                await params.io.removeLabel(rollback.label);
+              } else {
+                await params.io.addLabel(rollback.label);
+              }
+            } catch {
+              // best-effort rollback
+            }
+          }
+        }
+
+        return {
+          ok: false,
+          add: added,
+          remove: removed,
+          didRetry,
+          kind,
           error,
         };
       }
     }
 
+    if (params.repo) {
+      recordLabelWriteSuccess(params.repo);
+    }
     return { ok: true, add: added, remove: removed, didRetry };
   };
 

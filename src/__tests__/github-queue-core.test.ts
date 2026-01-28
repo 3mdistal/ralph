@@ -102,6 +102,11 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:blocked"], remove: [] });
   });
 
+  test("statusToRalphLabelDelta adds queued when entering blocked", () => {
+    const delta = statusToRalphLabelDelta("blocked", ["ralph:in-progress"]);
+    expect(delta).toEqual({ add: ["ralph:blocked", "ralph:queued"], remove: ["ralph:in-progress"] });
+  });
+
   test("statusToRalphLabelDelta removes other status labels when blocked", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:queued", "ralph:in-progress"]);
     expect(delta).toEqual({ add: ["ralph:blocked"], remove: ["ralph:in-progress"] });
@@ -182,6 +187,47 @@ describe("github queue core", () => {
     });
 
     expect(recover).toBe(true);
+  });
+
+  test("shouldRecoverStaleInProgress ignores released tasks", () => {
+    const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
+    const ttlMs = 60_000;
+
+    const recover = shouldRecoverStaleInProgress({
+      labels: ["ralph:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 64,
+        taskPath: "github:3mdistal/ralph#64",
+        heartbeatAt: "2026-01-11T00:00:00.000Z",
+        releasedAtMs: Date.parse("2026-01-11T00:05:00.000Z"),
+      },
+      nowMs,
+      ttlMs,
+    });
+
+    expect(recover).toBe(false);
+  });
+
+  test("deriveTaskView treats released tasks as queued", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 290,
+        title: "Released",
+        labels: ["ralph:in-progress"],
+      },
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 290,
+        taskPath: "github:3mdistal/ralph#290",
+        status: "in-progress",
+        releasedAtMs: Date.parse("2026-01-23T00:00:00.000Z"),
+      },
+      nowIso: "2026-01-23T00:10:00.000Z",
+    });
+
+    expect(task.status).toBe("queued");
   });
 });
 

@@ -1,15 +1,25 @@
 import { $ } from "bun";
-import crypto from "crypto";
-import { appendFile } from "fs/promises";
-import { isAbsolute, join } from "path";
-import { createAgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
+import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
+import { sanitizeEscalationText } from "./escalation-consultant/core";
+import { appendConsultantPacket } from "./escalation-consultant/io";
 import type { TaskPriority } from "./queue/priority";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
+import { appendBwrbNoteBody, buildEscalationPayload, buildIdeaPayload, createBwrbNote } from "./bwrb/artifacts";
+import { recordIssueErrorAlert, recordRepoErrorAlert, recordRollupReadyAlert } from "./alerts/service";
+import { parseIssueRef } from "./github/issue-ref";
 
 const sanitizeNoteTitle = sanitizeNoteName;
 
 export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
+
+export type ErrorNotificationContext = {
+  repo?: string | null;
+  issue?: string | null;
+  taskName?: string | null;
+};
+
+type ErrorNotificationInput = ErrorNotificationContext | string | null | undefined;
 
 // Cache for terminal-notifier availability check
 let terminalNotifierAvailable: boolean | null = null;
@@ -91,48 +101,6 @@ function getNotificationPrefix(type: NotificationType): string {
   }
 }
 
-function resolveVaultPath(p: string): string {
-  const vault = getBwrbVaultIfValid();
-  if (!vault) return p;
-  return isAbsolute(p) ? p : join(vault, p);
-}
-
-async function bwrbNewIdea(json: string): Promise<{ success: boolean; path?: string; error?: string }> {
-  const vault = getBwrbVaultForStorage("create notification");
-  if (!vault) {
-    return { success: false, error: "bwrbVault is missing or invalid" };
-  }
-  try {
-    const result = await $`bwrb new idea --json ${json}`.cwd(vault).quiet();
-    return JSON.parse(result.stdout.toString());
-  } catch (e: any) {
-    const stdout = e?.stdout?.toString?.() ?? "";
-    try {
-      return JSON.parse(stdout);
-    } catch {
-      return { success: false, error: e?.message ?? "Unknown error" };
-    }
-  }
-}
-
-async function bwrbNewEscalation(json: string): Promise<{ success: boolean; path?: string; error?: string }> {
-  const vault = getBwrbVaultForStorage("create escalation");
-  if (!vault) {
-    return { success: false, error: "bwrbVault is missing or invalid" };
-  }
-  try {
-    const result = await $`bwrb new agent-escalation --json ${json}`.cwd(vault).quiet();
-    return JSON.parse(result.stdout.toString());
-  } catch (e: any) {
-    const stdout = e?.stdout?.toString?.() ?? "";
-    try {
-      return JSON.parse(stdout);
-    } catch {
-      return { success: false, error: e?.message ?? "Unknown error" };
-    }
-  }
-}
-
 /**
  * Create a notification as a bwrb idea note.
  */
@@ -160,34 +128,35 @@ async function createNotification(
 
   const baseTitle = sanitizeNoteName(`${prefix} ${title}`);
 
-  let output = await bwrbNewIdea(
-    JSON.stringify({
-      name: baseTitle,
-      "creation-date": today,
-      scope: "builder",
-    })
-  );
+  const payload = buildIdeaPayload({
+    name: baseTitle,
+    creationDate: today,
+    scope: "builder",
+  });
 
-  if (!output.success && output.error?.includes("File already exists")) {
-    const suffix = crypto.randomUUID().slice(0, 8);
-    output = await bwrbNewIdea(
-      JSON.stringify({
-        name: `${baseTitle} [${suffix}]`,
-        "creation-date": today,
-        scope: "builder",
-      })
-    );
+  const output = await createBwrbNote({
+    type: "idea",
+    action: "create notification",
+    payload,
+    allowDuplicateSuffix: true,
+  });
+
+  if (!output.ok || !output.path) {
+    const error = output.ok ? "bwrb did not return a note path" : output.error;
+    const log = !output.ok && output.skipped ? console.warn : console.error;
+    log(`[ralph:notify] Failed to create notification: ${error}`);
+    return false;
   }
 
-  if (output.success && output.path) {
-    const notePath = resolveVaultPath(output.path);
-    await appendFile(notePath, noteBody, "utf8");
-    console.log(`[ralph:notify] Created notification: ${baseTitle}`);
-    return true;
+  const bodyResult = await appendBwrbNoteBody({ notePath: output.path, body: noteBody });
+  if (!bodyResult.ok) {
+    const log = bodyResult.skipped ? console.warn : console.error;
+    log(`[ralph:notify] Failed to write notification body: ${bodyResult.error}`);
+    return false;
   }
 
-  console.error(`[ralph:notify] Failed to create notification:`, output.error ?? "Unknown error");
-  return false;
+  console.log(`[ralph:notify] Created notification: ${baseTitle}`);
+  return true;
 }
 
 export interface EscalationContext {
@@ -269,24 +238,7 @@ function extractPlanSummary(output: string): string | null {
 }
 
 function sanitizeDiagnostics(text: string): string {
-  // Strip ANSI escape codes.
-  let out = text.replace(/\x1b\[[0-9;]*m/g, "");
-
-  // Best-effort redaction (keep conservative, avoid overfitting).
-  const patterns: Array<{ re: RegExp; replacement: string }> = [
-    { re: /ghp_[A-Za-z0-9]{20,}/g, replacement: "ghp_[REDACTED]" },
-    { re: /github_pat_[A-Za-z0-9_]{20,}/g, replacement: "github_pat_[REDACTED]" },
-    { re: /sk-[A-Za-z0-9]{20,}/g, replacement: "sk-[REDACTED]" },
-    { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "xox-[REDACTED]" },
-    { re: /(Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
-    { re: /(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
-  ];
-
-  for (const { re, replacement } of patterns) {
-    out = out.replace(re, replacement);
-  }
-
-  return out;
+  return sanitizeEscalationText(text, 20000);
 }
 
 export async function notifyEscalation(ctx: EscalationContext): Promise<boolean> {
@@ -468,44 +420,60 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
 
   // Create the agent-escalation note
   // Use taskFileName (the actual filename) for wikilinks, not taskName (display name)
-  let output = await bwrbNewEscalation(
-    JSON.stringify({
-      name: noteName,
-      task: `[[${resolvedTaskFileName}]]`,
-      "task-path": resolvedTaskPath,
-      issue: ctx.issue,
-      repo: ctx.repo,
-      "session-id": ctx.sessionId ?? "",
-      "escalation-type": ctx.escalationType,
-      status: "pending",
-      "creation-date": today,
-      scope: "builder",
-    })
-  );
+  const escalationPayload = buildEscalationPayload({
+    name: noteName,
+    task: `[[${resolvedTaskFileName}]]`,
+    taskPath: resolvedTaskPath,
+    issue: ctx.issue,
+    repo: ctx.repo,
+    sessionId: ctx.sessionId ?? "",
+    escalationType: ctx.escalationType,
+    status: "pending",
+    creationDate: today,
+    scope: "builder",
+  });
 
-  // Handle duplicate names
-  if (!output.success && output.error?.includes("File already exists")) {
-    const suffix = crypto.randomUUID().slice(0, 8);
-    output = await bwrbNewEscalation(
-      JSON.stringify({
-        name: `${noteName} [${suffix}]`,
-        task: `[[${resolvedTaskFileName}]]`,
-        "task-path": resolvedTaskPath,
-        issue: ctx.issue,
-        repo: ctx.repo,
-        "session-id": ctx.sessionId ?? "",
-        "escalation-type": ctx.escalationType,
-        status: "pending",
-        "creation-date": today,
-        scope: "builder",
-      })
-    );
-  }
+  const output = await createBwrbNote({
+    type: "agent-escalation",
+    action: "create escalation",
+    payload: escalationPayload,
+    allowDuplicateSuffix: true,
+  });
 
-  if (output.success && output.path) {
-    const notePath = resolveVaultPath(output.path);
-    await appendFile(notePath, noteBody, "utf8");
+  if (output.ok && output.path) {
+    const bodyResult = await appendBwrbNoteBody({ notePath: output.path, body: noteBody });
+    if (!bodyResult.ok) {
+      const log = bodyResult.skipped ? console.warn : console.error;
+      log(`[ralph:notify] Failed to write escalation body: ${bodyResult.error}`);
+      return false;
+    }
+
     console.log(`[ralph:notify] Created escalation: ${noteName}`);
+
+    try {
+      await appendConsultantPacket(
+        output.path,
+        {
+          issue: ctx.issue,
+          repo: ctx.repo,
+          taskName: ctx.taskName,
+          taskPath: resolvedTaskPath,
+          escalationType: ctx.escalationType,
+          reason: ctx.reason,
+          sessionId: ctx.sessionId ?? null,
+          githubCommentUrl: ctx.githubCommentUrl ?? null,
+          routing: ctx.routing,
+          devex: ctx.devex,
+          planOutput: ctx.planOutput ?? null,
+          createdAt: today,
+        },
+        {
+          log: (message) => console.log(message),
+        }
+      );
+    } catch (error: any) {
+      console.warn(`[ralph:notify] Failed to append escalation consultant packet: ${error?.message ?? String(error)}`);
+    }
 
     try {
       recordIdempotencyKey({
@@ -533,11 +501,31 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
     return true;
   }
 
-  console.error(`[ralph:notify] Failed to create escalation:`, output.error ?? "Unknown error");
+  const error = output.ok ? "bwrb did not return a note path" : output.error;
+  const log = !output.ok && output.skipped ? console.warn : console.error;
+  log(`[ralph:notify] Failed to create escalation: ${error}`);
   return false;
 }
 
 export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: string[]): Promise<void> {
+  const prNumberMatch = prUrl.match(/\/pull\/(\d+)(?:$|\?)/);
+  const prNumber = prNumberMatch ? Number(prNumberMatch[1]) : null;
+
+  try {
+    await recordRollupReadyAlert({
+      repo,
+      prNumber: prNumber && Number.isFinite(prNumber) ? prNumber : null,
+      prUrl,
+      mergedPRs,
+    });
+  } catch (error: any) {
+    console.warn(`[ralph:notify] Failed to record rollup-ready alert for ${repo}: ${error?.message ?? String(error)}`);
+  }
+
+  if (!prNumber || !Number.isFinite(prNumber)) {
+    console.warn(`[ralph:notify] Unable to parse rollup PR number from ${prUrl}`);
+  }
+
   const body = [
     `A rollup PR is ready for review in **${repo}**.`,
     "",
@@ -550,9 +538,53 @@ export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: 
   ].join("\n");
 
   await createNotification("rollup-ready", `Rollup for ${repo}`, body);
+
+  await sendDesktopNotification({
+    title: "Ralph: Rollup Ready",
+    subtitle: repo,
+    message: `Rollup PR ready: ${prUrl}`.slice(0, 120),
+    openUrl: prUrl,
+    sound: "Ping",
+  });
 }
 
-export async function notifyError(context: string, error: string, taskName?: string): Promise<void> {
+export async function notifyError(context: string, error: string, input?: ErrorNotificationInput): Promise<void> {
+  const normalizedInput: ErrorNotificationContext | undefined =
+    typeof input === "string" ? { taskName: input } : input ?? undefined;
+  const taskName = normalizedInput?.taskName ?? undefined;
+  const issueRaw = normalizedInput?.issue?.trim() ?? "";
+  const issueRef = issueRaw ? parseIssueRef(issueRaw, normalizedInput?.repo ?? "") : null;
+
+  if (issueRef) {
+    try {
+      await recordIssueErrorAlert({
+        repo: issueRef.repo,
+        issueNumber: issueRef.number,
+        taskName: taskName ?? undefined,
+        context,
+        error,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
+      );
+    }
+  } else if (normalizedInput?.repo) {
+    try {
+      recordRepoErrorAlert({
+        repo: normalizedInput.repo,
+        context,
+        error,
+      });
+    } catch (recordError: any) {
+      console.warn(
+        `[ralph:notify] Failed to record repo alert for ${normalizedInput.repo}: ${recordError?.message ?? String(recordError)}`
+      );
+    }
+  } else if (normalizedInput?.issue) {
+    console.warn(`[ralph:notify] Unable to resolve issue ref for alert (issue=${normalizedInput?.issue ?? ""})`);
+  }
+
   const body = [
     `An error occurred during: **${context}**`,
     "",
@@ -567,7 +599,6 @@ export async function notifyError(context: string, error: string, taskName?: str
 
   await createNotification("error", `Error: ${context}`, body, taskName);
 
-  // Send desktop notification
   await sendDesktopNotification({
     title: "Ralph: Error",
     subtitle: taskName ?? "Task Error",

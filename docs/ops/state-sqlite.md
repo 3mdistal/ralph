@@ -2,6 +2,8 @@
 
 `~/.ralph/state.sqlite` is Ralph's internal durable store for operational metadata (sessions, worktrees, cursors).
 
+It also stores deterministic gate state for each run (`ralph_run_gate_results`) and bounded, redacted artifacts (`ralph_run_gate_artifacts`).
+
 ## Migration policy
 
 - Forward-only, additive migrations on startup.

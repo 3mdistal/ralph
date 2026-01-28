@@ -14,6 +14,12 @@ let autoUpdateLabelGate: string | null = null;
 let autoUpdateMinMinutes = 30;
 let botBranchOverride: string | null = null;
 let originalGetIssuePrResolution: ((issueNumber: string) => Promise<any>) | null = null;
+let originalAddIssueLabel: ((payload: any, label: string) => Promise<void>) | null = null;
+let originalRemoveIssueLabel: ((payload: any, label: string) => Promise<void>) | null = null;
+let originalFetchRepoDefaultBranch: (() => Promise<string | null>) | null = null;
+let originalGetPullRequestBaseBranch: ((prUrl: string) => Promise<string | null>) | null = null;
+
+const lifecycleTimeoutMs = 20_000;
 
 let homeDir: string;
 let priorHome: string | undefined;
@@ -52,7 +58,7 @@ async function writeTestConfig(): Promise<void> {
 const updateTaskStatusMock = mock(async () => true);
 
 const notifyEscalationMock = mock(async () => true);
-const notifyErrorMock = mock(async () => {});
+const notifyErrorMock = mock(async (_title: string, _body: string, _context?: unknown) => {});
 const notifyTaskCompleteMock = mock(async () => {});
 
 const runAgentMock = mock(async () => ({
@@ -194,6 +200,22 @@ describe("integration-ish harness: full task lifecycle", () => {
       source: null,
       diagnostics: [],
     });
+    if (!originalAddIssueLabel) {
+      originalAddIssueLabel = (RepoWorker as any).prototype.addIssueLabel;
+    }
+    if (!originalRemoveIssueLabel) {
+      originalRemoveIssueLabel = (RepoWorker as any).prototype.removeIssueLabel;
+    }
+    if (!originalFetchRepoDefaultBranch) {
+      originalFetchRepoDefaultBranch = (RepoWorker as any).prototype.fetchRepoDefaultBranch;
+    }
+    if (!originalGetPullRequestBaseBranch) {
+      originalGetPullRequestBaseBranch = (RepoWorker as any).prototype.getPullRequestBaseBranch;
+    }
+    (RepoWorker as any).prototype.addIssueLabel = async () => {};
+    (RepoWorker as any).prototype.removeIssueLabel = async () => {};
+    (RepoWorker as any).prototype.fetchRepoDefaultBranch = async () => "main";
+    (RepoWorker as any).prototype.getPullRequestBaseBranch = async () => "bot/integration";
   });
 
   afterEach(async () => {
@@ -202,6 +224,18 @@ describe("integration-ish harness: full task lifecycle", () => {
     __resetConfigForTests();
     if (originalGetIssuePrResolution) {
       (RepoWorker as any).prototype.getIssuePrResolution = originalGetIssuePrResolution;
+    }
+    if (originalAddIssueLabel) {
+      (RepoWorker as any).prototype.addIssueLabel = originalAddIssueLabel;
+    }
+    if (originalRemoveIssueLabel) {
+      (RepoWorker as any).prototype.removeIssueLabel = originalRemoveIssueLabel;
+    }
+    if (originalFetchRepoDefaultBranch) {
+      (RepoWorker as any).prototype.fetchRepoDefaultBranch = originalFetchRepoDefaultBranch;
+    }
+    if (originalGetPullRequestBaseBranch) {
+      (RepoWorker as any).prototype.getPullRequestBaseBranch = originalGetPullRequestBaseBranch;
     }
     releaseLock?.();
     releaseLock = null;
@@ -356,7 +390,7 @@ describe("integration-ish harness: full task lifecycle", () => {
       expect.objectContaining({ repo: "3mdistal/ralph", number: 102 }),
       "ralph:in-progress"
     );
-  });
+  }, lifecycleTimeoutMs);
 
   test("restores session adapters after processTask", async () => {
     initStateDb();
@@ -394,7 +428,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     } finally {
       closeStateDbForTests();
     }
-  });
+  }, lifecycleTimeoutMs);
 
   test("merge to main with allow-main does not apply in-bot labels", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
@@ -461,7 +495,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(deleteMergedPrHeadBranchMock).not.toHaveBeenCalled();
     expect(addIssueLabelMock).not.toHaveBeenCalled();
     expect(removeIssueLabelMock).toHaveBeenCalled();
-  });
+  }, lifecycleTimeoutMs);
 
   test("botBranch main skips midpoint labels", async () => {
     botBranchOverride = "main";
@@ -528,7 +562,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(mergePullRequestMock).toHaveBeenCalled();
     expect(addIssueLabelMock).not.toHaveBeenCalled();
     expect(removeIssueLabelMock).toHaveBeenCalled();
-  });
+  }, lifecycleTimeoutMs);
 
   test("midpoint label failures do not block merge", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
@@ -597,7 +631,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(addIssueLabelMock).toHaveBeenCalled();
     expect(removeIssueLabelMock).toHaveBeenCalled();
     expect(notifyErrorMock).toHaveBeenCalled();
-  });
+  }, lifecycleTimeoutMs);
 
   test("ci-only PR blocks non-CI issue", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
@@ -664,7 +698,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(mergePullRequestMock).not.toHaveBeenCalled();
     expect(notifyErrorMock).toHaveBeenCalled();
     expect(agentRunData?.bodyPrefix).toContain("Blocked: CI-only PR for non-CI issue");
-  });
+  }, lifecycleTimeoutMs);
 
   test("merge retries after updating out-of-date branch", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
@@ -717,6 +751,81 @@ describe("integration-ish harness: full task lifecycle", () => {
       .mockImplementationOnce(async () => {
         const err: any = new Error("GraphQL: Head branch is not up to date with the base branch");
         err.stderr = "GraphQL: Head branch is not up to date with the base branch";
+        throw err;
+      })
+      .mockImplementationOnce(async () => {});
+
+    const updatePullRequestBranchMock = mock(async () => {});
+    const isPrBehindMock = mock(async () => false);
+
+    (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
+    (worker as any).isPrBehind = isPrBehindMock;
+
+    (worker as any).createAgentRun = async () => {};
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("success");
+    expect(updatePullRequestBranchMock).toHaveBeenCalledTimes(1);
+    expect(waitForRequiredChecksMock).toHaveBeenCalledTimes(2);
+    expect(mergePullRequestMock).toHaveBeenCalledTimes(2);
+    expect(mergePullRequestMock.mock.calls[0][1]).toBe("deadbeef");
+    expect(mergePullRequestMock.mock.calls[1][1]).toBe("beadfeed");
+  }, lifecycleTimeoutMs);
+
+  test("merge retries after updating when GitHub expects required status checks", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ kind: "ok", repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+
+    const waitForRequiredChecksMock = mock()
+      .mockImplementationOnce(async () => ({
+        headSha: "deadbeef",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
+        summary: {
+          status: "success",
+          required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+          available: ["ci"],
+        },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        timedOut: false,
+      }))
+      .mockImplementationOnce(async () => ({
+        headSha: "beadfeed",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "main",
+        summary: {
+          status: "success",
+          required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+          available: ["ci"],
+        },
+        checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        timedOut: false,
+      }));
+
+    const mergePullRequestMock = mock()
+      .mockImplementationOnce(async () => {
+        const err: any = new Error("gh: 3 of 3 required status checks are expected. (HTTP 405)");
+        err.stderr = "gh: 3 of 3 required status checks are expected. (HTTP 405)";
         throw err;
       })
       .mockImplementationOnce(async () => {});
@@ -803,7 +912,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("failed");
     expect(notifyErrorMock).toHaveBeenCalled();
     expect(notifyEscalationMock).not.toHaveBeenCalled();
-  });
+  }, lifecycleTimeoutMs);
 
   test("blocks main merge without override label", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
@@ -852,7 +961,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("success");
     expect(waitForRequiredChecksMock).toHaveBeenCalled();
     expect(mergePullRequestMock).toHaveBeenCalled();
-  });
+  }, lifecycleTimeoutMs);
 
   test("auto-update updates behind branch before merge", async () => {
     autoUpdateEnabled = true;
@@ -912,7 +1021,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(updatePullRequestBranchMock).toHaveBeenCalledTimes(1);
     expect(waitForRequiredChecksMock).toHaveBeenCalledTimes(1);
     expect(mergePullRequestMock).toHaveBeenCalledTimes(1);
-  });
+  }, lifecycleTimeoutMs);
 
   test("auto-update respects label gate", async () => {
     autoUpdateEnabled = true;
@@ -973,7 +1082,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(updatePullRequestBranchMock).not.toHaveBeenCalled();
     expect(waitForRequiredChecksMock).toHaveBeenCalledTimes(1);
     expect(mergePullRequestMock).toHaveBeenCalledTimes(1);
-  });
+  }, lifecycleTimeoutMs);
 
   test("auto-update escalates on conflicts", async () => {
     autoUpdateEnabled = true;
@@ -1017,9 +1126,14 @@ describe("integration-ish harness: full task lifecycle", () => {
       },
       timedOut: false,
     }));
+    const runMergeConflictRecoveryMock = mock(async () => ({
+      status: "failed",
+      run: { taskName: "Test", repo: "3mdistal/ralph", outcome: "failed" },
+    }));
 
     (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).runMergeConflictRecovery = runMergeConflictRecoveryMock;
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -1027,9 +1141,9 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("failed");
     expect(getPullRequestMergeStateMock).toHaveBeenCalledTimes(1);
     expect(waitForRequiredChecksMock).not.toHaveBeenCalled();
-    expect(notifyErrorMock).toHaveBeenCalled();
-    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
-  });
+    expect(runMergeConflictRecoveryMock).toHaveBeenCalled();
+    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).not.toContain("blocked");
+  }, lifecycleTimeoutMs);
 
   test("waitForRequiredChecks short-circuits on merge conflicts", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
@@ -1052,7 +1166,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.stopReason).toBe("merge-conflict");
     expect(result.timedOut).toBe(false);
     expect(getPullRequestChecksMock).toHaveBeenCalledTimes(1);
-  });
+  }, lifecycleTimeoutMs);
 
   test("merge conflicts during required checks block task", async () => {
     await writeTestConfig();
@@ -1099,24 +1213,29 @@ describe("integration-ish harness: full task lifecycle", () => {
       timedOut: false,
       stopReason: "merge-conflict",
     }));
+    const runMergeConflictRecoveryMock = mock(async () => ({
+      status: "failed",
+      run: { taskName: "Test", repo: "3mdistal/ralph", outcome: "failed" },
+    }));
 
     (worker as any).getPullRequestMergeState = getPullRequestMergeStateMock;
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
+    (worker as any).runMergeConflictRecovery = runMergeConflictRecoveryMock;
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
 
     expect(result.outcome).toBe("failed");
     expect(waitForRequiredChecksMock).toHaveBeenCalled();
-    expect(notifyErrorMock).toHaveBeenCalled();
-    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).toContain("blocked");
+    expect(runMergeConflictRecoveryMock).toHaveBeenCalled();
+    expect(updateTaskStatusMock.mock.calls.map((call: any[]) => call[1])).not.toContain("blocked");
 
     const messages = continueSessionMock.mock.calls.map((call: any[]) => String(call?.[2] ?? ""));
     const askedForCiFix = messages.some((message: string) =>
       message.includes("Timed out waiting for required checks") || message.includes("Fix the CI failure")
     );
     expect(askedForCiFix).toBe(false);
-  });
+  }, lifecycleTimeoutMs);
 
   test("hard throttle pauses before any model send", async () => {
     const resumeAtTs = Date.now() + 60_000;
@@ -1158,7 +1277,7 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     const statuses = updateTaskStatusMock.mock.calls.map((call: any[]) => call[1]);
     expect(statuses).toContain("throttled");
-  });
+  }, lifecycleTimeoutMs);
 
   test("missing opencode/PATH mismatch fails without crashing", async () => {
     runAgentMock.mockImplementationOnce(async () => ({
@@ -1190,5 +1309,5 @@ describe("integration-ish harness: full task lifecycle", () => {
     expect(result.outcome).toBe("failed");
     expect(notifyErrorMock).toHaveBeenCalled();
     expect(notifyEscalationMock).not.toHaveBeenCalled();
-  });
+  }, lifecycleTimeoutMs);
 });

@@ -7,6 +7,7 @@ describe("buildStatusSnapshot", () => {
     const snapshot = buildStatusSnapshot({
       mode: "running",
       queue: { backend: "bwrb", health: "ok", fallback: false, diagnostics: null },
+      daemon: null,
       controlProfile: null,
       activeProfile: null,
       throttle: { state: "ok" },
@@ -49,5 +50,39 @@ describe("buildStatusSnapshot", () => {
     expect(snapshot.blocked[0]?.blockedSource).toBeNull();
     expect(snapshot.blocked[0]?.blockedReason).toBeNull();
     expect(snapshot.blocked[0]?.blockedDetailsSnippet).toBeNull();
+  });
+
+  test("preserves in-progress token fields", () => {
+    const snapshot = buildStatusSnapshot({
+      mode: "running",
+      queue: { backend: "bwrb", health: "ok", fallback: false, diagnostics: null },
+      daemon: null,
+      controlProfile: null,
+      activeProfile: null,
+      throttle: { state: "ok" },
+      escalations: { pending: 0 },
+      inProgress: [
+        {
+          name: "Task C",
+          repo: "3mdistal/ralph",
+          issue: "3mdistal/ralph#3",
+          priority: "p2-medium",
+          opencodeProfile: null,
+          sessionId: null,
+          nowDoing: null,
+          line: null,
+          tokensTotal: 42,
+          tokensComplete: true,
+        },
+      ],
+      starting: [],
+      queued: [],
+      throttled: [],
+      blocked: [],
+      drain: { requestedAt: null, timeoutMs: null, pauseRequested: false, pauseAtCheckpoint: null },
+    });
+
+    expect(snapshot.inProgress[0]?.tokensTotal).toBe(42);
+    expect(snapshot.inProgress[0]?.tokensComplete).toBe(true);
   });
 });

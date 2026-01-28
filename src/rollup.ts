@@ -326,7 +326,7 @@ export class RollupMonitor {
       }
     } catch (e: any) {
       console.error(`[ralph:rollup] Failed to query existing rollup for ${params.repo} (${params.batchId}):`, e);
-      await notifyError(`Querying rollup PR for ${params.repo} (${params.batchId})`, e.message);
+      await notifyError(`Querying rollup PR for ${params.repo} (${params.batchId})`, e.message, { repo: params.repo });
       return { kind: "unknown", error: e?.message ?? String(e) };
     }
 
@@ -345,7 +345,7 @@ export class RollupMonitor {
 
     if (!batch) {
       console.error(`[ralph:rollup] No rollup batch found for ${repo}`);
-      await notifyError(`Creating rollup PR for ${repo}`, "No rollup batch found");
+      await notifyError(`Creating rollup PR for ${repo}`, "No rollup batch found", { repo });
       return null;
     }
 
@@ -367,7 +367,7 @@ export class RollupMonitor {
 
     if (existing.kind === "unknown") {
       console.error(`[ralph:rollup] Unable to verify existing rollup PR for ${repo} (${batch.id}); aborting creation.`);
-      await notifyError(`Creating rollup PR for ${repo} (${batch.id})`, existing.error);
+      await notifyError(`Creating rollup PR for ${repo} (${batch.id})`, existing.error, { repo });
       return null;
     }
 
@@ -439,7 +439,7 @@ export class RollupMonitor {
       return prUrl;
     } catch (e: any) {
       console.error(`[ralph:rollup] Failed to create rollup PR for ${repo} (${batch.id}):`, e);
-      await notifyError(`Creating rollup PR for ${repo} (${batch.id})`, e.message);
+      await notifyError(`Creating rollup PR for ${repo} (${batch.id})`, e.message, { repo });
       return null;
     }
     finally {

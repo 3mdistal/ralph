@@ -5,7 +5,8 @@
   "type": "module",
   "main": "src/index.ts",
   "bin": {
-    "ralph": "src/cli.ts"
+    "ralph": "src/cli.ts",
+    "ralphctl": "src/ralphctl.ts"
   },
   "scripts": {
     "start": "bun run src/index.ts",
@@ -14,6 +15,8 @@
     "usage": "bun run src/index.ts usage",
     "usage:json": "bun run src/index.ts usage --json",
     "watch": "bun run src/index.ts watch",
+    "sandbox:init": "bun run src/index.ts sandbox:init",
+    "sandbox:seed": "bun run src/index.ts sandbox:seed",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json && bun run scripts/copy-managed-templates.ts",

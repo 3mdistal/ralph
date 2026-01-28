@@ -45,7 +45,11 @@ export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: 
   if (!target) return { add: [], remove: [] };
 
   const labelSet = new Set(currentLabels);
-  const add = labelSet.has(target) ? [] : [target];
+  const add: string[] = [];
+  if (!labelSet.has(target)) add.push(target);
+  if (status === "blocked" && !labelSet.has(RALPH_LABEL_QUEUED)) {
+    add.push(RALPH_LABEL_QUEUED);
+  }
   const preserved = new Set(PRESERVE_LABELS_BY_STATUS[status] ?? []);
   const remove = KNOWN_RALPH_LABELS.filter(
     (label) => label !== target && labelSet.has(label) && !preserved.has(label)
@@ -102,6 +106,7 @@ export function shouldRecoverStaleInProgress(params: {
   ttlMs: number;
 }): boolean {
   if (!params.labels.includes("ralph:in-progress")) return false;
+  if (typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs)) return false;
   const heartbeat = params.opState?.heartbeatAt?.trim() ?? "";
   if (!heartbeat) return false;
   const heartbeatMs = Date.parse(heartbeat);
@@ -117,8 +122,9 @@ export function deriveTaskView(params: {
   const issueRef = `${params.issue.repo}#${params.issue.number}`;
   const taskPath = params.opState?.taskPath ?? `github:${issueRef}`;
   const labelStatus = deriveRalphStatus(params.issue.labels, params.issue.state);
-  const opStatus = (params.opState?.status as QueueTaskStatus | null) ?? null;
-  const status = opStatus === "throttled" ? "throttled" : labelStatus ?? opStatus ?? "queued";
+  const released = typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs);
+  const opStatus = released ? "queued" : ((params.opState?.status as QueueTaskStatus | null) ?? null);
+  const status = opStatus ?? labelStatus ?? "queued";
   const creationDate = params.issue.githubUpdatedAt ?? params.nowIso;
   const name = params.issue.title?.trim() ? params.issue.title : `Issue ${params.issue.number}`;
   const priority = inferPriorityFromLabels(params.issue.labels);
