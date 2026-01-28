@@ -3390,7 +3390,12 @@ ${guidance}`
   }): string {
     const base = params.baseRefName || "(unknown)";
     const head = params.headRefName || "(unknown)";
+    const normalizedHead = params.headRefName ? this.normalizeGitRef(params.headRefName) : "";
     const timedOutLine = params.timedOut ? "Timed out waiting for required checks to complete." : "";
+
+    const pushLine = normalizedHead
+      ? `git push origin HEAD:${normalizedHead}`
+      : "# If head ref is unknown, resolve it and push: gh pr view --json headRefName -q .headRefName";
 
     return [
       "CI-debug run for an existing PR with failing required checks.",
@@ -3408,8 +3413,11 @@ ${guidance}`
       "Commands (run in the CI-debug worktree):",
       "```bash",
       "git fetch origin",
-      `gh pr checkout ${params.prUrl}`,
+      `gh pr checkout --detach ${params.prUrl}`,
       "git status",
+      "",
+      "# After making a deterministic fix and committing it:",
+      pushLine,
       "```",
     ]
       .filter(Boolean)
