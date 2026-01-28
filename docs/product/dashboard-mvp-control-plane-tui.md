@@ -257,6 +257,7 @@ A **checkpoint** is a safe boundary where Ralph can pause without corrupting sta
 - `pauseRequested=true` means “stop at the next checkpoint”.
 - When a worker reaches a checkpoint:
   - if pause requested: it emits `worker.pause.reached` and does not proceed until resumed.
+- Operator control (MVP): set `pause_requested=true` in the control file to pause; clear it to resume.
 
 This is the baseline “stepwise pause” and is safe even without OpenCode server APIs.
 
