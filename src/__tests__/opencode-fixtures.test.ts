@@ -8,6 +8,7 @@ import { fileURLToPath } from "url";
 import { runCommand } from "../session";
 import { extractPrUrlFromSession } from "../routing";
 import { computeLiveAnomalyCountFromJsonl } from "../anomaly";
+import { isIntrospectionSummary } from "../introspection/summary";
 
 const fixtureTest = test;
 
@@ -287,5 +288,35 @@ describe("fixture-driven OpenCode JSON stream harness", () => {
     const status = computeLiveAnomalyCountFromJsonl(eventsJsonl, scheduler.now());
     expect(status.total).toBe(50);
     expect(status.recentBurst).toBe(false);
+  });
+
+  fixtureTest("tool-result-echo.jsonl: writes summary and anomaly", async () => {
+    const scheduler = new FakeScheduler(0);
+    const lines = await loadFixtureLines("tool-result-echo.jsonl");
+
+    const testOverrides = {
+      scheduler: scheduler as any,
+      sessionsDir,
+      spawn: spawnFromFixture({ lines, scheduler, closeOnStart: 0 }) as any,
+    };
+
+    const promise = runCommand("/tmp", "plan", [], {}, testOverrides);
+
+    scheduler.advanceBy(0);
+    await promise;
+
+    const eventsPath = join(sessionsDir, "ses_tool_echo", "events.jsonl");
+    const eventsJsonl = await readFile(eventsPath, "utf8");
+    const status = computeLiveAnomalyCountFromJsonl(eventsJsonl, scheduler.now());
+    expect(status.total).toBe(1);
+
+    const summaryPath = join(sessionsDir, "ses_tool_echo", "summary.json");
+    const summaryRaw = await readFile(summaryPath, "utf8");
+    const summary = JSON.parse(summaryRaw);
+    expect(isIntrospectionSummary(summary)).toBe(true);
+    if (!isIntrospectionSummary(summary)) return;
+    expect(summary.toolResultAsTextCount).toBe(1);
+    expect(summary.totalToolCalls).toBe(1);
+    expect(summary.recentTools).toEqual(["bash"]);
   });
 });
