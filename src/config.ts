@@ -8,6 +8,15 @@ import { resolveRequestedOpencodeProfile, type RequestedOpencodeProfile } from "
 export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
 import type { WatchdogConfig } from "./watchdog";
 
+export type AutoQueueScope = "labeled-only" | "all-open";
+
+export type AutoQueueConfig = {
+  enabled: boolean;
+  scope: AutoQueueScope;
+  maxPerTick: number;
+  dryRun: boolean;
+};
+
 export interface RepoConfig {
   name: string;      // "3mdistal/bwrb"
   path: string;      // "/Users/alicemoore/Developer/bwrb"
@@ -30,6 +39,8 @@ export interface RepoConfig {
   concurrencySlots?: number;
   /** Max concurrent tasks for this repo (default: 1). Deprecated: use concurrencySlots. */
   maxWorkers?: number;
+  /** Scheduler priority weighting for this repo (default: 1 when enabled). */
+  schedulerPriority?: number;
   /** PRs before rollup for this repo (defaults to global batchSize) */
   rollupBatchSize?: number;
   /** Enable proactive update-branch when a PR is BEHIND (default: false). */
@@ -38,6 +49,8 @@ export interface RepoConfig {
   autoUpdateBehindLabel?: string;
   /** Minimum minutes between proactive updates per PR (default: 30). */
   autoUpdateBehindMinMinutes?: number;
+  /** Auto-queue configuration (defaults to disabled). */
+  autoQueue?: Partial<AutoQueueConfig>;
 }
 
 
@@ -242,9 +255,14 @@ export interface RalphConfig {
 const DEFAULT_GLOBAL_MAX_WORKERS = 6;
 const DEFAULT_REPO_MAX_WORKERS = 1;
 const DEFAULT_REPO_CONCURRENCY_SLOTS = DEFAULT_REPO_MAX_WORKERS;
+export const DEFAULT_REPO_SCHEDULER_PRIORITY = 1;
+const MIN_REPO_SCHEDULER_PRIORITY = 0.1;
+const MAX_REPO_SCHEDULER_PRIORITY = 10;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
+const DEFAULT_AUTO_QUEUE_SCOPE: AutoQueueScope = "labeled-only";
+const DEFAULT_AUTO_QUEUE_MAX_PER_TICK = 200;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
 const DEFAULT_THROTTLE_OPENAI_SOURCE: "localLogs" | "remoteUsage" = "remoteUsage";
@@ -359,6 +377,12 @@ function toPositiveIntOrNull(value: unknown): number | null {
   return value;
 }
 
+function toFiniteNumberOrNull(value: unknown): number | null {
+  if (typeof value !== "number") return null;
+  if (!Number.isFinite(value)) return null;
+  return value;
+}
+
 function toPositiveIntFromUnknownOrNull(value: unknown): number | null {
   const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   if (!Number.isFinite(n)) return null;
@@ -466,6 +490,8 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
   loaded.repos = (loaded.repos ?? []).map((repo) => {
     const mw = toPositiveIntOrNull((repo as any).maxWorkers);
     const slots = toPositiveIntOrNull((repo as any).concurrencySlots);
+    const schedulerPriorityRaw = (repo as any).schedulerPriority;
+    const schedulerPriority = toFiniteNumberOrNull(schedulerPriorityRaw);
     const rollupBatch = toPositiveIntOrNull((repo as any).rollupBatchSize);
     const autoUpdateMin = toPositiveIntOrNull((repo as any).autoUpdateBehindMinMinutes);
     const updates: Partial<RepoConfig> = {};
@@ -492,6 +518,25 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           `falling back to global batchSize`
       );
       updates.rollupBatchSize = undefined;
+    }
+
+    if ((repo as any).schedulerPriority !== undefined) {
+      if (schedulerPriority === null) {
+        console.warn(
+          `[ralph] Invalid config schedulerPriority for repo ${repo.name}: ${JSON.stringify(schedulerPriorityRaw)}; ` +
+            `defaulting to ${DEFAULT_REPO_SCHEDULER_PRIORITY}`
+        );
+        updates.schedulerPriority = DEFAULT_REPO_SCHEDULER_PRIORITY;
+      } else {
+        const clamped = Math.min(MAX_REPO_SCHEDULER_PRIORITY, Math.max(MIN_REPO_SCHEDULER_PRIORITY, schedulerPriority));
+        if (clamped !== schedulerPriority) {
+          console.warn(
+            `[ralph] Clamped schedulerPriority for repo ${repo.name}: ${schedulerPriority} -> ${clamped} ` +
+              `(range ${MIN_REPO_SCHEDULER_PRIORITY}..${MAX_REPO_SCHEDULER_PRIORITY})`
+          );
+        }
+        updates.schedulerPriority = clamped;
+      }
     }
 
     const rawAutoUpdate = (repo as any).autoUpdateBehindPrs;
@@ -522,6 +567,56 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           `${JSON.stringify((repo as any).autoUpdateBehindMinMinutes)}; falling back to ${DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES}`
       );
       updates.autoUpdateBehindMinMinutes = DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES;
+    }
+
+    const rawAutoQueue = (repo as any).autoQueue;
+    if (rawAutoQueue !== undefined) {
+      if (!rawAutoQueue || typeof rawAutoQueue !== "object" || Array.isArray(rawAutoQueue)) {
+        console.warn(
+          `[ralph] Invalid config autoQueue for repo ${repo.name}: ${JSON.stringify(rawAutoQueue)}; disabling auto-queue.`
+        );
+        updates.autoQueue = {
+          enabled: false,
+          scope: DEFAULT_AUTO_QUEUE_SCOPE,
+          maxPerTick: DEFAULT_AUTO_QUEUE_MAX_PER_TICK,
+          dryRun: false,
+        };
+      } else {
+        const rawEnabled = (rawAutoQueue as any).enabled;
+        const enabled = typeof rawEnabled === "boolean" ? rawEnabled : false;
+        if (rawEnabled !== undefined && typeof rawEnabled !== "boolean") {
+          console.warn(
+            `[ralph] Invalid config autoQueue.enabled for repo ${repo.name}: ${JSON.stringify(rawEnabled)}; defaulting to false`
+          );
+        }
+
+        const rawScope = (rawAutoQueue as any).scope;
+        const scope = rawScope === "all-open" || rawScope === "labeled-only" ? rawScope : DEFAULT_AUTO_QUEUE_SCOPE;
+        if (rawScope !== undefined && scope !== rawScope) {
+          console.warn(
+            `[ralph] Invalid config autoQueue.scope for repo ${repo.name}: ${JSON.stringify(rawScope)}; defaulting to ${DEFAULT_AUTO_QUEUE_SCOPE}`
+          );
+        }
+
+        const rawMax = (rawAutoQueue as any).maxPerTick;
+        const maxPerTick = toPositiveIntFromUnknownOrNull(rawMax) ?? DEFAULT_AUTO_QUEUE_MAX_PER_TICK;
+        if (rawMax !== undefined && maxPerTick !== rawMax) {
+          console.warn(
+            `[ralph] Invalid config autoQueue.maxPerTick for repo ${repo.name}: ${JSON.stringify(rawMax)}; ` +
+              `defaulting to ${DEFAULT_AUTO_QUEUE_MAX_PER_TICK}`
+          );
+        }
+
+        const rawDryRun = (rawAutoQueue as any).dryRun;
+        const dryRun = typeof rawDryRun === "boolean" ? rawDryRun : false;
+        if (rawDryRun !== undefined && typeof rawDryRun !== "boolean") {
+          console.warn(
+            `[ralph] Invalid config autoQueue.dryRun for repo ${repo.name}: ${JSON.stringify(rawDryRun)}; defaulting to false`
+          );
+        }
+
+        updates.autoQueue = { enabled, scope, maxPerTick, dryRun };
+      }
     }
 
     if (Object.keys(updates).length === 0) return repo;
@@ -1451,11 +1546,29 @@ export function getRepoMaxWorkers(repoName: string): number {
   return getRepoConcurrencySlots(repoName);
 }
 
+export function getRepoSchedulerPriority(repoName: string): number | null {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  return typeof explicit?.schedulerPriority === "number" ? explicit.schedulerPriority : null;
+}
+
 export function getRepoRollupBatchSize(repoName: string, fallback?: number): number {
   const cfg = getConfig();
   const explicit = cfg.repos.find((r) => r.name === repoName);
   const rollupBatch = toPositiveIntOrNull(explicit?.rollupBatchSize);
   return rollupBatch ?? fallback ?? cfg.batchSize;
+}
+
+export function getRepoAutoQueueConfig(repoName: string): AutoQueueConfig | null {
+  const cfg = getConfig();
+  const explicit = cfg.repos.find((r) => r.name === repoName);
+  const raw = explicit?.autoQueue;
+  if (!raw) return null;
+  const enabled = raw.enabled ?? false;
+  const scope = raw.scope ?? DEFAULT_AUTO_QUEUE_SCOPE;
+  const maxPerTick = raw.maxPerTick ?? DEFAULT_AUTO_QUEUE_MAX_PER_TICK;
+  const dryRun = raw.dryRun ?? false;
+  return { enabled, scope, maxPerTick, dryRun };
 }
 
 export function isAutoUpdateBehindEnabled(repoName: string): boolean {

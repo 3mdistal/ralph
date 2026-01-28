@@ -211,6 +211,7 @@ export async function syncRepoIssuesOnce(params: {
   botBranch?: string;
   lastSyncAt: string | null;
   persistCursor?: boolean;
+  storeAllOpen?: boolean;
   deps?: SyncDeps;
 }): Promise<SyncResult> {
   const deps = params.deps ?? {};
@@ -272,9 +273,13 @@ export async function syncRepoIssuesOnce(params: {
         const hasRalph = hasRalphLabel(labels);
         if (hasRalph) ralphCount += 1;
 
-        if (!hasRalph && !hasIssueSnapshot(params.repo, issueRef)) continue;
-
         const normalizedState = issue.state ? issue.state.toUpperCase() : undefined;
+        const isClosed = normalizedState === "CLOSED";
+        const shouldStore =
+          hasRalph ||
+          hasIssueSnapshot(params.repo, issueRef) ||
+          (params.storeAllOpen && !isClosed);
+        if (!shouldStore) continue;
 
         recordIssueSnapshot({
           repo: params.repo,
@@ -361,12 +366,15 @@ function startRepoPoller(params: {
     if (stopped) return;
     const lastSyncAt = getRepoGithubIssueLastSyncAt(repoName);
 
+    const autoQueue = (params.repo as any).autoQueue as { enabled?: boolean; scope?: string } | undefined;
+    const storeAllOpen = Boolean(autoQueue?.enabled && autoQueue?.scope === "all-open");
     const result = await syncRepoIssuesOnce({
       repo: repoName,
       repoPath: params.repo.path,
       botBranch: params.repo.botBranch,
       lastSyncAt,
       persistCursor: true,
+      storeAllOpen,
     });
 
     if (result.ok) {
