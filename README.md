@@ -135,6 +135,30 @@ sandbox = {
 }
 ```
 
+### Sandbox repo lifecycle
+
+Sandbox run repos should be explicitly tagged with the `ralph-sandbox` topic before any automated teardown/prune. This is a hard safety invariant: teardown/prune refuses to mutate repos without the marker topic.
+
+Commands (dry-run by default):
+
+```bash
+ralph sandbox tag --apply
+ralph sandbox teardown --repo <owner/repo> --apply
+ralph sandbox prune --apply
+```
+
+Defaults (override via flags or `sandbox.retention`):
+
+- keep last 10 repos
+- keep failed repos (topic `run-failed`) for 14 days
+- default action is archive (reversible); delete requires `--delete --yes`
+
+You can add the failed marker when tagging:
+
+```bash
+ralph sandbox tag --failed --apply
+```
+
 ### Supported settings
 
 - `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
@@ -148,6 +172,9 @@ sandbox = {
   - `githubAuth` (object): dedicated sandbox auth
     - `githubApp` (object): GitHub App installation auth for sandbox runs
     - `tokenEnvVar` (string): env var name for a fine-grained PAT restricted to sandbox repos
+  - `retention` (object, optional): sandbox repo retention defaults
+    - `keepLast` (number): keep last N repos (default: 10)
+    - `keepFailedDays` (number): keep failed repos for N days (default: 14)
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
 - `githubApp` (object, optional): GitHub App installation auth for `gh` + REST (tokens cached in memory)
   - `appId` (number|string)

@@ -73,6 +73,7 @@ import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImp
 import { computeDaemonGate } from "./daemon-gate";
 import { runStatusCommand } from "./commands/status";
 import { runWorktreesCommand } from "./commands/worktrees";
+import { runSandboxCommand } from "./commands/sandbox";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 
@@ -1502,6 +1503,7 @@ function printGlobalHelp(): void {
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "",
@@ -1603,6 +1605,17 @@ function printCommandHelp(command: string): void {
           "  ralph rollup <repo>",
           "",
           "Rollup helpers. (Currently prints guidance; rollup is typically done via gh.)",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox <tag|teardown|prune> [options]",
+          "",
+          "Sandbox repo lifecycle helpers.",
         ].join("\n")
       );
       return;
@@ -2032,6 +2045,16 @@ if (args[0] === "worktrees") {
   }
 
   await runWorktreesCommand(args);
+  process.exit(0);
+}
+
+if (args[0] === "sandbox") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox");
+    process.exit(0);
+  }
+
+  await runSandboxCommand(args);
   process.exit(0);
 }
 

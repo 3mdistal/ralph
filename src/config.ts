@@ -155,6 +155,13 @@ export interface SandboxGithubAuthConfig {
   tokenEnvVar?: string;
 }
 
+export interface SandboxRetentionConfig {
+  /** Keep the last N sandbox run repos (default: 10). */
+  keepLast?: number;
+  /** Keep failed sandbox run repos for N days (default: 14). */
+  keepFailedDays?: number;
+}
+
 export interface SandboxProfileConfig {
   /** Allowed repo owners for sandbox runs (non-empty). */
   allowedOwners: string[];
@@ -162,6 +169,8 @@ export interface SandboxProfileConfig {
   repoNamePrefix: string;
   /** Dedicated GitHub auth for sandbox runs. */
   githubAuth: SandboxGithubAuthConfig;
+  /** Optional retention policy for sandbox run repos. */
+  retention?: SandboxRetentionConfig;
 }
 
 export interface DashboardConfig {
@@ -228,6 +237,8 @@ const DEFAULT_THROTTLE_MIN_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_THROTTLE_BUDGET_5H_TOKENS = 16_987_015;
 const DEFAULT_THROTTLE_BUDGET_WEEKLY_TOKENS = 55_769_305;
 const DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS = 14;
+const DEFAULT_SANDBOX_KEEP_LAST = 10;
+const DEFAULT_SANDBOX_KEEP_FAILED_DAYS = 14;
 
 function detectDefaultBwrbVault(): string {
   const start = process.cwd();
@@ -584,6 +595,35 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       }
     }
 
+    let retention: SandboxRetentionConfig | undefined;
+    const rawRetention = (rawSandbox as any).retention;
+    if (rawRetention !== undefined) {
+      if (!rawRetention || typeof rawRetention !== "object" || Array.isArray(rawRetention)) {
+        console.warn(`[ralph] Invalid config sandbox.retention=${JSON.stringify(rawRetention)}; ignoring`);
+      } else {
+        const keepLast = toNonNegativeIntOrNull((rawRetention as any).keepLast);
+        const keepFailedDays = toNonNegativeIntOrNull((rawRetention as any).keepFailedDays);
+        if ((rawRetention as any).keepLast !== undefined && keepLast === null) {
+          console.warn(
+            `[ralph] Invalid config sandbox.retention.keepLast=${JSON.stringify((rawRetention as any).keepLast)}; ignoring`
+          );
+        }
+        if ((rawRetention as any).keepFailedDays !== undefined && keepFailedDays === null) {
+          console.warn(
+            `[ralph] Invalid config sandbox.retention.keepFailedDays=${JSON.stringify(
+              (rawRetention as any).keepFailedDays
+            )}; ignoring`
+          );
+        }
+        if (keepLast !== null || keepFailedDays !== null) {
+          retention = {
+            ...(keepLast !== null ? { keepLast } : {}),
+            ...(keepFailedDays !== null ? { keepFailedDays } : {}),
+          };
+        }
+      }
+    }
+
     loaded.sandbox = {
       allowedOwners,
       repoNamePrefix,
@@ -591,6 +631,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
         ...(hasValidApp ? { githubApp: rawSandboxApp } : {}),
         ...(tokenEnvVar ? { tokenEnvVar } : {}),
       },
+      ...(retention ? { retention } : {}),
     };
   }
 
@@ -1275,6 +1316,13 @@ export function getDashboardEventsRetentionDays(): number {
   const raw = cfg.dashboard?.eventsRetentionDays;
   const parsed = toPositiveIntOrNull(raw);
   return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
+}
+
+export function getSandboxRetentionPolicy(): { keepLast: number; keepFailedDays: number } {
+  const sandbox = getSandboxProfileConfig();
+  const keepLast = toNonNegativeIntOrNull(sandbox?.retention?.keepLast) ?? DEFAULT_SANDBOX_KEEP_LAST;
+  const keepFailedDays = toNonNegativeIntOrNull(sandbox?.retention?.keepFailedDays) ?? DEFAULT_SANDBOX_KEEP_FAILED_DAYS;
+  return { keepLast, keepFailedDays };
 }
 
 export function getRepoConcurrencySlots(repoName: string): number {
