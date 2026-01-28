@@ -108,6 +108,8 @@ Recommended MVP `workerId`:
 
 - Require `Authorization: Bearer <token>` for all endpoints.
 - WebSocket auth supports `Authorization` header, `Sec-WebSocket-Protocol: ralph.bearer.<token>`, or `?access_token=` query param.
+- For WebSocket auth, if multiple tokens are provided, the connection is accepted if **any** presented token matches.
+- If `Sec-WebSocket-Protocol` is used for auth, the server echoes the same protocol on successful connection.
 - Token is configured in `~/.ralph/config.toml` or `~/.ralph/config.json` under `dashboard.controlPlane.token`, or via `RALPH_DASHBOARD_TOKEN`.
 - Control plane server only starts when explicitly enabled and a token is present.
 - Default bind: `127.0.0.1` (non-loopback binds require `dashboard.controlPlane.allowRemote = true`).
@@ -199,8 +201,42 @@ Dashboard events are distinct from OpenCode session `events.jsonl` streams; the 
   - `error` (structured; includes stack/message)
 
 Notes:
-- Control plane output is redacted for obvious tokens/paths.
+- Control plane output is redacted for obvious tokens/paths (applies to `/v1/state` and `/v1/events`).
 - `log.opencode.event` is **not streamed by default**; enable explicitly with `dashboard.controlPlane.exposeRawOpencodeEvents`.
+
+### /v1/events replay (MVP contract)
+
+- Query param: `replayLast` (integer)
+  - Default: `dashboard.controlPlane.replayLastDefault` (default 50).
+  - Clamped to `0..dashboard.controlPlane.replayLastMax` (default 250).
+  - Non-numeric values fall back to the default.
+- Query param: `access_token` (string, optional) for WebSocket auth.
+
+### /v1/state schema (MVP contract)
+
+`/v1/state` returns a JSON object with the following required top-level keys:
+
+```json
+{
+  "mode": "running|paused|draining|soft-throttled|hard-throttled",
+  "queue": { "backend": "...", "health": "...", "fallback": false, "diagnostics": null },
+  "controlProfile": null,
+  "activeProfile": null,
+  "throttle": {},
+  "usage": { "profiles": [] },
+  "escalations": { "pending": 0 },
+  "inProgress": [],
+  "starting": [],
+  "queued": [],
+  "throttled": [],
+  "blocked": [],
+  "drain": { "requestedAt": null, "timeoutMs": null, "pauseRequested": false, "pauseAtCheckpoint": null }
+}
+```
+
+Contract notes:
+- `/v1/state` is additive-only within the `/v1` surface: new fields may be added, but existing fields will not be removed or change type in v1.
+- Arrays contain task objects for each state (see `src/status-snapshot.ts` for the internal shapes; treat them as *extensible*).
 
 ## Checkpoints (Stepwise Pause)
 

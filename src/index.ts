@@ -79,6 +79,7 @@ import { runWorktreesCommand } from "./commands/worktrees";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 import { isLoopbackHost, startControlPlaneServer, type ControlPlaneServer } from "./dashboard/control-plane-server";
+import { toControlPlaneStateV1 } from "./dashboard/control-plane-state";
 import { buildProvisionPlan } from "./sandbox/provisioning-core";
 import {
   applySeedFromSpec,
@@ -1239,7 +1240,8 @@ async function main(): Promise<void> {
     } else {
       controlPlaneServer = startControlPlaneServer({
         bus: ralphEventBus,
-        getStateSnapshot: () => collectStatusSnapshot({ drain: getDrainSnapshotState(), initStateDb: false }),
+        getStateSnapshot: async () =>
+          toControlPlaneStateV1(await collectStatusSnapshot({ drain: getDrainSnapshotState(), initStateDb: false })),
         token: controlPlaneConfig.token,
         host: controlPlaneConfig.host,
         port: controlPlaneConfig.port,

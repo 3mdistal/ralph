@@ -26,6 +26,11 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 - Canonical spec: `docs/product/dashboard-mvp-control-plane-tui.md`
 - Issue map: https://github.com/3mdistal/ralph/issues/22 (MVP epic) and https://github.com/3mdistal/ralph/issues/23 (docs/scope)
 
+Control plane API (MVP):
+
+- `GET /v1/state` (requires `Authorization: Bearer <token>`)
+- `WS /v1/events` with auth via `Authorization` header, `Sec-WebSocket-Protocol: ralph.bearer.<token>`, or `?access_token=`
+
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.0.0

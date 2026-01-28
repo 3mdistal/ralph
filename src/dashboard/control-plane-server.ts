@@ -1,9 +1,17 @@
-import { timingSafeEqual } from "crypto";
 import type { ServerWebSocket } from "bun";
 
-import { buildRalphEvent, safeJsonStringifyRalphEvent, type RalphEvent } from "./events";
+import { buildRalphEvent } from "./events";
 import { type RalphEventBus } from "./event-bus";
-import { redactSensitiveText } from "../redaction";
+import {
+  matchAnyToken,
+  parseBearerToken,
+  parseProtocolToken,
+  parseQueryToken,
+  parseReplayLast,
+  serializeEvent,
+  serializeStateSnapshot,
+  tokensMatch,
+} from "./control-plane-core";
 
 export type ControlPlaneStateProvider<TSnapshot> = () => Promise<TSnapshot>;
 
@@ -32,8 +40,6 @@ type WebSocketData = {
 };
 
 const LOG_PREFIX = "[ralph:control-plane]";
-const AUTH_PREFIX = "Bearer ";
-const WS_PROTOCOL_PREFIX = "ralph.bearer.";
 
 export function isLoopbackHost(host: string): boolean {
   const normalized = host.trim().toLowerCase();
@@ -46,56 +52,14 @@ function jsonResponse(status: number, body: unknown, extraHeaders?: HeadersInit)
   return new Response(JSON.stringify(body), { status, headers });
 }
 
+function jsonResponseRaw(status: number, body: string, extraHeaders?: HeadersInit): Response {
+  const headers = new Headers(extraHeaders);
+  headers.set("Content-Type", "application/json");
+  return new Response(body, { status, headers });
+}
+
 function jsonError(status: number, code: string, message: string, extraHeaders?: HeadersInit): Response {
   return jsonResponse(status, { error: { code, message } }, extraHeaders);
-}
-
-function parseBearerToken(header: string | null): string | null {
-  if (!header) return null;
-  if (!header.toLowerCase().startsWith(AUTH_PREFIX.toLowerCase())) return null;
-  const token = header.slice(AUTH_PREFIX.length).trim();
-  return token ? token : null;
-}
-
-function parseProtocolToken(header: string | null): { token: string | null; protocol: string | null } {
-  if (!header) return { token: null, protocol: null };
-  const protocols = header.split(",").map((entry) => entry.trim()).filter(Boolean);
-  for (const protocol of protocols) {
-    if (protocol.startsWith(WS_PROTOCOL_PREFIX)) {
-      const token = protocol.slice(WS_PROTOCOL_PREFIX.length).trim();
-      if (token) return { token, protocol };
-    }
-  }
-  return { token: null, protocol: null };
-}
-
-function parseQueryToken(url: URL): string | null {
-  const token = url.searchParams.get("access_token")?.trim();
-  return token ? token : null;
-}
-
-function tokensMatch(expected: string, provided: string | null): boolean {
-  if (!provided) return false;
-  if (provided.length !== expected.length) return false;
-  const encoder = new TextEncoder();
-  const expectedBuf = encoder.encode(expected);
-  const providedBuf = encoder.encode(provided);
-  return timingSafeEqual(expectedBuf, providedBuf);
-}
-
-function parseReplayLast(raw: string | null, fallback: number, max: number): number {
-  if (!raw) return Math.min(Math.max(0, fallback), max);
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return Math.min(Math.max(0, fallback), max);
-  const value = Math.floor(parsed);
-  if (value < 0) return 0;
-  return Math.min(value, max);
-}
-
-function serializeEvent(event: RalphEvent, exposeRawOpencodeEvents: boolean): string | null {
-  if (!exposeRawOpencodeEvents && event.type === "log.opencode.event") return null;
-  const json = safeJsonStringifyRalphEvent(event);
-  return redactSensitiveText(json);
 }
 
 function publishInternalError(bus: RalphEventBus, message: string): void {
@@ -130,8 +94,14 @@ export function startControlPlaneServer<TSnapshot>(
           const { token: protocolToken, protocol } = parseProtocolToken(protocolHeader);
           const queryToken = parseQueryToken(url);
 
-          const providedToken = headerToken ?? protocolToken ?? queryToken;
-          if (!tokensMatch(token, providedToken)) {
+          const auth = matchAnyToken({
+            expected: token,
+            headerToken,
+            protocolToken,
+            protocol,
+            queryToken,
+          });
+          if (!auth.authorized) {
             return jsonError(
               401,
               "unauthorized",
@@ -146,7 +116,7 @@ export function startControlPlaneServer<TSnapshot>(
               replayLast,
               exposeRawOpencodeEvents: options.exposeRawOpencodeEvents ?? false,
             },
-            headers: protocol ? { "Sec-WebSocket-Protocol": protocol } : undefined,
+            headers: auth.protocol ? { "Sec-WebSocket-Protocol": auth.protocol } : undefined,
           });
 
           if (upgraded) return;
@@ -162,7 +132,7 @@ export function startControlPlaneServer<TSnapshot>(
 
           return options
             .getStateSnapshot()
-            .then((snapshot) => jsonResponse(200, snapshot))
+            .then((snapshot) => jsonResponseRaw(200, serializeStateSnapshot(snapshot)))
             .catch((error: any) => {
               const message = error?.message ?? String(error);
               console.warn(`${LOG_PREFIX} Failed to build state snapshot: ${message}`);
@@ -204,6 +174,9 @@ export function startControlPlaneServer<TSnapshot>(
         }, { replayLast });
         ws.data = { ...data, unsubscribe };
       },
+      message() {
+        // Control plane is server-push only.
+      },
       close(ws: ServerWebSocket<WebSocketData>) {
         ws.data.unsubscribe?.();
       },
@@ -212,8 +185,8 @@ export function startControlPlaneServer<TSnapshot>(
 
   return {
     host: options.host,
-    port: server.port,
-    url: `http://${options.host}:${server.port}`,
+    port: server.port ?? options.port,
+    url: `http://${options.host}:${server.port ?? options.port}`,
     stop: () => {
       server.stop(true);
     },

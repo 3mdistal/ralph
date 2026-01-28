@@ -84,6 +84,30 @@ describe("control plane server", () => {
     }
   });
 
+  test("redacts state snapshots", async () => {
+    const bus = new RalphEventBus();
+    const snapshot = createSnapshot();
+    snapshot.queue.diagnostics = "ghp_1234567890123456789012345";
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => snapshot,
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+    });
+
+    try {
+      const response = await fetch(`${server.url}/v1/state`, {
+        headers: { Authorization: "Bearer secret" },
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body.queue.diagnostics).toBe("ghp_[REDACTED]");
+    } finally {
+      server.stop();
+    }
+  });
+
   test("streams events with replay", async () => {
     const bus = new RalphEventBus({ bufferSize: 5 });
     const server = startControlPlaneServer({
@@ -162,6 +186,37 @@ describe("control plane server", () => {
       });
 
       expect(seen.includes("log.opencode.event")).toBe(false);
+      ws.close();
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("streams raw opencode events when enabled", async () => {
+    const bus = new RalphEventBus({ bufferSize: 5 });
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      exposeRawOpencodeEvents: true,
+    });
+
+    try {
+      const ws = new WebSocket(`${server.url.replace("http", "ws")}/v1/events?access_token=secret`);
+      await waitFor<void>("ws open", (resolve, reject) => {
+        ws.addEventListener("open", () => resolve());
+        ws.addEventListener("error", () => reject(new Error("ws error")));
+      });
+
+      const message = await waitFor<string>("ws message", (resolve) => {
+        ws.addEventListener("message", (event) => resolve(String(event.data)), { once: true });
+        bus.publish(buildRalphEvent({ type: "log.opencode.event", level: "info", data: { event: { secret: "x" } } }));
+      });
+      const parsed = JSON.parse(message);
+      expect(parsed.type).toBe("log.opencode.event");
+
       ws.close();
     } finally {
       server.stop();
