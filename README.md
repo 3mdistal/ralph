@@ -26,6 +26,11 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 - Canonical spec: `docs/product/dashboard-mvp-control-plane-tui.md`
 - Issue map: https://github.com/3mdistal/ralph/issues/22 (MVP epic) and https://github.com/3mdistal/ralph/issues/23 (docs/scope)
 
+Control plane API (MVP):
+
+- `GET /v1/state` (requires `Authorization: Bearer <token>`)
+- `WS /v1/events` with auth via `Authorization` header, `Sec-WebSocket-Protocol: ralph.bearer.<token>`, or `?access_token=`
+
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.0.0
@@ -240,6 +245,15 @@ ralph sandbox tag --failed --apply
   - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
 - `dashboard` (object, optional): control plane event persistence
   - `eventsRetentionDays` (number): days to keep `~/.ralph/events/YYYY-MM-DD.jsonl` logs (default: 14; UTC bucketing; cleanup on daemon startup)
+  - `controlPlane` (object, optional): local control plane server
+    - `enabled` (boolean): start the control plane server (default: false)
+    - `host` (string): bind host (default: `127.0.0.1`)
+    - `port` (number): bind port (default: `8787`)
+    - `token` (string): Bearer token required for all endpoints (server will not start without it)
+    - `allowRemote` (boolean): allow binding to non-loopback hosts (default: false)
+    - `exposeRawOpencodeEvents` (boolean): stream `log.opencode.event` payloads (default: false)
+    - `replayLastDefault` (number): default replay count for `/v1/events` (default: 50)
+    - `replayLastMax` (number): max replay count for `/v1/events` (default: 250)
 
 Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derives required checks from GitHub branch protection on `bot/integration` (or `repos[].botBranch`), falling back to the repository default branch (usually `main`). If branch protection is missing or unreadable, Ralph does not gate merges. Ralph considers both check runs and legacy status contexts when matching available check names. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
@@ -271,6 +285,12 @@ Only these env vars are currently supported (unless noted otherwise):
 | Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
 | Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
 | CI remediation attempts | `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` | `2` |
+| Control plane enabled | `RALPH_DASHBOARD_ENABLED` | `false` |
+| Control plane host | `RALPH_DASHBOARD_HOST` | `127.0.0.1` |
+| Control plane port | `RALPH_DASHBOARD_PORT` | `8787` |
+| Control plane token | `RALPH_DASHBOARD_TOKEN` | (none) |
+| Control plane replay default | `RALPH_DASHBOARD_REPLAY_DEFAULT` | `50` |
+| Control plane replay max | `RALPH_DASHBOARD_REPLAY_MAX` | `250` |
 
 Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 

@@ -15,6 +15,7 @@ import {
   ensureBwrbVaultLayout,
   getConfig,
   getDashboardEventsRetentionDays,
+  getDashboardControlPlaneConfig,
   getOpencodeDefaultProfileName,
   getRequestedOpencodeProfileName,
   listOpencodeProfileNames,
@@ -81,13 +82,15 @@ import {
 } from "./escalation-resume";
 import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 import { computeDaemonGate } from "./daemon-gate";
-import { runStatusCommand } from "./commands/status";
+import { collectStatusSnapshot, runStatusCommand, type StatusDrainState } from "./commands/status";
 import { runWorktreesCommand } from "./commands/worktrees";
 import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { createEscalationConsultantScheduler } from "./escalation-consultant/scheduler";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
+import { isLoopbackHost, startControlPlaneServer, type ControlPlaneServer } from "./dashboard/control-plane-server";
+import { toControlPlaneStateV1 } from "./dashboard/control-plane-state";
 import { buildProvisionPlan } from "./sandbox/provisioning-core";
 import {
   applySeedFromSpec,
@@ -110,6 +113,7 @@ let drainMonitor: DrainMonitor | null = null;
 let drainRequestedAt: number | null = null;
 let drainTimeoutMs: number | null = null;
 let dashboardEventPersistence: DashboardEventPersistence | null = null;
+let controlPlaneServer: ControlPlaneServer | null = null;
 let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
@@ -138,6 +142,15 @@ const idleState = new Map<
 function getDaemonMode(defaults?: Partial<ControlConfig>): DaemonMode {
   if (drainMonitor) return drainMonitor.getMode();
   return readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).mode;
+}
+
+function getDrainSnapshotState(): StatusDrainState {
+  return {
+    requestedAt: drainRequestedAt,
+    timeoutMs: drainTimeoutMs,
+    pauseRequested: pauseRequestedByControl,
+    pauseAtCheckpoint,
+  };
 }
 
 function applyControlState(control: {
@@ -1332,6 +1345,31 @@ async function main(): Promise<void> {
     scheduleQueuedTasksSoon,
   });
 
+  const controlPlaneConfig = getDashboardControlPlaneConfig();
+  if (controlPlaneConfig.enabled) {
+    if (!controlPlaneConfig.token) {
+      console.warn(`${"[ralph:control-plane]"} Enabled but no token configured; skipping startup`);
+    } else if (!controlPlaneConfig.allowRemote && !isLoopbackHost(controlPlaneConfig.host)) {
+      console.warn(
+        `${"[ralph:control-plane]"} Host ${controlPlaneConfig.host} is not loopback. ` +
+          `Set dashboard.controlPlane.allowRemote=true to override.`
+      );
+    } else {
+      controlPlaneServer = startControlPlaneServer({
+        bus: ralphEventBus,
+        getStateSnapshot: async () =>
+          toControlPlaneStateV1(await collectStatusSnapshot({ drain: getDrainSnapshotState(), initStateDb: false })),
+        token: controlPlaneConfig.token,
+        host: controlPlaneConfig.host,
+        port: controlPlaneConfig.port,
+        exposeRawOpencodeEvents: controlPlaneConfig.exposeRawOpencodeEvents,
+        replayLastDefault: controlPlaneConfig.replayLastDefault,
+        replayLastMax: controlPlaneConfig.replayLastMax,
+      });
+      console.log(`${"[ralph:control-plane]"} Listening on ${controlPlaneServer.url}`);
+    }
+  }
+
   githubIssuePollers = startGitHubIssuePollers({
     repos: config.repos,
     baseIntervalMs: config.pollInterval,
@@ -1598,6 +1636,7 @@ async function main(): Promise<void> {
     clearInterval(heartbeatTimer);
     clearInterval(idleRollupTimer);
     clearInterval(throttleResumeTimer);
+    controlPlaneServer?.stop();
     
     // Terminate in-flight OpenCode runs spawned by Ralph.
     const termination = await terminateOpencodeRuns({ graceMs: 5000 });

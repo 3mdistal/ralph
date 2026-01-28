@@ -29,12 +29,27 @@ const STATUS_TOKEN_TIMEOUT_MS = 5_000;
 const STATUS_TOKEN_CONCURRENCY = 3;
 const STATUS_TOKEN_BUDGET_MS = 4_000;
 
-type StatusDrainState = {
+export type StatusDrainState = {
   requestedAt: number | null;
   timeoutMs: number | null;
   pauseRequested: boolean;
   pauseAtCheckpoint: string | null;
 };
+
+export async function collectStatusSnapshot(opts: { drain: StatusDrainState; initStateDb?: boolean }): Promise<StatusSnapshot> {
+  const snapshot = await getStatusSnapshot();
+
+  // Allow callers to override drain info (e.g. derived from CLI flags).
+  return buildStatusSnapshot({
+    ...snapshot,
+    drain: {
+      requestedAt: opts.drain.requestedAt ? new Date(opts.drain.requestedAt).toISOString() : null,
+      timeoutMs: opts.drain.timeoutMs ?? null,
+      pauseRequested: opts.drain.pauseRequested,
+      pauseAtCheckpoint: opts.drain.pauseAtCheckpoint,
+    },
+  });
+}
 
 export async function getStatusSnapshot(): Promise<StatusSnapshot> {
   const config = getConfig();

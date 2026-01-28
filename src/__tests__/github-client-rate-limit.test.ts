@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { GitHubApiError, GitHubClient } from "../github/client";
 
@@ -13,6 +13,16 @@ async function withPatchedNow<T>(nowMs: number, fn: () => Promise<T> | T): Promi
 }
 
 describe("GitHubClient rate limit handling", () => {
+  let priorFetch: typeof fetch | undefined;
+
+  beforeEach(() => {
+    priorFetch = globalThis.fetch;
+  });
+
+  afterEach(() => {
+    if (priorFetch) globalThis.fetch = priorFetch;
+  });
+
   test("classifies 403 API rate limit exceeded as rate_limit and backs off until reset", async () => {
     await withPatchedNow(1_000_000, async () => {
       let call = 0;
