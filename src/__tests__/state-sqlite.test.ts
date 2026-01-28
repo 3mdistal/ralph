@@ -478,8 +478,8 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       (artifact) => artifact.gate === "ci" && artifact.kind === "failure_excerpt"
     );
     expect(artifacts).toHaveLength(10);
-    expect(artifacts.some((artifact) => artifact.content.includes("artifact-0"))).toBe(false);
-    expect(artifacts.some((artifact) => artifact.content.includes("artifact-1"))).toBe(false);
+    expect(artifacts.some((artifact) => artifact.content === "artifact-0")).toBe(false);
+    expect(artifacts.some((artifact) => artifact.content === "artifact-1")).toBe(false);
     expect(artifacts.some((artifact) => artifact.content.includes("artifact-11"))).toBe(true);
   });
 
