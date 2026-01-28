@@ -1655,11 +1655,11 @@ export class RepoWorker {
       fetchBaseBranch: async (prUrl) => this.getPullRequestBaseBranch(prUrl),
       addIssueLabel: async (issue, label) => this.addIssueLabel(issue, label),
       removeIssueLabel: async (issue, label) => this.removeIssueLabel(issue, label),
-      notifyError: async (title, body, taskName) =>
+      notifyError: async (title, body, context) =>
         this.notify.notifyError(title, body, {
-          taskName: taskName ?? undefined,
-          repo: params.task.repo,
-          issue: params.task.issue,
+          taskName: context?.taskName ?? params.task.name,
+          repo: context?.repo ?? params.task.repo,
+          issue: context?.issue ?? params.task.issue,
         }),
       warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
     });
