@@ -58,12 +58,21 @@ export interface WatchdogTimeoutInfo {
   recentEvents?: string[];
 }
 
+export interface StallTimeoutInfo {
+  kind: "stall-timeout";
+  idleMs: number;
+  lastActivityMsAgo: number;
+  context?: string;
+  recentEvents?: string[];
+}
+
 export interface SessionResult {
   sessionId: string;
   output: string;
   success: boolean;
   exitCode?: number;
   watchdogTimeout?: WatchdogTimeoutInfo;
+  stallTimeout?: StallTimeoutInfo;
   /** Best-effort PR URL discovered from structured JSON events. */
   prUrl?: string;
   errorCode?: "context_length_exceeded";
@@ -937,6 +946,10 @@ async function runSession(
   const recentEventLimit = options?.watchdog?.recentEventLimit ?? 50;
   const context = options?.watchdog?.context;
 
+  const stallEnabled = options?.stall?.enabled ?? false;
+  const stallIdleMs = options?.stall?.idleMs ?? 5 * 60_000;
+  const stallContext = options?.stall?.context ?? context;
+
   let stdout = "";
   let stderr = "";
 
@@ -1060,6 +1073,8 @@ async function runSession(
   let buffer = "";
   let recentEvents: string[] = [];
 
+  let lastActivityTs = scheduler.now();
+
   let lastSoftLogTs = 0;
 
   let inFlight:
@@ -1073,8 +1088,10 @@ async function runSession(
     | null = null;
 
   let watchdogTimeout: WatchdogTimeoutInfo | undefined;
+  let stallTimeout: StallTimeoutInfo | undefined;
 
   proc.stdout?.on("data", (data: Buffer) => {
+    lastActivityTs = scheduler.now();
     writeRunLog(data);
 
     const chunk = data.toString();
@@ -1192,9 +1209,35 @@ async function runSession(
   });
 
   proc.stderr?.on("data", (data: Buffer) => {
+    lastActivityTs = scheduler.now();
     writeRunLog(data);
     stderr += data.toString();
   });
+
+  let stallInterval: ReturnType<typeof setInterval> | undefined;
+  if (stallEnabled && stallIdleMs > 0) {
+    stallInterval = scheduler.setInterval(() => {
+      if (stallTimeout) return;
+      const now = scheduler.now();
+      const idleFor = now - lastActivityTs;
+      if (idleFor < stallIdleMs) return;
+
+      stallTimeout = {
+        kind: "stall-timeout",
+        idleMs: stallIdleMs,
+        lastActivityMsAgo: idleFor,
+        context: stallContext ?? undefined,
+        recentEvents,
+      };
+
+      const ctx = stallContext ? ` ${stallContext}` : "";
+      console.warn(
+        `[ralph:stall] Hard timeout${ctx}: no stdout/stderr activity for ${Math.round(idleFor / 1000)}s; killing opencode process`
+      );
+
+      requestKill();
+    }, 1000);
+  }
 
   let watchdogInterval: ReturnType<typeof setInterval> | undefined;
   if (watchdogEnabled) {
@@ -1251,17 +1294,53 @@ async function runSession(
     proc.on("error", (err) => {
       if (timeout) scheduler.clearTimeout(timeout);
       if (watchdogInterval) scheduler.clearInterval(watchdogInterval);
+      if (stallInterval) scheduler.clearInterval(stallInterval);
       reject(err);
     });
 
     proc.on("close", (code) => {
       if (timeout) scheduler.clearTimeout(timeout);
       if (watchdogInterval) scheduler.clearInterval(watchdogInterval);
+      if (stallInterval) scheduler.clearInterval(stallInterval);
       resolve(code ?? 0);
     });
   });
 
   await closeRunLogStream();
+
+  if (stallTimeout) {
+    const header = [
+      `Run stalled: no stdout/stderr activity for ${Math.round(stallTimeout.lastActivityMsAgo / 1000)}s (idleMs=${Math.round(
+        stallTimeout.idleMs / 1000
+      )}s)`,
+      stallTimeout.context ? `Context: ${stallTimeout.context}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const recent = stallTimeout.recentEvents?.length
+      ? ["Recent OpenCode events (bounded):", ...stallTimeout.recentEvents.map((l) => `- ${l}`)].join("\n")
+      : "";
+
+    const combined = [header, recent].filter(Boolean).join("\n\n");
+    const enriched = await appendOpencodeLogTail(combined);
+
+    if (sessionId) {
+      ensureEventStream(sessionId);
+      writeEvent({ type: "run-end", ts: scheduler.now(), success: false, exitCode, stallTimeout: true });
+      try {
+        await closeEventStream();
+      } catch {
+        // ignore
+      }
+    }
+
+    if (sessionId) {
+      await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
+    }
+
+    return { sessionId, output: enriched, success: false, exitCode, stallTimeout, prUrl: prUrlFromEvents ?? undefined };
+  }
 
   if (watchdogTimeout) {
     const header = [
@@ -1394,6 +1473,12 @@ export type RunSessionOptionsBase = {
     thresholdsMs?: Partial<WatchdogThresholdsMs>;
     softLogIntervalMs?: number;
     recentEventLimit?: number;
+    context?: string;
+  };
+  stall?: {
+    enabled?: boolean;
+    /** Kill the run if there is no stdout/stderr activity for this long. */
+    idleMs?: number;
     context?: string;
   };
   onEvent?: (event: any) => void;
