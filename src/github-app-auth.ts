@@ -127,8 +127,69 @@ const EXPIRY_SKEW_MS = 60_000;
 const tokenCache = new Map<string, InstallationTokenCache>();
 const inFlightToken = new Map<string, Promise<InstallationTokenCache>>();
 
+type AppSlugCache = {
+  slug: string;
+  expiresAtMs: number;
+};
+
+const APP_SLUG_TTL_MS = 10 * 60_000;
+const appSlugCache = new Map<string, AppSlugCache>();
+const inFlightAppSlug = new Map<string, Promise<AppSlugCache>>();
+
 function buildTokenCacheKey(profile: RalphProfile, app: GitHubAppConfig): string {
   return `${profile}:${app.appId}:${app.installationId}:${app.privateKeyPath}`;
+}
+
+async function fetchAuthenticatedAppSlug(params: { appId: number; privateKeyPath: string }): Promise<string> {
+  const jwt = await mintAppJwt({ appId: params.appId, privateKeyPath: params.privateKeyPath });
+  const url = "https://api.github.com/app";
+  const result = await fetchJson<{ slug?: string | null }>(deps.fetch, url, {
+    method: "GET",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${jwt}`,
+      "User-Agent": "ralph-loop",
+    },
+  });
+  if (!result.ok) {
+    throw new GitHubAuthError(
+      `Failed to fetch GitHub App metadata (HTTP ${result.status}). ${result.body ? `Body: ${result.body.slice(0, 400)}` : ""}`.trim()
+    );
+  }
+  const slug = typeof result.data?.slug === "string" ? result.data.slug.trim() : "";
+  if (!slug) throw new GitHubAuthError("GitHub App metadata missing slug");
+  return slug;
+}
+
+export async function __testOnlyFetchAuthenticatedAppSlug(params: { appId: number; privateKeyPath: string }): Promise<string> {
+  return fetchAuthenticatedAppSlug(params);
+}
+
+export async function getConfiguredGitHubAppSlug(profile: RalphProfile = getProfile()): Promise<string | null> {
+  const cfg = getConfig();
+  const app = getGitHubAppConfigForProfile(profile, cfg);
+  if (!app) return null;
+
+  const cacheKey = `${profile}:${app.appId}:${app.privateKeyPath}`;
+  const cached = appSlugCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && cached.expiresAtMs > now) return cached.slug;
+
+  if (!inFlightAppSlug.has(cacheKey)) {
+    const promise = fetchAuthenticatedAppSlug({ appId: app.appId, privateKeyPath: app.privateKeyPath })
+      .then((slug) => {
+        const entry: AppSlugCache = { slug, expiresAtMs: Date.now() + APP_SLUG_TTL_MS };
+        appSlugCache.set(cacheKey, entry);
+        return entry;
+      })
+      .finally(() => {
+        inFlightAppSlug.delete(cacheKey);
+      });
+    inFlightAppSlug.set(cacheKey, promise);
+  }
+
+  const fresh = await inFlightAppSlug.get(cacheKey)!;
+  return fresh.slug;
 }
 
 

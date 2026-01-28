@@ -5,8 +5,9 @@ import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
 import { isSafeSessionId } from "./session-id";
+import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 11;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -17,6 +18,45 @@ export type RalphRunDetails = {
   escalationType?: string;
   prUrl?: string;
   watchdogTimeout?: boolean;
+};
+
+export type AlertRecord = {
+  id: number;
+  repo: string;
+  targetType: AlertTargetType;
+  targetNumber: number;
+  kind: AlertKind;
+  fingerprint: string;
+  summary: string;
+  details: string | null;
+  count: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+};
+
+export type AlertDeliveryStatus = "success" | "skipped" | "failed";
+
+export type AlertDeliveryRecord = {
+  alertId: number;
+  channel: string;
+  markerId: string;
+  targetType: AlertTargetType;
+  targetNumber: number;
+  status: AlertDeliveryStatus;
+  commentId: number | null;
+  commentUrl: string | null;
+  attempts: number;
+  lastAttemptAt: string;
+  lastError: string | null;
+};
+
+export type IssueAlertSummary = {
+  repo: string;
+  issueNumber: number;
+  totalCount: number;
+  latestSummary: string | null;
+  latestAt: string | null;
+  latestCommentUrl: string | null;
 };
 export const PR_STATE_OPEN: PrState = "open";
 export const PR_STATE_MERGED: PrState = "merged";
@@ -144,6 +184,8 @@ function ensureSchema(database: Database): void {
             "issue_id INTEGER PRIMARY KEY, " +
             "last_checked_at TEXT NOT NULL, " +
             "last_seen_updated_at TEXT, " +
+            "last_resolved_comment_id INTEGER, " +
+            "last_resolved_comment_at TEXT, " +
             "FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE" +
             ")"
         );
@@ -181,6 +223,56 @@ function ensureSchema(database: Database): void {
           CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started
             ON ralph_runs(repo_id, issue_number, started_at);
         `);
+      }
+      if (existingVersion < 10) {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_id INTEGER NOT NULL,
+            target_type TEXT NOT NULL,
+            target_number INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            details TEXT,
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+            UNIQUE(repo_id, target_type, target_number, kind, fingerprint)
+          );
+          CREATE TABLE IF NOT EXISTS alert_deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER NOT NULL,
+            channel TEXT NOT NULL,
+            marker_id TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_number INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            comment_url TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at TEXT NOT NULL,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE,
+            UNIQUE(alert_id, channel, marker_id)
+          );
+          CREATE INDEX IF NOT EXISTS idx_alerts_repo_target ON alerts(repo_id, target_type, target_number, last_seen_at);
+          CREATE INDEX IF NOT EXISTS idx_alert_deliveries_alert_channel ON alert_deliveries(alert_id, channel);
+          CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
+        `);
+        try {
+          database.exec("ALTER TABLE issue_escalation_comment_checks ADD COLUMN last_resolved_comment_id INTEGER");
+        } catch {}
+        try {
+          database.exec("ALTER TABLE issue_escalation_comment_checks ADD COLUMN last_resolved_comment_at TEXT");
+        } catch {}
+      }
+      if (existingVersion < 11) {
+        database.exec("ALTER TABLE alert_deliveries ADD COLUMN comment_id INTEGER");
       }
     })();
   }
@@ -227,6 +319,8 @@ function ensureSchema(database: Database): void {
       issue_id INTEGER PRIMARY KEY,
       last_checked_at TEXT NOT NULL,
       last_seen_updated_at TEXT,
+      last_resolved_comment_id INTEGER,
+      last_resolved_comment_at TEXT,
       FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
 
@@ -347,6 +441,43 @@ function ensureSchema(database: Database): void {
       FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS alerts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      target_type TEXT NOT NULL,
+      target_number INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      fingerprint TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      details TEXT,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+      UNIQUE(repo_id, target_type, target_number, kind, fingerprint)
+    );
+
+    CREATE TABLE IF NOT EXISTS alert_deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      alert_id INTEGER NOT NULL,
+      channel TEXT NOT NULL,
+      marker_id TEXT NOT NULL,
+      target_type TEXT NOT NULL,
+      target_number INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      comment_id INTEGER,
+      comment_url TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE,
+      UNIQUE(alert_id, channel, marker_id)
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -358,6 +489,9 @@ function ensureSchema(database: Database): void {
     CREATE INDEX IF NOT EXISTS idx_rollup_batch_prs_batch ON rollup_batch_prs(batch_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_run_sessions_session_id ON ralph_run_sessions(session_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started ON ralph_runs(repo_id, issue_number, started_at);
+    CREATE INDEX IF NOT EXISTS idx_alerts_repo_target ON alerts(repo_id, target_type, target_number, last_seen_at);
+    CREATE INDEX IF NOT EXISTS idx_alert_deliveries_alert_channel ON alert_deliveries(alert_id, channel);
+    CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
   `);
 }
 
@@ -517,6 +651,310 @@ export function recordRepoGithubDoneReconcileCursor(params: {
       $last_pr_number: params.lastPrNumber,
       $updated_at: at,
     });
+}
+
+export function recordAlertOccurrence(params: {
+  repo: string;
+  targetType: AlertTargetType;
+  targetNumber: number;
+  kind: AlertKind;
+  fingerprint: string;
+  summary: string;
+  details?: string | null;
+  at?: string;
+}): AlertRecord {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+
+  database
+    .query(
+      `INSERT INTO alerts(
+         repo_id,
+         target_type,
+         target_number,
+         kind,
+         fingerprint,
+         summary,
+         details,
+         first_seen_at,
+         last_seen_at,
+         count,
+         created_at,
+         updated_at
+       ) VALUES (
+         $repo_id,
+         $target_type,
+         $target_number,
+         $kind,
+         $fingerprint,
+         $summary,
+         $details,
+         $first_seen_at,
+         $last_seen_at,
+         1,
+         $created_at,
+         $updated_at
+       )
+       ON CONFLICT(repo_id, target_type, target_number, kind, fingerprint)
+       DO UPDATE SET
+         summary = excluded.summary,
+         details = excluded.details,
+         last_seen_at = excluded.last_seen_at,
+         count = alerts.count + 1,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $target_type: params.targetType,
+      $target_number: params.targetNumber,
+      $kind: params.kind,
+      $fingerprint: params.fingerprint,
+      $summary: params.summary,
+      $details: params.details ?? null,
+      $first_seen_at: at,
+      $last_seen_at: at,
+      $created_at: at,
+      $updated_at: at,
+    });
+
+  const row = database
+    .query(
+      `SELECT id, summary, details, count, first_seen_at, last_seen_at
+       FROM alerts
+       WHERE repo_id = $repo_id AND target_type = $target_type AND target_number = $target_number
+         AND kind = $kind AND fingerprint = $fingerprint`
+    )
+    .get({
+      $repo_id: repoId,
+      $target_type: params.targetType,
+      $target_number: params.targetNumber,
+      $kind: params.kind,
+      $fingerprint: params.fingerprint,
+    }) as {
+    id?: number;
+    summary?: string;
+    details?: string | null;
+    count?: number;
+    first_seen_at?: string;
+    last_seen_at?: string;
+  } | undefined;
+
+  if (!row?.id) {
+    throw new Error(`Failed to record alert for ${params.repo} ${params.targetType} ${params.targetNumber}`);
+  }
+
+  return {
+    id: row.id,
+    repo: params.repo,
+    targetType: params.targetType,
+    targetNumber: params.targetNumber,
+    kind: params.kind,
+    fingerprint: params.fingerprint,
+    summary: row.summary ?? params.summary,
+    details: row.details ?? null,
+    count: typeof row.count === "number" ? row.count : 1,
+    firstSeenAt: row.first_seen_at ?? at,
+    lastSeenAt: row.last_seen_at ?? at,
+  };
+}
+
+export function getAlertDelivery(params: {
+  alertId: number;
+  channel: string;
+  markerId: string;
+}): AlertDeliveryRecord | null {
+  const database = requireDb();
+  const row = database
+    .query(
+       `SELECT alert_id, channel, marker_id, target_type, target_number, status, comment_id, comment_url, attempts, last_attempt_at, last_error
+        FROM alert_deliveries
+        WHERE alert_id = $alert_id AND channel = $channel AND marker_id = $marker_id`
+    )
+    .get({
+      $alert_id: params.alertId,
+      $channel: params.channel,
+      $marker_id: params.markerId,
+    }) as {
+    alert_id?: number;
+    channel?: string;
+    marker_id?: string;
+    target_type?: AlertTargetType;
+    target_number?: number;
+    status?: AlertDeliveryStatus;
+    comment_id?: number | null;
+    comment_url?: string | null;
+    attempts?: number;
+    last_attempt_at?: string;
+    last_error?: string | null;
+  } | undefined;
+
+  if (!row?.alert_id) return null;
+  return {
+    alertId: row.alert_id,
+    channel: row.channel ?? params.channel,
+    markerId: row.marker_id ?? params.markerId,
+    targetType: row.target_type ?? "issue",
+    targetNumber: typeof row.target_number === "number" ? row.target_number : 0,
+    status: (row.status as AlertDeliveryStatus) ?? "failed",
+    commentId: typeof row.comment_id === "number" ? row.comment_id : null,
+    commentUrl: row.comment_url ?? null,
+    attempts: typeof row.attempts === "number" ? row.attempts : 0,
+    lastAttemptAt: row.last_attempt_at ?? "",
+    lastError: row.last_error ?? null,
+  };
+}
+
+export function recordAlertDeliveryAttempt(params: {
+  alertId: number;
+  channel: string;
+  markerId: string;
+  targetType: AlertTargetType;
+  targetNumber: number;
+  status: AlertDeliveryStatus;
+  commentId?: number | null;
+  commentUrl?: string | null;
+  error?: string | null;
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+
+  database
+    .query(
+      `INSERT INTO alert_deliveries(
+         alert_id,
+         channel,
+         marker_id,
+         target_type,
+         target_number,
+         status,
+         comment_id,
+         comment_url,
+         attempts,
+         last_attempt_at,
+         last_error,
+         created_at,
+         updated_at
+       ) VALUES (
+         $alert_id,
+         $channel,
+         $marker_id,
+         $target_type,
+         $target_number,
+         $status,
+         $comment_id,
+         $comment_url,
+         1,
+         $last_attempt_at,
+         $last_error,
+         $created_at,
+         $updated_at
+       )
+       ON CONFLICT(alert_id, channel, marker_id)
+       DO UPDATE SET
+         status = excluded.status,
+         comment_id = COALESCE(excluded.comment_id, alert_deliveries.comment_id),
+         comment_url = COALESCE(excluded.comment_url, alert_deliveries.comment_url),
+         attempts = alert_deliveries.attempts + 1,
+         last_attempt_at = excluded.last_attempt_at,
+         last_error = excluded.last_error,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $alert_id: params.alertId,
+      $channel: params.channel,
+      $marker_id: params.markerId,
+      $target_type: params.targetType,
+      $target_number: params.targetNumber,
+      $status: params.status,
+       $comment_id: params.commentId ?? null,
+       $comment_url: params.commentUrl ?? null,
+      $last_attempt_at: at,
+      $last_error: params.error ?? null,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function listIssueAlertSummaries(params: { repo: string; issueNumbers: number[] }): IssueAlertSummary[] {
+  const database = requireDb();
+  if (params.issueNumbers.length === 0) return [];
+
+  const repoRow = database
+    .query("SELECT id FROM repos WHERE name = $name")
+    .get({ $name: params.repo }) as { id?: number } | undefined;
+  const repoId = repoRow?.id;
+  if (!repoId) return [];
+
+  const placeholders = params.issueNumbers.map((_, idx) => `$issue${idx}`);
+  const values: Record<string, number> = { $repo_id: repoId };
+  params.issueNumbers.forEach((num, idx) => {
+    values[`$issue${idx}`] = num;
+  });
+
+  const rows = database
+    .query(
+      `WITH issue_list(issue_number) AS (VALUES ${placeholders.map((p) => `(${p})`).join(", ")})
+       SELECT
+         issue_list.issue_number as issue_number,
+         COALESCE(SUM(a.count), 0) as total_count,
+         (
+           SELECT a2.summary FROM alerts a2
+           WHERE a2.repo_id = $repo_id
+             AND a2.target_type = 'issue'
+             AND a2.target_number = issue_list.issue_number
+             AND a2.kind = 'error'
+           ORDER BY a2.last_seen_at DESC
+           LIMIT 1
+         ) as latest_summary,
+         (
+           SELECT a2.last_seen_at FROM alerts a2
+           WHERE a2.repo_id = $repo_id
+             AND a2.target_type = 'issue'
+             AND a2.target_number = issue_list.issue_number
+             AND a2.kind = 'error'
+           ORDER BY a2.last_seen_at DESC
+           LIMIT 1
+         ) as latest_at,
+         (
+           SELECT d.comment_url FROM alert_deliveries d
+           JOIN alerts a3 ON a3.id = d.alert_id
+           WHERE a3.repo_id = $repo_id
+             AND a3.target_type = 'issue'
+             AND a3.target_number = issue_list.issue_number
+             AND a3.kind = 'error'
+             AND d.channel = 'github-issue-comment'
+             AND d.status = 'success'
+           ORDER BY d.updated_at DESC
+           LIMIT 1
+         ) as latest_comment_url
+       FROM issue_list
+       LEFT JOIN alerts a
+         ON a.repo_id = $repo_id
+         AND a.target_type = 'issue'
+         AND a.target_number = issue_list.issue_number
+         AND a.kind = 'error'
+       GROUP BY issue_list.issue_number`
+    )
+    .all(values) as Array<{
+    issue_number?: number;
+    total_count?: number;
+    latest_summary?: string | null;
+    latest_at?: string | null;
+    latest_comment_url?: string | null;
+  }>;
+
+  return rows
+    .map((row) => ({
+      repo: params.repo,
+      issueNumber: typeof row.issue_number === "number" ? row.issue_number : 0,
+      totalCount: typeof row.total_count === "number" ? row.total_count : 0,
+      latestSummary: row.latest_summary ?? null,
+      latestAt: row.latest_at ?? null,
+      latestCommentUrl: row.latest_comment_url ?? null,
+    }))
+    .filter((row) => row.issueNumber > 0);
 }
 
 export function hasIssueSnapshot(repo: string, issue: string): boolean {
@@ -1053,6 +1491,8 @@ export function getIssueSnapshotByNumber(repo: string, issueNumber: number): Iss
 export type EscalationCommentCheckState = {
   lastCheckedAt: string | null;
   lastSeenUpdatedAt: string | null;
+  lastResolvedCommentId: number | null;
+  lastResolvedCommentAt: string | null;
 };
 
 export function getEscalationCommentCheckState(
@@ -1062,20 +1502,30 @@ export function getEscalationCommentCheckState(
   const database = requireDb();
   const row = database
     .query(
-      `SELECT ecc.last_checked_at as last_checked_at, ecc.last_seen_updated_at as last_seen_updated_at
+      `SELECT ecc.last_checked_at as last_checked_at,
+              ecc.last_seen_updated_at as last_seen_updated_at,
+              ecc.last_resolved_comment_id as last_resolved_comment_id,
+              ecc.last_resolved_comment_at as last_resolved_comment_at
        FROM issue_escalation_comment_checks ecc
        JOIN issues i ON i.id = ecc.issue_id
        JOIN repos r ON r.id = i.repo_id
        WHERE r.name = $name AND i.number = $number`
     )
     .get({ $name: repo, $number: issueNumber }) as
-    | { last_checked_at?: string | null; last_seen_updated_at?: string | null }
+    | {
+        last_checked_at?: string | null;
+        last_seen_updated_at?: string | null;
+        last_resolved_comment_id?: number | null;
+        last_resolved_comment_at?: string | null;
+      }
     | undefined;
 
   if (!row) return null;
   return {
     lastCheckedAt: row.last_checked_at ?? null,
     lastSeenUpdatedAt: row.last_seen_updated_at ?? null,
+    lastResolvedCommentId: row.last_resolved_comment_id ?? null,
+    lastResolvedCommentAt: row.last_resolved_comment_at ?? null,
   };
 }
 
@@ -1084,6 +1534,8 @@ export function recordEscalationCommentCheckState(params: {
   issueNumber: number;
   lastCheckedAt: string;
   lastSeenUpdatedAt?: string | null;
+  lastResolvedCommentId?: number | null;
+  lastResolvedCommentAt?: string | null;
 }): void {
   const database = requireDb();
   const issueRow = database
@@ -1097,18 +1549,46 @@ export function recordEscalationCommentCheckState(params: {
 
   if (!issueRow?.id) return;
 
+  const existing = database
+    .query(
+      `SELECT last_resolved_comment_id as last_resolved_comment_id,
+              last_resolved_comment_at as last_resolved_comment_at
+       FROM issue_escalation_comment_checks
+       WHERE issue_id = $issue_id`
+    )
+    .get({ $issue_id: issueRow.id }) as
+    | { last_resolved_comment_id?: number | null; last_resolved_comment_at?: string | null }
+    | undefined;
+
+  const lastResolvedCommentId =
+    params.lastResolvedCommentId !== undefined
+      ? params.lastResolvedCommentId
+      : (existing?.last_resolved_comment_id ?? null);
+  const lastResolvedCommentAt =
+    params.lastResolvedCommentAt !== undefined ? params.lastResolvedCommentAt : (existing?.last_resolved_comment_at ?? null);
+
   database
     .query(
-      `INSERT INTO issue_escalation_comment_checks(issue_id, last_checked_at, last_seen_updated_at)
-       VALUES ($issue_id, $last_checked_at, $last_seen_updated_at)
+      `INSERT INTO issue_escalation_comment_checks(
+         issue_id,
+         last_checked_at,
+         last_seen_updated_at,
+         last_resolved_comment_id,
+         last_resolved_comment_at
+       )
+       VALUES ($issue_id, $last_checked_at, $last_seen_updated_at, $last_resolved_comment_id, $last_resolved_comment_at)
        ON CONFLICT(issue_id) DO UPDATE SET
-         last_checked_at = excluded.last_checked_at,
-         last_seen_updated_at = excluded.last_seen_updated_at`
+          last_checked_at = excluded.last_checked_at,
+          last_seen_updated_at = excluded.last_seen_updated_at,
+          last_resolved_comment_id = excluded.last_resolved_comment_id,
+          last_resolved_comment_at = excluded.last_resolved_comment_at`
     )
     .run({
       $issue_id: issueRow.id,
       $last_checked_at: params.lastCheckedAt,
       $last_seen_updated_at: params.lastSeenUpdatedAt ?? null,
+      $last_resolved_comment_id: lastResolvedCommentId,
+      $last_resolved_comment_at: lastResolvedCommentAt,
     });
 }
 
