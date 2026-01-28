@@ -1262,6 +1262,24 @@ export function recordRalphRunSessionUse(params: {
     });
 }
 
+export function getLatestRunIdForSession(sessionId: string): string | null {
+  const sid = sessionId?.trim();
+  if (!sid) return null;
+
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT run_id as run_id
+       FROM ralph_run_sessions
+       WHERE session_id = $session_id
+       ORDER BY last_seen_at DESC
+       LIMIT 1`
+    )
+    .get({ $session_id: sid }) as { run_id?: string } | undefined;
+
+  return typeof row?.run_id === "string" && row.run_id ? row.run_id : null;
+}
+
 export function completeRalphRun(params: {
   runId: string;
   outcome: RalphRunOutcome;
