@@ -184,6 +184,8 @@ function ensureSchema(database: Database): void {
             "issue_id INTEGER PRIMARY KEY, " +
             "last_checked_at TEXT NOT NULL, " +
             "last_seen_updated_at TEXT, " +
+            "last_resolved_comment_id INTEGER, " +
+            "last_resolved_comment_at TEXT, " +
             "FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE" +
             ")"
         );
@@ -262,6 +264,12 @@ function ensureSchema(database: Database): void {
           CREATE INDEX IF NOT EXISTS idx_alert_deliveries_alert_channel ON alert_deliveries(alert_id, channel);
           CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
         `);
+        try {
+          database.exec("ALTER TABLE issue_escalation_comment_checks ADD COLUMN last_resolved_comment_id INTEGER");
+        } catch {}
+        try {
+          database.exec("ALTER TABLE issue_escalation_comment_checks ADD COLUMN last_resolved_comment_at TEXT");
+        } catch {}
       }
       if (existingVersion < 11) {
         database.exec("ALTER TABLE alert_deliveries ADD COLUMN comment_id INTEGER");
@@ -311,6 +319,8 @@ function ensureSchema(database: Database): void {
       issue_id INTEGER PRIMARY KEY,
       last_checked_at TEXT NOT NULL,
       last_seen_updated_at TEXT,
+      last_resolved_comment_id INTEGER,
+      last_resolved_comment_at TEXT,
       FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
 
@@ -1481,6 +1491,8 @@ export function getIssueSnapshotByNumber(repo: string, issueNumber: number): Iss
 export type EscalationCommentCheckState = {
   lastCheckedAt: string | null;
   lastSeenUpdatedAt: string | null;
+  lastResolvedCommentId: number | null;
+  lastResolvedCommentAt: string | null;
 };
 
 export function getEscalationCommentCheckState(
@@ -1490,20 +1502,30 @@ export function getEscalationCommentCheckState(
   const database = requireDb();
   const row = database
     .query(
-      `SELECT ecc.last_checked_at as last_checked_at, ecc.last_seen_updated_at as last_seen_updated_at
+      `SELECT ecc.last_checked_at as last_checked_at,
+              ecc.last_seen_updated_at as last_seen_updated_at,
+              ecc.last_resolved_comment_id as last_resolved_comment_id,
+              ecc.last_resolved_comment_at as last_resolved_comment_at
        FROM issue_escalation_comment_checks ecc
        JOIN issues i ON i.id = ecc.issue_id
        JOIN repos r ON r.id = i.repo_id
        WHERE r.name = $name AND i.number = $number`
     )
     .get({ $name: repo, $number: issueNumber }) as
-    | { last_checked_at?: string | null; last_seen_updated_at?: string | null }
+    | {
+        last_checked_at?: string | null;
+        last_seen_updated_at?: string | null;
+        last_resolved_comment_id?: number | null;
+        last_resolved_comment_at?: string | null;
+      }
     | undefined;
 
   if (!row) return null;
   return {
     lastCheckedAt: row.last_checked_at ?? null,
     lastSeenUpdatedAt: row.last_seen_updated_at ?? null,
+    lastResolvedCommentId: row.last_resolved_comment_id ?? null,
+    lastResolvedCommentAt: row.last_resolved_comment_at ?? null,
   };
 }
 
@@ -1512,6 +1534,8 @@ export function recordEscalationCommentCheckState(params: {
   issueNumber: number;
   lastCheckedAt: string;
   lastSeenUpdatedAt?: string | null;
+  lastResolvedCommentId?: number | null;
+  lastResolvedCommentAt?: string | null;
 }): void {
   const database = requireDb();
   const issueRow = database
@@ -1525,18 +1549,46 @@ export function recordEscalationCommentCheckState(params: {
 
   if (!issueRow?.id) return;
 
+  const existing = database
+    .query(
+      `SELECT last_resolved_comment_id as last_resolved_comment_id,
+              last_resolved_comment_at as last_resolved_comment_at
+       FROM issue_escalation_comment_checks
+       WHERE issue_id = $issue_id`
+    )
+    .get({ $issue_id: issueRow.id }) as
+    | { last_resolved_comment_id?: number | null; last_resolved_comment_at?: string | null }
+    | undefined;
+
+  const lastResolvedCommentId =
+    params.lastResolvedCommentId !== undefined
+      ? params.lastResolvedCommentId
+      : (existing?.last_resolved_comment_id ?? null);
+  const lastResolvedCommentAt =
+    params.lastResolvedCommentAt !== undefined ? params.lastResolvedCommentAt : (existing?.last_resolved_comment_at ?? null);
+
   database
     .query(
-      `INSERT INTO issue_escalation_comment_checks(issue_id, last_checked_at, last_seen_updated_at)
-       VALUES ($issue_id, $last_checked_at, $last_seen_updated_at)
+      `INSERT INTO issue_escalation_comment_checks(
+         issue_id,
+         last_checked_at,
+         last_seen_updated_at,
+         last_resolved_comment_id,
+         last_resolved_comment_at
+       )
+       VALUES ($issue_id, $last_checked_at, $last_seen_updated_at, $last_resolved_comment_id, $last_resolved_comment_at)
        ON CONFLICT(issue_id) DO UPDATE SET
-         last_checked_at = excluded.last_checked_at,
-         last_seen_updated_at = excluded.last_seen_updated_at`
+          last_checked_at = excluded.last_checked_at,
+          last_seen_updated_at = excluded.last_seen_updated_at,
+          last_resolved_comment_id = excluded.last_resolved_comment_id,
+          last_resolved_comment_at = excluded.last_resolved_comment_at`
     )
     .run({
       $issue_id: issueRow.id,
       $last_checked_at: params.lastCheckedAt,
       $last_seen_updated_at: params.lastSeenUpdatedAt ?? null,
+      $last_resolved_comment_id: lastResolvedCommentId,
+      $last_resolved_comment_at: lastResolvedCommentAt,
     });
 }
 
