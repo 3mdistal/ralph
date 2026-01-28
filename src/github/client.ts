@@ -49,6 +49,17 @@ type ClientOptions = {
   sleepMs?: (ms: number) => Promise<void>;
 };
 
+function fnv1a32(input: string): string {
+  // Non-cryptographic hash; used only for in-memory backoff bucketing.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  // Unsigned 32-bit hex.
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
 function isGraphqlPath(path: string): boolean {
   return /^\/?graphql(?:\?|$)/.test(path);
 }
@@ -143,17 +154,17 @@ export class GitHubClient {
       });
   }
 
-  private getBackoffKeys(): string[] {
+  private getBackoffKeys(tokenKey?: string | null): string[] {
     const keys: string[] = [];
-    keys.push("github:global");
     keys.push(`github:repo:${this.repo}`);
     if (this.installationId) keys.push(`github:installation:${this.installationId}`);
+    if (tokenKey) keys.push(`github:token:${tokenKey}`);
     return keys;
   }
 
-  private async waitForBackoff(): Promise<void> {
+  private async waitForBackoff(tokenKey?: string | null): Promise<void> {
     let resumeAt = 0;
-    for (const key of this.getBackoffKeys()) {
+    for (const key of this.getBackoffKeys(tokenKey)) {
       const until = GitHubClient.backoffUntilByKey.get(key) ?? 0;
       if (until > resumeAt) resumeAt = until;
     }
@@ -163,7 +174,7 @@ export class GitHubClient {
     await this.sleepMsImpl(delayMs);
   }
 
-  private recordBackoff(params: { untilTs: number; installationId?: string | null }): void {
+  private recordBackoff(params: { untilTs: number; installationId?: string | null; tokenKey?: string | null }): void {
     const until = Math.max(0, Math.floor(params.untilTs));
     if (!Number.isFinite(until) || until <= Date.now()) return;
 
@@ -171,9 +182,9 @@ export class GitHubClient {
     if (install) this.installationId = install;
 
     const keys = new Set<string>();
-    keys.add("github:global");
     keys.add(`github:repo:${this.repo}`);
     if (install) keys.add(`github:installation:${install}`);
+    if (params.tokenKey?.trim()) keys.add(`github:token:${params.tokenKey.trim()}`);
 
     for (const key of keys) {
       const existing = GitHubClient.backoffUntilByKey.get(key) ?? 0;
@@ -195,8 +206,9 @@ export class GitHubClient {
   }
 
   async request<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T>> {
-    await this.waitForBackoff();
     const token = this.tokenOverride ?? (await this.getToken());
+    const tokenKey = token ? fnv1a32(token) : null;
+    await this.waitForBackoff(tokenKey);
     const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
     const method = (opts.method ?? "GET").toUpperCase();
     const profile = getProfile();
@@ -261,27 +273,22 @@ export class GitHubClient {
 
       const code: GitHubErrorCode = isRateLimited ? "rate_limit" : baseCode;
 
+      let untilTs: number | null = null;
       if (isRateLimited) {
         const now = Date.now();
-        const untilTs =
+        untilTs =
           retryAfterMs != null
             ? now + retryAfterMs
             : resetMs != null
               ? resetMs
               : now + 60_000;
-        this.recordBackoff({ untilTs, installationId: extractInstallationId(text) });
+        this.recordBackoff({ untilTs, installationId: extractInstallationId(text), tokenKey });
       }
+
+      const resumeAt = untilTs != null && untilTs > Date.now() ? ` resumeAt=${new Date(untilTs).toISOString()}` : "";
 
       const missingTokenHint =
         code === "auth" && !token ? "Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests. " : "";
-
-      const resumeAt =
-        code === "rate_limit"
-          ? (() => {
-              const until = GitHubClient.backoffUntilByKey.get("github:global") ?? 0;
-              return until > Date.now() ? ` resumeAt=${new Date(until).toISOString()}` : "";
-            })()
-          : "";
 
       throw new GitHubApiError({
         message: `${missingTokenHint}GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}${resumeAt}`.trim(),

@@ -118,4 +118,57 @@ describe("GitHubClient rate limit handling", () => {
       }
     });
   });
+
+  test("does not apply rate-limit backoff across different tokens", async () => {
+    await withPatchedNow(4_000_000, async () => {
+      let call = 0;
+      const sleepCalls: Array<{ token: string; ms: number }> = [];
+
+      const resetSeconds = Math.floor((Date.now() + 60_000) / 1000);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = async () => {
+        call += 1;
+        if (call === 1) {
+          const headers = new Headers({
+            "x-ratelimit-remaining": "0",
+            "x-ratelimit-reset": String(resetSeconds),
+            "x-github-request-id": "req-a",
+          });
+          return new Response(JSON.stringify({ message: "API rate limit exceeded for installation ID 104421788." }), {
+            status: 403,
+            headers,
+          });
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: new Headers({ "Content-Type": "application/json" }),
+        });
+      };
+
+      const clientA = new GitHubClient("3mdistal/bwrb", {
+        getToken: async () => "token-a",
+        sleepMs: async (ms) => {
+          sleepCalls.push({ token: "a", ms });
+        },
+      });
+
+      const clientB = new GitHubClient("3mdistal/ralph", {
+        getToken: async () => "token-b",
+        sleepMs: async (ms) => {
+          sleepCalls.push({ token: "b", ms });
+        },
+      });
+
+      try {
+        await clientA.request("/rate_limit_test", { method: "GET" });
+        throw new Error("expected request to fail");
+      } catch (e) {
+        expect(e).toBeInstanceOf(GitHubApiError);
+      }
+
+      await clientB.request("/after_other_token", { method: "GET" });
+      expect(sleepCalls).toEqual([]);
+    });
+  });
 });
