@@ -2,7 +2,7 @@ import { open } from "fs/promises";
 import { existsSync } from "fs";
 
 import { splitRepoFullName, type GitHubClient } from "./client";
-import { addIssueLabel, removeIssueLabel } from "./issue-label-io";
+import { executeIssueLabelOps } from "./issue-label-io";
 import { getSessionEventsPath } from "../paths";
 import { isSafeSessionId } from "../session-id";
 import { initStateDb, hasIdempotencyKey, recordIdempotencyKey, deleteIdempotencyKey } from "../state";
@@ -370,11 +370,27 @@ async function createIssueComment(params: {
 }
 
 async function addWatchdogLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await addIssueLabel(params);
+  await executeIssueLabelOps({
+    github: params.github,
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    ops: [{ action: "add", label: params.label }],
+    logLabel: `${params.repo}#${params.issueNumber}`,
+    log: (message) => console.warn(`[ralph:gh-watchdog:${params.repo}] ${message}`),
+    ensureBefore: true,
+  });
 }
 
 async function removeWatchdogLabel(params: { github: GitHubClient; repo: string; issueNumber: number; label: string }) {
-  await removeIssueLabel({ ...params, allowNotFound: true });
+  await executeIssueLabelOps({
+    github: params.github,
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    ops: [{ action: "remove", label: params.label }],
+    logLabel: `${params.repo}#${params.issueNumber}`,
+    log: (message) => console.warn(`[ralph:gh-watchdog:${params.repo}] ${message}`),
+    ensureBefore: true,
+  });
 }
 
 export async function writeWatchdogToGitHub(

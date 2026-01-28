@@ -13,6 +13,7 @@ import * as bwrbQueue from "./queue";
 import type { QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
 import type { TaskPriority } from "./queue/priority";
 import { createGitHubQueueDriver } from "./github-queue";
+import { isStateDbInitialized, listRepoLabelWriteStates } from "./state";
 
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
 
@@ -163,6 +164,29 @@ export function getQueueBackendState(): QueueBackendState {
   };
 
   return cachedState;
+}
+
+export function getQueueBackendStateWithLabelHealth(nowMs: number = Date.now()): QueueBackendState {
+  const base = getQueueBackendState();
+  if (base.backend !== "github" || base.health === "unavailable") return base;
+  if (!isStateDbInitialized()) return base;
+
+  const states = listRepoLabelWriteStates();
+  const blocked = states
+    .map((state) => ({ repo: state.repo, blockedUntilMs: state.blockedUntilMs, lastError: state.lastError }))
+    .filter((entry) => typeof entry.blockedUntilMs === "number" && entry.blockedUntilMs > nowMs);
+  if (blocked.length === 0) return base;
+
+  const nextBlockedUntilMs = Math.min(...blocked.map((entry) => entry.blockedUntilMs as number));
+  const untilIso = new Date(nextBlockedUntilMs).toISOString();
+  const detail = blocked.length === 1 ? `label writes blocked until ${untilIso}` : `label writes blocked for ${blocked.length} repos (next ${untilIso})`;
+  const diagnostics = base.diagnostics ? `${base.diagnostics} ${detail}` : detail;
+
+  return {
+    ...base,
+    health: "degraded",
+    diagnostics,
+  };
 }
 
 function logQueueBackendNote(action: string, state: QueueBackendState): void {

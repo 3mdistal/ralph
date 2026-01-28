@@ -384,6 +384,15 @@ ralph nudge <taskRef> "Just implement it, stop asking questions"
 - Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
 - Success means the delivery attempt succeeded, not guaranteed agent compliance.
 
+### Release a stuck task slot (local-only)
+
+```bash
+ralph queue release --repo <owner/repo> --issue <n>
+```
+
+- Clears the local slot reservation and marks the task released in SQLite.
+- Does not attempt GitHub label writes; labels converge later via reconciliation.
+
 
 ### Seed sandbox edge cases
 
