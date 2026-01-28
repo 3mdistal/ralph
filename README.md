@@ -135,6 +135,26 @@ sandbox = {
 }
 ```
 
+Optional provisioning block (used by `sandbox:init` / `sandbox:seed`):
+
+```toml
+profile = "sandbox"
+sandbox = {
+  allowedOwners = ["3mdistal"],
+  repoNamePrefix = "ralph-sandbox-",
+  githubAuth = { tokenEnvVar = "GITHUB_SANDBOX_TOKEN" },
+  provisioning = {
+    templateRepo = "3mdistal/ralph-sandbox-template",
+    templateRef = "main",
+    repoVisibility = "private",
+    settingsPreset = "minimal",
+    seed = { preset = "baseline" }
+  }
+}
+```
+
+Canonical sandbox provisioning contract: `docs/product/sandbox-provisioning.md`.
+
 ### Supported settings
 
 - `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
@@ -148,6 +168,12 @@ sandbox = {
   - `githubAuth` (object): dedicated sandbox auth
     - `githubApp` (object): GitHub App installation auth for sandbox runs
     - `tokenEnvVar` (string): env var name for a fine-grained PAT restricted to sandbox repos
+  - `provisioning` (object, optional): sandbox repo provisioning
+    - `templateRepo` (string): required template repo (`owner/name`)
+    - `templateRef` (string): template ref/branch (default: `main`)
+    - `repoVisibility` (string): `private` (default; other values invalid)
+    - `settingsPreset` (string): `minimal` (default) or `parity`
+    - `seed` (object, optional): `{ preset = "baseline" }` or `{ file = "/abs/path/seed.json" }`
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
 - `githubApp` (object, optional): GitHub App installation auth for `gh` + REST (tokens cached in memory)
   - `appId` (number|string)
@@ -270,6 +296,26 @@ Machine-readable output:
 ```bash
 ralph repos --json
 ```
+
+### Sandbox provisioning
+
+```bash
+bun run sandbox:init
+```
+
+Skip seeding:
+
+```bash
+bun run sandbox:init --no-seed
+```
+
+Seed an existing sandbox repo (defaults to newest manifest if `--run-id` omitted):
+
+```bash
+bun run sandbox:seed --run-id <run-id>
+```
+
+Manifests are written to `~/.ralph/sandbox/manifests/<runId>.json`.
 
 ### Nudge an in-progress task
 

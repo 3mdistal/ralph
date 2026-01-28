@@ -19,6 +19,8 @@ import {
   listOpencodeProfileNames,
   getRepoConcurrencySlots,
   getRepoPath,
+  getSandboxProfileConfig,
+  getSandboxProvisioningConfig,
   type ControlConfig,
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
@@ -47,7 +49,7 @@ import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
 import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
-import { getRalphSessionLockPath } from "./paths";
+import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessionLockPath } from "./paths";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { queueNudge } from "./nudge";
@@ -75,6 +77,15 @@ import { runStatusCommand } from "./commands/status";
 import { runWorktreesCommand } from "./commands/worktrees";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
+import { buildProvisionPlan } from "./sandbox/provisioning-core";
+import {
+  applySeedFromSpec,
+  executeProvisionPlan,
+  findLatestManifestPath,
+  readManifestOrNull,
+} from "./sandbox/provisioning-io";
+import { writeSandboxManifest } from "./sandbox/manifest";
+import { getBaselineSeedSpec, loadSeedSpecFromFile } from "./sandbox/seed-spec";
 
 // --- State ---
 
@@ -1502,6 +1513,8 @@ function printGlobalHelp(): void {
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "",
@@ -1592,6 +1605,29 @@ function printCommandHelp(command: string): void {
           "",
           "Queues an operator message and delivers it at the next safe checkpoint (between continueSession runs).",
           "taskRef can be a task path, name, or a substring (must match exactly one in-progress task).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:init":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:init [--no-seed]",
+          "",
+          "Creates a new sandbox repo from the configured template and writes a manifest.",
+          "Runs seeding unless --no-seed is provided.",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:seed":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:seed [--run-id <id>]",
+          "",
+          "Seeds a sandbox repo based on the manifest (defaults to newest manifest if omitted).",
         ].join("\n")
       );
       return;
@@ -1842,6 +1878,146 @@ if (args[0] === "usage") {
     console.log(line.map((v, i) => fmt(v, widths[i]!)).join(" "));
   }
 
+  process.exit(0);
+}
+
+if (args[0] === "sandbox:init") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox:init");
+    process.exit(0);
+  }
+
+  const sandbox = getSandboxProfileConfig();
+  if (!sandbox) {
+    console.error("[ralph:sandbox] sandbox:init requires profile=\"sandbox\" with a sandbox config block.");
+    process.exit(1);
+  }
+
+  const owner = getConfig().owner;
+  const ownerAllowed = sandbox.allowedOwners.some((allowed) => allowed.toLowerCase() === owner.toLowerCase());
+  if (!ownerAllowed) {
+    console.error(`[ralph:sandbox] sandbox:init owner ${owner} is not in sandbox.allowedOwners.`);
+    process.exit(1);
+  }
+
+  const provisioning = getSandboxProvisioningConfig();
+  if (!provisioning) {
+    console.error("[ralph:sandbox] sandbox:init requires sandbox.provisioning config.");
+    process.exit(1);
+  }
+
+  const noSeed = args.includes("--no-seed");
+  const runId = `sandbox-${crypto.randomUUID()}`;
+
+  const plan = buildProvisionPlan({
+    runId,
+    owner,
+    botBranch: "bot/integration",
+    sandbox,
+    provisioning: {
+      templateRepo: provisioning.templateRepo,
+      templateRef: provisioning.templateRef ?? "main",
+      repoVisibility: "private",
+      settingsPreset: provisioning.settingsPreset ?? "minimal",
+      seed: provisioning.seed,
+    },
+  });
+
+  let manifest = await executeProvisionPlan(plan);
+  if (!noSeed && plan.seed) {
+    const seedSpec = plan.seed.preset === "baseline"
+      ? getBaselineSeedSpec()
+      : plan.seed.file
+        ? await loadSeedSpecFromFile(plan.seed.file)
+        : null;
+
+    if (!seedSpec) {
+      console.error("[ralph:sandbox] No seed spec resolved; pass --no-seed to skip.");
+      process.exit(1);
+    }
+
+    manifest = await applySeedFromSpec({
+      repoFullName: plan.repoFullName,
+      manifest,
+      seedSpec,
+      seedConfig: {
+        preset: plan.seed.preset,
+        file: plan.seed.file,
+      },
+    });
+    await writeSandboxManifest(getRalphSandboxManifestPath(plan.runId), manifest);
+  }
+
+  console.log(`[ralph:sandbox] Provisioned ${plan.repoFullName}`);
+  console.log(`[ralph:sandbox] Manifest: ${getRalphSandboxManifestPath(plan.runId)}`);
+  process.exit(0);
+}
+
+if (args[0] === "sandbox:seed") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox:seed");
+    process.exit(0);
+  }
+
+  const sandbox = getSandboxProfileConfig();
+  if (!sandbox) {
+    console.error("[ralph:sandbox] sandbox:seed requires profile=\"sandbox\" with a sandbox config block.");
+    process.exit(1);
+  }
+
+  const provisioning = getSandboxProvisioningConfig();
+
+  const runIdFlag = args.findIndex((arg) => arg === "--run-id");
+  const runId = runIdFlag >= 0 ? args[runIdFlag + 1] : null;
+  if (runIdFlag >= 0 && (!runId || runId.startsWith("-"))) {
+    console.error("[ralph:sandbox] --run-id requires a value.");
+    process.exit(1);
+  }
+  let manifestPath = runId ? getRalphSandboxManifestPath(runId) : null;
+
+  if (!manifestPath) {
+    manifestPath = await findLatestManifestPath(getRalphSandboxManifestsDir());
+  }
+
+  if (!manifestPath) {
+    console.error("[ralph:sandbox] No manifest found. Provide --run-id or run sandbox:init.");
+    process.exit(1);
+  }
+
+  const manifest = await readManifestOrNull(manifestPath);
+  if (!manifest) {
+    console.error(`[ralph:sandbox] Failed to load manifest: ${manifestPath}`);
+    process.exit(1);
+  }
+
+  const seedFile = manifest.seed?.file ?? provisioning?.seed?.file;
+  const seedPreset = manifest.seed?.preset ?? provisioning?.seed?.preset;
+
+  let seedSpec: any = null;
+  if (seedFile) {
+    seedSpec = await loadSeedSpecFromFile(seedFile);
+  } else if (seedPreset === "baseline") {
+    seedSpec = getBaselineSeedSpec();
+  }
+
+  if (!seedSpec) {
+    console.error("[ralph:sandbox] No seed spec resolved. Configure sandbox.provisioning.seed or update the manifest.");
+    process.exit(1);
+  }
+
+  const updated = await applySeedFromSpec({
+    repoFullName: manifest.repo.fullName,
+    manifest,
+    seedSpec,
+    seedConfig: {
+      preset: seedPreset,
+      file: seedFile,
+    },
+  });
+  await writeSandboxManifest(manifestPath, updated);
+
+  console.log(`[ralph:sandbox] Seeded ${manifest.repo.fullName}`);
+  console.log(`[ralph:sandbox] Manifest: ${manifestPath}`);
   process.exit(0);
 }
 
