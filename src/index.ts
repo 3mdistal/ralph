@@ -728,6 +728,31 @@ async function startTask(opts: {
       inFlightTasks.add(key);
     }
 
+    const reconcile = await getOrCreateWorker(repo).tryReconcileMergeablePrForQueuedTask(claimedTask);
+    if (reconcile.handled) {
+      if (reconcile.merged) {
+        try {
+          recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: reconcile.prUrl, state: PR_STATE_MERGED });
+        } catch {
+          // best-effort
+        }
+        await rollupMonitor.recordMerge(repo, reconcile.prUrl);
+        console.log(`[ralph] Reconciled mergeable PR for ${claimedTask.issue}: ${reconcile.prUrl}`);
+      } else {
+        console.warn(`[ralph] Reconcile merge attempt failed for ${claimedTask.issue}: ${reconcile.reason}`);
+      }
+
+      inFlightTasks.delete(key);
+      forgetOwnedTask(claimedTask);
+      releaseGlobal();
+      releaseRepo();
+      if (!isShuttingDown) {
+        scheduleQueuedTasksSoon();
+        void checkIdleRollups();
+      }
+      return true;
+    }
+
     try {
       const reservation = reserveRepoSlotForTask(claimedTask);
       if (!reservation) {

@@ -9,9 +9,10 @@ import { buildStatusSnapshot } from "../status-snapshot";
 import { collectStatusUsageRows, formatStatusUsageSection } from "../status-usage";
 import { readRunTokenTotals, type SessionTokenReadResult } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
-import { initStateDb } from "../state";
+import { initStateDb, listIssueAlertSummaries } from "../state";
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
+import { parseIssueRef } from "../github/issue-ref";
 import {
   formatActiveOpencodeProfileLine,
   formatBlockedIdleSuffix,
@@ -88,6 +89,37 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     return a.issue.localeCompare(b.issue);
   });
 
+  const tasksForAlerts = [...starting, ...inProgress, ...queued, ...throttled, ...blocked];
+  const issuesByRepo = new Map<string, Set<number>>();
+  for (const task of tasksForAlerts) {
+    const ref = parseIssueRef(task.issue, task.repo);
+    if (!ref) continue;
+    const set = issuesByRepo.get(ref.repo) ?? new Set<number>();
+    set.add(ref.number);
+    issuesByRepo.set(ref.repo, set);
+  }
+
+  const alertSummaryByKey = new Map<string, ReturnType<typeof listIssueAlertSummaries>[number]>();
+  for (const [repo, numbers] of issuesByRepo.entries()) {
+    const summaries = listIssueAlertSummaries({ repo, issueNumbers: [...numbers] });
+    for (const summary of summaries) {
+      alertSummaryByKey.set(`${summary.repo}#${summary.issueNumber}`, summary);
+    }
+  }
+
+  const getAlertSummary = (task: { repo: string; issue: string }) => {
+    const ref = parseIssueRef(task.issue, task.repo);
+    if (!ref) return null;
+    const summary = alertSummaryByKey.get(`${ref.repo}#${ref.number}`);
+    if (!summary || summary.totalCount <= 0) return null;
+    return {
+      totalCount: summary.totalCount,
+      latestSummary: summary.latestSummary ?? null,
+      latestAt: summary.latestAt ?? null,
+      latestCommentUrl: summary.latestCommentUrl ?? null,
+    };
+  };
+
   const profileNames = isOpencodeProfilesEnabled() ? listOpencodeProfileNames() : [];
   const usageRows = await collectStatusUsageRows({
     profiles: profileNames,
@@ -125,6 +157,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
           line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
           tokensTotal: tokens.tokensTotal,
           tokensComplete: tokens.tokensComplete,
+          alerts: getAlertSummary(task),
         };
       })
     );
@@ -151,6 +184,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
         issue: t.issue,
         priority: t.priority ?? "p2-medium",
         opencodeProfile: getTaskOpencodeProfileName(t),
+        alerts: getAlertSummary(t),
       })),
       drain: {
         requestedAt: opts.drain.requestedAt ? new Date(opts.drain.requestedAt).toISOString() : null,
@@ -164,6 +198,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
         issue: t.issue,
         priority: t.priority ?? "p2-medium",
         opencodeProfile: getTaskOpencodeProfileName(t),
+        alerts: getAlertSummary(t),
       })),
       throttled: throttled.map((t) => ({
         name: t.name,
@@ -173,6 +208,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
         opencodeProfile: getTaskOpencodeProfileName(t),
         sessionId: t["session-id"]?.trim() || null,
         resumeAt: t["resume-at"]?.trim() || null,
+        alerts: getAlertSummary(t),
       })),
       blocked: blockedSorted.map((t) => {
         const details = t["blocked-details"]?.trim() ?? "";
@@ -187,6 +223,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
           blockedSource: t["blocked-source"]?.trim() || null,
           blockedReason: t["blocked-reason"]?.trim() || null,
           blockedDetailsSnippet: details ? summarizeBlockedDetailsSnippet(details) : null,
+          alerts: getAlertSummary(t),
         };
       }),
     });
@@ -249,8 +286,11 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     const source = task["blocked-source"]?.trim();
     const idleSuffix = formatBlockedIdleSuffix(task);
     const sourceSuffix = source ? ` source=${source}` : "";
+    const alerts = getAlertSummary(task);
+    const alertSummary = alerts?.latestSummary ? ` latest="${alerts.latestSummary}"` : "";
+    const alertSuffix = alerts ? ` alerts=${alerts.totalCount}${alertSummary}` : "";
     console.log(
-      `  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}] reason=${reason}${sourceSuffix}${idleSuffix}`
+      `  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}] reason=${reason}${sourceSuffix}${idleSuffix}${alertSuffix}`
     );
   }
 
