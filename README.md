@@ -155,6 +155,35 @@ sandbox = {
 
 Canonical sandbox provisioning contract: `docs/product/sandbox-provisioning.md`.
 
+### Sandbox repo lifecycle
+
+Sandbox run repos should be explicitly tagged with the `ralph-sandbox` topic before any automated teardown/prune. This is a hard safety invariant: teardown/prune refuses to mutate repos without the marker topic.
+
+Commands (dry-run by default):
+
+```bash
+ralph sandbox tag --apply
+ralph sandbox teardown --repo <owner/repo> --apply
+ralph sandbox prune --apply
+```
+
+Defaults (override via flags or `sandbox.retention`):
+
+- keep last 10 repos
+- keep failed repos (topic `run-failed`) for 14 days
+- default action is archive (reversible); delete requires `--delete --yes`
+
+Notes:
+
+- `ralph sandbox prune` skips repos that are already archived when action is `archive`.
+- `ralph sandbox tag --failed` adds the `run-failed` topic even if `ralph-sandbox` is already present.
+
+You can add the failed marker when tagging:
+
+```bash
+ralph sandbox tag --failed --apply
+```
+
 ### Supported settings
 
 - `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
@@ -174,6 +203,9 @@ Canonical sandbox provisioning contract: `docs/product/sandbox-provisioning.md`.
     - `repoVisibility` (string): `private` (default; other values invalid)
     - `settingsPreset` (string): `minimal` (default) or `parity`
     - `seed` (object, optional): `{ preset = "baseline" }` or `{ file = "/abs/path/seed.json" }`
+  - `retention` (object, optional): sandbox repo retention defaults
+    - `keepLast` (number): keep last N repos (default: 10)
+    - `keepFailedDays` (number): keep failed repos for N days (default: 14)
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
 - `githubApp` (object, optional): GitHub App installation auth for `gh` + REST (tokens cached in memory)
   - `appId` (number|string)
