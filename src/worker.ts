@@ -105,7 +105,10 @@ import {
   completeRalphRun,
   createRalphRun,
   ensureRalphRunGateRows,
+  getLatestRunIdForSession,
+  getRalphRunTokenTotals,
   getIdempotencyPayload,
+  listRalphRunSessionTokenTotals,
   recordRalphRunGateArtifact,
   upsertIdempotencyKey,
   recordIssueSnapshot,
@@ -118,6 +121,7 @@ import {
   type RalphRunDetails,
   upsertRalphRunGateResult,
 } from "./state";
+import { refreshRalphRunTokenTotals } from "./run-token-accounting";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
   detectLegacyWorktrees,
@@ -1127,6 +1131,34 @@ export class RepoWorker {
           `[ralph:worker:${this.repo}] Failed to complete run record for ${task.name}: ${error?.message ?? String(error)}`
         );
       }
+
+      // Best-effort: persist token totals + append to the latest run log.
+      try {
+        const opencodeProfile = this.getPinnedOpencodeProfileName(task);
+        await refreshRalphRunTokenTotals({ runId, opencodeProfile });
+        const totals = getRalphRunTokenTotals(runId);
+        const runLogPath = task["run-log-path"]?.trim() || "";
+        if (totals && runLogPath && existsSync(runLogPath)) {
+          const totalLabel = totals.tokensComplete && typeof totals.tokensTotal === "number" ? totals.tokensTotal : "?";
+          const perSession = listRalphRunSessionTokenTotals(runId);
+          const missingCount = perSession.filter((s) => s.quality !== "ok").length;
+          const suffix = missingCount > 0 ? ` missingSessions=${missingCount}` : "";
+
+          await appendFile(
+            runLogPath,
+            "\n" +
+              [
+                "-----",
+                `Token usage: total=${totalLabel} complete=${totals.tokensComplete ? "true" : "false"} sessions=${totals.sessionCount}${suffix}`,
+              ].join("\n") +
+              "\n",
+            "utf8"
+          );
+        }
+      } catch {
+        // best-effort token accounting
+      }
+
       this.activeRunId = previousRunId;
     }
   }
@@ -8085,6 +8117,46 @@ ${guidance}`
             `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
             ""
           );
+        }
+      }
+
+      // Add token totals (best-effort). GitHub queue tasks skip agent-run notes.
+      const tokenRunId = this.activeRunId ?? (data.sessionId ? getLatestRunIdForSession(data.sessionId) : null);
+      if (tokenRunId) {
+        try {
+          const opencodeProfile = this.getPinnedOpencodeProfileName(task);
+          let tokenTotals = getRalphRunTokenTotals(tokenRunId);
+          let sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
+          if (!tokenTotals || !tokenTotals.tokensComplete) {
+            await refreshRalphRunTokenTotals({ runId: tokenRunId, opencodeProfile });
+            tokenTotals = getRalphRunTokenTotals(tokenRunId);
+            sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
+          }
+
+          if (tokenTotals) {
+            const totalLabel = tokenTotals.tokensComplete && typeof tokenTotals.tokensTotal === "number" ? tokenTotals.tokensTotal : "?";
+            const showSessions = sessionTotals.length > 1;
+            bodySections.push(
+              "## Token Usage",
+              "",
+              `- **Total:** ${totalLabel}`,
+              `- **Complete:** ${tokenTotals.tokensComplete ? "Yes" : "No"}`,
+              `- **Sessions:** ${tokenTotals.sessionCount}`,
+              ""
+            );
+
+            if (showSessions) {
+              const lines = sessionTotals.slice(0, 10).map((s) => {
+                const label = typeof s.tokensTotal === "number" ? s.tokensTotal : "?";
+                return `- ${s.sessionId}: ${label} (${s.quality})`;
+              });
+              if (lines.length > 0) {
+                bodySections.push("### Sessions", "", ...lines, "");
+              }
+            }
+          }
+        } catch {
+          // best-effort token accounting
         }
       }
 

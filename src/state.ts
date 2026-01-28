@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -403,6 +403,36 @@ function ensureSchema(database: Database): void {
           database.exec("ALTER TABLE alert_deliveries ADD COLUMN comment_id INTEGER");
         } catch {}
       }
+
+      if (existingVersion < 12) {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS ralph_run_session_token_totals (
+            run_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            tokens_input INTEGER,
+            tokens_output INTEGER,
+            tokens_reasoning INTEGER,
+            tokens_total INTEGER,
+            quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'unreadable', 'timeout', 'error')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(run_id, session_id),
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_session_token_totals_session
+            ON ralph_run_session_token_totals(session_id);
+
+          CREATE TABLE IF NOT EXISTS ralph_run_token_totals (
+            run_id TEXT PRIMARY KEY,
+            tokens_total INTEGER,
+            tokens_complete INTEGER NOT NULL DEFAULT 0,
+            session_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+          );
+        `);
+      }
     })();
   }
 
@@ -574,6 +604,30 @@ function ensureSchema(database: Database): void {
       FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS ralph_run_session_token_totals (
+      run_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      tokens_input INTEGER,
+      tokens_output INTEGER,
+      tokens_reasoning INTEGER,
+      tokens_total INTEGER,
+      quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'unreadable', 'timeout', 'error')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, session_id),
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS ralph_run_token_totals (
+      run_id TEXT PRIMARY KEY,
+      tokens_total INTEGER,
+      tokens_complete INTEGER NOT NULL DEFAULT 0,
+      session_count INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
       run_id TEXT NOT NULL,
       gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
@@ -655,6 +709,8 @@ function ensureSchema(database: Database): void {
     CREATE INDEX IF NOT EXISTS idx_rollup_batches_repo_status ON rollup_batches(repo_id, bot_branch, status);
     CREATE INDEX IF NOT EXISTS idx_rollup_batch_prs_batch ON rollup_batch_prs(batch_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_run_sessions_session_id ON ralph_run_sessions(session_id);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_session_token_totals_session
+      ON ralph_run_session_token_totals(session_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started ON ralph_runs(repo_id, issue_number, started_at);
     CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
       ON ralph_run_gate_results(repo_id, issue_number, updated_at);
@@ -2021,6 +2077,197 @@ export function listRalphRunSessionIds(runId: string): string[] {
     .all({ $run_id: runId }) as Array<{ session_id?: string } | undefined>;
 
   return rows.map((row) => row?.session_id ?? "").filter((id) => Boolean(id));
+}
+
+export type RalphRunSessionTokenTotalsQuality = "ok" | "missing" | "unreadable" | "timeout" | "error";
+
+export type RalphRunSessionTokenTotals = {
+  runId: string;
+  sessionId: string;
+  tokensInput: number | null;
+  tokensOutput: number | null;
+  tokensReasoning: number | null;
+  tokensTotal: number | null;
+  quality: RalphRunSessionTokenTotalsQuality;
+  updatedAt: string;
+};
+
+export type RalphRunTokenTotals = {
+  runId: string;
+  tokensTotal: number | null;
+  tokensComplete: boolean;
+  sessionCount: number;
+  updatedAt: string;
+};
+
+function normalizeTokenQuality(value: unknown): RalphRunSessionTokenTotalsQuality {
+  switch (value) {
+    case "ok":
+    case "missing":
+    case "unreadable":
+    case "timeout":
+    case "error":
+      return value;
+    default:
+      return "error";
+  }
+}
+
+function toSqliteBool(value: boolean): number {
+  return value ? 1 : 0;
+}
+
+function fromSqliteBool(value: unknown): boolean {
+  return value === 1 || value === true || value === "1";
+}
+
+export function recordRalphRunSessionTokenTotals(params: {
+  runId: string;
+  sessionId: string;
+  tokensInput?: number | null;
+  tokensOutput?: number | null;
+  tokensReasoning?: number | null;
+  tokensTotal?: number | null;
+  quality: RalphRunSessionTokenTotalsQuality;
+  at?: string;
+}): void {
+  if (!params.runId?.trim()) return;
+  if (!isSafeSessionId(params.sessionId)) return;
+
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const quality = normalizeTokenQuality(params.quality);
+
+  database
+    .query(
+      `INSERT INTO ralph_run_session_token_totals(
+         run_id, session_id, tokens_input, tokens_output, tokens_reasoning, tokens_total, quality, created_at, updated_at
+       ) VALUES (
+         $run_id, $session_id, $tokens_input, $tokens_output, $tokens_reasoning, $tokens_total, $quality, $created_at, $updated_at
+       )
+       ON CONFLICT(run_id, session_id) DO UPDATE SET
+         tokens_input = excluded.tokens_input,
+         tokens_output = excluded.tokens_output,
+         tokens_reasoning = excluded.tokens_reasoning,
+         tokens_total = excluded.tokens_total,
+         quality = excluded.quality,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $run_id: params.runId,
+      $session_id: params.sessionId,
+      $tokens_input: typeof params.tokensInput === "number" ? params.tokensInput : null,
+      $tokens_output: typeof params.tokensOutput === "number" ? params.tokensOutput : null,
+      $tokens_reasoning: typeof params.tokensReasoning === "number" ? params.tokensReasoning : null,
+      $tokens_total: typeof params.tokensTotal === "number" ? params.tokensTotal : null,
+      $quality: quality,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function listRalphRunSessionTokenTotals(runId: string): RalphRunSessionTokenTotals[] {
+  if (!runId?.trim()) return [];
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT run_id, session_id, tokens_input, tokens_output, tokens_reasoning, tokens_total, quality, updated_at
+       FROM ralph_run_session_token_totals
+       WHERE run_id = $run_id
+       ORDER BY session_id`
+    )
+    .all({ $run_id: runId }) as Array<{
+    run_id?: string;
+    session_id?: string;
+    tokens_input?: number | null;
+    tokens_output?: number | null;
+    tokens_reasoning?: number | null;
+    tokens_total?: number | null;
+    quality?: string;
+    updated_at?: string;
+  }>;
+
+  return rows
+    .map((row) => {
+      const runId = row.run_id ?? "";
+      const sessionId = row.session_id ?? "";
+      const updatedAt = row.updated_at ?? "";
+      if (!runId || !sessionId || !updatedAt) return null;
+      return {
+        runId,
+        sessionId,
+        tokensInput: typeof row.tokens_input === "number" ? row.tokens_input : null,
+        tokensOutput: typeof row.tokens_output === "number" ? row.tokens_output : null,
+        tokensReasoning: typeof row.tokens_reasoning === "number" ? row.tokens_reasoning : null,
+        tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+        quality: normalizeTokenQuality(row.quality),
+        updatedAt,
+      } satisfies RalphRunSessionTokenTotals;
+    })
+    .filter((row): row is RalphRunSessionTokenTotals => Boolean(row));
+}
+
+export function recordRalphRunTokenTotals(params: {
+  runId: string;
+  tokensTotal: number | null;
+  tokensComplete: boolean;
+  sessionCount: number;
+  at?: string;
+}): void {
+  if (!params.runId?.trim()) return;
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+
+  database
+    .query(
+      `INSERT INTO ralph_run_token_totals(
+         run_id, tokens_total, tokens_complete, session_count, created_at, updated_at
+       ) VALUES (
+         $run_id, $tokens_total, $tokens_complete, $session_count, $created_at, $updated_at
+       )
+       ON CONFLICT(run_id) DO UPDATE SET
+         tokens_total = excluded.tokens_total,
+         tokens_complete = excluded.tokens_complete,
+         session_count = excluded.session_count,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $run_id: params.runId,
+      $tokens_total: typeof params.tokensTotal === "number" ? params.tokensTotal : null,
+      $tokens_complete: toSqliteBool(params.tokensComplete),
+      $session_count: Number.isFinite(params.sessionCount) ? Math.max(0, Math.floor(params.sessionCount)) : 0,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function getRalphRunTokenTotals(runId: string): RalphRunTokenTotals | null {
+  if (!runId?.trim()) return null;
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT run_id, tokens_total, tokens_complete, session_count, updated_at
+       FROM ralph_run_token_totals
+       WHERE run_id = $run_id`
+    )
+    .get({ $run_id: runId }) as
+    | {
+        run_id?: string;
+        tokens_total?: number | null;
+        tokens_complete?: number | null;
+        session_count?: number | null;
+        updated_at?: string;
+      }
+    | undefined;
+
+  if (!row?.run_id || !row.updated_at) return null;
+  return {
+    runId: row.run_id,
+    tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+    tokensComplete: fromSqliteBool(row.tokens_complete),
+    sessionCount: typeof row.session_count === "number" ? row.session_count : 0,
+    updatedAt: row.updated_at,
+  };
 }
 
 const LABEL_SEPARATOR = "\u0001";
