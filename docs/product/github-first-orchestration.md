@@ -53,6 +53,7 @@ Note: scheduler "priority tasks" are reserved for resume work and are separate f
 - Deployment model: **single daemon per queue**. Running multiple daemons against the same GitHub queue is unsupported.
 - Stale recovery: Ralph only re-queues `ralph:in-progress` issues when the stored `heartbeat-at` exists and is stale beyond `ownershipTtlMs`.
   Missing or invalid heartbeats do not trigger automatic recovery.
+- Orphan PR reconciliation: if an issue is `ralph:queued` but already has an open PR authored by the configured Ralph GitHub App that closes the issue (e.g. `Fixes #123`) and is mergeable into `bot/integration`, Ralph merges it and applies `ralph:in-bot`.
 
 ## Auto-queue (optional)
 

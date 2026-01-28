@@ -1,0 +1,182 @@
+{
+  "version": "v1",
+  "seedLabel": "ralph:seed-suite",
+  "marker": "ralph-seed-suite:v1",
+  "labels": [
+    {
+      "name": "ralph:seed-suite",
+      "color": "1D76DB",
+      "description": "Seed suite artifacts"
+    },
+    {
+      "name": "ralph:seed:orphaned",
+      "color": "B60205",
+      "description": "Seed suite orphaned artifact"
+    },
+    {
+      "name": "ralph:seed:collision",
+      "color": "0E8A16",
+      "description": "Seed suite collision scenario"
+    },
+    {
+      "name": "ralph:seed:rename-me",
+      "color": "D93F0B",
+      "description": "Seed suite label rename source"
+    },
+    {
+      "name": "ralph:seed:renamed",
+      "color": "D93F0B",
+      "description": "Seed suite label rename target"
+    },
+    {
+      "name": "ralph:queud",
+      "color": "FBCA04",
+      "description": "Misspelled queued (seed fixture)"
+    }
+  ],
+  "labelRenames": [
+    {
+      "from": "ralph:seed:rename-me",
+      "to": "ralph:seed:renamed",
+      "description": "Seed suite label rename target"
+    }
+  ],
+  "scenarios": [
+    {
+      "slug": "blocker-open",
+      "title": "Seed: blocker open",
+      "body": {
+        "intro": "Seed fixture: open blocker used by dependency scenarios."
+      }
+    },
+    {
+      "slug": "blocker-closed",
+      "title": "Seed: blocker closed",
+      "state": "closed",
+      "body": {
+        "intro": "Seed fixture: closed blocker used by dependency scenarios."
+      }
+    },
+    {
+      "slug": "deps-body-only",
+      "title": "Seed: deps body-only",
+      "body": {
+        "intro": "Seed fixture: blocked-by references live only in the body section.",
+        "blockedBy": [
+          { "slug": "blocker-open" },
+          { "slug": "blocker-closed", "checked": true }
+        ],
+        "footer": "No API-level dependencies should exist for this issue."
+      }
+    },
+    {
+      "slug": "deps-api-only",
+      "title": "Seed: deps API-only",
+      "body": {
+        "intro": "Seed fixture: blocked-by references live only in API relationships."
+      },
+      "relationships": {
+        "blockedBy": [
+          { "slug": "blocker-open", "source": "api" }
+        ]
+      },
+      "capabilities": {
+        "blockedByApi": "best-effort"
+      }
+    },
+    {
+      "slug": "deps-mixed",
+      "title": "Seed: deps mixed",
+      "body": {
+        "intro": "Seed fixture: blocked-by references exist in both API and body sections.",
+        "blockedBy": [
+          { "slug": "blocker-open" },
+          { "slug": "blocker-closed", "checked": true }
+        ],
+        "implicitBlockedBy": "This issue is implicitly blocked by blocker-open (sentence outside section)."
+      },
+      "relationships": {
+        "blockedBy": [
+          { "slug": "blocker-open", "source": "api" }
+        ]
+      },
+      "capabilities": {
+        "blockedByApi": "best-effort"
+      }
+    },
+    {
+      "slug": "sub-child-a",
+      "title": "Seed: sub-issue child A",
+      "body": {
+        "intro": "Seed fixture: child issue for sub-issue scenarios."
+      }
+    },
+    {
+      "slug": "sub-child-b",
+      "title": "Seed: sub-issue child B",
+      "body": {
+        "intro": "Seed fixture: child issue for sub-issue scenarios."
+      }
+    },
+    {
+      "slug": "sub-parent",
+      "title": "Seed: sub-issues API vs task list",
+      "body": {
+        "intro": "Seed fixture: API sub-issues plus a body task list referencing the same children.",
+        "taskList": [
+          { "slug": "sub-child-a" },
+          { "slug": "sub-child-b" },
+          { "text": "Body-only task list item (no issue)" }
+        ]
+      },
+      "relationships": {
+        "subIssues": [
+          { "slug": "sub-child-a", "source": "api" },
+          { "slug": "sub-child-b", "source": "api" }
+        ]
+      },
+      "capabilities": {
+        "subIssuesApi": "best-effort"
+      }
+    },
+    {
+      "slug": "empty-body",
+      "title": "Seed: empty body",
+      "body": {}
+    },
+    {
+      "slug": "mislabel",
+      "title": "Seed: mislabel",
+      "labels": ["ralph:queud"],
+      "body": {
+        "intro": "Seed fixture: mislabelled issue (intentionally misspelled ralph:queued)."
+      }
+    },
+    {
+      "slug": "renamed-label",
+      "title": "Seed: renamed label",
+      "labels": ["ralph:seed:renamed"],
+      "body": {
+        "intro": "Seed fixture: label renamed after creation."
+      }
+    },
+    {
+      "slug": "collision-a",
+      "title": "Seed: collision task A",
+      "labels": ["ralph:queued", "ralph:seed:collision"],
+      "body": {
+        "intro": "Seed fixture: concurrency collision task A.",
+        "footer": "Instruction: edit README.md and change the line 'collision-value: A' to 'collision-value: X'."
+      }
+    },
+    {
+      "slug": "collision-b",
+      "title": "Seed: collision task B",
+      "labels": ["ralph:queued", "ralph:seed:collision"],
+      "body": {
+        "intro": "Seed fixture: concurrency collision task B.",
+        "footer": "Instruction: edit README.md and change the line 'collision-value: A' to 'collision-value: Y'."
+      }
+    }
+  ]
+}

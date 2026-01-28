@@ -1,0 +1,3 @@
+{"type":"tool-start","tool":{"name":"bash","callId":"c1"},"sessionId":"ses_tool_echo"}
+{"type":"tool-result","tool":{"name":"bash","callId":"c1","result":"hello world hello world hello world hello world"},"sessionId":"ses_tool_echo"}
+{"type":"text","part":{"text":"hello world hello world hello world hello world"},"sessionId":"ses_tool_echo"}

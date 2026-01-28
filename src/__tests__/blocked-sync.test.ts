@@ -11,7 +11,7 @@ const queueAdapter = {
 
 const notifyAdapter = {
   notifyEscalation: async () => true,
-  notifyError: async () => {},
+  notifyError: async (_title: string, _body: string, _context?: unknown) => {},
   notifyTaskComplete: async () => {},
 };
 

@@ -163,7 +163,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     const nowIso = getNowIso(deps);
 
     for (const repo of getConfig().repos.map((entry) => entry.name)) {
-      await io.ensureWorkflowLabels(repo);
       const opStateByIssue = buildTaskOpStateMap(repo);
       const issues = listIssueSnapshotsWithRalphLabels(repo);
 
@@ -181,14 +180,25 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
 
         try {
           const delta = statusToRalphLabelDelta("queued", issue.labels);
-          for (const label of delta.add) {
-            await io.addIssueLabel(repo, issue.number, label);
-          }
-          for (const label of delta.remove) {
-            await io.removeIssueLabel(repo, issue.number, label);
+          const steps: LabelOp[] = [
+            ...delta.add.map((label) => ({ action: "add" as const, label })),
+            ...delta.remove.map((label) => ({ action: "remove" as const, label })),
+          ];
+
+          const labelOps = await applyIssueLabelOps({
+            ops: steps,
+            io: buildLabelOpsIo(io, repo, issue.number),
+            logLabel: `${repo}#${issue.number}`,
+            log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+            ensureLabels: async () => await io.ensureWorkflowLabels(repo),
+            retryMissingLabelOnce: true,
+          });
+
+          if (!labelOps.ok) {
+            throw labelOps.error;
           }
 
-          applyLabelDelta({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
+          applyLabelDelta({ repo, issueNumber: issue.number, add: labelOps.add, remove: labelOps.remove, nowIso });
           recordTaskSnapshot({
             repo,
             issue: `${repo}#${issue.number}`,
@@ -301,8 +311,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       if (issue.state?.toUpperCase() === "CLOSED") {
         return { claimed: false, task: opts.task, reason: "Issue is closed" };
       }
-
-      await io.ensureWorkflowLabels(issueRef.repo);
 
       const opStateByIssue = buildTaskOpStateMap(issueRef.repo);
       const opState = opStateByIssue.get(issueRef.number) ?? {
@@ -469,8 +477,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         });
         return true;
       }
-
-      await io.ensureWorkflowLabels(issueRef.repo);
       const delta = statusToRalphLabelDelta(status, issue.labels);
       const steps: LabelOp[] = [
         ...delta.add.map((label) => ({ action: "add" as const, label })),

@@ -37,6 +37,21 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 
 Ralph always runs workers inside a per-task git worktree and blocks execution if it cannot prove isolation. If the repo root checkout is dirty or a task is missing a valid `worktree-path`, the worker fails closed and reports the issue. This protects the main checkout from accidental writes.
 
+### Legacy worktree cleanup
+
+Older Ralph versions created git worktrees directly under `devDir` (for example, `~/Developer/worktree-<n>`). Ralph now warns when it detects these legacy paths but does not auto-delete them. To review and clean safe legacy worktrees:
+
+```bash
+ralph worktrees legacy --repo <owner/repo> --dry-run --action cleanup
+ralph worktrees legacy --repo <owner/repo> --action cleanup
+```
+
+Optional: migrate safe legacy worktrees into the managed worktrees directory:
+
+```bash
+ralph worktrees legacy --repo <owner/repo> --action migrate
+```
+
 If you previously installed bwrb via `pnpm link -g`, unlink it first so Ralph uses the published CLI on your PATH (Bun just shells out to the `bwrb` binary).
 
 ## Installation
@@ -52,6 +67,8 @@ bun install
 Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
 When using the GitHub queue backend, `bwrbVault` is optional. When `queueBackend = "bwrb"`, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
+
+`bwrb` is a legacy backend. GitHub Issues plus `~/.ralph/state.sqlite` are the canonical queue surfaces. Existing bwrb usage (escalation notes, agent-run notes, notifications) is best-effort mirror output only, and new bwrb-dependent behavior should not be added.
 
 Note: `orchestration/` is gitignored in this repo, but bwrb still needs to traverse it for queue operations. `.bwrbignore` re-includes `orchestration/**` for bwrb even when `.gitignore` excludes it; if your queue appears empty, check `bwrb --version` and upgrade to >= 0.1.3.
 
@@ -118,6 +135,55 @@ sandbox = {
 }
 ```
 
+Optional provisioning block (used by `sandbox:init` / `sandbox:seed`):
+
+```toml
+profile = "sandbox"
+sandbox = {
+  allowedOwners = ["3mdistal"],
+  repoNamePrefix = "ralph-sandbox-",
+  githubAuth = { tokenEnvVar = "GITHUB_SANDBOX_TOKEN" },
+  provisioning = {
+    templateRepo = "3mdistal/ralph-sandbox-template",
+    templateRef = "main",
+    repoVisibility = "private",
+    settingsPreset = "minimal",
+    seed = { preset = "baseline" }
+  }
+}
+```
+
+Canonical sandbox provisioning contract: `docs/product/sandbox-provisioning.md`.
+
+### Sandbox repo lifecycle
+
+Sandbox run repos should be explicitly tagged with the `ralph-sandbox` topic before any automated teardown/prune. This is a hard safety invariant: teardown/prune refuses to mutate repos without the marker topic.
+
+Commands (dry-run by default):
+
+```bash
+ralph sandbox tag --apply
+ralph sandbox teardown --repo <owner/repo> --apply
+ralph sandbox prune --apply
+```
+
+Defaults (override via flags or `sandbox.retention`):
+
+- keep last 10 repos
+- keep failed repos (topic `run-failed`) for 14 days
+- default action is archive (reversible); delete requires `--delete --yes`
+
+Notes:
+
+- `ralph sandbox prune` skips repos that are already archived when action is `archive`.
+- `ralph sandbox tag --failed` adds the `run-failed` topic even if `ralph-sandbox` is already present.
+
+You can add the failed marker when tagging:
+
+```bash
+ralph sandbox tag --failed --apply
+```
+
 ### Supported settings
 
 - `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
@@ -131,14 +197,24 @@ sandbox = {
   - `githubAuth` (object): dedicated sandbox auth
     - `githubApp` (object): GitHub App installation auth for sandbox runs
     - `tokenEnvVar` (string): env var name for a fine-grained PAT restricted to sandbox repos
+  - `provisioning` (object, optional): sandbox repo provisioning
+    - `templateRepo` (string): required template repo (`owner/name`)
+    - `templateRef` (string): template ref/branch (default: `main`)
+    - `repoVisibility` (string): `private` (default; other values invalid)
+    - `settingsPreset` (string): `minimal` (default) or `parity`
+    - `seed` (object, optional): `{ preset = "baseline" }` or `{ file = "/abs/path/seed.json" }`
+  - `retention` (object, optional): sandbox repo retention defaults
+    - `keepLast` (number): keep last N repos (default: 10)
+    - `keepFailedDays` (number): keep failed repos for N days (default: 14)
 - `allowedOwners` (array): guardrail allowlist of repo owners (default: `[owner]`)
 - `githubApp` (object, optional): GitHub App installation auth for `gh` + REST (tokens cached in memory)
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `maxWorkers`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `concurrencySlots`, optional `maxWorkers` (deprecated), optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
+- `repos[].concurrencySlots` (number): per-repo concurrency slots (defaults to 1; overrides `repos[].maxWorkers`)
 - `repos[].rollupBatchSize` (number): per-repo override for rollup batch size (defaults to `batchSize`)
 - `ownershipTtlMs` (number): task ownership TTL in milliseconds (defaults to 60000)
 - `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
@@ -169,12 +245,12 @@ Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derive
 Note: `repos[].setup` commands run in the task worktree before any OpenCode agent execution. Setup is cached per worktree by `(commands hash + lockfile signature)`; if commands or lockfiles change, setup runs again.
 
 
-When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections, and the required check contexts must exist.
+When `repos[].requiredChecks` is configured, Ralph enforces branch protection on `bot/integration` (or `repos[].botBranch`) and `main` to require those checks and PR merges with 0 approvals. The GitHub token must be able to manage branch protections. If required check contexts are missing (including when no check contexts exist yet), Ralph logs a warning, proceeds without protection for now, and retries after a short delay.
 Setting `repos[].requiredChecks` to `[]` disables Ralph's merge gating but does not clear existing GitHub branch protection rules.
 
 Ralph refuses to auto-merge PRs targeting `main` unless the issue has the `allow-main` label. This guardrail only affects Ralph automation; humans can still merge to `main` normally.
 
-If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names.
+If Ralph logs that required checks are unavailable with `Available check contexts: (none)`, it usually means CI hasn't run on that branch yet. Push a commit or re-run your CI workflows to seed check runs/statuses, or update `repos[].requiredChecks` to match actual check names. Ralph will retry branch protection after the defer window.
 
 ### GitHub auth precedence
 
@@ -206,7 +282,7 @@ Older README versions mentioned `RALPH_VAULT`, `RALPH_DEV_DIR`, and `RALPH_BATCH
 - **Config changes not taking effect**: Ralph caches config after the first `loadConfig()`; restart the daemon.
 - **Config file not picked up**: Ralph reads `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json`.
 - **Config parse errors**: Ralph logs `[ralph] Failed to load TOML/JSON config from ...` and continues with defaults.
-- **Invalid maxWorkers values**: Non-positive/non-integer values fall back to defaults and emit a warning.
+- **Invalid maxWorkers/concurrencySlots values**: Non-positive/non-integer values fall back to defaults and emit a warning.
 
 ## Usage
 
@@ -228,7 +304,7 @@ bun dev
 bun run status
 ```
 
-Status output includes blocked tasks with reasons and idle age.
+Status output includes blocked tasks with reasons/idle age and recent alert summaries (when available).
 
 Machine-readable output:
 
@@ -236,7 +312,7 @@ Machine-readable output:
 bun run status --json
 ```
 
-JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, and a short `blockedDetailsSnippet`.
+JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, a short `blockedDetailsSnippet`, and per-task `alerts` summaries when present.
 
 Live updates (prints when status changes):
 
@@ -258,6 +334,26 @@ Machine-readable output:
 ralph repos --json
 ```
 
+### Sandbox provisioning
+
+```bash
+bun run sandbox:init
+```
+
+Skip seeding:
+
+```bash
+bun run sandbox:init --no-seed
+```
+
+Seed an existing sandbox repo (defaults to newest manifest if `--run-id` omitted):
+
+```bash
+bun run sandbox:seed --run-id <run-id>
+```
+
+Manifests are written to `~/.ralph/sandbox/manifests/<runId>.json`.
+
 ### Nudge an in-progress task
 
 ```bash
@@ -266,6 +362,22 @@ ralph nudge <taskRef> "Just implement it, stop asking questions"
 
 - Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
 - Success means the delivery attempt succeeded, not guaranteed agent compliance.
+
+
+### Seed sandbox edge cases
+
+```bash
+ralph sandbox seed --repo <owner/repo>
+```
+
+Seeds a sandbox repo with deterministic edge-case issues/relationships (dependency graphs, sub-issues, label drift, and collision tasks). This command requires `profile = "sandbox"` with a configured sandbox allowlist/prefix.
+
+Useful flags:
+
+```bash
+ralph sandbox seed --repo <owner/repo> --dry-run
+ralph sandbox seed --repo <owner/repo> --manifest sandbox/seed-manifest.v1.json --out sandbox/seed-ids.v1.json
+```
 
 
 ### Queue a task
@@ -298,7 +410,7 @@ orchestration/
   config.toml     # preferred config (if present)
   config.json     # fallback config
   state.sqlite    # durable metadata for idempotency + recovery (repos/issues/tasks/prs + sync/idempotency)
-  sessions/       # introspection logs per session
+  sessions/       # introspection logs per session (events.jsonl + summary.json)
 ```
 
 ## How it works
@@ -374,6 +486,8 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 ## Managed OpenCode config (daemon runs)
 
 Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `$HOME/.ralph/opencode`. This directory is owned by Ralph and overwritten on startup to match the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Override precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. Overrides must be absolute paths (no `~` expansion). For safety, Ralph refuses to manage non-managed directories unless they already contain the `.ralph-managed-opencode` marker file. This does not change OpenCode profile storage; profiles still control XDG roots for auth/storage/usage logs.
+
+Daemon runs do not rely on `~/.config/opencode` plugins. Ralph emits its own introspection artifacts at `~/.ralph/sessions/<sessionId>/events.jsonl` and `~/.ralph/sessions/<sessionId>/summary.json` for watchdog/anomaly detection.
 
 ## OpenCode profiles (multi-account)
 
@@ -531,7 +645,7 @@ In daemon mode, a single tool call can hang indefinitely. Ralph uses a watchdog 
 
 ### Configuration
 
-Configure via `~/.config/opencode/ralph/ralph.json` under `watchdog`:
+Configure via `~/.ralph/config.toml` or `~/.ralph/config.json` under `watchdog` (legacy `~/.config/opencode/ralph/ralph.json` is still supported):
 
 ```json
 {

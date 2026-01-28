@@ -45,7 +45,20 @@ type ClientOptions = {
   token?: string;
   userAgent?: string;
   getToken?: () => Promise<string | null>;
+  /** Injected for tests / custom backoff behavior. */
+  sleepMs?: (ms: number) => Promise<void>;
 };
+
+function fnv1a32(input: string): string {
+  // Non-cryptographic hash; used only for in-memory backoff bucketing.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  // Unsigned 32-bit hex.
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
 
 function isGraphqlPath(path: string): boolean {
   return /^\/?graphql(?:\?|$)/.test(path);
@@ -74,6 +87,37 @@ function classifyStatus(status: number): GitHubErrorCode {
   return "unknown";
 }
 
+function isSecondaryRateLimitText(text: string): boolean {
+  const t = text.toLowerCase();
+  return t.includes("secondary rate limit") || t.includes("abuse detection") || t.includes("temporarily blocked");
+}
+
+function isPrimaryRateLimitText(text: string): boolean {
+  const t = text.toLowerCase();
+  return t.includes("api rate limit exceeded") || t.includes("rate limit exceeded");
+}
+
+function parseRetryAfterMs(headers: Headers): number | null {
+  const raw = headers.get("retry-after");
+  if (!raw) return null;
+  const seconds = Number(raw.trim());
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.round(seconds * 1000);
+}
+
+function parseRateLimitResetMs(headers: Headers): number | null {
+  const raw = headers.get("x-ratelimit-reset");
+  if (!raw) return null;
+  const seconds = Number(raw.trim());
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.round(seconds * 1000);
+}
+
+function extractInstallationId(text: string): string | null {
+  const match = text.match(/installation\s+id\s+(\d+)/i);
+  return match?.[1] ?? null;
+}
+
 function safeJsonParse<T>(text: string): T | null {
   if (!text.trim()) return null;
   try {
@@ -92,12 +136,60 @@ export class GitHubClient {
   private readonly userAgent: string;
   private readonly tokenOverride: string | null;
   private readonly getToken: () => Promise<string | null>;
+  private readonly sleepMsImpl: (ms: number) => Promise<void>;
+
+  private installationId: string | null = null;
+
+  private static readonly backoffUntilByKey = new Map<string, number>();
 
   constructor(repo: string, opts?: ClientOptions) {
     this.repo = repo;
     this.userAgent = opts?.userAgent ?? "ralph-loop";
     this.tokenOverride = opts?.token ?? null;
     this.getToken = opts?.getToken ?? resolveGitHubToken;
+    this.sleepMsImpl =
+      opts?.sleepMs ??
+      (async (ms) => {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+      });
+  }
+
+  private getBackoffKeys(tokenKey?: string | null): string[] {
+    const keys: string[] = [];
+    keys.push(`github:repo:${this.repo}`);
+    if (this.installationId) keys.push(`github:installation:${this.installationId}`);
+    if (tokenKey) keys.push(`github:token:${tokenKey}`);
+    return keys;
+  }
+
+  private async waitForBackoff(tokenKey?: string | null): Promise<void> {
+    let resumeAt = 0;
+    for (const key of this.getBackoffKeys(tokenKey)) {
+      const until = GitHubClient.backoffUntilByKey.get(key) ?? 0;
+      if (until > resumeAt) resumeAt = until;
+    }
+    const now = Date.now();
+    if (resumeAt <= now) return;
+    const delayMs = Math.min(resumeAt - now, 10 * 60_000);
+    await this.sleepMsImpl(delayMs);
+  }
+
+  private recordBackoff(params: { untilTs: number; installationId?: string | null; tokenKey?: string | null }): void {
+    const until = Math.max(0, Math.floor(params.untilTs));
+    if (!Number.isFinite(until) || until <= Date.now()) return;
+
+    const install = params.installationId?.trim() || null;
+    if (install) this.installationId = install;
+
+    const keys = new Set<string>();
+    keys.add(`github:repo:${this.repo}`);
+    if (install) keys.add(`github:installation:${install}`);
+    if (params.tokenKey?.trim()) keys.add(`github:token:${params.tokenKey.trim()}`);
+
+    for (const key of keys) {
+      const existing = GitHubClient.backoffUntilByKey.get(key) ?? 0;
+      if (until > existing) GitHubClient.backoffUntilByKey.set(key, until);
+    }
   }
 
   private buildHeaders(opts: RequestOptions, token: string | null): Record<string, string> {
@@ -115,6 +207,8 @@ export class GitHubClient {
 
   async request<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T>> {
     const token = this.tokenOverride ?? (await this.getToken());
+    const tokenKey = token ? fnv1a32(token) : null;
+    await this.waitForBackoff(tokenKey);
     const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
     const method = (opts.method ?? "GET").toUpperCase();
     const profile = getProfile();
@@ -166,12 +260,38 @@ export class GitHubClient {
 
     const text = await res.text();
     if (!res.ok) {
-      const code = classifyStatus(res.status);
+      const baseCode = classifyStatus(res.status);
+      const retryAfterMs = parseRetryAfterMs(res.headers);
+      const resetMs = parseRateLimitResetMs(res.headers);
+      const remaining = res.headers.get("x-ratelimit-remaining");
+      const remainingZero = typeof remaining === "string" && remaining.trim() === "0";
+      const isRateLimited =
+        res.status === 429 ||
+        retryAfterMs != null ||
+        isSecondaryRateLimitText(text) ||
+        (res.status === 403 && (isPrimaryRateLimitText(text) || remainingZero));
+
+      const code: GitHubErrorCode = isRateLimited ? "rate_limit" : baseCode;
+
+      let untilTs: number | null = null;
+      if (isRateLimited) {
+        const now = Date.now();
+        untilTs =
+          retryAfterMs != null
+            ? now + retryAfterMs
+            : resetMs != null
+              ? resetMs
+              : now + 60_000;
+        this.recordBackoff({ untilTs, installationId: extractInstallationId(text), tokenKey });
+      }
+
+      const resumeAt = untilTs != null && untilTs > Date.now() ? ` resumeAt=${new Date(untilTs).toISOString()}` : "";
+
       const missingTokenHint =
         code === "auth" && !token ? "Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests. " : "";
 
       throw new GitHubApiError({
-        message: `${missingTokenHint}GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}`.trim(),
+        message: `${missingTokenHint}GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}${resumeAt}`.trim(),
         code,
         status: res.status,
         requestId: res.headers.get("x-github-request-id"),
