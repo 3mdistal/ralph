@@ -54,7 +54,7 @@ export function buildAlertSummary(context: string, error: string): string {
   return truncateText(combined || "(unknown error)", MAX_SUMMARY_CHARS);
 }
 
-export function buildAlertDetails(error: string): string | null {
+function buildAlertDetails(error: string): string | null {
   const safe = sanitizeText(error);
   if (!safe) return null;
   return truncateText(safe, MAX_DETAILS_CHARS);

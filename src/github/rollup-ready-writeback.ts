@@ -65,7 +65,7 @@ function buildMarker(params: { repo: string; prNumber: number }): string {
   return `${ROLLUP_MARKER_PREFIX}${markerId} -->`;
 }
 
-export function extractExistingRollupMarker(body: string): string | null {
+function extractExistingRollupMarker(body: string): string | null {
   const match = body.match(ROLLUP_MARKER_REGEX);
   return match?.[1] ?? null;
 }
@@ -78,7 +78,7 @@ function formatMergedPrs(mergedPRs: string[]): string[] {
   return [...head, `- ...and ${remainder} more`];
 }
 
-export function planRollupReadyWriteback(ctx: RollupReadyContext): RollupReadyPlan {
+function planRollupReadyWriteback(ctx: RollupReadyContext): RollupReadyPlan {
   const marker = buildMarker({ repo: ctx.repo, prNumber: ctx.prNumber });
   const markerId = buildMarkerId({ repo: ctx.repo, prNumber: ctx.prNumber });
 
