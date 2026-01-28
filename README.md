@@ -281,6 +281,22 @@ ralph nudge <taskRef> "Just implement it, stop asking questions"
 - Success means the delivery attempt succeeded, not guaranteed agent compliance.
 
 
+### Seed sandbox edge cases
+
+```bash
+ralph sandbox seed --repo <owner/repo>
+```
+
+Seeds a sandbox repo with deterministic edge-case issues/relationships (dependency graphs, sub-issues, label drift, and collision tasks). This command requires `profile = "sandbox"` with a configured sandbox allowlist/prefix.
+
+Useful flags:
+
+```bash
+ralph sandbox seed --repo <owner/repo> --dry-run
+ralph sandbox seed --repo <owner/repo> --manifest sandbox/seed-manifest.v1.json --out sandbox/seed-ids.v1.json
+```
+
+
 ### Queue a task
 
 Create an `agent-task` note in your bwrb vault:

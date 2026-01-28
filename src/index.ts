@@ -73,6 +73,7 @@ import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImp
 import { computeDaemonGate } from "./daemon-gate";
 import { runStatusCommand } from "./commands/status";
 import { runWorktreesCommand } from "./commands/worktrees";
+import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 
@@ -1504,6 +1505,7 @@ function printGlobalHelp(): void {
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
+      "  ralph sandbox seed                 Seed sandbox edge-case issues",
       "",
       "Options:",
       "  -h, --help                         Show help (also: ralph help [command])",
@@ -1614,6 +1616,17 @@ function printCommandHelp(command: string): void {
           "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
           "",
           "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox seed --repo <owner/repo> [options]",
+          "",
+          "Seeds a sandbox repo with deterministic edge-case issues and relationships.",
         ].join("\n")
       );
       return;
@@ -2002,6 +2015,21 @@ if (args[0] === "watch") {
   await new Promise(() => {
     // intentional
   });
+}
+
+if (args[0] === "sandbox") {
+  if (hasHelpFlag || args[1] === "help") {
+    printCommandHelp("sandbox");
+    process.exit(0);
+  }
+
+  if (args[1] !== "seed") {
+    console.error("Usage: ralph sandbox seed --repo <owner/repo> [options]");
+    process.exit(1);
+  }
+
+  await runSandboxSeedCommand(args.slice(2));
+  process.exit(0);
 }
 
 
