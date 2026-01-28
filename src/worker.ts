@@ -92,9 +92,10 @@ import {
   type IssueRelationshipSnapshot,
 } from "./github/issue-relationships";
 import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
-import { ralphEventBus } from "./dashboard/bus";
-import { buildRalphEvent } from "./dashboard/events";
+import { type RalphCheckpoint, type RalphEvent } from "./dashboard/events";
+import { publishDashboardEvent, type DashboardEventContext } from "./dashboard/publisher";
 import { cleanupSessionArtifacts } from "./introspection-traces";
+import { isIntrospectionSummary, type IntrospectionSummary } from "./introspection/summary";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "./run-recording-session-adapter";
 import { redactHomePathForDisplay } from "./redaction";
 import { isSafeSessionId } from "./session-id";
@@ -223,16 +224,6 @@ const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
 const CI_REMEDIATION_BACKOFF_BASE_MS = 30_000;
 const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 
-interface IntrospectionSummary {
-  sessionId: string;
-  endTime: number;
-  toolResultAsTextCount: number;
-  totalToolCalls: number;
-  stepCount: number;
-  hasAnomalies: boolean;
-  recentTools: string[];
-}
-
 interface LiveAnomalyCount {
   total: number;
   recentBurst: boolean;
@@ -245,7 +236,8 @@ async function readIntrospectionSummary(sessionId: string): Promise<Introspectio
   
   try {
     const content = await readFile(summaryPath, "utf8");
-    return JSON.parse(content);
+    const parsed = JSON.parse(content);
+    return isIntrospectionSummary(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -916,6 +908,7 @@ export class RepoWorker {
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
+  private activeDashboardContext: DashboardEventContext | null = null;
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -992,6 +985,58 @@ export class RepoWorker {
     }
   }
 
+  private buildDashboardContext(task: AgentTask, runId?: string | null): DashboardEventContext {
+    const taskId = task._path || task._name || task.name || undefined;
+    const workerId = task["worker-id"]?.trim() || (taskId ? `${this.repo}#${taskId}` : undefined);
+    const sessionId = task["session-id"]?.trim() || undefined;
+    return {
+      runId: runId ?? undefined,
+      workerId,
+      repo: this.repo,
+      taskId,
+      sessionId,
+    };
+  }
+
+  private withDashboardContext<T>(context: DashboardEventContext, run: () => Promise<T>): Promise<T> {
+    const prev = this.activeDashboardContext;
+    this.activeDashboardContext = context;
+    return Promise.resolve(run()).finally(() => {
+      this.activeDashboardContext = prev;
+    });
+  }
+
+  private publishDashboardEvent(
+    event: Omit<RalphEvent, "ts"> & { ts?: string },
+    overrides?: Partial<DashboardEventContext>
+  ): void {
+    const context = this.activeDashboardContext ? { ...this.activeDashboardContext, ...overrides } : overrides;
+    publishDashboardEvent(event, context);
+  }
+
+  private publishCheckpoint(checkpoint: RalphCheckpoint, overrides?: Partial<DashboardEventContext>): void {
+    this.publishDashboardEvent(
+      {
+        type: "worker.checkpoint.reached",
+        level: "info",
+        data: { checkpoint },
+      },
+      overrides
+    );
+  }
+
+  private logWorker(message: string, overrides?: Partial<DashboardEventContext>): void {
+    console.log(`[ralph:worker:${this.repo}] ${message}`);
+    this.publishDashboardEvent(
+      {
+        type: "log.worker",
+        level: "info",
+        data: { message },
+      },
+      overrides
+    );
+  }
+
   private async withRunContext(
     task: AgentTask,
     attemptKind: RalphRunAttemptKind,
@@ -1025,11 +1070,25 @@ export class RepoWorker {
     const recordingSession = this.createContextRecoveryAdapter(recordingBase);
 
     let result: AgentRun | null = null;
+    const context = this.buildDashboardContext(task, runId);
 
     try {
-      result = await this.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, run);
+      result = await this.withDashboardContext(context, async () => {
+        this.publishDashboardEvent({
+          type: "worker.became_busy",
+          level: "info",
+          data: { taskName: task.name, issue: task.issue },
+        });
+        return await this.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, run);
+      });
       return result;
     } finally {
+      this.publishDashboardEvent({
+        type: "worker.became_idle",
+        level: "info",
+        data: { reason: result?.outcome },
+      });
+
       try {
         completeRalphRun({
           runId,
@@ -1147,38 +1206,88 @@ export class RepoWorker {
   private createContextRecoveryAdapter(base: SessionAdapter): SessionAdapter {
     return {
       runAgent: async (repoPath, agent, message, options, testOverrides) => {
-        const result = await base.runAgent(repoPath, agent, message, options, testOverrides);
+        const dashboardOptions = this.withDashboardSessionOptions(options);
+        const result = await base.runAgent(repoPath, agent, message, dashboardOptions, testOverrides);
         return this.maybeRecoverFromContextLengthExceeded({
           repoPath,
           sessionId: result.sessionId,
           stepKey: options?.introspection?.stepTitle ?? `agent:${agent}`,
           result,
-          options,
+          options: dashboardOptions,
         });
       },
       continueSession: async (repoPath, sessionId, message, options) => {
-        const result = await base.continueSession(repoPath, sessionId, message, options);
+        const dashboardOptions = this.withDashboardSessionOptions(options, { sessionId });
+        const result = await base.continueSession(repoPath, sessionId, message, dashboardOptions);
         return this.maybeRecoverFromContextLengthExceeded({
           repoPath,
           sessionId,
           stepKey: options?.introspection?.stepTitle ?? `session:${sessionId}`,
           result,
-          options,
+          options: dashboardOptions,
         });
       },
       continueCommand: async (repoPath, sessionId, command, args, options) => {
-        const result = await base.continueCommand(repoPath, sessionId, command, args, options);
+        const dashboardOptions = this.withDashboardSessionOptions(options, { sessionId });
+        const result = await base.continueCommand(repoPath, sessionId, command, args, dashboardOptions);
         return this.maybeRecoverFromContextLengthExceeded({
           repoPath,
           sessionId,
           stepKey: options?.introspection?.stepTitle ?? `command:${command}`,
           result,
-          options,
+          options: dashboardOptions,
           command,
         });
       },
       getRalphXdgCacheHome: base.getRalphXdgCacheHome,
     };
+  }
+
+  private withDashboardSessionOptions(
+    options?: RunSessionOptionsBase,
+    overrides?: Partial<DashboardEventContext>
+  ): RunSessionOptionsBase | undefined {
+    const context = this.activeDashboardContext ? { ...this.activeDashboardContext, ...overrides } : overrides;
+    if (!context) return options;
+
+    const existingOnEvent = options?.onEvent;
+    const onEvent = (event: any) => {
+      if (!event) return;
+      const eventSessionId = event.sessionID ?? event.sessionId;
+      const sessionId = typeof eventSessionId === "string" ? eventSessionId : context.sessionId;
+
+      this.publishDashboardEvent(
+        {
+          type: "log.opencode.event",
+          level: "info",
+          repo: context.repo,
+          taskId: context.taskId,
+          workerId: context.workerId,
+          sessionId,
+          data: { event },
+        },
+        { ...context, sessionId }
+      );
+
+      if (event.type === "text" && event.part?.text) {
+        this.publishDashboardEvent(
+          {
+            type: "log.opencode.text",
+            level: "info",
+            repo: context.repo,
+            taskId: context.taskId,
+            workerId: context.workerId,
+            sessionId,
+            data: { text: String(event.part.text) },
+          },
+          { ...context, sessionId }
+        );
+      }
+
+      existingOnEvent?.(event);
+    };
+
+    return { ...(options ?? {}), onEvent };
   }
 
   private recordContextCompactAttempt(task: AgentTask, stepKey: string): { allowed: boolean; attempt: number } {
@@ -1253,8 +1362,8 @@ export class RepoWorker {
       compactOptions,
       resumeOptions,
       onEvent: (event) => {
-        ralphEventBus.publish(
-          buildRalphEvent({
+        this.publishDashboardEvent(
+          {
             type: "worker.context_compact.triggered",
             level: "info",
             repo: this.repo,
@@ -1264,7 +1373,8 @@ export class RepoWorker {
               stepTitle: event.stepKey,
               attempt: event.attempt,
             },
-          })
+          },
+          { sessionId: event.sessionId }
         );
       },
     });
@@ -3049,8 +3159,18 @@ ${guidance}`
   }
 
   private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+
     // Never pass --admin or -d (delete branch). Branch cleanup is handled separately with guardrails.
-    await ghWrite(this.repo)`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
+    // Use the merge REST API to avoid interactive gh pr merge behavior in daemon mode.
+    await ghWrite(this.repo)`gh api -X PUT /repos/${owner}/${name}/pulls/${prNumber}/merge -f merge_method=merge -f sha=${headSha}`
+      .cwd(cwd)
+      .quiet();
   }
 
   private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
@@ -3338,7 +3458,12 @@ ${guidance}`
   }): string {
     const base = params.baseRefName || "(unknown)";
     const head = params.headRefName || "(unknown)";
+    const normalizedHead = params.headRefName ? this.normalizeGitRef(params.headRefName) : "";
     const timedOutLine = params.timedOut ? "Timed out waiting for required checks to complete." : "";
+
+    const pushLine = normalizedHead
+      ? `git push origin HEAD:${normalizedHead}`
+      : "# If head ref is unknown, resolve it and push: gh pr view --json headRefName -q .headRefName";
 
     return [
       "CI-debug run for an existing PR with failing required checks.",
@@ -3356,8 +3481,11 @@ ${guidance}`
       "Commands (run in the CI-debug worktree):",
       "```bash",
       "git fetch origin",
-      `gh pr checkout ${params.prUrl}`,
+      `gh pr checkout --detach ${params.prUrl}`,
       "git status",
+      "",
+      "# After making a deterministic fix and committing it:",
+      pushLine,
       "```",
     ]
       .filter(Boolean)
@@ -5056,6 +5184,8 @@ ${guidance}`
       devex,
     });
 
+    this.publishCheckpoint("recorded", { sessionId });
+
     await this.queue.updateTaskStatus(task, "done", {
       "completed-at": endTime.toISOString().split("T")[0],
       "session-id": "",
@@ -5939,6 +6069,15 @@ ${guidance}`
     const throttledAt = new Date().toISOString();
     const resumeAt = decision.resumeAtTs ? new Date(decision.resumeAtTs).toISOString() : "";
 
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.requested",
+        level: "warn",
+        data: { reason: `hard-throttle:${stage}` },
+      },
+      { sessionId: sid || undefined }
+    );
+
     const extraFields: Record<string, string> = {
       "throttled-at": throttledAt,
       "resume-at": resumeAt,
@@ -5974,6 +6113,15 @@ ${guidance}`
 
     console.log(
       `[ralph:worker:${this.repo}] Hard throttle active; pausing at checkpoint stage=${stage} resumeAt=${resumeAt || "unknown"}`
+    );
+
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.reached",
+        level: "warn",
+        data: {},
+      },
+      { sessionId: sid || undefined }
     );
 
     return {
@@ -6180,7 +6328,6 @@ ${guidance}`
 
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string; repoSlot?: number | null }): Promise<AgentRun> {
     const startTime = new Date();
-    console.log(`[ralph:worker:${this.repo}] Resuming task: ${task.name}`);
 
     if (!isRepoAllowed(task.repo)) {
       return await this.blockDisallowedRepo(task, startTime, "resume");
@@ -6248,21 +6395,6 @@ ${guidance}`
 
       const eventWorkerId = task["worker-id"]?.trim();
 
-      ralphEventBus.publish(
-        buildRalphEvent({
-          type: "worker.created",
-          level: "info",
-          ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
-          repo: this.repo,
-          taskId: task._path,
-          sessionId: existingSessionId,
-          data: {
-            ...(worktreePath ? { worktreePath } : {}),
-            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
-          },
-        })
-      );
-
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
 
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
@@ -6328,6 +6460,24 @@ ${guidance}`
       if (pausedBefore) return pausedBefore;
 
       return await this.withRunContext(task, "resume", async () => {
+      this.publishDashboardEvent(
+        {
+          type: "worker.created",
+          level: "info",
+          ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
+          repo: this.repo,
+          taskId: task._path,
+          sessionId: existingSessionId,
+          data: {
+            ...(worktreePath ? { worktreePath } : {}),
+            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
+          },
+        },
+        { sessionId: existingSessionId, workerId: eventWorkerId }
+      );
+
+      this.logWorker(`Resuming task: ${task.name}`, { sessionId: existingSessionId, workerId: eventWorkerId });
+
       const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
       let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
@@ -6367,6 +6517,10 @@ ${guidance}`
           escalationReason: reason,
         };
       }
+
+      this.publishCheckpoint("implementation_step_complete", {
+        sessionId: buildResult.sessionId || existingSessionId || undefined,
+      });
 
       if (buildResult.sessionId) {
         await this.queue.updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
@@ -6498,6 +6652,10 @@ ${guidance}`
             break;
           }
 
+          this.publishCheckpoint("implementation_step_complete", {
+            sessionId: buildResult.sessionId || existingSessionId || undefined,
+          });
+
           lastAnomalyCount = anomalyStatus.total;
           prUrl = this.updateOpenPrSnapshot(
             task,
@@ -6579,6 +6737,9 @@ ${guidance}`
             break;
           }
         } else {
+          this.publishCheckpoint("implementation_step_complete", {
+            sessionId: buildResult.sessionId || existingSessionId || undefined,
+          });
           prUrl = this.updateOpenPrSnapshot(
             task,
             prUrl,
@@ -6650,6 +6811,8 @@ ${guidance}`
         prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
       }
 
+      this.publishCheckpoint("pr_ready", { sessionId: buildResult.sessionId || existingSessionId || undefined });
+
       const pausedMerge = await this.pauseIfHardThrottled(task, "resume merge", buildResult.sessionId || existingSessionId);
       if (pausedMerge) return pausedMerge;
 
@@ -6675,6 +6838,10 @@ ${guidance}`
         mergeGate.sessionId || buildResult.sessionId || existingSessionId
       );
       if (pausedMergeAfter) return pausedMergeAfter;
+
+      this.publishCheckpoint("merge_step_complete", {
+        sessionId: mergeGate.sessionId || buildResult.sessionId || existingSessionId || undefined,
+      });
 
       prUrl = mergeGate.prUrl;
       buildResult.sessionId = mergeGate.sessionId;
@@ -6708,6 +6875,10 @@ ${guidance}`
         }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
+
+      this.publishCheckpoint("survey_complete", {
+        sessionId: surveyResult.sessionId || buildResult.sessionId || existingSessionId || undefined,
+      });
 
       return await this.finalizeTaskSuccess({
         task,
@@ -6747,7 +6918,6 @@ ${guidance}`
 
   async processTask(task: AgentTask, opts?: { repoSlot?: number | null }): Promise<AgentRun> {
     const startTime = new Date();
-    console.log(`[ralph:worker:${this.repo}] Starting task: ${task.name}`);
 
     let workerId: string | undefined;
     let allocatedSlot: number | null = null;
@@ -6820,8 +6990,11 @@ ${guidance}`
 
       await this.prepareContextRecovery(task, taskRepoPath);
 
-      ralphEventBus.publish(
-        buildRalphEvent({
+      await this.assertRepoRootClean(task, "start");
+
+      return await this.withRunContext(task, "process", async () => {
+      this.publishDashboardEvent(
+        {
           type: "worker.created",
           level: "info",
           ...(workerId ? { workerId } : {}),
@@ -6832,12 +7005,12 @@ ${guidance}`
             ...(worktreePath ? { worktreePath } : {}),
             ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
           },
-        })
+        },
+        { sessionId: task["session-id"]?.trim() || undefined, workerId }
       );
 
-      await this.assertRepoRootClean(task, "start");
+      this.logWorker(`Starting task: ${task.name}`, { workerId });
 
-      return await this.withRunContext(task, "process", async () => {
       const pausedSetup = await this.pauseIfHardThrottled(task, "setup");
       if (pausedSetup) return pausedSetup;
 
@@ -6944,7 +7117,25 @@ ${guidance}`
         if (planResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
         }
-        throw new Error(`planner failed: ${planResult.output}`);
+
+        const reason = `planner failed: ${planResult.output}`;
+        const details = planResult.output;
+
+        await this.markTaskBlocked(task, "runtime-error", {
+          reason,
+          details,
+          sessionId: planResult.sessionId,
+          runLogPath: planRunLogPath,
+        });
+        await this.notify.notifyError(`Processing ${task.name}`, reason, task.name);
+
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: planResult.sessionId,
+          escalationReason: reason,
+        };
       }
 
       // Persist OpenCode session ID for crash recovery
@@ -6955,6 +7146,8 @@ ${guidance}`
           ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
         });
       }
+
+      this.publishCheckpoint("planned", { sessionId: planResult.sessionId || undefined });
 
       // 5. Parse routing decision
       let routing = parseRoutingDecision(planResult.output);
@@ -7075,6 +7268,7 @@ ${guidance}`
       }
 
       // 7. Decide whether to escalate
+      this.publishCheckpoint("routed", { sessionId: planResult.sessionId || undefined });
       const shouldEscalate = this.shouldEscalate(routing, hasGap, isImplementationTask);
       
       if (shouldEscalate) {
@@ -7197,6 +7391,10 @@ ${guidance}`
         }
         throw new Error(`Build failed: ${buildResult.output}`);
       }
+
+      this.publishCheckpoint("implementation_step_complete", {
+        sessionId: buildResult.sessionId || planResult.sessionId || undefined,
+      });
 
       // Keep the latest session ID persisted
       if (buildResult.sessionId) {
@@ -7329,6 +7527,10 @@ ${guidance}`
             break;
           }
 
+          this.publishCheckpoint("implementation_step_complete", {
+            sessionId: buildResult.sessionId || planResult.sessionId || undefined,
+          });
+
           // Reset anomaly tracking for fresh window
           lastAnomalyCount = anomalyStatus.total;
           prUrl = this.updateOpenPrSnapshot(
@@ -7406,6 +7608,9 @@ ${guidance}`
             break;
           }
         } else {
+          this.publishCheckpoint("implementation_step_complete", {
+            sessionId: buildResult.sessionId || planResult.sessionId || undefined,
+          });
           prUrl = this.updateOpenPrSnapshot(
             task,
             prUrl,
@@ -7478,6 +7683,8 @@ ${guidance}`
         prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
       }
 
+      this.publishCheckpoint("pr_ready", { sessionId: buildResult.sessionId || planResult.sessionId || undefined });
+
       const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);
       if (pausedMerge) return pausedMerge;
 
@@ -7498,6 +7705,10 @@ ${guidance}`
 
       const pausedMergeAfter = await this.pauseIfHardThrottled(task, "merge (post)", mergeGate.sessionId || buildResult.sessionId);
       if (pausedMergeAfter) return pausedMergeAfter;
+
+      this.publishCheckpoint("merge_step_complete", {
+        sessionId: mergeGate.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
+      });
 
       prUrl = mergeGate.prUrl;
       buildResult.sessionId = mergeGate.sessionId;
@@ -7534,6 +7745,10 @@ ${guidance}`
         }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
+
+      this.publishCheckpoint("survey_complete", {
+        sessionId: surveyResult.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
+      });
 
       return await this.finalizeTaskSuccess({
         task,
@@ -7586,6 +7801,9 @@ ${guidance}`
       bodyPrefix?: string;
     }
   ): Promise<void> {
+    if (this.isGitHubQueueTask(task)) {
+      return;
+    }
     const vault = getBwrbVaultForStorage("create agent-run note");
     if (!vault) {
       return;
