@@ -121,6 +121,6 @@ export async function appendConsultantPacket(
   }
 }
 
-export async function readEscalationNote(notePath: string): Promise<string> {
+async function readEscalationNote(notePath: string): Promise<string> {
   return readFile(notePath, "utf8");
 }

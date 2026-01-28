@@ -2,8 +2,8 @@ import { redactSensitiveText } from "../redaction";
 
 export const CONSULTANT_SCHEMA_VERSION = 1;
 export const CONSULTANT_MARKER = "<!-- ralph-consultant:v1 -->";
-export const CONSULTANT_BRIEF_HEADING = "## Consultant Brief";
-export const CONSULTANT_DECISION_HEADING = "## Consultant Decision (machine)";
+const CONSULTANT_BRIEF_HEADING = "## Consultant Brief";
+const CONSULTANT_DECISION_HEADING = "## Consultant Decision (machine)";
 
 const BRIEF_SENTINEL_START = "RALPH_CONSULTANT_BRIEF_BEGIN";
 const BRIEF_SENTINEL_END = "RALPH_CONSULTANT_BRIEF_END";
