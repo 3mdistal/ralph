@@ -31,6 +31,7 @@ function printGlobalHelp(): void {
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
+      "  ralph sandbox seed                 Seed sandbox edge-case issues",
       "",
       "Options:",
       "  -h, --help                         Show help (also: ralph help [command])",
@@ -165,6 +166,17 @@ function printCommandHelp(command: string): void {
           "  ralph worktrees legacy --repo <owner/repo> --action <cleanup|migrate> [--dry-run]",
           "",
           "Manages legacy worktrees created under devDir (e.g. ~/Developer/worktree-<n>).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox seed --repo <owner/repo> [options]",
+          "",
+          "Seeds a sandbox repo with deterministic edge-case issues and relationships.",
         ].join("\n")
       );
       return;
