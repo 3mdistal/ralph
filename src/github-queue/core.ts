@@ -99,19 +99,50 @@ export function planClaim(currentLabels: string[]): {
   };
 }
 
-export function shouldRecoverStaleInProgress(params: {
+export type StaleInProgressRecoveryReason =
+  | "missing-op-state"
+  | "missing-session-id"
+  | "missing-heartbeat"
+  | "invalid-heartbeat"
+  | "stale-heartbeat";
+
+export function computeStaleInProgressRecovery(params: {
   labels: string[];
   opState?: TaskOpState | null;
   nowMs: number;
   ttlMs: number;
-}): boolean {
-  if (!params.labels.includes("ralph:in-progress")) return false;
-  if (typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs)) return false;
-  const heartbeat = params.opState?.heartbeatAt?.trim() ?? "";
-  if (!heartbeat) return false;
+}): { shouldRecover: boolean; reason?: StaleInProgressRecoveryReason } {
+  if (!params.labels.includes("ralph:in-progress")) return { shouldRecover: false };
+  if (typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs)) {
+    return { shouldRecover: false };
+  }
+
+  // Safety: only recover issues we have local op-state for.
+  // Without an op-state row we can't distinguish "another daemon is actively working" from "orphaned".
+  if (!params.opState) {
+    return { shouldRecover: false, reason: "missing-op-state" };
+  }
+
+  const sessionId = params.opState.sessionId?.trim() ?? "";
+  if (!sessionId) {
+    return { shouldRecover: true, reason: "missing-session-id" };
+  }
+
+  const heartbeat = params.opState.heartbeatAt?.trim() ?? "";
+  if (!heartbeat) {
+    return { shouldRecover: true, reason: "missing-heartbeat" };
+  }
+
   const heartbeatMs = Date.parse(heartbeat);
-  if (!Number.isFinite(heartbeatMs)) return false;
-  return params.nowMs - heartbeatMs > params.ttlMs;
+  if (!Number.isFinite(heartbeatMs)) {
+    return { shouldRecover: true, reason: "invalid-heartbeat" };
+  }
+
+  if (params.nowMs - heartbeatMs > params.ttlMs) {
+    return { shouldRecover: true, reason: "stale-heartbeat" };
+  }
+
+  return { shouldRecover: false };
 }
 
 export function deriveTaskView(params: {

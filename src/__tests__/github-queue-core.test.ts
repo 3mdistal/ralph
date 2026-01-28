@@ -6,7 +6,7 @@ import {
   deriveRalphStatus,
   deriveTaskView,
   planClaim,
-  shouldRecoverStaleInProgress,
+  computeStaleInProgressRecovery,
   statusToRalphLabelDelta,
 } from "../github-queue/core";
 
@@ -169,11 +169,11 @@ describe("github queue core", () => {
     expect(status).toBe("done");
   });
 
-  test("shouldRecoverStaleInProgress requires stale heartbeat", () => {
+  test("computeStaleInProgressRecovery recovers missing session id", () => {
     const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
     const ttlMs = 60_000;
 
-    const recover = shouldRecoverStaleInProgress({
+    const recovery = computeStaleInProgressRecovery({
       labels: ["ralph:in-progress"],
       opState: {
         repo: "3mdistal/ralph",
@@ -186,14 +186,54 @@ describe("github queue core", () => {
       ttlMs,
     });
 
-    expect(recover).toBe(true);
+    expect(recovery).toEqual({ shouldRecover: true, reason: "missing-session-id" });
   });
 
-  test("shouldRecoverStaleInProgress ignores released tasks", () => {
+  test("computeStaleInProgressRecovery recovers stale heartbeat", () => {
     const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
     const ttlMs = 60_000;
 
-    const recover = shouldRecoverStaleInProgress({
+    const recovery = computeStaleInProgressRecovery({
+      labels: ["ralph:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 63,
+        taskPath: "github:3mdistal/ralph#63",
+        heartbeatAt: "2026-01-11T00:00:00.000Z",
+        sessionId: "opencode-session-123",
+      },
+      nowMs,
+      ttlMs,
+    });
+
+    expect(recovery).toEqual({ shouldRecover: true, reason: "stale-heartbeat" });
+  });
+
+  test("computeStaleInProgressRecovery ignores fresh heartbeat", () => {
+    const nowMs = Date.parse("2026-01-11T00:01:00.000Z");
+    const ttlMs = 60_000;
+
+    const recovery = computeStaleInProgressRecovery({
+      labels: ["ralph:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 63,
+        taskPath: "github:3mdistal/ralph#63",
+        heartbeatAt: "2026-01-11T00:00:30.000Z",
+        sessionId: "opencode-session-123",
+      },
+      nowMs,
+      ttlMs,
+    });
+
+    expect(recovery.shouldRecover).toBe(false);
+  });
+
+  test("computeStaleInProgressRecovery ignores released tasks", () => {
+    const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
+    const ttlMs = 60_000;
+
+    const recovery = computeStaleInProgressRecovery({
       labels: ["ralph:in-progress"],
       opState: {
         repo: "3mdistal/ralph",
@@ -206,7 +246,7 @@ describe("github queue core", () => {
       ttlMs,
     });
 
-    expect(recover).toBe(false);
+    expect(recovery.shouldRecover).toBe(false);
   });
 
   test("deriveTaskView treats released tasks as queued", () => {
