@@ -1,4 +1,4 @@
-import { getConfig, getOpencodeDefaultProfileName, isOpencodeProfilesEnabled, listOpencodeProfileNames } from "../config";
+import { getConfig, isOpencodeProfilesEnabled, listOpencodeProfileNames } from "../config";
 import { readControlStateSnapshot, type DaemonMode } from "../drain";
 import { readDaemonRecord } from "../daemon-record";
 import { getEscalationsByStatus } from "../escalation-notes";
@@ -56,8 +56,8 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
   const controlProfile = control.opencodeProfile?.trim() || "";
 
-  const requestedProfile =
-    controlProfile === "auto" ? "auto" : controlProfile || getOpencodeDefaultProfileName() || null;
+  const defaultProfile = (config.opencode?.defaultProfile ?? "").trim() || null;
+  const requestedProfile = controlProfile === "auto" ? "auto" : controlProfile || defaultProfile;
 
   const now = Date.now();
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
@@ -239,8 +239,8 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
   const controlProfile = control.opencodeProfile?.trim() || "";
 
-  const requestedProfile =
-    controlProfile === "auto" ? "auto" : controlProfile || getOpencodeDefaultProfileName() || null;
+  const defaultProfile = (config.opencode?.defaultProfile ?? "").trim() || null;
+  const requestedProfile = controlProfile === "auto" ? "auto" : controlProfile || defaultProfile;
 
   const now = Date.now();
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
