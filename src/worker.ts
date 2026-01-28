@@ -7733,6 +7733,9 @@ ${guidance}`
       bodyPrefix?: string;
     }
   ): Promise<void> {
+    if (this.isGitHubQueueTask(task)) {
+      return;
+    }
     const vault = getBwrbVaultForStorage("create agent-run note");
     if (!vault) {
       return;
