@@ -15,7 +15,7 @@ type SeedArgs = {
 const DEFAULT_MANIFEST = "sandbox/seed-manifest.v1.json";
 const DEFAULT_OUTPUT = "sandbox/seed-ids.v1.json";
 
-export function printSandboxSeedHelp(): void {
+function printSandboxSeedHelp(): void {
   console.log(
     [
       "Usage:",

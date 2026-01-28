@@ -149,7 +149,7 @@ function validateScenario(scenario: SeedScenario, errors: string[], index: numbe
   }
 }
 
-export function validateSeedManifest(manifest: SeedManifest): ValidationResult {
+function validateSeedManifest(manifest: SeedManifest): ValidationResult {
   const errors: string[] = [];
   if (manifest.version !== "v1") errors.push(`version must be "v1"`);
   if (!isNonEmptyString(manifest.seedLabel)) errors.push(`seedLabel must be a non-empty string`);
