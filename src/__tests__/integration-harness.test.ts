@@ -52,7 +52,7 @@ async function writeTestConfig(): Promise<void> {
 const updateTaskStatusMock = mock(async () => true);
 
 const notifyEscalationMock = mock(async () => true);
-const notifyErrorMock = mock(async () => {});
+const notifyErrorMock = mock(async (_title: string, _body: string, _context?: unknown) => {});
 const notifyTaskCompleteMock = mock(async () => {});
 
 const runAgentMock = mock(async () => ({

@@ -1304,7 +1304,11 @@ export class RepoWorker {
       ].join("\n"),
     });
 
-    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, task.name);
+    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, {
+      taskName: task.name,
+      repo: task.repo,
+      issue: task.issue,
+    });
 
     const error = new Error(reason) as Error & { ralphRootDirty?: boolean };
     error.ralphRootDirty = true;
@@ -1651,7 +1655,12 @@ export class RepoWorker {
       fetchBaseBranch: async (prUrl) => this.getPullRequestBaseBranch(prUrl),
       addIssueLabel: async (issue, label) => this.addIssueLabel(issue, label),
       removeIssueLabel: async (issue, label) => this.removeIssueLabel(issue, label),
-      notifyError: async (title, body, taskName) => this.notify.notifyError(title, body, taskName ?? undefined),
+      notifyError: async (title, body, taskName) =>
+        this.notify.notifyError(title, body, {
+          taskName: taskName ?? undefined,
+          repo: params.task.repo,
+          issue: params.task.issue,
+        }),
       warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
     });
   }
@@ -4870,7 +4879,11 @@ ${guidance}`
         details,
         sessionId: recoveryResult.sessionId ?? task["session-id"]?.trim(),
       });
-      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, task.name);
+      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, {
+        taskName: task.name,
+        repo: task.repo,
+        issue: task.issue,
+      });
 
       return {
         taskName: task.name,
@@ -5381,7 +5394,11 @@ ${guidance}`
         },
       });
 
-      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+      await this.notify.notifyError(params.notifyTitle, reason, {
+        taskName: params.task.name,
+        repo: params.task.repo,
+        issue: params.task.issue,
+      });
 
       return {
         ok: false,
@@ -5426,7 +5443,11 @@ ${guidance}`
         },
       });
 
-      await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+      await this.notify.notifyError(params.notifyTitle, reason, {
+        taskName: params.task.name,
+        repo: params.task.repo,
+        issue: params.task.issue,
+      });
 
       return {
         ok: false,
@@ -5480,7 +5501,11 @@ ${guidance}`
             const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
             console.warn(`[ralph:worker:${this.repo}] ${reason}`);
             await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-            await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+            await this.notify.notifyError(params.notifyTitle, reason, {
+              taskName: params.task.name,
+              repo: params.task.repo,
+              issue: params.task.issue,
+            });
 
             return {
               ok: false,
@@ -5600,7 +5625,11 @@ ${guidance}`
           // best-effort
         }
         await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-        await this.notify.notifyError(params.notifyTitle, reason, params.task.name);
+        await this.notify.notifyError(params.notifyTitle, reason, {
+          taskName: params.task.name,
+          repo: params.task.repo,
+          issue: params.task.issue,
+        });
 
         return {
           ok: false,
@@ -6673,7 +6702,11 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), task.name);
+        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), {
+          taskName: task.name,
+          repo: task.repo,
+          issue: task.issue,
+        });
       }
 
       return {
@@ -7500,7 +7533,11 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), task.name);
+        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), {
+          taskName: task.name,
+          repo: task.repo,
+          issue: task.issue,
+        });
       }
 
       return {

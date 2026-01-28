@@ -1,6 +1,7 @@
 import { RALPH_LABEL_IN_BOT, RALPH_LABEL_IN_PROGRESS } from "./github-labels";
 import { computeMidpointLabelPlan } from "./midpoint-labels";
 import type { IssueRef } from "./github/issue-ref";
+import type { ErrorNotificationContext } from "./notify";
 
 const MIDPOINT_LABEL_TIMEOUT_MS = 10_000;
 
@@ -15,7 +16,7 @@ export type MidpointLabelerInput = {
   fetchBaseBranch: (prUrl: string) => Promise<string | null>;
   addIssueLabel: (issue: IssueRef, label: string) => Promise<void>;
   removeIssueLabel: (issue: IssueRef, label: string) => Promise<void>;
-  notifyError: (title: string, body: string, taskName?: string | null) => Promise<void>;
+  notifyError: (title: string, body: string, context?: ErrorNotificationContext) => Promise<void>;
   warn?: (message: string) => void;
 };
 
@@ -113,7 +114,11 @@ export async function applyMidpointLabelsBestEffort(input: MidpointLabelerInput)
     ].join("\n");
     try {
       await withTimeout(
-        input.notifyError("Midpoint label update failed", body, input.taskName ?? undefined),
+        input.notifyError("Midpoint label update failed", body, {
+          taskName: input.taskName ?? undefined,
+          repo: input.issueRef.repo,
+          issue: input.issue,
+        }),
         MIDPOINT_LABEL_TIMEOUT_MS,
         "notify midpoint label failure"
       );

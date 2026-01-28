@@ -1,13 +1,24 @@
 import { $ } from "bun";
 import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "./queue-backend";
 import type { TaskPriority } from "./queue/priority";
-import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
+import { hasIdempotencyKey, initStateDb, recordAlertOccurrence, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { appendBwrbNoteBody, buildEscalationPayload, buildIdeaPayload, createBwrbNote } from "./bwrb/artifacts";
+import { planAlertRecord } from "./alerts/core";
+import { GitHubClient } from "./github/client";
+import { parseIssueRef } from "./github/issue-ref";
+import { writeAlertToGitHub } from "./github/alert-writeback";
+import { writeRollupReadyToGitHub } from "./github/rollup-ready-writeback";
 
 const sanitizeNoteTitle = sanitizeNoteName;
 
 export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
+
+export type ErrorNotificationContext = {
+  repo?: string | null;
+  issue?: string | null;
+  taskName?: string | null;
+};
 
 // Cache for terminal-notifier availability check
 let terminalNotifierAvailable: boolean | null = null;
@@ -488,6 +499,30 @@ export async function notifyEscalation(ctx: EscalationContext): Promise<boolean>
 }
 
 export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: string[]): Promise<void> {
+  const prNumberMatch = prUrl.match(/\/pull\/(\d+)(?:$|\?)/);
+  const prNumber = prNumberMatch ? Number(prNumberMatch[1]) : null;
+
+  if (!prNumber || !Number.isFinite(prNumber)) {
+    console.warn(`[ralph:notify] Unable to parse rollup PR number from ${prUrl}`);
+  } else {
+    try {
+      const github = new GitHubClient(repo);
+      await writeRollupReadyToGitHub(
+        {
+          repo,
+          prNumber,
+          prUrl,
+          mergedPRs,
+        },
+        { github }
+      );
+    } catch (error: any) {
+      console.warn(
+        `[ralph:notify] Failed to write rollup-ready comment for ${repo}#${prNumber}: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
   const body = [
     `A rollup PR is ready for review in **${repo}**.`,
     "",
@@ -500,9 +535,75 @@ export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: 
   ].join("\n");
 
   await createNotification("rollup-ready", `Rollup for ${repo}`, body);
+
+  await sendDesktopNotification({
+    title: "Ralph: Rollup Ready",
+    subtitle: repo,
+    message: `Rollup PR ready: ${prUrl}`.slice(0, 120),
+    openUrl: prUrl,
+    sound: "Ping",
+  });
 }
 
-export async function notifyError(context: string, error: string, taskName?: string): Promise<void> {
+export async function notifyError(context: string, error: string, input?: ErrorNotificationContext): Promise<void> {
+  const taskName = input?.taskName ?? undefined;
+  const issueRaw = input?.issue?.trim() ?? "";
+  const issueRef = issueRaw ? parseIssueRef(issueRaw, input?.repo ?? "") : null;
+
+  if (issueRef) {
+    try {
+      initStateDb();
+      const planned = planAlertRecord({
+        kind: "error",
+        targetType: "issue",
+        targetNumber: issueRef.number,
+        context,
+        error,
+      });
+
+      const alert = recordAlertOccurrence({
+        repo: issueRef.repo,
+        targetType: planned.targetType,
+        targetNumber: planned.targetNumber,
+        kind: planned.kind,
+        fingerprint: planned.fingerprint,
+        summary: planned.summary,
+        details: planned.details,
+      });
+
+      try {
+        const github = new GitHubClient(issueRef.repo);
+        await writeAlertToGitHub(
+          {
+            repo: issueRef.repo,
+            issueNumber: issueRef.number,
+            taskName,
+            kind: planned.kind,
+            fingerprint: planned.fingerprint,
+            alertId: alert.id,
+            summary: alert.summary,
+            details: alert.details,
+            count: alert.count,
+            lastSeenAt: alert.lastSeenAt,
+          },
+          { github }
+        );
+      } catch (writeError: any) {
+        console.warn(
+          `[ralph:notify] Failed to write alert comment for ${issueRef.repo}#${issueRef.number}: ${
+            writeError?.message ?? String(writeError)
+          }`
+        );
+      }
+    } catch (error: any) {
+      console.warn(`[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`);
+    }
+  } else if (input?.repo || input?.issue) {
+    console.warn(
+      `[ralph:notify] Unable to resolve issue ref for alert (repo=${input?.repo ?? ""} issue=${input?.issue ?? ""})`
+    );
+  }
+
   const body = [
     `An error occurred during: **${context}**`,
     "",
@@ -517,7 +618,6 @@ export async function notifyError(context: string, error: string, taskName?: str
 
   await createNotification("error", `Error: ${context}`, body, taskName);
 
-  // Send desktop notification
   await sendDesktopNotification({
     title: "Ralph: Error",
     subtitle: taskName ?? "Task Error",
