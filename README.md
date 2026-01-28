@@ -150,6 +150,7 @@ sandbox = {
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `doneReconcileIntervalMs` (number): ms between GitHub done reconciliation checks (defaults to 300000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
+- `stall` (object, optional): idle session stall detector + recovery ladder (see below)
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 - `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
   - `managedConfigDir` (string, optional): absolute path for Ralph-managed OpenCode config (default: `$HOME/.ralph/opencode`)
@@ -526,7 +527,7 @@ In daemon mode, a single tool call can hang indefinitely. Ralph uses a watchdog 
 
 ### Configuration
 
-Configure via `~/.config/opencode/ralph/ralph.json` under `watchdog`:
+Configure via `~/.ralph/config.toml` or `~/.ralph/config.json` under `watchdog` (legacy `~/.config/opencode/ralph/ralph.json` is still supported):
 
 ```json
 {
@@ -541,6 +542,28 @@ Configure via `~/.config/opencode/ralph/ralph.json` under `watchdog`:
       "task": { "softMs": 180000, "hardMs": 600000 },
       "bash": { "softMs": 300000, "hardMs": 1800000 }
     }
+  }
+}
+```
+
+## Stall Detection (Idle Sessions)
+
+In daemon mode, an OpenCode run can wedge without tripping per-tool watchdog thresholds (e.g. stuck between tool calls). Ralph also detects run-level stalls by watching session activity and applying a deterministic recovery ladder:
+
+- **Nudge**: after `stall.nudgeAfterMs` of inactivity, re-queue the task to resume the same session with a nudge prompt
+- **Restart** (once): if it stalls again, re-queue with a cleared `session-id` to start a fresh session
+- **Escalate**: if it stalls again after the restart, escalate with trace pointers
+
+### Configuration
+
+```json
+{
+  "stall": {
+    "enabled": true,
+    "idleMs": 300000,
+    "nudgeAfterMs": 300000,
+    "restartAfterMs": 600000,
+    "maxRestarts": 1
   }
 }
 ```

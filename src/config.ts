@@ -205,6 +205,18 @@ export interface RalphConfig {
 
   devDir: string;          // base directory for repos (default: ~/Developer)
   watchdog?: WatchdogConfig;
+  /** Session stall detector / recovery ladder. */
+  stall?: {
+    enabled?: boolean;
+    /** Treat a session as idle after this long without new events (default: 5m). */
+    idleMs?: number;
+    /** Nudge the session after this idle duration (default: 5m). */
+    nudgeAfterMs?: number;
+    /** Restart (clear session-id) after this idle duration (default: 10m). */
+    restartAfterMs?: number;
+    /** Max restart attempts before escalating (default: 1). */
+    maxRestarts?: number;
+  };
   throttle?: ThrottleConfig;
   opencode?: OpencodeConfig;
   control?: ControlConfig;
