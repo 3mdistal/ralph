@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join } from "path";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 
 import { getRalphConfigJsonPath, getRalphConfigTomlPath, getRalphLegacyConfigPath } from "./paths";
+import { resolveRequestedOpencodeProfile, type RequestedOpencodeProfile } from "./opencode-profile-utils";
 
 export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
 import type { WatchdogConfig } from "./watchdog";
@@ -755,6 +756,8 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       loaded.opencode = attachManaged({ enabled: false });
     } else if (!enabled) {
       loaded.opencode = attachManaged({ enabled: false });
+    } else if (defaultProfile === "auto") {
+      loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
     } else if (defaultProfile && profiles[defaultProfile]) {
       loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
     } else {
@@ -1350,6 +1353,13 @@ export function getOpencodeDefaultProfileName(): string | null {
   const raw = cfg.opencode?.defaultProfile;
   const trimmed = typeof raw === "string" ? raw.trim() : "";
   return trimmed ? trimmed : null;
+}
+
+export function getRequestedOpencodeProfileName(controlProfileRaw?: string | null): RequestedOpencodeProfile {
+  return resolveRequestedOpencodeProfile({
+    controlProfile: controlProfileRaw,
+    defaultProfile: getOpencodeDefaultProfileName(),
+  });
 }
 
 export function resolveOpencodeProfile(name?: string | null): ResolvedOpencodeProfile | null {

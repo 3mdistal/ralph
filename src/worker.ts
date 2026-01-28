@@ -10,6 +10,7 @@ import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
   getOpencodeDefaultProfileName,
+  getRequestedOpencodeProfileName,
   getRepoBotBranch,
   getRepoConcurrencySlots,
   getRepoRequiredChecksOverride,
@@ -5785,7 +5786,7 @@ ${guidance}`
 
     const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-    const requested = control.opencodeProfile?.trim() ?? "";
+    const requested = getRequestedOpencodeProfileName(control.opencodeProfile);
 
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
@@ -5820,7 +5821,15 @@ ${guidance}`
         `[ralph:worker:${this.repo}] Control opencode_profile=${JSON.stringify(requested)} does not match a configured profile; ` +
           `falling back to defaultProfile=${JSON.stringify(getOpencodeDefaultProfileName() ?? "")}`
       );
-      resolved = resolveOpencodeProfile(null);
+      const fallbackRequested = getRequestedOpencodeProfileName(null);
+      if (fallbackRequested === "auto") {
+        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+          getThrottleDecision: this.throttle.getThrottleDecision,
+        });
+        resolved = chosen ? resolveOpencodeProfile(chosen) : null;
+      } else {
+        resolved = fallbackRequested ? resolveOpencodeProfile(fallbackRequested) : null;
+      }
     }
 
     if (!resolved) {
@@ -5852,27 +5861,27 @@ ${guidance}`
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
       const defaults = getConfig().control;
-      const controlProfile =
-        readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
+      const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile;
+      const requestedProfile = getRequestedOpencodeProfileName(controlProfile);
 
-      if (controlProfile === "auto") {
+      if (requestedProfile === "auto") {
         const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
           getThrottleDecision: this.throttle.getThrottleDecision,
         });
 
         decision = await this.throttle.getThrottleDecision(Date.now(), {
-          opencodeProfile: chosen ?? getOpencodeDefaultProfileName(),
+          opencodeProfile: chosen ?? null,
         });
       } else if (!hasSession) {
         // Safe to fail over between profiles before starting a new session.
         decision = (
-          await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null, {
+          await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile || null, {
             getThrottleDecision: this.throttle.getThrottleDecision,
           })
         ).decision;
       } else {
         // Do not fail over while a session is in flight/resuming.
-        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
+        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: requestedProfile || null });
       }
     }
 
