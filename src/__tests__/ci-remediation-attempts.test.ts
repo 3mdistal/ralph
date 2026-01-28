@@ -36,6 +36,21 @@ function buildGithubCommentStub(params: { owner: string; repo: string; issueNumb
 }
 
 describe("CI remediation attempts", () => {
+  test("CI-debug prompt uses detached checkout and push-to-head", () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const prompt = (worker as any).buildCiDebugPrompt({
+      prUrl: "https://github.com/3mdistal/ralph/pull/1",
+      baseRefName: "bot/integration",
+      headRefName: "feat/test-branch",
+      summary: { status: "failed", required: [], optional: [] },
+      timedOut: false,
+      remediationContext: "",
+    });
+
+    expect(prompt).toContain("gh pr checkout --detach");
+    expect(prompt).toContain("git push origin HEAD:feat/test-branch");
+  });
+
   test("defaults CI remediation attempts to 5", () => {
     const prev = process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS;
     delete process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS;
