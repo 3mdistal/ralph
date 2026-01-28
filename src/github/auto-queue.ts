@@ -105,7 +105,7 @@ export type AutoQueueResult = {
   hadChanges: boolean;
 };
 
-export async function runAutoQueueOnce(params: {
+async function runAutoQueueOnce(params: {
   repo: RepoConfig;
   now?: () => Date;
 }): Promise<AutoQueueResult> {
