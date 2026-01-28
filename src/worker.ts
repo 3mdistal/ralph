@@ -3437,6 +3437,12 @@ ${guidance}`
     return /not up to date with the base branch/i.test(message);
   }
 
+  private isRequiredChecksExpectedMergeError(error: any): boolean {
+    const message = String(error?.stderr ?? error?.message ?? "");
+    if (!message) return false;
+    return /required status checks are expected/i.test(message);
+  }
+
   private shouldFallbackToWorktreeUpdate(message: string): boolean {
     const lowered = message.toLowerCase();
     if (!lowered) return false;
@@ -5710,8 +5716,14 @@ ${guidance}`
         }
         return { ok: true, prUrl, sessionId };
       } catch (error: any) {
-        if (!didUpdateBranch && this.isOutOfDateMergeError(error)) {
-          console.log(`[ralph:worker:${this.repo}] PR out of date with base; updating branch ${prUrl}`);
+        const shouldUpdateBeforeRetry =
+          !didUpdateBranch && (this.isOutOfDateMergeError(error) || this.isRequiredChecksExpectedMergeError(error));
+
+        if (shouldUpdateBeforeRetry) {
+          const why = this.isRequiredChecksExpectedMergeError(error)
+            ? "required checks expected"
+            : "out of date with base";
+          console.log(`[ralph:worker:${this.repo}] PR ${why}; updating branch ${prUrl}`);
           didUpdateBranch = true;
           try {
             await this.updatePullRequestBranch(prUrl, params.repoPath);
