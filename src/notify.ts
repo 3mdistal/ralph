@@ -20,6 +20,8 @@ export type ErrorNotificationContext = {
   taskName?: string | null;
 };
 
+type ErrorNotificationInput = ErrorNotificationContext | string | null | undefined;
+
 // Cache for terminal-notifier availability check
 let terminalNotifierAvailable: boolean | null = null;
 
@@ -574,10 +576,12 @@ export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: 
   });
 }
 
-export async function notifyError(context: string, error: string, input?: ErrorNotificationContext): Promise<void> {
-  const taskName = input?.taskName ?? undefined;
-  const issueRaw = input?.issue?.trim() ?? "";
-  const issueRef = issueRaw ? parseIssueRef(issueRaw, input?.repo ?? "") : null;
+export async function notifyError(context: string, error: string, input?: ErrorNotificationInput): Promise<void> {
+  const normalizedInput: ErrorNotificationContext | undefined =
+    typeof input === "string" ? { taskName: input } : input ?? undefined;
+  const taskName = normalizedInput?.taskName ?? undefined;
+  const issueRaw = normalizedInput?.issue?.trim() ?? "";
+  const issueRef = issueRaw ? parseIssueRef(issueRaw, normalizedInput?.repo ?? "") : null;
 
   if (issueRef) {
     try {
@@ -629,7 +633,7 @@ export async function notifyError(context: string, error: string, input?: ErrorN
         `[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
       );
     }
-  } else if (input?.repo) {
+  } else if (normalizedInput?.repo) {
     try {
       initStateDb();
       const planned = planAlertRecord({
@@ -640,7 +644,7 @@ export async function notifyError(context: string, error: string, input?: ErrorN
         error,
       });
       recordAlertOccurrence({
-        repo: input.repo,
+        repo: normalizedInput.repo,
         targetType: planned.targetType,
         targetNumber: planned.targetNumber,
         kind: planned.kind,
@@ -650,11 +654,11 @@ export async function notifyError(context: string, error: string, input?: ErrorN
       });
     } catch (recordError: any) {
       console.warn(
-        `[ralph:notify] Failed to record repo alert for ${input.repo}: ${recordError?.message ?? String(recordError)}`
+        `[ralph:notify] Failed to record repo alert for ${normalizedInput.repo}: ${recordError?.message ?? String(recordError)}`
       );
     }
-  } else if (input?.issue) {
-    console.warn(`[ralph:notify] Unable to resolve issue ref for alert (issue=${input?.issue ?? ""})`);
+  } else if (normalizedInput?.issue) {
+    console.warn(`[ralph:notify] Unable to resolve issue ref for alert (issue=${normalizedInput?.issue ?? ""})`);
   }
 
   const body = [
