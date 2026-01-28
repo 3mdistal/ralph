@@ -32,6 +32,11 @@ export function hasSandboxMarker(repo: SandboxRepoIdentity): boolean {
   return topics.map(normalizeValue).includes(SANDBOX_MARKER_TOPIC);
 }
 
+export function hasFailedTopic(repo: { topics?: string[] }): boolean {
+  const topics = repo.topics ?? [];
+  return topics.map(normalizeValue).includes(SANDBOX_FAILED_TOPIC);
+}
+
 export function isSandboxMutableRepo(repo: SandboxRepoIdentity, rules: SandboxSelectorRules): boolean {
   return isSandboxCandidate(repo, rules) && hasSandboxMarker(repo);
 }

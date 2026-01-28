@@ -1,4 +1,4 @@
-import { SANDBOX_FAILED_TOPIC } from "./selector";
+import { hasFailedTopic } from "./selector";
 
 export type SandboxRetentionPolicy = {
   keepLast: number;
@@ -34,10 +34,6 @@ function normalizeInt(value: number): number {
   return Math.max(0, Math.floor(value));
 }
 
-function hasFailedTopic(topics: string[]): boolean {
-  return topics.map((topic) => topic.trim().toLowerCase()).includes(SANDBOX_FAILED_TOPIC);
-}
-
 export function buildSandboxRetentionPlan(params: {
   repos: SandboxRepoInfo[];
   policy: SandboxRetentionPolicy;
@@ -66,9 +62,9 @@ export function buildSandboxRetentionPlan(params: {
       return { repo, keep: true, reason: "invalidCreatedAt" };
     }
 
-    if (keepFailedDays > 0 && hasFailedTopic(repo.topics)) {
-      const ageDays = Math.floor((nowMs - createdAtMs) / DAY_MS);
-      if (ageDays <= keepFailedDays) {
+    if (keepFailedDays > 0 && hasFailedTopic({ topics: repo.topics })) {
+      const cutoffMs = nowMs - keepFailedDays * DAY_MS;
+      if (createdAtMs >= cutoffMs) {
         return { repo, keep: true, reason: "failedWithinDays" };
       }
     }

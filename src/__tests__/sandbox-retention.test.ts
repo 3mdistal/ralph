@@ -70,4 +70,31 @@ describe("sandbox retention", () => {
 
     expect(decisions[0]?.keep).toBe(false);
   });
+
+  test("failed retention respects cutoff timestamp", () => {
+    const decisions = buildSandboxRetentionPlan({
+      repos: [
+        repo({
+          fullName: "3mdistal/ralph-sandbox-cutoff",
+          createdAt: "2026-01-14T00:00:00.000Z",
+          topics: [SANDBOX_FAILED_TOPIC],
+        }),
+        repo({
+          fullName: "3mdistal/ralph-sandbox-before-cutoff",
+          createdAt: "2026-01-13T23:59:59.000Z",
+          topics: [SANDBOX_FAILED_TOPIC],
+        }),
+      ],
+      policy: { keepLast: 0, keepFailedDays: 14 },
+      nowMs,
+    });
+
+    const cutoff = decisions.find((d) => d.repo.fullName.endsWith("sandbox-cutoff"));
+    const before = decisions.find((d) => d.repo.fullName.endsWith("before-cutoff"));
+
+    expect(cutoff?.keep).toBe(true);
+    expect(cutoff?.reason).toBe("failedWithinDays");
+    expect(before?.keep).toBe(false);
+    expect(before?.reason).toBe("expired");
+  });
 });

@@ -9,10 +9,13 @@ import {
 } from "../github/sandbox-repos";
 import { getSandboxProfileConfig, getSandboxRetentionPolicy } from "../config";
 import { executeSandboxActions } from "../sandbox/plan-executor";
+import { mapWithConcurrency } from "../sandbox/concurrency";
+import { buildSandboxPrunePlan } from "../sandbox/prune-plan";
 import { buildSandboxRetentionPlan } from "../sandbox/retention";
 import {
   SANDBOX_FAILED_TOPIC,
   SANDBOX_MARKER_TOPIC,
+  hasFailedTopic,
   hasSandboxMarker,
   isSandboxCandidate,
   type SandboxSelectorRules,
@@ -29,6 +32,7 @@ type SandboxFlags = {
 };
 
 const DEFAULT_MAX_MUTATIONS = 20;
+const DEFAULT_GITHUB_CONCURRENCY = 5;
 
 function formatSandboxUsage(): string {
   return [
@@ -166,14 +170,15 @@ async function listSandboxCandidates(rules: SandboxSelectorRules, owners: string
   return repos;
 }
 
-async function hydrateTopics(repos: SandboxRepoRecord[]): Promise<SandboxRepoRecord[]> {
-  return await Promise.all(
-    repos.map(async (repo) => {
-      const github = new GitHubClient(repo.fullName);
-      const topics = await fetchRepoTopics({ github, repoFullName: repo.fullName });
-      return { ...repo, topics };
-    })
-  );
+async function hydrateTopics(
+  repos: SandboxRepoRecord[],
+  concurrency: number = DEFAULT_GITHUB_CONCURRENCY
+): Promise<SandboxRepoRecord[]> {
+  return await mapWithConcurrency(repos, concurrency, async (repo) => {
+    const github = new GitHubClient(repo.fullName);
+    const topics = await fetchRepoTopics({ github, repoFullName: repo.fullName });
+    return { ...repo, topics };
+  });
 }
 
 function selectActionMode(flags: SandboxFlags): SandboxActionMode {
@@ -204,9 +209,13 @@ async function runSandboxTag(args: string[]): Promise<void> {
   }
 
   const withTopics = await hydrateTopics(candidates);
-  const pending = withTopics.filter((repo) => !hasSandboxMarker(repo));
+  const pending = withTopics.filter((repo) => {
+    const needsMarker = !hasSandboxMarker(repo);
+    const needsFailed = failed && !hasFailedTopic(repo);
+    return needsMarker || needsFailed;
+  });
   if (pending.length === 0) {
-    console.log("All sandbox candidate repos already have the ralph-sandbox marker.");
+    console.log("All sandbox candidate repos already have the required topics.");
     process.exit(0);
   }
 
@@ -214,8 +223,11 @@ async function runSandboxTag(args: string[]): Promise<void> {
 
   console.log(`Sandbox tag plan: ${selected.length} repo(s)${flags.dryRun ? " (dry-run)" : ""}`);
   for (const repo of selected) {
-    const extras = failed ? ` +${SANDBOX_FAILED_TOPIC}` : "";
-    console.log(`- ${repo.fullName} -> add ${SANDBOX_MARKER_TOPIC}${extras}`);
+    const additions = [
+      !hasSandboxMarker(repo) ? SANDBOX_MARKER_TOPIC : null,
+      failed && !hasFailedTopic(repo) ? SANDBOX_FAILED_TOPIC : null,
+    ].filter(Boolean);
+    console.log(`- ${repo.fullName} -> add ${additions.join(" +")}`);
   }
   if (truncated) {
     console.warn(`Truncated to ${selected.length} repo(s) due to --max.`);
@@ -225,6 +237,7 @@ async function runSandboxTag(args: string[]): Promise<void> {
   const result = await executeSandboxActions({
     actions,
     apply: flags.apply,
+    concurrency: DEFAULT_GITHUB_CONCURRENCY,
     execute: async (action) => {
       const github = new GitHubClient(action.repoFullName);
       await ensureRepoTopics({
@@ -237,6 +250,14 @@ async function runSandboxTag(args: string[]): Promise<void> {
 
   if (flags.apply && result.executed.length > 0) {
     console.log(`Tagged ${result.executed.length} repo(s).`);
+  }
+
+  if (flags.apply && result.failed.length > 0) {
+    console.error(`Failed to tag ${result.failed.length} repo(s):`);
+    for (const failure of result.failed) {
+      console.error(`- ${failure.action.repoFullName}: ${failure.error}`);
+    }
+    process.exit(1);
   }
 
   process.exit(0);
@@ -278,9 +299,10 @@ async function runSandboxTeardown(args: string[]): Promise<void> {
   );
 
   const actions = [{ repoFullName, action: mode }];
-  await executeSandboxActions({
+  const result = await executeSandboxActions({
     actions,
     apply: flags.apply,
+    concurrency: DEFAULT_GITHUB_CONCURRENCY,
     execute: async (action) => {
       const client = new GitHubClient(action.repoFullName);
       if (action.action === "delete") {
@@ -290,6 +312,12 @@ async function runSandboxTeardown(args: string[]): Promise<void> {
       }
     },
   });
+
+  if (flags.apply && result.failed.length > 0) {
+    const failure = result.failed[0];
+    console.error(`Failed to ${mode} ${repoFullName}: ${failure?.error ?? "unknown error"}`);
+    process.exit(1);
+  }
 
   process.exit(0);
 }
@@ -348,44 +376,36 @@ async function runSandboxPrune(args: string[]): Promise<void> {
   });
 
   const mode = selectActionMode(flags);
-
-  const eligible = decisions.filter((decision) => !decision.keep && hasSandboxMarker(decision.repo));
-  const skippedMissingMarker = decisions.filter((decision) => !decision.keep && !hasSandboxMarker(decision.repo));
-
-  const ordered = [...eligible].sort((a, b) => {
-    const aMs = Date.parse(a.repo.createdAt);
-    const bMs = Date.parse(b.repo.createdAt);
-    if (Number.isFinite(aMs) && Number.isFinite(bMs) && aMs !== bMs) return aMs - bMs;
-    return a.repo.fullName.localeCompare(b.repo.fullName);
+  const prunePlan = buildSandboxPrunePlan({
+    decisions,
+    action: mode,
+    max: flags.max ?? DEFAULT_MAX_MUTATIONS,
   });
-
-  const { selected, truncated } = clampActions(ordered, flags.max ?? DEFAULT_MAX_MUTATIONS);
 
   console.log(
     `Sandbox prune plan: keepLast=${keepLast} keepFailedDays=${keepFailedDays} ` +
       `action=${mode}${flags.dryRun ? " (dry-run)" : ""}`
   );
-  console.log(`- keep: ${decisions.filter((d) => d.keep).length}`);
-  console.log(`- prune candidates: ${eligible.length}`);
-  if (skippedMissingMarker.length > 0) {
-    console.warn(`- skipped missing ${SANDBOX_MARKER_TOPIC}: ${skippedMissingMarker.length}`);
+  console.log(`- keep: ${prunePlan.keepCount}`);
+  console.log(`- prune candidates: ${prunePlan.candidateCount}`);
+  if (prunePlan.skippedMissingMarker.length > 0) {
+    console.warn(`- skipped missing ${SANDBOX_MARKER_TOPIC}: ${prunePlan.skippedMissingMarker.length}`);
   }
-  for (const decision of selected) {
-    console.log(`- ${decision.repo.fullName} -> ${mode} (${decision.reason})`);
+  if (prunePlan.skippedAlreadyArchived.length > 0) {
+    console.warn(`- skipped already archived: ${prunePlan.skippedAlreadyArchived.length}`);
   }
-  if (truncated) {
-    console.warn(`Truncated to ${selected.length} repo(s) due to --max.`);
+  for (const action of prunePlan.actions) {
+    const reason = action.reason ? ` (${action.reason})` : "";
+    console.log(`- ${action.repoFullName} -> ${mode}${reason}`);
+  }
+  if (prunePlan.truncated) {
+    console.warn(`Truncated to ${prunePlan.actions.length} repo(s) due to --max.`);
   }
 
-  const actions = selected.map((decision) => ({
-    repoFullName: decision.repo.fullName,
-    action: mode,
-    reason: decision.reason,
-  }));
-
-  await executeSandboxActions({
-    actions,
+  const result = await executeSandboxActions({
+    actions: prunePlan.actions,
     apply: flags.apply,
+    concurrency: DEFAULT_GITHUB_CONCURRENCY,
     execute: async (action) => {
       const client = new GitHubClient(action.repoFullName);
       if (action.action === "delete") {
@@ -395,6 +415,14 @@ async function runSandboxPrune(args: string[]): Promise<void> {
       }
     },
   });
+
+  if (flags.apply && result.failed.length > 0) {
+    console.error(`Failed to ${mode} ${result.failed.length} repo(s):`);
+    for (const failure of result.failed) {
+      console.error(`- ${failure.action.repoFullName}: ${failure.error}`);
+    }
+    process.exit(1);
+  }
 
   process.exit(0);
 }

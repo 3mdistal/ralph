@@ -18,5 +18,28 @@ describe("sandbox plan executor", () => {
     expect(calls).toBe(0);
     expect(result.executed.length).toBe(0);
     expect(result.skipped.length).toBe(1);
+    expect(result.failed.length).toBe(0);
+  });
+
+  test("collects failures when apply=true", async () => {
+    const actions = [
+      { repoFullName: "3mdistal/ralph-sandbox-ok", action: "archive" as const },
+      { repoFullName: "3mdistal/ralph-sandbox-fail", action: "archive" as const },
+    ];
+
+    const result = await executeSandboxActions({
+      actions,
+      apply: true,
+      concurrency: 2,
+      execute: async (action) => {
+        if (action.repoFullName.endsWith("fail")) {
+          throw new Error("boom");
+        }
+      },
+    });
+
+    expect(result.executed.length).toBe(1);
+    expect(result.failed.length).toBe(1);
+    expect(result.failed[0]?.action.repoFullName).toBe("3mdistal/ralph-sandbox-fail");
   });
 });

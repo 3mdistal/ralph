@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   SANDBOX_MARKER_TOPIC,
+  hasFailedTopic,
   hasSandboxMarker,
   isSandboxCandidate,
   isSandboxMutableRepo,
@@ -22,6 +23,10 @@ describe("sandbox selector", () => {
 
   test("marker detection is case-insensitive", () => {
     expect(hasSandboxMarker({ owner: "3mdistal", name: "x", fullName: "3mdistal/x", topics: ["RALPH-SANDBOX"] })).toBe(true);
+  });
+
+  test("failed topic detection is case-insensitive", () => {
+    expect(hasFailedTopic({ topics: ["RUN-FAILED"] })).toBe(true);
   });
 
   test("mutable requires candidate + marker", () => {

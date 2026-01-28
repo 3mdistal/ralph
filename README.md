@@ -153,6 +153,11 @@ Defaults (override via flags or `sandbox.retention`):
 - keep failed repos (topic `run-failed`) for 14 days
 - default action is archive (reversible); delete requires `--delete --yes`
 
+Notes:
+
+- `ralph sandbox prune` skips repos that are already archived when action is `archive`.
+- `ralph sandbox tag --failed` adds the `run-failed` topic even if `ralph-sandbox` is already present.
+
 You can add the failed marker when tagging:
 
 ```bash
