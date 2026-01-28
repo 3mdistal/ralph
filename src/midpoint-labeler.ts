@@ -1,6 +1,7 @@
 import { RALPH_LABEL_IN_BOT, RALPH_LABEL_IN_PROGRESS } from "./github-labels";
 import { computeMidpointLabelPlan } from "./midpoint-labels";
 import type { IssueRef } from "./github/issue-ref";
+import type { ErrorNotificationContext } from "./notify";
 
 const MIDPOINT_LABEL_TIMEOUT_MS = 10_000;
 
@@ -15,7 +16,7 @@ export type MidpointLabelerInput = {
   fetchBaseBranch: (prUrl: string) => Promise<string | null>;
   addIssueLabel: (issue: IssueRef, label: string) => Promise<void>;
   removeIssueLabel: (issue: IssueRef, label: string) => Promise<void>;
-  notifyError: (title: string, body: string, taskName?: string | null) => Promise<void>;
+  notifyError: (title: string, body: string, context?: ErrorNotificationContext) => Promise<void>;
   warn?: (message: string) => void;
 };
 
@@ -37,19 +38,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 export async function applyMidpointLabelsBestEffort(input: MidpointLabelerInput): Promise<void> {
   const warn = input.warn ?? ((message: string) => console.warn(message));
   let baseBranch = input.baseBranch ?? "";
-  let defaultBranch: string | null = null;
-
-  try {
-    defaultBranch = await withTimeout(
-      input.fetchDefaultBranch(),
-      MIDPOINT_LABEL_TIMEOUT_MS,
-      "fetch default branch"
-    );
-  } catch (error: any) {
-    warn(`Failed to fetch default branch for midpoint labels: ${error?.message ?? String(error)}`);
-  }
-
-  const resolvedDefaultBranch = defaultBranch ?? "";
 
   if (!baseBranch) {
     try {
@@ -63,6 +51,11 @@ export async function applyMidpointLabelsBestEffort(input: MidpointLabelerInput)
       warn(`Failed to re-check PR base before midpoint labeling: ${error?.message ?? String(error)}`);
     }
   }
+
+  // Avoid blocking midpoint label cleanup on fetching the repo default branch.
+  // The default-branch lookup is network-bound and may be rate-limited; when it fails
+  // we prefer a conservative heuristic over stalling merges.
+  const resolvedDefaultBranch = "";
 
   const plan = computeMidpointLabelPlan({
     baseBranch,
@@ -113,7 +106,11 @@ export async function applyMidpointLabelsBestEffort(input: MidpointLabelerInput)
     ].join("\n");
     try {
       await withTimeout(
-        input.notifyError("Midpoint label update failed", body, input.taskName ?? undefined),
+        input.notifyError("Midpoint label update failed", body, {
+          taskName: input.taskName ?? undefined,
+          repo: input.issueRef.repo,
+          issue: input.issue,
+        }),
         MIDPOINT_LABEL_TIMEOUT_MS,
         "notify midpoint label failure"
       );
