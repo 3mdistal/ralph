@@ -26,6 +26,11 @@ Ralph’s control plane (operator dashboard) is **operator tooling** (not a user
 - Canonical spec: `docs/product/dashboard-mvp-control-plane-tui.md`
 - Issue map: https://github.com/3mdistal/ralph/issues/22 (MVP epic) and https://github.com/3mdistal/ralph/issues/23 (docs/scope)
 
+Control plane API (MVP):
+
+- `GET /v1/state` (requires `Authorization: Bearer <token>`)
+- `WS /v1/events` with auth via `Authorization` header, `Sec-WebSocket-Protocol: ralph.bearer.<token>`, or `?access_token=`
+
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.0.0
@@ -211,15 +216,21 @@ ralph sandbox tag --failed --apply
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `concurrencySlots`, optional `maxWorkers` (deprecated), optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `concurrencySlots`, optional `maxWorkers` (deprecated), optional `schedulerPriority`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `repos[].concurrencySlots` (number): per-repo concurrency slots (defaults to 1; overrides `repos[].maxWorkers`)
 - `repos[].rollupBatchSize` (number): per-repo override for rollup batch size (defaults to `batchSize`)
+- `repos[].schedulerPriority` (number): per-repo scheduler priority weighting (default: 1 when enabled; clamped to 0.1..10). Effective weight = `schedulerPriority * issuePriorityWeight` (p0..p4 => 5..1). Scheduling switches to weighted selection when any repo sets this field; otherwise legacy round-robin remains.
 - `ownershipTtlMs` (number): task ownership TTL in milliseconds (defaults to 60000)
 - `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
 - `repos[].autoUpdateBehindLabel` (string): optional label gate required for proactive update-branch
 - `repos[].autoUpdateBehindMinMinutes` (number): minimum minutes between updates per PR (default: 30)
+- `repos[].autoQueue` (object, optional): auto-queue configuration
+  - `enabled` (boolean): enable auto-queue reconciliation (default: false)
+  - `scope` (string): `labeled-only` or `all-open` (default: `labeled-only`)
+  - `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
+  - `dryRun` (boolean): compute decisions without mutating labels (default: false)
 - `repos[].setup` (array): optional setup commands to run in the task worktree before any agent execution (operator-owned)
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
 - Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
@@ -234,6 +245,15 @@ ralph sandbox tag --failed --apply
   - `suppressMissingWarnings` (boolean): suppress warnings when control file missing (default: true)
 - `dashboard` (object, optional): control plane event persistence
   - `eventsRetentionDays` (number): days to keep `~/.ralph/events/YYYY-MM-DD.jsonl` logs (default: 14; UTC bucketing; cleanup on daemon startup)
+  - `controlPlane` (object, optional): local control plane server
+    - `enabled` (boolean): start the control plane server (default: false)
+    - `host` (string): bind host (default: `127.0.0.1`)
+    - `port` (number): bind port (default: `8787`)
+    - `token` (string): Bearer token required for all endpoints (server will not start without it)
+    - `allowRemote` (boolean): allow binding to non-loopback hosts (default: false)
+    - `exposeRawOpencodeEvents` (boolean): stream `log.opencode.event` payloads (default: false)
+    - `replayLastDefault` (number): default replay count for `/v1/events` (default: 50)
+    - `replayLastMax` (number): max replay count for `/v1/events` (default: 250)
 
 Note: `repos[].requiredChecks` is an explicit override. If omitted, Ralph derives required checks from GitHub branch protection on `bot/integration` (or `repos[].botBranch`), falling back to the repository default branch (usually `main`). If branch protection is missing or unreadable, Ralph does not gate merges. Ralph considers both check runs and legacy status contexts when matching available check names. Values must match the GitHub check context name. Set it to `[]` to disable merge gating for a repo.
 
@@ -265,6 +285,12 @@ Only these env vars are currently supported (unless noted otherwise):
 | Run log max bytes | `RALPH_RUN_LOG_MAX_BYTES` | `10485760` (10MB) |
 | Run log backups | `RALPH_RUN_LOG_MAX_BACKUPS` | `3` |
 | CI remediation attempts | `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` | `2` |
+| Control plane enabled | `RALPH_DASHBOARD_ENABLED` | `false` |
+| Control plane host | `RALPH_DASHBOARD_HOST` | `127.0.0.1` |
+| Control plane port | `RALPH_DASHBOARD_PORT` | `8787` |
+| Control plane token | `RALPH_DASHBOARD_TOKEN` | (none) |
+| Control plane replay default | `RALPH_DASHBOARD_REPLAY_DEFAULT` | `50` |
+| Control plane replay max | `RALPH_DASHBOARD_REPLAY_MAX` | `250` |
 
 Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
@@ -299,7 +325,7 @@ bun dev
 bun run status
 ```
 
-Status output includes blocked tasks with reasons and idle age.
+Status output includes blocked tasks with reasons/idle age and recent alert summaries (when available).
 
 Machine-readable output:
 
@@ -307,7 +333,7 @@ Machine-readable output:
 bun run status --json
 ```
 
-JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, and a short `blockedDetailsSnippet`.
+JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, a short `blockedDetailsSnippet`, and per-task `alerts` summaries when present.
 
 Live updates (prints when status changes):
 
@@ -478,6 +504,24 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
 
+### ralphctl (operator CLI)
+
+`ralphctl` wraps the control file and restart flow:
+
+- `ralphctl status [--json]`
+- `ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]`
+- `ralphctl resume`
+- `ralphctl restart [--grace 5m] [--start-cmd "<command>"]`
+- `ralphctl upgrade [--grace 5m] [--start-cmd "<command>"] [--upgrade-cmd "<command>"]`
+
+Daemon discovery for restart/upgrade uses a lease record at:
+
+- `$XDG_STATE_HOME/ralph/daemon.json`
+- Fallback: `~/.local/state/ralph/daemon.json`
+- Last resort: `/tmp/ralph/<uid>/daemon.json`
+
+The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
+
 ## Managed OpenCode config (daemon runs)
 
 Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `$HOME/.ralph/opencode`. This directory is owned by Ralph and overwritten on startup to match the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Override precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. Overrides must be absolute paths (no `~` expansion). For safety, Ralph refuses to manage non-managed directories unless they already contain the `.ralph-managed-opencode` marker file. This does not change OpenCode profile storage; profiles still control XDG roots for auth/storage/usage logs.
@@ -636,6 +680,7 @@ Shows the latest persisted deterministic gate state and any bounded artifacts fo
 
 - Paths must be absolute (no `~` expansion).
 - New tasks start under the active `opencode_profile` from the control file (or `defaultProfile` when unset).
+- `defaultProfile` may be set to `"auto"` to auto-select a profile for new work when no control profile is set.
 - Tasks persist `opencode-profile` in frontmatter and always resume under the same profile.
 - Throttle is computed per profile—a throttled profile won't affect tasks on other profiles.
 

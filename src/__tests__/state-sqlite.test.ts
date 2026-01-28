@@ -36,6 +36,9 @@ import {
   recordRalphRunSessionUse,
   recordTaskSnapshot,
   recordPrSnapshot,
+  recordAlertOccurrence,
+  recordAlertDeliveryAttempt,
+  listIssueAlertSummaries,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
   recordRollupMerge,
@@ -162,7 +165,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("10");
+      expect(meta.value).toBe("11");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -197,6 +200,16 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_done_reconcile_cursor'")
         .get() as { name?: string } | undefined;
       expect(doneCursorTable?.name).toBe("repo_github_done_reconcile_cursor");
+
+      const alertsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alerts'")
+        .get() as { name?: string } | undefined;
+      expect(alertsTable?.name).toBe("alerts");
+
+      const deliveriesTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alert_deliveries'")
+        .get() as { name?: string } | undefined;
+      expect(deliveriesTable?.name).toBe("alert_deliveries");
     } finally {
       migrated.close();
     }
@@ -240,7 +253,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("10");
+      expect(meta.value).toBe("11");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -265,6 +278,15 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_artifacts'")
         .get() as { name?: string } | undefined;
       expect(gateArtifactsTable?.name).toBe("ralph_run_gate_artifacts");
+      const alertsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alerts'")
+        .get() as { name?: string } | undefined;
+      expect(alertsTable?.name).toBe("alerts");
+
+      const deliveriesTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alert_deliveries'")
+        .get() as { name?: string } | undefined;
+      expect(deliveriesTable?.name).toBe("alert_deliveries");
     } finally {
       migrated.close();
     }
@@ -715,7 +737,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("10");
+      expect(meta.value).toBe("11");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -951,5 +973,65 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const openBatches = listOpenRollupBatches();
     expect(openBatches).toHaveLength(1);
     expect(openBatches[0].id).toBe(newBatch.id);
+  });
+
+  test("records alert occurrences and summaries", () => {
+    initStateDb();
+
+    const first = recordAlertOccurrence({
+      repo: "3mdistal/ralph",
+      targetType: "issue",
+      targetNumber: 42,
+      kind: "error",
+      fingerprint: "abc",
+      summary: "Error: build failed",
+      details: "build failed",
+      at: "2026-01-11T00:00:10.000Z",
+    });
+
+    const second = recordAlertOccurrence({
+      repo: "3mdistal/ralph",
+      targetType: "issue",
+      targetNumber: 42,
+      kind: "error",
+      fingerprint: "abc",
+      summary: "Error: build failed",
+      details: "build failed again",
+      at: "2026-01-11T00:00:11.000Z",
+    });
+
+    const third = recordAlertOccurrence({
+      repo: "3mdistal/ralph",
+      targetType: "issue",
+      targetNumber: 42,
+      kind: "error",
+      fingerprint: "def",
+      summary: "Error: test failed",
+      details: "test failed",
+      at: "2026-01-11T00:00:12.000Z",
+    });
+
+    recordAlertDeliveryAttempt({
+      alertId: third.id,
+      channel: "github-issue-comment",
+      markerId: "marker-1",
+      targetType: "issue",
+      targetNumber: 42,
+      status: "success",
+      commentId: 1,
+      commentUrl: "https://github.com/3mdistal/ralph/issues/42#issuecomment-1",
+      at: "2026-01-11T00:00:13.000Z",
+    });
+
+    const summaries = listIssueAlertSummaries({ repo: "3mdistal/ralph", issueNumbers: [42, 99] });
+    const summary = summaries.find((row) => row.issueNumber === 42);
+
+    expect(first.id).toBeGreaterThan(0);
+    expect(second.id).toBe(first.id);
+    expect(third.id).not.toBe(first.id);
+    expect(summary?.totalCount).toBe(3);
+    expect(summary?.latestSummary).toBe("Error: test failed");
+    expect(summary?.latestAt).toBe("2026-01-11T00:00:12.000Z");
+    expect(summary?.latestCommentUrl).toBe("https://github.com/3mdistal/ralph/issues/42#issuecomment-1");
   });
 });

@@ -14,7 +14,7 @@ describe("midpoint labeler", () => {
   test("clears in-progress for non-bot merge", async () => {
     const addIssueLabelMock = mock(async () => {});
     const removeIssueLabelMock = mock(async () => {});
-    const notifyErrorMock = mock(async () => {});
+    const notifyErrorMock = mock(async (_title: string, _body: string, _context?: unknown) => {});
 
     await applyMidpointLabelsBestEffort({
       issueRef,
@@ -42,7 +42,7 @@ describe("midpoint labeler", () => {
     const removeIssueLabelMock = mock(async () => {
       throw new Error("label remove failed");
     });
-    const notifyErrorMock = mock(async () => {});
+    const notifyErrorMock = mock(async (_title: string, _body: string, _context?: unknown) => {});
     const warnMock = mock(() => {});
 
     await applyMidpointLabelsBestEffort({

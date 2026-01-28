@@ -1,0 +1,421 @@
+#!/usr/bin/env bun
+
+import { spawn } from "child_process";
+import { readDaemonRecord, resolveDaemonRecordPath, type DaemonRecord } from "./daemon-record";
+import { updateControlFile } from "./control-file";
+import { getStatusSnapshot } from "./commands/status";
+import type { StatusSnapshot } from "./status-snapshot";
+
+const DEFAULT_GRACE_MS = 5 * 60_000;
+const DRAIN_POLL_INTERVAL_MS = 1000;
+const DAEMON_START_TIMEOUT_MS = 30_000;
+const DAEMON_STOP_TIMEOUT_MS = 10_000;
+
+type CommandArgs = string[];
+
+function printGlobalHelp(): void {
+  console.log(
+    [
+      "ralphctl",
+      "",
+      "Usage:",
+      "  ralphctl status [--json]",
+      "  ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]",
+      "  ralphctl resume",
+      "  ralphctl restart [--grace 5m] [--force] [--start-cmd \"<command>\"]",
+      "  ralphctl upgrade [--grace 5m] [--force] [--start-cmd \"<command>\"] [--upgrade-cmd \"<command>\"]",
+      "",
+      "Options:",
+      "  -h, --help       Show help",
+      "  --json           Emit machine-readable JSON output",
+      "  --timeout <dur>  Drain timeout (e.g. 30s, 5m)",
+      "  --grace <dur>    Restart grace period (e.g. 30s, 5m)",
+      "  --pause-at-checkpoint <name>  Pause workers at checkpoint while draining",
+      "  --start-cmd <cmd>             Override daemon start command",
+      "  --upgrade-cmd <cmd>           Command to run before restart",
+      "  --force          Proceed with kill even when safety checks fail",
+    ].join("\n")
+  );
+}
+
+function printCommandHelp(command: string): void {
+  switch (command) {
+    case "status":
+      console.log(["Usage:", "  ralphctl status [--json]"].join("\n"));
+      return;
+    case "drain":
+      console.log([
+        "Usage:",
+        "  ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]",
+      ].join("\n"));
+      return;
+    case "resume":
+      console.log(["Usage:", "  ralphctl resume"].join("\n"));
+      return;
+    case "restart":
+      console.log([
+        "Usage:",
+        "  ralphctl restart [--grace 5m] [--force] [--start-cmd \"<command>\"]",
+      ].join("\n"));
+      return;
+    case "upgrade":
+      console.log([
+        "Usage:",
+        "  ralphctl upgrade [--grace 5m] [--force] [--start-cmd \"<command>\"] [--upgrade-cmd \"<command>\"]",
+      ].join("\n"));
+      return;
+    default:
+      printGlobalHelp();
+  }
+}
+
+function getFlagValue(args: CommandArgs, flag: string): string | null {
+  const idx = args.indexOf(flag);
+  if (idx < 0) return null;
+  const value = args[idx + 1];
+  if (!value || value.startsWith("-")) return null;
+  return value.trim();
+}
+
+function hasFlag(args: CommandArgs, flag: string): boolean {
+  return args.includes(flag);
+}
+
+function parseDuration(value: string | null): number | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^\d+$/.test(trimmed)) return Number(trimmed);
+  const match = trimmed.match(/^(\d+(?:\.\d+)?)(ms|s|m|h)$/);
+  if (!match) return null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount)) return null;
+  switch (match[2]) {
+    case "ms":
+      return amount;
+    case "s":
+      return amount * 1000;
+    case "m":
+      return amount * 60_000;
+    case "h":
+      return amount * 60 * 60_000;
+    default:
+      return null;
+  }
+}
+
+function splitCommandLine(value: string | null): string[] | null {
+  if (!value) return null;
+  const input = value.trim();
+  if (!input) return null;
+  const parts: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | null = null;
+
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+        continue;
+      }
+      if (ch === "\\" && quote === '"' && i + 1 < input.length) {
+        current += input[i + 1];
+        i += 1;
+        continue;
+      }
+      current += ch;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      if (current) {
+        parts.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (current) parts.push(current);
+  return parts.length > 0 ? parts : null;
+}
+
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForDrained(timeoutMs: number): Promise<StatusSnapshot> {
+  const deadline = Date.now() + timeoutMs;
+  let lastSnapshot: StatusSnapshot = await getStatusSnapshot();
+  while (Date.now() < deadline) {
+    if (lastSnapshot.starting.length === 0 && lastSnapshot.inProgress.length === 0) return lastSnapshot;
+    await sleep(DRAIN_POLL_INTERVAL_MS);
+    lastSnapshot = await getStatusSnapshot();
+  }
+  return lastSnapshot;
+}
+
+async function waitForDaemonRecordChange(oldRecord: DaemonRecord, timeoutMs: number): Promise<DaemonRecord> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const next = readDaemonRecord();
+    if (next && (next.daemonId !== oldRecord.daemonId || next.pid !== oldRecord.pid)) return next;
+    await sleep(500);
+  }
+  throw new Error("Timed out waiting for new daemon record");
+}
+
+async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isPidAlive(pid)) return true;
+    await sleep(250);
+  }
+  return !isPidAlive(pid);
+}
+
+function spawnDetached(command: string[], cwd: string): void {
+  const [exec, ...args] = command;
+  const child = spawn(exec, args, { cwd, stdio: "ignore", detached: true });
+  child.unref();
+}
+
+async function runUpgradeCommand(command: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const [exec, ...args] = command;
+    const child = spawn(exec, args, { stdio: "inherit" });
+    child.on("exit", (code: number | null) => {
+      if (code === 0) resolve();
+      else reject(new Error(`Upgrade command failed (exit ${code ?? "unknown"})`));
+    });
+    child.on("error", reject);
+  });
+}
+
+async function stopDaemon(record: DaemonRecord, force: boolean): Promise<void> {
+  if (!isPidAlive(record.pid)) {
+    console.log("Daemon process not running; skipping stop.");
+    return;
+  }
+
+  if (!force && !record.daemonId) {
+    throw new Error("Refusing to stop daemon without daemonId; use --force to override.");
+  }
+
+  try {
+    process.kill(record.pid, "SIGTERM");
+  } catch (e: any) {
+    throw new Error(`Failed to send SIGTERM: ${e?.message ?? String(e)}`);
+  }
+
+  const exited = await waitForProcessExit(record.pid, DAEMON_STOP_TIMEOUT_MS);
+  if (exited) return;
+
+  console.warn("Daemon did not exit after SIGTERM; sending SIGKILL.");
+  try {
+    process.kill(record.pid, "SIGKILL");
+  } catch (e: any) {
+    throw new Error(`Failed to send SIGKILL: ${e?.message ?? String(e)}`);
+  }
+  await waitForProcessExit(record.pid, DAEMON_STOP_TIMEOUT_MS);
+}
+
+function buildTaskKey(task: { repo: string; issue: string; name: string }): string {
+  return `${task.repo}#${task.issue}:${task.name}`;
+}
+
+function verifyResumption(before: StatusSnapshot, after: StatusSnapshot): void {
+  const expected = new Map<string, string>();
+  for (const task of before.inProgress) {
+    if (task.sessionId) expected.set(buildTaskKey(task), task.sessionId);
+  }
+  if (expected.size === 0) return;
+
+  const afterMap = new Map<string, string | null>();
+  for (const task of after.inProgress) {
+    afterMap.set(buildTaskKey(task), task.sessionId);
+  }
+
+  for (const [key, sessionId] of expected) {
+    if (!afterMap.has(key)) {
+      console.warn(`Task no longer in progress after restart: ${key}`);
+      continue;
+    }
+    const nextSessionId = afterMap.get(key);
+    if (nextSessionId && nextSessionId !== sessionId) {
+      throw new Error(`Task resumed with different session: ${key} (${sessionId} -> ${nextSessionId})`);
+    }
+  }
+}
+
+async function restartFlow(opts: {
+  graceMs: number;
+  force: boolean;
+  startCmd: string[] | null;
+  upgradeCmd: string[] | null;
+}): Promise<void> {
+  const beforeSnapshot = await getStatusSnapshot();
+
+  updateControlFile({
+    patch: {
+      mode: "draining",
+      drainTimeoutMs: opts.graceMs,
+    },
+  });
+
+  const drainedSnapshot = await waitForDrained(opts.graceMs);
+  if (drainedSnapshot.starting.length > 0 || drainedSnapshot.inProgress.length > 0) {
+    console.warn("Drain timeout reached; proceeding with restart.");
+  }
+
+  const daemonRecord = readDaemonRecord();
+  if (!daemonRecord) {
+    const recordPath = resolveDaemonRecordPath();
+    throw new Error(`Daemon record not found at ${recordPath}`);
+  }
+
+  await stopDaemon(daemonRecord, opts.force);
+
+  if (opts.upgradeCmd) {
+    console.log("Running upgrade command...");
+    await runUpgradeCommand(opts.upgradeCmd);
+  }
+
+  const command = opts.startCmd ?? daemonRecord.command;
+  if (!command || command.length === 0) {
+    throw new Error("Missing start command; pass --start-cmd to restart.");
+  }
+
+  console.log("Starting daemon...");
+  spawnDetached(command, daemonRecord.cwd || process.cwd());
+
+  const newRecord = await waitForDaemonRecordChange(daemonRecord, DAEMON_START_TIMEOUT_MS);
+  const afterSnapshot = await getStatusSnapshot();
+  if (afterSnapshot.mode === "draining") {
+    console.warn("Daemon still in draining mode after restart.");
+  }
+  verifyResumption(beforeSnapshot, afterSnapshot);
+  console.log(`Daemon restarted (pid=${newRecord.pid}, id=${newRecord.daemonId}).`);
+}
+
+async function run(): Promise<void> {
+  const args = process.argv.slice(2);
+  const cmd = args[0];
+  const hasHelp = hasFlag(args, "--help") || hasFlag(args, "-h");
+
+  if (!cmd || cmd.startsWith("-")) {
+    if (hasHelp) {
+      printGlobalHelp();
+      process.exit(0);
+    }
+    printGlobalHelp();
+    process.exit(2);
+  }
+
+  if (cmd === "help") {
+    const target = args[1];
+    if (!target || target.startsWith("-")) printGlobalHelp();
+    else printCommandHelp(target);
+    process.exit(0);
+  }
+
+  if (hasHelp) {
+    printCommandHelp(cmd);
+    process.exit(0);
+  }
+
+  if (cmd === "status") {
+    const json = hasFlag(args, "--json");
+    const snapshot = await getStatusSnapshot();
+    if (json) {
+      console.log(JSON.stringify(snapshot, null, 2));
+      process.exit(0);
+    }
+    console.log(`Mode: ${snapshot.mode}`);
+    console.log(`Queue backend: ${snapshot.queue.backend}`);
+    if (snapshot.daemon) {
+      console.log(
+        `Daemon: id=${snapshot.daemon.daemonId ?? "unknown"} pid=${snapshot.daemon.pid ?? "unknown"}`
+      );
+    }
+    console.log(`In-progress tasks: ${snapshot.inProgress.length}`);
+    console.log(`Queued tasks: ${snapshot.queued.length}`);
+    process.exit(0);
+  }
+
+  if (cmd === "drain") {
+    const timeoutMs = parseDuration(getFlagValue(args, "--timeout"));
+    const pauseAtCheckpoint = getFlagValue(args, "--pause-at-checkpoint");
+    const patch = {
+      mode: "draining" as const,
+      drainTimeoutMs: timeoutMs ?? undefined,
+      pauseRequested: pauseAtCheckpoint ? true : undefined,
+      pauseAtCheckpoint: pauseAtCheckpoint ?? undefined,
+    };
+    const { path } = updateControlFile({ patch });
+    const record = readDaemonRecord();
+    if (record?.pid && isPidAlive(record.pid)) {
+      try {
+        process.kill(record.pid, "SIGUSR1");
+      } catch {
+        // ignore
+      }
+    }
+    console.log(`Drain requested (control file: ${path}).`);
+    process.exit(0);
+  }
+
+  if (cmd === "resume") {
+    const patch = {
+      mode: "running" as const,
+      pauseRequested: null,
+      pauseAtCheckpoint: null,
+      drainTimeoutMs: null,
+    };
+    const { path } = updateControlFile({ patch });
+    const record = readDaemonRecord();
+    if (record?.pid && isPidAlive(record.pid)) {
+      try {
+        process.kill(record.pid, "SIGUSR1");
+      } catch {
+        // ignore
+      }
+    }
+    console.log(`Resume requested (control file: ${path}).`);
+    process.exit(0);
+  }
+
+  if (cmd === "restart" || cmd === "upgrade") {
+    const graceMs = parseDuration(getFlagValue(args, "--grace")) ?? DEFAULT_GRACE_MS;
+    const force = hasFlag(args, "--force");
+    const startCmd = splitCommandLine(getFlagValue(args, "--start-cmd"));
+    const upgradeCmd = cmd === "upgrade" ? splitCommandLine(getFlagValue(args, "--upgrade-cmd")) : null;
+    if (cmd === "upgrade" && !upgradeCmd) {
+      console.warn("No upgrade command provided; performing restart only.");
+    }
+    await restartFlow({ graceMs, force, startCmd, upgradeCmd });
+    process.exit(0);
+  }
+
+  console.error(`Unknown command: ${cmd}`);
+  printGlobalHelp();
+  process.exit(2);
+}
+
+run().catch((err) => {
+  console.error(err?.message ?? String(err));
+  process.exit(1);
+});
