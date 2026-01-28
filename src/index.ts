@@ -16,8 +16,11 @@ import {
   getConfig,
   getDashboardEventsRetentionDays,
   getOpencodeDefaultProfileName,
+  getRequestedOpencodeProfileName,
   listOpencodeProfileNames,
   getRepoConcurrencySlots,
+  getRepoSchedulerPriority,
+  DEFAULT_REPO_SCHEDULER_PRIORITY,
   getRepoPath,
   getSandboxProfileConfig,
   getSandboxProvisioningConfig,
@@ -43,6 +46,8 @@ import { RepoWorker, type AgentRun } from "./worker";
 import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
+import { createPrioritySelectorState } from "./scheduler/priority-policy";
+import { issuePriorityWeight } from "./queue/priority";
 
 import { DrainMonitor, readControlStateSnapshot, resolveControlFilePath, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
@@ -60,6 +65,7 @@ import { ralphEventBus } from "./dashboard/bus";
 import { publishDashboardEvent } from "./dashboard/publisher";
 import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
 import { startGitHubIssuePollers } from "./github-issues-sync";
+import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
@@ -80,6 +86,7 @@ import { runWorktreesCommand } from "./commands/worktrees";
 import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
+import { createEscalationConsultantScheduler } from "./escalation-consultant/scheduler";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 import { buildProvisionPlan } from "./sandbox/provisioning-core";
 import {
@@ -107,6 +114,7 @@ let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
 let githubDoneReconciler: { stop: () => void } | null = null;
+let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
 const daemonStartedAt = new Date().toISOString();
@@ -115,6 +123,7 @@ const daemonVersion = getRalphVersion();
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
+const ESCALATION_CONSULTANT_INTERVAL_MS = 60_000;
 
 const idleState = new Map<
   string,
@@ -165,10 +174,7 @@ function getActiveOpencodeProfileName(defaults?: Partial<ControlConfig>): string
     ? drainMonitor.getState()
     : readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
 
-  const fromControl = control.opencodeProfile?.trim() ?? "";
-  if (fromControl) return fromControl;
-
-  return getOpencodeDefaultProfileName();
+  return getRequestedOpencodeProfileName(control.opencodeProfile);
 }
 
 async function resolveEffectiveOpencodeProfileNameForNewTasks(
@@ -258,6 +264,7 @@ let globalSemaphore: Semaphore | null = null;
 const repoSemaphores = new Map<string, Semaphore>();
 
 const rrCursor = { value: 0 };
+const schedulerPriorityState = { value: createPrioritySelectorState() };
 
 function requireBwrbQueueOrExit(action: string): void {
   const state = getQueueBackendState();
@@ -289,6 +296,48 @@ function getRepoSemaphore(repo: string): Semaphore {
     repoSemaphores.set(repo, sem);
   }
   return sem;
+}
+
+function buildRepoOrderForTasks(tasks: AgentTask[], priorityTasks: AgentTask[]): string[] {
+  const repoSet = new Set<string>();
+  for (const task of tasks) repoSet.add(task.repo);
+  for (const task of priorityTasks) repoSet.add(task.repo);
+  if (repoSet.size === 0) return [];
+
+  const cfg = getConfig();
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+
+  for (const repo of cfg.repos.map((entry) => entry.name)) {
+    if (!repoSet.has(repo)) continue;
+    ordered.push(repo);
+    seen.add(repo);
+  }
+
+  const extras = Array.from(repoSet)
+    .filter((repo) => !seen.has(repo))
+    .sort((a, b) => a.localeCompare(b));
+
+  return ordered.concat(extras);
+}
+
+function buildSchedulerPriorityConfig(repoOrder: string[]): { enabled: boolean; priorities: Map<string, number> } {
+  const cfg = getConfig();
+  const explicit = new Map<string, number>();
+
+  for (const repo of cfg.repos) {
+    const priority = getRepoSchedulerPriority(repo.name);
+    if (priority !== null) explicit.set(repo.name, priority);
+  }
+
+  const enabled = explicit.size > 0;
+  const priorities = new Map<string, number>();
+
+  for (const repo of repoOrder) {
+    priorities.set(repo, explicit.get(repo) ?? DEFAULT_REPO_SCHEDULER_PRIORITY);
+  }
+
+  return { enabled, priorities };
 }
 
 async function checkIdleRollups(): Promise<void> {
@@ -489,6 +538,9 @@ const schedulerController = createSchedulerController({
     ensureSemaphores();
     if (!globalSemaphore) return;
 
+    const repoOrder = buildRepoOrderForTasks([], priorityTasks);
+    const priorityConfig = buildSchedulerPriorityConfig(repoOrder);
+
     void startQueuedTasks({
       gate: "running",
       tasks: [],
@@ -499,6 +551,11 @@ const schedulerController = createSchedulerController({
       globalSemaphore,
       getRepoSemaphore,
       rrCursor,
+      repoOrder,
+      repoPriorities: priorityConfig.priorities,
+      priorityEnabled: priorityConfig.enabled,
+      priorityState: schedulerPriorityState,
+      getTaskPriorityWeight: (task: AgentTask) => issuePriorityWeight(task.priority),
       shouldLog,
       log: (message) => console.log(message),
       startTask,
@@ -975,6 +1032,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
 
   const unblockedTasks = tasks.filter((task) => !(task._path && blockedPaths.has(task._path)));
   const queueTasks = isDraining ? [] : unblockedTasks;
+  const pendingResumes = Array.from(pendingResumeTasks.values());
 
   if (queueTasks.length > 0) {
     resetIdleState(queueTasks);
@@ -982,16 +1040,24 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
     resetIdleState(tasks);
   }
 
+  const repoOrder = buildRepoOrderForTasks(queueTasks, pendingResumes);
+  const priorityConfig = buildSchedulerPriorityConfig(repoOrder);
+
   const startedCount = await startQueuedTasks({
     gate: "running",
     tasks: queueTasks,
-    priorityTasks: Array.from(pendingResumeTasks.values()),
+    priorityTasks: pendingResumes,
     inFlightTasks,
     getTaskKey: (t) => getTaskKey(t),
     groupByRepo,
     globalSemaphore,
     getRepoSemaphore,
     rrCursor,
+    repoOrder,
+    repoPriorities: priorityConfig.priorities,
+    priorityEnabled: priorityConfig.enabled,
+    priorityState: schedulerPriorityState,
+    getTaskPriorityWeight: (task: AgentTask) => issuePriorityWeight(task.priority),
     shouldLog,
     log: (message) => console.log(message),
     startTask,
@@ -1262,15 +1328,30 @@ async function main(): Promise<void> {
     retentionDays,
   });
 
+  autoQueueRunner = createAutoQueueRunner({
+    scheduleQueuedTasksSoon,
+  });
+
   githubIssuePollers = startGitHubIssuePollers({
     repos: config.repos,
     baseIntervalMs: config.pollInterval,
     log: (message) => console.log(message),
-    onSync: ({ result }) => {
-      if (!result.hadChanges || isShuttingDown || queueState.backend !== "github") return;
+    onSync: ({ repo, result }) => {
+      if (isShuttingDown || queueState.backend !== "github") return;
+      const repoConfig = config.repos.find((entry) => entry.name === repo);
+      if (repoConfig && autoQueueRunner) {
+        autoQueueRunner.schedule(repoConfig, "sync");
+      }
+      if (!result.hadChanges) return;
       scheduleQueuedTasksSoon();
     },
   });
+
+  if (queueState.backend === "github") {
+    for (const repo of config.repos) {
+      autoQueueRunner?.schedule(repo, "startup");
+    }
+  }
 
   githubDoneReconciler = startGitHubDoneReconciler({
     repos: config.repos,
@@ -1406,6 +1487,28 @@ async function main(): Promise<void> {
     console.log(`[ralph] Queue backend disabled; running without queued tasks.${detail}`);
     resetIdleState([]);
   }
+
+  const escalationConsultantScheduler = createEscalationConsultantScheduler({
+    getEscalationsByStatus,
+    getVaultPath: () => getBwrbVaultIfValid(),
+    isShuttingDown: () => isShuttingDown,
+    allowModelSend: async () => {
+      const controlProfile = getActiveOpencodeProfileName(config.control ?? {});
+      const decision = await getThrottleDecision(Date.now(), {
+        opencodeProfile: controlProfile || getOpencodeDefaultProfileName() || null,
+      });
+      const gate = computeDaemonGate({ mode: getDaemonMode(config.control), throttle: decision, isShuttingDown });
+      return gate.allowModelSend;
+    },
+    repoPath: () => ".",
+    log: (message) => console.log(message),
+  });
+  void escalationConsultantScheduler.tick();
+  const escalationConsultantTimer = setInterval(() => {
+    escalationConsultantScheduler.tick().catch(() => {
+      // ignore
+    });
+  }, ESCALATION_CONSULTANT_INTERVAL_MS);
 
   const ownershipTtlMs = getConfig().ownershipTtlMs;
   const heartbeatIntervalMs = computeHeartbeatIntervalMs(ownershipTtlMs);
@@ -1831,11 +1934,7 @@ if (args[0] === "usage") {
   const now = Date.now();
   const config = getConfig();
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
-  const controlProfile = control.opencodeProfile?.trim() || "";
-
-  const requestedProfile =
-    profileOverride ||
-    (controlProfile === "auto" ? "auto" : controlProfile || getOpencodeDefaultProfileName() || null);
+  const requestedProfile = profileOverride || getRequestedOpencodeProfileName(control.opencodeProfile);
 
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
   const chosenProfile = selection.profileName;

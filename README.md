@@ -211,15 +211,21 @@ ralph sandbox tag --failed --apply
   - `appId` (number|string)
   - `installationId` (number|string)
   - `privateKeyPath` (string): path to a PEM file; key material is never logged
-- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `concurrencySlots`, optional `maxWorkers` (deprecated), optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
+- `repos` (array): per-repo overrides (`name`, `path`, `botBranch`, optional `requiredChecks`, optional `setup`, optional `concurrencySlots`, optional `maxWorkers` (deprecated), optional `schedulerPriority`, optional `rollupBatchSize`, optional `autoUpdateBehindPrs`, optional `autoUpdateBehindLabel`, optional `autoUpdateBehindMinMinutes`)
 - `maxWorkers` (number): global max concurrent tasks (validated as positive integer; defaults to 6)
 - `batchSize` (number): PRs before rollup (defaults to 10)
 - `repos[].concurrencySlots` (number): per-repo concurrency slots (defaults to 1; overrides `repos[].maxWorkers`)
 - `repos[].rollupBatchSize` (number): per-repo override for rollup batch size (defaults to `batchSize`)
+- `repos[].schedulerPriority` (number): per-repo scheduler priority weighting (default: 1 when enabled; clamped to 0.1..10). Effective weight = `schedulerPriority * issuePriorityWeight` (p0..p4 => 5..1). Scheduling switches to weighted selection when any repo sets this field; otherwise legacy round-robin remains.
 - `ownershipTtlMs` (number): task ownership TTL in milliseconds (defaults to 60000)
 - `repos[].autoUpdateBehindPrs` (boolean): proactively update PR branches when merge state is BEHIND (default: false)
 - `repos[].autoUpdateBehindLabel` (string): optional label gate required for proactive update-branch
 - `repos[].autoUpdateBehindMinMinutes` (number): minimum minutes between updates per PR (default: 30)
+- `repos[].autoQueue` (object, optional): auto-queue configuration
+  - `enabled` (boolean): enable auto-queue reconciliation (default: false)
+  - `scope` (string): `labeled-only` or `all-open` (default: `labeled-only`)
+  - `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
+  - `dryRun` (boolean): compute decisions without mutating labels (default: false)
 - `repos[].setup` (array): optional setup commands to run in the task worktree before any agent execution (operator-owned)
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
 - Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
@@ -646,6 +652,7 @@ Shows active profile, throttle state, pending escalations, and per-task profile 
 
 - Paths must be absolute (no `~` expansion).
 - New tasks start under the active `opencode_profile` from the control file (or `defaultProfile` when unset).
+- `defaultProfile` may be set to `"auto"` to auto-select a profile for new work when no control profile is set.
 - Tasks persist `opencode-profile` in frontmatter and always resume under the same profile.
 - Throttle is computed per profile—a throttled profile won't affect tasks on other profiles.
 

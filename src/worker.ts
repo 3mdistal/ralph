@@ -10,6 +10,7 @@ import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
   getOpencodeDefaultProfileName,
+  getRequestedOpencodeProfileName,
   getRepoBotBranch,
   getRepoConcurrencySlots,
   getRepoRequiredChecksOverride,
@@ -57,6 +58,7 @@ import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
+import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import {
   buildCiDebugCommentBody,
@@ -2431,40 +2433,11 @@ ${guidance}`
   }
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
-    const resolved = this.resolveDependencySignals(snapshot);
+    const resolved = resolveRelationshipSignals(snapshot);
     if (resolved.ignoredBodyBlockers > 0) {
       this.logIgnoredBodyBlockers(snapshot.issue, resolved.ignoredBodyBlockers, resolved.ignoreReason);
     }
-
-    if (!snapshot.coverage.githubDepsComplete && !resolved.hasBodyDepsCoverage) {
-      resolved.signals.push({ source: "github", kind: "blocked_by", state: "unknown" });
-    }
-    if (!snapshot.coverage.githubSubIssuesComplete) {
-      resolved.signals.push({ source: "github", kind: "sub_issue", state: "unknown" });
-    }
     return resolved.signals;
-  }
-
-  private resolveDependencySignals(snapshot: IssueRelationshipSnapshot): {
-    signals: RelationshipSignal[];
-    hasBodyDepsCoverage: boolean;
-    ignoredBodyBlockers: number;
-    ignoreReason: "complete" | "partial";
-  } {
-    const signals = [...snapshot.signals];
-    const githubDepsSignals = signals.filter((signal) => signal.source === "github" && signal.kind === "blocked_by");
-    const bodyDepsSignals = signals.filter((signal) => signal.source === "body" && signal.kind === "blocked_by");
-    const hasGithubDepsSignals = githubDepsSignals.length > 0;
-    const hasGithubDepsCoverage = snapshot.coverage.githubDepsComplete;
-    const shouldIgnoreBodyDeps = hasGithubDepsCoverage || (!hasGithubDepsCoverage && hasGithubDepsSignals);
-    const filteredSignals = shouldIgnoreBodyDeps
-      ? signals.filter((signal) => !(signal.source === "body" && signal.kind === "blocked_by"))
-      : signals;
-    const hasBodyDepsCoverage = snapshot.coverage.bodyDeps && !shouldIgnoreBodyDeps;
-    const ignoredBodyBlockers = shouldIgnoreBodyDeps ? bodyDepsSignals.length : 0;
-    const ignoreReason = hasGithubDepsCoverage ? "complete" : "partial";
-
-    return { signals: filteredSignals, hasBodyDepsCoverage, ignoredBodyBlockers, ignoreReason };
   }
 
   private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {
@@ -6123,7 +6096,7 @@ ${guidance}`
 
     const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-    const requested = control.opencodeProfile?.trim() ?? "";
+    const requested = getRequestedOpencodeProfileName(control.opencodeProfile);
 
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
@@ -6158,7 +6131,15 @@ ${guidance}`
         `[ralph:worker:${this.repo}] Control opencode_profile=${JSON.stringify(requested)} does not match a configured profile; ` +
           `falling back to defaultProfile=${JSON.stringify(getOpencodeDefaultProfileName() ?? "")}`
       );
-      resolved = resolveOpencodeProfile(null);
+      const fallbackRequested = getRequestedOpencodeProfileName(null);
+      if (fallbackRequested === "auto") {
+        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+          getThrottleDecision: this.throttle.getThrottleDecision,
+        });
+        resolved = chosen ? resolveOpencodeProfile(chosen) : null;
+      } else {
+        resolved = fallbackRequested ? resolveOpencodeProfile(fallbackRequested) : null;
+      }
     }
 
     if (!resolved) {
@@ -6190,27 +6171,27 @@ ${guidance}`
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
       const defaults = getConfig().control;
-      const controlProfile =
-        readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile?.trim() ?? "";
+      const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile;
+      const requestedProfile = getRequestedOpencodeProfileName(controlProfile);
 
-      if (controlProfile === "auto") {
+      if (requestedProfile === "auto") {
         const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
           getThrottleDecision: this.throttle.getThrottleDecision,
         });
 
         decision = await this.throttle.getThrottleDecision(Date.now(), {
-          opencodeProfile: chosen ?? getOpencodeDefaultProfileName(),
+          opencodeProfile: chosen ?? null,
         });
       } else if (!hasSession) {
         // Safe to fail over between profiles before starting a new session.
         decision = (
-          await resolveOpencodeProfileForNewWork(Date.now(), controlProfile || null, {
+          await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile || null, {
             getThrottleDecision: this.throttle.getThrottleDecision,
           })
         ).decision;
       } else {
         // Do not fail over while a session is in flight/resuming.
-        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: controlProfile || getOpencodeDefaultProfileName() });
+        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: requestedProfile || null });
       }
     }
 

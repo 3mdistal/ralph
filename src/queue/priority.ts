@@ -51,3 +51,9 @@ export function priorityRank(priority: unknown): number {
   const normalized = normalizeTaskPriority(priority);
   return PRIORITY_BY_INDEX.indexOf(normalized);
 }
+
+export function issuePriorityWeight(priority: unknown): number {
+  const rank = priorityRank(priority);
+  const weight = PRIORITY_BY_INDEX.length - rank;
+  return weight > 0 ? weight : 1;
+}
