@@ -10,7 +10,7 @@ export type PrioritySelectorState = {
   bandCursors: Record<string, number>;
 };
 
-export const PRIORITY_SELECTOR_VERSION = 1;
+const PRIORITY_SELECTOR_VERSION = 1;
 
 export function createPrioritySelectorState(): PrioritySelectorState {
   return {
