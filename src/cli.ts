@@ -27,6 +27,8 @@ function printGlobalHelp(): void {
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
+      "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "",
@@ -118,6 +120,29 @@ function printCommandHelp(command: string): void {
           "",
           "Queues an operator message and delivers it at the next safe checkpoint (between continueSession runs).",
           "taskRef can be a task path, name, or a substring (must match exactly one in-progress task).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:init":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:init [--no-seed]",
+          "",
+          "Creates a new sandbox repo from the configured template and writes a manifest.",
+          "Runs seeding unless --no-seed is provided.",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:seed":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:seed [--run-id <id>]",
+          "",
+          "Seeds a sandbox repo based on the manifest (defaults to newest manifest if omitted).",
         ].join("\n")
       );
       return;

@@ -57,6 +57,7 @@ describe("dashboard event schema", () => {
     const ok = buildRalphEvent({
       type: "worker.checkpoint.reached",
       level: "info",
+      runId: "run-123",
       workerId: "3mdistal/ralph#orchestration/tasks/30",
       repo: "3mdistal/ralph",
       taskId: "orchestration/tasks/30",
