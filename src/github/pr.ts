@@ -12,6 +12,19 @@ export type PullRequestView = {
   isDraft?: boolean;
 };
 
+export type PullRequestMergeCandidate = {
+  url: string;
+  state: string;
+  baseRefName?: string;
+  headRefName?: string;
+  isDraft?: boolean;
+  mergeable?: string;
+  mergeStateStatus?: string;
+  authorLogin?: string;
+  authorIsBot?: boolean;
+  body?: string;
+};
+
 export type PullRequestSearchResult = {
   url: string;
   createdAt?: string;
@@ -41,6 +54,26 @@ export async function viewPullRequest(repo: string, prUrl: string): Promise<Pull
   };
 }
 
+export async function viewPullRequestMergeCandidate(repo: string, prUrl: string): Promise<PullRequestMergeCandidate | null> {
+  const response = await ghRead(repo)`gh pr view ${prUrl} --repo ${repo} --json url,state,baseRefName,headRefName,isDraft,mergeable,mergeStateStatus,author,body`.quiet();
+  const data = JSON.parse(response.stdout.toString());
+  if (!data?.url) return null;
+
+  const author = data?.author;
+  return {
+    url: String(data.url),
+    state: String(data.state ?? ""),
+    baseRefName: data.baseRefName ? String(data.baseRefName) : undefined,
+    headRefName: data.headRefName ? String(data.headRefName) : undefined,
+    isDraft: typeof data.isDraft === "boolean" ? data.isDraft : undefined,
+    mergeable: data.mergeable ? String(data.mergeable) : undefined,
+    mergeStateStatus: data.mergeStateStatus ? String(data.mergeStateStatus) : undefined,
+    authorLogin: typeof author?.login === "string" ? author.login : undefined,
+    authorIsBot: typeof author?.is_bot === "boolean" ? author.is_bot : undefined,
+    body: typeof data.body === "string" ? data.body : undefined,
+  };
+}
+
 function parseSearchOutput(output: string): PullRequestSearchResult[] {
   const data = JSON.parse(output);
   if (!Array.isArray(data)) return [];
@@ -67,16 +100,17 @@ export async function searchOpenPullRequestsByIssueLink(
   repo: string,
   issueNumber: string
 ): Promise<PullRequestSearchResult[]> {
-  const search = `fixes #${issueNumber} OR closes #${issueNumber}`;
+  const search = `fixes #${issueNumber} OR closes #${issueNumber} OR resolves #${issueNumber}`;
 
   try {
     return await runSearch(repo, search);
   } catch {
     const fixes = await runSearch(repo, `fixes #${issueNumber}`);
     const closes = await runSearch(repo, `closes #${issueNumber}`);
+    const resolves = await runSearch(repo, `resolves #${issueNumber}`);
     const seen = new Set<string>();
     const combined: PullRequestSearchResult[] = [];
-    for (const entry of [...fixes, ...closes]) {
+    for (const entry of [...fixes, ...closes, ...resolves]) {
       const normalized = normalizePrUrl(entry.url);
       if (seen.has(normalized)) continue;
       seen.add(normalized);
