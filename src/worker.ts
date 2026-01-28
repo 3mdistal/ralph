@@ -3101,8 +3101,18 @@ ${guidance}`
   }
 
   private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
+    const prNumber = extractPullRequestNumber(prUrl);
+    if (!prNumber) {
+      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
+    }
+
+    const { owner, name } = splitRepoFullName(this.repo);
+
     // Never pass --admin or -d (delete branch). Branch cleanup is handled separately with guardrails.
-    await ghWrite(this.repo)`gh pr merge ${prUrl} --repo ${this.repo} --merge --match-head-commit ${headSha}`.cwd(cwd).quiet();
+    // Use the merge REST API to avoid interactive gh pr merge behavior in daemon mode.
+    await ghWrite(this.repo)`gh api -X PUT /repos/${owner}/${name}/pulls/${prNumber}/merge -f merge_method=merge -f sha=${headSha}`
+      .cwd(cwd)
+      .quiet();
   }
 
   private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
@@ -7733,6 +7743,9 @@ ${guidance}`
       bodyPrefix?: string;
     }
   ): Promise<void> {
+    if (this.isGitHubQueueTask(task)) {
+      return;
+    }
     const vault = getBwrbVaultForStorage("create agent-run note");
     if (!vault) {
       return;

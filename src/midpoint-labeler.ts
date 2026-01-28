@@ -37,19 +37,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 export async function applyMidpointLabelsBestEffort(input: MidpointLabelerInput): Promise<void> {
   const warn = input.warn ?? ((message: string) => console.warn(message));
   let baseBranch = input.baseBranch ?? "";
-  let defaultBranch: string | null = null;
-
-  try {
-    defaultBranch = await withTimeout(
-      input.fetchDefaultBranch(),
-      MIDPOINT_LABEL_TIMEOUT_MS,
-      "fetch default branch"
-    );
-  } catch (error: any) {
-    warn(`Failed to fetch default branch for midpoint labels: ${error?.message ?? String(error)}`);
-  }
-
-  const resolvedDefaultBranch = defaultBranch ?? "";
 
   if (!baseBranch) {
     try {
@@ -63,6 +50,11 @@ export async function applyMidpointLabelsBestEffort(input: MidpointLabelerInput)
       warn(`Failed to re-check PR base before midpoint labeling: ${error?.message ?? String(error)}`);
     }
   }
+
+  // Avoid blocking midpoint label cleanup on fetching the repo default branch.
+  // The default-branch lookup is network-bound and may be rate-limited; when it fails
+  // we prefer a conservative heuristic over stalling merges.
+  const resolvedDefaultBranch = "";
 
   const plan = computeMidpointLabelPlan({
     baseBranch,
