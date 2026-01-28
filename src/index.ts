@@ -49,7 +49,7 @@ import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 import { createPrioritySelectorState } from "./scheduler/priority-policy";
-import { issuePriorityWeight } from "./queue/priority";
+import { issuePriorityWeight, normalizeTaskPriority, type TaskPriority } from "./queue/priority";
 
 import { DrainMonitor, readControlStateSnapshot, resolveControlFilePath, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
@@ -62,6 +62,7 @@ import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { releaseTaskSlot } from "./state";
+import { updateControlFile } from "./control-file";
 import { queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
@@ -71,6 +72,10 @@ import { startGitHubIssuePollers } from "./github-issues-sync";
 import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import { startGitHubLabelReconciler } from "./github/label-reconciler";
+import { resolveGitHubToken } from "./github-auth";
+import { GitHubClient } from "./github/client";
+import { parseIssueRef } from "./github/issue-ref";
+import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -1358,6 +1363,23 @@ async function main(): Promise<void> {
           `Set dashboard.controlPlane.allowRemote=true to override.`
       );
     } else {
+      const signalControlReload = (): void => {
+        try {
+          process.kill(process.pid, "SIGUSR1");
+        } catch {
+          // ignore
+        }
+      };
+
+      const resolveSessionIdForWorkerId = (workerId: string | null): string | null => {
+        const needle = workerId?.trim();
+        if (!needle) return null;
+        for (const [sessionId, payload] of activeSessionTasks) {
+          if (payload.workerId === needle) return sessionId;
+        }
+        return null;
+      };
+
       controlPlaneServer = startControlPlaneServer({
         bus: ralphEventBus,
         getStateSnapshot: async () =>
@@ -1368,6 +1390,146 @@ async function main(): Promise<void> {
         exposeRawOpencodeEvents: controlPlaneConfig.exposeRawOpencodeEvents,
         replayLastDefault: controlPlaneConfig.replayLastDefault,
         replayLastMax: controlPlaneConfig.replayLastMax,
+        commands: {
+          pause: async ({ workerId, reason, checkpoint }) => {
+            const patch = {
+              mode: "paused" as const,
+              pauseRequested: checkpoint ? true : undefined,
+              pauseAtCheckpoint: checkpoint ?? undefined,
+            };
+            updateControlFile({ patch });
+            signalControlReload();
+
+            const sessionId = resolveSessionIdForWorkerId(workerId ?? null);
+            publishDashboardEvent(
+              {
+                type: "worker.pause.requested",
+                level: "info",
+                ...(workerId ? { workerId } : {}),
+                ...(sessionId ? { sessionId } : {}),
+                data: reason ? { reason } : {},
+              },
+              { workerId: workerId ?? undefined, sessionId: sessionId ?? undefined }
+            );
+          },
+          resume: async ({ workerId, reason }) => {
+            const patch = {
+              mode: "running" as const,
+              pauseRequested: null,
+              pauseAtCheckpoint: null,
+              drainTimeoutMs: null,
+            };
+            updateControlFile({ patch });
+            signalControlReload();
+
+            const sessionId = resolveSessionIdForWorkerId(workerId ?? null);
+            publishDashboardEvent(
+              {
+                type: "worker.pause.cleared",
+                level: "info",
+                ...(workerId ? { workerId } : {}),
+                ...(sessionId ? { sessionId } : {}),
+                data: reason ? { reason } : {},
+              },
+              { workerId: workerId ?? undefined, sessionId: sessionId ?? undefined }
+            );
+          },
+          enqueueMessage: async ({ workerId, sessionId, text }) => {
+            const resolvedSessionId = sessionId?.trim() || resolveSessionIdForWorkerId(workerId ?? null);
+            if (!resolvedSessionId) {
+              throw new Error("Unable to resolve session; provide sessionId or an active workerId");
+            }
+
+            const payload = activeSessionTasks.get(resolvedSessionId);
+            const id = await queueNudge(resolvedSessionId, text, {
+              repo: payload?.task.repo,
+              taskRef: payload?.task.issue,
+              taskPath: payload?.task._path,
+            });
+
+            publishDashboardEvent(
+              {
+                type: "log.ralph",
+                level: "info",
+                ...(payload?.workerId ? { workerId: payload.workerId } : {}),
+                ...(payload?.task.repo ? { repo: payload.task.repo } : {}),
+                ...(payload?.taskId ? { taskId: payload.taskId } : {}),
+                sessionId: resolvedSessionId,
+                data: { message: `Queued nudge ${id}` },
+              },
+              { sessionId: resolvedSessionId, workerId: payload?.workerId }
+            );
+
+            return { id };
+          },
+          setTaskPriority: async ({ taskId, priority }) => {
+            const normalized = normalizeTaskPriority(priority);
+            const raw = taskId.startsWith("github:") ? taskId.slice("github:".length) : taskId;
+            const issueRef = parseIssueRef(raw, "");
+
+            if (issueRef) {
+              const token = await resolveGitHubToken();
+              if (!token) throw new Error("GitHub auth is not configured");
+
+              const github = new GitHubClient(issueRef.repo, { getToken: resolveGitHubToken });
+              const priorityLabels: TaskPriority[] = [
+                "p0-critical",
+                "p1-high",
+                "p2-medium",
+                "p3-low",
+                "p4-backlog",
+              ];
+
+              const ops = planIssueLabelOps({
+                add: [normalized],
+                remove: priorityLabels.filter((label) => label !== normalized),
+                allowNonRalph: true,
+              });
+
+              const result = await executeIssueLabelOps({
+                github,
+                repo: issueRef.repo,
+                issueNumber: issueRef.number,
+                ops,
+                allowNonRalph: true,
+              });
+
+              if (!result.ok) {
+                const message = result.error instanceof Error ? result.error.message : String(result.error);
+                throw new Error(`Failed to update issue priority: ${message}`);
+              }
+
+              publishDashboardEvent({
+                type: "log.ralph",
+                level: "info",
+                repo: issueRef.repo,
+                taskId,
+                data: { message: `Set priority ${normalized} on ${issueRef.repo}#${issueRef.number}` },
+              });
+
+              return;
+            }
+
+            const task = await getTaskByPath(taskId);
+            if (!task) {
+              throw new Error(`Unknown taskId: ${taskId}`);
+            }
+
+            const updated = await updateTaskStatus(task, task.status, { priority: normalized });
+            if (!updated) {
+              throw new Error(`Failed to update task priority for ${taskId}`);
+            }
+
+            publishDashboardEvent({
+              type: "log.ralph",
+              level: "info",
+              repo: task.repo,
+              taskId,
+              sessionId: task["session-id"],
+              data: { message: `Set priority ${normalized} for ${taskId}` },
+            });
+          },
+        },
       });
       console.log(`${"[ralph:control-plane]"} Listening on ${controlPlaneServer.url}`);
     }

@@ -223,4 +223,162 @@ describe("control plane server", () => {
       server.stop();
     }
   });
+
+  test("executes pause/resume commands", async () => {
+    const bus = new RalphEventBus();
+    let seenPause: any = null;
+    let seenResume: any = null;
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async (params) => {
+          seenPause = params;
+        },
+        resume: async (params) => {
+          seenResume = params;
+        },
+        enqueueMessage: async () => ({ id: "n1" }),
+        setTaskPriority: async () => {},
+      },
+    });
+
+    try {
+      const pauseRes = await fetch(`${server.url}/v1/commands/pause`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ workerId: "w1", reason: "operator" }),
+      });
+      expect(pauseRes.status).toBe(200);
+      expect(seenPause?.workerId).toBe("w1");
+      expect(seenPause?.reason).toBe("operator");
+
+      const resumeRes = await fetch(`${server.url}/v1/commands/resume`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ workerId: "w1" }),
+      });
+      expect(resumeRes.status).toBe(200);
+      expect(seenResume?.workerId).toBe("w1");
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("enqueue message requires json and text", async () => {
+    const bus = new RalphEventBus();
+    let seenEnqueue: any = null;
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async () => {},
+        resume: async () => {},
+        enqueueMessage: async (params) => {
+          seenEnqueue = params;
+          return { id: "n2" };
+        },
+        setTaskPriority: async () => {},
+      },
+    });
+
+    try {
+      const badType = await fetch(`${server.url}/v1/commands/message/enqueue`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "text/plain" },
+        body: "nope",
+      });
+      expect(badType.status).toBe(415);
+
+      const missingText = await fetch(`${server.url}/v1/commands/message/enqueue`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: "ses_1" }),
+      });
+      expect(missingText.status).toBe(400);
+
+      const ok = await fetch(`${server.url}/v1/commands/message/enqueue`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: "ses_1", text: "hello" }),
+      });
+      expect(ok.status).toBe(200);
+      const body = await ok.json();
+      expect(body.ok).toBe(true);
+      expect(body.id).toBe("n2");
+      expect(seenEnqueue?.sessionId).toBe("ses_1");
+      expect(seenEnqueue?.text).toBe("hello");
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("interrupt messaging returns 501 when disabled", async () => {
+    const bus = new RalphEventBus();
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async () => {},
+        resume: async () => {},
+        enqueueMessage: async () => ({ id: "n3" }),
+        setTaskPriority: async () => {},
+      },
+    });
+
+    try {
+      const res = await fetch(`${server.url}/v1/commands/message/interrupt`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ sessionId: "ses_1", text: "stop" }),
+      });
+      expect(res.status).toBe(501);
+      const body = await res.json();
+      expect(body?.error?.code).toBe("not_implemented");
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("set task priority calls handler", async () => {
+    const bus = new RalphEventBus();
+    let seen: any = null;
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async () => {},
+        resume: async () => {},
+        enqueueMessage: async () => ({ id: "n4" }),
+        setTaskPriority: async (params) => {
+          seen = params;
+        },
+      },
+    });
+
+    try {
+      const res = await fetch(`${server.url}/v1/commands/task/priority`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: "github:owner/repo#123", priority: "p1" }),
+      });
+      expect(res.status).toBe(200);
+      expect(seen?.taskId).toBe("github:owner/repo#123");
+      expect(seen?.priority).toBe("p1");
+    } finally {
+      server.stop();
+    }
+  });
 });
