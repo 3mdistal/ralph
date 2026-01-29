@@ -28,7 +28,7 @@ import {
   type TaskOpState,
 } from "../state";
 import type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "../queue/types";
-import { deriveTaskView, planClaim, statusToRalphLabelDelta, shouldRecoverStaleInProgress, type LabelOp } from "./core";
+import { computeStaleInProgressRecovery, deriveTaskView, planClaim, statusToRalphLabelDelta, type LabelOp } from "./core";
 
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 const WATCH_MIN_INTERVAL_MS = 1000;
@@ -204,20 +204,20 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         if (stopRequested) return;
         if (!issue.labels.includes("ralph:in-progress")) continue;
         const opState = opStateByIssue.get(issue.number) ?? null;
-        const shouldRecover = shouldRecoverStaleInProgress({
+        const recovery = computeStaleInProgressRecovery({
           labels: issue.labels,
           opState,
           nowMs,
           ttlMs,
         });
-        if (!shouldRecover) continue;
+        if (!recovery.shouldRecover) continue;
 
         try {
           releaseTaskSlot({
             repo,
             issueNumber: issue.number,
             taskPath: `github:${repo}#${issue.number}`,
-            releasedReason: "stale-heartbeat",
+            releasedReason: recovery.reason ?? "stale-in-progress",
             status: "queued",
           });
 
@@ -255,9 +255,8 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             applyLabelDelta({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
           }
 
-          console.warn(
-            `[ralph:queue:github] Recovered stale in-progress issue ${repo}#${issue.number}; released locally`
-          );
+          const reason = recovery.reason ? ` reason=${recovery.reason}` : "";
+          console.warn(`[ralph:queue:github] Recovered stale in-progress issue ${repo}#${issue.number}; released locally${reason}`);
         } catch (error: any) {
           console.warn(
             `[ralph:queue:github] Failed to recover stale in-progress ${repo}#${issue.number}: ${error?.message ?? String(error)}`

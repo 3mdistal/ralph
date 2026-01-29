@@ -42,6 +42,8 @@ import { buildWorktreePath } from "./worktree-paths";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
+import { buildCheckpointState, type CheckpointState } from "./checkpoints/core";
+import { applyCheckpointReached } from "./checkpoints/runtime";
 import { hasProductGap, parseRoutingDecision, selectPrUrl, type RoutingDecision } from "./routing";
 import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
 import {
@@ -94,7 +96,8 @@ import {
   type IssueRelationshipSnapshot,
 } from "./github/issue-relationships";
 import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
-import { type RalphCheckpoint, type RalphEvent } from "./dashboard/events";
+import { ralphEventBus } from "./dashboard/bus";
+import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "./dashboard/events";
 import { publishDashboardEvent, type DashboardEventContext } from "./dashboard/publisher";
 import { cleanupSessionArtifacts } from "./introspection-traces";
 import { isIntrospectionSummary, type IntrospectionSummary } from "./introspection/summary";
@@ -244,6 +247,9 @@ const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
 const CI_REMEDIATION_BACKOFF_BASE_MS = 30_000;
 const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 
+const CHECKPOINT_SEQ_FIELD = "checkpoint-seq";
+const PAUSE_REQUESTED_FIELD = "pause-requested";
+const PAUSED_AT_CHECKPOINT_FIELD = "paused-at-checkpoint";
 interface LiveAnomalyCount {
   total: number;
   recentBurst: boolean;
@@ -436,6 +442,58 @@ function applyTaskPatch(task: AgentTask, status: AgentTask["status"], patch: Rec
   task.status = status;
   for (const [key, value] of Object.entries(patch)) {
     (task as unknown as Record<string, unknown>)[key] = typeof value === "number" ? String(value) : value;
+  }
+}
+
+function parseCheckpointSeq(value?: string): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return parsed;
+}
+
+function parsePauseRequested(value?: string): boolean {
+  return value?.trim().toLowerCase() === "true";
+}
+
+function parseCheckpointValue(value?: string): RalphCheckpoint | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return isRalphCheckpoint(trimmed) ? (trimmed as RalphCheckpoint) : null;
+}
+
+function buildCheckpointPatch(state: CheckpointState): Record<string, string> {
+  return {
+    checkpoint: state.lastCheckpoint ?? "",
+    [CHECKPOINT_SEQ_FIELD]: String(state.checkpointSeq),
+    [PAUSE_REQUESTED_FIELD]: state.pauseRequested ? "true" : "false",
+    [PAUSED_AT_CHECKPOINT_FIELD]: state.pausedAtCheckpoint ?? "",
+  };
+}
+
+class CheckpointEventDeduper {
+  #seen = new Set<string>();
+  #order: string[] = [];
+  #limit: number;
+
+  constructor(limit = 5000) {
+    this.#limit = Math.max(0, Math.floor(limit));
+  }
+
+  hasEmitted(key: string): boolean {
+    return this.#seen.has(key);
+  }
+
+  emit(event: RalphEvent, key: string): void {
+    if (this.#seen.has(key)) return;
+    ralphEventBus.publish(event);
+    if (this.#limit === 0) return;
+    this.#seen.add(key);
+    this.#order.push(key);
+    if (this.#order.length > this.#limit) {
+      const oldest = this.#order.shift();
+      if (oldest) this.#seen.delete(oldest);
+    }
   }
 }
 
@@ -928,6 +986,7 @@ export class RepoWorker {
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
+  private checkpointEvents = new CheckpointEventDeduper();
   private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
 
@@ -961,6 +1020,7 @@ export class RepoWorker {
         "completed-at": completedAt,
         "session-id": "",
         "watchdog-retries": "",
+        "stall-retries": "",
         ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
         ...(task["worker-id"] ? { "worker-id": "" } : {}),
         ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
@@ -1489,6 +1549,7 @@ export class RepoWorker {
         "completed-at": new Date().toISOString().split("T")[0],
         "session-id": "",
         "watchdog-retries": "",
+        "stall-retries": "",
         ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
       },
     });
@@ -2720,6 +2781,7 @@ ${guidance}`
           "daemon-id": "",
           "heartbeat-at": "",
           "watchdog-retries": "",
+          "stall-retries": "",
         });
         if (!updated) {
           throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
@@ -4806,6 +4868,7 @@ ${guidance}`
         stepTitle: `ci-debug attempt ${attemptNumber}`,
       },
       ...this.buildWatchdogOptions(params.task, `ci-debug-${attemptNumber}`),
+      ...this.buildStallOptions(params.task, `ci-debug-${attemptNumber}`),
       ...params.opencodeSessionOptions,
     });
 
@@ -4824,6 +4887,12 @@ ${guidance}`
         sessionResult,
         params.opencodeXdg
       );
+      return { status: "failed", run };
+    }
+
+    if (sessionResult.stallTimeout) {
+      await this.cleanupGitWorktree(worktreePath);
+      const run = await this.handleStallTimeout(params.task, params.cacheKey, `ci-debug-${attemptNumber}`, sessionResult);
       return { status: "failed", run };
     }
 
@@ -5058,9 +5127,13 @@ ${guidance}`
       ...opencodeSessionOptions,
     });
 
+    await this.recordImplementationCheckpoint(task, surveyResult.sessionId || mergeGate.sessionId);
+
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
+
+    await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return {
       taskName: task.name,
@@ -5169,12 +5242,21 @@ ${guidance}`
         stepTitle: "survey",
       },
       ...this.buildWatchdogOptions(task, "survey"),
+      ...this.buildStallOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
+
+    await this.recordImplementationCheckpoint(task, surveyResult.sessionId || mergeGate.sessionId);
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
+
+    if (!surveyResult.success && surveyResult.stallTimeout) {
+      return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
+    }
+
+    await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return {
       taskName: task.name,
@@ -5235,6 +5317,7 @@ ${guidance}`
             stepTitle: stage,
           },
           ...this.buildWatchdogOptions(task, stage),
+          ...this.buildStallOptions(task, stage),
           ...opencodeSessionOptions,
         })
       : await this.session.runAgent(taskRepoPath, "general", prompt, {
@@ -5249,8 +5332,13 @@ ${guidance}`
             stepTitle: stage,
           },
           ...this.buildWatchdogOptions(task, stage),
+          ...this.buildStallOptions(task, stage),
           ...opencodeSessionOptions,
         });
+
+    if (resumeSessionId) {
+      await this.recordImplementationCheckpoint(task, recoveryResult.sessionId || resumeSessionId);
+    }
 
     const pausedAfter = await this.pauseIfHardThrottled(task, `${stage} (post)`, recoveryResult.sessionId);
     if (pausedAfter) return pausedAfter;
@@ -5258,6 +5346,10 @@ ${guidance}`
     if (!recoveryResult.success) {
       if (recoveryResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, stage, recoveryResult, opencodeXdg);
+      }
+
+      if (recoveryResult.stallTimeout) {
+        return await this.handleStallTimeout(task, cacheKey, stage, recoveryResult);
       }
 
       const details = summarizeBlockedDetails(recoveryResult.output);
@@ -5321,8 +5413,11 @@ ${guidance}`
         stepTitle: "survey",
       },
       ...this.buildWatchdogOptions(task, "survey"),
+      ...this.buildStallOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
+
+    await this.recordImplementationCheckpoint(task, surveyResult.sessionId || mergeGate.sessionId);
 
     const pausedSurveyAfter = await this.pauseIfHardThrottled(
       task,
@@ -5334,6 +5429,12 @@ ${guidance}`
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
+
+    if (!surveyResult.success && surveyResult.stallTimeout) {
+      return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
+    }
+
+    await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return await this.finalizeTaskSuccess({
       task,
@@ -5398,12 +5499,14 @@ ${guidance}`
       devex,
     });
 
+    await this.recordCheckpoint(task, "recorded", sessionId);
     this.publishCheckpoint("recorded", { sessionId });
 
     await this.queue.updateTaskStatus(task, "done", {
       "completed-at": endTime.toISOString().split("T")[0],
       "session-id": "",
       "watchdog-retries": "",
+      "stall-retries": "",
       ...(shouldClearWorktree ? { "worktree-path": "" } : {}),
       ...(shouldClearWorkerId ? { "worker-id": "" } : {}),
       ...(shouldClearRepoSlot ? { "repo-slot": "" } : {}),
@@ -5748,6 +5851,8 @@ ${guidance}`
     let sessionId = params.sessionId;
     let didUpdateBranch = false;
 
+    await this.recordCheckpoint(params.task, "pr_ready", sessionId);
+
     const prFiles = await this.getPullRequestFiles(prUrl);
     const ciOnly = isCiOnlyChangeSet(prFiles);
     const isCiIssue = isCiRelatedIssue(params.issueMeta.labels ?? []);
@@ -5779,6 +5884,7 @@ ${guidance}`
           "completed-at": completedAt,
           "session-id": "",
           "watchdog-retries": "",
+          "stall-retries": "",
           ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
         },
       });
@@ -5828,6 +5934,7 @@ ${guidance}`
           "completed-at": completedAt,
           "session-id": "",
           "watchdog-retries": "",
+          "stall-retries": "",
           ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
         },
       });
@@ -5879,6 +5986,7 @@ ${guidance}`
         } catch (error: any) {
           console.warn(`[ralph:worker:${this.repo}] Failed to delete PR head branch: ${this.formatGhError(error)}`);
         }
+        await this.recordCheckpoint(params.task, "merge_step_complete", sessionId);
         return { ok: true, prUrl, sessionId };
       } catch (error: any) {
         const shouldUpdateBeforeRetry =
@@ -6122,6 +6230,7 @@ ${guidance}`
       "completed-at": completedAt,
       "session-id": "",
       "watchdog-retries": "",
+      "stall-retries": "",
       ...(task["worktree-path"] ? { "worktree-path": "" } : {}),
       ...(task["worker-id"] ? { "worker-id": "" } : {}),
       ...(task["repo-slot"] ? { "repo-slot": "" } : {}),
@@ -6152,6 +6261,12 @@ ${guidance}`
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
   }
 
+  private getStallRetryCount(task: AgentTask): number {
+    const raw = task["stall-retries"];
+    const parsed = Number.parseInt(String(raw ?? "0"), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
   private buildWatchdogOptions(task: AgentTask, stage: string) {
     const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
@@ -6162,6 +6277,20 @@ ${guidance}`
         thresholdsMs: cfg?.thresholdsMs,
         softLogIntervalMs: cfg?.softLogIntervalMs,
         recentEventLimit: cfg?.recentEventLimit,
+        context,
+      },
+    };
+  }
+
+  private buildStallOptions(task: AgentTask, stage: string) {
+    const cfg = getConfig().stall;
+    const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
+    const idleMs = cfg?.nudgeAfterMs ?? cfg?.idleMs ?? 5 * 60_000;
+
+    return {
+      stall: {
+        enabled: cfg?.enabled ?? true,
+        idleMs,
         context,
       },
     };
@@ -6271,6 +6400,100 @@ ${guidance}`
         cacheHome: resolved.xdgCacheHome,
       },
     };
+  }
+
+  private readPauseRequested(): boolean {
+    const defaults = getConfig().control;
+    const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
+    return control.pauseRequested === true;
+  }
+
+  private async waitForPauseCleared(opts?: { signal?: AbortSignal }): Promise<void> {
+    const minMs = 250;
+    const maxMs = 2000;
+    let delayMs = minMs;
+
+    while (this.readPauseRequested()) {
+      if (opts?.signal?.aborted) return;
+
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, delayMs);
+        if (opts?.signal) {
+          const onAbort = () => {
+            clearTimeout(timeout);
+            resolve();
+          };
+          opts.signal.addEventListener("abort", onAbort, { once: true });
+        }
+      });
+
+      const jitter = Math.floor(Math.random() * 125);
+      delayMs = Math.min(maxMs, Math.floor(delayMs * 1.6) + jitter);
+    }
+  }
+
+  private getCheckpointState(task: AgentTask): CheckpointState {
+    return buildCheckpointState({
+      lastCheckpoint: parseCheckpointValue(task.checkpoint),
+      checkpointSeq: parseCheckpointSeq(task[CHECKPOINT_SEQ_FIELD]),
+      pausedAtCheckpoint: parseCheckpointValue(task[PAUSED_AT_CHECKPOINT_FIELD]),
+      pauseRequested: parsePauseRequested(task[PAUSE_REQUESTED_FIELD]),
+    });
+  }
+
+  private async recordCheckpoint(task: AgentTask, checkpoint: RalphCheckpoint, sessionId?: string): Promise<void> {
+    const workerId = await this.formatWorkerId(task, task._path);
+    const state = this.getCheckpointState(task);
+
+    const store = {
+      persist: async (nextState: CheckpointState) => {
+        const patch = buildCheckpointPatch(nextState);
+        try {
+          const updated = await this.queue.updateTaskStatus(task, task.status, patch);
+          if (!updated) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to persist checkpoint state (checkpoint=${checkpoint}, task=${task.issue})`
+            );
+            return;
+          }
+          applyTaskPatch(task, task.status, patch);
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to persist checkpoint state (checkpoint=${checkpoint}, task=${task.issue}): ${
+              error?.message ?? String(error)
+            }`
+          );
+        }
+      },
+    };
+
+    const pauseSource = {
+      isPauseRequested: () => this.readPauseRequested(),
+      waitUntilCleared: (opts?: { signal?: AbortSignal }) => this.waitForPauseCleared(opts),
+    };
+
+    const emitter = {
+      emit: (event: RalphEvent, key: string) => this.checkpointEvents.emit(event, key),
+      hasEmitted: (key: string) => this.checkpointEvents.hasEmitted(key),
+    };
+
+    await applyCheckpointReached({
+      checkpoint,
+      state,
+      context: {
+        workerId,
+        repo: this.repo,
+        taskId: task._path,
+        sessionId: sessionId ?? (task["session-id"]?.trim() || undefined),
+      },
+      store,
+      pauseSource,
+      emitter,
+    });
+  }
+
+  private async recordImplementationCheckpoint(task: AgentTask, sessionId?: string): Promise<void> {
+    await this.recordCheckpoint(task, "implementation_step_complete", sessionId);
   }
 
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
@@ -6404,8 +6627,10 @@ ${guidance}`
           cacheKey,
           runLogPath,
           ...this.buildWatchdogOptions(task, `nudge-${stage}`),
+          ...this.buildStallOptions(task, `nudge-${stage}`),
           ...opencodeSessionOptions,
         });
+        await this.recordImplementationCheckpoint(task, res.sessionId || sid);
         return { success: res.success, error: res.success ? undefined : res.output };
       });
 
@@ -6567,6 +6792,126 @@ ${guidance}`
       outcome: "escalated",
       sessionId: result.sessionId || undefined,
       escalationReason: escalationReason,
+    };
+  }
+
+  private async handleStallTimeout(
+    task: AgentTask,
+    cacheKey: string,
+    stage: string,
+    result: SessionResult
+  ): Promise<AgentRun> {
+    const cfg = getConfig().stall;
+    const maxRestarts = cfg?.maxRestarts ?? 1;
+
+    const timeout = result.stallTimeout;
+    const retryCount = this.getStallRetryCount(task);
+    const nextRetryCount = retryCount + 1;
+    const sessionId = result.sessionId || task["session-id"]?.trim() || "";
+
+    const idleSeconds = timeout ? Math.round(timeout.lastActivityMsAgo / 1000) : 0;
+    const reason = timeout
+      ? `Session stalled: no activity for ${idleSeconds}s (${stage})`
+      : `Session stalled (${stage})`;
+
+    if (retryCount === 0 && sessionId) {
+      const nudgeReason = `${reason}; nudging session`;
+      console.warn(`[ralph:worker:${this.repo}] Stall detected; nudging by re-queuing for resume: ${nudgeReason}`);
+      await this.queue.updateTaskStatus(task, "queued", {
+        "session-id": sessionId,
+        "stall-retries": String(nextRetryCount),
+        "blocked-source": "stall",
+        "blocked-reason": nudgeReason,
+        "blocked-details": timeout?.context ? `Context: ${timeout.context}` : "",
+        "blocked-at": new Date().toISOString(),
+        "blocked-checked-at": new Date().toISOString(),
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: nudgeReason,
+      };
+    }
+
+    if (retryCount <= maxRestarts) {
+      console.warn(`[ralph:worker:${this.repo}] Stall repeated; restarting with fresh session: ${reason}`);
+      await this.queue.updateTaskStatus(task, "queued", {
+        "session-id": "",
+        "stall-retries": String(nextRetryCount),
+        "blocked-source": "",
+        "blocked-reason": "",
+        "blocked-details": "",
+        "blocked-at": "",
+        "blocked-checked-at": "",
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: reason,
+      };
+    }
+
+    console.log(`[ralph:worker:${this.repo}] Stall repeated after restart; escalating: ${reason}`);
+    const escalationFields: Record<string, string> = {
+      "stall-retries": String(nextRetryCount),
+    };
+    if (sessionId) escalationFields["session-id"] = sessionId;
+
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
+    if (escalated) {
+      applyTaskPatch(task, "escalated", escalationFields);
+    }
+
+    const details = [
+      timeout?.context ? `Context: ${timeout.context}` : null,
+      sessionId ? `Session: ${sessionId}` : null,
+      task["run-log-path"]?.trim() ? `Run log: ${task["run-log-path"]?.trim()}` : null,
+      sessionId ? `Events: ${getSessionEventsPath(sessionId)}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const githubCommentUrl = await this.writeEscalationWriteback(task, {
+      reason,
+      details: details || undefined,
+      escalationType: "other",
+    });
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      sessionId: sessionId || undefined,
+      reason,
+      escalationType: "other",
+      githubCommentUrl: githubCommentUrl ?? undefined,
+      planOutput: result.output,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        sessionId: sessionId || undefined,
+        details: result.output,
+      });
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: sessionId || undefined,
+      escalationReason: reason,
     };
   }
 
@@ -6736,8 +7081,11 @@ ${guidance}`
           stepTitle: "resume",
         },
         ...this.buildWatchdogOptions(task, "resume"),
+        ...this.buildStallOptions(task, "resume"),
         ...opencodeSessionOptions,
       });
+
+      await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
 
       const pausedAfter = await this.pauseIfHardThrottled(task, "resume (post)", buildResult.sessionId || existingSessionId);
       if (pausedAfter) return pausedAfter;
@@ -6745,6 +7093,10 @@ ${guidance}`
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult, opencodeXdg);
+        }
+
+        if (buildResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "resume", buildResult);
         }
 
         const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
@@ -6877,9 +7229,12 @@ ${guidance}`
                 stepTitle: "resume loop-break",
               },
               ...this.buildWatchdogOptions(task, "resume-loop-break"),
+              ...this.buildStallOptions(task, "resume-loop-break"),
               ...opencodeSessionOptions,
             }
           );
+
+          await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
 
           const pausedLoopBreakAfter = await this.pauseIfHardThrottled(
             task,
@@ -6891,6 +7246,10 @@ ${guidance}`
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
+            }
+
+            if (buildResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "resume-loop-break", buildResult);
             }
             console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
             break;
@@ -6951,8 +7310,11 @@ ${guidance}`
             stepTitle: "continue",
           },
           ...this.buildWatchdogOptions(task, "resume-continue"),
+          ...this.buildStallOptions(task, "resume-continue"),
           ...opencodeSessionOptions,
         });
+
+        await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
 
         const pausedContinueAfter = await this.pauseIfHardThrottled(
           task,
@@ -6964,6 +7326,10 @@ ${guidance}`
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult, opencodeXdg);
+          }
+
+          if (buildResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "resume-continue", buildResult);
           }
 
           // If the session ended without printing a URL, try to recover PR from git state.
@@ -7102,8 +7468,11 @@ ${guidance}`
         cacheKey,
         runLogPath: resumeSurveyRunLogPath,
         ...this.buildWatchdogOptions(task, "resume-survey"),
+        ...this.buildStallOptions(task, "resume-survey"),
         ...opencodeSessionOptions,
       });
+
+      await this.recordImplementationCheckpoint(task, surveyResult.sessionId || buildResult.sessionId || existingSessionId);
 
 
       const pausedSurveyAfter = await this.pauseIfHardThrottled(
@@ -7117,9 +7486,18 @@ ${guidance}`
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult, opencodeXdg);
         }
+
+        if (surveyResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "resume-survey", surveyResult);
+        }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
+      await this.recordCheckpoint(
+        task,
+        "survey_complete",
+        surveyResult.sessionId || buildResult.sessionId || existingSessionId
+      );
       this.publishCheckpoint("survey_complete", {
         sessionId: surveyResult.sessionId || buildResult.sessionId || existingSessionId || undefined,
       });
@@ -7327,6 +7705,7 @@ ${guidance}`
           stepTitle: "plan",
         },
         ...this.buildWatchdogOptions(task, "plan"),
+        ...this.buildStallOptions(task, "plan"),
         ...opencodeSessionOptions,
       });
 
@@ -7335,6 +7714,10 @@ ${guidance}`
 
       if (!planResult.success && planResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
+      }
+
+      if (!planResult.success && planResult.stallTimeout) {
+        return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
       }
 
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
@@ -7354,6 +7737,7 @@ ${guidance}`
             stepTitle: "plan (retry)",
           },
           ...this.buildWatchdogOptions(task, "plan-retry"),
+          ...this.buildStallOptions(task, "plan-retry"),
           ...opencodeSessionOptions,
         });
       }
@@ -7364,6 +7748,10 @@ ${guidance}`
       if (!planResult.success) {
         if (planResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
+        }
+
+        if (planResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
         }
 
         const reason = `planner failed: ${planResult.output}`;
@@ -7395,11 +7783,14 @@ ${guidance}`
         });
       }
 
+      await this.recordCheckpoint(task, "planned", planResult.sessionId);
       this.publishCheckpoint("planned", { sessionId: planResult.sessionId || undefined });
 
       // 5. Parse routing decision
       let routing = parseRoutingDecision(planResult.output);
       let hasGap = hasProductGap(planResult.output);
+
+      await this.recordCheckpoint(task, "routed", planResult.sessionId);
 
       // 6. Consult devex once before escalating implementation tasks
       let devexContext: EscalationContext["devex"] | undefined;
@@ -7433,8 +7824,11 @@ ${guidance}`
             step: 2,
             stepTitle: "consult devex",
           },
+          ...this.buildStallOptions(task, "consult devex"),
           ...opencodeSessionOptions,
         });
+
+        await this.recordImplementationCheckpoint(task, devexResult.sessionId || baseSessionId);
 
         const pausedAfterDevexConsult = await this.pauseIfHardThrottled(
           task,
@@ -7444,6 +7838,9 @@ ${guidance}`
         if (pausedAfterDevexConsult) return pausedAfterDevexConsult;
 
         if (!devexResult.success) {
+          if (devexResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "consult devex", devexResult);
+          }
           console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
           devexContext = {
             consulted: true,
@@ -7488,8 +7885,11 @@ ${guidance}`
               step: 3,
               stepTitle: "reroute after devex",
             },
+            ...this.buildStallOptions(task, "reroute after devex"),
             ...opencodeSessionOptions,
           });
+
+          await this.recordImplementationCheckpoint(task, rerouteResult.sessionId || baseSessionId);
 
           const pausedAfterReroute = await this.pauseIfHardThrottled(
             task,
@@ -7499,6 +7899,9 @@ ${guidance}`
           if (pausedAfterReroute) return pausedAfterReroute;
 
           if (!rerouteResult.success) {
+            if (rerouteResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "reroute after devex", rerouteResult);
+            }
             console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
           } else {
             if (rerouteResult.sessionId) {
@@ -7627,8 +8030,11 @@ ${guidance}`
           stepTitle: "build",
         },
         ...this.buildWatchdogOptions(task, "build"),
+        ...this.buildStallOptions(task, "build"),
         ...opencodeSessionOptions,
       });
+
+      await this.recordImplementationCheckpoint(task, buildResult.sessionId || planResult.sessionId);
 
       const pausedAfterBuild = await this.pauseIfHardThrottled(task, "build (post)", buildResult.sessionId || planResult.sessionId);
       if (pausedAfterBuild) return pausedAfterBuild;
@@ -7636,6 +8042,10 @@ ${guidance}`
       if (!buildResult.success) {
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult, opencodeXdg);
+        }
+
+        if (buildResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "build", buildResult);
         }
         throw new Error(`Build failed: ${buildResult.output}`);
       }
@@ -7760,9 +8170,12 @@ ${guidance}`
                 stepTitle: "build loop-break",
               },
               ...this.buildWatchdogOptions(task, "build-loop-break"),
+              ...this.buildStallOptions(task, "build-loop-break"),
               ...opencodeSessionOptions,
             }
           );
+
+          await this.recordImplementationCheckpoint(task, buildResult.sessionId);
 
           const pausedBuildLoopBreakAfter = await this.pauseIfHardThrottled(task, "build loop-break (post)", buildResult.sessionId);
           if (pausedBuildLoopBreakAfter) return pausedBuildLoopBreakAfter;
@@ -7770,6 +8183,10 @@ ${guidance}`
           if (!buildResult.success) {
             if (buildResult.watchdogTimeout) {
               return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
+            }
+
+            if (buildResult.stallTimeout) {
+              return await this.handleStallTimeout(task, cacheKey, "build-loop-break", buildResult);
             }
             console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
             break;
@@ -7830,8 +8247,11 @@ ${guidance}`
             stepTitle: "build continue",
           },
           ...this.buildWatchdogOptions(task, "build-continue"),
+          ...this.buildStallOptions(task, "build-continue"),
           ...opencodeSessionOptions,
         });
+
+        await this.recordImplementationCheckpoint(task, buildResult.sessionId);
 
         const pausedBuildContinueAfter = await this.pauseIfHardThrottled(task, "build continue (post)", buildResult.sessionId);
         if (pausedBuildContinueAfter) return pausedBuildContinueAfter;
@@ -7839,6 +8259,10 @@ ${guidance}`
         if (!buildResult.success) {
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult, opencodeXdg);
+          }
+
+          if (buildResult.stallTimeout) {
+            return await this.handleStallTimeout(task, cacheKey, "build-continue", buildResult);
           }
 
           // If the session ended without printing a URL, try to recover PR from git state.
@@ -7981,8 +8405,11 @@ ${guidance}`
           stepTitle: "survey",
         },
         ...this.buildWatchdogOptions(task, "survey"),
+        ...this.buildStallOptions(task, "survey"),
         ...opencodeSessionOptions,
       });
+
+      await this.recordImplementationCheckpoint(task, surveyResult.sessionId || buildResult.sessionId);
 
       const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "survey (post)", surveyResult.sessionId || buildResult.sessionId);
       if (pausedSurveyAfter) return pausedSurveyAfter;
@@ -7991,9 +8418,14 @@ ${guidance}`
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
         }
+
+        if (surveyResult.stallTimeout) {
+          return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
+        }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
+      await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || buildResult.sessionId);
       this.publishCheckpoint("survey_complete", {
         sessionId: surveyResult.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
       });

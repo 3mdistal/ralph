@@ -15,6 +15,20 @@ import {
 
 export type ControlPlaneStateProvider<TSnapshot> = () => Promise<TSnapshot>;
 
+export type ControlPlaneCommandHandlers = {
+  pause: (params: { workerId?: string | null; reason?: string | null; checkpoint?: string | null }) => Promise<void> | void;
+  resume: (params: { workerId?: string | null; reason?: string | null }) => Promise<void> | void;
+  enqueueMessage: (params: { workerId?: string | null; sessionId?: string | null; text: string }) =>
+    | Promise<{ id?: string } | void>
+    | { id?: string }
+    | void;
+  interruptMessage?: (params: { workerId?: string | null; sessionId?: string | null; text: string }) =>
+    | Promise<{ id?: string } | void>
+    | { id?: string }
+    | void;
+  setTaskPriority: (params: { taskId: string; priority: string }) => Promise<void> | void;
+};
+
 export type ControlPlaneServerOptions<TSnapshot> = {
   bus: RalphEventBus;
   getStateSnapshot: ControlPlaneStateProvider<TSnapshot>;
@@ -24,6 +38,7 @@ export type ControlPlaneServerOptions<TSnapshot> = {
   exposeRawOpencodeEvents?: boolean;
   replayLastDefault?: number;
   replayLastMax?: number;
+  commands?: ControlPlaneCommandHandlers;
 };
 
 export type ControlPlaneServer = {
@@ -62,6 +77,28 @@ function jsonError(status: number, code: string, message: string, extraHeaders?:
   return jsonResponse(status, { error: { code, message } }, extraHeaders);
 }
 
+async function parseJsonBody(request: Request): Promise<{ ok: true; value: any } | { ok: false; error: Response }> {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    return { ok: false, error: jsonError(415, "unsupported_media_type", "Expected application/json") };
+  }
+
+  try {
+    const value = await request.json();
+    return { ok: true, value };
+  } catch {
+    return { ok: false, error: jsonError(400, "bad_request", "Invalid JSON") };
+  }
+}
+
+function requireBearerAuth(token: string, request: Request): Response | null {
+  const auth = parseBearerToken(request.headers.get("authorization"));
+  if (!tokensMatch(token, auth)) {
+    return jsonError(401, "unauthorized", "Missing or invalid token", { "WWW-Authenticate": "Bearer" });
+  }
+  return null;
+}
+
 function publishInternalError(bus: RalphEventBus, message: string): void {
   bus.publish(
     buildRalphEvent({
@@ -82,7 +119,7 @@ export function startControlPlaneServer<TSnapshot>(
   const server = Bun.serve<WebSocketData>({
     hostname: options.host,
     port: options.port,
-    fetch(request: Request, serverInstance: Bun.Server<WebSocketData>) {
+    async fetch(request: Request, serverInstance: Bun.Server<WebSocketData>) {
       const url = new URL(request.url);
       const path = url.pathname;
 
@@ -125,10 +162,8 @@ export function startControlPlaneServer<TSnapshot>(
 
         if (path === "/v1/state") {
           if (request.method !== "GET") return jsonError(405, "method_not_allowed", "Method not allowed");
-          const auth = parseBearerToken(request.headers.get("authorization"));
-          if (!tokensMatch(token, auth)) {
-            return jsonError(401, "unauthorized", "Missing or invalid token", { "WWW-Authenticate": "Bearer" });
-          }
+          const authError = requireBearerAuth(token, request);
+          if (authError) return authError;
 
           return options
             .getStateSnapshot()
@@ -143,11 +178,93 @@ export function startControlPlaneServer<TSnapshot>(
 
         if (path === "/healthz") {
           if (request.method !== "GET") return jsonError(405, "method_not_allowed", "Method not allowed");
-          const auth = parseBearerToken(request.headers.get("authorization"));
-          if (!tokensMatch(token, auth)) {
-            return jsonError(401, "unauthorized", "Missing or invalid token", { "WWW-Authenticate": "Bearer" });
-          }
+          const authError = requireBearerAuth(token, request);
+          if (authError) return authError;
           return jsonResponse(200, { ok: true });
+        }
+
+        if (path.startsWith("/v1/commands/")) {
+          const authError = requireBearerAuth(token, request);
+          if (authError) return authError;
+          if (request.method !== "POST") return jsonError(405, "method_not_allowed", "Method not allowed");
+
+          const commands = options.commands;
+          if (!commands) {
+            return jsonError(501, "not_implemented", "Control commands are not enabled");
+          }
+
+          if (path === "/v1/commands/pause") {
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const body = parsed.value;
+
+            const workerId = typeof body?.workerId === "string" ? body.workerId : null;
+            const reason = typeof body?.reason === "string" ? body.reason : null;
+            const checkpoint = typeof body?.checkpoint === "string" ? body.checkpoint : null;
+
+            await commands.pause({ workerId, reason, checkpoint });
+            return jsonResponse(200, { ok: true });
+          }
+
+          if (path === "/v1/commands/resume") {
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const body = parsed.value;
+
+            const workerId = typeof body?.workerId === "string" ? body.workerId : null;
+            const reason = typeof body?.reason === "string" ? body.reason : null;
+
+            await commands.resume({ workerId, reason });
+            return jsonResponse(200, { ok: true });
+          }
+
+          if (path === "/v1/commands/message/enqueue") {
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const body = parsed.value;
+
+            const text = typeof body?.text === "string" ? body.text : "";
+            if (!text.trim()) return jsonError(400, "bad_request", "Missing text");
+
+            const workerId = typeof body?.workerId === "string" ? body.workerId : null;
+            const sessionId = typeof body?.sessionId === "string" ? body.sessionId : null;
+            const result = await commands.enqueueMessage({ workerId, sessionId, text });
+            return jsonResponse(200, { ok: true, ...(result && typeof result === "object" ? result : {}) });
+          }
+
+          if (path === "/v1/commands/message/interrupt") {
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const body = parsed.value;
+
+            const text = typeof body?.text === "string" ? body.text : "";
+            if (!text.trim()) return jsonError(400, "bad_request", "Missing text");
+
+            if (!commands.interruptMessage) {
+              return jsonError(501, "not_implemented", "Interrupt messaging is not enabled");
+            }
+
+            const workerId = typeof body?.workerId === "string" ? body.workerId : null;
+            const sessionId = typeof body?.sessionId === "string" ? body.sessionId : null;
+            const result = await commands.interruptMessage({ workerId, sessionId, text });
+            return jsonResponse(200, { ok: true, ...(result && typeof result === "object" ? result : {}) });
+          }
+
+          if (path === "/v1/commands/task/priority") {
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const body = parsed.value;
+
+            const taskId = typeof body?.taskId === "string" ? body.taskId : "";
+            const priority = typeof body?.priority === "string" ? body.priority : "";
+            if (!taskId.trim()) return jsonError(400, "bad_request", "Missing taskId");
+            if (!priority.trim()) return jsonError(400, "bad_request", "Missing priority");
+
+            await commands.setTaskPriority({ taskId, priority });
+            return jsonResponse(200, { ok: true });
+          }
+
+          return jsonError(404, "not_found", "Not found");
         }
 
         return jsonError(404, "not_found", "Not found");
