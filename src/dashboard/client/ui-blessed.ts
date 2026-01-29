@@ -57,6 +57,12 @@ function formatFooter(status: string, hint: string | null): string {
   return hint ? `${base} | ${hint}` : base;
 }
 
+function toNumber(value: number | string): number {
+  if (typeof value === "number") return value;
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function safeExit(): void {
   const globalAny = globalThis as typeof globalThis & {
     Bun?: { exit?: (code: number) => void };
@@ -83,7 +89,6 @@ export async function startDashboardTui(options: DashboardTuiOptions): Promise<v
     },
     scrollbar: {
       ch: " ",
-      inverse: true,
     },
   });
 
@@ -137,7 +142,7 @@ export async function startDashboardTui(options: DashboardTuiOptions): Promise<v
 
   const render = () => {
     const rows = selectWorkerRows(model, Date.now());
-    const width = typeof list.width === "number" ? list.width : screen.width * 0.45;
+    const width = typeof list.width === "number" ? list.width : toNumber(screen.width) * 0.45;
     const items = rows.length === 0 ? ["(no workers yet)"] : rows.map((row) => formatRow(row, width));
     list.setItems(items);
 
