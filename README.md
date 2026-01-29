@@ -31,6 +31,17 @@ Control plane API (MVP):
 - `GET /v1/state` (requires `Authorization: Bearer <token>`)
 - `WS /v1/events` with auth via `Authorization` header, `Sec-WebSocket-Protocol: ralph.bearer.<token>`, or `?access_token=`
 
+Dashboard TUI (MVP):
+
+1. Enable the control plane with a token in `~/.ralph/config.toml` or `~/.ralph/config.json` (see `docs/product/dashboard-mvp-control-plane-tui.md`).
+2. Run the TUI client:
+
+```bash
+RALPH_DASHBOARD_TOKEN="your-token" ralphctl dashboard
+```
+
+Optional flags: `--url`, `--host`, `--port`, `--token`, `--replay-last`.
+
 ## Requirements
 
 - [Bun](https://bun.sh) >= 1.0.0
