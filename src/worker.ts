@@ -42,6 +42,8 @@ import { buildWorktreePath } from "./worktree-paths";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
+import { buildCheckpointState, type CheckpointState } from "./checkpoints/core";
+import { applyCheckpointReached } from "./checkpoints/runtime";
 import { hasProductGap, parseRoutingDecision, selectPrUrl, type RoutingDecision } from "./routing";
 import { computeLiveAnomalyCountFromJsonl } from "./anomaly";
 import {
@@ -94,7 +96,8 @@ import {
   type IssueRelationshipSnapshot,
 } from "./github/issue-relationships";
 import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessionEventsPath } from "./paths";
-import { type RalphCheckpoint, type RalphEvent } from "./dashboard/events";
+import { ralphEventBus } from "./dashboard/bus";
+import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "./dashboard/events";
 import { publishDashboardEvent, type DashboardEventContext } from "./dashboard/publisher";
 import { cleanupSessionArtifacts } from "./introspection-traces";
 import { isIntrospectionSummary, type IntrospectionSummary } from "./introspection/summary";
@@ -244,6 +247,9 @@ const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
 const CI_REMEDIATION_BACKOFF_BASE_MS = 30_000;
 const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 
+const CHECKPOINT_SEQ_FIELD = "checkpoint-seq";
+const PAUSE_REQUESTED_FIELD = "pause-requested";
+const PAUSED_AT_CHECKPOINT_FIELD = "paused-at-checkpoint";
 interface LiveAnomalyCount {
   total: number;
   recentBurst: boolean;
@@ -436,6 +442,58 @@ function applyTaskPatch(task: AgentTask, status: AgentTask["status"], patch: Rec
   task.status = status;
   for (const [key, value] of Object.entries(patch)) {
     (task as unknown as Record<string, unknown>)[key] = typeof value === "number" ? String(value) : value;
+  }
+}
+
+function parseCheckpointSeq(value?: string): number {
+  const parsed = Number.parseInt(value ?? "", 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return parsed;
+}
+
+function parsePauseRequested(value?: string): boolean {
+  return value?.trim().toLowerCase() === "true";
+}
+
+function parseCheckpointValue(value?: string): RalphCheckpoint | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return isRalphCheckpoint(trimmed) ? (trimmed as RalphCheckpoint) : null;
+}
+
+function buildCheckpointPatch(state: CheckpointState): Record<string, string> {
+  return {
+    checkpoint: state.lastCheckpoint ?? "",
+    [CHECKPOINT_SEQ_FIELD]: String(state.checkpointSeq),
+    [PAUSE_REQUESTED_FIELD]: state.pauseRequested ? "true" : "false",
+    [PAUSED_AT_CHECKPOINT_FIELD]: state.pausedAtCheckpoint ?? "",
+  };
+}
+
+class CheckpointEventDeduper {
+  #seen = new Set<string>();
+  #order: string[] = [];
+  #limit: number;
+
+  constructor(limit = 5000) {
+    this.#limit = Math.max(0, Math.floor(limit));
+  }
+
+  hasEmitted(key: string): boolean {
+    return this.#seen.has(key);
+  }
+
+  emit(event: RalphEvent, key: string): void {
+    if (this.#seen.has(key)) return;
+    ralphEventBus.publish(event);
+    if (this.#limit === 0) return;
+    this.#seen.add(key);
+    this.#order.push(key);
+    if (this.#order.length > this.#limit) {
+      const oldest = this.#order.shift();
+      if (oldest) this.#seen.delete(oldest);
+    }
   }
 }
 
@@ -928,6 +986,7 @@ export class RepoWorker {
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
+  private checkpointEvents = new CheckpointEventDeduper();
   private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
 
@@ -5068,9 +5127,13 @@ ${guidance}`
       ...opencodeSessionOptions,
     });
 
+    await this.recordImplementationCheckpoint(task, surveyResult.sessionId || mergeGate.sessionId);
+
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
+
+    await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return {
       taskName: task.name,
@@ -5183,6 +5246,8 @@ ${guidance}`
       ...opencodeSessionOptions,
     });
 
+    await this.recordImplementationCheckpoint(task, surveyResult.sessionId || mergeGate.sessionId);
+
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
@@ -5190,6 +5255,8 @@ ${guidance}`
     if (!surveyResult.success && surveyResult.stallTimeout) {
       return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
+
+    await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return {
       taskName: task.name,
@@ -5269,6 +5336,10 @@ ${guidance}`
           ...opencodeSessionOptions,
         });
 
+    if (resumeSessionId) {
+      await this.recordImplementationCheckpoint(task, recoveryResult.sessionId || resumeSessionId);
+    }
+
     const pausedAfter = await this.pauseIfHardThrottled(task, `${stage} (post)`, recoveryResult.sessionId);
     if (pausedAfter) return pausedAfter;
 
@@ -5346,6 +5417,8 @@ ${guidance}`
       ...opencodeSessionOptions,
     });
 
+    await this.recordImplementationCheckpoint(task, surveyResult.sessionId || mergeGate.sessionId);
+
     const pausedSurveyAfter = await this.pauseIfHardThrottled(
       task,
       "survey (post)",
@@ -5360,6 +5433,8 @@ ${guidance}`
     if (!surveyResult.success && surveyResult.stallTimeout) {
       return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
+
+    await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return await this.finalizeTaskSuccess({
       task,
@@ -5424,6 +5499,7 @@ ${guidance}`
       devex,
     });
 
+    await this.recordCheckpoint(task, "recorded", sessionId);
     this.publishCheckpoint("recorded", { sessionId });
 
     await this.queue.updateTaskStatus(task, "done", {
@@ -5775,6 +5851,8 @@ ${guidance}`
     let sessionId = params.sessionId;
     let didUpdateBranch = false;
 
+    await this.recordCheckpoint(params.task, "pr_ready", sessionId);
+
     const prFiles = await this.getPullRequestFiles(prUrl);
     const ciOnly = isCiOnlyChangeSet(prFiles);
     const isCiIssue = isCiRelatedIssue(params.issueMeta.labels ?? []);
@@ -5908,6 +5986,7 @@ ${guidance}`
         } catch (error: any) {
           console.warn(`[ralph:worker:${this.repo}] Failed to delete PR head branch: ${this.formatGhError(error)}`);
         }
+        await this.recordCheckpoint(params.task, "merge_step_complete", sessionId);
         return { ok: true, prUrl, sessionId };
       } catch (error: any) {
         const shouldUpdateBeforeRetry =
@@ -6323,6 +6402,100 @@ ${guidance}`
     };
   }
 
+  private readPauseRequested(): boolean {
+    const defaults = getConfig().control;
+    const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
+    return control.pauseRequested === true;
+  }
+
+  private async waitForPauseCleared(opts?: { signal?: AbortSignal }): Promise<void> {
+    const minMs = 250;
+    const maxMs = 2000;
+    let delayMs = minMs;
+
+    while (this.readPauseRequested()) {
+      if (opts?.signal?.aborted) return;
+
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(resolve, delayMs);
+        if (opts?.signal) {
+          const onAbort = () => {
+            clearTimeout(timeout);
+            resolve();
+          };
+          opts.signal.addEventListener("abort", onAbort, { once: true });
+        }
+      });
+
+      const jitter = Math.floor(Math.random() * 125);
+      delayMs = Math.min(maxMs, Math.floor(delayMs * 1.6) + jitter);
+    }
+  }
+
+  private getCheckpointState(task: AgentTask): CheckpointState {
+    return buildCheckpointState({
+      lastCheckpoint: parseCheckpointValue(task.checkpoint),
+      checkpointSeq: parseCheckpointSeq(task[CHECKPOINT_SEQ_FIELD]),
+      pausedAtCheckpoint: parseCheckpointValue(task[PAUSED_AT_CHECKPOINT_FIELD]),
+      pauseRequested: parsePauseRequested(task[PAUSE_REQUESTED_FIELD]),
+    });
+  }
+
+  private async recordCheckpoint(task: AgentTask, checkpoint: RalphCheckpoint, sessionId?: string): Promise<void> {
+    const workerId = await this.formatWorkerId(task, task._path);
+    const state = this.getCheckpointState(task);
+
+    const store = {
+      persist: async (nextState: CheckpointState) => {
+        const patch = buildCheckpointPatch(nextState);
+        try {
+          const updated = await this.queue.updateTaskStatus(task, task.status, patch);
+          if (!updated) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to persist checkpoint state (checkpoint=${checkpoint}, task=${task.issue})`
+            );
+            return;
+          }
+          applyTaskPatch(task, task.status, patch);
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to persist checkpoint state (checkpoint=${checkpoint}, task=${task.issue}): ${
+              error?.message ?? String(error)
+            }`
+          );
+        }
+      },
+    };
+
+    const pauseSource = {
+      isPauseRequested: () => this.readPauseRequested(),
+      waitUntilCleared: (opts?: { signal?: AbortSignal }) => this.waitForPauseCleared(opts),
+    };
+
+    const emitter = {
+      emit: (event: RalphEvent, key: string) => this.checkpointEvents.emit(event, key),
+      hasEmitted: (key: string) => this.checkpointEvents.hasEmitted(key),
+    };
+
+    await applyCheckpointReached({
+      checkpoint,
+      state,
+      context: {
+        workerId,
+        repo: this.repo,
+        taskId: task._path,
+        sessionId: sessionId ?? (task["session-id"]?.trim() || undefined),
+      },
+      store,
+      pauseSource,
+      emitter,
+    });
+  }
+
+  private async recordImplementationCheckpoint(task: AgentTask, sessionId?: string): Promise<void> {
+    await this.recordCheckpoint(task, "implementation_step_complete", sessionId);
+  }
+
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
     const pinned = this.getPinnedOpencodeProfileName(task);
     const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
@@ -6457,6 +6630,7 @@ ${guidance}`
           ...this.buildStallOptions(task, `nudge-${stage}`),
           ...opencodeSessionOptions,
         });
+        await this.recordImplementationCheckpoint(task, res.sessionId || sid);
         return { success: res.success, error: res.success ? undefined : res.output };
       });
 
@@ -6911,6 +7085,8 @@ ${guidance}`
         ...opencodeSessionOptions,
       });
 
+      await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
+
       const pausedAfter = await this.pauseIfHardThrottled(task, "resume (post)", buildResult.sessionId || existingSessionId);
       if (pausedAfter) return pausedAfter;
 
@@ -7058,6 +7234,8 @@ ${guidance}`
             }
           );
 
+          await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
+
           const pausedLoopBreakAfter = await this.pauseIfHardThrottled(
             task,
             "resume loop-break (post)",
@@ -7135,6 +7313,8 @@ ${guidance}`
           ...this.buildStallOptions(task, "resume-continue"),
           ...opencodeSessionOptions,
         });
+
+        await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
 
         const pausedContinueAfter = await this.pauseIfHardThrottled(
           task,
@@ -7292,6 +7472,8 @@ ${guidance}`
         ...opencodeSessionOptions,
       });
 
+      await this.recordImplementationCheckpoint(task, surveyResult.sessionId || buildResult.sessionId || existingSessionId);
+
 
       const pausedSurveyAfter = await this.pauseIfHardThrottled(
         task,
@@ -7311,6 +7493,11 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
+      await this.recordCheckpoint(
+        task,
+        "survey_complete",
+        surveyResult.sessionId || buildResult.sessionId || existingSessionId
+      );
       this.publishCheckpoint("survey_complete", {
         sessionId: surveyResult.sessionId || buildResult.sessionId || existingSessionId || undefined,
       });
@@ -7596,11 +7783,14 @@ ${guidance}`
         });
       }
 
+      await this.recordCheckpoint(task, "planned", planResult.sessionId);
       this.publishCheckpoint("planned", { sessionId: planResult.sessionId || undefined });
 
       // 5. Parse routing decision
       let routing = parseRoutingDecision(planResult.output);
       let hasGap = hasProductGap(planResult.output);
+
+      await this.recordCheckpoint(task, "routed", planResult.sessionId);
 
       // 6. Consult devex once before escalating implementation tasks
       let devexContext: EscalationContext["devex"] | undefined;
@@ -7637,6 +7827,8 @@ ${guidance}`
           ...this.buildStallOptions(task, "consult devex"),
           ...opencodeSessionOptions,
         });
+
+        await this.recordImplementationCheckpoint(task, devexResult.sessionId || baseSessionId);
 
         const pausedAfterDevexConsult = await this.pauseIfHardThrottled(
           task,
@@ -7696,6 +7888,8 @@ ${guidance}`
             ...this.buildStallOptions(task, "reroute after devex"),
             ...opencodeSessionOptions,
           });
+
+          await this.recordImplementationCheckpoint(task, rerouteResult.sessionId || baseSessionId);
 
           const pausedAfterReroute = await this.pauseIfHardThrottled(
             task,
@@ -7840,6 +8034,8 @@ ${guidance}`
         ...opencodeSessionOptions,
       });
 
+      await this.recordImplementationCheckpoint(task, buildResult.sessionId || planResult.sessionId);
+
       const pausedAfterBuild = await this.pauseIfHardThrottled(task, "build (post)", buildResult.sessionId || planResult.sessionId);
       if (pausedAfterBuild) return pausedAfterBuild;
 
@@ -7979,6 +8175,8 @@ ${guidance}`
             }
           );
 
+          await this.recordImplementationCheckpoint(task, buildResult.sessionId);
+
           const pausedBuildLoopBreakAfter = await this.pauseIfHardThrottled(task, "build loop-break (post)", buildResult.sessionId);
           if (pausedBuildLoopBreakAfter) return pausedBuildLoopBreakAfter;
 
@@ -8052,6 +8250,8 @@ ${guidance}`
           ...this.buildStallOptions(task, "build-continue"),
           ...opencodeSessionOptions,
         });
+
+        await this.recordImplementationCheckpoint(task, buildResult.sessionId);
 
         const pausedBuildContinueAfter = await this.pauseIfHardThrottled(task, "build continue (post)", buildResult.sessionId);
         if (pausedBuildContinueAfter) return pausedBuildContinueAfter;
@@ -8209,6 +8409,8 @@ ${guidance}`
         ...opencodeSessionOptions,
       });
 
+      await this.recordImplementationCheckpoint(task, surveyResult.sessionId || buildResult.sessionId);
+
       const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "survey (post)", surveyResult.sessionId || buildResult.sessionId);
       if (pausedSurveyAfter) return pausedSurveyAfter;
 
@@ -8223,6 +8425,7 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
+      await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || buildResult.sessionId);
       this.publishCheckpoint("survey_complete", {
         sessionId: surveyResult.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
       });

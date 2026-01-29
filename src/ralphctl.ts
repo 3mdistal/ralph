@@ -5,6 +5,7 @@ import { readDaemonRecord, resolveDaemonRecordPath, type DaemonRecord } from "./
 import { updateControlFile } from "./control-file";
 import { getStatusSnapshot } from "./commands/status";
 import type { StatusSnapshot } from "./status-snapshot";
+import { startDashboardTui } from "./dashboard/client/ui-blessed";
 
 const DEFAULT_GRACE_MS = 5 * 60_000;
 const DRAIN_POLL_INTERVAL_MS = 1000;
@@ -20,6 +21,7 @@ function printGlobalHelp(): void {
       "",
       "Usage:",
       "  ralphctl status [--json]",
+      "  ralphctl dashboard [--url <url>] [--host <host>] [--port <port>] [--token <token>] [--replay-last <n>]",
       "  ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]",
       "  ralphctl resume",
       "  ralphctl restart [--grace 5m] [--force] [--start-cmd \"<command>\"]",
@@ -42,6 +44,21 @@ function printCommandHelp(command: string): void {
   switch (command) {
     case "status":
       console.log(["Usage:", "  ralphctl status [--json]"].join("\n"));
+      return;
+    case "dashboard":
+      console.log(
+        [
+          "Usage:",
+          "  ralphctl dashboard [--url <url>] [--host <host>] [--port <port>] [--token <token>] [--replay-last <n>]",
+          "",
+          "Options:",
+          "  --url <url>        Full base URL for control plane (overrides host/port)",
+          "  --host <host>      Control plane host (default: 127.0.0.1)",
+          "  --port <port>      Control plane port (default: 8787)",
+          "  --token <token>    Bearer token (fallback: RALPH_DASHBOARD_TOKEN)",
+          "  --replay-last <n>  Replay count for /v1/events (default: 50)",
+        ].join("\n")
+      );
       return;
     case "drain":
       console.log([
@@ -102,6 +119,29 @@ function parseDuration(value: string | null): number | null {
     default:
       return null;
   }
+}
+
+function parseInteger(value: string | null, fallback: number): number {
+  if (!value) return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  const floored = Math.floor(parsed);
+  return floored >= 0 ? floored : fallback;
+}
+
+function resolveDashboardOptions(args: CommandArgs): { baseUrl: string; token: string; replayLast: number } {
+  const url = getFlagValue(args, "--url");
+  const host = getFlagValue(args, "--host") ?? "127.0.0.1";
+  const port = parseInteger(getFlagValue(args, "--port"), 8787);
+  const replayLast = parseInteger(getFlagValue(args, "--replay-last"), 50);
+  const token = getFlagValue(args, "--token") ?? process.env.RALPH_DASHBOARD_TOKEN ?? "";
+
+  if (!token) {
+    throw new Error("Missing token; pass --token or set RALPH_DASHBOARD_TOKEN");
+  }
+
+  if (url) return { baseUrl: url, token, replayLast };
+  return { baseUrl: `http://${host}:${port}`, token, replayLast };
 }
 
 function splitCommandLine(value: string | null): string[] | null {
@@ -354,6 +394,12 @@ async function run(): Promise<void> {
     console.log(`In-progress tasks: ${snapshot.inProgress.length}`);
     console.log(`Queued tasks: ${snapshot.queued.length}`);
     process.exit(0);
+  }
+
+  if (cmd === "dashboard") {
+    const { baseUrl, token, replayLast } = resolveDashboardOptions(args);
+    await startDashboardTui({ baseUrl, token, replayLast });
+    return;
   }
 
   if (cmd === "drain") {
