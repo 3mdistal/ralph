@@ -654,11 +654,26 @@ async function runSession(
   args.push("--format", "json");
 
   const opencodeXdg = options?.opencodeXdg;
-  const { env } = buildOpencodeSpawnEnvironment({
+  const { env: baseEnv, xdgCacheHome } = buildOpencodeSpawnEnvironment({
     repo: options?.repo,
     cacheKey: options?.cacheKey,
     opencodeXdg,
   });
+
+  // Ensure any `gh` usage inside OpenCode runs is scoped to Ralph auth + config.
+  // This avoids falling back to a developer's local `gh` auth in daemon runs.
+  const ghConfigDir = join(xdgCacheHome, "gh");
+  try {
+    mkdirSync(ghConfigDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+
+  const env: Record<string, string | undefined> = {
+    ...baseEnv,
+    GH_CONFIG_DIR: ghConfigDir,
+  };
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const processKill = options?.__testOverrides?.processKill ?? process.kill;
   const useProcessGroup = process.platform !== "win32";
@@ -1583,11 +1598,24 @@ async function* streamSession(
 
   args.push("--format", "json");
 
-  const { env } = buildOpencodeSpawnEnvironment({
+  const { env: baseEnv, xdgCacheHome } = buildOpencodeSpawnEnvironment({
     repo: options?.repo,
     cacheKey: options?.cacheKey,
     opencodeXdg: options?.opencodeXdg,
   });
+
+  const ghConfigDir = join(xdgCacheHome, "gh");
+  try {
+    mkdirSync(ghConfigDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+
+  const env: Record<string, string | undefined> = {
+    ...baseEnv,
+    GH_CONFIG_DIR: ghConfigDir,
+  };
 
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const useProcessGroup = process.platform !== "win32";

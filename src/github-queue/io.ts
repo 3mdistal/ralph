@@ -20,6 +20,7 @@ import {
   getIssueSnapshotByNumber,
   getTaskOpStateByPath,
   listIssueSnapshotsWithRalphLabels,
+  listOpenPrCandidatesForIssue,
   listTaskOpStatesByRepo,
   recordIssueLabelsSnapshot,
   recordTaskSnapshot,
@@ -41,6 +42,7 @@ type GitHubQueueDeps = {
 type GitHubQueueIO = {
   ensureWorkflowLabels: (repo: string) => Promise<EnsureOutcome>;
   listIssueLabels: (repo: string, issueNumber: number) => Promise<string[]>;
+  reopenIssue: (repo: string, issueNumber: number) => Promise<void>;
   addIssueLabel: (repo: string, issueNumber: number, label: string) => Promise<void>;
   addIssueLabels: (repo: string, issueNumber: number, labels: string[]) => Promise<void>;
   removeIssueLabel: (repo: string, issueNumber: number, label: string) => Promise<{ removed: boolean }>;
@@ -84,6 +86,14 @@ function createGitHubQueueIo(): GitHubQueueIO {
         `/repos/${owner}/${name}/issues/${issueNumber}/labels?per_page=100`
       );
       return (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+    },
+    reopenIssue: async (repo, issueNumber) => {
+      const { owner, name } = splitRepoFullName(repo);
+      const client = await createGitHubClient(repo);
+      await client.request(`/repos/${owner}/${name}/issues/${issueNumber}`, {
+        method: "PATCH",
+        body: { state: "open" },
+      });
     },
     addIssueLabel: async (repo, issueNumber, label) => {
       const client = await createGitHubClient(repo);
@@ -184,9 +194,144 @@ function resolveIssueSnapshot(repo: string, issueNumber: number): IssueSnapshot 
 export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   const io = deps?.io ?? createGitHubQueueIo();
   let lastSweepAt = 0;
+  let lastClosedSweepAt = 0;
   let stopRequested = false;
   let watchTimer: ReturnType<typeof setTimeout> | null = null;
   let watchInFlight = false;
+
+  const maybeSweepClosedIssues = async (): Promise<void> => {
+    const nowMs = getNowMs(deps);
+    if (nowMs - lastClosedSweepAt < SWEEP_INTERVAL_MS) return;
+    lastClosedSweepAt = nowMs;
+
+    const nowIso = getNowIso(deps);
+
+    for (const repo of getConfig().repos.map((entry) => entry.name)) {
+      const opStateByIssue = buildTaskOpStateMap(repo);
+      const issues = listIssueSnapshotsWithRalphLabels(repo);
+
+      for (const issue of issues) {
+        if (stopRequested) return;
+        if ((issue.state ?? "").toUpperCase() !== "CLOSED") continue;
+
+        const openPrs = listOpenPrCandidatesForIssue(repo, issue.number);
+        const opState = opStateByIssue.get(issue.number) ?? null;
+        const isReleased = typeof opState?.releasedAtMs === "number" && Number.isFinite(opState.releasedAtMs);
+
+        // If a tracked PR is still open, keep the issue open.
+        if (openPrs.length > 0) {
+          try {
+            await io.reopenIssue(repo, issue.number);
+          } catch (error: any) {
+            console.warn(
+              `[ralph:queue:github] Failed to reopen closed issue with open PR ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+            );
+          }
+
+          try {
+            if (!isReleased) {
+              releaseTaskSlot({
+                repo,
+                issueNumber: issue.number,
+                taskPath: `github:${repo}#${issue.number}`,
+                releasedReason: "closed-with-open-pr",
+                status: "queued",
+              });
+            }
+
+            const delta = statusToRalphLabelDelta("queued", issue.labels);
+            const didMutate = await io.mutateIssueLabels({
+              repo,
+              issueNumber: issue.number,
+              issueNodeId: issue.githubNodeId,
+              add: delta.add,
+              remove: delta.remove,
+            });
+
+            if (!didMutate) {
+              const steps: LabelOp[] = [
+                ...delta.add.map((label) => ({ action: "add" as const, label })),
+                ...delta.remove.map((label) => ({ action: "remove" as const, label })),
+              ];
+
+              const labelOps = await applyIssueLabelOps({
+                ops: steps,
+                io: buildLabelOpsIo(io, repo, issue.number),
+                logLabel: `${repo}#${issue.number}`,
+                log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+                repo,
+                ensureLabels: async () => await io.ensureWorkflowLabels(repo),
+                retryMissingLabelOnce: true,
+              });
+
+              if (labelOps.ok) {
+                applyLabelDelta({ repo, issueNumber: issue.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+              } else if (labelOps.kind !== "transient") {
+                throw labelOps.error;
+              }
+            } else {
+              applyLabelDelta({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
+            }
+          } catch (error: any) {
+            console.warn(
+              `[ralph:queue:github] Failed to reconcile labels for reopened issue ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+            );
+          }
+
+          continue;
+        }
+
+        // Otherwise: issue is closed and no active PR is tracked. Release locally and clear Ralph workflow labels.
+        try {
+          if (!isReleased) {
+            releaseTaskSlot({
+              repo,
+              issueNumber: issue.number,
+              taskPath: `github:${repo}#${issue.number}`,
+              releasedReason: "issue-closed",
+              status: "queued",
+            });
+          }
+
+          const remove = issue.labels.filter((label) => label.toLowerCase().startsWith("ralph:"));
+          if (remove.length > 0) {
+            const didMutate = await io.mutateIssueLabels({
+              repo,
+              issueNumber: issue.number,
+              issueNodeId: issue.githubNodeId,
+              add: [],
+              remove,
+            });
+
+            if (!didMutate) {
+              const steps: LabelOp[] = remove.map((label) => ({ action: "remove" as const, label }));
+              const labelOps = await applyIssueLabelOps({
+                ops: steps,
+                io: buildLabelOpsIo(io, repo, issue.number),
+                logLabel: `${repo}#${issue.number}`,
+                log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+                repo,
+                ensureLabels: async () => await io.ensureWorkflowLabels(repo),
+                retryMissingLabelOnce: true,
+              });
+
+              if (labelOps.ok) {
+                applyLabelDelta({ repo, issueNumber: issue.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+              } else if (labelOps.kind !== "transient") {
+                throw labelOps.error;
+              }
+            } else {
+              applyLabelDelta({ repo, issueNumber: issue.number, add: [], remove, nowIso });
+            }
+          }
+        } catch (error: any) {
+          console.warn(
+            `[ralph:queue:github] Failed to reconcile closed issue ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+          );
+        }
+      }
+    }
+  };
 
   const maybeSweepStaleInProgress = async (): Promise<void> => {
     const nowMs = getNowMs(deps);
@@ -275,6 +420,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
 
   const listTasksByStatus = async (status: QueueTaskStatus): Promise<AgentTask[]> => {
     if (status === "starting" || status === "throttled") return [];
+    await maybeSweepClosedIssues();
     await maybeSweepStaleInProgress();
 
     const tasks: AgentTask[] = [];

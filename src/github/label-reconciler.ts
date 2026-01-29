@@ -68,6 +68,7 @@ async function reconcileRepo(repo: string, maxIssues: number): Promise<number> {
 
   for (const issue of issues) {
     if (processed >= maxIssues) break;
+    if ((issue.state ?? "").toUpperCase() === "CLOSED") continue;
     const opState = opStateByIssue.get(issue.number);
     if (!opState) continue;
 
