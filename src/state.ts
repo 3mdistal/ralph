@@ -75,6 +75,7 @@ const ARTIFACT_MAX_CHARS = 20_000;
 const ARTIFACT_MAX_PER_GATE_KIND = 10;
 
 let db: Database | null = null;
+let dbPath: string | null = null;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -808,9 +809,12 @@ function ensureSchema(database: Database): void {
 }
 
 export function initStateDb(): void {
-  if (db) return;
-
   const stateDbPath = getRalphStateDbPath();
+  if (db) {
+    if (dbPath === stateDbPath) return;
+    db.close();
+    db = null;
+  }
   if (!process.env.RALPH_STATE_DB_PATH?.trim()) {
     mkdirSync(getRalphHomeDir(), { recursive: true });
   }
@@ -820,6 +824,7 @@ export function initStateDb(): void {
   ensureSchema(database);
 
   db = database;
+  dbPath = stateDbPath;
 }
 
 export function isStateDbInitialized(): boolean {
@@ -830,6 +835,7 @@ export function closeStateDbForTests(): void {
   if (!db) return;
   db.close();
   db = null;
+  dbPath = null;
 }
 
 function parseIssueNumber(issueRef: string): number | null {
