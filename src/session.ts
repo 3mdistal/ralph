@@ -320,6 +320,35 @@ async function buildOpencodeGitHubScopedEnv(params: {
   };
 }
 
+function buildOpencodeGitHubScopedEnvForTests(params: {
+  baseEnv: Record<string, string | undefined>;
+  xdgCacheHome: string;
+}): Record<string, string | undefined> {
+  const ghConfigDir = join(params.xdgCacheHome, "gh");
+  try {
+    mkdirSync(ghConfigDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+  const token = (params.baseEnv.GH_TOKEN ?? params.baseEnv.GITHUB_TOKEN ?? "").trim();
+  const extra: Record<string, string | undefined> = token
+    ? {
+        GH_TOKEN: token,
+        GITHUB_TOKEN: token,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_ASKPASS: ensureGitAskpassScript(params.xdgCacheHome),
+      }
+    : {};
+
+  return {
+    ...params.baseEnv,
+    GH_CONFIG_DIR: ghConfigDir,
+    GH_PROMPT_DISABLED: "1",
+    ...extra,
+  };
+}
+
 function extractOpencodeLogPath(text: string): string | null {
   // Example: "check log file at /Users/.../.local/share/opencode/log/2026-01-10T003721.log"
   const match = text.match(/check log file at\s+([^\s]+\.log)/i);
@@ -740,11 +769,13 @@ async function runSession(
     opencodeXdg,
   });
 
-  const env = await buildOpencodeGitHubScopedEnv({
-    baseEnv,
-    xdgCacheHome,
-    resolveToken: options?.__testOverrides?.resolveGhTokenEnv,
-  });
+  const env = options?.__testOverrides?.spawn
+    ? buildOpencodeGitHubScopedEnvForTests({ baseEnv, xdgCacheHome })
+    : await buildOpencodeGitHubScopedEnv({
+        baseEnv,
+        xdgCacheHome,
+        resolveToken: options?.__testOverrides?.resolveGhTokenEnv,
+      });
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const processKill = options?.__testOverrides?.processKill ?? process.kill;
   const useProcessGroup = process.platform !== "win32";
@@ -1677,11 +1708,13 @@ async function* streamSession(
     opencodeXdg: options?.opencodeXdg,
   });
 
-  const env = await buildOpencodeGitHubScopedEnv({
-    baseEnv,
-    xdgCacheHome,
-    resolveToken: options?.__testOverrides?.resolveGhTokenEnv,
-  });
+  const env = options?.__testOverrides?.spawn
+    ? buildOpencodeGitHubScopedEnvForTests({ baseEnv, xdgCacheHome })
+    : await buildOpencodeGitHubScopedEnv({
+        baseEnv,
+        xdgCacheHome,
+        resolveToken: options?.__testOverrides?.resolveGhTokenEnv,
+      });
 
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const useProcessGroup = process.platform !== "win32";
