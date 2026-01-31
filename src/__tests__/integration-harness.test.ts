@@ -71,7 +71,7 @@ const defaultPlanOutput = [
   "",
 ].join("\n");
 
-const defaultRunAgentImpl = async () => ({
+const defaultRunAgentImpl = async (..._args: unknown[]) => ({
   sessionId: "ses_plan",
   success: true,
   output: defaultPlanOutput,
