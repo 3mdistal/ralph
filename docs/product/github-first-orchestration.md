@@ -117,6 +117,11 @@ Blocked enforcement:
 - Blocked issues get the `ralph:blocked` label and their agent-task status is set to `blocked`.
 - When unblocked, Ralph removes `ralph:blocked` and re-queues only tasks that were blocked due to dependencies.
 
+Parent verification lane:
+- When dependency blockers clear, Ralph runs a lightweight parent verification lane before full implementation.
+- The lane emits a deterministic marker and either proceeds to implementation or escalates with a "close or clarify" summary.
+- See `docs/product/parent-verification-lane.md` for the detailed contract.
+
 Blocked attribution (`blocked-source` in agent-task frontmatter):
 - `deps` - blocked by issue dependencies or sub-issues
 - `allowlist` - repo owner not in allowlist

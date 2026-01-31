@@ -1,7 +1,11 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
+import { mkdtemp, rm } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
 
 import { RepoWorker } from "../worker";
 import type { IssueRelationshipProvider, IssueRelationshipSnapshot } from "../github/issue-relationships";
+import { closeStateDbForTests, getParentVerificationState, initStateDb } from "../state";
 
 const updateTaskStatusMock = mock(async () => true);
 
@@ -188,6 +192,44 @@ describe("syncBlockedStateForTasks", () => {
 
     expect(updateTaskStatusMock).toHaveBeenCalledTimes(1);
     expect(removeIssueLabelMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("sets parent verification pending when deps unblock", async () => {
+    updateTaskStatusMock.mockClear();
+    const priorStateDb = process.env.RALPH_STATE_DB_PATH;
+    const stateDir = await mkdtemp(join(tmpdir(), "ralph-state-"));
+    process.env.RALPH_STATE_DB_PATH = join(stateDir, "state.sqlite");
+    initStateDb();
+
+    try {
+      const provider: IssueRelationshipProvider = {
+        getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
+          issue,
+          signals: [],
+          coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
+        }),
+      };
+
+      const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+        session: sessionAdapter,
+        queue: queueAdapter,
+        notify: notifyAdapter,
+        throttle: throttleAdapter,
+        relationships: provider,
+      });
+
+      (worker as any).removeIssueLabel = async () => {};
+      const task = createTask({ status: "blocked", "blocked-source": "deps" });
+      await worker.syncBlockedStateForTasks([task]);
+
+      const pending = getParentVerificationState({ repo: "3mdistal/ralph", issueNumber: 10 });
+      expect(pending?.status).toBe("pending");
+    } finally {
+      closeStateDbForTests();
+      if (priorStateDb === undefined) delete process.env.RALPH_STATE_DB_PATH;
+      else process.env.RALPH_STATE_DB_PATH = priorStateDb;
+      await rm(stateDir, { recursive: true, force: true });
+    }
   });
 
   test("ignores body blockers when GitHub deps coverage is present", async () => {
