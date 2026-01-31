@@ -5,7 +5,7 @@ import { mutateIssueLabels } from "../github/label-mutation";
 import { createRalphWorkflowLabelsEnsurer, type EnsureOutcome } from "../github/ensure-ralph-workflow-labels";
 import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
-import { GitHubRelationshipProvider } from "../github/issue-relationships";
+import { GitHubRelationshipProvider, type IssueRelationshipProvider } from "../github/issue-relationships";
 import { resolveRelationshipSignals } from "../github/relationship-signals";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
@@ -20,6 +20,7 @@ import {
   getIssueSnapshotByNumber,
   getTaskOpStateByPath,
   listIssueSnapshotsWithRalphLabels,
+  listOpenPrCandidatesForIssue,
   listTaskOpStatesByRepo,
   recordIssueLabelsSnapshot,
   recordTaskSnapshot,
@@ -36,11 +37,13 @@ const WATCH_MIN_INTERVAL_MS = 1000;
 type GitHubQueueDeps = {
   now?: () => Date;
   io?: GitHubQueueIO;
+  relationshipsProviderFactory?: (repo: string) => IssueRelationshipProvider;
 };
 
 type GitHubQueueIO = {
   ensureWorkflowLabels: (repo: string) => Promise<EnsureOutcome>;
   listIssueLabels: (repo: string, issueNumber: number) => Promise<string[]>;
+  reopenIssue: (repo: string, issueNumber: number) => Promise<void>;
   addIssueLabel: (repo: string, issueNumber: number, label: string) => Promise<void>;
   addIssueLabels: (repo: string, issueNumber: number, labels: string[]) => Promise<void>;
   removeIssueLabel: (repo: string, issueNumber: number, label: string) => Promise<{ removed: boolean }>;
@@ -84,6 +87,14 @@ function createGitHubQueueIo(): GitHubQueueIO {
         `/repos/${owner}/${name}/issues/${issueNumber}/labels?per_page=100`
       );
       return (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+    },
+    reopenIssue: async (repo, issueNumber) => {
+      const { owner, name } = splitRepoFullName(repo);
+      const client = await createGitHubClient(repo);
+      await client.request(`/repos/${owner}/${name}/issues/${issueNumber}`, {
+        method: "PATCH",
+        body: { state: "open" },
+      });
     },
     addIssueLabel: async (repo, issueNumber, label) => {
       const client = await createGitHubClient(repo);
@@ -183,10 +194,197 @@ function resolveIssueSnapshot(repo: string, issueNumber: number): IssueSnapshot 
 
 export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   const io = deps?.io ?? createGitHubQueueIo();
+  const relationshipsProviderFactory =
+    deps?.relationshipsProviderFactory ?? ((repo: string) => new GitHubRelationshipProvider(repo));
   let lastSweepAt = 0;
+  let lastClosedSweepAt = 0;
+  let lastBlockedSweepAt = 0;
   let stopRequested = false;
   let watchTimer: ReturnType<typeof setTimeout> | null = null;
   let watchInFlight = false;
+
+  const maybeSweepBlockedLabels = async (): Promise<void> => {
+    const nowMs = getNowMs(deps);
+    if (nowMs - lastBlockedSweepAt < SWEEP_INTERVAL_MS) return;
+    lastBlockedSweepAt = nowMs;
+
+    const nowIso = getNowIso(deps);
+
+    for (const repo of getConfig().repos.map((entry) => entry.name)) {
+      if (stopRequested) return;
+      const autoQueueEnabled = getRepoAutoQueueConfig(repo)?.enabled ?? false;
+      if (!autoQueueEnabled) continue;
+
+      const issues = listIssueSnapshotsWithRalphLabels(repo);
+      for (const issue of issues) {
+        if (stopRequested) return;
+        if ((issue.state ?? "").toUpperCase() === "CLOSED") continue;
+        if (!issue.labels.includes("ralph:queued")) continue;
+
+        try {
+          const provider = relationshipsProviderFactory(repo);
+          const snapshot = await provider.getSnapshot({ repo, number: issue.number });
+          const resolved = resolveRelationshipSignals(snapshot);
+          const decision = computeBlockedDecision(resolved.signals);
+
+          const shouldBeBlocked = decision.blocked || decision.confidence === "unknown";
+          const hasBlocked = issue.labels.includes("ralph:blocked");
+          const add = shouldBeBlocked && !hasBlocked ? ["ralph:blocked"] : [];
+          const remove = !shouldBeBlocked && hasBlocked ? ["ralph:blocked"] : [];
+          if (add.length === 0 && remove.length === 0) continue;
+
+          const didMutate = await io.mutateIssueLabels({
+            repo,
+            issueNumber: issue.number,
+            issueNodeId: issue.githubNodeId,
+            add,
+            remove,
+          });
+          if (didMutate) {
+            applyLabelDelta({ repo, issueNumber: issue.number, add, remove, nowIso });
+          }
+        } catch (error: any) {
+          console.warn(
+            `[ralph:queue:github] Failed to reconcile blocked label for ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+          );
+        }
+      }
+    }
+  };
+
+  const maybeSweepClosedIssues = async (): Promise<void> => {
+    const nowMs = getNowMs(deps);
+    if (nowMs - lastClosedSweepAt < SWEEP_INTERVAL_MS) return;
+    lastClosedSweepAt = nowMs;
+
+    const nowIso = getNowIso(deps);
+
+    for (const repo of getConfig().repos.map((entry) => entry.name)) {
+      const opStateByIssue = buildTaskOpStateMap(repo);
+      const issues = listIssueSnapshotsWithRalphLabels(repo);
+
+      for (const issue of issues) {
+        if (stopRequested) return;
+        if ((issue.state ?? "").toUpperCase() !== "CLOSED") continue;
+
+        const openPrs = listOpenPrCandidatesForIssue(repo, issue.number);
+        const opState = opStateByIssue.get(issue.number) ?? null;
+        const isReleased = typeof opState?.releasedAtMs === "number" && Number.isFinite(opState.releasedAtMs);
+
+        // If a tracked PR is still open, keep the issue open.
+        if (openPrs.length > 0) {
+          try {
+            await io.reopenIssue(repo, issue.number);
+          } catch (error: any) {
+            console.warn(
+              `[ralph:queue:github] Failed to reopen closed issue with open PR ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+            );
+          }
+
+          try {
+            if (!isReleased) {
+              releaseTaskSlot({
+                repo,
+                issueNumber: issue.number,
+                taskPath: `github:${repo}#${issue.number}`,
+                releasedReason: "closed-with-open-pr",
+                status: "queued",
+              });
+            }
+
+            const delta = statusToRalphLabelDelta("queued", issue.labels);
+            const didMutate = await io.mutateIssueLabels({
+              repo,
+              issueNumber: issue.number,
+              issueNodeId: issue.githubNodeId,
+              add: delta.add,
+              remove: delta.remove,
+            });
+
+            if (!didMutate) {
+              const steps: LabelOp[] = [
+                ...delta.add.map((label) => ({ action: "add" as const, label })),
+                ...delta.remove.map((label) => ({ action: "remove" as const, label })),
+              ];
+
+              const labelOps = await applyIssueLabelOps({
+                ops: steps,
+                io: buildLabelOpsIo(io, repo, issue.number),
+                logLabel: `${repo}#${issue.number}`,
+                log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+                repo,
+                ensureLabels: async () => await io.ensureWorkflowLabels(repo),
+                retryMissingLabelOnce: true,
+              });
+
+              if (labelOps.ok) {
+                applyLabelDelta({ repo, issueNumber: issue.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+              } else if (labelOps.kind !== "transient") {
+                throw labelOps.error;
+              }
+            } else {
+              applyLabelDelta({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
+            }
+          } catch (error: any) {
+            console.warn(
+              `[ralph:queue:github] Failed to reconcile labels for reopened issue ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+            );
+          }
+
+          continue;
+        }
+
+        // Otherwise: issue is closed and no active PR is tracked. Release locally and clear Ralph workflow labels.
+        try {
+          if (!isReleased) {
+            releaseTaskSlot({
+              repo,
+              issueNumber: issue.number,
+              taskPath: `github:${repo}#${issue.number}`,
+              releasedReason: "issue-closed",
+              status: "queued",
+            });
+          }
+
+          const remove = issue.labels.filter((label) => label.toLowerCase().startsWith("ralph:"));
+          if (remove.length > 0) {
+            const didMutate = await io.mutateIssueLabels({
+              repo,
+              issueNumber: issue.number,
+              issueNodeId: issue.githubNodeId,
+              add: [],
+              remove,
+            });
+
+            if (!didMutate) {
+              const steps: LabelOp[] = remove.map((label) => ({ action: "remove" as const, label }));
+              const labelOps = await applyIssueLabelOps({
+                ops: steps,
+                io: buildLabelOpsIo(io, repo, issue.number),
+                logLabel: `${repo}#${issue.number}`,
+                log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+                repo,
+                ensureLabels: async () => await io.ensureWorkflowLabels(repo),
+                retryMissingLabelOnce: true,
+              });
+
+              if (labelOps.ok) {
+                applyLabelDelta({ repo, issueNumber: issue.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+              } else if (labelOps.kind !== "transient") {
+                throw labelOps.error;
+              }
+            } else {
+              applyLabelDelta({ repo, issueNumber: issue.number, add: [], remove, nowIso });
+            }
+          }
+        } catch (error: any) {
+          console.warn(
+            `[ralph:queue:github] Failed to reconcile closed issue ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+          );
+        }
+      }
+    }
+  };
 
   const maybeSweepStaleInProgress = async (): Promise<void> => {
     const nowMs = getNowMs(deps);
@@ -275,7 +473,9 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
 
   const listTasksByStatus = async (status: QueueTaskStatus): Promise<AgentTask[]> => {
     if (status === "starting" || status === "throttled") return [];
+    await maybeSweepClosedIssues();
     await maybeSweepStaleInProgress();
+    await maybeSweepBlockedLabels();
 
     const tasks: AgentTask[] = [];
     for (const repo of getConfig().repos.map((entry) => entry.name)) {
@@ -375,7 +575,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           const shouldCheckDependencies = liveLabels.includes("ralph:blocked") || autoQueueEnabled;
           if (shouldCheckDependencies) {
             try {
-              const relationships = new GitHubRelationshipProvider(issueRef.repo);
+              const relationships = relationshipsProviderFactory(issueRef.repo);
               const snapshot = await relationships.getSnapshot(issueRef);
               const resolved = resolveRelationshipSignals(snapshot);
               const decision = computeBlockedDecision(resolved.signals);
@@ -384,6 +584,31 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
                   decision.blocked && decision.reasons.length > 0
                     ? `Issue blocked by dependencies (${decision.reasons.join(", ")})`
                     : "Dependency coverage unknown; treating issue as blocked";
+
+                // Best-effort: materialize blocked label for visibility.
+                if (autoQueueEnabled && !liveLabels.includes("ralph:blocked")) {
+                  try {
+                    const nowIso = new Date(opts.nowMs).toISOString();
+                    const didMutate = await io.mutateIssueLabels({
+                      repo: issueRef.repo,
+                      issueNumber: issueRef.number,
+                      issueNodeId: issue.githubNodeId,
+                      add: ["ralph:blocked"],
+                      remove: [],
+                    });
+                    if (didMutate) {
+                      applyLabelDelta({
+                        repo: issueRef.repo,
+                        issueNumber: issueRef.number,
+                        add: ["ralph:blocked"],
+                        remove: [],
+                        nowIso,
+                      });
+                    }
+                  } catch {
+                    // best-effort
+                  }
+                }
                 return { claimed: false, task: opts.task, reason };
               }
             } catch (error: any) {

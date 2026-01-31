@@ -22,8 +22,11 @@
     "build": "tsc -p tsconfig.json && bun run scripts/copy-managed-templates.ts",
     "knip": "knip"
   },
-  "dependencies": {},
+  "dependencies": {
+    "blessed": "^0.1.81"
+  },
   "devDependencies": {
+    "@types/blessed": "^0.1.25",
     "@types/bun": "latest",
     "@types/node": "^20.11.0",
     "knip": "^5.80.2",
