@@ -63,6 +63,13 @@ import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow
 import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import {
+  buildParentVerificationPrompt,
+  getParentVerificationEligibility,
+  hasRequiredParentEvidence,
+  parseParentVerificationOutput,
+} from "./parent-verification/core";
+import { buildParentVerificationContext, ensureCleanWorktree, writeParentVerificationToGitHub } from "./parent-verification/io";
+import {
   buildCiDebugCommentBody,
   createCiDebugComment,
   findCiDebugComment,
@@ -327,6 +334,7 @@ export interface AgentRun {
   repo: string;
   outcome: "success" | "throttled" | "escalated" | "failed";
   pr?: string;
+  completion?: "pr" | "verified";
   sessionId?: string;
   escalationReason?: string;
   surveyResults?: string;
@@ -5267,6 +5275,165 @@ ${guidance}`
     };
   }
 
+  private async maybeRunParentVerification(params: {
+    task: AgentTask;
+    issueNumber: string;
+    taskRepoPath: string;
+    cacheKey: string;
+    issueMeta: IssueMetadata;
+    startTime: Date;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+    workerId?: string;
+    worktreePath?: string;
+    allocatedSlot?: number | null;
+  }): Promise<AgentRun | null> {
+    const {
+      task,
+      issueNumber,
+      taskRepoPath,
+      cacheKey,
+      issueMeta,
+      startTime,
+      opencodeXdg,
+      opencodeSessionOptions,
+      workerId,
+      worktreePath,
+      allocatedSlot,
+    } = params;
+
+    if (!this.isGitHubQueueTask(task)) return null;
+
+    const issueNumberValue = Number.parseInt(issueNumber, 10);
+    if (!Number.isFinite(issueNumberValue)) return null;
+
+    let snapshot: IssueRelationshipSnapshot;
+    try {
+      snapshot = await this.relationships.getSnapshot({ repo: this.repo, number: issueNumberValue });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Parent verification skipped; relationship fetch failed for ${task.issue}: ${
+          error?.message ?? String(error)
+        }`
+      );
+      return null;
+    }
+
+    const resolvedSignals = resolveRelationshipSignals(snapshot);
+    const eligibility = getParentVerificationEligibility(snapshot, resolvedSignals.signals);
+    if (!eligibility.eligible) {
+      console.log(
+        `[ralph:worker:${this.repo}] Parent verification not eligible for ${task.issue}: ${eligibility.reason}`
+      );
+      return null;
+    }
+
+    const context = await buildParentVerificationContext({
+      repo: this.repo,
+      issueNumber: issueNumberValue,
+      issueMeta,
+      snapshot,
+      childRefs: eligibility.childRefs,
+      github: this.github,
+    });
+
+    const cleanBefore = await ensureCleanWorktree(taskRepoPath);
+    if (!cleanBefore.clean) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Parent verification skipped; worktree dirty before verification for ${task.issue}`
+      );
+      return null;
+    }
+
+    const prompt = buildParentVerificationPrompt(context);
+    const runLogPath = await this.recordRunLogPath(task, issueNumber, "parent-verify", "starting");
+
+    let verificationResult = await this.session.runAgent(taskRepoPath, "general", prompt, {
+      repo: this.repo,
+      cacheKey,
+      runLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: task.issue,
+        taskName: task.name,
+        step: 1,
+        stepTitle: "parent verification",
+      },
+      ...this.buildWatchdogOptions(task, "parent-verify"),
+      ...this.buildStallOptions(task, "parent-verify"),
+      ...opencodeSessionOptions,
+    });
+
+    const pausedAfter = await this.pauseIfHardThrottled(task, "parent-verify (post)", verificationResult.sessionId);
+    if (pausedAfter) return pausedAfter;
+
+    if (!verificationResult.success && verificationResult.watchdogTimeout) {
+      return await this.handleWatchdogTimeout(task, cacheKey, "parent-verify", verificationResult, opencodeXdg);
+    }
+
+    if (!verificationResult.success && verificationResult.stallTimeout) {
+      return await this.handleStallTimeout(task, cacheKey, "parent-verify", verificationResult);
+    }
+
+    if (verificationResult.sessionId) {
+      await this.queue.updateTaskStatus(task, "in-progress", { "session-id": verificationResult.sessionId });
+    }
+
+    if (!verificationResult.success) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Parent verification failed for ${task.issue}; continuing with planner.`
+      );
+      return null;
+    }
+
+    const cleanAfter = await ensureCleanWorktree(taskRepoPath);
+    if (!cleanAfter.clean) {
+      const reason = `Parent verification left the worktree dirty for ${task.issue}; refusing to continue.`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return await this.escalateSetupFailure(task, reason, verificationResult.sessionId);
+    }
+
+    const decision = parseParentVerificationOutput(verificationResult.output);
+    if (!decision.valid || !decision.satisfied) {
+      return null;
+    }
+
+    const evidenceOk = hasRequiredParentEvidence(context.children);
+    if (!evidenceOk) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Parent verification satisfied but missing merge evidence for ${task.issue}`
+      );
+      return null;
+    }
+
+    const writeback = await writeParentVerificationToGitHub({
+      context,
+      github: this.github,
+      removeLabels: ["ralph:queued", "ralph:escalated", "ralph:in-progress"],
+    });
+
+    if (!writeback.ok) {
+      const reason = `Parent verification satisfied but writeback failed (${writeback.error ?? "unknown error"}).`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return await this.escalateSetupFailure(task, reason, verificationResult.sessionId);
+    }
+
+    return await this.finalizeTaskSuccess({
+      task,
+      prUrl: null,
+      completion: "verified",
+      sessionId: verificationResult.sessionId || task["session-id"]?.trim() || "",
+      startTime,
+      cacheKey,
+      opencodeXdg,
+      worktreePath,
+      workerId,
+      repoSlot: typeof allocatedSlot === "number" ? String(allocatedSlot) : undefined,
+      notify: true,
+      logMessage: `Task verified complete: ${task.name}`,
+    });
+  }
+
   private async runExistingPrRecovery(params: {
     task: AgentTask;
     issueNumber: string;
@@ -5451,7 +5618,7 @@ ${guidance}`
 
   private async finalizeTaskSuccess(params: {
     task: AgentTask;
-    prUrl: string;
+    prUrl: string | null;
     sessionId: string;
     startTime: Date;
     surveyResults?: string;
@@ -5461,6 +5628,7 @@ ${guidance}`
     workerId?: string;
     repoSlot?: string | number | null;
     devex?: EscalationContext["devex"];
+    completion?: "pr" | "verified";
     notify?: boolean;
     logMessage?: string;
   }): Promise<AgentRun> {
@@ -5476,6 +5644,7 @@ ${guidance}`
       workerId,
       repoSlot,
       devex,
+      completion,
       notify,
       logMessage,
     } = params;
@@ -5533,6 +5702,7 @@ ${guidance}`
       outcome: "success",
       sessionId,
       pr: prUrl ?? undefined,
+      completion: completion ?? (prUrl ? "pr" : "verified"),
     };
   }
 
@@ -7655,6 +7825,21 @@ ${guidance}`
         opencodeSessionOptions,
       });
       if (ciFailureRun) return ciFailureRun;
+
+      const parentVerificationRun = await this.maybeRunParentVerification({
+        task,
+        issueNumber,
+        taskRepoPath,
+        cacheKey,
+        issueMeta,
+        startTime,
+        opencodeXdg,
+        opencodeSessionOptions,
+        workerId,
+        worktreePath,
+        allocatedSlot,
+      });
+      if (parentVerificationRun) return parentVerificationRun;
 
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
