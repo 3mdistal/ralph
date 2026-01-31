@@ -3,6 +3,7 @@ import { isRepoAllowed } from "./github-app-auth";
 import { resolveGitHubToken } from "./github-auth";
 import { fetchJson, parseLinkHeader } from "./github/http";
 import { shouldLog } from "./logging";
+import { Semaphore, type ReleaseFn } from "./semaphore";
 import {
   getRepoGithubIssueLastSyncAt,
   hasIssueSnapshot,
@@ -52,6 +53,20 @@ const DEFAULT_ERROR_MULTIPLIER = 2;
 const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
 const ESCALATION_RECONCILE_MIN_INTERVAL_MS = 60_000;
+
+const DEFAULT_ISSUE_SYNC_MAX_INFLIGHT = 2;
+
+function readEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+}
+
+const issueSyncSemaphore = new Semaphore(
+  Math.max(1, readEnvInt("RALPH_GITHUB_ISSUES_SYNC_MAX_INFLIGHT", DEFAULT_ISSUE_SYNC_MAX_INFLIGHT))
+);
 
 function applyJitter(valueMs: number, pct = DEFAULT_JITTER_PCT): number {
   const clamped = Math.max(valueMs, MIN_DELAY_MS);
@@ -135,6 +150,40 @@ function resolveRateLimitReset(headers: Headers): number | null {
   return resetSeconds * 1000;
 }
 
+function parseRetryAfterMs(headers: Headers): number | null {
+  const raw = headers.get("retry-after");
+  if (!raw) return null;
+  const seconds = Number(raw.trim());
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.round(seconds * 1000);
+}
+
+function isSecondaryRateLimitText(text: string): boolean {
+  const value = text.toLowerCase();
+  return value.includes("secondary rate limit") || value.includes("abuse detection") || value.includes("temporarily blocked");
+}
+
+function isPrimaryRateLimitText(text: string): boolean {
+  const value = text.toLowerCase();
+  return value.includes("api rate limit exceeded") || value.includes("rate limit exceeded");
+}
+
+function resolveRateLimitResetMs(headers: Headers, body: string): number | null {
+  const nowMs = Date.now();
+
+  const retryAfterMs = parseRetryAfterMs(headers);
+  if (retryAfterMs != null) return nowMs + retryAfterMs;
+
+  const reset = resolveRateLimitReset(headers);
+  if (reset != null) return reset;
+
+  if (isSecondaryRateLimitText(body) || isPrimaryRateLimitText(body)) {
+    return nowMs + 60_000;
+  }
+
+  return null;
+}
+
 function resolveRateLimitDelayMs(resetAtMs: number, nowMs: number): number {
   return Math.max(MIN_DELAY_MS, resetAtMs - nowMs);
 }
@@ -170,7 +219,7 @@ async function fetchIssuesSince(params: {
     });
 
     if (!result.ok) {
-      const resetAt = resolveRateLimitReset(result.headers);
+      const resetAt = resolveRateLimitResetMs(result.headers, result.body);
       return {
         ok: false,
         fetched,
@@ -221,7 +270,10 @@ export async function syncRepoIssuesOnce(params: {
   const nowIso = now.toISOString();
   const since = computeSince(params.lastSyncAt);
 
+  let releaseSync: ReleaseFn | null = null;
+
   try {
+    releaseSync = await issueSyncSemaphore.acquire();
     const token = await getToken();
     if (!token) {
       if (shouldLog(`github-sync:auth-missing:${params.repo}`, 60_000)) {
@@ -330,6 +382,8 @@ export async function syncRepoIssuesOnce(params: {
       hadChanges: false,
       error: error?.message ?? String(error),
     };
+  } finally {
+    releaseSync?.();
   }
 }
 

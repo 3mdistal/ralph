@@ -303,6 +303,9 @@ Only these env vars are currently supported (unless noted otherwise):
 | Control plane token | `RALPH_DASHBOARD_TOKEN` | (none) |
 | Control plane replay default | `RALPH_DASHBOARD_REPLAY_DEFAULT` | `50` |
 | Control plane replay max | `RALPH_DASHBOARD_REPLAY_MAX` | `250` |
+| GitHub API max in-flight requests | `RALPH_GITHUB_MAX_INFLIGHT` | `16` |
+| GitHub API max in-flight writes | `RALPH_GITHUB_MAX_INFLIGHT_WRITES` | `2` |
+| GitHub issue sync max in-flight repos | `RALPH_GITHUB_ISSUES_SYNC_MAX_INFLIGHT` | `2` |
 
 Run logs are written under `$XDG_STATE_HOME/ralph/run-logs` (fallback: `~/.local/state/ralph/run-logs`).
 
