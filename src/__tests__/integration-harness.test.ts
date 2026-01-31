@@ -420,7 +420,8 @@ describe("integration-ish harness: full task lifecycle", () => {
     setParentVerificationPending({ repo: "3mdistal/ralph", issueNumber: 102, nowMs: Date.now() });
 
     const events: string[] = [];
-    runAgentMock.mockImplementation(async (_repoPath: string, agent: string) => {
+    runAgentMock.mockImplementation(async (...args: unknown[]) => {
+      const agent = typeof args[1] === "string" ? args[1] : "";
       if (agent === "ralph-parent-verify") {
         events.push("verify");
         return {
