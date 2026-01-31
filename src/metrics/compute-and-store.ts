@@ -5,7 +5,8 @@ import {
   recordRalphRunMetrics,
   recordRalphRunStepMetrics,
 } from "../state";
-import { getSessionEventsPath } from "../paths";
+import { getSessionEventsPath, getSessionEventsPathFromDir } from "../paths";
+import { isAbsolute, join } from "path";
 import { aggregateRunMetrics, computeSessionMetrics } from "./core";
 import { readSessionEventLines } from "./io";
 import { parseEventsFromLines } from "./parse";
@@ -51,6 +52,7 @@ export async function computeAndStoreRunMetrics(params: {
   runId: string;
   maxBytesPerSession?: number;
   timeBudgetMs?: number;
+  sessionsDir?: string;
 }): Promise<void> {
   const runId = params.runId?.trim();
   if (!runId) return;
@@ -69,6 +71,14 @@ export async function computeAndStoreRunMetrics(params: {
   const sessions: SessionMetrics[] = [];
   let timedOut = false;
 
+  const resolveEventsPath = (sessionId: string): string => {
+    if (!params.sessionsDir) return getSessionEventsPath(sessionId);
+    const base = params.sessionsDir.trim();
+    if (!base) return getSessionEventsPath(sessionId);
+    const sessionsRoot = isAbsolute(base) ? base : join(process.cwd(), base);
+    return getSessionEventsPathFromDir(sessionsRoot, sessionId);
+  };
+
   for (const sessionId of sessionIds) {
     const elapsed = Date.now() - startedAt;
     const remainingBudgetMs = timeBudgetMs - elapsed;
@@ -77,7 +87,7 @@ export async function computeAndStoreRunMetrics(params: {
       break;
     }
 
-    const eventsPath = getSessionEventsPath(sessionId);
+    const eventsPath = resolveEventsPath(sessionId);
     const readResult = await readSessionEventLines({ path: eventsPath, maxBytes: maxBytesPerSession, timeBudgetMs: remainingBudgetMs });
     const { events, eventCount, parseErrorCount } = parseEventsFromLines(readResult.lines);
 
