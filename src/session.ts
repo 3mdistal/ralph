@@ -20,7 +20,7 @@ const defaultScheduler: Scheduler = {
   clearInterval,
 };
 
-import { createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
+import { chmodSync, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
 import { dirname, join } from "path";
@@ -38,6 +38,7 @@ import { isSafeSessionId } from "./session-id";
 import { ensureManagedOpencodeConfigInstalled } from "./opencode-managed-config";
 import { registerOpencodeRun, unregisterOpencodeRun, updateOpencodeRun } from "./opencode-process-registry";
 import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
+import { resolveGhTokenEnv } from "./github-app-auth";
 
 export interface ServerHandle {
   url: string;
@@ -243,6 +244,111 @@ export function __buildOpencodeEnvForTests(opts?: OpencodeSpawnOptions): Record<
   return buildOpencodeSpawnEnvironment(opts).env;
 }
 
+function ensureGitAskpassScript(xdgCacheHome: string): string {
+  const scriptPath = join(xdgCacheHome, "git-askpass.sh");
+  if (!existsSync(scriptPath)) {
+    // IMPORTANT: do not embed any secrets in this script; it reads from env.
+    const script = [
+      "#!/bin/sh",
+      "# Ralph-managed git askpass helper (non-interactive HTTPS auth)",
+      "# Reads GH_TOKEN/GITHUB_TOKEN from environment.",
+      "case \"$1\" in",
+      "  *Username*) echo \"x-access-token\" ;;",
+      "  *Password*) echo \"${GH_TOKEN:-${GITHUB_TOKEN:-}}\" ;;",
+      "  *) echo \"\" ;;",
+      "esac",
+      "",
+    ].join("\n");
+    writeFileSync(scriptPath, script, { encoding: "utf8", mode: 0o700 });
+  }
+
+  // Best-effort: enforce executable bit (some FS ignore mode on create).
+  try {
+    chmodSync(scriptPath, 0o700);
+  } catch {
+    // ignore
+  }
+
+  return scriptPath;
+}
+
+async function buildOpencodeGitHubScopedEnv(params: {
+  baseEnv: Record<string, string | undefined>;
+  xdgCacheHome: string;
+  resolveToken?: () => Promise<string | null>;
+}): Promise<Record<string, string | undefined>> {
+  // Ensure any `gh` usage inside OpenCode runs is scoped to Ralph auth + config.
+  // This avoids falling back to a developer's local `gh` auth in daemon runs.
+  const ghConfigDir = join(params.xdgCacheHome, "gh");
+  try {
+    mkdirSync(ghConfigDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+  let token: string | null = null;
+  try {
+    const resolve = params.resolveToken ?? resolveGhTokenEnv;
+    token = await resolve();
+  } catch (e: any) {
+    // Best-effort: avoid blocking OpenCode runs when GitHub auth is temporarily unavailable.
+    // GitHub writes will still fail inside the run, but the agent can proceed with local work.
+    const message = sanitizeOpencodeLog(e?.message ?? String(e));
+    console.warn(`[ralph:session] Failed to resolve GH token for OpenCode env: ${message}`);
+    token = null;
+  }
+  const scoped: Record<string, string | undefined> = {
+    GH_CONFIG_DIR: ghConfigDir,
+    // Fail fast instead of prompting.
+    GH_PROMPT_DISABLED: "1",
+  };
+
+  if (token && token.trim()) {
+    const trimmed = token.trim();
+    scoped.GH_TOKEN = trimmed;
+    scoped.GITHUB_TOKEN = trimmed;
+
+    // NixOS/home-manager setups often have read-only git config; avoid relying on
+    // credential helpers and instead force non-interactive env-based auth.
+    scoped.GIT_TERMINAL_PROMPT = "0";
+    scoped.GIT_ASKPASS = ensureGitAskpassScript(params.xdgCacheHome);
+  }
+
+  return {
+    ...params.baseEnv,
+    ...scoped,
+  };
+}
+
+function buildOpencodeGitHubScopedEnvForTests(params: {
+  baseEnv: Record<string, string | undefined>;
+  xdgCacheHome: string;
+}): Record<string, string | undefined> {
+  const ghConfigDir = join(params.xdgCacheHome, "gh");
+  try {
+    mkdirSync(ghConfigDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+  const token = (params.baseEnv.GH_TOKEN ?? params.baseEnv.GITHUB_TOKEN ?? "").trim();
+  const extra: Record<string, string | undefined> = token
+    ? {
+        GH_TOKEN: token,
+        GITHUB_TOKEN: token,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_ASKPASS: ensureGitAskpassScript(params.xdgCacheHome),
+      }
+    : {};
+
+  return {
+    ...params.baseEnv,
+    GH_CONFIG_DIR: ghConfigDir,
+    GH_PROMPT_DISABLED: "1",
+    ...extra,
+  };
+}
+
 function extractOpencodeLogPath(text: string): string | null {
   // Example: "check log file at /Users/.../.local/share/opencode/log/2026-01-10T003721.log"
   const match = text.match(/check log file at\s+([^\s]+\.log)/i);
@@ -262,7 +368,10 @@ function sanitizeOpencodeLog(text: string): string {
   // Best-effort redaction. This is intentionally conservative and may miss some secrets,
   // but it helps reduce accidental leakage in error notes.
   const patterns: Array<{ re: RegExp; replacement: string }> = [
+    { re: /gho_[A-Za-z0-9]{20,}/g, replacement: "gho_[REDACTED]" },
     { re: /ghp_[A-Za-z0-9]{20,}/g, replacement: "ghp_[REDACTED]" },
+    { re: /ghs_[A-Za-z0-9]{20,}/g, replacement: "ghs_[REDACTED]" },
+    { re: /ghu_[A-Za-z0-9]{20,}/g, replacement: "ghu_[REDACTED]" },
     { re: /github_pat_[A-Za-z0-9_]{20,}/g, replacement: "github_pat_[REDACTED]" },
     { re: /sk-[A-Za-z0-9]{20,}/g, replacement: "sk-[REDACTED]" },
     { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "xox-[REDACTED]" },
@@ -660,20 +769,13 @@ async function runSession(
     opencodeXdg,
   });
 
-  // Ensure any `gh` usage inside OpenCode runs is scoped to Ralph auth + config.
-  // This avoids falling back to a developer's local `gh` auth in daemon runs.
-  const ghConfigDir = join(xdgCacheHome, "gh");
-  try {
-    mkdirSync(ghConfigDir, { recursive: true });
-  } catch {
-    // ignore
-  }
-
-
-  const env: Record<string, string | undefined> = {
-    ...baseEnv,
-    GH_CONFIG_DIR: ghConfigDir,
-  };
+  const env = options?.__testOverrides?.spawn
+    ? buildOpencodeGitHubScopedEnvForTests({ baseEnv, xdgCacheHome })
+    : await buildOpencodeGitHubScopedEnv({
+        baseEnv,
+        xdgCacheHome,
+        resolveToken: options?.__testOverrides?.resolveGhTokenEnv,
+      });
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const processKill = options?.__testOverrides?.processKill ?? process.kill;
   const useProcessGroup = process.platform !== "win32";
@@ -1504,6 +1606,8 @@ export type RunSessionTestOverrides = {
   scheduler?: Scheduler;
   sessionsDir?: string;
   processKill?: typeof process.kill;
+  /** Overrides GitHub token resolution to avoid network in tests. */
+  resolveGhTokenEnv?: () => Promise<string | null>;
 };
 
 type RunSessionInternalOptions = RunSessionOptionsBase & {
@@ -1604,18 +1708,13 @@ async function* streamSession(
     opencodeXdg: options?.opencodeXdg,
   });
 
-  const ghConfigDir = join(xdgCacheHome, "gh");
-  try {
-    mkdirSync(ghConfigDir, { recursive: true });
-  } catch {
-    // ignore
-  }
-
-
-  const env: Record<string, string | undefined> = {
-    ...baseEnv,
-    GH_CONFIG_DIR: ghConfigDir,
-  };
+  const env = options?.__testOverrides?.spawn
+    ? buildOpencodeGitHubScopedEnvForTests({ baseEnv, xdgCacheHome })
+    : await buildOpencodeGitHubScopedEnv({
+        baseEnv,
+        xdgCacheHome,
+        resolveToken: options?.__testOverrides?.resolveGhTokenEnv,
+      });
 
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const useProcessGroup = process.platform !== "win32";
