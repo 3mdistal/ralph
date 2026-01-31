@@ -6336,9 +6336,8 @@ ${guidance}`
       };
     }
 
-    const defaults = getConfig().control;
-    const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-    const requested = getRequestedOpencodeProfileName(control.opencodeProfile);
+    // Source of truth is config (opencode.defaultProfile). The control file no longer controls profile.
+    const requested = getRequestedOpencodeProfileName(null);
 
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
@@ -6366,22 +6365,6 @@ ${guidance}`
       resolved = chosen ? resolveOpencodeProfile(chosen) : null;
     } else {
       resolved = requested ? resolveOpencodeProfile(requested) : null;
-    }
-
-    if (requested && requested !== "auto" && !resolved) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Control opencode_profile=${JSON.stringify(requested)} does not match a configured profile; ` +
-          `falling back to defaultProfile=${JSON.stringify(getOpencodeDefaultProfileName() ?? "")}`
-      );
-      const fallbackRequested = getRequestedOpencodeProfileName(null);
-      if (fallbackRequested === "auto") {
-        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
-          getThrottleDecision: this.throttle.getThrottleDecision,
-        });
-        resolved = chosen ? resolveOpencodeProfile(chosen) : null;
-      } else {
-        resolved = fallbackRequested ? resolveOpencodeProfile(fallbackRequested) : null;
-      }
     }
 
     if (!resolved) {
@@ -6506,9 +6489,7 @@ ${guidance}`
     if (pinned) {
       decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
     } else {
-      const defaults = getConfig().control;
-      const controlProfile = readControlStateSnapshot({ log: (message) => console.warn(message), defaults }).opencodeProfile;
-      const requestedProfile = getRequestedOpencodeProfileName(controlProfile);
+      const requestedProfile = getRequestedOpencodeProfileName(null);
 
       if (requestedProfile === "auto") {
         const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
