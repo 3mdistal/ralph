@@ -16,6 +16,16 @@ let releaseLock: (() => void) | null = null;
 const repo = "3mdistal/ralph";
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+async function withPatchedNow<T>(nowMs: number, fn: () => Promise<T> | T): Promise<T> {
+  const original = Date.now;
+  Date.now = () => nowMs;
+  try {
+    return await fn();
+  } finally {
+    Date.now = original;
+  }
+}
+
 function buildIssue(params: {
   number: number;
   updatedAt: string;
@@ -234,5 +244,25 @@ describe("github issue sync", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("surfaces Retry-After-based rate limit backoff", async () => {
+    await withPatchedNow(1_000_000, async () => {
+      const fetchMock: FetchLike = async () =>
+        new Response("You have exceeded a secondary rate limit", {
+          status: 403,
+          headers: { "Retry-After": "120" },
+        });
+
+      const result = await syncRepoIssuesOnce({
+        repo,
+        lastSyncAt: "2026-01-11T00:00:00.000Z",
+        deps: { fetch: fetchMock, getToken: async () => "token" },
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.rateLimitResetMs).toBe(1_000_000 + 120_000);
+      expect(result.error ?? "").toContain("HTTP 403");
+    });
   });
 });
