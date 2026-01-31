@@ -10,7 +10,7 @@ export interface ExistingLabelSpec {
   description?: string | null;
 }
 
-const RALPH_LABEL_QUEUED = "ralph:queued";
+export const RALPH_LABEL_QUEUED = "ralph:queued";
 export const RALPH_LABEL_IN_PROGRESS = "ralph:in-progress";
 export const RALPH_LABEL_IN_BOT = "ralph:in-bot";
 export const RALPH_LABEL_BLOCKED = "ralph:blocked";

@@ -165,7 +165,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("12");
+      expect(meta.value).toBe("13");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -220,6 +220,11 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alert_deliveries'")
         .get() as { name?: string } | undefined;
       expect(deliveriesTable?.name).toBe("alert_deliveries");
+
+      const parentVerifyTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'parent_verification_state'")
+        .get() as { name?: string } | undefined;
+      expect(parentVerifyTable?.name).toBe("parent_verification_state");
     } finally {
       migrated.close();
     }
