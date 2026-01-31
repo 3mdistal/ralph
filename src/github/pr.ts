@@ -25,6 +25,11 @@ export type PullRequestMergeCandidate = {
   body?: string;
 };
 
+export type PullRequestMergeCommit = {
+  sha: string | null;
+  url: string | null;
+};
+
 export type PullRequestSearchResult = {
   url: string;
   createdAt?: string;
@@ -96,6 +101,11 @@ async function runSearch(repo: string, search: string): Promise<PullRequestSearc
   return parseSearchOutput(response.stdout.toString());
 }
 
+async function runMergedSearch(repo: string, search: string): Promise<PullRequestSearchResult[]> {
+  const response = await ghRead(repo)`gh pr list --repo ${repo} --state merged --search ${search} --json url,createdAt,updatedAt,number`.quiet();
+  return parseSearchOutput(response.stdout.toString());
+}
+
 export async function searchOpenPullRequestsByIssueLink(
   repo: string,
   issueNumber: string
@@ -118,4 +128,38 @@ export async function searchOpenPullRequestsByIssueLink(
     }
     return combined;
   }
+}
+
+export async function searchMergedPullRequestsByIssueLink(
+  repo: string,
+  issueNumber: string
+): Promise<PullRequestSearchResult[]> {
+  const search = `fixes #${issueNumber} OR closes #${issueNumber} OR resolves #${issueNumber}`;
+
+  try {
+    return await runMergedSearch(repo, search);
+  } catch {
+    const fixes = await runMergedSearch(repo, `fixes #${issueNumber}`);
+    const closes = await runMergedSearch(repo, `closes #${issueNumber}`);
+    const resolves = await runMergedSearch(repo, `resolves #${issueNumber}`);
+    const seen = new Set<string>();
+    const combined: PullRequestSearchResult[] = [];
+    for (const entry of [...fixes, ...closes, ...resolves]) {
+      const normalized = normalizePrUrl(entry.url);
+      if (seen.has(normalized)) continue;
+      seen.add(normalized);
+      combined.push(entry);
+    }
+    return combined;
+  }
+}
+
+export async function viewPullRequestMergeCommit(repo: string, prUrl: string): Promise<PullRequestMergeCommit | null> {
+  const response = await ghRead(repo)`gh pr view ${prUrl} --repo ${repo} --json mergeCommit,state`.quiet();
+  const data = JSON.parse(response.stdout.toString());
+  if (!data) return null;
+  const mergeCommit = data.mergeCommit ?? null;
+  const sha = typeof mergeCommit?.oid === "string" ? mergeCommit.oid : null;
+  const url = typeof mergeCommit?.url === "string" ? mergeCommit.url : null;
+  return { sha, url };
 }
