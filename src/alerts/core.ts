@@ -19,9 +19,9 @@ export type PlannedAlertRecord = {
   fingerprint: string;
 };
 
-const MAX_SUMMARY_CHARS = 300;
-const MAX_DETAILS_CHARS = 4000;
-const MAX_FINGERPRINT_CHARS = 2000;
+export const ALERT_SUMMARY_MAX_CHARS = 300;
+export const ALERT_DETAILS_MAX_CHARS = 4000;
+export const ALERT_FINGERPRINT_MAX_CHARS = 2000;
 
 function truncateText(input: string, maxChars: number): string {
   const trimmed = input.trim();
@@ -46,23 +46,38 @@ function hashFNV1a(input: string): string {
   return hash.toString(16).padStart(8, "0");
 }
 
+export function formatAlertSummary(input: string): string {
+  const safe = normalizeWhitespace(sanitizeText(input));
+  return truncateText(safe || "(unknown error)", ALERT_SUMMARY_MAX_CHARS);
+}
+
+export function formatAlertDetails(input: string): string | null {
+  const safe = sanitizeText(input);
+  if (!safe) return null;
+  return truncateText(safe, ALERT_DETAILS_MAX_CHARS);
+}
+
+export function buildAlertFingerprintFromSeed(seed: string): string {
+  const safeSeed = sanitizeText(seed);
+  const base = truncateText(safeSeed, ALERT_FINGERPRINT_MAX_CHARS);
+  return hashFNV1a(base);
+}
+
 export function buildAlertSummary(context: string, error: string): string {
   const safeContext = normalizeWhitespace(sanitizeText(context));
   const firstLine = normalizeWhitespace(sanitizeText(error).split("\n")[0] ?? "");
   const combined = firstLine ? `${safeContext}: ${firstLine}` : safeContext;
-  return truncateText(combined || "(unknown error)", MAX_SUMMARY_CHARS);
+  return formatAlertSummary(combined || "(unknown error)");
 }
 
 function buildAlertDetails(error: string): string | null {
-  const safe = sanitizeText(error);
-  if (!safe) return null;
-  return truncateText(safe, MAX_DETAILS_CHARS);
+  return formatAlertDetails(error);
 }
 
 export function buildAlertFingerprint(context: string, error: string): string {
   const safeContext = sanitizeText(context);
   const safeError = sanitizeText(error);
-  const base = truncateText(`${safeContext}\n${safeError}`, MAX_FINGERPRINT_CHARS);
+  const base = truncateText(`${safeContext}\n${safeError}`, ALERT_FINGERPRINT_MAX_CHARS);
   return hashFNV1a(base);
 }
 
