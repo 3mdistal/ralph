@@ -106,6 +106,10 @@ export function getSessionEventsPath(sessionId: string): string {
   return join(getRalphSessionDir(sessionId), "events.jsonl");
 }
 
+export function getSessionEventsPathFromDir(sessionsDir: string, sessionId: string): string {
+  return join(sessionsDir, sessionId, "events.jsonl");
+}
+
 export function getRalphSessionLockPath(sessionId: string): string {
   return join(getRalphSessionDir(sessionId), "active.lock");
 }
