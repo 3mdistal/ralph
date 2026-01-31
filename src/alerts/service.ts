@@ -2,7 +2,7 @@ import { GitHubClient } from "../github/client";
 import { writeAlertToGitHub } from "../github/alert-writeback";
 import { writeRollupReadyToGitHub } from "../github/rollup-ready-writeback";
 import { initStateDb, recordAlertOccurrence } from "../state";
-import { planAlertRecord } from "./core";
+import { buildAlertFingerprintFromSeed, formatAlertDetails, formatAlertSummary, planAlertRecord } from "./core";
 
 export async function recordIssueErrorAlert(params: {
   repo: string;
@@ -38,6 +38,47 @@ export async function recordIssueErrorAlert(params: {
       taskName: params.taskName,
       kind: planned.kind,
       fingerprint: planned.fingerprint,
+      alertId: alert.id,
+      summary: alert.summary,
+      details: alert.details,
+      count: alert.count,
+      lastSeenAt: alert.lastSeenAt,
+    },
+    { github }
+  );
+}
+
+export async function recordIssueAlert(params: {
+  repo: string;
+  issueNumber: number;
+  taskName?: string;
+  kind: "error";
+  fingerprintSeed: string;
+  summary: string;
+  details?: string | null;
+}): Promise<void> {
+  initStateDb();
+  const fingerprint = buildAlertFingerprintFromSeed(params.fingerprintSeed);
+  const summary = formatAlertSummary(params.summary);
+  const details = params.details ? formatAlertDetails(params.details) : null;
+  const alert = recordAlertOccurrence({
+    repo: params.repo,
+    targetType: "issue",
+    targetNumber: params.issueNumber,
+    kind: params.kind,
+    fingerprint,
+    summary,
+    details,
+  });
+
+  const github = new GitHubClient(params.repo);
+  await writeAlertToGitHub(
+    {
+      repo: params.repo,
+      issueNumber: params.issueNumber,
+      taskName: params.taskName,
+      kind: params.kind,
+      fingerprint,
       alertId: alert.id,
       summary: alert.summary,
       details: alert.details,

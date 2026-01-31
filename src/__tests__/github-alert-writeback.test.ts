@@ -332,4 +332,73 @@ describe("github alert writeback", () => {
     expect(updatedBodies.length).toBe(1);
     expect(deliveries.some((entry) => entry.status === "success")).toBe(true);
   });
+
+  test("writeAlertToGitHub throttles frequent updates", async () => {
+    const keys = new Set<string>();
+    const deliveries: any[] = [];
+
+    const plan = planAlertWriteback({
+      repo: "3mdistal/ralph",
+      issueNumber: 42,
+      taskName: "Alert task",
+      kind: "error",
+      fingerprint: "abc",
+      alertId: 1,
+      summary: "Error: boom",
+      details: "boom",
+      count: 2,
+    });
+
+    const github = {
+      request: async () => {
+        throw new Error("Unexpected GitHub request");
+      },
+    } as any;
+
+    const now = new Date().toISOString();
+    const result = await writeAlertToGitHub(
+      {
+        repo: "3mdistal/ralph",
+        issueNumber: 42,
+        taskName: "Alert task",
+        kind: "error",
+        fingerprint: "abc",
+        alertId: 1,
+        summary: "Error: boom",
+        details: "boom",
+        count: 2,
+        lastSeenAt: "2026-01-11T00:00:00.000Z",
+      },
+      {
+        github,
+        hasIdempotencyKey: (key) => keys.has(key),
+        recordIdempotencyKey: (input) => {
+          keys.add(input.key);
+          return true;
+        },
+        deleteIdempotencyKey: (key) => {
+          keys.delete(key);
+        },
+        recordAlertDeliveryAttempt: (input: any) => {
+          deliveries.push(input);
+        },
+        getAlertDelivery: () => ({
+          alertId: 1,
+          channel: "github-issue-comment",
+          markerId: plan.markerId,
+          targetType: "issue",
+          targetNumber: 42,
+          status: "success",
+          commentId: 101,
+          commentUrl: "https://github.com/3mdistal/ralph/issues/42#issuecomment-101",
+          attempts: 1,
+          lastAttemptAt: now,
+          lastError: null,
+        }),
+      }
+    );
+
+    expect(result.skippedComment).toBe(true);
+    expect(deliveries.some((entry) => entry.status === "skipped")).toBe(true);
+  });
 });
