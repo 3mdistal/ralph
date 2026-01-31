@@ -2564,6 +2564,7 @@ export function recordEscalationCommentCheckState(params: {
 }
 
 export function getIssueLabels(repo: string, issueNumber: number): string[] {
+  if (!db) return [];
   const database = requireDb();
   const row = database
     .query(
