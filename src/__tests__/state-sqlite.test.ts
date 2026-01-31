@@ -220,6 +220,16 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alert_deliveries'")
         .get() as { name?: string } | undefined;
       expect(deliveriesTable?.name).toBe("alert_deliveries");
+
+      const runMetricsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_metrics'")
+        .get() as { name?: string } | undefined;
+      expect(runMetricsTable?.name).toBe("ralph_run_metrics");
+
+      const stepMetricsTable = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_step_metrics'")
+        .get() as { name?: string } | undefined;
+      expect(stepMetricsTable?.name).toBe("ralph_run_step_metrics");
     } finally {
       migrated.close();
     }

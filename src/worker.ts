@@ -125,6 +125,7 @@ import {
   upsertRalphRunGateResult,
 } from "./state";
 import { refreshRalphRunTokenTotals } from "./run-token-accounting";
+import { computeAndStoreRunMetrics } from "./metrics/compute-and-store";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
   detectLegacyWorktrees,
@@ -1217,6 +1218,12 @@ export class RepoWorker {
         }
       } catch {
         // best-effort token accounting
+      }
+
+      try {
+        await computeAndStoreRunMetrics({ runId });
+      } catch {
+        // best-effort metrics persistence
       }
 
       this.activeRunId = previousRunId;
