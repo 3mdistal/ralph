@@ -1,6 +1,7 @@
 import type { ExistingLabelSpec, LabelSpec } from "../github-labels";
 import { getProfile, getSandboxProfileConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
+import { Semaphore, type ReleaseFn } from "../semaphore";
 import { SandboxTripwireError, assertSandboxWriteAllowed } from "./sandbox-tripwire";
 
 export type GitHubErrorCode = "rate_limit" | "not_found" | "conflict" | "auth" | "unknown";
@@ -48,6 +49,27 @@ type ClientOptions = {
   /** Injected for tests / custom backoff behavior. */
   sleepMs?: (ms: number) => Promise<void>;
 };
+
+type GitHubConcurrencyConfig = {
+  maxInflight: number;
+  maxInflightWrites: number;
+};
+
+const DEFAULT_MAX_INFLIGHT = 16;
+const DEFAULT_MAX_INFLIGHT_WRITES = 2;
+
+function readEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.floor(parsed);
+}
+
+function clampConcurrency(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
 
 function fnv1a32(input: string): string {
   // Non-cryptographic hash; used only for in-memory backoff bucketing.
@@ -141,6 +163,57 @@ export class GitHubClient {
   private installationId: string | null = null;
 
   private static readonly backoffUntilByKey = new Map<string, number>();
+
+  private static concurrencyConfig: GitHubConcurrencyConfig | null = null;
+  private static requestSemaphore: Semaphore | null = null;
+  private static writeSemaphore: Semaphore | null = null;
+
+  private static resolveConcurrencyConfig(): GitHubConcurrencyConfig {
+    if (GitHubClient.concurrencyConfig) return GitHubClient.concurrencyConfig;
+
+    const maxInflight = clampConcurrency(readEnvInt("RALPH_GITHUB_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT), DEFAULT_MAX_INFLIGHT);
+    const maxInflightWrites = clampConcurrency(
+      readEnvInt("RALPH_GITHUB_MAX_INFLIGHT_WRITES", DEFAULT_MAX_INFLIGHT_WRITES),
+      DEFAULT_MAX_INFLIGHT_WRITES
+    );
+
+    GitHubClient.concurrencyConfig = {
+      maxInflight,
+      maxInflightWrites: Math.min(maxInflight, maxInflightWrites),
+    };
+
+    return GitHubClient.concurrencyConfig;
+  }
+
+  private static resolveSemaphores(): { request: Semaphore; write: Semaphore } {
+    if (!GitHubClient.requestSemaphore || !GitHubClient.writeSemaphore) {
+      const cfg = GitHubClient.resolveConcurrencyConfig();
+      GitHubClient.requestSemaphore = new Semaphore(cfg.maxInflight);
+      GitHubClient.writeSemaphore = new Semaphore(cfg.maxInflightWrites);
+    }
+    return { request: GitHubClient.requestSemaphore, write: GitHubClient.writeSemaphore };
+  }
+
+  static __resetForTests(overrides?: Partial<GitHubConcurrencyConfig>): void {
+    GitHubClient.backoffUntilByKey.clear();
+    GitHubClient.concurrencyConfig = overrides
+      ? {
+          maxInflight: clampConcurrency(overrides.maxInflight ?? DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_INFLIGHT),
+          maxInflightWrites: clampConcurrency(
+            overrides.maxInflightWrites ?? DEFAULT_MAX_INFLIGHT_WRITES,
+            DEFAULT_MAX_INFLIGHT_WRITES
+          ),
+        }
+      : null;
+    if (GitHubClient.concurrencyConfig) {
+      GitHubClient.concurrencyConfig.maxInflightWrites = Math.min(
+        GitHubClient.concurrencyConfig.maxInflight,
+        GitHubClient.concurrencyConfig.maxInflightWrites
+      );
+    }
+    GitHubClient.requestSemaphore = null;
+    GitHubClient.writeSemaphore = null;
+  }
 
   constructor(repo: string, opts?: ClientOptions) {
     this.repo = repo;
@@ -253,7 +326,21 @@ export class GitHubClient {
       init.body = JSON.stringify(opts.body);
     }
 
-    const res = await fetch(url, init);
+    const isWrite = method !== "GET" && method !== "HEAD";
+    const semaphores = GitHubClient.resolveSemaphores();
+    const releaseRequest: ReleaseFn = await semaphores.request.acquire();
+    let releaseWrite: ReleaseFn | null = null;
+    if (isWrite) {
+      releaseWrite = await semaphores.write.acquire();
+    }
+
+    let res: Response;
+    try {
+      res = await fetch(url, init);
+    } finally {
+      releaseWrite?.();
+      releaseRequest();
+    }
     if (opts.allowNotFound && res.status === 404) {
       return { data: null, etag: res.headers.get("etag"), status: res.status };
     }
@@ -382,4 +469,8 @@ export function splitRepoFullName(full: string): { owner: string; name: string }
     throw new Error(`Invalid repo name: ${full}`);
   }
   return { owner, name };
+}
+
+export function __resetGitHubClientForTests(overrides?: Partial<{ maxInflight: number; maxInflightWrites: number }>): void {
+  GitHubClient.__resetForTests(overrides);
 }
