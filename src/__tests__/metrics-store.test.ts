@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 
 import { closeStateDbForTests, createRalphRun, initStateDb, recordRalphRunSessionUse } from "../state";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
-import { getRalphStateDbPath, getSessionEventsPath } from "../paths";
+import { getRalphStateDbPath, getSessionEventsPathFromDir } from "../paths";
 
 describe("metrics persistence", () => {
   test("stores run and step metrics from session events", async () => {
@@ -15,9 +15,7 @@ describe("metrics persistence", () => {
     const sessionsDir = join(root, "sessions");
 
     const priorState = process.env.RALPH_STATE_DB_PATH;
-    const priorSessions = process.env.RALPH_SESSIONS_DIR;
     process.env.RALPH_STATE_DB_PATH = statePath;
-    process.env.RALPH_SESSIONS_DIR = sessionsDir;
 
     try {
       initStateDb();
@@ -36,7 +34,7 @@ describe("metrics persistence", () => {
         at: "2026-01-31T09:01:00.000Z",
       });
 
-      const eventsPath = getSessionEventsPath("ses_metrics");
+      const eventsPath = getSessionEventsPathFromDir(sessionsDir, "ses_metrics");
       await mkdir(dirname(eventsPath), { recursive: true });
       await writeFile(
         eventsPath,
@@ -49,7 +47,7 @@ describe("metrics persistence", () => {
         "utf8"
       );
 
-      await computeAndStoreRunMetrics({ runId });
+      await computeAndStoreRunMetrics({ runId, sessionsDir });
 
       const db = new Database(getRalphStateDbPath());
       try {
@@ -73,7 +71,6 @@ describe("metrics persistence", () => {
     } finally {
       closeStateDbForTests();
       process.env.RALPH_STATE_DB_PATH = priorState;
-      process.env.RALPH_SESSIONS_DIR = priorSessions;
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -84,9 +81,7 @@ describe("metrics persistence", () => {
     const sessionsDir = join(root, "sessions");
 
     const priorState = process.env.RALPH_STATE_DB_PATH;
-    const priorSessions = process.env.RALPH_SESSIONS_DIR;
     process.env.RALPH_STATE_DB_PATH = statePath;
-    process.env.RALPH_SESSIONS_DIR = sessionsDir;
 
     try {
       initStateDb();
@@ -105,11 +100,11 @@ describe("metrics persistence", () => {
         at: "2026-01-31T09:11:00.000Z",
       });
 
-      const eventsPath = getSessionEventsPath("ses_big");
+      const eventsPath = getSessionEventsPathFromDir(sessionsDir, "ses_big");
       await mkdir(dirname(eventsPath), { recursive: true });
       await writeFile(eventsPath, "{\"type\":\"run-start\",\"ts\":0}\n".repeat(100), "utf8");
 
-      await computeAndStoreRunMetrics({ runId, maxBytesPerSession: 10 });
+      await computeAndStoreRunMetrics({ runId, maxBytesPerSession: 10, sessionsDir });
 
       const db = new Database(getRalphStateDbPath());
       try {
@@ -123,7 +118,6 @@ describe("metrics persistence", () => {
     } finally {
       closeStateDbForTests();
       process.env.RALPH_STATE_DB_PATH = priorState;
-      process.env.RALPH_SESSIONS_DIR = priorSessions;
       await rm(root, { recursive: true, force: true });
     }
   });
