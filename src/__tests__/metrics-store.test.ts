@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "fs/promises";
-import { join } from "path";
+import { mkdtemp, mkdir, rm, writeFile } from "fs/promises";
+import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
 
-import { createRalphRun, initStateDb, recordRalphRunSessionUse } from "../state";
+import { closeStateDbForTests, createRalphRun, initStateDb, recordRalphRunSessionUse } from "../state";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
 import { getRalphStateDbPath, getSessionEventsPath } from "../paths";
 
@@ -37,6 +37,7 @@ describe("metrics persistence", () => {
       });
 
       const eventsPath = getSessionEventsPath("ses_metrics");
+      await mkdir(dirname(eventsPath), { recursive: true });
       await writeFile(
         eventsPath,
         [
@@ -70,6 +71,7 @@ describe("metrics persistence", () => {
         db.close();
       }
     } finally {
+      closeStateDbForTests();
       process.env.RALPH_STATE_DB_PATH = priorState;
       process.env.RALPH_SESSIONS_DIR = priorSessions;
       await rm(root, { recursive: true, force: true });
@@ -104,6 +106,7 @@ describe("metrics persistence", () => {
       });
 
       const eventsPath = getSessionEventsPath("ses_big");
+      await mkdir(dirname(eventsPath), { recursive: true });
       await writeFile(eventsPath, "{\"type\":\"run-start\",\"ts\":0}\n".repeat(100), "utf8");
 
       await computeAndStoreRunMetrics({ runId, maxBytesPerSession: 10 });
@@ -118,6 +121,7 @@ describe("metrics persistence", () => {
         db.close();
       }
     } finally {
+      closeStateDbForTests();
       process.env.RALPH_STATE_DB_PATH = priorState;
       process.env.RALPH_SESSIONS_DIR = priorSessions;
       await rm(root, { recursive: true, force: true });
