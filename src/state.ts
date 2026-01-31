@@ -449,7 +449,6 @@ function ensureSchema(database: Database): void {
           );
         `);
       }
-
       if (existingVersion < 13) {
         database.exec(`
           CREATE TABLE IF NOT EXISTS parent_verification_state (
@@ -468,6 +467,46 @@ function ensureSchema(database: Database): void {
           );
           CREATE INDEX IF NOT EXISTS idx_parent_verification_state_repo_status
             ON parent_verification_state(repo_id, status, updated_at_ms);
+
+          CREATE TABLE IF NOT EXISTS ralph_run_metrics (
+            run_id TEXT PRIMARY KEY,
+            wall_time_ms INTEGER,
+            tool_call_count INTEGER NOT NULL DEFAULT 0,
+            tool_time_ms INTEGER,
+            anomaly_count INTEGER NOT NULL DEFAULT 0,
+            anomaly_recent_burst INTEGER NOT NULL DEFAULT 0,
+            tokens_total REAL,
+            tokens_complete INTEGER NOT NULL DEFAULT 0,
+            event_count INTEGER NOT NULL DEFAULT 0,
+            parse_error_count INTEGER NOT NULL DEFAULT 0,
+            quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+            computed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+          );
+          CREATE TABLE IF NOT EXISTS ralph_run_step_metrics (
+            run_id TEXT NOT NULL,
+            step_title TEXT NOT NULL,
+            wall_time_ms INTEGER,
+            tool_call_count INTEGER NOT NULL DEFAULT 0,
+            tool_time_ms INTEGER,
+            anomaly_count INTEGER NOT NULL DEFAULT 0,
+            anomaly_recent_burst INTEGER NOT NULL DEFAULT 0,
+            tokens_total REAL,
+            event_count INTEGER NOT NULL DEFAULT 0,
+            parse_error_count INTEGER NOT NULL DEFAULT 0,
+            quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+            computed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(run_id, step_title),
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_step_metrics_run
+            ON ralph_run_step_metrics(run_id);
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_quality
+            ON ralph_run_metrics(quality);
         `);
       }
     })();
@@ -681,6 +720,46 @@ function ensureSchema(database: Database): void {
       updated_at TEXT NOT NULL,
       FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS ralph_run_metrics (
+      run_id TEXT PRIMARY KEY,
+      wall_time_ms INTEGER,
+      tool_call_count INTEGER NOT NULL DEFAULT 0,
+      tool_time_ms INTEGER,
+      anomaly_count INTEGER NOT NULL DEFAULT 0,
+      anomaly_recent_burst INTEGER NOT NULL DEFAULT 0,
+      tokens_total REAL,
+      tokens_complete INTEGER NOT NULL DEFAULT 0,
+      event_count INTEGER NOT NULL DEFAULT 0,
+      parse_error_count INTEGER NOT NULL DEFAULT 0,
+      quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+      computed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS ralph_run_step_metrics (
+      run_id TEXT NOT NULL,
+      step_title TEXT NOT NULL,
+      wall_time_ms INTEGER,
+      tool_call_count INTEGER NOT NULL DEFAULT 0,
+      tool_time_ms INTEGER,
+      anomaly_count INTEGER NOT NULL DEFAULT 0,
+      anomaly_recent_burst INTEGER NOT NULL DEFAULT 0,
+      tokens_total REAL,
+      event_count INTEGER NOT NULL DEFAULT 0,
+      parse_error_count INTEGER NOT NULL DEFAULT 0,
+      quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+      computed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, step_title),
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_step_metrics_run
+      ON ralph_run_step_metrics(run_id);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_quality
+      ON ralph_run_metrics(quality);
 
     CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
       run_id TEXT NOT NULL,
@@ -2154,11 +2233,59 @@ export type RalphRunTokenTotals = {
   updatedAt: string;
 };
 
+export type RalphRunMetricsQuality = "ok" | "missing" | "partial" | "too_large" | "timeout" | "error";
+
+export type RalphRunMetrics = {
+  runId: string;
+  wallTimeMs: number | null;
+  toolCallCount: number;
+  toolTimeMs: number | null;
+  anomalyCount: number;
+  anomalyRecentBurst: boolean;
+  tokensTotal: number | null;
+  tokensComplete: boolean;
+  eventCount: number;
+  parseErrorCount: number;
+  quality: RalphRunMetricsQuality;
+  computedAt: string;
+  updatedAt: string;
+};
+
+export type RalphRunStepMetrics = {
+  runId: string;
+  stepTitle: string;
+  wallTimeMs: number | null;
+  toolCallCount: number;
+  toolTimeMs: number | null;
+  anomalyCount: number;
+  anomalyRecentBurst: boolean;
+  tokensTotal: number | null;
+  eventCount: number;
+  parseErrorCount: number;
+  quality: RalphRunMetricsQuality;
+  computedAt: string;
+  updatedAt: string;
+};
+
 function normalizeTokenQuality(value: unknown): RalphRunSessionTokenTotalsQuality {
   switch (value) {
     case "ok":
     case "missing":
     case "unreadable":
+    case "timeout":
+    case "error":
+      return value;
+    default:
+      return "error";
+  }
+}
+
+function normalizeMetricsQuality(value: unknown): RalphRunMetricsQuality {
+  switch (value) {
+    case "ok":
+    case "missing":
+    case "partial":
+    case "too_large":
     case "timeout":
     case "error":
       return value;
@@ -2322,6 +2449,131 @@ export function getRalphRunTokenTotals(runId: string): RalphRunTokenTotals | nul
     sessionCount: typeof row.session_count === "number" ? row.session_count : 0,
     updatedAt: row.updated_at,
   };
+}
+
+export function recordRalphRunMetrics(params: {
+  runId: string;
+  wallTimeMs: number | null;
+  toolCallCount: number;
+  toolTimeMs: number | null;
+  anomalyCount: number;
+  anomalyRecentBurst: boolean;
+  tokensTotal: number | null;
+  tokensComplete: boolean;
+  eventCount: number;
+  parseErrorCount: number;
+  quality: RalphRunMetricsQuality;
+  computedAt: string;
+  at?: string;
+}): void {
+  if (!params.runId?.trim()) return;
+
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const quality = normalizeMetricsQuality(params.quality);
+
+  database
+    .query(
+      `INSERT INTO ralph_run_metrics(
+         run_id, wall_time_ms, tool_call_count, tool_time_ms, anomaly_count, anomaly_recent_burst,
+         tokens_total, tokens_complete, event_count, parse_error_count, quality, computed_at, created_at, updated_at
+       ) VALUES (
+         $run_id, $wall_time_ms, $tool_call_count, $tool_time_ms, $anomaly_count, $anomaly_recent_burst,
+         $tokens_total, $tokens_complete, $event_count, $parse_error_count, $quality, $computed_at, $created_at, $updated_at
+       )
+       ON CONFLICT(run_id) DO UPDATE SET
+         wall_time_ms = excluded.wall_time_ms,
+         tool_call_count = excluded.tool_call_count,
+         tool_time_ms = excluded.tool_time_ms,
+         anomaly_count = excluded.anomaly_count,
+         anomaly_recent_burst = excluded.anomaly_recent_burst,
+         tokens_total = excluded.tokens_total,
+         tokens_complete = excluded.tokens_complete,
+         event_count = excluded.event_count,
+         parse_error_count = excluded.parse_error_count,
+         quality = excluded.quality,
+         computed_at = excluded.computed_at,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $run_id: params.runId,
+      $wall_time_ms: typeof params.wallTimeMs === "number" ? Math.max(0, Math.floor(params.wallTimeMs)) : null,
+      $tool_call_count: Number.isFinite(params.toolCallCount) ? Math.max(0, Math.floor(params.toolCallCount)) : 0,
+      $tool_time_ms: typeof params.toolTimeMs === "number" ? Math.max(0, Math.floor(params.toolTimeMs)) : null,
+      $anomaly_count: Number.isFinite(params.anomalyCount) ? Math.max(0, Math.floor(params.anomalyCount)) : 0,
+      $anomaly_recent_burst: toSqliteBool(Boolean(params.anomalyRecentBurst)),
+      $tokens_total: typeof params.tokensTotal === "number" ? params.tokensTotal : null,
+      $tokens_complete: toSqliteBool(Boolean(params.tokensComplete)),
+      $event_count: Number.isFinite(params.eventCount) ? Math.max(0, Math.floor(params.eventCount)) : 0,
+      $parse_error_count: Number.isFinite(params.parseErrorCount) ? Math.max(0, Math.floor(params.parseErrorCount)) : 0,
+      $quality: quality,
+      $computed_at: params.computedAt,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function recordRalphRunStepMetrics(params: {
+  runId: string;
+  stepTitle: string;
+  wallTimeMs: number | null;
+  toolCallCount: number;
+  toolTimeMs: number | null;
+  anomalyCount: number;
+  anomalyRecentBurst: boolean;
+  tokensTotal: number | null;
+  eventCount: number;
+  parseErrorCount: number;
+  quality: RalphRunMetricsQuality;
+  computedAt: string;
+  at?: string;
+}): void {
+  if (!params.runId?.trim()) return;
+  const stepTitle = trimRunLabel(params.stepTitle ?? undefined, 200);
+  if (!stepTitle) return;
+
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const quality = normalizeMetricsQuality(params.quality);
+
+  database
+    .query(
+      `INSERT INTO ralph_run_step_metrics(
+         run_id, step_title, wall_time_ms, tool_call_count, tool_time_ms, anomaly_count, anomaly_recent_burst,
+         tokens_total, event_count, parse_error_count, quality, computed_at, created_at, updated_at
+       ) VALUES (
+         $run_id, $step_title, $wall_time_ms, $tool_call_count, $tool_time_ms, $anomaly_count, $anomaly_recent_burst,
+         $tokens_total, $event_count, $parse_error_count, $quality, $computed_at, $created_at, $updated_at
+       )
+       ON CONFLICT(run_id, step_title) DO UPDATE SET
+         wall_time_ms = excluded.wall_time_ms,
+         tool_call_count = excluded.tool_call_count,
+         tool_time_ms = excluded.tool_time_ms,
+         anomaly_count = excluded.anomaly_count,
+         anomaly_recent_burst = excluded.anomaly_recent_burst,
+         tokens_total = excluded.tokens_total,
+         event_count = excluded.event_count,
+         parse_error_count = excluded.parse_error_count,
+         quality = excluded.quality,
+         computed_at = excluded.computed_at,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $run_id: params.runId,
+      $step_title: stepTitle,
+      $wall_time_ms: typeof params.wallTimeMs === "number" ? Math.max(0, Math.floor(params.wallTimeMs)) : null,
+      $tool_call_count: Number.isFinite(params.toolCallCount) ? Math.max(0, Math.floor(params.toolCallCount)) : 0,
+      $tool_time_ms: typeof params.toolTimeMs === "number" ? Math.max(0, Math.floor(params.toolTimeMs)) : null,
+      $anomaly_count: Number.isFinite(params.anomalyCount) ? Math.max(0, Math.floor(params.anomalyCount)) : 0,
+      $anomaly_recent_burst: toSqliteBool(Boolean(params.anomalyRecentBurst)),
+      $tokens_total: typeof params.tokensTotal === "number" ? params.tokensTotal : null,
+      $event_count: Number.isFinite(params.eventCount) ? Math.max(0, Math.floor(params.eventCount)) : 0,
+      $parse_error_count: Number.isFinite(params.parseErrorCount) ? Math.max(0, Math.floor(params.parseErrorCount)) : 0,
+      $quality: quality,
+      $computed_at: params.computedAt,
+      $created_at: at,
+      $updated_at: at,
+    });
 }
 
 const LABEL_SEPARATOR = "\u0001";
