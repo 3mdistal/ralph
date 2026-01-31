@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname } from "path";
 import { resolveControlFilePath, type DaemonMode } from "./drain";
+import { readDaemonRecord } from "./daemon-record";
 
 type ControlFileShape = Record<string, unknown>;
 
@@ -9,7 +10,6 @@ export type ControlFilePatch = {
   pauseRequested?: boolean | null;
   pauseAtCheckpoint?: string | null;
   drainTimeoutMs?: number | null;
-  opencodeProfile?: string | null;
 };
 
 function readControlFileJson(path: string): ControlFileShape {
@@ -48,16 +48,30 @@ function applyPatch(current: ControlFileShape, patch: ControlFilePatch): Control
     next.drain_timeout_ms = Math.max(0, Math.floor(patch.drainTimeoutMs));
   }
 
-  if (patch.opencodeProfile === null) delete next.opencode_profile;
-  else if (typeof patch.opencodeProfile === "string" && patch.opencodeProfile.trim()) {
-    next.opencode_profile = patch.opencodeProfile.trim();
-  }
+  // OpenCode profile selection is driven by config (config.toml), not the control file.
+  // Keep control.json focused on operator runtime controls only.
+  if ("opencode_profile" in next) delete (next as any).opencode_profile;
 
   return next;
 }
 
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function updateControlFile(opts: { patch: ControlFilePatch; path?: string }): { path: string; state: ControlFileShape } {
-  const path = opts.path ?? resolveControlFilePath();
+  const daemonRecord = readDaemonRecord();
+  const daemonControlPath =
+    daemonRecord && isPidAlive(daemonRecord.pid) && daemonRecord.controlFilePath.trim()
+      ? daemonRecord.controlFilePath.trim()
+      : null;
+  const path = opts.path ?? daemonControlPath ?? resolveControlFilePath();
   const current = readControlFileJson(path);
   const next = applyPatch(current, opts.patch);
   writeControlFileJson(path, next);
