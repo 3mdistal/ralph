@@ -44,6 +44,23 @@ export function resolveDaemonRecordPath(opts?: { homeDir?: string; xdgStateHome?
   return join(resolveStateDir(opts), "daemon.json");
 }
 
+function resolveDaemonRecordPathCandidates(opts?: { homeDir?: string; xdgStateHome?: string }): string[] {
+  const primary = resolveDaemonRecordPath(opts);
+  const homeFallback = resolveDaemonRecordPath({ homeDir: opts?.homeDir, xdgStateHome: "" });
+  const tmpFallback = join(resolveTmpStateDir(), "daemon.json");
+  return Array.from(new Set([primary, homeFallback, tmpFallback]));
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function ensureParentDir(path: string): void {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -107,16 +124,48 @@ export function readDaemonRecord(opts?: {
   xdgStateHome?: string;
   log?: (message: string) => void;
 }): DaemonRecord | null {
-  const path = resolveDaemonRecordPath(opts);
-  if (!existsSync(path)) return null;
-  try {
-    assertSafeRecordFile(path);
-    const raw = readFileSync(path, "utf8");
-    return parseRecord(raw);
-  } catch (e: any) {
-    opts?.log?.(`[ralph] Failed to read daemon record ${path}: ${e?.message ?? String(e)}`);
-    return null;
+  const primaryPath = resolveDaemonRecordPath(opts);
+  if (existsSync(primaryPath)) {
+    try {
+      assertSafeRecordFile(primaryPath);
+      const raw = readFileSync(primaryPath, "utf8");
+      const record = parseRecord(raw);
+      if (record) return record;
+    } catch (e: any) {
+      opts?.log?.(`[ralph] Failed to read daemon record ${primaryPath}: ${e?.message ?? String(e)}`);
+    }
   }
+
+  const fallbacks = resolveDaemonRecordPathCandidates(opts).filter((p) => p !== primaryPath);
+  const parsed: DaemonRecord[] = [];
+
+  for (const path of fallbacks) {
+    if (!existsSync(path)) continue;
+    try {
+      assertSafeRecordFile(path);
+      const raw = readFileSync(path, "utf8");
+      const record = parseRecord(raw);
+      if (record) parsed.push(record);
+    } catch (e: any) {
+      opts?.log?.(`[ralph] Failed to read daemon record ${path}: ${e?.message ?? String(e)}`);
+    }
+  }
+
+  if (parsed.length === 0) return null;
+
+  const alive = parsed.filter((r) => isPidAlive(r.pid));
+  const pool = alive.length > 0 ? alive : parsed;
+
+  pool.sort((a, b) => {
+    const aTs = Date.parse(a.startedAt);
+    const bTs = Date.parse(b.startedAt);
+    if (Number.isFinite(aTs) && Number.isFinite(bTs)) return bTs - aTs;
+    if (Number.isFinite(aTs)) return -1;
+    if (Number.isFinite(bTs)) return 1;
+    return 0;
+  });
+
+  return pool[0] ?? null;
 }
 
 export function writeDaemonRecord(record: DaemonRecord, opts?: { homeDir?: string; xdgStateHome?: string }): void {

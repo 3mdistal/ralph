@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
+import { readDaemonRecord } from "./daemon-record";
 
 export type DaemonMode = "running" | "draining" | "paused";
 
@@ -9,8 +10,6 @@ export type ControlState = {
   pauseRequested?: boolean;
   pauseAtCheckpoint?: string;
   drainTimeoutMs?: number;
-  /** Active OpenCode profile for starting new tasks (control file key: opencode_profile). */
-  opencodeProfile?: string;
 };
 
 export type ControlDefaults = {
@@ -45,6 +44,23 @@ function resolveHomeDirFallback(): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveEffectiveControlFilePath(opts?: { homeDir?: string; xdgStateHome?: string; log?: (message: string) => void }): string {
+  const record = readDaemonRecord({ homeDir: opts?.homeDir, xdgStateHome: opts?.xdgStateHome, log: opts?.log });
+  const daemonControlPath =
+    record && isPidAlive(record.pid) && record.controlFilePath.trim() ? record.controlFilePath.trim() : null;
+  return daemonControlPath ?? resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
 }
 
 export function resolveControlFilePath(
@@ -107,12 +123,6 @@ function parseControlStateJson(raw: string): ControlState {
 
   if (typeof drainTimeoutRaw === "number" && Number.isFinite(drainTimeoutRaw) && drainTimeoutRaw >= 0) {
     state.drainTimeoutMs = drainTimeoutRaw;
-  }
-
-  const opencodeProfileRaw = obj.opencode_profile;
-  if (typeof opencodeProfileRaw === "string") {
-    const trimmed = opencodeProfileRaw.trim();
-    if (trimmed) state.opencodeProfile = trimmed;
   }
 
   return state;
@@ -229,7 +239,7 @@ export function readControlStateSnapshot(opts?: {
   log?: (message: string) => void;
   defaults?: Partial<ControlDefaults>;
 }): ControlState {
-  const path = resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
+  const path = resolveEffectiveControlFilePath(opts);
   const defaults = getControlDefaults({ defaults: opts?.defaults });
   if (defaults.autoCreate) {
     writeDefaultControlFile(path, opts?.log);

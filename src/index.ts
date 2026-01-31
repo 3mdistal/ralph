@@ -193,11 +193,8 @@ function applyControlState(control: {
 }
 
 function getActiveOpencodeProfileName(defaults?: Partial<ControlConfig>): string | null {
-  const control = drainMonitor
-    ? drainMonitor.getState()
-    : readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-
-  return getRequestedOpencodeProfileName(control.opencodeProfile);
+  // Source of truth is config (opencode.defaultProfile). The control file no longer controls profile.
+  return getRequestedOpencodeProfileName(null);
 }
 
 async function resolveEffectiveOpencodeProfileNameForNewTasks(
@@ -1759,11 +1756,9 @@ async function main(): Promise<void> {
     getVaultPath: () => getBwrbVaultIfValid(),
     isShuttingDown: () => isShuttingDown,
     allowModelSend: async () => {
-      const controlProfile = getActiveOpencodeProfileName(config.control ?? {});
-      const decision = await getThrottleDecision(Date.now(), {
-        opencodeProfile: controlProfile || getOpencodeDefaultProfileName() || null,
-      });
-      const gate = computeDaemonGate({ mode: getDaemonMode(config.control), throttle: decision, isShuttingDown });
+      const requestedProfile = getRequestedOpencodeProfileName(null);
+      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile);
+      const gate = computeDaemonGate({ mode: getDaemonMode(config.control), throttle: selection.decision, isShuttingDown });
       return gate.allowModelSend;
     },
     repoPath: () => ".",
@@ -1964,7 +1959,7 @@ function printGlobalHelp(): void {
       "",
       "Notes:",
       "  Control file: set version=1 and mode=running|draining|paused in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
-      "  OpenCode profile: set opencode_profile=\"<name>\" in the same control file (affects new tasks).",
+      "  OpenCode profile: set [opencode].defaultProfile in ~/.ralph/config.toml (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
   );
@@ -2272,8 +2267,7 @@ if (args[0] === "usage") {
 
   const now = Date.now();
   const config = getConfig();
-  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
-  const requestedProfile = profileOverride || getRequestedOpencodeProfileName(control.opencodeProfile);
+  const requestedProfile = profileOverride || getRequestedOpencodeProfileName(null);
 
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
   const chosenProfile = selection.profileName;

@@ -8,15 +8,19 @@ import { updateControlFile } from "../control-file";
 
 describe("control file", () => {
   let priorXdgStateHome: string | undefined;
+  let priorHome: string | undefined;
   const tempDirs: string[] = [];
 
   beforeEach(() => {
     priorXdgStateHome = process.env.XDG_STATE_HOME;
+    priorHome = process.env.HOME;
   });
 
   afterEach(() => {
     if (priorXdgStateHome !== undefined) process.env.XDG_STATE_HOME = priorXdgStateHome;
     else delete process.env.XDG_STATE_HOME;
+    if (priorHome !== undefined) process.env.HOME = priorHome;
+    else delete process.env.HOME;
     for (const dir of tempDirs) {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -27,6 +31,7 @@ describe("control file", () => {
     const base = mkdtempSync(join(tmpdir(), "ralph-control-"));
     tempDirs.push(base);
     process.env.XDG_STATE_HOME = base;
+    process.env.HOME = base;
 
     updateControlFile({
       patch: {

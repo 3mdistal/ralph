@@ -515,13 +515,13 @@ Example:
 { "version": 1, "mode": "draining" }
 ```
 
-Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested"?: boolean, "pause_at_checkpoint"?: string, "drain_timeout_ms"?: number, "opencode_profile"?: string }` (unknown fields ignored)
+Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested"?: boolean, "pause_at_checkpoint"?: string, "drain_timeout_ms"?: number }` (unknown fields ignored)
 
 - Enable drain: set `mode` to `draining`
 - Disable drain: set `mode` to `running`
 - Pause all scheduling: set `mode` to `paused`
 - Pause at checkpoint: set `pause_requested=true` and optionally `pause_at_checkpoint`
-- Active OpenCode profile: set `opencode_profile` (affects new tasks only; tasks pin their profile on start)
+- Active OpenCode profile: set `[opencode].defaultProfile` in `~/.ralph/config.toml` (affects new tasks only; tasks pin their profile on start)
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
 
@@ -601,18 +601,18 @@ xdgCacheHome = "/Users/you/.opencode-profiles/personal/cache"
 
 ### Switching the active profile
 
-Edit the control file (`~/.local/state/ralph/control.json`):
+Edit `~/.ralph/config.toml`:
 
-```json
-{ "mode": "running", "opencode_profile": "personal" }
+```toml
+[opencode]
+defaultProfile = "personal"
 ```
-
-Or send `SIGUSR1` to the daemon for immediate reload after editing.
 
 You can also use automatic selection for new tasks (for example between "apple", "google", and "tempo"):
 
-```json
-{ "mode": "running", "opencode_profile": "auto" }
+```toml
+[opencode]
+defaultProfile = "auto"
 ```
 
 New tasks will start under the active profile. In-flight tasks continue under their pinned profile.
@@ -700,8 +700,8 @@ Shows the latest persisted deterministic gate state and any bounded artifacts fo
 ### Notes
 
 - Paths must be absolute (no `~` expansion).
-- New tasks start under the active `opencode_profile` from the control file (or `defaultProfile` when unset).
-- `defaultProfile` may be set to `"auto"` to auto-select a profile for new work when no control profile is set.
+- New tasks start under `[opencode].defaultProfile`.
+- `defaultProfile` may be set to `"auto"` to auto-select a profile for new work.
 - Tasks persist `opencode-profile` in frontmatter and always resume under the same profile.
 - Throttle is computed per profile—a throttled profile won't affect tasks on other profiles.
 

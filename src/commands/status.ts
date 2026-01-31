@@ -72,8 +72,8 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
     : null;
 
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
-  const controlProfile = control.opencodeProfile?.trim() || "";
-  const requestedProfile = getRequestedOpencodeProfileName(control.opencodeProfile);
+  const controlProfile = "";
+  const requestedProfile = getRequestedOpencodeProfileName(null);
 
   const now = Date.now();
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
@@ -254,8 +254,8 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     : null;
 
   const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
-  const controlProfile = control.opencodeProfile?.trim() || "";
-  const requestedProfile = getRequestedOpencodeProfileName(control.opencodeProfile);
+  const controlProfile = "";
+  const requestedProfile = getRequestedOpencodeProfileName(null);
 
   const now = Date.now();
   const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
