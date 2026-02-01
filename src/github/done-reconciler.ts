@@ -9,7 +9,7 @@ import { isRepoAllowed } from "../github-app-auth";
 import { createRalphWorkflowLabelsEnsurer, ensureRalphWorkflowLabelsOnce, type EnsureOutcome } from "./ensure-ralph-workflow-labels";
 import { GitHubClient, splitRepoFullName } from "./client";
 import { executeIssueLabelOps, planIssueLabelOps } from "./issue-label-io";
-import { RALPH_LABEL_DONE } from "../github-labels";
+import { RALPH_STATUS_LABELS } from "./status-labels";
 
 type PollerHandle = { stop: () => void };
 type TimeoutHandle = ReturnType<typeof setTimeout>;
@@ -50,8 +50,16 @@ const MIN_DELAY_MS = 1000;
 const DEFAULT_DEFAULT_BRANCH_CACHE_TTL_MS = 10 * 60_000;
 const IDLE_LOG_INTERVAL_MS = 60_000;
 
-const DONE_LABEL = RALPH_LABEL_DONE;
-const TRANSITION_LABELS = ["ralph:queued", "ralph:in-progress", "ralph:in-bot", "ralph:blocked", "ralph:escalated"];
+const DONE_LABEL = RALPH_STATUS_LABELS.done;
+const TRANSITION_LABELS = [
+  RALPH_STATUS_LABELS.queued,
+  RALPH_STATUS_LABELS.inProgress,
+  RALPH_STATUS_LABELS.inBot,
+  RALPH_STATUS_LABELS.blocked,
+  RALPH_STATUS_LABELS.paused,
+  RALPH_STATUS_LABELS.throttled,
+  RALPH_STATUS_LABELS.stuck,
+];
 
 function applyJitter(valueMs: number): number {
   const clamped = Math.max(valueMs, MIN_DELAY_MS);

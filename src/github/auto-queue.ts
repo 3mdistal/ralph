@@ -1,20 +1,17 @@
 import { type RepoConfig, getRepoAutoQueueConfig } from "../config";
 import { isRepoAllowed } from "../github-app-auth";
 import { shouldLog } from "../logging";
-import { getIssueLabels, listIssueSnapshots, recordIssueLabelsSnapshot, type IssueSnapshot } from "../state";
+import { listIssueSnapshots, type IssueSnapshot } from "../state";
 import { computeBlockedDecision, type BlockedDecision } from "./issue-blocking-core";
-import { addIssueLabel, applyIssueLabelOps, planIssueLabelOps, removeIssueLabel } from "./issue-label-io";
+import { applyIssueLabelWriteback } from "./issue-label-writeback";
+import { addIssueLabel, addIssueLabels, removeIssueLabel } from "./issue-label-io";
+import { mutateIssueLabels } from "./label-mutation";
 import { GitHubClient } from "./client";
 import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels";
 import { GitHubRelationshipProvider } from "./issue-relationships";
 import { resolveRelationshipSignals } from "./relationship-signals";
-
-const RALPH_LABEL_QUEUED = "ralph:queued";
-const RALPH_LABEL_BLOCKED = "ralph:blocked";
-const RALPH_LABEL_DONE = "ralph:done";
-const RALPH_LABEL_IN_BOT = "ralph:in-bot";
-const RALPH_LABEL_IN_PROGRESS = "ralph:in-progress";
-const RALPH_LABEL_ESCALATED = "ralph:escalated";
+import { detectLegacyStatusLabels, formatLegacyStatusDiagnostic, getStatusLabels, planSetStatus, RALPH_STATUS_LABELS } from "./status-labels";
+import type { QueueTaskStatus } from "../queue/types";
 
 const AUTO_QUEUE_DEBOUNCE_MS = 500;
 
@@ -34,11 +31,18 @@ function hasRalphLabel(labels: string[]): boolean {
 function shouldSkipIssue(issue: IssueSnapshot): { skip: boolean; reason?: string } {
   if (issue.state?.toUpperCase() === "CLOSED") return { skip: true, reason: "closed" };
   const labels = issue.labels ?? [];
-  if (labels.includes(RALPH_LABEL_DONE) || labels.includes(RALPH_LABEL_IN_BOT)) {
+  const statusLabels = getStatusLabels(labels);
+  if (statusLabels.length > 1) return { skip: true, reason: "invalid-status" };
+  const statusLabel = statusLabels[0];
+  if (!statusLabel) return { skip: false };
+  if (statusLabel === RALPH_STATUS_LABELS.inProgress) return { skip: true, reason: "in-progress" };
+  if (statusLabel === RALPH_STATUS_LABELS.inBot || statusLabel === RALPH_STATUS_LABELS.done) {
     return { skip: true, reason: "done" };
   }
-  if (labels.includes(RALPH_LABEL_IN_PROGRESS)) return { skip: true, reason: "in-progress" };
-  if (labels.includes(RALPH_LABEL_ESCALATED)) return { skip: true, reason: "escalated" };
+  if (statusLabel === RALPH_STATUS_LABELS.paused || statusLabel === RALPH_STATUS_LABELS.throttled) {
+    return { skip: true, reason: "paused" };
+  }
+  if (statusLabel === RALPH_STATUS_LABELS.stuck) return { skip: true, reason: "stuck" };
   return { skip: false };
 }
 
@@ -61,39 +65,15 @@ export function computeAutoQueueLabelPlan(params: {
     return { add: [], remove: [], blocked: params.blocked, runnable: false, skipped: true, reason: "unknown" };
   }
 
-  const add: string[] = [];
-  const remove: string[] = [];
-  const hasQueued = labels.includes(RALPH_LABEL_QUEUED);
-  const hasBlocked = labels.includes(RALPH_LABEL_BLOCKED);
-
-  if (params.blocked.blocked) {
-    if (!hasBlocked) add.push(RALPH_LABEL_BLOCKED);
-    return { add, remove, blocked: params.blocked, runnable: false, skipped: add.length === 0 };
-  }
-
-  if (hasBlocked) remove.push(RALPH_LABEL_BLOCKED);
-  if (!hasQueued) add.push(RALPH_LABEL_QUEUED);
-  return { add, remove, blocked: params.blocked, runnable: true, skipped: add.length === 0 && remove.length === 0 };
-}
-
-function applyLabelDelta(params: {
-  repo: string;
-  issueNumber: number;
-  add: string[];
-  remove: string[];
-  nowIso: string;
-}): void {
-  const current = getIssueLabels(params.repo, params.issueNumber);
-  const set = new Set(current);
-  for (const label of params.remove) set.delete(label);
-  for (const label of params.add) set.add(label);
-
-  recordIssueLabelsSnapshot({
-    repo: params.repo,
-    issue: `${params.repo}#${params.issueNumber}`,
-    labels: Array.from(set),
-    at: params.nowIso,
-  });
+  const targetStatus: QueueTaskStatus = params.blocked.blocked ? "blocked" : "queued";
+  const delta = planSetStatus({ desired: targetStatus, currentLabels: labels });
+  return {
+    add: delta.add,
+    remove: delta.remove,
+    blocked: params.blocked,
+    runnable: !params.blocked.blocked,
+    skipped: delta.add.length === 0 && delta.remove.length === 0,
+  };
 }
 
 export type AutoQueueResult = {
@@ -135,6 +115,7 @@ async function runAutoQueueOnce(params: {
   const labelEnsurer = createRalphWorkflowLabelsEnsurer({
     githubFactory: (repo) => new GitHubClient(repo),
   });
+  const labelIdCache = new Map<string, string>();
 
   let updated = 0;
   let skipped = 0;
@@ -146,6 +127,11 @@ async function runAutoQueueOnce(params: {
     if (skip.skip) {
       skipped += 1;
       continue;
+    }
+
+    const legacy = detectLegacyStatusLabels(issue.labels ?? []);
+    if (legacy.length > 0 && shouldLog(`auto-queue:legacy:${issue.repo}#${issue.number}`, 60_000)) {
+      console.warn(formatLegacyStatusDiagnostic({ repo: issue.repo, issueNumber: issue.number, legacyLabels: legacy }));
     }
 
     if (autoQueue.scope === "labeled-only" && !hasRalphLabel(issue.labels)) {
@@ -182,42 +168,52 @@ async function runAutoQueueOnce(params: {
     }
 
     try {
-      const ops = planIssueLabelOps({ add: plan.add, remove: plan.remove });
-      if (ops.length === 0) {
-        skipped += 1;
-        continue;
-      }
-
-      const io = {
-        addLabel: async (label: string) => {
-          await addIssueLabel({ github, repo: issue.repo, issueNumber: issue.number, label });
+      const result = await applyIssueLabelWriteback({
+        io: {
+          mutateIssueLabels: async ({ repo, issueNumber, issueNodeId, add, remove }) => {
+            const outcome = await mutateIssueLabels({
+              github,
+              repo,
+              issueNumber,
+              issueNodeId,
+              plan: { add, remove },
+              labelIdCache,
+            });
+            return outcome.ok;
+          },
+          addIssueLabel: async (repo, issueNumber, label) => {
+            await addIssueLabel({ github, repo, issueNumber, label });
+          },
+          addIssueLabels: async (repo, issueNumber, labels) => {
+            await addIssueLabels({ github, repo, issueNumber, labels });
+          },
+          removeIssueLabel: async (repo, issueNumber, label) => {
+            return await removeIssueLabel({ github, repo, issueNumber, label, allowNotFound: true });
+          },
         },
-        removeLabel: async (label: string) => {
-          return await removeIssueLabel({ github, repo: issue.repo, issueNumber: issue.number, label, allowNotFound: true });
-        },
-      };
-
-      const result = await applyIssueLabelOps({
-        ops,
-        io,
+        repo: issue.repo,
+        issueNumber: issue.number,
+        issueNodeId: issue.githubNodeId,
+        add: plan.add,
+        remove: plan.remove,
+        nowIso,
         logLabel: `${issue.repo}#${issue.number}`,
         log: (message) => console.warn(`[ralph:auto-queue:${issue.repo}] ${message}`),
         ensureLabels: async () => await labelEnsurer.ensure(issue.repo),
-        retryMissingLabelOnce: true,
       });
 
       if (!result.ok) {
         errors += 1;
+        const failure = result.result;
+        if (!failure.ok && failure.kind !== "transient") {
+          if (shouldLog(`auto-queue:label:${issue.repo}#${issue.number}`, 60_000)) {
+            console.warn(
+              `[ralph:auto-queue:${issue.repo}] Failed label update for #${issue.number}: ${failure.error}`
+            );
+          }
+        }
         continue;
       }
-
-      applyLabelDelta({
-        repo: issue.repo,
-        issueNumber: issue.number,
-        add: result.add,
-        remove: result.remove,
-        nowIso,
-      });
 
       updated += 1;
       hadChanges = true;

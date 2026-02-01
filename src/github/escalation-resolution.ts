@@ -230,10 +230,24 @@ export async function reconcileEscalationResolutions(params: {
     labels: [RALPH_LABEL_ESCALATED],
   });
 
-  const queuedKeys = new Set(queuedEscalations.map((issue) => issueKey(issue)));
-  const pendingCommentChecks = escalatedIssues.filter((issue) => !queuedKeys.has(issueKey(issue)));
+  const filterEscalated = async (issues: EscalatedIssue[]): Promise<EscalatedIssue[]> => {
+    const out: EscalatedIssue[] = [];
+    for (const issue of issues) {
+      const task = await deps.resolveAgentTaskByIssue(`${issue.repo}#${issue.number}`, issue.repo);
+      if (task?.status === "escalated") {
+        out.push(issue);
+      }
+    }
+    return out;
+  };
 
-  for (const issue of queuedEscalations) {
+  const filteredQueuedEscalations = await filterEscalated(queuedEscalations);
+  const filteredEscalatedIssues = await filterEscalated(escalatedIssues);
+
+  const queuedKeys = new Set(filteredQueuedEscalations.map((issue) => issueKey(issue)));
+  const pendingCommentChecks = filteredEscalatedIssues.filter((issue) => !queuedKeys.has(issueKey(issue)));
+
+  for (const issue of filteredQueuedEscalations) {
     try {
       await resolveEscalation({
         deps,

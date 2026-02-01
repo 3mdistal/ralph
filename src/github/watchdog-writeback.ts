@@ -303,7 +303,7 @@ export async function planWatchdogWriteback(ctx: WatchdogWritebackContext): Prom
     marker,
     markerId,
     commentBody,
-    addLabels: ["ralph:stuck"],
+    addLabels: ["ralph:status:stuck"],
     removeLabels: [],
     idempotencyKey: `gh-watchdog:${ctx.repo}#${ctx.issueNumber}:${markerId}`,
   };

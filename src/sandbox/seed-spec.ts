@@ -183,7 +183,7 @@ export function getBaselineSeedSpec(): NormalizedSeedSpec {
           key: "baseline-issue",
           title: "Sandbox baseline issue",
           body: "This is a seeded issue created for sandbox validation.",
-          labels: ["ralph:queued"],
+          labels: ["ralph:status:queued"],
           comments: [{ body: "Seeded issue comment." }],
         },
       ],

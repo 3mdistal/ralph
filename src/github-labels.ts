@@ -10,22 +10,29 @@ export interface ExistingLabelSpec {
   description?: string | null;
 }
 
-export const RALPH_LABEL_QUEUED = "ralph:queued";
-export const RALPH_LABEL_IN_PROGRESS = "ralph:in-progress";
-export const RALPH_LABEL_IN_BOT = "ralph:in-bot";
-export const RALPH_LABEL_BLOCKED = "ralph:blocked";
-export const RALPH_LABEL_STUCK = "ralph:stuck";
-export const RALPH_LABEL_DONE = "ralph:done";
-export const RALPH_LABEL_ESCALATED = "ralph:escalated";
+import { RALPH_STATUS_LABELS } from "./github/status-labels";
+
+export const RALPH_LABEL_QUEUED = RALPH_STATUS_LABELS.queued;
+export const RALPH_LABEL_IN_PROGRESS = RALPH_STATUS_LABELS.inProgress;
+export const RALPH_LABEL_IN_BOT = RALPH_STATUS_LABELS.inBot;
+export const RALPH_LABEL_BLOCKED = RALPH_STATUS_LABELS.blocked;
+export const RALPH_LABEL_STUCK = RALPH_STATUS_LABELS.stuck;
+export const RALPH_LABEL_DONE = RALPH_STATUS_LABELS.done;
+export const RALPH_LABEL_ESCALATED = RALPH_STATUS_LABELS.blocked;
 
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
-  { name: RALPH_LABEL_QUEUED, color: "0366D6", description: "In queue; claimable when not blocked or escalated" },
-  { name: RALPH_LABEL_IN_PROGRESS, color: "FBCA04", description: "Ralph is actively working" },
-  { name: RALPH_LABEL_IN_BOT, color: "0E8A16", description: "Task PR merged to bot/integration" },
-  { name: RALPH_LABEL_BLOCKED, color: "D73A4A", description: "Blocked by dependencies" },
-  { name: RALPH_LABEL_STUCK, color: "F9A825", description: "CI remediation in progress" },
-  { name: RALPH_LABEL_DONE, color: "1A7F37", description: "Task merged to default branch" },
-  { name: RALPH_LABEL_ESCALATED, color: "B60205", description: "Waiting on human input" },
+  {
+    name: RALPH_STATUS_LABELS.queued,
+    color: "0366D6",
+    description: "In queue; claimable when not blocked or paused",
+  },
+  { name: RALPH_STATUS_LABELS.inProgress, color: "FBCA04", description: "Ralph is actively working" },
+  { name: RALPH_STATUS_LABELS.inBot, color: "0E8A16", description: "Task PR merged to bot/integration" },
+  { name: RALPH_STATUS_LABELS.blocked, color: "D73A4A", description: "Blocked by dependencies" },
+  { name: RALPH_STATUS_LABELS.paused, color: "9E9E9E", description: "Operator pause requested" },
+  { name: RALPH_STATUS_LABELS.throttled, color: "8E24AA", description: "Hard throttled; do not claim" },
+  { name: RALPH_STATUS_LABELS.stuck, color: "F9A825", description: "CI remediation in progress" },
+  { name: RALPH_STATUS_LABELS.done, color: "1A7F37", description: "Task merged to default branch" },
 ] as const;
 
 function normalizeLabelName(name: string): string {

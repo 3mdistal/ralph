@@ -28,7 +28,7 @@ describe("applyIssueLabelOps", () => {
     };
 
     const result = await applyIssueLabelOps({
-      ops: [{ action: "add", label: "ralph:queued" }],
+      ops: [{ action: "add", label: "ralph:status:queued" }],
       io,
       ensureLabels,
       retryMissingLabelOnce: true,
@@ -60,7 +60,7 @@ describe("applyIssueLabelOps", () => {
     };
 
     const result = await applyIssueLabelOps({
-      ops: [{ action: "add", label: "ralph:queued" }],
+      ops: [{ action: "add", label: "ralph:status:queued" }],
       io,
       ensureLabels,
       retryMissingLabelOnce: true,
@@ -92,17 +92,17 @@ describe("applyIssueLabelOps", () => {
 
     const result = await applyIssueLabelOps({
       ops: [
-        { action: "add", label: "ralph:queued" },
-        { action: "remove", label: "ralph:in-progress" },
+        { action: "add", label: "ralph:status:queued" },
+        { action: "remove", label: "ralph:status:in-progress" },
       ],
       io,
     });
 
     expect(result.ok).toBe(false);
     expect(calls).toEqual([
-      "add:ralph:queued",
-      "remove:ralph:in-progress",
-      "remove:ralph:queued",
+      "add:ralph:status:queued",
+      "remove:ralph:status:in-progress",
+      "remove:ralph:status:queued",
     ]);
   });
 
@@ -126,8 +126,8 @@ describe("applyIssueLabelOps", () => {
 
     const result = await applyIssueLabelOps({
       ops: [
-        { action: "add", label: "ralph:queued" },
-        { action: "remove", label: "ralph:in-progress" },
+        { action: "add", label: "ralph:status:queued" },
+        { action: "remove", label: "ralph:status:in-progress" },
       ],
       io,
       repo: "3mdistal/ralph",
@@ -137,6 +137,6 @@ describe("applyIssueLabelOps", () => {
     if (!result.ok) {
       expect(result.kind).toBe("transient");
     }
-    expect(calls).toEqual(["add:ralph:queued", "remove:ralph:in-progress"]);
+    expect(calls).toEqual(["add:ralph:status:queued", "remove:ralph:status:in-progress"]);
   });
 });

@@ -1,40 +1,16 @@
 import { getConfig } from "../config";
 import { shouldLog } from "../logging";
-import {
-  getIssueLabels,
-  listIssueSnapshotsWithRalphLabels,
-  listTaskOpStatesByRepo,
-  recordIssueLabelsSnapshot,
-} from "../state";
+import { listIssueSnapshotsWithRalphLabels, listTaskOpStatesByRepo } from "../state";
 import { GitHubClient } from "./client";
 import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels";
 import { executeIssueLabelOps } from "./issue-label-io";
 import { mutateIssueLabels } from "./label-mutation";
+import { applyIssueLabelWriteback } from "./issue-label-writeback";
 import { statusToRalphLabelDelta, type LabelOp } from "../github-queue/core";
 import type { QueueTaskStatus } from "../queue/types";
 
 const DEFAULT_INTERVAL_MS = 60_000;
 const MAX_ISSUES_PER_TICK = 10;
-
-function applyLabelDeltaSnapshot(params: {
-  repo: string;
-  issueNumber: number;
-  add: string[];
-  remove: string[];
-  nowIso: string;
-}): void {
-  const current = getIssueLabels(params.repo, params.issueNumber);
-  const set = new Set(current);
-  for (const label of params.remove) set.delete(label);
-  for (const label of params.add) set.add(label);
-
-  recordIssueLabelsSnapshot({
-    repo: params.repo,
-    issue: `${params.repo}#${params.issueNumber}`,
-    labels: Array.from(set),
-    at: params.nowIso,
-  });
-}
 
 function toDesiredStatus(raw: string | null | undefined): QueueTaskStatus | null {
   if (!raw) return null;
@@ -84,36 +60,66 @@ async function reconcileRepo(repo: string, maxIssues: number): Promise<number> {
       ...delta.remove.map((label) => ({ action: "remove" as const, label })),
     ];
 
-    let didApply = false;
-    const graphResult = await mutateIssueLabels({
-      github,
+    const graphResult = await applyIssueLabelWriteback({
+      io: {
+        mutateIssueLabels: async ({ repo, issueNumber, issueNodeId, add, remove }) => {
+          const outcome = await mutateIssueLabels({
+            github,
+            repo,
+            issueNumber,
+            issueNodeId,
+            plan: { add, remove },
+            labelIdCache,
+          });
+          return outcome.ok;
+        },
+        addIssueLabel: async (repo, issueNumber, label) => {
+          const result = await executeIssueLabelOps({
+            github,
+            repo,
+            issueNumber,
+            ops: [{ action: "add", label }],
+            log: (message) => console.warn(`[ralph:labels:reconcile:${repo}] ${message}`),
+            logLabel: `${repo}#${issue.number}`,
+            ensureLabels: async () => await labelEnsurer.ensure(repo),
+            retryMissingLabelOnce: true,
+            ensureBefore: false,
+          });
+          if (!result.ok) throw result.error;
+        },
+        removeIssueLabel: async (repo, issueNumber, label) => {
+          const result = await executeIssueLabelOps({
+            github,
+            repo,
+            issueNumber,
+            ops: [{ action: "remove", label }],
+            log: (message) => console.warn(`[ralph:labels:reconcile:${repo}] ${message}`),
+            logLabel: `${repo}#${issue.number}`,
+            ensureLabels: async () => await labelEnsurer.ensure(repo),
+            retryMissingLabelOnce: true,
+            ensureBefore: false,
+          });
+          if (!result.ok) throw result.error;
+          return { removed: true };
+        },
+      },
       repo,
       issueNumber: issue.number,
       issueNodeId: issue.githubNodeId,
-      plan: { add: delta.add, remove: delta.remove },
-      labelIdCache,
+      add: delta.add,
+      remove: delta.remove,
+      nowIso,
+      logLabel: `${repo}#${issue.number}`,
+      log: (message) => console.warn(`[ralph:labels:reconcile:${repo}] ${message}`),
+      ensureLabels: async () => await labelEnsurer.ensure(repo),
     });
-    if (graphResult.ok) {
-      applyLabelDeltaSnapshot({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
-      didApply = true;
-    }
 
-    if (!didApply) {
-      const result = await executeIssueLabelOps({
-        github,
-        repo,
-        issueNumber: issue.number,
-        ops,
-        log: (message) => console.warn(`[ralph:labels:reconcile:${repo}] ${message}`),
-        logLabel: `${repo}#${issue.number}`,
-        ensureLabels: async () => await labelEnsurer.ensure(repo),
-        retryMissingLabelOnce: true,
-        ensureBefore: false,
-      });
-
-      if (result.ok) {
-        applyLabelDeltaSnapshot({ repo, issueNumber: issue.number, add: result.add, remove: result.remove, nowIso });
-        didApply = true;
+    if (!graphResult.ok) {
+      const failure = graphResult.result;
+      if (!failure.ok && failure.kind !== "transient") {
+        console.warn(
+          `[ralph:labels:reconcile:${repo}] Failed to reconcile labels for #${issue.number}: ${failure.error}`
+        );
       }
     }
 

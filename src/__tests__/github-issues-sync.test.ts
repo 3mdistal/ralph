@@ -77,7 +77,7 @@ describe("github issue sync", () => {
       calls.push(String(input));
       return new Response(
         JSON.stringify([
-          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] }),
           buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["dx", "chore"] }),
           buildIssue({ number: 3, updatedAt: "2026-01-11T00:00:03.000Z", isPr: true }),
         ]),
@@ -117,7 +117,7 @@ describe("github issue sync", () => {
         )
         .all() as Array<{ issue_number: number; name: string }>;
 
-      expect(labels).toEqual([{ issue_number: 1, name: "ralph:queued" }]);
+      expect(labels).toEqual([{ issue_number: 1, name: "ralph:status:queued" }]);
     } finally {
       db.close();
     }
@@ -125,7 +125,7 @@ describe("github issue sync", () => {
 
   test("clears labels when removed", async () => {
     const responses = [
-      [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] })],
+      [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] })],
       [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:02.000Z", labels: [] })],
     ];
     let idx = 0;
@@ -192,15 +192,15 @@ describe("github issue sync", () => {
       calls.push(url);
       if (url.includes("page=2")) {
         return new Response(
-          JSON.stringify([buildIssue({ number: 4, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:queued"] })]),
+          JSON.stringify([buildIssue({ number: 4, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
           { status: 200, headers: { "Content-Type": "application/json" } }
         );
       }
 
       return new Response(
         JSON.stringify([
-          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
-          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] }),
+          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["ralph:status:queued"] }),
         ]),
         {
           status: 200,

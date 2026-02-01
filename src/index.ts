@@ -74,9 +74,11 @@ import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import { startGitHubLabelReconciler } from "./github/label-reconciler";
 import { resolveGitHubToken } from "./github-auth";
-import { GitHubClient } from "./github/client";
+import { GitHubClient, splitRepoFullName } from "./github/client";
 import { parseIssueRef } from "./github/issue-ref";
-import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
+import { applyIssueLabelWriteback } from "./github/issue-label-writeback";
+import { mutateIssueLabels } from "./github/label-mutation";
+import { addIssueLabel as addIssueLabelIo, addIssueLabels as addIssueLabelsIo, removeIssueLabel as removeIssueLabelIo } from "./github/issue-label-io";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -1549,30 +1551,75 @@ async function main(): Promise<void> {
               if (!token) throw new Error("GitHub auth is not configured");
 
               const github = new GitHubClient(issueRef.repo, { getToken: resolveGitHubToken });
-              const priorityLabels: TaskPriority[] = [
-                "p0-critical",
-                "p1-high",
-                "p2-medium",
-                "p3-low",
-                "p4-backlog",
-              ];
+              const desiredLabel = normalized.startsWith("p0")
+                ? "p0"
+                : normalized.startsWith("p1")
+                  ? "p1"
+                  : normalized.startsWith("p2")
+                    ? "p2"
+                    : normalized.startsWith("p3")
+                      ? "p3"
+                      : "p4";
 
-              const ops = planIssueLabelOps({
-                add: [normalized],
-                remove: priorityLabels.filter((label) => label !== normalized),
-                allowNonRalph: true,
-              });
+              const repoLabels = await github.listLabels();
+              const hasDesired = repoLabels.some((label) => label.toLowerCase() === desiredLabel);
+              if (!hasDesired) {
+                throw new Error(
+                  `Missing priority label '${desiredLabel}'. Create it in ${issueRef.repo} or use an existing p0..p4 label.`
+                );
+              }
 
-              const result = await executeIssueLabelOps({
-                github,
+              const { owner, name } = splitRepoFullName(issueRef.repo);
+              const response = await github.request<Array<{ name?: string | null }>>(
+                `/repos/${owner}/${name}/issues/${issueRef.number}/labels?per_page=100`
+              );
+              const currentLabels = (response.data ?? [])
+                .map((label) => label?.name ?? "")
+                .map((label) => label.trim())
+                .filter(Boolean);
+
+              const priorityLabelsToRemove = currentLabels.filter(
+                (label) => /^p[0-4]/i.test(label) && label.toLowerCase() !== desiredLabel
+              );
+
+              const result = await applyIssueLabelWriteback({
+                io: {
+                  mutateIssueLabels: async ({ repo, issueNumber, issueNodeId, add, remove }) => {
+                    const outcome = await mutateIssueLabels({
+                      github,
+                      repo,
+                      issueNumber,
+                      issueNodeId,
+                      plan: { add, remove },
+                    });
+                    return outcome.ok;
+                  },
+                  addIssueLabel: async (repo, issueNumber, label) => {
+                    await addIssueLabelIo({ github, repo, issueNumber, label, allowNonRalph: true });
+                  },
+                  addIssueLabels: async (repo, issueNumber, labels) => {
+                    await addIssueLabelsIo({ github, repo, issueNumber, labels, allowNonRalph: true });
+                  },
+                  removeIssueLabel: async (repo, issueNumber, label) => {
+                    return await removeIssueLabelIo({ github, repo, issueNumber, label, allowNonRalph: true });
+                  },
+                },
                 repo: issueRef.repo,
                 issueNumber: issueRef.number,
-                ops,
+                add: [desiredLabel],
+                remove: priorityLabelsToRemove,
+                nowIso: new Date().toISOString(),
+                logLabel: `${issueRef.repo}#${issueRef.number}`,
                 allowNonRalph: true,
               });
 
               if (!result.ok) {
-                const message = result.error instanceof Error ? result.error.message : String(result.error);
+                const failure = result.result;
+                const message = failure.ok
+                  ? "Failed to update issue priority"
+                  : failure.error instanceof Error
+                    ? failure.error.message
+                    : String(failure.error);
                 throw new Error(`Failed to update issue priority: ${message}`);
               }
 

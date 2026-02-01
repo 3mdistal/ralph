@@ -1,60 +1,21 @@
 import type { AgentTask, QueueTaskStatus } from "../queue/types";
 import { inferPriorityFromLabels } from "../queue/priority";
+import { RALPH_STATUS_LABELS, getStatusLabels, planSetStatus, resolveStatusFromLabels } from "../github/status-labels";
 import type { IssueSnapshot, TaskOpState } from "../state";
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
-const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
-  queued: "ralph:queued",
-  "in-progress": "ralph:in-progress",
-  blocked: "ralph:blocked",
-  escalated: "ralph:escalated",
-  done: "ralph:in-bot",
-  starting: "ralph:in-progress",
-  throttled: null,
-};
-
-const RALPH_LABEL_DONE = "ralph:done";
-const KNOWN_RALPH_LABELS = Array.from(
-  new Set([...Object.values(RALPH_STATUS_LABELS).filter(Boolean), RALPH_LABEL_DONE])
-) as string[];
-const RALPH_LABEL_QUEUED = RALPH_STATUS_LABELS.queued ?? "ralph:queued";
-// Preserve queued intent while blocked; claimability is determined at the queue layer.
-const PRESERVE_LABELS_BY_STATUS: Partial<Record<QueueTaskStatus, readonly string[]>> = {
-  blocked: [RALPH_LABEL_QUEUED],
-};
-
 export function deriveRalphStatus(labels: string[], issueState?: string | null): QueueTaskStatus | null {
-  const normalizedState = issueState?.toUpperCase();
-  if (normalizedState === "CLOSED") return "done";
-  if (labels.includes(RALPH_LABEL_DONE)) return "done";
-  if (labels.includes("ralph:in-bot")) return "done";
-  if (labels.includes("ralph:escalated")) return "escalated";
-  if (labels.includes("ralph:blocked") && labels.includes("ralph:queued")) return "queued";
-  if (labels.includes("ralph:blocked")) return "blocked";
-  if (labels.includes("ralph:in-progress")) return "in-progress";
-  if (labels.includes("ralph:queued")) return "queued";
-  return null;
+  const resolved = resolveStatusFromLabels({ labels, issueState });
+  return resolved.status;
 }
 
 export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: string[]): {
   add: string[];
   remove: string[];
 } {
-  const target = RALPH_STATUS_LABELS[status];
-  if (!target) return { add: [], remove: [] };
-
-  const labelSet = new Set(currentLabels);
-  const add: string[] = [];
-  if (!labelSet.has(target)) add.push(target);
-  if (status === "blocked" && !labelSet.has(RALPH_LABEL_QUEUED)) {
-    add.push(RALPH_LABEL_QUEUED);
-  }
-  const preserved = new Set(PRESERVE_LABELS_BY_STATUS[status] ?? []);
-  const remove = KNOWN_RALPH_LABELS.filter(
-    (label) => label !== target && labelSet.has(label) && !preserved.has(label)
-  );
-  return { add, remove };
+  const plan = planSetStatus({ desired: status, currentLabels });
+  return { add: plan.add, remove: plan.remove };
 }
 
 export function planClaim(currentLabels: string[]): {
@@ -62,31 +23,23 @@ export function planClaim(currentLabels: string[]): {
   steps: LabelOp[];
   reason?: string;
 } {
-  const labelSet = new Set(currentLabels);
-  if (labelSet.has(RALPH_LABEL_DONE)) {
-    return { claimable: false, steps: [], reason: "Issue already done" };
+  const statusLabels = getStatusLabels(currentLabels);
+  if (statusLabels.length > 1) {
+    return { claimable: false, steps: [], reason: "Multiple ralph:status labels present" };
   }
-  if (labelSet.has("ralph:escalated")) {
-    return { claimable: false, steps: [], reason: "Issue is escalated" };
+  const statusLabel = statusLabels[0] ?? null;
+  if (!statusLabel) {
+    return { claimable: false, steps: [], reason: "Missing ralph:status:queued label" };
   }
-  if (labelSet.has("ralph:in-bot")) {
-    return { claimable: false, steps: [], reason: "Issue already in bot" };
-  }
-  if (labelSet.has("ralph:in-progress")) {
-    return { claimable: false, steps: [], reason: "Issue already in progress" };
-  }
-  if (labelSet.has("ralph:blocked")) {
-    return { claimable: false, steps: [], reason: "Issue is blocked" };
-  }
-  if (!labelSet.has("ralph:queued")) {
-    return { claimable: false, steps: [], reason: "Missing ralph:queued label" };
+  if (statusLabel !== RALPH_STATUS_LABELS.queued) {
+    return { claimable: false, steps: [], reason: `Issue is ${statusLabel}` };
   }
 
   return {
     claimable: true,
     steps: [
-      { action: "add", label: "ralph:in-progress" },
-      { action: "remove", label: "ralph:queued" },
+      { action: "add", label: RALPH_STATUS_LABELS.inProgress },
+      { action: "remove", label: RALPH_STATUS_LABELS.queued },
     ],
   };
 }
@@ -104,7 +57,7 @@ export function computeStaleInProgressRecovery(params: {
   nowMs: number;
   ttlMs: number;
 }): { shouldRecover: boolean; reason?: StaleInProgressRecoveryReason } {
-  if (!params.labels.includes("ralph:in-progress")) return { shouldRecover: false };
+  if (!params.labels.includes(RALPH_STATUS_LABELS.inProgress)) return { shouldRecover: false };
   if (typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs)) {
     return { shouldRecover: false };
   }
@@ -144,10 +97,11 @@ export function deriveTaskView(params: {
 }): AgentTask {
   const issueRef = `${params.issue.repo}#${params.issue.number}`;
   const taskPath = params.opState?.taskPath ?? `github:${issueRef}`;
-  const labelStatus = deriveRalphStatus(params.issue.labels, params.issue.state);
+  const statusInfo = resolveStatusFromLabels({ labels: params.issue.labels, issueState: params.issue.state });
+  const labelStatus = statusInfo.status;
   const released = typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs);
   const opStatus = released ? "queued" : ((params.opState?.status as QueueTaskStatus | null) ?? null);
-  const status = opStatus ?? labelStatus ?? "queued";
+  const status = opStatus ?? labelStatus ?? "blocked";
   const creationDate = params.issue.githubUpdatedAt ?? params.nowIso;
   const name = params.issue.title?.trim() ? params.issue.title : `Issue ${params.issue.number}`;
   const priority = inferPriorityFromLabels(params.issue.labels);

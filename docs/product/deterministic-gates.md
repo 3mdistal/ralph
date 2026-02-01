@@ -158,11 +158,11 @@ Escalation policy:
 When an issue already has an open PR and required checks are failing or timed out, Ralph must treat CI-debug as a first-class recovery path.
 
 Behavior:
-- Detect: if required checks are failing or timed out, do **not** end in `ralph:blocked`.
+- Detect: if required checks are failing or timed out, do **not** end in `ralph:status:blocked`.
 - Comment: post a single canonical GitHub **issue** comment listing failing required check names + links, base/head refs, and the action statement: “Ralph is spawning a dedicated CI-debug run to make required checks green.” Edit this comment as CI state changes (no duplicates).
 - Run: spawn a dedicated CI-debug run immediately with a fresh worktree and fresh OpenCode session (no planning phase). Seed the prompt with failing check names/URLs/refs and a brief failure summary.
 - Retries: allow bounded retries (2–3). If the same failure signature repeats across attempts, stop early and escalate.
-- Labels: while CI-debug is in progress, apply `ralph:stuck` and avoid `ralph:blocked`. Apply `ralph:escalated` only after bounded CI-debug attempts fail.
+- Labels: while CI-debug is in progress, apply `ralph:status:stuck` and avoid `ralph:status:blocked`. Apply `ralph:status:blocked` with an escalation comment only after bounded CI-debug attempts fail.
 - Escalation: post a final comment summarizing what failed, what was tried (links to attempts), and the exact next human action.
 
 ## Merge-conflict recovery lane (mergeStateStatus=DIRTY)
@@ -170,12 +170,12 @@ Behavior:
 When an issue already has an open PR with merge conflicts, Ralph must treat merge-conflict recovery as a first-class lane (like CI-debug).
 
 Behavior:
-- Detect: if the PR is `mergeStateStatus=DIRTY`, do **not** end in `ralph:blocked` without attempting recovery.
+- Detect: if the PR is `mergeStateStatus=DIRTY`, do **not** end in `ralph:status:blocked` without attempting recovery.
 - Comment: post a single canonical GitHub **issue** comment with PR/base/head refs, conflict file count/sample, and the action statement. Edit the same comment as state changes (no duplicates).
 - Run: spawn a dedicated merge-conflict recovery run with a fresh worktree and fresh OpenCode session (no planning phase). Merge base into head (no rebase / no force-push), resolve conflicts, run tests/typecheck/build/knip, then push updates.
 - Wait: after pushing, wait for `mergeStateStatus != DIRTY` and for required checks to appear for the new head SHA before resuming merge-gate logic.
 - Retries: bounded attempts (2–3). If the same conflict signature repeats across attempts, stop early and escalate.
-- Labels: while recovery is in progress, apply `ralph:stuck` and avoid `ralph:blocked`. Apply `ralph:escalated` only after bounded attempts fail.
+- Labels: while recovery is in progress, apply `ralph:status:stuck` and avoid `ralph:status:blocked`. Apply `ralph:status:blocked` with an escalation comment only after bounded attempts fail.
 - Escalation: post a final comment summarizing the conflict files and the exact next human action needed.
 
 ## Test Philosophy (Agentic Coding)

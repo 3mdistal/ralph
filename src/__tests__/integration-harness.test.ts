@@ -388,11 +388,11 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     expect(addIssueLabelMock).toHaveBeenCalledWith(
       expect.objectContaining({ repo: "3mdistal/ralph", number: 102 }),
-      "ralph:in-bot"
+      "ralph:status:in-bot"
     );
     expect(removeIssueLabelMock).toHaveBeenCalledWith(
       expect.objectContaining({ repo: "3mdistal/ralph", number: 102 }),
-      "ralph:in-progress"
+      "ralph:status:in-progress"
     );
   }, lifecycleTimeoutMs);
 

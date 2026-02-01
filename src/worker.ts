@@ -58,7 +58,7 @@ import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationConte
 import { buildWorkerFailureAlert, type WorkerFailureKind } from "./alerts/worker-failure-core";
 import { buildNudgePreview, drainQueuedNudges, type NudgeDeliveryOutcome } from "./nudge";
 import { redactSensitiveText } from "./redaction";
-import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
+import { RALPH_LABEL_BLOCKED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { writeDxSurveyToGitHubIssues } from "./github/dx-survey-writeback";
@@ -4333,7 +4333,7 @@ ${guidance}`
 
     lines.push(
       "Next action:",
-      "- Resolve conflicts on the PR branch, push updates, then re-add `ralph:queued` (or comment `RALPH RESOLVED:`) to resume."
+      "- Resolve conflicts on the PR branch, push updates, then re-add `ralph:status:queued` (or comment `RALPH RESOLVED:`) to resume."
     );
 
     return lines.join("\n");
@@ -4867,7 +4867,7 @@ ${guidance}`
     lines.push(
       "",
       "Next action:",
-      "- Inspect the failing check runs linked above, fix or rerun as needed, then re-add `ralph:queued` (or comment `RALPH RESOLVED:`) to resume."
+      "- Inspect the failing check runs linked above, fix or rerun as needed, then re-add `ralph:status:queued` (or comment `RALPH RESOLVED:`) to resume."
     );
 
     return lines.join("\n");
@@ -5208,7 +5208,7 @@ ${guidance}`
 
     // Escalated issues are explicitly waiting on humans; do not attempt autonomous CI remediation.
     const issueLabels = issueMeta.labels ?? [];
-    if (task.status === "escalated" || issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_ESCALATED)) {
+    if (task.status === "escalated") {
       return null;
     }
 
