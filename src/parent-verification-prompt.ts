@@ -1,11 +1,13 @@
 type ParentVerificationPromptOptions = {
   repo: string;
   issueNumber: string | number;
+  issueContext?: string | null;
 };
 
 export function buildParentVerificationPrompt(options: ParentVerificationPromptOptions): string {
   const issueNumber = String(options.issueNumber).trim();
   const repo = options.repo.trim();
+  const issueContext = String(options.issueContext ?? "").trim();
 
   return [
     "Parent verification prompt v1",
@@ -15,8 +17,16 @@ export function buildParentVerificationPrompt(options: ParentVerificationPromptO
     "IMPORTANT: This runs in a non-interactive daemon. Do NOT ask questions. If you would normally ask a question, make a reasonable default choice and proceed, stating any assumptions briefly.",
     "",
     "Steps:",
-    "1) Read the GitHub issue body.",
-    `2) Read the issue comments (use 'GH_PAGER=cat gh issue view ${issueNumber} --repo ${repo} --comments' to fetch the full thread; prioritize latest maintainer/owner comments).`,
+    "1) Review the GitHub issue context below (prefetched by the orchestrator when possible).",
+    issueContext ? "---" : null,
+    issueContext ? issueContext : null,
+    issueContext ? "---" : null,
+    "",
+    "If issue context is missing/unavailable, fetch it via REST (avoid `gh issue view`, which uses GraphQL):",
+    "```bash",
+    `gh api repos/${repo}/issues/${issueNumber}`,
+    `gh api repos/${repo}/issues/${issueNumber}/comments --paginate`,
+    "```",
     "3) Decide if any implementation work remains given the issue description, current dependency state, and latest comments.",
     "",
     "Decision guidance:",
