@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -66,6 +66,22 @@ export const PR_STATE_MERGED: PrState = "merged";
 export type GateName = "preflight" | "product_review" | "devex_review" | "ci";
 export type GateStatus = "pending" | "pass" | "fail" | "skipped";
 export type GateArtifactKind = "command_output" | "failure_excerpt" | "note";
+
+export type ParentVerificationStatus = "pending" | "running" | "complete";
+export type ParentVerificationOutcome = "work_remains" | "no_work" | "failed" | "skipped";
+
+export type ParentVerificationState = {
+  repo: string;
+  issueNumber: number;
+  status: ParentVerificationStatus;
+  pendingAtMs: number | null;
+  attemptCount: number;
+  lastAttemptAtMs: number | null;
+  nextAttemptAtMs: number | null;
+  outcome: ParentVerificationOutcome | null;
+  outcomeDetails: string | null;
+  updatedAtMs: number;
+};
 
 const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci"];
 const GATE_STATUSES: GateStatus[] = ["pending", "pass", "fail", "skipped"];
@@ -436,6 +452,27 @@ function ensureSchema(database: Database): void {
           );
         `);
       }
+
+      if (existingVersion < 13) {
+        database.exec(`
+          CREATE TABLE IF NOT EXISTS parent_verification_state (
+            repo_id INTEGER NOT NULL,
+            issue_number INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'complete')),
+            pending_at_ms INTEGER,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at_ms INTEGER,
+            next_attempt_at_ms INTEGER,
+            outcome TEXT,
+            outcome_details TEXT,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(repo_id, issue_number),
+            FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_parent_verification_state_repo_status
+            ON parent_verification_state(repo_id, status, updated_at_ms);
+        `);
+      }
     })();
   }
 
@@ -478,6 +515,23 @@ function ensureSchema(database: Database): void {
       UNIQUE(issue_id, name),
       FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS parent_verification_state (
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'complete')),
+      pending_at_ms INTEGER,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at_ms INTEGER,
+      next_attempt_at_ms INTEGER,
+      outcome TEXT,
+      outcome_details TEXT,
+      updated_at_ms INTEGER NOT NULL,
+      PRIMARY KEY(repo_id, issue_number),
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_parent_verification_state_repo_status
+      ON parent_verification_state(repo_id, status, updated_at_ms);
 
     CREATE TABLE IF NOT EXISTS issue_escalation_comment_checks (
       issue_id INTEGER PRIMARY KEY,
@@ -2513,6 +2567,7 @@ export function recordEscalationCommentCheckState(params: {
 }
 
 export function getIssueLabels(repo: string, issueNumber: number): string[] {
+  if (!db) return [];
   const database = requireDb();
   const row = database
     .query(
@@ -2529,6 +2584,220 @@ export function getIssueLabels(repo: string, issueNumber: number): string[] {
     .all({ $id: row.id }) as Array<{ name: string }>;
 
   return labels.map((label) => label.name);
+}
+
+function mapParentVerificationRow(row: {
+  issue_number?: number | null;
+  status?: string | null;
+  pending_at_ms?: number | null;
+  attempt_count?: number | null;
+  last_attempt_at_ms?: number | null;
+  next_attempt_at_ms?: number | null;
+  outcome?: string | null;
+  outcome_details?: string | null;
+  updated_at_ms?: number | null;
+} | undefined, repo: string): ParentVerificationState | null {
+  if (!row || typeof row.issue_number !== "number") return null;
+  const status = row.status as ParentVerificationStatus | null;
+  if (!status || (status !== "pending" && status !== "running" && status !== "complete")) return null;
+  const updatedAtMs = typeof row.updated_at_ms === "number" ? row.updated_at_ms : 0;
+  if (!updatedAtMs) return null;
+  return {
+    repo,
+    issueNumber: row.issue_number,
+    status,
+    pendingAtMs: typeof row.pending_at_ms === "number" ? row.pending_at_ms : null,
+    attemptCount: typeof row.attempt_count === "number" ? row.attempt_count : 0,
+    lastAttemptAtMs: typeof row.last_attempt_at_ms === "number" ? row.last_attempt_at_ms : null,
+    nextAttemptAtMs: typeof row.next_attempt_at_ms === "number" ? row.next_attempt_at_ms : null,
+    outcome: (row.outcome as ParentVerificationOutcome | null) ?? null,
+    outcomeDetails: row.outcome_details ?? null,
+    updatedAtMs,
+  };
+}
+
+export function getParentVerificationState(params: {
+  repo: string;
+  issueNumber: number;
+}): ParentVerificationState | null {
+  if (!db) return null;
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT issue_number, status, pending_at_ms, attempt_count, last_attempt_at_ms, next_attempt_at_ms,
+              outcome, outcome_details, updated_at_ms
+       FROM parent_verification_state p
+       JOIN repos r ON r.id = p.repo_id
+       WHERE r.name = $name AND p.issue_number = $number`
+    )
+    .get({ $name: params.repo, $number: params.issueNumber }) as
+    | {
+        issue_number?: number | null;
+        status?: string | null;
+        pending_at_ms?: number | null;
+        attempt_count?: number | null;
+        last_attempt_at_ms?: number | null;
+        next_attempt_at_ms?: number | null;
+        outcome?: string | null;
+        outcome_details?: string | null;
+        updated_at_ms?: number | null;
+      }
+    | undefined;
+
+  return mapParentVerificationRow(row, params.repo);
+}
+
+export function setParentVerificationPending(params: {
+  repo: string;
+  issueNumber: number;
+  nowMs: number;
+}): boolean {
+  if (!db) return false;
+  const database = requireDb();
+  const updatedAtMs = params.nowMs;
+  const atIso = new Date(params.nowMs).toISOString();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const existing = database
+    .query(
+      `SELECT status FROM parent_verification_state
+       WHERE repo_id = $repo_id AND issue_number = $issue_number`
+    )
+    .get({ $repo_id: repoId, $issue_number: params.issueNumber }) as { status?: string | null } | undefined;
+
+  if (existing && existing.status !== "complete") return false;
+
+  const result = database
+    .query(
+      `INSERT INTO parent_verification_state(
+         repo_id, issue_number, status, pending_at_ms, attempt_count, last_attempt_at_ms,
+         next_attempt_at_ms, outcome, outcome_details, updated_at_ms
+       ) VALUES (
+         $repo_id, $issue_number, 'pending', $pending_at_ms, 0, NULL,
+         $next_attempt_at_ms, NULL, NULL, $updated_at_ms
+       )
+       ON CONFLICT(repo_id, issue_number) DO UPDATE SET
+         status = 'pending',
+         pending_at_ms = excluded.pending_at_ms,
+         attempt_count = 0,
+         last_attempt_at_ms = NULL,
+         next_attempt_at_ms = excluded.next_attempt_at_ms,
+         outcome = NULL,
+         outcome_details = NULL,
+         updated_at_ms = excluded.updated_at_ms
+       WHERE parent_verification_state.status = 'complete'`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $pending_at_ms: updatedAtMs,
+      $next_attempt_at_ms: updatedAtMs,
+      $updated_at_ms: updatedAtMs,
+    });
+
+  return result.changes > 0;
+}
+
+export function tryClaimParentVerification(params: {
+  repo: string;
+  issueNumber: number;
+  nowMs: number;
+}): ParentVerificationState | null {
+  if (!db) return null;
+  const database = requireDb();
+  const atIso = new Date(params.nowMs).toISOString();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const result = database
+    .query(
+      `UPDATE parent_verification_state
+       SET status = 'running',
+           attempt_count = attempt_count + 1,
+           last_attempt_at_ms = $now_ms,
+           updated_at_ms = $now_ms
+       WHERE repo_id = $repo_id
+         AND issue_number = $issue_number
+         AND status = 'pending'
+         AND (next_attempt_at_ms IS NULL OR next_attempt_at_ms <= $now_ms)`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $now_ms: params.nowMs,
+    });
+
+  if (result.changes === 0) return null;
+  return getParentVerificationState({ repo: params.repo, issueNumber: params.issueNumber });
+}
+
+export function recordParentVerificationAttemptFailure(params: {
+  repo: string;
+  issueNumber: number;
+  attemptCount: number;
+  nextAttemptAtMs: number;
+  nowMs: number;
+  details?: string | null;
+}): void {
+  if (!db) return;
+  const database = requireDb();
+  const atIso = new Date(params.nowMs).toISOString();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const outcomeDetails = sanitizeOptionalText(params.details ?? null, 1000);
+  database
+    .query(
+      `UPDATE parent_verification_state
+       SET status = 'pending',
+           attempt_count = $attempt_count,
+           last_attempt_at_ms = $last_attempt_at_ms,
+           next_attempt_at_ms = $next_attempt_at_ms,
+           outcome = 'failed',
+           outcome_details = $outcome_details,
+           updated_at_ms = $updated_at_ms
+       WHERE repo_id = $repo_id AND issue_number = $issue_number`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $attempt_count: params.attemptCount,
+      $last_attempt_at_ms: params.nowMs,
+      $next_attempt_at_ms: params.nextAttemptAtMs,
+      $outcome_details: outcomeDetails ?? null,
+      $updated_at_ms: params.nowMs,
+    });
+}
+
+export function completeParentVerification(params: {
+  repo: string;
+  issueNumber: number;
+  outcome: ParentVerificationOutcome;
+  details?: string | null;
+  nowMs: number;
+}): void {
+  if (!db) return;
+  const database = requireDb();
+  const atIso = new Date(params.nowMs).toISOString();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const outcomeDetails = sanitizeOptionalText(params.details ?? null, 1000);
+  database
+    .query(
+      `INSERT INTO parent_verification_state(
+         repo_id, issue_number, status, pending_at_ms, attempt_count, last_attempt_at_ms,
+         next_attempt_at_ms, outcome, outcome_details, updated_at_ms
+       ) VALUES (
+         $repo_id, $issue_number, 'complete', NULL, 0, NULL, NULL,
+         $outcome, $outcome_details, $updated_at_ms
+       )
+       ON CONFLICT(repo_id, issue_number) DO UPDATE SET
+         status = 'complete',
+         outcome = excluded.outcome,
+         outcome_details = excluded.outcome_details,
+         updated_at_ms = excluded.updated_at_ms`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $outcome: params.outcome,
+      $outcome_details: outcomeDetails ?? null,
+      $updated_at_ms: params.nowMs,
+    });
 }
 
 export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
