@@ -136,14 +136,10 @@ describe("github queue core", () => {
     expect(plan.claimable).toBe(false);
   });
 
-  test("planClaim allows blocked issues to requeue", () => {
+  test("planClaim rejects blocked issues", () => {
     const plan = planClaim(["ralph:queued", "ralph:blocked"]);
-    expect(plan.claimable).toBe(true);
-    expect(plan.steps).toEqual([
-      { action: "add", label: "ralph:in-progress" },
-      { action: "remove", label: "ralph:queued" },
-      { action: "remove", label: "ralph:blocked" },
-    ]);
+    expect(plan.claimable).toBe(false);
+    expect(plan.steps).toEqual([]);
   });
 
   test("planClaim rejects done issues", () => {

@@ -6,7 +6,7 @@ import { tmpdir } from "os";
 import { __resetConfigForTests } from "../config";
 import { getRalphConfigJsonPath } from "../paths";
 import { RepoWorker } from "../worker";
-import { closeStateDbForTests, initStateDb } from "../state";
+import { closeStateDbForTests, initStateDb, setParentVerificationPending } from "../state";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let autoUpdateEnabled = false;
@@ -61,19 +61,23 @@ const notifyEscalationMock = mock(async () => true);
 const notifyErrorMock = mock(async (_title: string, _body: string, _context?: unknown) => {});
 const notifyTaskCompleteMock = mock(async () => {});
 
-const runAgentMock = mock(async () => ({
+const defaultPlanOutput = [
+  "## Plan",
+  "- Do the thing",
+  "",
+  "```json",
+  JSON.stringify({ decision: "proceed", confidence: "high", escalation_reason: null }, null, 2),
+  "```",
+  "",
+].join("\n");
+
+const defaultRunAgentImpl = async (..._args: unknown[]) => ({
   sessionId: "ses_plan",
   success: true,
-  output: [
-    "## Plan",
-    "- Do the thing",
-    "",
-    "```json",
-    JSON.stringify({ decision: "proceed", confidence: "high", escalation_reason: null }, null, 2),
-    "```",
-    "",
-  ].join("\n"),
-}));
+  output: defaultPlanOutput,
+});
+
+const runAgentMock = mock(defaultRunAgentImpl);
 
 const continueSessionMock = mock(async (_repoPath: string, _sessionId: string, message: string) => {
   if (message.includes("Proceed with implementation")) {
@@ -390,6 +394,57 @@ describe("integration-ish harness: full task lifecycle", () => {
       expect.objectContaining({ repo: "3mdistal/ralph", number: 102 }),
       "ralph:in-progress"
     );
+  }, lifecycleTimeoutMs);
+
+  test("runs parent verification before planning", async () => {
+    const priorStateDb = process.env.RALPH_STATE_DB_PATH;
+    const stateDir = await mkdtemp(join(tmpdir(), "ralph-state-"));
+    process.env.RALPH_STATE_DB_PATH = join(stateDir, "state.sqlite");
+    initStateDb();
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { session: sessionAdapter, queue: queueAdapter, notify: notifyAdapter, throttle: throttleAdapter });
+    (worker as any).resolveTaskRepoPath = async () => ({ kind: "ok", repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+
+    setParentVerificationPending({ repo: "3mdistal/ralph", issueNumber: 102, nowMs: Date.now() });
+
+    const events: string[] = [];
+    runAgentMock.mockImplementation(async (...args: unknown[]) => {
+      const agent = typeof args[1] === "string" ? args[1] : "";
+      if (agent === "ralph-parent-verify") {
+        events.push("verify");
+        return {
+          sessionId: "ses_verify",
+          success: true,
+          output: `Note\nRALPH_PARENT_VERIFY: {"version":1,"work_remains":true,"reason":"Work remains"}`,
+        };
+      }
+      events.push("plan");
+      return defaultRunAgentImpl();
+    });
+
+    const task = createMockTask();
+    await worker.processTask(task);
+
+    expect(events[0]).toBe("verify");
+    expect(events).toContain("plan");
+
+    runAgentMock.mockImplementation(defaultRunAgentImpl);
+    closeStateDbForTests();
+    if (priorStateDb === undefined) delete process.env.RALPH_STATE_DB_PATH;
+    else process.env.RALPH_STATE_DB_PATH = priorStateDb;
+    await rm(stateDir, { recursive: true, force: true });
   }, lifecycleTimeoutMs);
 
   test("restores session adapters after processTask", async () => {

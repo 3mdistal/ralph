@@ -26,5 +26,12 @@
       "prompt": "agent/devex.md",
       "mode": "subagent"
     }
+  },
+  "command": {
+    "survey": {
+      "description": "DX survey -> GitHub issues",
+      "agent": "devex",
+      "template": "You are running as a post-job DX survey bot for Ralph.\n\nYour task: output a SINGLE JSON object (no markdown, no code fences, no extra text).\n\nSchema: ralph.dx_survey.v1\n\nRules:\n- Capture ANY negative feedback as a separate item in negativeItems (even minor).\n- Set severity as one of: p0, p1, p2, p3, p4 (p0 = blocker, p4 = backlog).\n- Set ownership.owner as one of: target_repo, ralph\n  - target_repo: fix by changing code/config/docs/tests in the repo being worked on\n  - ralph: fix by changing Ralph orchestration OR Ralph-managed OpenCode config/commands\n- Always include ownership.confidence (high|medium|low) and ownership.rationale (1-2 sentences).\n- Each negative item must be actionable: include a clear title, body, and acceptanceCriteria (array of strings).\n- If you are not confident about ownership, set confidence=low and explain why.\n\nOutput JSON shape:\n{\n  \"schema\": \"ralph.dx_survey.v1\",\n  \"overall\": {\n    \"rating\": <1-5 integer>,\n    \"highlights\": [<string>...],\n    \"frictions\": [<string>...]\n  },\n  \"negativeItems\": [\n    {\n      \"title\": <string>,\n      \"severity\": \"p0\"|\"p1\"|\"p2\"|\"p3\"|\"p4\",\n      \"ownership\": {\n        \"owner\": \"target_repo\"|\"ralph\",\n        \"confidence\": \"high\"|\"medium\"|\"low\",\n        \"rationale\": <string>\n      },\n      \"body\": <string>,\n      \"acceptanceCriteria\": [<string>...],\n      \"evidence\": {\n        \"sessionIds\": [<string>...],\n        \"runLogPaths\": [<string>...],\n        \"urls\": [<string>...]\n      }\n    }\n  ],\n  \"positives\": [\n    {\n      \"title\": <string>,\n      \"details\": <string>\n    }\n  ]\n}\n\nIf there are no negative items, output negativeItems: [] (still output the JSON object)."
+    }
   }
 }
