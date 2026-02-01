@@ -7,6 +7,7 @@ import {
   buildEscalationComment,
   buildEscalationMarker,
   extractExistingMarker,
+  planEscalationCommentWrite,
   planEscalationWriteback,
   sanitizeEscalationReason,
   writeEscalationToGitHub,
@@ -68,8 +69,64 @@ describe("github escalation writeback", () => {
     expect(extractExistingMarker("<!-- ralph-escalation:id=deadbeef -->")).toBe("deadbeef");
   });
 
+  test("planEscalationCommentWrite prefers noop when body matches", () => {
+    const plan = planEscalationWriteback({
+      repo: "3mdistal/ralph",
+      issueNumber: 66,
+      taskName: "Escalation task",
+      taskPath: "orchestration/tasks/ralph 66.md",
+      reason: "Need guidance",
+      escalationType: "other",
+    });
+
+    const commentBody = buildEscalationComment({
+      marker: plan.marker,
+      taskName: "Escalation task",
+      issueUrl: "https://github.com/3mdistal/ralph/issues/66",
+      reason: "Need guidance",
+      ownerHandle: "@3mdistal",
+    });
+
+    const result = planEscalationCommentWrite({
+      desiredBody: plan.commentBody,
+      markerId: plan.markerId,
+      marker: plan.marker,
+      scannedComments: [{ body: commentBody, databaseId: 123, createdAt: "2025-01-01T00:00:00Z", url: "url" }],
+    });
+
+    expect(result.action).toBe("noop");
+    expect(result.markerFound).toBe(true);
+    expect(result.targetCommentId).toBe(123);
+  });
+
+  test("planEscalationCommentWrite selects newest matching marker comment", () => {
+    const plan = planEscalationWriteback({
+      repo: "3mdistal/ralph",
+      issueNumber: 66,
+      taskName: "Escalation task",
+      taskPath: "orchestration/tasks/ralph 66.md",
+      reason: "Need guidance",
+      escalationType: "other",
+    });
+
+    const result = planEscalationCommentWrite({
+      desiredBody: "Updated body",
+      markerId: plan.markerId,
+      marker: plan.marker,
+      scannedComments: [
+        { body: `${plan.marker}\nold`, databaseId: 111, createdAt: "2024-01-01T00:00:00Z", url: "old" },
+        { body: `${plan.marker}\nnew`, databaseId: 222, createdAt: "2024-02-01T00:00:00Z", url: "new" },
+      ],
+    });
+
+    expect(result.action).toBe("patch");
+    expect(result.targetCommentId).toBe(222);
+    expect(result.targetCommentUrl).toBe("new");
+  });
+
   test("writeEscalationToGitHub posts once and records idempotency", async () => {
     const keys = new Set<string>();
+    const payloads = new Map<string, string>();
     const postedBodies: string[] = [];
 
     const plan = planEscalationWriteback({
@@ -121,10 +178,17 @@ describe("github escalation writeback", () => {
         hasIdempotencyKey: (key) => keys.has(key),
         recordIdempotencyKey: (input) => {
           keys.add(input.key);
+          if (input.payloadJson) payloads.set(input.key, input.payloadJson);
           return true;
         },
         deleteIdempotencyKey: (key) => {
           keys.delete(key);
+          payloads.delete(key);
+        },
+        getIdempotencyPayload: (key) => payloads.get(key) ?? null,
+        upsertIdempotencyKey: (input) => {
+          keys.add(input.key);
+          payloads.set(input.key, input.payloadJson ?? "");
         },
       }
     );
@@ -135,9 +199,11 @@ describe("github escalation writeback", () => {
     expect(postedBodies[0]).toContain(plan.marker);
   });
 
-  test("writeEscalationToGitHub skips when marker already present", async () => {
+  test("writeEscalationToGitHub updates when marker already present", async () => {
     const keys = new Set<string>();
+    const payloads = new Map<string, string>();
     const postedBodies: string[] = [];
+    const patchedBodies: string[] = [];
 
     const plan = planEscalationWriteback({
       repo: "3mdistal/ralph",
@@ -160,7 +226,14 @@ describe("github escalation writeback", () => {
                 repository: {
                   issue: {
                     comments: {
-                      nodes: [{ body: `prior\n${plan.marker}` }],
+                      nodes: [
+                        {
+                          body: `prior\n${plan.marker}`,
+                          databaseId: 123,
+                          createdAt: "2024-01-01T00:00:00Z",
+                          url: "https://github.com/3mdistal/ralph/issues/66#issuecomment-123",
+                        },
+                      ],
                       pageInfo: { hasPreviousPage: false },
                     },
                   },
@@ -168,6 +241,10 @@ describe("github escalation writeback", () => {
               },
             },
           };
+        }
+        if (path.includes("/issues/comments/") && opts.method === "PATCH") {
+          patchedBodies.push(opts.body?.body ?? "");
+          return { data: { html_url: "https://github.com/3mdistal/ralph/issues/66#issuecomment-123" } };
         }
         if (path.includes("/comments") && opts.method === "POST") {
           postedBodies.push(opts.body?.body ?? "");
@@ -191,16 +268,125 @@ describe("github escalation writeback", () => {
         hasIdempotencyKey: (key) => keys.has(key),
         recordIdempotencyKey: (input) => {
           keys.add(input.key);
+          if (input.payloadJson) payloads.set(input.key, input.payloadJson);
           return true;
         },
         deleteIdempotencyKey: (key) => {
           keys.delete(key);
+          payloads.delete(key);
+        },
+        getIdempotencyPayload: (key) => payloads.get(key) ?? null,
+        upsertIdempotencyKey: (input) => {
+          keys.add(input.key);
+          payloads.set(input.key, input.payloadJson ?? "");
         },
       }
     );
 
     expect(result.postedComment).toBe(false);
     expect(result.markerFound).toBe(true);
+    expect(result.skippedComment).toBe(false);
+    expect(patchedBodies.length).toBe(1);
+    expect(postedBodies.length).toBe(0);
+    expect(keys.has(plan.idempotencyKey)).toBe(true);
+  });
+
+  test("writeEscalationToGitHub no-ops when marker comment matches", async () => {
+    const keys = new Set<string>();
+    const payloads = new Map<string, string>();
+    const postedBodies: string[] = [];
+    const patchedBodies: string[] = [];
+
+    const plan = planEscalationWriteback({
+      repo: "3mdistal/ralph",
+      issueNumber: 66,
+      taskName: "Escalation task",
+      taskPath: "orchestration/tasks/ralph 66.md",
+      reason: "Need guidance",
+      escalationType: "other",
+    });
+
+    const canonicalBody = buildEscalationComment({
+      marker: plan.marker,
+      taskName: "Escalation task",
+      issueUrl: "https://github.com/3mdistal/ralph/issues/66",
+      reason: "Need guidance",
+      ownerHandle: "@3mdistal",
+    });
+
+    const github = {
+      request: async (path: string, opts: { method?: string; body?: { body?: string } } = {}) => {
+        if (path.startsWith("/repos/3mdistal/ralph/labels")) {
+          return { data: [] };
+        }
+        if (path === "/graphql") {
+          return {
+            data: {
+              data: {
+                repository: {
+                  issue: {
+                    comments: {
+                      nodes: [
+                        {
+                          body: canonicalBody,
+                          databaseId: 123,
+                          createdAt: "2024-01-01T00:00:00Z",
+                          url: "https://github.com/3mdistal/ralph/issues/66#issuecomment-123",
+                        },
+                      ],
+                      pageInfo: { hasPreviousPage: false },
+                    },
+                  },
+                },
+              },
+            },
+          };
+        }
+        if (path.includes("/issues/comments/") && opts.method === "PATCH") {
+          patchedBodies.push(opts.body?.body ?? "");
+          return { data: {} };
+        }
+        if (path.includes("/comments") && opts.method === "POST") {
+          postedBodies.push(opts.body?.body ?? "");
+          return { data: {} };
+        }
+        return { data: {} };
+      },
+    } as any;
+
+    const result = await writeEscalationToGitHub(
+      {
+        repo: "3mdistal/ralph",
+        issueNumber: 66,
+        taskName: "Escalation task",
+        taskPath: "orchestration/tasks/ralph 66.md",
+        reason: "Need guidance",
+        escalationType: "other",
+      },
+      {
+        github,
+        hasIdempotencyKey: (key) => keys.has(key),
+        recordIdempotencyKey: (input) => {
+          keys.add(input.key);
+          if (input.payloadJson) payloads.set(input.key, input.payloadJson);
+          return true;
+        },
+        deleteIdempotencyKey: (key) => {
+          keys.delete(key);
+          payloads.delete(key);
+        },
+        getIdempotencyPayload: (key) => payloads.get(key) ?? null,
+        upsertIdempotencyKey: (input) => {
+          keys.add(input.key);
+          payloads.set(input.key, input.payloadJson ?? "");
+        },
+      }
+    );
+
+    expect(result.postedComment).toBe(false);
+    expect(result.skippedComment).toBe(true);
+    expect(result.markerFound).toBe(true);
+    expect(patchedBodies.length).toBe(0);
     expect(postedBodies.length).toBe(0);
     expect(keys.has(plan.idempotencyKey)).toBe(true);
   });
