@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { GitHubApiError, GitHubClient } from "../github/client";
+import { __resetGitHubClientForTests, GitHubApiError, GitHubClient } from "../github/client";
 
 async function withPatchedNow<T>(nowMs: number, fn: () => Promise<T> | T): Promise<T> {
   const original = Date.now;
@@ -17,6 +17,7 @@ describe("GitHubClient rate limit handling", () => {
 
   beforeEach(() => {
     priorFetch = globalThis.fetch;
+    __resetGitHubClientForTests();
   });
 
   afterEach(() => {
@@ -126,6 +127,55 @@ describe("GitHubClient rate limit handling", () => {
         const err = e as GitHubApiError;
         expect(err.code).toBe("rate_limit");
       }
+    });
+  });
+
+  test("backs off until timestamp embedded in secondary rate limit message", async () => {
+    await withPatchedNow(Date.parse("2026-01-31T19:34:17.000Z"), async () => {
+      let call = 0;
+      const sleepCalls: number[] = [];
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (globalThis as any).fetch = async () => {
+        call += 1;
+        if (call === 1) {
+          const headers = new Headers({
+            "x-github-request-id": "req-ts",
+          });
+          return new Response(
+            JSON.stringify({
+              message:
+                "API rate limit exceeded for installation ID 104421788. If you reach out to GitHub Support for help, please include the request ID 80D8:1DA0:6C7BD7:1D56133:697E5939 and timestamp 2026-01-31 19:49:07 UTC.",
+            }),
+            { status: 403, headers }
+          );
+        }
+
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: new Headers({ "Content-Type": "application/json" }),
+        });
+      };
+
+      const client = new GitHubClient("3mdistal/ralph", {
+        getToken: async () => "token",
+        sleepMs: async (ms) => {
+          sleepCalls.push(ms);
+        },
+      });
+
+      try {
+        await client.request("/rate_limit_test", { method: "GET" });
+        throw new Error("expected request to fail");
+      } catch (e) {
+        expect(e).toBeInstanceOf(GitHubApiError);
+        const err = e as GitHubApiError;
+        expect(err.code).toBe("rate_limit");
+        expect(err.resumeAtTs).toBe(Date.parse("2026-01-31T19:49:07.000Z"));
+      }
+
+      await client.request("/after_backoff", { method: "GET" });
+      expect(sleepCalls).toEqual([890_000]);
     });
   });
 
