@@ -29,6 +29,7 @@ Keep this doc focused on product intent; update routing/escalation policy in one
 - `docs/product/deterministic-gates.md`
 - `docs/product/usage-throttling.md`
 - `docs/product/worktree-management.md`
+- `docs/product/parent-verification-lane.md`
 
 ## The Problem We're Solving
 
