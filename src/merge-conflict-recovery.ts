@@ -113,3 +113,77 @@ export function buildMergeConflictCommentLines(params: {
   lines.push("", `Action: ${params.action}`, `Attempts: ${params.attemptCount}/${params.maxAttempts}`);
   return lines;
 }
+
+export function buildMergeConflictEscalationDetails(params: {
+  prUrl: string;
+  baseRefName: string | null;
+  headRefName: string | null;
+  attempts: MergeConflictAttempt[];
+  reason: string;
+  botBranch?: string | null;
+}): string {
+  const baseName = params.baseRefName || params.botBranch || "(unknown)";
+  const headName = params.headRefName || "(unknown)";
+  const baseForCommand = params.baseRefName || params.botBranch || "<base-branch>";
+  const normalizedHead = params.headRefName ? params.headRefName.trim() : "";
+  const pushLine = normalizedHead
+    ? `git push origin HEAD:${normalizedHead}`
+    : "# Resolve head ref name: gh pr view --json headRefName -q .headRefName";
+
+  const lines: string[] = [];
+  lines.push("Merge-conflict escalation summary", "", `PR: ${params.prUrl}`, `Base: ${baseName}`, `Head: ${headName}`);
+  lines.push("", "Reason:", params.reason);
+
+  const latestWithPaths = [...params.attempts].reverse().find((attempt) => attempt.conflictPaths?.length);
+  const conflictSample = formatMergeConflictPaths(latestWithPaths?.conflictPaths ?? []);
+  const conflictTotal =
+    typeof latestWithPaths?.conflictCount === "number" ? latestWithPaths.conflictCount : conflictSample.total;
+  lines.push("", `Conflicting files: ${conflictTotal}`);
+  if (conflictSample.sample.length > 0) {
+    lines.push("", "Conflicting file sample:");
+    for (const file of conflictSample.sample) {
+      lines.push(`- ${file}`);
+    }
+  }
+
+  if (params.attempts.length > 0) {
+    lines.push("", "Attempts:");
+    for (const attempt of params.attempts) {
+      const when = attempt.completedAt || attempt.startedAt;
+      const conflictCount = typeof attempt.conflictCount === "number" ? `, ${attempt.conflictCount} files` : "";
+      lines.push(
+        `- Attempt ${attempt.attempt} (${attempt.status ?? "unknown"}, ${when})${conflictCount}: ${
+          attempt.signature || "(no signature)"
+        }`
+      );
+      if (attempt.conflictPaths && attempt.conflictPaths.length > 0) {
+        const attemptSample = formatMergeConflictPaths(attempt.conflictPaths, 8);
+        lines.push(...attemptSample.sample.map((file) => `  - ${file}`));
+        if (attemptSample.total > attemptSample.sample.length) {
+          lines.push(`  - (and ${attemptSample.total - attemptSample.sample.length} more)`);
+        }
+      }
+    }
+  }
+
+  lines.push(
+    "",
+    "Commands (run locally):",
+    "```bash",
+    "git fetch origin",
+    `gh pr checkout ${params.prUrl}`,
+    `git merge --no-edit origin/${baseForCommand}`,
+    "git status",
+    "# Resolve conflicts, then:",
+    "git add -A",
+    "git commit -m \"Resolve merge conflicts\"",
+    pushLine,
+    "```",
+    "",
+    "Notes:",
+    "- Do not rebase or force-push this PR branch.",
+    "- After pushing, re-add `ralph:queued` or comment `RALPH RESOLVED:` to resume."
+  );
+
+  return lines.join("\n");
+}
