@@ -1,5 +1,5 @@
 import { existsSync } from "fs";
-import { readFile, rename, writeFile } from "fs/promises";
+import { chmod, copyFile, readFile, rename, stat, writeFile } from "fs/promises";
 import { dirname, join } from "path";
 
 type OpenCodeAuthFile = {
@@ -28,12 +28,17 @@ export type RemoteOpenaiUsage = {
 const USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
 const TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token";
 
+const DEFAULT_REMOTE_USAGE_TIMEOUT_MS = 2_000;
+const DEFAULT_FAILURE_THRESHOLD = 3;
+const DEFAULT_FAILURE_COOLDOWN_MS = 60_000;
+
 // Observed OpenAI web client id used by OpenCode/ChatGPT OAuth refresh flow.
 const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 type CacheEntry = { fetchedAtMs: number; data: RemoteOpenaiUsage };
 const cache = new Map<string, CacheEntry>();
 const inFlight = new Map<string, Promise<RemoteOpenaiUsage>>();
+const failureState = new Map<string, { count: number; lastFailureAtMs: number }>();
 
 function toFiniteNumber(value: unknown): number | null {
   if (typeof value !== "number") return null;
@@ -91,8 +96,16 @@ async function readAuthFile(path: string): Promise<OpenCodeAuthFile> {
 async function writeAuthFileAtomic(path: string, auth: OpenCodeAuthFile): Promise<void> {
   const dir = dirname(path);
   const tmp = join(dir, `.auth.json.tmp.${process.pid}.${Math.random().toString(16).slice(2)}`);
+  const backup = join(dir, "auth.json.bak");
   const content = JSON.stringify(auth, null, 2) + "\n";
-  await writeFile(tmp, content, "utf8");
+  const priorStat = await stat(path).catch(() => null);
+  const mode = priorStat ? priorStat.mode & 0o777 : 0o600;
+  if (priorStat) {
+    await copyFile(path, backup);
+    await chmod(backup, mode).catch(() => undefined);
+  }
+  await writeFile(tmp, content, { encoding: "utf8", mode });
+  await chmod(tmp, mode).catch(() => undefined);
   await rename(tmp, path);
 }
 
@@ -102,14 +115,28 @@ function isTokenExpired(expiresAtMs: number, nowMs: number): boolean {
   return nowMs >= expiresAtMs - bufferMs;
 }
 
-async function refreshToken(refreshTokenValue: string): Promise<{
+async function refreshToken(
+  refreshTokenValue: string,
+  timeoutMs: number
+): Promise<{
   access_token: string;
   refresh_token?: string;
   expires_in: number;
   token_type?: string;
 }> {
+  const fetchWithTimeout = async (input: RequestInfo | URL, init: RequestInit): Promise<Response> => {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return fetch(input, init);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(input, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
   const attemptJson = async (): Promise<Response> => {
-    return fetch(TOKEN_ENDPOINT, {
+    return fetchWithTimeout(TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -127,7 +154,7 @@ async function refreshToken(refreshTokenValue: string): Promise<{
       client_id: OPENAI_CLIENT_ID,
     });
 
-    return fetch(TOKEN_ENDPOINT, {
+    return fetchWithTimeout(TOKEN_ENDPOINT, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
@@ -142,8 +169,7 @@ async function refreshToken(refreshTokenValue: string): Promise<{
   }
 
   if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Token refresh failed: ${response.status} ${text}`.trim());
+    throw new Error(`Token refresh failed: ${response.status}`.trim());
   }
 
   return response.json();
@@ -219,8 +245,19 @@ function parseUsageResponse(raw: unknown): {
   };
 }
 
-async function fetchUsage(accessToken: string): Promise<RemoteOpenaiUsage> {
-  const response = await fetch(USAGE_ENDPOINT, {
+async function fetchUsage(accessToken: string, timeoutMs: number): Promise<RemoteOpenaiUsage> {
+  const fetchWithTimeout = async (input: RequestInfo | URL, init: RequestInit): Promise<Response> => {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return fetch(input, init);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(input, { ...init, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const response = await fetchWithTimeout(USAGE_ENDPOINT, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
@@ -228,8 +265,7 @@ async function fetchUsage(accessToken: string): Promise<RemoteOpenaiUsage> {
   });
 
   if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`Usage API failed: ${response.status} ${text}`.trim());
+    throw new Error(`Usage API failed: ${response.status}`.trim());
   }
 
   const raw = await response.json();
@@ -270,10 +306,25 @@ export async function getRemoteOpenaiUsage(opts: {
   skipCache?: boolean;
   cacheTtlMs?: number;
   autoRefresh?: boolean;
+  timeoutMs?: number;
+  failureThreshold?: number;
+  failureCooldownMs?: number;
 }): Promise<RemoteOpenaiUsage> {
   const nowMs = typeof opts.now === "number" && Number.isFinite(opts.now) ? Math.floor(opts.now) : Date.now();
   const skipCache = opts.skipCache === true;
   const autoRefresh = opts.autoRefresh !== false;
+  const timeoutMs =
+    typeof opts.timeoutMs === "number" && Number.isFinite(opts.timeoutMs)
+      ? Math.max(0, Math.floor(opts.timeoutMs))
+      : DEFAULT_REMOTE_USAGE_TIMEOUT_MS;
+  const failureThreshold =
+    typeof opts.failureThreshold === "number" && Number.isFinite(opts.failureThreshold)
+      ? Math.max(1, Math.floor(opts.failureThreshold))
+      : DEFAULT_FAILURE_THRESHOLD;
+  const failureCooldownMs =
+    typeof opts.failureCooldownMs === "number" && Number.isFinite(opts.failureCooldownMs)
+      ? Math.max(0, Math.floor(opts.failureCooldownMs))
+      : DEFAULT_FAILURE_COOLDOWN_MS;
 
   const ttlMs =
     typeof opts.cacheTtlMs === "number" && Number.isFinite(opts.cacheTtlMs) ? Math.max(0, Math.floor(opts.cacheTtlMs)) : 120_000;
@@ -285,6 +336,15 @@ export async function getRemoteOpenaiUsage(opts: {
 
   const existing = inFlight.get(opts.authFilePath);
   if (existing) return existing;
+
+  const recentFailure = failureState.get(opts.authFilePath);
+  if (
+    recentFailure &&
+    recentFailure.count >= failureThreshold &&
+    nowMs - recentFailure.lastFailureAtMs < failureCooldownMs
+  ) {
+    throw new Error("Remote usage temporarily disabled after recent failures");
+  }
 
   const promise = (async (): Promise<RemoteOpenaiUsage> => {
     if (!existsSync(opts.authFilePath)) {
@@ -306,7 +366,7 @@ export async function getRemoteOpenaiUsage(opts: {
       const refresh = typeof openai?.refresh === "string" ? openai.refresh.trim() : "";
       if (!refresh) throw new Error("OpenAI access token expired and no refresh token available");
 
-      const tokens = await refreshToken(refresh);
+      const tokens = await refreshToken(refresh, timeoutMs);
       accessToken = tokens.access_token;
 
       auth.openai = {
@@ -316,10 +376,14 @@ export async function getRemoteOpenaiUsage(opts: {
         expires: nowMs + tokens.expires_in * 1000,
       };
 
-      await writeAuthFileAtomic(opts.authFilePath, auth);
+      try {
+        await writeAuthFileAtomic(opts.authFilePath, auth);
+      } catch {
+        // Best-effort writeback only; continue with in-memory token.
+      }
     }
 
-    const data = await fetchUsage(accessToken);
+    const data = await fetchUsage(accessToken, timeoutMs);
     if (!skipCache && ttlMs > 0) {
       cache.set(opts.authFilePath, { fetchedAtMs: nowMs, data });
     }
@@ -328,7 +392,14 @@ export async function getRemoteOpenaiUsage(opts: {
 
   inFlight.set(opts.authFilePath, promise);
   try {
-    return await promise;
+    const data = await promise;
+    failureState.delete(opts.authFilePath);
+    return data;
+  } catch (error) {
+    const existingFailure = failureState.get(opts.authFilePath);
+    const nextCount = existingFailure ? existingFailure.count + 1 : 1;
+    failureState.set(opts.authFilePath, { count: nextCount, lastFailureAtMs: nowMs });
+    throw error;
   } finally {
     inFlight.delete(opts.authFilePath);
   }
@@ -337,4 +408,5 @@ export async function getRemoteOpenaiUsage(opts: {
 export function __clearRemoteOpenaiUsageCacheForTests(): void {
   cache.clear();
   inFlight.clear();
+  failureState.clear();
 }

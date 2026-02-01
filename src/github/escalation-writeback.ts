@@ -1,4 +1,11 @@
-import { deleteIdempotencyKey, hasIdempotencyKey, initStateDb, recordIdempotencyKey } from "../state";
+import {
+  deleteIdempotencyKey,
+  getIdempotencyPayload,
+  hasIdempotencyKey,
+  initStateDb,
+  recordIdempotencyKey,
+  upsertIdempotencyKey,
+} from "../state";
 import {
   RALPH_LABEL_ESCALATED,
   RALPH_LABEL_IN_PROGRESS,
@@ -7,7 +14,7 @@ import {
   RALPH_ESCALATION_MARKER_REGEX,
   RALPH_RESOLVED_TEXT,
 } from "./escalation-constants";
-import { GitHubClient, splitRepoFullName } from "./client";
+import { GitHubApiError, GitHubClient, splitRepoFullName } from "./client";
 import { ensureRalphWorkflowLabelsOnce } from "./ensure-ralph-workflow-labels";
 import { executeIssueLabelOps, type LabelOp } from "./issue-label-io";
 
@@ -38,7 +45,12 @@ export type EscalationWritebackResult = {
   commentUrl?: string | null;
 };
 
-type IssueComment = { body?: string | null };
+type IssueComment = {
+  body?: string | null;
+  databaseId?: number | null;
+  createdAt?: string | null;
+  url?: string | null;
+};
 
 type WritebackDeps = {
   github: GitHubClient;
@@ -47,6 +59,8 @@ type WritebackDeps = {
   hasIdempotencyKey?: (key: string) => boolean;
   recordIdempotencyKey?: (input: { key: string; scope?: string; payloadJson?: string }) => boolean;
   deleteIdempotencyKey?: (key: string) => void;
+  getIdempotencyPayload?: (key: string) => string | null;
+  upsertIdempotencyKey?: (input: { key: string; scope?: string; payloadJson?: string; createdAt?: string }) => void;
 };
 
 const DEFAULT_COMMENT_SCAN_LIMIT = 100;
@@ -68,6 +82,55 @@ function hashFNV1a(input: string): string {
     hash = Math.imul(hash, FNV_PRIME) >>> 0;
   }
   return hash.toString(16).padStart(8, "0");
+}
+
+function normalizeEscalationBody(body: string): string {
+  const trimmed = String(body ?? "").trimEnd();
+  return `${trimmed}\n`;
+}
+
+function isMissingCommentError(error: unknown): boolean {
+  return error instanceof GitHubApiError && (error.status === 404 || error.status === 410);
+}
+
+function parseBodyHash(payload: string | null): string | null {
+  if (!payload) return null;
+  try {
+    const parsed = JSON.parse(payload) as { bodyHash?: unknown };
+    return typeof parsed?.bodyHash === "string" ? parsed.bodyHash : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseIsoMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function pickNewestComment(comments: IssueComment[]): IssueComment | null {
+  return comments.reduce<IssueComment | null>((latest, current) => {
+    if (!latest) return current;
+    const latestTime = parseIsoMs(latest.createdAt);
+    const currentTime = parseIsoMs(current.createdAt);
+    if (currentTime !== null && (latestTime === null || currentTime > latestTime)) {
+      return current;
+    }
+    if (currentTime === null && latestTime === null) {
+      const latestId = latest.databaseId ?? -1;
+      const currentId = current.databaseId ?? -1;
+      if (currentId > latestId) return current;
+      if (currentId === -1 && latestId === -1) return current;
+    }
+    return latest;
+  }, null);
+}
+
+function commentMatchesMarker(params: { body: string; markerId: string; marker: string }): boolean {
+  const found = extractExistingMarker(params.body);
+  if (found) return found.toLowerCase() === params.markerId;
+  return params.body.includes(params.marker);
 }
 
 export function sanitizeEscalationReason(input: string): string {
@@ -148,6 +211,53 @@ export function buildEscalationComment(params: {
   ].join("\n");
 }
 
+export type EscalationCommentPlan = {
+  action: "noop" | "patch" | "post";
+  body: string;
+  markerFound: boolean;
+  targetCommentId?: number;
+  targetCommentUrl?: string | null;
+};
+
+export function planEscalationCommentWrite(params: {
+  desiredBody: string;
+  markerId: string;
+  marker: string;
+  scannedComments: IssueComment[];
+}): EscalationCommentPlan {
+  const normalizedBody = normalizeEscalationBody(params.desiredBody);
+  const markerId = params.markerId.toLowerCase();
+  const matches = params.scannedComments.filter((comment) =>
+    commentMatchesMarker({ body: comment.body ?? "", markerId, marker: params.marker })
+  );
+
+  if (matches.length > 0) {
+    const target = pickNewestComment(matches);
+    const targetBody = normalizeEscalationBody(target?.body ?? "");
+    if (targetBody === normalizedBody) {
+      return {
+        action: "noop",
+        body: normalizedBody,
+        markerFound: true,
+        targetCommentId: target?.databaseId ?? undefined,
+        targetCommentUrl: target?.url ?? null,
+      };
+    }
+    if (target?.databaseId) {
+      return {
+        action: "patch",
+        body: normalizedBody,
+        markerFound: true,
+        targetCommentId: target.databaseId,
+        targetCommentUrl: target.url ?? null,
+      };
+    }
+    return { action: "post", body: normalizedBody, markerFound: true };
+  }
+
+  return { action: "post", body: normalizedBody, markerFound: false };
+}
+
 export function planEscalationWriteback(ctx: EscalationWritebackContext): EscalationWritebackPlan {
   const repoOwner = ctx.repo.split("/")[0] ?? "";
   const ownerHandle = ctx.ownerHandle?.trim() || (repoOwner ? `@${repoOwner}` : "");
@@ -197,6 +307,9 @@ async function listRecentIssueComments(params: {
       comments(last: $last) {
         nodes {
           body
+          databaseId
+          createdAt
+          url
         }
         pageInfo {
           hasPreviousPage
@@ -209,7 +322,17 @@ async function listRecentIssueComments(params: {
   const response = await params.github.request<{
     data?: {
       repository?: {
-        issue?: { comments?: { nodes?: Array<{ body?: string | null }>; pageInfo?: { hasPreviousPage?: boolean } } };
+        issue?: {
+          comments?: {
+            nodes?: Array<{
+              body?: string | null;
+              databaseId?: number | null;
+              createdAt?: string | null;
+              url?: string | null;
+            }>;
+            pageInfo?: { hasPreviousPage?: boolean };
+          };
+        };
       };
     };
   }>("/graphql", {
@@ -221,7 +344,12 @@ async function listRecentIssueComments(params: {
   });
 
   const nodes = response.data?.data?.repository?.issue?.comments?.nodes ?? [];
-  const comments = nodes.map((node) => ({ body: node?.body ?? "" }));
+  const comments = nodes.map((node) => ({
+    body: node?.body ?? "",
+    databaseId: typeof node?.databaseId === "number" ? node.databaseId : null,
+    createdAt: node?.createdAt ?? null,
+    url: node?.url ?? null,
+  }));
   const reachedMax = Boolean(response.data?.data?.repository?.issue?.comments?.pageInfo?.hasPreviousPage);
 
   return { comments, reachedMax };
@@ -244,6 +372,23 @@ async function createIssueComment(params: {
   return response.data ?? {};
 }
 
+async function updateIssueComment(params: {
+  github: GitHubClient;
+  repo: string;
+  commentId: number;
+  body: string;
+}): Promise<{ html_url?: string | null }> {
+  const { owner, name } = splitRepoFullName(params.repo);
+  const response = await params.github.request<{ html_url?: string | null }>(
+    `/repos/${owner}/${name}/issues/comments/${params.commentId}`,
+    {
+      method: "PATCH",
+      body: { body: params.body },
+    }
+  );
+  return response.data ?? {};
+}
+
 function buildEscalationLabelOps(plan: EscalationWritebackPlan): LabelOp[] {
   return [
     ...plan.removeLabels.map((label) => ({ action: "remove" as const, label })),
@@ -255,10 +400,14 @@ export async function writeEscalationToGitHub(
   ctx: EscalationWritebackContext,
   deps: WritebackDeps
 ): Promise<EscalationWritebackResult> {
-  const overrideCount = [deps.hasIdempotencyKey, deps.recordIdempotencyKey, deps.deleteIdempotencyKey].filter(
-    Boolean
-  ).length;
-  if (overrideCount > 0 && overrideCount < 3) {
+  const overrideCount = [
+    deps.hasIdempotencyKey,
+    deps.recordIdempotencyKey,
+    deps.deleteIdempotencyKey,
+    deps.getIdempotencyPayload,
+    deps.upsertIdempotencyKey,
+  ].filter(Boolean).length;
+  if (overrideCount > 0 && overrideCount < 5) {
     throw new Error("writeEscalationToGitHub requires all idempotency overrides when any are provided");
   }
   if (overrideCount === 0) {
@@ -270,6 +419,8 @@ export async function writeEscalationToGitHub(
   const hasKey = deps.hasIdempotencyKey ?? hasIdempotencyKey;
   const recordKey = deps.recordIdempotencyKey ?? recordIdempotencyKey;
   const deleteKey = deps.deleteIdempotencyKey ?? deleteIdempotencyKey;
+  const getPayload = deps.getIdempotencyPayload ?? getIdempotencyPayload;
+  const upsertKey = deps.upsertIdempotencyKey ?? upsertIdempotencyKey;
   const prefix = `[ralph:gh-escalation:${ctx.repo}]`;
 
   const labelOps = buildEscalationLabelOps(plan);
@@ -314,22 +465,66 @@ export async function writeEscalationToGitHub(
     log(`${prefix} Comment scan hit cap (${commentLimit}); marker detection may be incomplete.`);
   }
 
-  const markerId = plan.markerId.toLowerCase();
-  const markerFound =
-    listResult?.comments.some((comment) => {
-      const body = comment.body ?? "";
-      const found = extractExistingMarker(body);
-      return found ? found.toLowerCase() === markerId : body.includes(plan.marker);
-    }) ?? false;
+  const scanComplete = Boolean(listResult && !listResult.reachedMax);
+  let commentPlan = planEscalationCommentWrite({
+    desiredBody: plan.commentBody,
+    markerId: plan.markerId,
+    marker: plan.marker,
+    scannedComments: listResult?.comments ?? [],
+  });
+  const desiredBodyHash = hashFNV1a(commentPlan.body);
 
-  if (hasKeyResult && markerFound) {
-    log(`${prefix} Escalation comment already recorded (idempotency + marker); skipping.`);
-    return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: null };
+  if (commentPlan.action === "noop") {
+    try {
+      upsertKey({
+        key: plan.idempotencyKey,
+        scope: "gh-escalation",
+        payloadJson: JSON.stringify({ bodyHash: desiredBodyHash }),
+      });
+    } catch (error: any) {
+      log(`${prefix} Failed to update idempotency after noop: ${error?.message ?? String(error)}`);
+    }
+    log(`${prefix} Escalation comment already up to date for #${ctx.issueNumber}; skipping.`);
+    return {
+      postedComment: false,
+      skippedComment: true,
+      markerFound: true,
+      commentUrl: commentPlan.targetCommentUrl ?? null,
+    };
   }
 
-  const scanComplete = Boolean(listResult && !listResult.reachedMax);
+  if (commentPlan.action === "patch") {
+    let commentUrl: string | null = commentPlan.targetCommentUrl ?? null;
+    try {
+      const comment = await updateIssueComment({
+        github: deps.github,
+        repo: ctx.repo,
+        commentId: commentPlan.targetCommentId ?? 0,
+        body: commentPlan.body,
+      });
+      commentUrl = comment?.html_url ?? commentUrl;
+      try {
+        upsertKey({
+          key: plan.idempotencyKey,
+          scope: "gh-escalation",
+          payloadJson: JSON.stringify({ bodyHash: desiredBodyHash }),
+        });
+      } catch (error: any) {
+        log(`${prefix} Failed to update idempotency after patch: ${error?.message ?? String(error)}`);
+      }
+      log(`${prefix} Updated escalation comment for #${ctx.issueNumber}.`);
+      return { postedComment: false, skippedComment: false, markerFound: true, commentUrl };
+    } catch (error) {
+      if (!isMissingCommentError(error)) {
+        throw error;
+      }
+      log(`${prefix} Escalation comment missing; posting a fresh comment.`);
+      commentPlan = { ...commentPlan, action: "post" };
+      ignoreExistingKey = true;
+    }
+  }
 
-  if (hasKeyResult && scanComplete && !markerFound) {
+  if (hasKeyResult && scanComplete && !commentPlan.markerFound) {
     ignoreExistingKey = true;
     try {
       deleteKey(plan.idempotencyKey);
@@ -338,25 +533,28 @@ export async function writeEscalationToGitHub(
     }
   }
 
-  if (hasKeyResult && !scanComplete && !markerFound) {
-    ignoreExistingKey = true;
-    log(`${prefix} Idempotency key exists but marker scan incomplete; proceeding cautiously.`);
-  }
-
-  if (markerFound) {
+  if (hasKeyResult && !scanComplete && !commentPlan.markerFound) {
+    let priorHash: string | null = null;
     try {
-      recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
+      priorHash = parseBodyHash(getPayload(plan.idempotencyKey));
     } catch (error: any) {
-      log(`${prefix} Failed to record idempotency after marker match: ${error?.message ?? String(error)}`);
+      log(`${prefix} Failed to read idempotency payload: ${error?.message ?? String(error)}`);
     }
-    log(`${prefix} Existing escalation marker found for #${ctx.issueNumber}; skipping comment.`);
-    return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: null };
+    if (priorHash && priorHash === desiredBodyHash) {
+      log(`${prefix} Escalation comment already recorded (idempotency payload match); skipping.`);
+      return { postedComment: false, skippedComment: true, markerFound: false, commentUrl: null };
+    }
+    ignoreExistingKey = true;
+    log(`${prefix} Idempotency key exists but marker scan incomplete; proceeding to post updated escalation.`);
   }
-
 
   let claimed = false;
   try {
-    claimed = recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
+    claimed = recordKey({
+      key: plan.idempotencyKey,
+      scope: "gh-escalation",
+      payloadJson: JSON.stringify({ bodyHash: desiredBodyHash }),
+    });
   } catch (error: any) {
     log(`${prefix} Failed to record idempotency before posting comment: ${error?.message ?? String(error)}`);
   }
@@ -374,14 +572,13 @@ export async function writeEscalationToGitHub(
     }
   }
 
-
   let commentUrl: string | null = null;
   try {
     const comment = await createIssueComment({
       github: deps.github,
       repo: ctx.repo,
       issueNumber: ctx.issueNumber,
-      body: plan.commentBody,
+      body: commentPlan.body,
     });
     commentUrl = comment?.html_url ?? null;
   } catch (error) {
@@ -395,15 +592,22 @@ export async function writeEscalationToGitHub(
     throw error;
   }
 
-  if (!claimed) {
-    try {
-      recordKey({ key: plan.idempotencyKey, scope: "gh-escalation" });
-    } catch (error: any) {
-      log(`${prefix} Failed to record idempotency after posting comment: ${error?.message ?? String(error)}`);
-    }
+  try {
+    upsertKey({
+      key: plan.idempotencyKey,
+      scope: "gh-escalation",
+      payloadJson: JSON.stringify({ bodyHash: desiredBodyHash }),
+    });
+  } catch (error: any) {
+    log(`${prefix} Failed to update idempotency after posting comment: ${error?.message ?? String(error)}`);
   }
 
   log(`${prefix} Posted escalation comment for #${ctx.issueNumber}.`);
 
-  return { postedComment: true, skippedComment: false, markerFound: false, commentUrl };
+  return {
+    postedComment: true,
+    skippedComment: false,
+    markerFound: commentPlan.markerFound,
+    commentUrl,
+  };
 }

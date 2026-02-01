@@ -56,7 +56,8 @@ import {
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
 import { buildWorkerFailureAlert, type WorkerFailureKind } from "./alerts/worker-failure-core";
-import { drainQueuedNudges } from "./nudge";
+import { buildNudgePreview, drainQueuedNudges, type NudgeDeliveryOutcome } from "./nudge";
+import { redactSensitiveText } from "./redaction";
 import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
@@ -434,7 +435,7 @@ function summarizeBlockedDetails(text: string): string {
   return trimmed.slice(0, BLOCKED_DETAILS_MAX_LEN).trimEnd() + "…";
 }
 
-function buildBlockedSignature(source?: BlockedSource, reason?: string): string {
+function buildBlockedSignature(source?: string, reason?: string): string {
   return `${source ?? ""}::${reason ?? ""}`;
 }
 
@@ -450,10 +451,21 @@ function computeBlockedPatch(
   const reasonSummary = opts.reason ? summarizeBlockedReason(opts.reason) : "";
   const detailsSource = opts.details ?? opts.reason ?? "";
   const detailsSummary = detailsSource ? summarizeBlockedDetails(detailsSource) : "";
-  const previousSignature = buildBlockedSignature(task["blocked-source"], task["blocked-reason"]);
+
+  // NOTE: GitHub-backed tasks do not currently persist blocked-* metadata in durable op-state.
+  // That means we can repeatedly rebuild AgentTask objects that have status=blocked but empty
+  // blocked-source/reason fields. Treating that as a "signature change" causes noisy re-entry
+  // notifications (blocked-deps spam) even though nothing changed.
+  const priorBlockedSource = typeof task["blocked-source"] === "string" ? task["blocked-source"].trim() : "";
+  const priorBlockedReason = typeof task["blocked-reason"] === "string" ? task["blocked-reason"].trim() : "";
+  const hasPriorBlockedSignature = Boolean(priorBlockedSource || priorBlockedReason);
+
+  const previousSignature = buildBlockedSignature(priorBlockedSource, priorBlockedReason);
   const nextSignature = buildBlockedSignature(opts.source, reasonSummary);
   const didChangeSignature = previousSignature !== nextSignature;
-  const didEnterBlocked = task.status !== "blocked" || didChangeSignature;
+
+  const didEnterBlocked =
+    task.status !== "blocked" ? true : (hasPriorBlockedSignature ? didChangeSignature : false);
 
   const patch: Record<string, string> = {
     "blocked-source": opts.source,
@@ -6986,26 +6998,95 @@ ${guidance}`
     try {
       const issueNumber = task.issue.match(/#(\d+)$/)?.[1] ?? cacheKey;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
+      const maxAttempts = 3;
+      const pausedAtCheckpoint = parseCheckpointValue(task[PAUSED_AT_CHECKPOINT_FIELD]);
+      let deferredReason: string | null = pausedAtCheckpoint ? "paused_at_checkpoint" : null;
 
-      const result = await drainQueuedNudges(sid, async (message) => {
+      if (!deferredReason) {
         const paused = await this.pauseIfHardThrottled(task, `nudge-${stage}`, sid);
-        if (paused) {
-          return { success: false, error: "hard throttled" };
+        if (paused) deferredReason = "hard_throttled";
+      }
+
+      const result = await drainQueuedNudges(
+        sid,
+        async (message): Promise<NudgeDeliveryOutcome> => {
+          if (deferredReason) return { kind: "deferred", reason: deferredReason };
+          const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`, "in-progress");
+
+          const res = await this.session.continueSession(repoPath, sid, message, {
+            repo: this.repo,
+            cacheKey,
+            runLogPath,
+            ...this.buildWatchdogOptions(task, `nudge-${stage}`),
+            ...this.buildStallOptions(task, `nudge-${stage}`),
+            ...opencodeSessionOptions,
+          });
+          await this.recordImplementationCheckpoint(task, res.sessionId || sid);
+          return res.success ? { kind: "delivered" } : { kind: "failed", error: res.output };
+        },
+        {
+          maxAttempts,
+          onDetect: (state) => {
+            if (state.pending.length === 0 && !state.blocked) return;
+            this.publishDashboardEvent(
+              {
+                type: "message.detected",
+                level: "info",
+                data: { count: state.pending.length, ...(state.blocked ? { blocked: true } : {}) },
+              },
+              { sessionId: sid }
+            );
+          },
+          onOutcome: (nudge, outcome) => {
+            if (outcome.kind === "deferred") {
+              this.publishDashboardEvent(
+                {
+                  type: "message.delivery.deferred",
+                  level: deferredReason === "hard_throttled" ? "warn" : "info",
+                  data: { id: nudge.id, reason: outcome.reason },
+                },
+                { sessionId: sid }
+              );
+              return;
+            }
+
+            const preview = buildNudgePreview(nudge.message);
+            const error =
+              outcome.kind === "failed"
+                ? redactSensitiveText(String(outcome.error ?? "").trim()).slice(0, 400)
+                : undefined;
+            this.publishDashboardEvent(
+              {
+                type: "message.delivery.attempted",
+                level: outcome.kind === "failed" ? "warn" : "info",
+                data: {
+                  id: nudge.id,
+                  len: preview.len,
+                  preview: preview.preview,
+                  success: outcome.kind === "delivered",
+                  ...(error ? { error } : {}),
+                },
+              },
+              { sessionId: sid }
+            );
+          },
         }
+      );
 
-        const runLogPath = await this.recordRunLogPath(task, issueNumber, `nudge-${stage}`, "in-progress");
-
-        const res = await this.session.continueSession(repoPath, sid, message, {
-          repo: this.repo,
-          cacheKey,
-          runLogPath,
-          ...this.buildWatchdogOptions(task, `nudge-${stage}`),
-          ...this.buildStallOptions(task, `nudge-${stage}`),
-          ...opencodeSessionOptions,
-        });
-        await this.recordImplementationCheckpoint(task, res.sessionId || sid);
-        return { success: res.success, error: res.success ? undefined : res.output };
-      });
+      if (result.blocked && result.blockedNudge) {
+        this.publishDashboardEvent(
+          {
+            type: "message.delivery.blocked",
+            level: "warn",
+            data: {
+              id: result.blockedNudge.id,
+              failedAttempts: result.blockedNudge.failedAttempts,
+              maxAttempts,
+            },
+          },
+          { sessionId: sid }
+        );
+      }
 
       if (result.attempted > 0) {
         const suffix = result.stoppedOnError ? " (stopped on error)" : "";

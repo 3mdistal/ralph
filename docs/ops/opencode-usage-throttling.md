@@ -19,10 +19,10 @@ Ensure Ralph never consumes more than a configurable fraction of the operator's 
 
 ## Usage Source Precedence (OpenAI)
 
-Ralph prefers remote usage meters for OpenAI when available and falls back to local OpenCode logs when remote usage is unavailable or fails.
+Ralph can use remote usage meters for OpenAI when enabled and falls back to local OpenCode logs when remote usage is unavailable or fails.
 
-- Default/preferred: `openaiSource=remoteUsage`.
-- Fallback: `localLogs` (OpenCode message-log scan).
+- Default: `openaiSource=remoteUsage`.
+- If `openaiSource=remoteUsage`, attempt remote usage meters and fall back to `localLogs` on failure.
 - If `openaiSource=localLogs`, never attempt remote usage.
 
 ## Data Source (Meters + Fallback)
@@ -31,6 +31,7 @@ Ralph prefers remote usage meters for OpenAI when available and falls back to lo
 
 - Uses OpenAI remote usage meters (best-effort) when `openaiSource=remoteUsage`.
 - Remote usage provides per-window `usedPct` and `resetAt` values for rolling 5h + weekly.
+- OAuth tokens are read from `XDG_DATA_HOME/opencode/auth.json`; refreshed tokens are written back atomically with `auth.json.bak` as a backup and never logged.
 
 ### Local logs (fallback)
 
@@ -120,7 +121,7 @@ Add a throttle config section to Ralph:
 
 - `throttle.enabled`
 - `throttle.providerID` (default `openai`)
-- `throttle.openaiSource` (`localLogs` | `remoteUsage`, default `remoteUsage`; OpenAI-only)
+- `throttle.openaiSource` (`localLogs` | `remoteUsage`, default `localLogs`; OpenAI-only)
 - `throttle.windows.rolling5h.budgetTokens` (default 16,987,015)
 - `throttle.windows.weekly.budgetTokens` (default 55,769,305)
 - `throttle.softPct` (default 0.65)

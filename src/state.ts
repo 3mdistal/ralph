@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -270,6 +270,11 @@ function ensureSchema(database: Database): void {
       }
       if (existingVersion < 8) {
         database.exec("ALTER TABLE tasks ADD COLUMN session_events_path TEXT");
+      }
+      if (existingVersion < 14) {
+        database.exec(
+          "CREATE TABLE IF NOT EXISTS repo_github_issue_sync_bootstrap_cursor (repo_id INTEGER PRIMARY KEY, next_url TEXT NOT NULL, high_watermark_updated_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
+        );
       }
       if (existingVersion < 9) {
         database.exec(
@@ -629,6 +634,14 @@ function ensureSchema(database: Database): void {
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS repo_github_issue_sync_bootstrap_cursor (
+      repo_id INTEGER PRIMARY KEY,
+      next_url TEXT NOT NULL,
+      high_watermark_updated_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (
       repo_id INTEGER PRIMARY KEY,
       last_merged_at TEXT NOT NULL,
@@ -980,6 +993,72 @@ export function getRepoGithubIssueLastSyncAt(repo: string): string | null {
     .get({ $name: repo }) as { last_sync_at?: string } | undefined;
 
   return typeof row?.last_sync_at === "string" ? row.last_sync_at : null;
+}
+
+export type RepoGithubIssueBootstrapCursor = {
+  nextUrl: string;
+  highWatermarkUpdatedAt: string;
+  updatedAt: string;
+};
+
+export function getRepoGithubIssueBootstrapCursor(repo: string): RepoGithubIssueBootstrapCursor | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT bc.next_url as next_url, bc.high_watermark_updated_at as high_watermark_updated_at, bc.updated_at as updated_at
+       FROM repo_github_issue_sync_bootstrap_cursor bc
+       JOIN repos r ON r.id = bc.repo_id
+       WHERE r.name = $name`
+    )
+    .get({ $name: repo }) as
+    | { next_url?: string; high_watermark_updated_at?: string; updated_at?: string }
+    | undefined;
+
+  if (!row?.next_url || !row?.high_watermark_updated_at || !row?.updated_at) return null;
+  return {
+    nextUrl: row.next_url,
+    highWatermarkUpdatedAt: row.high_watermark_updated_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function recordRepoGithubIssueBootstrapCursor(params: {
+  repo: string;
+  repoPath?: string;
+  botBranch?: string;
+  nextUrl: string;
+  highWatermarkUpdatedAt: string;
+  updatedAt?: string;
+}): void {
+  const database = requireDb();
+  const at = params.updatedAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, repoPath: params.repoPath, botBranch: params.botBranch, at });
+
+  database
+    .query(
+      `INSERT INTO repo_github_issue_sync_bootstrap_cursor(repo_id, next_url, high_watermark_updated_at, updated_at)
+       VALUES ($repo_id, $next_url, $high_watermark_updated_at, $updated_at)
+       ON CONFLICT(repo_id) DO UPDATE SET
+         next_url = excluded.next_url,
+         high_watermark_updated_at = excluded.high_watermark_updated_at,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $next_url: params.nextUrl,
+      $high_watermark_updated_at: params.highWatermarkUpdatedAt,
+      $updated_at: at,
+    });
+}
+
+export function clearRepoGithubIssueBootstrapCursor(params: { repo: string }): void {
+  const database = requireDb();
+  database
+    .query(
+      `DELETE FROM repo_github_issue_sync_bootstrap_cursor
+       WHERE repo_id = (SELECT id FROM repos WHERE name = $name)`
+    )
+    .run({ $name: params.repo });
 }
 
 export type RepoGithubDoneCursor = { lastMergedAt: string; lastPrNumber: number };
