@@ -190,6 +190,10 @@ Default-branch unknown fallback:
 - Ralph removes `ralph:in-progress` and `ralph:queued`, then adds `ralph:escalated`.
 - Ralph posts a comment containing a stable hidden marker (e.g. `<!-- ralph-escalation:id=... -->`),
   the operator @mention, and resolution instructions.
+- If the issue re-escalates and the marker comment is discoverable, Ralph updates the existing escalation comment
+  with the latest reason/instructions instead of posting a duplicate.
+- If the marker comment is not discoverable within the comment scan window, Ralph posts a fresh canonical escalation
+  comment to ensure the latest required input is visible.
 - Operator @mention defaults to the repo owner handle (e.g. `@owner`); if no owner can be parsed, omit the mention.
 - Resolution signals (either is sufficient):
   - A new operator comment contains `RALPH RESOLVED:` (only honored when authored by the repo owner or an `OWNER`/`MEMBER`/`COLLABORATOR`).
