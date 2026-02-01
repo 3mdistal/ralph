@@ -222,6 +222,16 @@ This document captures decisions and discoveries made during an interactive audi
   - Low confidence alone does not trigger escalation.
 - Dropped vague `escalation.markers-deterministic` claim in favor of explicit `product-gap.*` claims.
 
+### Interview 10 (2026-02-01)
+
+- Orchestration contract decisions:
+  - `ralph:cmd:*` commands may be issued by any collaborator who can apply labels.
+  - `ralph:cmd:queue` may be processed asynchronously; status convergence is best-effort.
+  - `ralph:cmd:stop` stops automation but leaves open PRs open.
+  - `ralph:cmd:satisfy` is dependency-graph only; does not imply merge/close.
+  - `ralph:status:done` is derived from merged PR evidence reconciled to default branch; on done Ralph closes the issue.
+  - Degraded mode: keep progressing using SQLite truth and reconcile labels later.
+
 ### Repo Scan (code reality) (2026-02-01)
 
 - bwrb is still heavily present in implementation (`src/queue.ts`, `src/queue-backend.ts`, `src/bwrb/*`, `src/notify.ts`, `src/escalation-notes.ts`, and multiple tests).

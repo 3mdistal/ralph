@@ -54,12 +54,16 @@ Notes:
 | `ralph:cmd:queue` | Enqueue / re-enqueue | Ralph processes idempotently, comments success/refusal, then removes the command label. |
 | `ralph:cmd:pause` | Pause at safe checkpoints | Ralph transitions status to `paused`, then removes the command label. |
 | `ralph:cmd:stop` | Cancel / stop work | Ralph transitions status to `stopped`, cleans up best-effort, then removes the command label. |
-| `ralph:cmd:satisfy` | Mark satisfied for dependency graph | Ralph records satisfaction (internal + GitHub-visible status if applicable), then removes the command label. |
+| `ralph:cmd:satisfy` | Mark satisfied for dependency graph | Ralph records dependency satisfaction (internal) and removes the command label. This does not imply merge/close. |
 
 Command processing requirements:
 
 - Ralph must be idempotent and avoid comment spam.
 - If a command is refused, Ralph must comment why.
+
+Command issuer policy:
+
+- Any collaborator who can apply labels may issue `ralph:cmd:*` commands.
 
 ## Queue semantics
 
@@ -73,6 +77,8 @@ Command processing requirements:
 
 - Clears any prior stop/pause/escalation state and returns the issue to `ralph:status:queued`.
 - Clears best-effort internal retry/blocked metadata so Ralph can attempt a fresh recovery loop.
+
+Note: status updates are best-effort and may be applied asynchronously.
 
 ## Degraded mode: GitHub label writes unavailable
 
@@ -94,6 +100,19 @@ GitHub label writes are best-effort. When throttled/blocked by GitHub rate limit
 
 - Ralph closes issues when `ralph:status:done` is reached.
 - Rollup PRs may also close issues via `Fixes #N`, but the operator-visible definition is "done == reconciled to default branch".
+
+## Done semantics (deterministic)
+
+`ralph:status:done` is derived from merged PR evidence:
+
+- If Ralph can detect a merged PR that closes the issue and is reconciled onto the repo default branch, it sets `ralph:status:done` and closes the issue.
+
+## Stop semantics
+
+When `ralph:cmd:stop` is applied:
+
+- Ralph stops automation and relinquishes ownership.
+- Any existing open PRs remain open.
 
 ## Legacy mapping (to be removed)
 
