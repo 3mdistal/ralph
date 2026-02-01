@@ -87,6 +87,7 @@ function startRepoPoller(params: {
   const timers = deps.timers;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let activeController: AbortController | null = null;
   let delayMs = resolveBaseIntervalMs(params.baseIntervalMs);
   let lastEscalationReconcileAt = 0;
   const repoName = params.repo.name;
@@ -112,16 +113,30 @@ function startRepoPoller(params: {
 
     const autoQueue = (params.repo as any).autoQueue as { enabled?: boolean; scope?: string } | undefined;
     const storeAllOpen = Boolean(autoQueue?.enabled && autoQueue?.scope === "all-open");
-    const result = await deps.syncOnce({
-      repo: repoName,
-      repoPath: params.repo.path,
-      botBranch: params.repo.botBranch,
-      lastSyncAt,
-      persistCursor: true,
-      storeAllOpen,
-    });
+    const controller = new AbortController();
+    activeController = controller;
+    let result: SyncResult;
+    try {
+      result = await deps.syncOnce({
+        repo: repoName,
+        repoPath: params.repo.path,
+        botBranch: params.repo.botBranch,
+        lastSyncAt,
+        persistCursor: true,
+        storeAllOpen,
+        signal: controller.signal,
+      });
+    } finally {
+      if (activeController === controller) activeController = null;
+    }
 
-    if (result.ok) {
+    if (stopped) return;
+    if (result.status === "aborted") {
+      scheduleNext(delayMs, false);
+      return;
+    }
+
+    if (result.status === "ok") {
       delayMs = nextDelayMs({
         baseMs: params.baseIntervalMs,
         previousMs: delayMs,
@@ -161,7 +176,7 @@ function startRepoPoller(params: {
       return;
     }
 
-    if (result.rateLimitResetMs) {
+    if (result.status === "error" && result.rateLimitResetMs) {
       const nowMs = deps.nowMs();
       const resetDelay = resolveRateLimitDelayMs(result.rateLimitResetMs, nowMs);
       delayMs = Math.max(delayMs, resetDelay);
@@ -185,6 +200,7 @@ function startRepoPoller(params: {
   return {
     stop: () => {
       stopped = true;
+      activeController?.abort();
       if (timer) timers.clearTimeout(timer);
       timer = null;
     },

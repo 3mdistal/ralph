@@ -3,7 +3,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { __testOnlyStartRepoPoller, type SyncResult } from "../github-issues-sync";
+import { __testOnlyStartRepoPoller, syncRepoIssuesOnce, type SyncResult } from "../github-issues-sync";
 import { closeStateDbForTests, initStateDb } from "../state";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
@@ -83,7 +83,7 @@ describe("github issue poller", () => {
     };
 
     const syncOnce = async (): Promise<SyncResult> => ({
-      ok: true,
+      status: "ok",
       fetched: 0,
       stored: 0,
       ralphCount: 0,
@@ -122,5 +122,53 @@ describe("github issue poller", () => {
 
     await run(1);
     expect(records.length).toBe(2);
+  });
+
+  test("stop aborts in-flight sync and prevents reschedule", async () => {
+    const { timers, records, run } = createRecordingTimers();
+    let capturedSignal: { aborted: boolean } | null = null;
+    let resolveSync: ((result: SyncResult) => void) | null = null;
+
+    const syncOnce: typeof syncRepoIssuesOnce = async (params) => {
+      capturedSignal = (params.signal as { aborted: boolean } | null) ?? null;
+      return await new Promise<SyncResult>((resolve) => {
+        resolveSync = resolve;
+      });
+    };
+
+    const repo = { name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" };
+
+    const poller = __testOnlyStartRepoPoller({
+      repo,
+      baseIntervalMs: 10_000,
+      log: () => {},
+      deps: {
+        timers,
+        random: () => 0.1,
+        syncOnce,
+        nowMs: () => 0,
+        getLastSyncAt: () => null,
+      },
+    });
+
+    const runPromise = run(0);
+
+    poller.stop();
+    if (resolveSync) {
+      resolveSync({
+        status: "aborted",
+        fetched: 0,
+        stored: 0,
+        ralphCount: 0,
+        newLastSyncAt: null,
+        hadChanges: false,
+      });
+    }
+
+    await runPromise;
+
+    if (!capturedSignal) throw new Error("missing abort signal");
+    expect(capturedSignal.aborted).toBe(true);
+    expect(records.length).toBe(1);
   });
 });

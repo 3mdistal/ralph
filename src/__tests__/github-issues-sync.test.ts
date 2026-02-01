@@ -4,6 +4,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
 
+import { createAbortError } from "../abort";
 import { closeStateDbForTests, initStateDb } from "../state";
 import { getRalphStateDbPath } from "../paths";
 import { syncRepoIssuesOnce } from "../github-issues-sync";
@@ -15,16 +16,6 @@ let releaseLock: (() => void) | null = null;
 
 const repo = "3mdistal/ralph";
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-
-async function withPatchedNow<T>(nowMs: number, fn: () => Promise<T> | T): Promise<T> {
-  const original = Date.now;
-  Date.now = () => nowMs;
-  try {
-    return await fn();
-  } finally {
-    Date.now = original;
-  }
-}
 
 function buildIssue(params: {
   number: number;
@@ -95,7 +86,7 @@ describe("github issue sync", () => {
       },
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.stored).toBe(1);
     expect(result.ralphCount).toBe(1);
     expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
@@ -173,7 +164,7 @@ describe("github issue sync", () => {
       deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.stored).toBe(1);
 
     const db = new Database(getRalphStateDbPath());
@@ -218,7 +209,7 @@ describe("github issue sync", () => {
       deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.fetched).toBe(3);
     expect(result.stored).toBe(3);
     expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
@@ -234,7 +225,7 @@ describe("github issue sync", () => {
       deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
-    expect(result.ok).toBe(false);
+    expect(result.status).toBe("error");
     expect(result.newLastSyncAt).toBe(null);
 
     const db = new Database(getRalphStateDbPath());
@@ -247,22 +238,129 @@ describe("github issue sync", () => {
   });
 
   test("surfaces Retry-After-based rate limit backoff", async () => {
-    await withPatchedNow(1_000_000, async () => {
-      const fetchMock: FetchLike = async () =>
-        new Response("You have exceeded a secondary rate limit", {
-          status: 403,
-          headers: { "Retry-After": "120" },
-        });
-
-      const result = await syncRepoIssuesOnce({
-        repo,
-        lastSyncAt: "2026-01-11T00:00:00.000Z",
-        deps: { fetch: fetchMock, getToken: async () => "token" },
+    const fetchMock: FetchLike = async () =>
+      new Response("You have exceeded a secondary rate limit", {
+        status: 403,
+        headers: { "Retry-After": "120" },
       });
 
-      expect(result.ok).toBe(false);
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: "2026-01-11T00:00:00.000Z",
+      deps: { fetch: fetchMock, getToken: async () => "token", now: () => new Date(1_000_000) },
+    });
+
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
       expect(result.rateLimitResetMs).toBe(1_000_000 + 120_000);
       expect(result.error ?? "").toContain("HTTP 403");
+    }
+  });
+
+  test("aborts before starting", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const stateCalls: string[] = [];
+
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: "2026-01-11T00:00:00.000Z",
+      signal: controller.signal,
+      deps: {
+        getToken: async () => "token",
+        fetch: async () => {
+          throw new Error("fetch should not be called");
+        },
+        state: {
+          hasIssueSnapshot: () => false,
+          runInStateTransaction: () => {
+            stateCalls.push("transaction");
+          },
+          recordIssueSnapshot: () => stateCalls.push("issue"),
+          recordIssueLabelsSnapshot: () => stateCalls.push("labels"),
+          recordRepoGithubIssueSync: () => stateCalls.push("cursor"),
+        },
+      },
     });
+
+    expect(result.status).toBe("aborted");
+    expect(result.newLastSyncAt).toBe("2026-01-11T00:00:00.000Z");
+    expect(stateCalls).toHaveLength(0);
+  });
+
+  test("aborts while waiting on semaphore", async () => {
+    const controller = new AbortController();
+    const stateCalls: string[] = [];
+
+    const resultPromise = syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      signal: controller.signal,
+      deps: {
+        getToken: async () => "token",
+        acquireSyncPermit: (opts) =>
+          new Promise<() => void>((_resolve, reject) => {
+            opts?.signal?.addEventListener("abort", () => reject(createAbortError()), { once: true });
+          }),
+        state: {
+          hasIssueSnapshot: () => false,
+          runInStateTransaction: () => {
+            stateCalls.push("transaction");
+          },
+          recordIssueSnapshot: () => stateCalls.push("issue"),
+          recordIssueLabelsSnapshot: () => stateCalls.push("labels"),
+          recordRepoGithubIssueSync: () => stateCalls.push("cursor"),
+        },
+      },
+    });
+
+    controller.abort();
+
+    const result = await resultPromise;
+
+    expect(result.status).toBe("aborted");
+    expect(stateCalls).toHaveLength(0);
+  });
+
+  test("aborts during fetch", async () => {
+    const controller = new AbortController();
+    const stateCalls: string[] = [];
+
+    const fetchMock: FetchLike = async (_input, init) =>
+      new Promise((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal | undefined;
+        if (!signal) {
+          reject(new Error("missing signal"));
+          return;
+        }
+        signal.addEventListener("abort", () => reject(createAbortError()), { once: true });
+      });
+
+    const resultPromise = syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      signal: controller.signal,
+      deps: {
+        getToken: async () => "token",
+        fetch: fetchMock,
+        state: {
+          hasIssueSnapshot: () => false,
+          runInStateTransaction: () => {
+            stateCalls.push("transaction");
+          },
+          recordIssueSnapshot: () => stateCalls.push("issue"),
+          recordIssueLabelsSnapshot: () => stateCalls.push("labels"),
+          recordRepoGithubIssueSync: () => stateCalls.push("cursor"),
+        },
+      },
+    });
+
+    controller.abort();
+
+    const result = await resultPromise;
+
+    expect(result.status).toBe("aborted");
+    expect(stateCalls).toHaveLength(0);
   });
 });

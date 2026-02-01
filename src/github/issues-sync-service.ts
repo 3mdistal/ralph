@@ -1,5 +1,6 @@
 import { resolveGitHubToken } from "../github-auth";
 import { shouldLog } from "../logging";
+import { isAbortError } from "../abort";
 import { Semaphore, type ReleaseFn } from "../semaphore";
 import {
   hasIssueSnapshot,
@@ -33,6 +34,7 @@ export async function syncRepoIssuesOnce(params: {
   lastSyncAt: string | null;
   persistCursor?: boolean;
   storeAllOpen?: boolean;
+  signal?: AbortSignal;
   deps?: SyncDeps;
 }): Promise<SyncResult> {
   const deps = params.deps ?? {};
@@ -40,20 +42,41 @@ export async function syncRepoIssuesOnce(params: {
   const getToken = deps.getToken ?? resolveGitHubToken;
   const now = deps.now ? deps.now() : new Date();
   const nowIso = now.toISOString();
-  const nowMs = Date.now();
+  const nowMs = now.getTime();
   const since = computeSince(params.lastSyncAt);
+  const signal = params.signal;
+  const acquireSyncPermit =
+    deps.acquireSyncPermit ?? ((opts?: { signal?: AbortSignal }) => issueSyncSemaphore.acquire(opts));
+  const state = deps.state ?? {
+    hasIssueSnapshot,
+    recordIssueLabelsSnapshot,
+    recordIssueSnapshot,
+    recordRepoGithubIssueSync,
+    runInStateTransaction,
+  };
+
+  const abortedResult = (): SyncResult => ({
+    status: "aborted",
+    fetched: 0,
+    stored: 0,
+    ralphCount: 0,
+    newLastSyncAt: params.lastSyncAt ?? null,
+    hadChanges: false,
+  });
 
   let releaseSync: ReleaseFn | null = null;
 
   try {
-    releaseSync = await issueSyncSemaphore.acquire();
+    if (signal?.aborted) return abortedResult();
+    releaseSync = await acquireSyncPermit({ signal });
+    if (signal?.aborted) return abortedResult();
     const token = await getToken();
     if (!token) {
       if (shouldLog(`github-sync:auth-missing:${params.repo}`, 60_000)) {
         console.warn(`[ralph:gh-sync] GitHub auth is not configured; skipping issue sync for ${params.repo}`);
       }
       return {
-        ok: true,
+        status: "ok",
         fetched: 0,
         stored: 0,
         ralphCount: 0,
@@ -62,17 +85,20 @@ export async function syncRepoIssuesOnce(params: {
       };
     }
 
+    if (signal?.aborted) return abortedResult();
+
     const fetchResult = await fetchIssuesSince({
       repo: params.repo,
       since,
       token,
       fetchImpl,
       nowMs,
+      signal,
     });
 
     if (!fetchResult.ok) {
       return {
-        ok: false,
+        status: "error",
         fetched: fetchResult.fetched,
         stored: 0,
         ralphCount: 0,
@@ -83,6 +109,8 @@ export async function syncRepoIssuesOnce(params: {
       };
     }
 
+    if (signal?.aborted) return abortedResult();
+
     const newLastSyncAt = computeNewLastSyncAt({
       fetched: fetchResult.fetched,
       maxUpdatedAt: fetchResult.maxUpdatedAt,
@@ -92,16 +120,18 @@ export async function syncRepoIssuesOnce(params: {
 
     let plan: ReturnType<typeof buildIssueStorePlan> | null = null;
 
-    runInStateTransaction(() => {
+    if (signal?.aborted) return abortedResult();
+
+    state.runInStateTransaction(() => {
       plan = buildIssueStorePlan({
         repo: params.repo,
         issues: fetchResult.issues,
         storeAllOpen: params.storeAllOpen,
-        hasIssueSnapshot,
+        hasIssueSnapshot: state.hasIssueSnapshot,
       });
 
       for (const item of plan.plans) {
-        recordIssueSnapshot({
+        state.recordIssueSnapshot({
           repo: params.repo,
           issue: item.issueRef,
           title: item.title,
@@ -112,7 +142,7 @@ export async function syncRepoIssuesOnce(params: {
           at: nowIso,
         });
 
-        recordIssueLabelsSnapshot({
+        state.recordIssueLabelsSnapshot({
           repo: params.repo,
           issue: item.issueRef,
           labels: item.labels,
@@ -121,7 +151,7 @@ export async function syncRepoIssuesOnce(params: {
       }
 
       if (params.persistCursor && newLastSyncAt && newLastSyncAt !== params.lastSyncAt) {
-        recordRepoGithubIssueSync({
+        state.recordRepoGithubIssueSync({
           repo: params.repo,
           repoPath: params.repoPath,
           botBranch: params.botBranch,
@@ -133,7 +163,7 @@ export async function syncRepoIssuesOnce(params: {
     const finalPlan = plan ?? { plans: [], ralphCount: 0 };
 
     return {
-      ok: true,
+      status: "ok",
       fetched: fetchResult.fetched,
       stored: finalPlan.plans.length,
       ralphCount: finalPlan.ralphCount,
@@ -141,8 +171,11 @@ export async function syncRepoIssuesOnce(params: {
       hadChanges: finalPlan.plans.length > 0,
     };
   } catch (error: any) {
+    if (isAbortError(error) || signal?.aborted) {
+      return abortedResult();
+    }
     return {
-      ok: false,
+      status: "error",
       fetched: 0,
       stored: 0,
       ralphCount: 0,
