@@ -116,8 +116,11 @@ function evaluateParentVerificationEligibility(params: {
 }
 
 export function buildParentVerificationPrompt(input: ParentVerificationPromptInput): string {
-  const childLines = input.childIssues.map((issue) => `- https://github.com/${issue.repo}/issues/${issue.number}`);
-  const evidenceLines = input.evidence.map((item) => `- ${item.label ? `${item.label}: ` : ""}${item.url}`);
+  const childIssues = Array.isArray((input as any)?.childIssues) ? (input as any).childIssues : [];
+  const evidence = Array.isArray((input as any)?.evidence) ? (input as any).evidence : [];
+
+  const childLines = childIssues.map((issue: any) => `- https://github.com/${issue.repo}/issues/${issue.number}`);
+  const evidenceLines = evidence.map((item: any) => `- ${item.label ? `${item.label}: ` : ""}${item.url}`);
 
   return [
     "You are verifying whether a parent issue is already satisfied by its closed sub-issues.",
