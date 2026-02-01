@@ -56,6 +56,7 @@ const DEFAULT_COMMENT_SCAN_LIMIT = 100;
 const MAX_SUMMARY_CHARS = 500;
 const MAX_DETAILS_CHARS = 3000;
 const MAX_COMMENT_CHARS = 8000;
+const MIN_ALERT_EDIT_INTERVAL_MS = 2 * 60_000;
 
 function truncateText(input: string, maxChars: number): string {
   const trimmed = input.trim();
@@ -265,6 +266,30 @@ export async function writeAlertToGitHub(ctx: AlertWritebackContext, deps: Write
 
   const existingDelivery = readDelivery({ alertId: ctx.alertId, channel, markerId: plan.markerId });
   const existingCommentId = existingDelivery?.commentId ?? parseCommentIdFromUrl(existingDelivery?.commentUrl);
+  const lastAttemptAt = existingDelivery?.lastAttemptAt ? Date.parse(existingDelivery.lastAttemptAt) : Number.NaN;
+  const shouldThrottleExisting =
+    existingCommentId && Number.isFinite(lastAttemptAt) && Date.now() - lastAttemptAt < MIN_ALERT_EDIT_INTERVAL_MS;
+
+  if (shouldThrottleExisting) {
+    recordDelivery({
+      alertId: ctx.alertId,
+      channel,
+      markerId: plan.markerId,
+      targetType: "issue",
+      targetNumber: ctx.issueNumber,
+      status: "skipped",
+      commentId: existingCommentId,
+      commentUrl: existingDelivery?.commentUrl ?? null,
+      error: "throttled",
+    });
+    log(`${prefix} Throttling alert update for #${ctx.issueNumber}.`);
+    return {
+      postedComment: false,
+      skippedComment: true,
+      markerFound: true,
+      commentUrl: existingDelivery?.commentUrl ?? null,
+    };
+  }
   if (existingCommentId) {
     try {
       const updated = await updateIssueComment({
@@ -341,6 +366,23 @@ export async function writeAlertToGitHub(ctx: AlertWritebackContext, deps: Write
     }
 
     if (markerCommentId) {
+      const shouldThrottleMarker =
+        Number.isFinite(lastAttemptAt) && Date.now() - lastAttemptAt < MIN_ALERT_EDIT_INTERVAL_MS;
+      if (shouldThrottleMarker) {
+        recordDelivery({
+          alertId: ctx.alertId,
+          channel,
+          markerId: plan.markerId,
+          targetType: "issue",
+          targetNumber: ctx.issueNumber,
+          status: "skipped",
+          commentId: markerCommentId,
+          commentUrl: markerCommentUrl ?? null,
+          error: "throttled",
+        });
+        log(`${prefix} Throttling alert update for #${ctx.issueNumber}.`);
+        return { postedComment: false, skippedComment: true, markerFound: true, commentUrl: markerCommentUrl };
+      }
       try {
         const updated = await updateIssueComment({
           github: deps.github,

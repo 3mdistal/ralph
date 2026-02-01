@@ -117,6 +117,11 @@ Blocked enforcement:
 - Blocked issues get the `ralph:blocked` label and their agent-task status is set to `blocked`.
 - When unblocked, Ralph removes `ralph:blocked` and re-queues only tasks that were blocked due to dependencies.
 
+Parent verification lane:
+- When dependency blockers clear, Ralph runs a lightweight parent verification lane before full implementation.
+- The lane emits a deterministic marker and either proceeds to implementation or escalates with a "close or clarify" summary.
+- See `docs/product/parent-verification-lane.md` for the detailed contract.
+
 Blocked attribution (`blocked-source` in agent-task frontmatter):
 - `deps` - blocked by issue dependencies or sub-issues
 - `allowlist` - repo owner not in allowlist
@@ -148,6 +153,14 @@ Requeue resolution (non-dependency blocked tasks):
 - When a task PR merges to `bot/integration`, Ralph applies `ralph:in-bot` and clears `ralph:in-progress`.
 - When the rollup PR merges to `main`, Ralph applies `ralph:done` and clears transitional labels (`ralph:in-bot`, `ralph:in-progress`, `ralph:blocked`, `ralph:escalated`, `ralph:queued`).
 - Closing the issue remains a separate policy decision (not required for done).
+
+### Verification-only completion (parent issues)
+
+When a parent issue becomes runnable after all sub-issues close, Ralph runs a verification-only pass seeded with child issues + linked PRs/merges.
+
+- If verification shows the parent is already satisfied, Ralph posts a single canonical comment: "Verification complete — no changes required" with evidence links, removes `ralph:queued` (if present) + `ralph:escalated`, and closes the issue.
+- This path completes the task without a PR URL and does **not** imply `ralph:done` merge semantics.
+- If verification finds remaining work (or is inconclusive), Ralph proceeds with the normal implement + PR flow.
 
 Direct-to-main (override / Pattern B):
 - If a task PR is merged directly to `main` (or the repo config sets `botBranch: main`), Ralph does **not** apply the

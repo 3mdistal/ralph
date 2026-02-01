@@ -6,11 +6,14 @@ import { tmpdir } from "os";
 import { closeStateDbForTests, getRepoLabelWriteState, initStateDb } from "../state";
 import { recordLabelWriteFailure, canAttemptLabelWrite, recordLabelWriteSuccess } from "../github/label-write-backoff";
 import { GitHubApiError } from "../github/client";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 describe("label write backoff", () => {
   let priorStateDbPath: string | undefined;
+  let releaseLock: (() => void) | null = null;
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    releaseLock = await acquireGlobalTestLock();
     priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
     const homeDir = mkdtempSync(join(tmpdir(), "ralph-label-backoff-"));
     process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
@@ -22,6 +25,9 @@ describe("label write backoff", () => {
     closeStateDbForTests();
     if (priorStateDbPath === undefined) delete process.env.RALPH_STATE_DB_PATH;
     else process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
+
+    releaseLock?.();
+    releaseLock = null;
   });
 
   test("records backoff and blocks until resume", () => {

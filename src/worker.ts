@@ -33,6 +33,7 @@ import {
   type SessionResult,
 } from "./session";
 import { buildPlannerPrompt } from "./planner-prompt";
+import { buildParentVerificationPrompt } from "./parent-verification-prompt";
 import { getThrottleDecision } from "./throttle";
 import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
 import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
@@ -54,14 +55,23 @@ import {
   type IssueMetadata,
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
+import { buildWorkerFailureAlert, type WorkerFailureKind } from "./alerts/worker-failure-core";
 import { drainQueuedNudges } from "./nudge";
-import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_STUCK } from "./github-labels";
+import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { writeDxSurveyToGitHubIssues } from "./github/dx-survey-writeback";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
+import {
+  buildParentVerificationPrompt as buildParentVerificationPromptLegacy,
+  evaluateParentVerificationEligibility,
+  parseParentVerificationOutput,
+} from "./parent-verification/core";
+import { collectParentVerificationEvidence } from "./parent-verification/io";
+import { writeParentVerificationToGitHub } from "./github/parent-verification-writeback";
 import {
   buildCiDebugCommentBody,
   createCiDebugComment,
@@ -105,13 +115,17 @@ import { createRunRecordingSessionAdapter, type SessionAdapter } from "./run-rec
 import { redactHomePathForDisplay } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import {
+  completeParentVerification,
   completeRalphRun,
   createRalphRun,
   ensureRalphRunGateRows,
+  getParentVerificationState,
+  getIssueLabels,
   getLatestRunIdForSession,
   getRalphRunTokenTotals,
   getIdempotencyPayload,
   listRalphRunSessionTokenTotals,
+  recordParentVerificationAttemptFailure,
   recordRalphRunGateArtifact,
   upsertIdempotencyKey,
   recordIssueSnapshot,
@@ -122,9 +136,21 @@ import {
   type PrState,
   type RalphRunAttemptKind,
   type RalphRunDetails,
+  tryClaimParentVerification,
+  setParentVerificationPending,
   upsertRalphRunGateResult,
 } from "./state";
+import {
+  getParentVerificationBackoffMs,
+  getParentVerificationMaxAttempts,
+  isParentVerificationDisabled,
+  parseParentVerificationMarker,
+  PARENT_VERIFY_MARKER_PREFIX,
+  PARENT_VERIFY_MARKER_VERSION,
+} from "./parent-verification";
+import { parseLastLineJsonMarker } from "./markers";
 import { refreshRalphRunTokenTotals } from "./run-token-accounting";
+import { computeAndStoreRunMetrics } from "./metrics/compute-and-store";
 import { selectCanonicalPr, type ResolvedPrCandidate } from "./pr-resolution";
 import {
   detectLegacyWorktrees,
@@ -327,6 +353,7 @@ export interface AgentRun {
   repo: string;
   outcome: "success" | "throttled" | "escalated" | "failed";
   pr?: string;
+  completionKind?: "pr" | "verified";
   sessionId?: string;
   escalationReason?: string;
   surveyResults?: string;
@@ -364,6 +391,10 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 
   if (result.pr) {
     details.prUrl = result.pr;
+  }
+
+  if (result.completionKind) {
+    details.completionKind = result.completionKind;
   }
 
   if (result.outcome === "escalated") {
@@ -1219,6 +1250,12 @@ export class RepoWorker {
         // best-effort token accounting
       }
 
+      try {
+        await computeAndStoreRunMetrics({ runId });
+      } catch {
+        // best-effort metrics persistence
+      }
+
       this.activeRunId = previousRunId;
     }
   }
@@ -1247,6 +1284,40 @@ export class RepoWorker {
   }
 
   private async escalateSetupFailure(task: AgentTask, reason: string, sessionId?: string): Promise<AgentRun> {
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated");
+    if (escalated) {
+      applyTaskPatch(task, "escalated", {});
+    }
+
+    await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      sessionId: (sessionId ?? task["session-id"]?.trim()) || undefined,
+      reason,
+      escalationType: "other",
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, { reason, sessionId, details: reason });
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId,
+      escalationReason: reason,
+    };
+  }
+
+  private async escalateParentVerificationFailure(task: AgentTask, reason: string, sessionId?: string): Promise<AgentRun> {
     const wasEscalated = task.status === "escalated";
     const escalated = await this.queue.updateTaskStatus(task, "escalated");
     if (escalated) {
@@ -1570,12 +1641,6 @@ export class RepoWorker {
       ].join("\n"),
     });
 
-    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, {
-      taskName: task.name,
-      repo: task.repo,
-      issue: task.issue,
-    });
-
     const error = new Error(reason) as Error & { ralphRootDirty?: boolean };
     error.ralphRootDirty = true;
     throw error;
@@ -1598,7 +1663,7 @@ export class RepoWorker {
       source = "runtime-error";
     }
     const nowIso = new Date().toISOString();
-    const { patch, didEnterBlocked, reasonSummary } = computeBlockedPatch(task, {
+    const { patch, didEnterBlocked, reasonSummary, detailsSummary } = computeBlockedPatch(task, {
       source,
       reason: opts?.reason,
       details: opts?.details,
@@ -1619,6 +1684,7 @@ export class RepoWorker {
         return false;
       })
     );
+    const priorWorktreePath = task["worktree-path"]?.trim() || "";
     const updatePatch = { ...sanitizedExtraFields, ...patch };
     const updated = await this.queue.updateTaskStatus(task, "blocked", updatePatch);
 
@@ -1648,7 +1714,70 @@ export class RepoWorker {
       });
     }
 
+    if (updated && didEnterBlocked && source !== "allowlist") {
+      const kind: WorkerFailureKind = source === "runtime-error" ? "runtime-error" : "blocked";
+      const reason = reasonSummary || `Blocked: ${source}`;
+      await this.notifyTaskFailure(task, {
+        kind,
+        stage: `blocked:${source}`,
+        reason,
+        details: detailsSummary || undefined,
+        sessionId: opts?.sessionId,
+        runLogPath: opts?.runLogPath,
+        worktreePath: priorWorktreePath || undefined,
+      });
+    }
+
     return updated;
+  }
+
+  private buildFailurePointers(
+    task: AgentTask,
+    overrides?: { sessionId?: string; runLogPath?: string; worktreePath?: string }
+  ) {
+    return {
+      sessionId: overrides?.sessionId ?? task["session-id"]?.trim() ?? null,
+      worktreePath: overrides?.worktreePath ?? task["worktree-path"]?.trim() ?? null,
+      runLogPath: overrides?.runLogPath ?? task["run-log-path"]?.trim() ?? null,
+      workerId: task["worker-id"]?.trim() ?? null,
+      repoSlot: task["repo-slot"]?.trim() ?? null,
+    };
+  }
+
+  private async notifyTaskFailure(
+    task: AgentTask,
+    params: {
+      kind: WorkerFailureKind;
+      stage: string;
+      reason: string;
+      details?: string;
+      sessionId?: string;
+      runLogPath?: string;
+      worktreePath?: string;
+    }
+  ): Promise<void> {
+    const alert = buildWorkerFailureAlert({
+      kind: params.kind,
+      stage: params.stage,
+      reason: params.reason,
+      details: params.details,
+      pointers: this.buildFailurePointers(task, {
+        sessionId: params.sessionId,
+        runLogPath: params.runLogPath,
+        worktreePath: params.worktreePath,
+      }),
+    });
+
+    await this.notify.notifyError(`${params.stage} ${task.name}`, params.details ?? params.reason, {
+      taskName: task.name,
+      repo: task.repo,
+      issue: task.issue,
+      alertOverride: {
+        fingerprintSeed: alert.fingerprintSeed,
+        summary: alert.summary,
+        details: alert.details ?? undefined,
+      },
+    });
   }
 
   private async markTaskUnblocked(task: AgentTask): Promise<boolean> {
@@ -2493,6 +2622,11 @@ ${guidance}`
       }
 
       if (!decision.blocked && decision.confidence === "certain") {
+        const labels = getIssueLabels(this.repo, entry.issue.number);
+        const shouldSetParentVerification =
+          labels.length === 0
+            ? true
+            : labels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_QUEUED);
         let shouldRemoveBlockedLabel = true;
         for (const task of entry.tasks) {
           if (task.status !== "blocked") continue;
@@ -2503,6 +2637,19 @@ ${guidance}`
           const unblocked = await this.markTaskUnblocked(task);
           if (!unblocked) {
             shouldRemoveBlockedLabel = false;
+          } else {
+            if (shouldSetParentVerification) {
+              const didSet = setParentVerificationPending({
+                repo: this.repo,
+                issueNumber: entry.issue.number,
+                nowMs: now,
+              });
+              if (didSet) {
+                console.log(
+                  `[ralph:worker:${this.repo}] Parent verification pending for ${formatIssueRef(entry.issue)}`
+                );
+              }
+            }
           }
         }
 
@@ -2578,6 +2725,11 @@ ${guidance}`
     } catch {
       return "HEAD";
     }
+  }
+
+  private buildParentVerificationWorktreePath(issueNumber: string): string {
+    const repoKey = safeNoteName(this.repo);
+    return join(RALPH_WORKTREES_DIR, repoKey, `parent-verify-${issueNumber}`);
   }
 
   private isManagedWorktreePath(worktreePath: string, baseDir = RALPH_WORKTREES_DIR): boolean {
@@ -5133,6 +5285,22 @@ ${guidance}`
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
 
+    try {
+      await writeDxSurveyToGitHubIssues({
+        github: this.github,
+        targetRepo: this.repo,
+        ralphRepo: "3mdistal/ralph",
+        issueNumber,
+        taskName: task.name,
+        cacheKey,
+        prUrl: recovery.prUrl ?? null,
+        sessionId: surveyResult.sessionId || mergeGate.sessionId || recovery.sessionId || null,
+        surveyOutput: surveyResult.output,
+      });
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
+    }
+
     await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return {
@@ -5256,6 +5424,22 @@ ${guidance}`
       return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
 
+    try {
+      await writeDxSurveyToGitHubIssues({
+        github: this.github,
+        targetRepo: this.repo,
+        ralphRepo: "3mdistal/ralph",
+        issueNumber,
+        taskName: task.name,
+        cacheKey,
+        prUrl: recovery.prUrl ?? null,
+        sessionId: surveyResult.sessionId || mergeGate.sessionId || recovery.sessionId || null,
+        surveyOutput: surveyResult.output,
+      });
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
+    }
+
     await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return {
@@ -5358,12 +5542,6 @@ ${guidance}`
         details,
         sessionId: recoveryResult.sessionId ?? task["session-id"]?.trim(),
       });
-      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, {
-        taskName: task.name,
-        repo: task.repo,
-        issue: task.issue,
-      });
-
       return {
         taskName: task.name,
         repo: this.repo,
@@ -5434,6 +5612,22 @@ ${guidance}`
       return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
 
+    try {
+      await writeDxSurveyToGitHubIssues({
+        github: this.github,
+        targetRepo: this.repo,
+        ralphRepo: "3mdistal/ralph",
+        issueNumber,
+        taskName: task.name,
+        cacheKey,
+        prUrl: mergeGate.prUrl ?? null,
+        sessionId: surveyResult.sessionId || mergeGate.sessionId || recoverySessionId || null,
+        surveyOutput: surveyResult.output,
+      });
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
+    }
+
     await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return await this.finalizeTaskSuccess({
@@ -5451,7 +5645,8 @@ ${guidance}`
 
   private async finalizeTaskSuccess(params: {
     task: AgentTask;
-    prUrl: string;
+    prUrl?: string | null;
+    completionKind?: "pr" | "verified";
     sessionId: string;
     startTime: Date;
     surveyResults?: string;
@@ -5467,6 +5662,7 @@ ${guidance}`
     const {
       task,
       prUrl,
+      completionKind,
       sessionId,
       startTime,
       surveyResults,
@@ -5479,6 +5675,8 @@ ${guidance}`
       notify,
       logMessage,
     } = params;
+    const resolvedPrUrl = prUrl ?? undefined;
+    const resolvedCompletionKind = completionKind ?? (resolvedPrUrl ? "pr" : "verified");
     const resolvedWorktreePath = worktreePath ?? task["worktree-path"]?.trim();
     const resolvedWorkerId = workerId ?? task["worker-id"]?.trim();
     const resolvedRepoSlot = repoSlot ?? task["repo-slot"]?.trim();
@@ -5491,7 +5689,7 @@ ${guidance}`
     const endTime = new Date();
     await this.createAgentRun(task, {
       sessionId,
-      pr: prUrl,
+      pr: resolvedPrUrl ?? null,
       outcome: "success",
       started: startTime,
       completed: endTime,
@@ -5521,7 +5719,7 @@ ${guidance}`
     await this.assertRepoRootClean(task, "post-run");
 
     if (notify ?? true) {
-      await this.notify.notifyTaskComplete(task.name, this.repo, prUrl ?? undefined);
+      await this.notify.notifyTaskComplete(task.name, this.repo, resolvedPrUrl);
     }
     if (logMessage) {
       console.log(`[ralph:worker:${this.repo}] ${logMessage}`);
@@ -5532,7 +5730,8 @@ ${guidance}`
       repo: this.repo,
       outcome: "success",
       sessionId,
-      pr: prUrl ?? undefined,
+      pr: resolvedPrUrl,
+      completionKind: resolvedCompletionKind,
     };
   }
 
@@ -5889,12 +6088,6 @@ ${guidance}`
         },
       });
 
-      await this.notify.notifyError(params.notifyTitle, reason, {
-        taskName: params.task.name,
-        repo: params.task.repo,
-        issue: params.task.issue,
-      });
-
       return {
         ok: false,
         run: {
@@ -5937,12 +6130,6 @@ ${guidance}`
           "stall-retries": "",
           ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
         },
-      });
-
-      await this.notify.notifyError(params.notifyTitle, reason, {
-        taskName: params.task.name,
-        repo: params.task.repo,
-        issue: params.task.issue,
       });
 
       return {
@@ -6004,12 +6191,6 @@ ${guidance}`
             const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
             console.warn(`[ralph:worker:${this.repo}] ${reason}`);
             await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-            await this.notify.notifyError(params.notifyTitle, reason, {
-              taskName: params.task.name,
-              repo: params.task.repo,
-              issue: params.task.issue,
-            });
-
             return {
               ok: false,
               run: {
@@ -6128,12 +6309,6 @@ ${guidance}`
           // best-effort
         }
         await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-        await this.notify.notifyError(params.notifyTitle, reason, {
-          taskName: params.task.name,
-          repo: params.task.repo,
-          issue: params.task.issue,
-        });
-
         return {
           ok: false,
           run: {
@@ -6240,6 +6415,223 @@ ${guidance}`
       taskName: task.name,
       repo: this.repo,
       outcome: "success",
+    };
+  }
+
+  private async deferParentVerification(task: AgentTask, reason: string): Promise<AgentRun> {
+    const patch: Record<string, string> = {
+      "daemon-id": "",
+      "heartbeat-at": "",
+    };
+    const updated = await this.queue.updateTaskStatus(task, "queued", patch);
+    if (updated) {
+      applyTaskPatch(task, "queued", patch);
+    }
+
+    console.log(`[ralph:worker:${this.repo}] Parent verification deferred: ${reason}`);
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "failed",
+      escalationReason: reason,
+    };
+  }
+
+  private async maybeRunParentVerification(params: {
+    task: AgentTask;
+    issueNumber: string;
+    issueMeta: IssueMetadata;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions?: RunSessionOptionsBase;
+  }): Promise<AgentRun | null> {
+    if (isParentVerificationDisabled()) return null;
+    const parsedIssueNumber = Number(params.issueNumber);
+    if (!Number.isFinite(parsedIssueNumber)) return null;
+
+    const state = getParentVerificationState({ repo: this.repo, issueNumber: parsedIssueNumber });
+    if (!state || state.status !== "pending") return null;
+
+    const nowMs = Date.now();
+    if (state.nextAttemptAtMs && state.nextAttemptAtMs > nowMs) {
+      return await this.deferParentVerification(
+        params.task,
+        `backoff active until ${new Date(state.nextAttemptAtMs).toISOString()}`
+      );
+    }
+
+    const maxAttempts = getParentVerificationMaxAttempts();
+    if (state.attemptCount >= maxAttempts) {
+      completeParentVerification({
+        repo: this.repo,
+        issueNumber: parsedIssueNumber,
+        outcome: "skipped",
+        details: `max attempts (${maxAttempts}) reached`,
+        nowMs,
+      });
+      console.log(
+        `[ralph:worker:${this.repo}] Parent verification skipped (attempts=${state.attemptCount} max=${maxAttempts})`
+      );
+      return null;
+    }
+
+    const claimed = tryClaimParentVerification({ repo: this.repo, issueNumber: parsedIssueNumber, nowMs });
+    if (!claimed) {
+      return await this.deferParentVerification(params.task, "pending claim not acquired");
+    }
+
+    const attemptCount = claimed.attemptCount;
+    await this.recordRunLogPath(params.task, params.issueNumber, "parent-verify", "queued");
+    const prompt = buildParentVerificationPrompt({ repo: this.repo, issueNumber: params.issueNumber });
+    let result: SessionResult;
+    try {
+      result = await this.session.runAgent(this.repoPath, "ralph-parent-verify", prompt, {
+        repo: this.repo,
+        cacheKey: `parent-verify-${params.issueNumber}`,
+        introspection: {
+          repo: this.repo,
+          issue: params.task.issue,
+          taskName: params.task.name,
+          step: 0,
+          stepTitle: "parent verification",
+        },
+        ...this.buildWatchdogOptions(params.task, "parent-verify"),
+        ...this.buildStallOptions(params.task, "parent-verify"),
+        ...(params.opencodeSessionOptions ?? {}),
+      });
+    } catch (error: any) {
+      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
+      recordParentVerificationAttemptFailure({
+        repo: this.repo,
+        issueNumber: parsedIssueNumber,
+        attemptCount,
+        nextAttemptAtMs,
+        nowMs,
+        details: error?.message ?? String(error),
+      });
+      if (attemptCount >= maxAttempts) {
+        completeParentVerification({
+          repo: this.repo,
+          issueNumber: parsedIssueNumber,
+          outcome: "skipped",
+          details: "parent verification failed; proceeding to implementation",
+          nowMs,
+        });
+        return null;
+      }
+      return await this.deferParentVerification(params.task, "parent verification error");
+    }
+
+    if (!result.success) {
+      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
+      recordParentVerificationAttemptFailure({
+        repo: this.repo,
+        issueNumber: parsedIssueNumber,
+        attemptCount,
+        nextAttemptAtMs,
+        nowMs,
+        details: result.output,
+      });
+      if (attemptCount >= maxAttempts) {
+        completeParentVerification({
+          repo: this.repo,
+          issueNumber: parsedIssueNumber,
+          outcome: "skipped",
+          details: "parent verification failed; proceeding to implementation",
+          nowMs,
+        });
+        return null;
+      }
+      return await this.deferParentVerification(params.task, "parent verification failed");
+    }
+
+    const markerResult = parseLastLineJsonMarker(result.output ?? "", PARENT_VERIFY_MARKER_PREFIX);
+    const parsedMarker = markerResult.ok ? parseParentVerificationMarker(markerResult.value) : null;
+    if (!markerResult.ok || !parsedMarker || parsedMarker.version !== PARENT_VERIFY_MARKER_VERSION) {
+      const detail = markerResult.ok ? "invalid marker payload" : markerResult.error;
+      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
+      recordParentVerificationAttemptFailure({
+        repo: this.repo,
+        issueNumber: parsedIssueNumber,
+        attemptCount,
+        nextAttemptAtMs,
+        nowMs,
+        details: detail,
+      });
+      if (attemptCount >= maxAttempts) {
+        completeParentVerification({
+          repo: this.repo,
+          issueNumber: parsedIssueNumber,
+          outcome: "skipped",
+          details: "parent verification marker invalid; proceeding to implementation",
+          nowMs,
+        });
+        return null;
+      }
+      return await this.deferParentVerification(params.task, "parent verification marker invalid");
+    }
+
+    if (parsedMarker.work_remains) {
+      completeParentVerification({
+        repo: this.repo,
+        issueNumber: parsedIssueNumber,
+        outcome: "work_remains",
+        details: parsedMarker.reason,
+        nowMs,
+      });
+      console.log(
+        `[ralph:worker:${this.repo}] Parent verification: work remains for ${params.task.issue} (${parsedMarker.reason})`
+      );
+      return null;
+    }
+
+    completeParentVerification({
+      repo: this.repo,
+      issueNumber: parsedIssueNumber,
+      outcome: "no_work",
+      details: parsedMarker.reason,
+      nowMs,
+    });
+
+    const reason = `Parent verification: no remaining work. ${parsedMarker.reason}`;
+    const wasEscalated = params.task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(params.task, "escalated", {
+      "daemon-id": "",
+      "heartbeat-at": "",
+    });
+    if (escalated) {
+      applyTaskPatch(params.task, "escalated", {
+        "daemon-id": "",
+        "heartbeat-at": "",
+      });
+    }
+
+    await this.writeEscalationWriteback(params.task, { reason, details: parsedMarker.reason, escalationType: "other" });
+    await this.notify.notifyEscalation({
+      taskName: params.task.name,
+      taskFileName: params.task._name,
+      taskPath: params.task._path,
+      issue: params.task.issue,
+      repo: this.repo,
+      sessionId: result.sessionId || params.task["session-id"]?.trim() || undefined,
+      reason,
+      escalationType: "other",
+      planOutput: result.output,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(params.task, {
+        reason,
+        sessionId: result.sessionId,
+        details: result.output,
+      });
+    }
+
+    return {
+      taskName: params.task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: result.sessionId || undefined,
+      escalationReason: reason,
     };
   }
 
@@ -7474,6 +7866,22 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
+      try {
+        await writeDxSurveyToGitHubIssues({
+          github: this.github,
+          targetRepo: this.repo,
+          ralphRepo: "3mdistal/ralph",
+          issueNumber,
+          taskName: task.name,
+          cacheKey,
+          prUrl: prUrl ?? null,
+          sessionId: surveyResult.sessionId || buildResult.sessionId || existingSessionId || null,
+          surveyOutput: surveyResult.output,
+        });
+      } catch (error: any) {
+        console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
+      }
+
       await this.recordCheckpoint(
         task,
         "survey_complete",
@@ -7505,11 +7913,6 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), {
-          taskName: task.name,
-          repo: task.repo,
-          issue: task.issue,
-        });
       }
 
       return {
@@ -7520,6 +7923,204 @@ ${guidance}`
       };
     } finally {
       // slot release handled by scheduler-level reservation
+    }
+  }
+
+  private async maybeHandleParentVerification(params: {
+    task: AgentTask;
+    issueNumber: string;
+    issueMeta: IssueMetadata;
+    cacheKey: string;
+    startTime: Date;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions?: RunSessionOptionsBase;
+    worktreePath?: string;
+    workerId?: string;
+    allocatedSlot?: number | null;
+  }): Promise<AgentRun | null> {
+    const issueRef = parseIssueRef(params.task.issue, params.task.repo);
+    if (!issueRef) return null;
+
+    const snapshot = await this.getRelationshipSnapshot(issueRef, true);
+    if (!snapshot) return null;
+
+    const signals = this.buildRelationshipSignals(snapshot);
+    const eligibility = evaluateParentVerificationEligibility({ snapshot, signals });
+    if (eligibility.decision !== "verify") {
+      console.log(
+        `[ralph:worker:${this.repo}] Parent verification skipped for ${params.task.issue}: ${eligibility.reason}`
+      );
+      return null;
+    }
+
+    const issueUrl =
+      params.issueMeta.url ?? `https://github.com/${issueRef.repo}/issues/${issueRef.number}`;
+    const evidence = await collectParentVerificationEvidence({ childIssues: eligibility.childIssues });
+    if (evidence.diagnostics.length > 0) {
+      console.log(
+        `[ralph:worker:${this.repo}] Parent verification evidence diagnostics for ${params.task.issue}:\n${evidence.diagnostics.join(
+          "\n"
+        )}`
+      );
+    }
+
+    const prompt = buildParentVerificationPromptLegacy({
+      repo: this.repo,
+      issueNumber: Number(params.issueNumber),
+      issueUrl,
+      childIssues: eligibility.childIssues,
+      evidence: evidence.evidence,
+    });
+
+    const verifyWorktreePath = this.buildParentVerificationWorktreePath(params.issueNumber);
+    const verifyCacheKey = `${params.cacheKey}-parent-verify`;
+    let dirtyWorktree = false;
+
+    try {
+      try {
+        await this.ensureGitWorktree(verifyWorktreePath);
+      } catch (error: any) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Failed to prepare parent verification worktree: ${error?.message ?? String(error)}`
+        );
+        return null;
+      }
+
+      const preStatus = await this.getWorktreeStatusPorcelain(verifyWorktreePath);
+      if (preStatus) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Parent verification worktree not clean; skipping verification for ${params.task.issue}.`
+        );
+        dirtyWorktree = true;
+        return null;
+      }
+
+      const pausedVerify = await this.pauseIfHardThrottled(params.task, "parent verification");
+      if (pausedVerify) return pausedVerify;
+
+      const verifyRunLogPath = await this.recordRunLogPath(
+        params.task,
+        params.issueNumber,
+        "parent-verify",
+        "starting"
+      );
+
+      const verifyResult = await this.session.runAgent(verifyWorktreePath, "general", prompt, {
+        repo: this.repo,
+        cacheKey: verifyCacheKey,
+        runLogPath: verifyRunLogPath,
+        introspection: {
+          repo: this.repo,
+          issue: params.task.issue,
+          taskName: params.task.name,
+          step: 1,
+          stepTitle: "parent verification",
+        },
+        ...this.buildWatchdogOptions(params.task, "parent-verify"),
+        ...this.buildStallOptions(params.task, "parent-verify"),
+        ...(params.opencodeSessionOptions ?? {}),
+      });
+
+      const pausedAfterVerify = await this.pauseIfHardThrottled(
+        params.task,
+        "parent verification (post)",
+        verifyResult.sessionId
+      );
+      if (pausedAfterVerify) return pausedAfterVerify;
+
+      if (!verifyResult.success && verifyResult.watchdogTimeout) {
+        return await this.handleWatchdogTimeout(params.task, verifyCacheKey, "parent-verify", verifyResult, params.opencodeXdg);
+      }
+
+      if (!verifyResult.success && verifyResult.stallTimeout) {
+        return await this.handleStallTimeout(params.task, verifyCacheKey, "parent-verify", verifyResult);
+      }
+
+      const postStatus = await this.getWorktreeStatusPorcelain(verifyWorktreePath);
+      if (postStatus) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Parent verification dirtied its worktree; skipping verification for ${params.task.issue}.`
+        );
+        dirtyWorktree = true;
+        return null;
+      }
+
+      if (!verifyResult.success) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Parent verification run failed; continuing with normal flow for ${params.task.issue}.`
+        );
+        return null;
+      }
+
+      if (verifyResult.sessionId) {
+        await this.queue.updateTaskStatus(params.task, "in-progress", {
+          "session-id": verifyResult.sessionId,
+          ...(params.workerId ? { "worker-id": params.workerId } : {}),
+          ...(typeof params.allocatedSlot === "number" ? { "repo-slot": String(params.allocatedSlot) } : {}),
+        });
+      }
+
+      const parsed = parseParentVerificationOutput(verifyResult.output);
+      if (!parsed.satisfied) {
+        console.log(
+          `[ralph:worker:${this.repo}] Parent verification not satisfied for ${params.task.issue}: ${parsed.reason ?? "unsatisfied"}`
+        );
+        return null;
+      }
+
+      const writeback = await writeParentVerificationToGitHub(
+        {
+          repo: this.repo,
+          issueNumber: Number(params.issueNumber),
+          childIssues: eligibility.childIssues,
+          evidence: evidence.evidence,
+        },
+        { github: this.github }
+      );
+
+      if (!writeback.ok) {
+        const reason = writeback.error ?? "Parent verification writeback failed";
+        return await this.escalateParentVerificationFailure(params.task, reason, verifyResult.sessionId);
+      }
+
+      recordIssueSnapshot({
+        repo: issueRef.repo,
+        issue: params.task.issue,
+        title: params.issueMeta.title,
+        state: "CLOSED",
+        url: issueUrl,
+      });
+
+      return await this.finalizeTaskSuccess({
+        task: params.task,
+        prUrl: null,
+        completionKind: "verified",
+        sessionId: verifyResult.sessionId || params.task["session-id"]?.trim() || "",
+        startTime: params.startTime,
+        cacheKey: verifyCacheKey,
+        opencodeXdg: params.opencodeXdg,
+        worktreePath: params.worktreePath,
+        workerId: params.workerId,
+        repoSlot: typeof params.allocatedSlot === "number" ? String(params.allocatedSlot) : undefined,
+        notify: true,
+        logMessage: `Task verified without changes: ${params.task.name}`,
+      });
+    } finally {
+      if (dirtyWorktree) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Parent verification worktree left for inspection: ${verifyWorktreePath}`
+        );
+      }
+
+      if (!dirtyWorktree) {
+        try {
+          await this.cleanupGitWorktree(verifyWorktreePath);
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to cleanup parent verification worktree: ${error?.message ?? String(error)}`
+          );
+        }
+      }
     }
   }
 
@@ -7558,6 +8159,15 @@ ${guidance}`
       const opencodeProfileName = resolvedOpencode.profileName;
       const opencodeXdg = resolvedOpencode.opencodeXdg;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
+
+      const parentVerifyRun = await this.maybeRunParentVerification({
+        task,
+        issueNumber,
+        issueMeta,
+        opencodeXdg,
+        opencodeSessionOptions,
+      });
+      if (parentVerifyRun) return parentVerifyRun;
 
       await this.ensureRalphWorkflowLabelsOnce();
 
@@ -7744,8 +8354,6 @@ ${guidance}`
           sessionId: planResult.sessionId,
           runLogPath: planRunLogPath,
         });
-        await this.notify.notifyError(`Processing ${task.name}`, reason, task.name);
-
         return {
           taskName: task.name,
           repo: this.repo,
@@ -8406,6 +9014,22 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
+      try {
+        await writeDxSurveyToGitHubIssues({
+          github: this.github,
+          targetRepo: this.repo,
+          ralphRepo: "3mdistal/ralph",
+          issueNumber,
+          taskName: task.name,
+          cacheKey,
+          prUrl: prUrl ?? null,
+          sessionId: surveyResult.sessionId || buildResult.sessionId || null,
+          surveyOutput: surveyResult.output,
+        });
+      } catch (error: any) {
+        console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
+      }
+
       await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || buildResult.sessionId);
       this.publishCheckpoint("survey_complete", {
         sessionId: surveyResult.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
@@ -8434,11 +9058,6 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), {
-          taskName: task.name,
-          repo: task.repo,
-          issue: task.issue,
-        });
       }
 
       return {

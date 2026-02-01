@@ -190,6 +190,7 @@ export function getManagedOpencodeConfigManifest(configDir?: string): ManagedCon
   const files: ManagedConfigFile[] = [
     { path: join(resolvedDir, "opencode.json"), contents: readTemplate("opencode.json") },
     { path: join(resolvedDir, "agent", "build.md"), contents: readTemplate("agent/build.md") },
+    { path: join(resolvedDir, "agent", "ralph-parent-verify.md"), contents: readTemplate("agent/ralph-parent-verify.md") },
     { path: join(resolvedDir, "agent", "ralph-plan.md"), contents: readTemplate("agent/ralph-plan.md") },
     { path: join(resolvedDir, "agent", "product.md"), contents: readTemplate("agent/product.md") },
     { path: join(resolvedDir, "agent", "devex.md"), contents: readTemplate("agent/devex.md") },

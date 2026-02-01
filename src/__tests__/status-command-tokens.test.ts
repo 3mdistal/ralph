@@ -8,6 +8,7 @@ import { __resetQueueBackendStateForTests } from "../queue-backend";
 import { __resetBwrbRunnerForTests, __setBwrbRunnerForTests } from "../queue";
 import { closeStateDbForTests, createRalphRun, initStateDb, recordRalphRunSessionUse } from "../state";
 import { runStatusCommand } from "../commands/status";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 type AgentTaskRow = Record<string, unknown>;
 
@@ -16,6 +17,7 @@ let vaultDir = "";
 let priorHome: string | undefined;
 let priorStateDb: string | undefined;
 let priorXdgData: string | undefined;
+let releaseLock: (() => void) | null = null;
 
 function createMockTask(overrides: AgentTaskRow = {}): AgentTaskRow {
   return {
@@ -113,11 +115,14 @@ async function teardownEnv(): Promise<void> {
 }
 
 beforeEach(async () => {
+  releaseLock = await acquireGlobalTestLock();
   await setupEnv();
 });
 
 afterEach(async () => {
   await teardownEnv();
+  releaseLock?.();
+  releaseLock = null;
 });
 
 describe("status token totals", () => {
