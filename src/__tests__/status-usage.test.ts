@@ -103,6 +103,17 @@ describe("status usage mapping", () => {
     expect(lines).toContain("remoteUsageError=remote down");
   });
 
+  test("redacts sensitive tokens in remoteUsageError", () => {
+    const snapshot = baseSnapshot({
+      openaiSource: "remoteUsage",
+      remoteUsage: undefined,
+      remoteUsageError: "Bearer sk-1234567890123456789012345",
+    });
+
+    const row = buildStatusUsageRow("p1", makeDecision(snapshot));
+    expect(row.remoteUsageError).not.toContain("sk-");
+  });
+
   test("shows no data when logs are missing", () => {
     const snapshot = baseSnapshot({
       messagesRootDirExists: false,

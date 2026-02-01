@@ -44,9 +44,10 @@ When no effective profile is known, Ralph should fall back to global throttle se
 
 When the effective provider is OpenAI, the usage source used for throttling **and** status must follow this precedence:
 
-- Default/preferred: remote meters (`openaiSource=remoteUsage`).
+- Default: remote meters (`openaiSource=remoteUsage`).
 - If remote usage is enabled but unavailable/fails, fall back to local OpenCode message-log scanning.
 - If `openaiSource` is explicitly set to `localLogs`, do not attempt remote usage.
+- Remote usage requires OAuth tokens from `XDG_DATA_HOME/opencode/auth.json`; refresh writeback is atomic with a backup and tokens are never logged.
 
 ### Status visibility
 
