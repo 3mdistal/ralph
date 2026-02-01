@@ -24,6 +24,15 @@ export type SyncResult = {
   ralphCount: number;
   newLastSyncAt: string | null;
   hadChanges: boolean;
+  progressed: boolean;
+  limitHit?: {
+    kind: "maxPages" | "maxIssues";
+    pagesFetched: number;
+    issuesFetched: number;
+    maxPages: number;
+    maxIssues: number;
+  };
+  cursorInvalid?: boolean;
   rateLimitResetMs?: number;
   error?: string;
 };
