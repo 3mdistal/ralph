@@ -97,7 +97,7 @@ export interface ThrottleConfig {
   enabled?: boolean;
   /** Provider ID to count toward usage (default: "openai"). */
   providerID?: string;
-  /** OpenAI throttle source (default: "remoteUsage"). */
+  /** OpenAI throttle source (default: "localLogs"). */
   openaiSource?: "localLogs" | "remoteUsage";
   /** Soft throttle threshold as fraction of budget (default: 0.65). */
   softPct?: number;
@@ -298,7 +298,7 @@ const DEFAULT_AUTO_QUEUE_SCOPE: AutoQueueScope = "labeled-only";
 const DEFAULT_AUTO_QUEUE_MAX_PER_TICK = 200;
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
-const DEFAULT_THROTTLE_OPENAI_SOURCE: "localLogs" | "remoteUsage" = "remoteUsage";
+const DEFAULT_THROTTLE_OPENAI_SOURCE: "localLogs" | "remoteUsage" = "localLogs";
 const DEFAULT_THROTTLE_SOFT_PCT = 0.65;
 const DEFAULT_THROTTLE_HARD_PCT = 0.75;
 const DEFAULT_THROTTLE_MIN_CHECK_INTERVAL_MS = 15_000;

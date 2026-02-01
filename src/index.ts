@@ -2324,7 +2324,7 @@ if (args[0] === "usage") {
       profile: name,
       chosen: chosenProfile ? name === chosenProfile : name === "ambient",
       state: decision.state,
-      openaiSource: snap?.openaiSource ?? "remoteUsage",
+      openaiSource: snap?.openaiSource ?? "localLogs",
       rollingUsedPct: rollingUsed,
       weeklyUsedPct: weeklyUsed,
       rollingResetAt,
