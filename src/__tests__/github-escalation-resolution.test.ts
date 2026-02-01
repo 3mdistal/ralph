@@ -270,7 +270,7 @@ describe("escalation resolution reconciliation", () => {
     } as any;
 
     const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
-      if (labels.includes("ralph:queued")) return [];
+      if (labels.includes("ralph:status:queued")) return [];
       return [{ repo: "3mdistal/ralph", number: 13 }];
     };
 
