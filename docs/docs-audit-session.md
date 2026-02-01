@@ -266,6 +266,14 @@ This document captures decisions and discoveries made during an interactive audi
   - `minimal` preset ensures required `ralph:*` labels and creates bot branch.
   - `parity` preset is best-effort; failures become warnings and do not block provisioning.
 
+### Usage + GitHub Throttling (2026-02-01)
+
+- OpenAI usage throttling:
+  - Remote-first with fallback to local logs.
+  - Hard throttle is the must-enforce boundary; soft throttle is best-effort.
+- GitHub API pacing is a separate canonical policy doc:
+  - `docs/ops/github-rate-limiting.md` (backoff + caching + coalescing writes).
+
 ### SQLite Policy (2026-02-01)
 
 - Promoted additional SQLite migration claims:

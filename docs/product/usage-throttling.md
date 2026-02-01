@@ -27,7 +27,7 @@ This is a product-level policy: the system should self-regulate to preserve pred
 
 ### Two-tier throttle
 
-- **Soft throttle**: stop *starting new tasks* (do not schedule/dequeue new work).
+- **Soft throttle**: stop *starting new tasks* (do not schedule/dequeue new work). (best-effort)
 - **Hard throttle**: stop *all* model sends (including continuing in-flight tasks).
 
 ### Layered windows
@@ -88,6 +88,10 @@ Hard throttle is enforced at safe checkpoints (control boundaries), not by inter
   - before merge/survey steps
 - Store a durable throttle snapshot when entering throttled states (reason, window(s), used %, caps, reset times).
 - Ensure “stop starting new tasks” composes with drain mode and does not interrupt in-flight work unless hard-throttled.
+
+## Non-goal: GitHub API throttling
+
+GitHub API pacing/backoff is a separate policy surface (rate limits are not model usage). See `docs/ops/github-rate-limiting.md`.
 
 ## Throttle persistence
 
