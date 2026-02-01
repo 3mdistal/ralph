@@ -59,6 +59,7 @@ import { drainQueuedNudges } from "./nudge";
 import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { writeDxSurveyToGitHubIssues } from "./github/dx-survey-writeback";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "./github/relationship-signals";
@@ -5167,6 +5168,22 @@ ${guidance}`
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
 
+    try {
+      await writeDxSurveyToGitHubIssues({
+        github: this.github,
+        targetRepo: this.repo,
+        ralphRepo: "3mdistal/ralph",
+        issueNumber,
+        taskName: task.name,
+        cacheKey,
+        prUrl: recovery.prUrl ?? null,
+        sessionId: surveyResult.sessionId || mergeGate.sessionId || recovery.sessionId || null,
+        surveyOutput: surveyResult.output,
+      });
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
+    }
+
     await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
 
     return {
@@ -5288,6 +5305,22 @@ ${guidance}`
 
     if (!surveyResult.success && surveyResult.stallTimeout) {
       return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
+    }
+
+    try {
+      await writeDxSurveyToGitHubIssues({
+        github: this.github,
+        targetRepo: this.repo,
+        ralphRepo: "3mdistal/ralph",
+        issueNumber,
+        taskName: task.name,
+        cacheKey,
+        prUrl: recovery.prUrl ?? null,
+        sessionId: surveyResult.sessionId || mergeGate.sessionId || recovery.sessionId || null,
+        surveyOutput: surveyResult.output,
+      });
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
     }
 
     await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
@@ -5466,6 +5499,22 @@ ${guidance}`
 
     if (!surveyResult.success && surveyResult.stallTimeout) {
       return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
+    }
+
+    try {
+      await writeDxSurveyToGitHubIssues({
+        github: this.github,
+        targetRepo: this.repo,
+        ralphRepo: "3mdistal/ralph",
+        issueNumber,
+        taskName: task.name,
+        cacheKey,
+        prUrl: mergeGate.prUrl ?? null,
+        sessionId: surveyResult.sessionId || mergeGate.sessionId || recoverySessionId || null,
+        surveyOutput: surveyResult.output,
+      });
+    } catch (error: any) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
     }
 
     await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || mergeGate.sessionId);
@@ -7725,6 +7774,22 @@ ${guidance}`
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
       }
 
+      try {
+        await writeDxSurveyToGitHubIssues({
+          github: this.github,
+          targetRepo: this.repo,
+          ralphRepo: "3mdistal/ralph",
+          issueNumber,
+          taskName: task.name,
+          cacheKey,
+          prUrl: prUrl ?? null,
+          sessionId: surveyResult.sessionId || buildResult.sessionId || existingSessionId || null,
+          surveyOutput: surveyResult.output,
+        });
+      } catch (error: any) {
+        console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
+      }
+
       await this.recordCheckpoint(
         task,
         "survey_complete",
@@ -8664,6 +8729,22 @@ ${guidance}`
           return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
         }
         console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
+      }
+
+      try {
+        await writeDxSurveyToGitHubIssues({
+          github: this.github,
+          targetRepo: this.repo,
+          ralphRepo: "3mdistal/ralph",
+          issueNumber,
+          taskName: task.name,
+          cacheKey,
+          prUrl: prUrl ?? null,
+          sessionId: surveyResult.sessionId || buildResult.sessionId || null,
+          surveyOutput: surveyResult.output,
+        });
+      } catch (error: any) {
+        console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
       }
 
       await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || buildResult.sessionId);

@@ -38,7 +38,7 @@ The manual workflow is effective but repetitive:
 2. Run planner prompt with `--agent ralph-plan` - plan agent consults @product, asks questions
 3. Agent builds (worktree, commits, tests)
 4. Agent presents PR - human says "looks good, merge and clean up"
-5. Run `/survey` - @devex recommends issues
+5. Run `/survey` - emits structured DX feedback and files GitHub issues (job record + actionable work items)
 
 When reviewing ~40 PRs/day and almost never rejecting them, the human becomes a bottleneck. The questions from the plan agent are usually right - intervention only happens when @product flags a documentation gap.
 
