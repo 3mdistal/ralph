@@ -42,9 +42,10 @@ describe("label docs drift guard", () => {
     const rows = parseLabelTable(contents);
     const rowByLabel = new Map(rows.map((row) => [row.label, row]));
 
-    expect(rowByLabel.size).toBe(RALPH_WORKFLOW_LABELS.length);
+    const expected = RALPH_WORKFLOW_LABELS.filter((label) => label.name.startsWith("ralph:status:"));
+    expect(rowByLabel.size).toBe(expected.length);
 
-    for (const label of RALPH_WORKFLOW_LABELS) {
+    for (const label of expected) {
       const row = rowByLabel.get(label.name);
       expect(row).toBeTruthy();
       if (!row) continue;

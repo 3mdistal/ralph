@@ -51,6 +51,21 @@ describe("github escalation writeback", () => {
     expect(comment).toContain("@3mdistal");
   });
 
+  test("planEscalationWriteback includes details for merge-conflict", () => {
+    const plan = planEscalationWriteback({
+      repo: "3mdistal/ralph",
+      issueNumber: 66,
+      taskName: "Escalation task",
+      taskPath: "orchestration/tasks/ralph 66.md",
+      reason: "Need guidance",
+      details: "Conflict details here",
+      escalationType: "merge-conflict",
+    });
+
+    expect(plan.commentBody).toContain("Details:");
+    expect(plan.commentBody).toContain("Conflict details here");
+  });
+
   test("sanitizeEscalationReason redacts tokens and paths", () => {
     const input =
       "ghp_abcdefghijklmnopqrstuv Authorization: Bearer secret-token /home/alice/project /Users/bob/app \x1b[31mred\x1b[0m";

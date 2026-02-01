@@ -249,6 +249,8 @@ ralph sandbox tag --failed --apply
 - `doneReconcileIntervalMs` (number): ms between GitHub done reconciliation checks (defaults to 300000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
 - `stall` (object, optional): idle session stall detector + recovery ladder (see below)
+- `loopDetection` (object, optional): edit-churn loop detection (stop early + escalate; see below)
+- `repos[].loopDetection` (object, optional): per-repo override for loop detection
 - `throttle` (object, optional): usage-based soft throttle scheduler gate (see `docs/ops/opencode-usage-throttling.md`)
 - `opencode` (object, optional): named OpenCode XDG profiles (multi-account; see below)
   - `managedConfigDir` (string, optional): absolute path for Ralph-managed OpenCode config (default: `$HOME/.ralph/opencode`)
@@ -527,7 +529,7 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - Enable drain: set `mode` to `draining`
 - Disable drain: set `mode` to `running`
 - Pause all scheduling: set `mode` to `paused`
-- Pause at checkpoint: set `pause_requested=true` and optionally `pause_at_checkpoint`
+- Pause at checkpoint: set `pause_requested=true` (pauses at the next checkpoint). If you set `pause_at_checkpoint`, Ralph will keep running until it reaches that named checkpoint, then pause.
 - Active OpenCode profile: set `[opencode].defaultProfile` in `~/.ralph/config.toml` (affects new tasks only; tasks pin their profile on start)
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
@@ -758,6 +760,34 @@ In daemon mode, an OpenCode run can wedge without tripping per-tool watchdog thr
     "nudgeAfterMs": 300000,
     "restartAfterMs": 600000,
     "maxRestarts": 1
+  }
+}
+```
+
+## Loop Detection (Edit Churn)
+
+Sometimes an agent can burn a full watchdog budget repeatedly editing files without running deterministic gates (typecheck/tests/build).
+Loop detection lets Ralph stop early and escalate with a bounded, GitHub-visible handoff.
+
+Notes:
+- Disabled by default (`enabled: false`).
+- Gate detection is deterministic and based on a command allowlist (`gateMatchers`).
+- When thresholds trip, Ralph kills the in-flight run and escalates with top repeated files + a recommended next gate command.
+
+### Configuration
+
+```json
+{
+  "loopDetection": {
+    "enabled": false,
+    "gateMatchers": ["bun test", "bun run typecheck", "bun run build", "bun run knip"],
+    "recommendedGateCommand": "bun test",
+    "thresholds": {
+      "minEdits": 20,
+      "minElapsedMsWithoutGate": 480000,
+      "minTopFileTouches": 8,
+      "minTopFileShare": 0.6
+    }
   }
 }
 ```

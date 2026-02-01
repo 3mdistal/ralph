@@ -31,6 +31,7 @@ export type CheckpointEventEmitter = {
 
 export async function applyCheckpointReached(params: {
   checkpoint: RalphCheckpoint;
+  pauseAtCheckpoint?: RalphCheckpoint | null;
   state: CheckpointState;
   context: CheckpointContext;
   store: CheckpointStore;
@@ -43,6 +44,7 @@ export async function applyCheckpointReached(params: {
     checkpoint: params.checkpoint,
     state: params.state,
     pauseRequested,
+    pauseAtCheckpoint: params.pauseAtCheckpoint,
     workerId: params.context.workerId,
   });
 

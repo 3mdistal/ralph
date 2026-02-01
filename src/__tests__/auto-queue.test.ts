@@ -33,13 +33,13 @@ describe("auto-queue planning", () => {
 
   test("adds queued and removes blocked when unblocked", () => {
     const plan = computeAutoQueueLabelPlan({
-      issue: { ...baseIssue, labels: ["ralph:blocked"] },
+      issue: { ...baseIssue, labels: ["ralph:status:blocked"] },
       blocked: { blocked: false, confidence: "certain", reasons: [] },
       scope: "all-open",
     });
 
-    expect(plan.add).toEqual(["ralph:queued"]);
-    expect(plan.remove).toEqual(["ralph:blocked"]);
+    expect(plan.add).toEqual(["ralph:status:queued"]);
+    expect(plan.remove).toEqual(["ralph:status:blocked"]);
   });
 
   test("adds blocked when blocked", () => {
@@ -49,13 +49,13 @@ describe("auto-queue planning", () => {
       scope: "all-open",
     });
 
-    expect(plan.add).toEqual(["ralph:blocked"]);
+    expect(plan.add).toEqual(["ralph:status:blocked"]);
     expect(plan.remove).toEqual([]);
   });
 
   test("skips when dependency coverage is unknown", () => {
     const plan = computeAutoQueueLabelPlan({
-      issue: { ...baseIssue, labels: ["ralph:queued"] },
+      issue: { ...baseIssue, labels: ["ralph:status:queued"] },
       blocked: { blocked: false, confidence: "unknown", reasons: ["relationship coverage unknown"] },
       scope: "all-open",
     });
@@ -63,9 +63,9 @@ describe("auto-queue planning", () => {
     expect(plan.skipped).toBe(true);
   });
 
-  test("skips escalated issues", () => {
+  test("skips in-progress issues", () => {
     const plan = computeAutoQueueLabelPlan({
-      issue: { ...baseIssue, labels: ["ralph:escalated"] },
+      issue: { ...baseIssue, labels: ["ralph:status:in-progress"] },
       blocked: { blocked: false, confidence: "certain", reasons: [] },
       scope: "all-open",
     });

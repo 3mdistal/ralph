@@ -13,6 +13,7 @@ import {
   getRequestedOpencodeProfileName,
   getRepoBotBranch,
   getRepoConcurrencySlots,
+  getRepoLoopDetectionConfig,
   getRepoRequiredChecksOverride,
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
@@ -58,14 +59,20 @@ import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationConte
 import { buildWorkerFailureAlert, type WorkerFailureKind } from "./alerts/worker-failure-core";
 import { buildNudgePreview, drainQueuedNudges, type NudgeDeliveryOutcome } from "./nudge";
 import { redactSensitiveText } from "./redaction";
-import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
+import {
+  RALPH_LABEL_STATUS_BLOCKED,
+  RALPH_LABEL_STATUS_IN_PROGRESS,
+  RALPH_LABEL_STATUS_QUEUED,
+} from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { computeGitHubRateLimitPause } from "./github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "./github/dx-survey-writeback";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
+import { ensureEscalationCommentHasConsultantPacket } from "./github/escalation-consultant-writeback";
 import {
   buildParentVerificationPrompt as buildParentVerificationPromptLegacy,
   evaluateParentVerificationEligibility,
@@ -93,11 +100,13 @@ import {
 } from "./github/merge-conflict-comment";
 import {
   buildMergeConflictCommentLines,
+  buildMergeConflictEscalationDetails,
   buildMergeConflictSignature,
   computeMergeConflictDecision,
   formatMergeConflictPaths,
 } from "./merge-conflict-recovery";
 import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "./github/watchdog-writeback";
+import { buildLoopTripDetails } from "./loop-detection/format";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
@@ -2218,7 +2227,38 @@ export class RepoWorker {
           log: (message) => console.log(message),
         }
       );
-      return result.commentUrl ?? null;
+      const commentUrl = result.commentUrl ?? null;
+
+      if (commentUrl) {
+        try {
+          const repoPath = task["worktree-path"]?.trim() || this.repoPath;
+          await ensureEscalationCommentHasConsultantPacket({
+            github: this.github,
+            repo: escalationIssueRef.repo,
+            escalationCommentUrl: commentUrl,
+            repoPath,
+            input: {
+              issue: task.issue,
+              repo: escalationIssueRef.repo,
+              taskName: task.name,
+              taskPath: task._path ?? task.name,
+              escalationType: params.escalationType,
+              reason: params.reason,
+              sessionId: task["session-id"]?.trim() || null,
+              githubCommentUrl: commentUrl,
+            },
+            log: (m) => console.log(m),
+          });
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to attach consultant packet to escalation comment: ${
+              error?.message ?? String(error)
+            }`
+          );
+        }
+      }
+
+      return commentUrl;
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Escalation writeback failed for ${task.issue}: ${error?.message ?? String(error)}`
@@ -2624,10 +2664,12 @@ ${guidance}`
         }
 
         try {
-          await this.addIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
+          await this.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
         } catch (error: any) {
           console.warn(
-            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
+            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+              error?.message ?? String(error)
+            }`
           );
         }
         continue;
@@ -2638,7 +2680,7 @@ ${guidance}`
         const shouldSetParentVerification =
           labels.length === 0
             ? true
-            : labels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_QUEUED);
+            : labels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_QUEUED);
         let shouldRemoveBlockedLabel = true;
         for (const task of entry.tasks) {
           if (task.status !== "blocked") continue;
@@ -2667,10 +2709,12 @@ ${guidance}`
 
         if (shouldRemoveBlockedLabel) {
           try {
-            await this.removeIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
+            await this.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
           } catch (error: any) {
             console.warn(
-              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
+              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+                error?.message ?? String(error)
+              }`
             );
           }
         }
@@ -4016,20 +4060,24 @@ ${guidance}`
 
   private async applyCiDebugLabels(issue: IssueRef): Promise<void> {
     try {
-      await this.addIssueLabel(issue, RALPH_LABEL_STUCK);
+      await this.addIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
     }
 
     try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_BLOCKED);
+      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_BLOCKED);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
@@ -4038,10 +4086,12 @@ ${guidance}`
 
   private async clearCiDebugLabels(issue: IssueRef): Promise<void> {
     try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_STUCK);
+      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
@@ -4189,20 +4239,24 @@ ${guidance}`
 
   private async applyMergeConflictLabels(issue: IssueRef): Promise<void> {
     try {
-      await this.addIssueLabel(issue, RALPH_LABEL_STUCK);
+      await this.addIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
     }
 
     try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_BLOCKED);
+      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_BLOCKED);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
@@ -4211,10 +4265,12 @@ ${guidance}`
 
   private async clearMergeConflictLabels(issue: IssueRef): Promise<void> {
     try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_STUCK);
+      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
@@ -4302,51 +4358,6 @@ ${guidance}`
     };
   }
 
-  private buildMergeConflictEscalationSummary(params: {
-    prUrl: string;
-    baseRefName: string | null;
-    headRefName: string | null;
-    attempts: MergeConflictAttempt[];
-    reason: string;
-  }): string {
-    const lines: string[] = [];
-    const base = params.baseRefName || "(unknown)";
-    const head = params.headRefName || "(unknown)";
-    lines.push("Merge-conflict escalation summary", "", `PR: ${params.prUrl}`, `Base: ${base}`, `Head: ${head}`, "", "Reason:", params.reason, "");
-
-    if (params.attempts.length > 0) {
-      lines.push("Attempts:");
-      for (const attempt of params.attempts) {
-        const when = attempt.completedAt || attempt.startedAt;
-        const conflictCount = typeof attempt.conflictCount === "number" ? `, ${attempt.conflictCount} files` : "";
-        lines.push(
-          `- Attempt ${attempt.attempt} (${attempt.status ?? "unknown"}, ${when})${conflictCount}: ${
-            attempt.signature || "(no signature)"
-          }`
-        );
-        if (attempt.conflictPaths && attempt.conflictPaths.length > 0) {
-          lines.push(...attempt.conflictPaths.map((file) => `  - ${file}`));
-        }
-      }
-      lines.push("");
-    }
-
-    lines.push(
-      "Next action:",
-      "- Resolve conflicts on the PR branch, push updates, then re-add `ralph:queued` (or comment `RALPH RESOLVED:`) to resume."
-    );
-
-    return lines.join("\n");
-  }
-
-  private async writeMergeConflictEscalationComment(params: { issueNumber: number; body: string }): Promise<void> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    await this.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments`, {
-      method: "POST",
-      body: { body: params.body },
-    });
-  }
-
   private async finalizeMergeConflictEscalation(params: {
     task: AgentTask;
     issueNumber: string;
@@ -4364,21 +4375,25 @@ ${guidance}`
 
     await this.clearMergeConflictLabels(issueRef);
 
-    const escalationBody = this.buildMergeConflictEscalationSummary({
+    const escalationBody = buildMergeConflictEscalationDetails({
       prUrl: params.prUrl,
       baseRefName: params.baseRefName,
       headRefName: params.headRefName,
       attempts: params.attempts,
       reason: params.reason,
+      botBranch: getRepoBotBranch(this.repo),
     });
-    await this.writeMergeConflictEscalationComment({ issueNumber: Number(params.issueNumber), body: escalationBody });
 
     const wasEscalated = params.task.status === "escalated";
     const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
     if (escalated) {
       applyTaskPatch(params.task, "escalated", {});
     }
-    await this.writeEscalationWriteback(params.task, { reason: params.reason, escalationType: "blocked" });
+    await this.writeEscalationWriteback(params.task, {
+      reason: params.reason,
+      details: escalationBody,
+      escalationType: "merge-conflict",
+    });
     await this.notify.notifyEscalation({
       taskName: params.task.name,
       taskFileName: params.task._name,
@@ -4387,7 +4402,7 @@ ${guidance}`
       repo: this.repo,
       sessionId: params.sessionId,
       reason: params.reason,
-      escalationType: "blocked",
+      escalationType: "merge-conflict",
       planOutput: escalationBody,
     });
 
@@ -4676,6 +4691,8 @@ ${guidance}`
         stepTitle: `merge-conflict attempt ${attemptNumber}`,
       },
       ...this.buildWatchdogOptions(params.task, `merge-conflict-${attemptNumber}`),
+      ...this.buildStallOptions(params.task, `merge-conflict-${attemptNumber}`),
+      ...this.buildLoopDetectionOptions(params.task, `merge-conflict-${attemptNumber}`),
       ...params.opencodeSessionOptions,
     });
 
@@ -4687,6 +4704,12 @@ ${guidance}`
     if (pausedAfter) {
       await this.cleanupGitWorktree(worktreePath);
       return { status: "failed", run: pausedAfter };
+    }
+
+    if (sessionResult.loopTrip) {
+      await this.cleanupGitWorktree(worktreePath);
+      const run = await this.handleLoopTrip(params.task, params.cacheKey, `merge-conflict-${attemptNumber}`, sessionResult);
+      return { status: "failed", run };
     }
 
     if (sessionResult.watchdogTimeout) {
@@ -4867,7 +4890,7 @@ ${guidance}`
     lines.push(
       "",
       "Next action:",
-      "- Inspect the failing check runs linked above, fix or rerun as needed, then re-add `ralph:queued` (or comment `RALPH RESOLVED:`) to resume."
+      "- Inspect the failing check runs linked above, fix or rerun as needed, then re-add `ralph:status:queued` (or comment `RALPH RESOLVED:`) to resume."
     );
 
     return lines.join("\n");
@@ -5033,6 +5056,7 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(params.task, `ci-debug-${attemptNumber}`),
       ...this.buildStallOptions(params.task, `ci-debug-${attemptNumber}`),
+      ...this.buildLoopDetectionOptions(params.task, `ci-debug-${attemptNumber}`),
       ...params.opencodeSessionOptions,
     });
 
@@ -5206,9 +5230,9 @@ ${guidance}`
 
     if (!this.isGitHubQueueTask(task)) return null;
 
-    // Escalated issues are explicitly waiting on humans; do not attempt autonomous CI remediation.
+    // Escalated tasks are explicitly waiting on humans; do not attempt autonomous CI remediation.
     const issueLabels = issueMeta.labels ?? [];
-    if (task.status === "escalated" || issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_ESCALATED)) {
+    if (task.status === "escalated") {
       return null;
     }
 
@@ -5288,13 +5312,23 @@ ${guidance}`
         stepTitle: "survey",
       },
       ...this.buildWatchdogOptions(task, "survey"),
+      ...this.buildStallOptions(task, "survey"),
+      ...this.buildLoopDetectionOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
 
     await this.recordImplementationCheckpoint(task, surveyResult.sessionId || mergeGate.sessionId);
 
+    if (!surveyResult.success && surveyResult.loopTrip) {
+      return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
+    }
+
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
+    }
+
+    if (!surveyResult.success && surveyResult.stallTimeout) {
+      return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
     }
 
     try {
@@ -5423,10 +5457,15 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(task, "survey"),
       ...this.buildStallOptions(task, "survey"),
+      ...this.buildLoopDetectionOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
 
     await this.recordImplementationCheckpoint(task, surveyResult.sessionId || mergeGate.sessionId);
+
+    if (!surveyResult.success && surveyResult.loopTrip) {
+      return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
+    }
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
@@ -5514,6 +5553,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, stage),
           ...this.buildStallOptions(task, stage),
+          ...this.buildLoopDetectionOptions(task, stage),
           ...opencodeSessionOptions,
         })
       : await this.session.runAgent(taskRepoPath, "general", prompt, {
@@ -5529,6 +5569,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, stage),
           ...this.buildStallOptions(task, stage),
+          ...this.buildLoopDetectionOptions(task, stage),
           ...opencodeSessionOptions,
         });
 
@@ -5540,6 +5581,9 @@ ${guidance}`
     if (pausedAfter) return pausedAfter;
 
     if (!recoveryResult.success) {
+      if (recoveryResult.loopTrip) {
+        return await this.handleLoopTrip(task, cacheKey, stage, recoveryResult);
+      }
       if (recoveryResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, stage, recoveryResult, opencodeXdg);
       }
@@ -5604,6 +5648,7 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(task, "survey"),
       ...this.buildStallOptions(task, "survey"),
+      ...this.buildLoopDetectionOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
 
@@ -5615,6 +5660,10 @@ ${guidance}`
       surveyResult.sessionId || mergeGate.sessionId
     );
     if (pausedSurveyAfter) return pausedSurveyAfter;
+
+    if (!surveyResult.success && surveyResult.loopTrip) {
+      return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
+    }
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
       return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
@@ -6508,6 +6557,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(params.task, "parent-verify"),
         ...this.buildStallOptions(params.task, "parent-verify"),
+        ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
         ...(params.opencodeSessionOptions ?? {}),
       });
     } catch (error: any) {
@@ -6531,6 +6581,10 @@ ${guidance}`
         return null;
       }
       return await this.deferParentVerification(params.task, "parent verification error");
+    }
+
+    if (result.loopTrip) {
+      return await this.handleLoopTrip(params.task, `parent-verify-${params.issueNumber}`, "parent-verify", result);
     }
 
     if (!result.success) {
@@ -6700,6 +6754,21 @@ ${guidance}`
     };
   }
 
+  private buildLoopDetectionOptions(task: AgentTask, stage: string) {
+    void stage;
+    const cfg = getRepoLoopDetectionConfig(this.repo);
+    if (!cfg) return {};
+
+    return {
+      loopDetection: {
+        enabled: true,
+        gateMatchers: cfg.gateMatchers,
+        recommendedGateCommand: cfg.recommendedGateCommand,
+        thresholds: cfg.thresholds,
+      },
+    };
+  }
+
   private getPinnedOpencodeProfileName(task: AgentTask): string | null {
     const raw = task["opencode-profile"];
     const trimmed = typeof raw === "string" ? raw.trim() : "";
@@ -6790,9 +6859,20 @@ ${guidance}`
   }
 
   private readPauseRequested(): boolean {
+    return this.readPauseControl().pauseRequested;
+  }
+
+  private readPauseControl(): { pauseRequested: boolean; pauseAtCheckpoint: RalphCheckpoint | null } {
     const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-    return control.pauseRequested === true;
+
+    const pauseRequested = control.pauseRequested === true;
+    const pauseAtCheckpoint =
+      typeof control.pauseAtCheckpoint === "string" && isRalphCheckpoint(control.pauseAtCheckpoint)
+        ? (control.pauseAtCheckpoint as RalphCheckpoint)
+        : null;
+
+    return { pauseRequested, pauseAtCheckpoint };
   }
 
   private async waitForPauseCleared(opts?: { signal?: AbortSignal }): Promise<void> {
@@ -6859,6 +6939,8 @@ ${guidance}`
       waitUntilCleared: (opts?: { signal?: AbortSignal }) => this.waitForPauseCleared(opts),
     };
 
+    const pauseAtCheckpoint = this.readPauseControl().pauseAtCheckpoint;
+
     const emitter = {
       emit: (event: RalphEvent, key: string) => this.checkpointEvents.emit(event, key),
       hasEmitted: (key: string) => this.checkpointEvents.hasEmitted(key),
@@ -6866,6 +6948,7 @@ ${guidance}`
 
     await applyCheckpointReached({
       checkpoint,
+      pauseAtCheckpoint,
       state,
       context: {
         workerId,
@@ -6881,6 +6964,89 @@ ${guidance}`
 
   private async recordImplementationCheckpoint(task: AgentTask, sessionId?: string): Promise<void> {
     await this.recordCheckpoint(task, "implementation_step_complete", sessionId);
+  }
+
+  private async pauseIfGitHubRateLimited(
+    task: AgentTask,
+    stage: string,
+    error: unknown,
+    opts?: { sessionId?: string; runLogPath?: string }
+  ): Promise<AgentRun | null> {
+    const pause = computeGitHubRateLimitPause({
+      nowMs: Date.now(),
+      stage,
+      error,
+      priorResumeAtIso: task["resume-at"]?.trim() || null,
+    });
+
+    if (!pause) return null;
+
+    const sid = opts?.sessionId?.trim() || task["session-id"]?.trim() || "";
+
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.requested",
+        level: "warn",
+        data: { reason: `github-rate-limit:${stage}` },
+      },
+      { sessionId: sid || undefined }
+    );
+
+    const extraFields: Record<string, string> = {
+      "throttled-at": pause.throttledAtIso,
+      "resume-at": pause.resumeAtIso,
+      "usage-snapshot": pause.usageSnapshotJson,
+    };
+
+    if (sid) extraFields["session-id"] = sid;
+
+    const enteringThrottled = task.status !== "throttled";
+    const updated = await this.queue.updateTaskStatus(task, "throttled", extraFields);
+    if (!updated) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to mark task throttled after GitHub rate limit at stage=${stage}`);
+      return null;
+    }
+
+    applyTaskPatch(task, "throttled", extraFields);
+
+    if (enteringThrottled) {
+      const bodyPrefix = buildAgentRunBodyPrefix({
+        task,
+        headline: `Throttled: GitHub rate limit (${stage})`,
+        reason: `Resume at: ${pause.resumeAtIso}`,
+        details: pause.usageSnapshotJson,
+        sessionId: sid || undefined,
+        runLogPath: opts?.runLogPath ?? task["run-log-path"]?.trim() ?? undefined,
+      });
+      const runTime = new Date();
+      await this.createAgentRun(task, {
+        outcome: "throttled",
+        sessionId: sid || undefined,
+        started: runTime,
+        completed: runTime,
+        bodyPrefix,
+      });
+    }
+
+    console.log(
+      `[ralph:worker:${this.repo}] GitHub rate limit active; pausing at stage=${stage} resumeAt=${pause.resumeAtIso}`
+    );
+
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.reached",
+        level: "warn",
+        data: {},
+      },
+      { sessionId: sid || undefined }
+    );
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "throttled",
+      sessionId: sid || undefined,
+    };
   }
 
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
@@ -7019,6 +7185,7 @@ ${guidance}`
             runLogPath,
             ...this.buildWatchdogOptions(task, `nudge-${stage}`),
             ...this.buildStallOptions(task, `nudge-${stage}`),
+            ...this.buildLoopDetectionOptions(task, `nudge-${stage}`),
             ...opencodeSessionOptions,
           });
           await this.recordImplementationCheckpoint(task, res.sessionId || sid);
@@ -7369,6 +7536,94 @@ ${guidance}`
     };
   }
 
+  private async handleLoopTrip(task: AgentTask, cacheKey: string, stage: string, result: SessionResult): Promise<AgentRun> {
+    const trip = result.loopTrip;
+    const sessionId = result.sessionId || task["session-id"]?.trim() || "";
+    const worktreePath = task["worktree-path"]?.trim() || "";
+
+    const reason = trip ? `Loop detection tripped: ${trip.reason} (${stage})` : `Loop detection tripped (${stage})`;
+
+    let fallbackTouchedFiles: string[] | null = null;
+    if (trip && trip.metrics.topFiles.length === 0 && worktreePath) {
+      try {
+        const names = (await $`git diff --name-only`.cwd(worktreePath).quiet()).stdout
+          .toString()
+          .split("\n")
+          .map((v: string) => v.trim())
+          .filter(Boolean);
+        fallbackTouchedFiles = names.slice(0, 10);
+      } catch {
+        // ignore
+      }
+    }
+
+    const loopCfg = getRepoLoopDetectionConfig(this.repo);
+    const recommendedGateCommand = loopCfg?.recommendedGateCommand ?? "bun test";
+
+    const details =
+      trip != null
+        ? buildLoopTripDetails({
+            trip,
+            recommendedGateCommand,
+            lastDiagnosticSnippet: result.output,
+            fallbackTouchedFiles,
+          })
+        : undefined;
+
+    const escalationFields: Record<string, string> = {};
+    if (sessionId) escalationFields["session-id"] = sessionId;
+
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
+    if (escalated) {
+      applyTaskPatch(task, "escalated", escalationFields);
+    }
+
+    const githubCommentUrl = await this.writeEscalationWriteback(task, {
+      reason,
+      details,
+      escalationType: "other",
+    });
+
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      sessionId: sessionId || undefined,
+      reason,
+      escalationType: "other",
+      githubCommentUrl: githubCommentUrl ?? undefined,
+      planOutput: result.output,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        sessionId: sessionId || undefined,
+        details: result.output,
+      });
+    }
+
+    // Best-effort: clear per-task cache after a loop-trip, since we killed the session.
+    try {
+      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: sessionId || undefined,
+      escalationReason: reason,
+    };
+  }
+
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string; repoSlot?: number | null }): Promise<AgentRun> {
     const startTime = new Date();
 
@@ -7536,6 +7791,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(task, "resume"),
         ...this.buildStallOptions(task, "resume"),
+        ...this.buildLoopDetectionOptions(task, "resume"),
         ...opencodeSessionOptions,
       });
 
@@ -7545,6 +7801,9 @@ ${guidance}`
       if (pausedAfter) return pausedAfter;
 
       if (!buildResult.success) {
+        if (buildResult.loopTrip) {
+          return await this.handleLoopTrip(task, cacheKey, "resume", buildResult);
+        }
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult, opencodeXdg);
         }
@@ -7684,6 +7943,7 @@ ${guidance}`
               },
               ...this.buildWatchdogOptions(task, "resume-loop-break"),
               ...this.buildStallOptions(task, "resume-loop-break"),
+              ...this.buildLoopDetectionOptions(task, "resume-loop-break"),
               ...opencodeSessionOptions,
             }
           );
@@ -7697,10 +7957,13 @@ ${guidance}`
           );
           if (pausedLoopBreakAfter) return pausedLoopBreakAfter;
 
-          if (!buildResult.success) {
-            if (buildResult.watchdogTimeout) {
-              return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
-            }
+            if (!buildResult.success) {
+              if (buildResult.loopTrip) {
+                return await this.handleLoopTrip(task, cacheKey, "resume-loop-break", buildResult);
+              }
+              if (buildResult.watchdogTimeout) {
+                return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
+              }
 
             if (buildResult.stallTimeout) {
               return await this.handleStallTimeout(task, cacheKey, "resume-loop-break", buildResult);
@@ -7765,6 +8028,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, "resume-continue"),
           ...this.buildStallOptions(task, "resume-continue"),
+          ...this.buildLoopDetectionOptions(task, "resume-continue"),
           ...opencodeSessionOptions,
         });
 
@@ -7778,6 +8042,9 @@ ${guidance}`
         if (pausedContinueAfter) return pausedContinueAfter;
 
         if (!buildResult.success) {
+          if (buildResult.loopTrip) {
+            return await this.handleLoopTrip(task, cacheKey, "resume-continue", buildResult);
+          }
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult, opencodeXdg);
           }
@@ -7923,6 +8190,7 @@ ${guidance}`
         runLogPath: resumeSurveyRunLogPath,
         ...this.buildWatchdogOptions(task, "resume-survey"),
         ...this.buildStallOptions(task, "resume-survey"),
+        ...this.buildLoopDetectionOptions(task, "resume-survey"),
         ...opencodeSessionOptions,
       });
 
@@ -7937,6 +8205,9 @@ ${guidance}`
       if (pausedSurveyAfter) return pausedSurveyAfter;
 
       if (!surveyResult.success) {
+        if (surveyResult.loopTrip) {
+          return await this.handleLoopTrip(task, cacheKey, "resume-survey", surveyResult);
+        }
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult, opencodeXdg);
         }
@@ -7991,6 +8262,12 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
       if (!error?.ralphRootDirty) {
+        const paused = await this.pauseIfGitHubRateLimited(task, "resume", error, {
+          sessionId: task["session-id"]?.trim() || undefined,
+          runLogPath: task["run-log-path"]?.trim() || undefined,
+        });
+        if (paused) return paused;
+
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
@@ -8099,6 +8376,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(params.task, "parent-verify"),
         ...this.buildStallOptions(params.task, "parent-verify"),
+        ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
         ...(params.opencodeSessionOptions ?? {}),
       });
 
@@ -8108,6 +8386,10 @@ ${guidance}`
         verifyResult.sessionId
       );
       if (pausedAfterVerify) return pausedAfterVerify;
+
+      if (verifyResult.loopTrip) {
+        return await this.handleLoopTrip(params.task, verifyCacheKey, "parent-verify", verifyResult);
+      }
 
       if (!verifyResult.success && verifyResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(params.task, verifyCacheKey, "parent-verify", verifyResult, params.opencodeXdg);
@@ -8378,6 +8660,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(task, "plan"),
         ...this.buildStallOptions(task, "plan"),
+        ...this.buildLoopDetectionOptions(task, "plan"),
         ...opencodeSessionOptions,
       });
 
@@ -8390,6 +8673,10 @@ ${guidance}`
 
       if (!planResult.success && planResult.stallTimeout) {
         return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
+      }
+
+      if (!planResult.success && planResult.loopTrip) {
+        return await this.handleLoopTrip(task, cacheKey, "plan", planResult);
       }
 
       if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
@@ -8410,6 +8697,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, "plan-retry"),
           ...this.buildStallOptions(task, "plan-retry"),
+          ...this.buildLoopDetectionOptions(task, "plan-retry"),
           ...opencodeSessionOptions,
         });
       }
@@ -8495,6 +8783,7 @@ ${guidance}`
             stepTitle: "consult devex",
           },
           ...this.buildStallOptions(task, "consult devex"),
+          ...this.buildLoopDetectionOptions(task, "consult devex"),
           ...opencodeSessionOptions,
         });
 
@@ -8508,6 +8797,9 @@ ${guidance}`
         if (pausedAfterDevexConsult) return pausedAfterDevexConsult;
 
         if (!devexResult.success) {
+          if (devexResult.loopTrip) {
+            return await this.handleLoopTrip(task, cacheKey, "consult devex", devexResult);
+          }
           if (devexResult.stallTimeout) {
             return await this.handleStallTimeout(task, cacheKey, "consult devex", devexResult);
           }
@@ -8556,6 +8848,7 @@ ${guidance}`
               stepTitle: "reroute after devex",
             },
             ...this.buildStallOptions(task, "reroute after devex"),
+            ...this.buildLoopDetectionOptions(task, "reroute after devex"),
             ...opencodeSessionOptions,
           });
 
@@ -8569,6 +8862,9 @@ ${guidance}`
           if (pausedAfterReroute) return pausedAfterReroute;
 
           if (!rerouteResult.success) {
+            if (rerouteResult.loopTrip) {
+              return await this.handleLoopTrip(task, cacheKey, "reroute after devex", rerouteResult);
+            }
             if (rerouteResult.stallTimeout) {
               return await this.handleStallTimeout(task, cacheKey, "reroute after devex", rerouteResult);
             }
@@ -8701,6 +8997,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(task, "build"),
         ...this.buildStallOptions(task, "build"),
+        ...this.buildLoopDetectionOptions(task, "build"),
         ...opencodeSessionOptions,
       });
 
@@ -8710,6 +9007,9 @@ ${guidance}`
       if (pausedAfterBuild) return pausedAfterBuild;
 
       if (!buildResult.success) {
+        if (buildResult.loopTrip) {
+          return await this.handleLoopTrip(task, cacheKey, "build", buildResult);
+        }
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult, opencodeXdg);
         }
@@ -8841,6 +9141,7 @@ ${guidance}`
               },
               ...this.buildWatchdogOptions(task, "build-loop-break"),
               ...this.buildStallOptions(task, "build-loop-break"),
+              ...this.buildLoopDetectionOptions(task, "build-loop-break"),
               ...opencodeSessionOptions,
             }
           );
@@ -8850,10 +9151,13 @@ ${guidance}`
           const pausedBuildLoopBreakAfter = await this.pauseIfHardThrottled(task, "build loop-break (post)", buildResult.sessionId);
           if (pausedBuildLoopBreakAfter) return pausedBuildLoopBreakAfter;
 
-          if (!buildResult.success) {
-            if (buildResult.watchdogTimeout) {
-              return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
-            }
+            if (!buildResult.success) {
+              if (buildResult.loopTrip) {
+                return await this.handleLoopTrip(task, cacheKey, "build-loop-break", buildResult);
+              }
+              if (buildResult.watchdogTimeout) {
+                return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
+              }
 
             if (buildResult.stallTimeout) {
               return await this.handleStallTimeout(task, cacheKey, "build-loop-break", buildResult);
@@ -8918,6 +9222,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, "build-continue"),
           ...this.buildStallOptions(task, "build-continue"),
+          ...this.buildLoopDetectionOptions(task, "build-continue"),
           ...opencodeSessionOptions,
         });
 
@@ -8927,6 +9232,9 @@ ${guidance}`
         if (pausedBuildContinueAfter) return pausedBuildContinueAfter;
 
         if (!buildResult.success) {
+          if (buildResult.loopTrip) {
+            return await this.handleLoopTrip(task, cacheKey, "build-continue", buildResult);
+          }
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult, opencodeXdg);
           }
@@ -9076,6 +9384,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(task, "survey"),
         ...this.buildStallOptions(task, "survey"),
+        ...this.buildLoopDetectionOptions(task, "survey"),
         ...opencodeSessionOptions,
       });
 
@@ -9085,6 +9394,9 @@ ${guidance}`
       if (pausedSurveyAfter) return pausedSurveyAfter;
 
       if (!surveyResult.success) {
+        if (surveyResult.loopTrip) {
+          return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
+        }
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
         }
@@ -9136,6 +9448,12 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
       if (!error?.ralphRootDirty) {
+        const paused = await this.pauseIfGitHubRateLimited(task, "process", error, {
+          sessionId: task["session-id"]?.trim() || undefined,
+          runLogPath: task["run-log-path"]?.trim() || undefined,
+        });
+        if (paused) return paused;
+
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });

@@ -9,11 +9,13 @@ import {
   recordIssueSnapshot,
   recordRepoGithubIssueBootstrapCursor,
   recordRepoGithubIssueSync,
+  setRepoLabelSchemeState,
   runInStateTransaction,
 } from "../state";
 import { buildIssuesListUrl, fetchIssuesPage, fetchIssuesSince, validateIssuesCursor } from "./issues-rest";
-import { buildIssueStorePlan, computeNewLastSyncAt, computeSince } from "./issues-sync-core";
+import { buildIssueStorePlan, computeNewLastSyncAt, computeSince, extractLabelNames, normalizeIssueState } from "./issues-sync-core";
 import type { SyncDeps, SyncResult } from "./issues-sync-types";
+import { detectLegacyWorkflowLabels } from "../github-labels";
 
 const DEFAULT_ISSUE_SYNC_MAX_INFLIGHT = 2;
 const DEFAULT_ISSUE_SYNC_MAX_PAGES_PER_TICK = 2;
@@ -57,6 +59,36 @@ export async function syncRepoIssuesOnce(params: {
   );
 
   let releaseSync: ReleaseFn | null = null;
+  const legacyDetected = new Set<string>();
+
+  const scanLegacyLabels = (rows: Array<{ state?: string; labels?: unknown }>) => {
+    for (const row of rows) {
+      const state = normalizeIssueState(row.state);
+      if (state === "CLOSED") continue;
+      const labels = extractLabelNames(row.labels as any);
+      for (const legacy of detectLegacyWorkflowLabels(labels)) {
+        legacyDetected.add(legacy);
+      }
+    }
+  };
+
+  const persistLabelSchemeState = () => {
+    const detected = Array.from(legacyDetected).sort((a, b) => a.localeCompare(b));
+    if (detected.length === 0) {
+      setRepoLabelSchemeState({ repo: params.repo, errorCode: null, errorDetails: null, checkedAt: nowIso });
+      return;
+    }
+
+    const details =
+      `Legacy workflow labels detected on OPEN issues/PRs: ${detected.join(", ")}. ` +
+      `Manual cutover required: see docs/ops/label-scheme-migration.md`;
+    setRepoLabelSchemeState({
+      repo: params.repo,
+      errorCode: "legacy-workflow-labels",
+      errorDetails: details,
+      checkedAt: nowIso,
+    });
+  };
 
   try {
     releaseSync = await issueSyncSemaphore.acquire();
@@ -125,6 +157,8 @@ export async function syncRepoIssuesOnce(params: {
 
         fetched += page.fetched;
         pagesFetched += 1;
+
+        scanLegacyLabels(page.rows);
 
         if (!bootstrapHighWatermark && page.pageMaxUpdatedAt) {
           bootstrapHighWatermark = page.pageMaxUpdatedAt;
@@ -203,6 +237,8 @@ export async function syncRepoIssuesOnce(params: {
         url = page.nextUrlRaw ? new URL(page.nextUrlRaw) : null;
       }
 
+      persistLabelSchemeState();
+
       return {
         ok: true,
         fetched,
@@ -237,6 +273,8 @@ export async function syncRepoIssuesOnce(params: {
         error: fetchResult.error,
       };
     }
+
+    scanLegacyLabels(fetchResult.issues);
 
     const newLastSyncAt = computeNewLastSyncAt({
       fetched: fetchResult.fetched,
@@ -286,6 +324,8 @@ export async function syncRepoIssuesOnce(params: {
     });
 
     const finalPlan = plan ?? { plans: [], ralphCount: 0 };
+
+    persistLabelSchemeState();
 
     return {
       ok: true,

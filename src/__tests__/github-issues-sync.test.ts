@@ -4,7 +4,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
 
-import { closeStateDbForTests, initStateDb, recordRepoGithubIssueBootstrapCursor } from "../state";
+import { closeStateDbForTests, getRepoLabelSchemeState, initStateDb, recordRepoGithubIssueBootstrapCursor } from "../state";
 import { getRalphStateDbPath } from "../paths";
 import { syncRepoIssuesOnce } from "../github-issues-sync";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
@@ -102,7 +102,7 @@ describe("github issue sync", () => {
       calls.push(String(input));
       return new Response(
         JSON.stringify([
-          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] }),
           buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["dx", "chore"] }),
           buildIssue({ number: 3, updatedAt: "2026-01-11T00:00:03.000Z", isPr: true }),
         ]),
@@ -142,15 +142,41 @@ describe("github issue sync", () => {
         )
         .all() as Array<{ issue_number: number; name: string }>;
 
-      expect(labels).toEqual([{ issue_number: 1, name: "ralph:queued" }]);
+      expect(labels).toEqual([{ issue_number: 1, name: "ralph:status:queued" }]);
     } finally {
       db.close();
     }
   });
 
+  test("records legacy workflow label scheme errors", async () => {
+    const fetchMock: FetchLike = async () =>
+      new Response(
+        JSON.stringify([
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", isPr: true, labels: ["ralph:queued"] }),
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      deps: {
+        fetch: fetchMock,
+        getToken: async () => "token",
+        now: () => new Date("2026-01-11T00:00:10.000Z"),
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    const scheme = getRepoLabelSchemeState(repo);
+    expect(scheme.errorCode).toBe("legacy-workflow-labels");
+    expect(scheme.errorDetails ?? "").toContain("ralph:queued");
+  });
+
   test("clears labels when removed", async () => {
     const responses = [
-      [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] })],
+      [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] })],
       [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:02.000Z", labels: [] })],
     ];
     let idx = 0;
@@ -217,15 +243,15 @@ describe("github issue sync", () => {
       calls.push(url);
       if (url.includes("page=2")) {
         return new Response(
-          JSON.stringify([buildIssue({ number: 4, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:queued"] })]),
+          JSON.stringify([buildIssue({ number: 4, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
           { status: 200, headers: { "Content-Type": "application/json" } }
         );
       }
 
       return new Response(
         JSON.stringify([
-          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
-          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] }),
+          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["ralph:status:queued"] }),
         ]),
         {
           status: 200,
@@ -303,7 +329,7 @@ describe("github issue sync", () => {
           const url = String(input);
           calls.push(url);
           return new Response(
-            JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:queued"] })]),
+            JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
             {
               status: 200,
               headers: {
@@ -363,12 +389,12 @@ describe("github issue sync", () => {
         calls.push(url);
         if (url.includes("page=2")) {
           return new Response(
-            JSON.stringify([buildIssue({ number: 2, updatedAt: "2026-01-10T00:00:01.000Z", labels: ["ralph:queued"] })]),
+            JSON.stringify([buildIssue({ number: 2, updatedAt: "2026-01-10T00:00:01.000Z", labels: ["ralph:status:queued"] })]),
             { status: 200, headers: { "Content-Type": "application/json" } }
           );
         }
         return new Response(
-          JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:queued"] })]),
+          JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
           {
             status: 200,
             headers: {
@@ -446,7 +472,7 @@ describe("github issue sync", () => {
     const fetchMock: FetchLike = async (input: RequestInfo | URL) => {
       calls.push(String(input));
       return new Response(
-        JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:queued"] })]),
+        JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
         { status: 200, headers: { "Content-Type": "application/json" } }
       );
     };

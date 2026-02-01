@@ -30,7 +30,15 @@ type IssueComment = { body?: string | null; databaseId?: number | null; url?: st
 const MARKER_PREFIX = "<!-- ralph-parent-verify:id=";
 const MARKER_REGEX = /<!--\s*ralph-parent-verify:id=([^\s]+)\s*-->/i;
 const DEFAULT_COMMENT_SCAN_LIMIT = 100;
-const LABELS_TO_REMOVE = ["ralph:queued", "ralph:escalated", "ralph:in-progress"];
+const LABELS_TO_REMOVE = [
+  "ralph:status:queued",
+  "ralph:status:blocked",
+  "ralph:status:in-progress",
+  "ralph:status:paused",
+  "ralph:status:throttled",
+  "ralph:status:in-bot",
+  "ralph:status:done",
+];
 
 function hashFNV1a(input: string): string {
   let hash = 2166136261;

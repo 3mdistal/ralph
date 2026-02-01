@@ -10,7 +10,7 @@ import { buildStatusSnapshot, type StatusSnapshot } from "../status-snapshot";
 import { collectStatusUsageRows, formatStatusUsageSection } from "../status-usage";
 import { readRunTokenTotals } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
-import { initStateDb, listIssueAlertSummaries } from "../state";
+import { initStateDb, listIssueAlertSummaries, listTopRalphRunTriages } from "../state";
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
 import { parseIssueRef } from "../github/issue-ref";
@@ -144,6 +144,8 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
     };
   };
 
+  const triageRuns = listTopRalphRunTriages({ limit: 5, sinceDays: 14 });
+
   const inProgressWithStatus = await Promise.all(
     inProgress.map(async (task) => {
       const sessionId = task["session-id"]?.trim() || null;
@@ -174,6 +176,18 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
     controlProfile: controlProfile || null,
     activeProfile: resolvedProfile ?? null,
     throttle: throttle.snapshot,
+    triageRuns: triageRuns.map((r) => ({
+      runId: r.runId,
+      repo: r.repo,
+      issueNumber: r.issueNumber,
+      outcome: r.outcome,
+      score: r.score,
+      reasons: r.reasons,
+      tokensTotal: r.tokensTotal,
+      toolCallCount: r.toolCallCount,
+      wallTimeMs: r.wallTimeMs,
+      computedAt: r.computedAt,
+    })),
     escalations: {
       pending: pendingEscalations.length,
     },
@@ -336,6 +350,8 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     timeoutMs: STATUS_USAGE_TIMEOUT_MS,
   });
 
+  const triageRuns = listTopRalphRunTriages({ limit: 5, sinceDays: 14 });
+
     if (json) {
       const inProgressWithStatus = await Promise.all(
         inProgress.map(async (task) => {
@@ -379,6 +395,18 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       activeProfile: resolvedProfile ?? null,
       throttle: throttle.snapshot,
       usage: { profiles: usageRows },
+      triageRuns: triageRuns.map((r) => ({
+        runId: r.runId,
+        repo: r.repo,
+        issueNumber: r.issueNumber,
+        outcome: r.outcome,
+        score: r.score,
+        reasons: r.reasons,
+        tokensTotal: r.tokensTotal,
+        toolCallCount: r.toolCallCount,
+        wallTimeMs: r.wallTimeMs,
+        computedAt: r.computedAt,
+      })),
       escalations: {
         pending: pendingEscalations.length,
       },
@@ -469,6 +497,18 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   for (const line of usageLines) console.log(line);
 
   console.log(`Escalations: ${pendingEscalations.length} pending`);
+
+  if (triageRuns.length > 0) {
+    console.log(`Triage runs (last 14d): ${triageRuns.length}`);
+    for (const run of triageRuns) {
+      const issueLabel = run.issueNumber ? `#${run.issueNumber}` : "(no issue)";
+      const runShort = run.runId.slice(0, 8);
+      const reasons = run.reasons.length > 0 ? run.reasons.join(",") : "(none)";
+      console.log(
+        `  - score=${run.score} outcome=${run.outcome ?? "unknown"} ${run.repo}${issueLabel} run=${runShort} reasons=${reasons}`
+      );
+    }
+  }
   console.log(`Starting tasks: ${starting.length}`);
   for (const task of starting) {
     console.log(`  - ${await getTaskNowDoingLine(task)}`);
