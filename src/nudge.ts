@@ -4,6 +4,7 @@ import { randomUUID } from "crypto";
 import { dirname, join } from "path";
 
 import { getRalphSessionDir, getRalphSessionNudgesPath } from "./paths";
+import { redactSensitiveText } from "./redaction";
 
 export interface PendingNudge {
   id: string;
@@ -11,6 +12,21 @@ export interface PendingNudge {
   createdAt: number;
   failedAttempts: number;
 }
+
+export type NudgePreview = {
+  len: number;
+  preview: string;
+};
+
+export type NudgeDeliveryOutcome =
+  | { kind: "delivered" }
+  | { kind: "failed"; error?: string }
+  | { kind: "deferred"; reason: string };
+
+export type NudgeQueueState = {
+  pending: PendingNudge[];
+  blocked?: PendingNudge;
+};
 
 type NudgeEvent =
   | {
@@ -43,6 +59,13 @@ function safeJsonParse(line: string): any | null {
 function truncate(value: string, max = 800): string {
   const trimmed = value.trim();
   return trimmed.length > max ? trimmed.slice(0, max) + "…" : trimmed;
+}
+
+export function buildNudgePreview(message: string, maxPreview = 160): NudgePreview {
+  const raw = String(message ?? "");
+  const redacted = redactSensitiveText(raw).trim();
+  const preview = redacted.length > maxPreview ? `${redacted.slice(0, maxPreview)}...` : redacted;
+  return { len: raw.length, preview };
 }
 
 const DRAIN_LOCK_TTL_MS = 10 * 60_000;
@@ -118,6 +141,65 @@ async function readEvents(sessionId: string): Promise<NudgeEvent[]> {
   return out;
 }
 
+function buildQueueState(events: NudgeEvent[], maxAttempts: number): NudgeQueueState {
+  const order: string[] = [];
+  const nudges = new Map<
+    string,
+    { message: string; createdAt: number; failedAttempts: number; delivered: boolean }
+  >();
+
+  for (const event of events) {
+    if (event.type === "nudge") {
+      if (!nudges.has(event.id)) {
+        nudges.set(event.id, {
+          message: event.message,
+          createdAt: event.ts,
+          failedAttempts: 0,
+          delivered: false,
+        });
+        order.push(event.id);
+      }
+      continue;
+    }
+
+    const nudge = nudges.get(event.id);
+    if (!nudge) continue;
+
+    if (event.success) {
+      nudge.delivered = true;
+    } else {
+      nudge.failedAttempts += 1;
+    }
+  }
+
+  const pending: PendingNudge[] = [];
+  for (const id of order) {
+    const nudge = nudges.get(id);
+    if (!nudge || nudge.delivered) continue;
+
+    if (nudge.failedAttempts >= maxAttempts) {
+      return {
+        pending: [],
+        blocked: {
+          id,
+          message: nudge.message,
+          createdAt: nudge.createdAt,
+          failedAttempts: nudge.failedAttempts,
+        },
+      };
+    }
+
+    pending.push({
+      id,
+      message: nudge.message,
+      createdAt: nudge.createdAt,
+      failedAttempts: nudge.failedAttempts,
+    });
+  }
+
+  return { pending };
+}
+
 export async function queueNudge(
   sessionId: string,
   message: string,
@@ -154,83 +236,108 @@ export async function recordDeliveryAttempt(
 
 export async function getPendingNudges(sessionId: string, maxAttempts = 3): Promise<PendingNudge[]> {
   const events = await readEvents(sessionId);
+  const state = buildQueueState(events, maxAttempts);
+  return state.pending;
+}
 
-  const nudges = new Map<string, { message: string; createdAt: number; failedAttempts: number; delivered: boolean }>();
-
-  for (const event of events) {
-    if (event.type === "nudge") {
-      if (!nudges.has(event.id)) {
-        nudges.set(event.id, {
-          message: event.message,
-          createdAt: event.ts,
-          failedAttempts: 0,
-          delivered: false,
-        });
-      }
-      continue;
-    }
-
-    const nudge = nudges.get(event.id);
-    if (!nudge) continue;
-
-    if (event.success) {
-      nudge.delivered = true;
-    } else {
-      nudge.failedAttempts++;
-    }
-  }
-
-  const pending: PendingNudge[] = [];
-  for (const [id, nudge] of nudges) {
-    if (nudge.delivered) continue;
-    if (nudge.failedAttempts >= maxAttempts) continue;
-    pending.push({ id, message: nudge.message, createdAt: nudge.createdAt, failedAttempts: nudge.failedAttempts });
-  }
-
-  pending.sort((a, b) => a.createdAt - b.createdAt);
-  return pending;
+export async function getNudgeQueueState(sessionId: string, maxAttempts = 3): Promise<NudgeQueueState> {
+  const events = await readEvents(sessionId);
+  return buildQueueState(events, maxAttempts);
 }
 
 export interface DrainResult {
   attempted: number;
   delivered: number;
   stoppedOnError: boolean;
+  deferred: boolean;
+  deferredReason?: string;
+  deferredNudgeId?: string;
+  blocked: boolean;
+  blockedNudge?: PendingNudge;
 }
 
 export async function drainQueuedNudges(
   sessionId: string,
-  deliver: (message: string) => Promise<{ success: boolean; error?: string }>,
-  opts?: { maxAttempts?: number }
+  deliver: (message: string) => Promise<NudgeDeliveryOutcome>,
+  opts?: {
+    maxAttempts?: number;
+    onDetect?: (state: NudgeQueueState) => void;
+    onAttempt?: (nudge: PendingNudge) => void;
+    onOutcome?: (nudge: PendingNudge, outcome: NudgeDeliveryOutcome) => void;
+  }
 ): Promise<DrainResult> {
   const release = await acquireDrainLock(sessionId);
   if (!release) {
-    return { attempted: 0, delivered: 0, stoppedOnError: false };
+    return {
+      attempted: 0,
+      delivered: 0,
+      stoppedOnError: false,
+      deferred: false,
+      blocked: false,
+    };
   }
 
   let attempted = 0;
   let delivered = 0;
   let stoppedOnError = false;
+  let deferred = false;
+  let deferredReason: string | undefined;
+  let deferredNudgeId: string | undefined;
+  let blocked = false;
+  let blockedNudge: PendingNudge | undefined;
 
   try {
     const maxAttempts = opts?.maxAttempts ?? 3;
-    const pending = await getPendingNudges(sessionId, maxAttempts);
+    const state = await getNudgeQueueState(sessionId, maxAttempts);
+    opts?.onDetect?.(state);
 
-    for (const nudge of pending) {
+    if (state.blocked) {
+      blocked = true;
+      blockedNudge = state.blocked;
+      return {
+        attempted,
+        delivered,
+        stoppedOnError,
+        deferred,
+        blocked,
+        blockedNudge,
+      };
+    }
+
+    for (const nudge of state.pending) {
+      opts?.onAttempt?.(nudge);
+      const outcome = await deliver(nudge.message);
+      opts?.onOutcome?.(nudge, outcome);
+
+      if (outcome.kind === "deferred") {
+        deferred = true;
+        deferredReason = outcome.reason;
+        deferredNudgeId = nudge.id;
+        break;
+      }
+
       attempted += 1;
-
-      const delivery = await deliver(nudge.message);
-      await recordDeliveryAttempt(sessionId, nudge.id, delivery);
-
-      if (!delivery.success) {
+      if (outcome.kind === "failed") {
+        await recordDeliveryAttempt(sessionId, nudge.id, { success: false, error: outcome.error });
         stoppedOnError = true;
         break;
       }
 
+      await recordDeliveryAttempt(sessionId, nudge.id, { success: true });
       delivered += 1;
     }
   } finally {
     await release();
   }
 
-  return { attempted: attempted, delivered: delivered, stoppedOnError: stoppedOnError };
+  return {
+    attempted,
+    delivered,
+    stoppedOnError,
+    deferred,
+    deferredReason,
+    deferredNudgeId,
+    blocked,
+    blockedNudge,
+  };
 }

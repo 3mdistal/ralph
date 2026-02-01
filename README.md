@@ -398,6 +398,8 @@ ralph nudge <taskRef> "Just implement it, stop asking questions"
 
 - Best-effort queued delivery: Ralph queues the message and delivers it at the next safe checkpoint (between `continueSession(...)` runs).
 - Success means the delivery attempt succeeded, not guaranteed agent compliance.
+- Delivery is FIFO per session; multiple messages deliver sequentially at a checkpoint and stop on the first failed attempt.
+- If a worker is paused at a checkpoint (or hard-throttled), delivery is deferred and the attempt is not burned.
 
 ### Release a stuck task slot (local-only)
 

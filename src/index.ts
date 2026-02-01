@@ -63,11 +63,12 @@ import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { releaseTaskSlot } from "./state";
 import { updateControlFile } from "./control-file";
-import { queueNudge } from "./nudge";
+import { buildNudgePreview, queueNudge } from "./nudge";
 import { terminateOpencodeRuns } from "./opencode-process-registry";
 import { ralphEventBus } from "./dashboard/bus";
 import { publishDashboardEvent } from "./dashboard/publisher";
 import { cleanupDashboardEventLogs, installDashboardEventPersistence, type DashboardEventPersistence } from "./dashboard/event-persistence";
+import { resolveMessageSessionId } from "./dashboard/message-targeting";
 import { startGitHubIssuePollers } from "./github-issues-sync";
 import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
@@ -1488,10 +1489,19 @@ async function main(): Promise<void> {
             );
           },
           enqueueMessage: async ({ workerId, sessionId, text }) => {
-            const resolvedSessionId = sessionId?.trim() || resolveSessionIdForWorkerId(workerId ?? null);
-            if (!resolvedSessionId) {
-              throw new Error("Unable to resolve session; provide sessionId or an active workerId");
+            const resolvedTarget = resolveMessageSessionId({
+              workerId,
+              sessionId,
+              resolveWorkerId: resolveSessionIdForWorkerId,
+            });
+            if (!resolvedTarget.sessionId) {
+              if (workerId?.trim()) {
+                throw new Error("Unable to resolve session for workerId; worker is not active");
+              }
+              throw new Error("Provide sessionId or an active workerId");
             }
+
+            const resolvedSessionId = resolvedTarget.sessionId;
 
             const payload = activeSessionTasks.get(resolvedSessionId);
             const id = await queueNudge(resolvedSessionId, text, {
@@ -1499,6 +1509,20 @@ async function main(): Promise<void> {
               taskRef: payload?.task.issue,
               taskPath: payload?.task._path,
             });
+
+            const preview = buildNudgePreview(text);
+            publishDashboardEvent(
+              {
+                type: "message.queued",
+                level: "info",
+                ...(payload?.workerId ? { workerId: payload.workerId } : {}),
+                ...(payload?.task.repo ? { repo: payload.task.repo } : {}),
+                ...(payload?.taskId ? { taskId: payload.taskId } : {}),
+                sessionId: resolvedSessionId,
+                data: { id, len: preview.len, preview: preview.preview },
+              },
+              { sessionId: resolvedSessionId, workerId: payload?.workerId }
+            );
 
             publishDashboardEvent(
               {
