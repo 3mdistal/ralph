@@ -241,6 +241,13 @@ This document captures decisions and discoveries made during an interactive audi
 
 - Required label set becomes an explicit canonical claim (enumerated status + command labels).
 
+### Interview 13 (2026-02-01)
+
+- Deterministic gates decisions:
+  - Promote core gates claims (preflight, review marker contract, CI triage lanes, persisted gate state).
+  - Make `ralph gates <repo> <issueNumber> [--json]` a canonical planned CLI surface.
+  - Avoid duplicate opencode determinism claims; keep `opencode.managed-config` as the single canonical claim.
+
 ### Repo Scan (code reality) (2026-02-01)
 
 - bwrb is still heavily present in implementation (`src/queue.ts`, `src/queue-backend.ts`, `src/bwrb/*`, `src/notify.ts`, `src/escalation-notes.ts`, and multiple tests).
