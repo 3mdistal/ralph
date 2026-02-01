@@ -33,7 +33,7 @@ import {
   type SessionResult,
 } from "./session";
 import { buildPlannerPrompt } from "./planner-prompt";
-import { buildParentVerificationPrompt } from "./parent-verification-prompt";
+import { buildParentVerificationPrompt as buildLegacyParentVerificationPrompt } from "./parent-verification-prompt";
 import { getThrottleDecision } from "./throttle";
 import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
 import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
@@ -5346,7 +5346,7 @@ ${guidance}`
     };
   }
 
-  private async maybeRunParentVerification(params: {
+  private async maybeRunParentCompletionVerification(params: {
     task: AgentTask;
     issueNumber: string;
     taskRepoPath: string;
@@ -6527,7 +6527,7 @@ ${guidance}`
     };
   }
 
-  private async maybeRunParentVerification(params: {
+  private async maybeRunLegacyParentVerification(params: {
     task: AgentTask;
     issueNumber: string;
     issueMeta: IssueMetadata;
@@ -6571,7 +6571,7 @@ ${guidance}`
 
     const attemptCount = claimed.attemptCount;
     await this.recordRunLogPath(params.task, params.issueNumber, "parent-verify", "queued");
-    const prompt = buildParentVerificationPrompt({ repo: this.repo, issueNumber: params.issueNumber });
+    const prompt = buildLegacyParentVerificationPrompt({ repo: this.repo, issueNumber: params.issueNumber });
     let result: SessionResult;
     try {
       result = await this.session.runAgent(this.repoPath, "ralph-parent-verify", prompt, {
@@ -8057,7 +8057,7 @@ ${guidance}`
       const opencodeXdg = resolvedOpencode.opencodeXdg;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
-      const parentVerifyRun = await this.maybeRunParentVerification({
+      const parentVerifyRun = await this.maybeRunLegacyParentVerification({
         task,
         issueNumber,
         issueMeta,
@@ -8163,7 +8163,7 @@ ${guidance}`
       });
       if (ciFailureRun) return ciFailureRun;
 
-      const parentVerificationRun = await this.maybeRunParentVerification({
+      const parentVerificationRun = await this.maybeRunParentCompletionVerification({
         task,
         issueNumber,
         taskRepoPath,
