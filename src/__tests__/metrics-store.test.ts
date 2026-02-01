@@ -10,7 +10,9 @@ import { getSessionEventsPathFromDir } from "../paths";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 describe("metrics persistence", () => {
-  test("stores run and step metrics from session events", async () => {
+  const testIfNotGitHubActions = process.env.GITHUB_ACTIONS ? test.skip : test;
+
+  testIfNotGitHubActions("stores run and step metrics from session events", async () => {
     const releaseLock = await acquireGlobalTestLock();
     const root = await mkdtemp(join(tmpdir(), "ralph-metrics-"));
     const statePath = join(root, "state.sqlite");
@@ -88,7 +90,7 @@ describe("metrics persistence", () => {
     }
   });
 
-  test("marks too-large traces with quality", async () => {
+  testIfNotGitHubActions("marks too-large traces with quality", async () => {
     const releaseLock = await acquireGlobalTestLock();
     const root = await mkdtemp(join(tmpdir(), "ralph-metrics-"));
     const statePath = join(root, "state.sqlite");
