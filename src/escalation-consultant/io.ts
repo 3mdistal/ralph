@@ -54,7 +54,8 @@ async function releaseLock(lockPath: string | null): Promise<void> {
 }
 
 function hasConsultantMarker(text: string): boolean {
-  return text.includes(CONSULTANT_MARKER) || text.includes("## Consultant Decision (machine)");
+  const markerRe = /<!--\s*ralph-consultant:v\d+\s*-->/i;
+  return markerRe.test(text) || text.includes("## Consultant Decision (machine)");
 }
 
 function ensureTrailingNewline(text: string): string {

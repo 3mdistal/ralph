@@ -1,7 +1,8 @@
 import { redactSensitiveText } from "../redaction";
+import { hasProductGap } from "../product-gap";
 
-export const CONSULTANT_SCHEMA_VERSION = 1;
-export const CONSULTANT_MARKER = "<!-- ralph-consultant:v1 -->";
+export const CONSULTANT_SCHEMA_VERSION = 2;
+export const CONSULTANT_MARKER = "<!-- ralph-consultant:v2 -->";
 const CONSULTANT_BRIEF_HEADING = "## Consultant Brief";
 const CONSULTANT_DECISION_HEADING = "## Consultant Decision (machine)";
 
@@ -16,6 +17,15 @@ const MAX_PROPOSED_RESOLUTION_CHARS = 2000;
 const MAX_JSON_REASON_CHARS = 1200;
 const MAX_FOLLOWUP_TITLE_CHARS = 200;
 const MAX_FOLLOWUP_BODY_CHARS = 2000;
+const MAX_CURRENT_STATE_CHARS = 800;
+const MAX_WHATS_MISSING_CHARS = 800;
+const MAX_RECOMMENDATION_CHARS = 800;
+const MAX_OPTION_CHARS = 240;
+const MAX_QUESTION_CHARS = 200;
+const MAX_OPTIONS = 4;
+const MIN_OPTIONS = 2;
+const MAX_QUESTIONS = 3;
+const MIN_QUESTIONS = 1;
 const MAX_NOTE_CONTEXT_CHARS = 6000;
 const MAX_PLAN_CONTEXT_CHARS = 4000;
 const MAX_PRODUCT_CONTEXT_CHARS = 2000;
@@ -27,6 +37,11 @@ export type ConsultantDecision = {
   decision: "auto-resolve" | "needs-human";
   confidence: "high" | "medium" | "low";
   requires_approval: true;
+  current_state: string;
+  whats_missing: string;
+  options: string[];
+  recommendation: string;
+  questions: string[];
   proposed_resolution_text: string;
   reason: string;
   followups: Array<{ type: "issue"; title: string; body: string }>;
@@ -112,6 +127,126 @@ function normalizeFollowups(value: unknown): Array<{ type: "issue"; title: strin
     .filter((entry): entry is { type: "issue"; title: string; body: string } => Boolean(entry));
 }
 
+function normalizeStringField(value: unknown, maxChars: number, fallback: string): string {
+  const text = sanitizeEscalationText(String(value ?? ""), maxChars);
+  return text || fallback;
+}
+
+function normalizeStringList(
+  value: unknown,
+  opts: {
+    label: string;
+    maxItems: number;
+    minItems: number;
+    maxItemChars: number;
+    fallback: string[];
+  }
+): { items: string[]; notes: string[] } {
+  const notes: string[] = [];
+  const rawItems: string[] = [];
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (typeof entry === "string") rawItems.push(entry);
+      else if (entry !== null && entry !== undefined) rawItems.push(String(entry));
+    }
+  } else if (typeof value === "string") {
+    rawItems.push(...value.split(/\r?\n/));
+  }
+
+  const cleaned = rawItems
+    .map((entry) => entry.replace(/^\s*(?:[-*]|\d+\.)\s+/, "").trim())
+    .map((entry) => sanitizeEscalationText(entry, opts.maxItemChars))
+    .filter((entry) => Boolean(entry));
+
+  let items = cleaned;
+  if (items.length > opts.maxItems) {
+    items = items.slice(0, opts.maxItems);
+    notes.push(`truncated ${opts.label} to ${opts.maxItems}`);
+  }
+
+  if (items.length < opts.minItems) {
+    const fallbackItems = opts.fallback
+      .map((entry) => sanitizeEscalationText(entry, opts.maxItemChars))
+      .filter((entry) => Boolean(entry));
+    const seen = new Set(items.map((entry) => entry.toLowerCase()));
+    for (const fallback of fallbackItems) {
+      if (items.length >= opts.minItems) break;
+      if (seen.has(fallback.toLowerCase())) continue;
+      items.push(fallback);
+      seen.add(fallback.toLowerCase());
+    }
+  }
+
+  if (items.length > opts.maxItems) {
+    items = items.slice(0, opts.maxItems);
+  }
+
+  return { items, notes };
+}
+
+function appendNotesToReason(reason: string, notes: string[]): string {
+  if (notes.length === 0) return reason;
+  const suffix = ` (${notes.join("; ")})`;
+  if (reason.length + suffix.length <= MAX_JSON_REASON_CHARS) return `${reason}${suffix}`;
+  return truncateText(`${reason} ${notes.join("; ")}`.trim(), MAX_JSON_REASON_CHARS);
+}
+
+function normalizeConsultantDecision(obj: Record<string, unknown>): ConsultantDecision {
+  const notes: string[] = [];
+  const parsedSchema = typeof obj.schema_version === "number" ? obj.schema_version : null;
+  if (parsedSchema !== null && parsedSchema !== CONSULTANT_SCHEMA_VERSION) {
+    notes.push(`normalized schema_version to ${CONSULTANT_SCHEMA_VERSION} from ${parsedSchema}`);
+  }
+
+  const decision = normalizeDecision(obj.decision);
+  const confidence = normalizeConfidence(obj.confidence);
+  const currentState = normalizeStringField(obj.current_state, MAX_CURRENT_STATE_CHARS, "Not provided in consultant output.");
+  const whatsMissing = normalizeStringField(obj.whats_missing, MAX_WHATS_MISSING_CHARS, "Not provided in consultant output.");
+  const recommendation = normalizeStringField(obj.recommendation, MAX_RECOMMENDATION_CHARS, "Needs human decision.");
+  const proposed =
+    sanitizeEscalationText(String(obj.proposed_resolution_text ?? ""), MAX_PROPOSED_RESOLUTION_CHARS) || recommendation;
+  const reasonBase =
+    sanitizeEscalationText(String(obj.reason ?? ""), MAX_JSON_REASON_CHARS) ||
+    "Missing or invalid consultant output; defaulting to normalized decision.";
+  const followups = normalizeFollowups(obj.followups);
+
+  const optionsResult = normalizeStringList(obj.options, {
+    label: "options",
+    maxItems: MAX_OPTIONS,
+    minItems: MIN_OPTIONS,
+    maxItemChars: MAX_OPTION_CHARS,
+    fallback: [
+      "Provide guidance in the escalation Resolution section.",
+      "Defer until requirements are clarified on the issue.",
+    ],
+  });
+  const questionsResult = normalizeStringList(obj.questions, {
+    label: "questions",
+    maxItems: MAX_QUESTIONS,
+    minItems: MIN_QUESTIONS,
+    maxItemChars: MAX_QUESTION_CHARS,
+    fallback: ["Approve the recommendation?"],
+  });
+
+  notes.push(...optionsResult.notes, ...questionsResult.notes);
+
+  return {
+    schema_version: CONSULTANT_SCHEMA_VERSION,
+    decision,
+    confidence,
+    requires_approval: true,
+    current_state: currentState,
+    whats_missing: whatsMissing,
+    options: optionsResult.items,
+    recommendation,
+    questions: questionsResult.items,
+    proposed_resolution_text: proposed,
+    reason: appendNotesToReason(reasonBase, notes),
+    followups,
+  };
+}
+
 export function parseConsultantResponse(text: string): ParsedConsultantResponse | null {
   const brief = extractDelimitedBlock(text, BRIEF_SENTINEL_START, BRIEF_SENTINEL_END);
   const jsonBlock = extractDelimitedBlock(text, JSON_SENTINEL_START, JSON_SENTINEL_END);
@@ -126,21 +261,7 @@ export function parseConsultantResponse(text: string): ParsedConsultantResponse 
 
   if (!parsed || typeof parsed !== "object") return null;
   const obj = parsed as Record<string, unknown>;
-  const decision = normalizeDecision(obj.decision);
-  const confidence = normalizeConfidence(obj.confidence);
-  const proposed = sanitizeEscalationText(String(obj.proposed_resolution_text ?? ""), MAX_PROPOSED_RESOLUTION_CHARS);
-  const reason = sanitizeEscalationText(String(obj.reason ?? ""), MAX_JSON_REASON_CHARS);
-  const followups = normalizeFollowups(obj.followups);
-
-  const normalized: ConsultantDecision = {
-    schema_version: CONSULTANT_SCHEMA_VERSION,
-    decision,
-    confidence,
-    requires_approval: true,
-    proposed_resolution_text: proposed,
-    reason,
-    followups,
-  };
+  const normalized = normalizeConsultantDecision(obj);
 
   return {
     brief: sanitizeEscalationText(brief, MAX_BRIEF_CHARS),
@@ -197,6 +318,8 @@ export function buildConsultantPrompt(input: EscalationConsultantInput): string 
   const productBlock = sanitizeEscalationText(productSummary, MAX_PRODUCT_CONTEXT_CHARS);
   const planBlock = sanitizeEscalationText(planSummary, MAX_PLAN_CONTEXT_CHARS);
 
+  const isProductGap = input.escalationType === "product-gap" || hasProductGap(input.noteContent ?? "");
+
   const contextLines = [
     "Escalation summary:",
     `- Issue: ${input.issue}`,
@@ -230,7 +353,7 @@ export function buildConsultantPrompt(input: EscalationConsultantInput): string 
     JSON_SENTINEL_END,
     "",
     "Brief requirements:",
-    "- Include trigger, current state, relevant context, options (2-4), recommendation.",
+    "- Include trigger, current state, what's missing, options (2-4), recommendation, questions (1-3).",
     "- Keep it concise; do NOT include huge logs or diffs.",
     "",
     "JSON schema requirements:",
@@ -238,9 +361,18 @@ export function buildConsultantPrompt(input: EscalationConsultantInput): string 
     "- decision: \"auto-resolve\" | \"needs-human\"",
     "- confidence: \"high\" | \"medium\" | \"low\"",
     "- requires_approval: true",
+    "- current_state: string",
+    "- whats_missing: string",
+    "- options: string[] (2-4 entries)",
+    "- recommendation: string",
+    "- questions: string[] (1-3 entries)",
     "- proposed_resolution_text: string",
     "- reason: string",
     "- followups: [{ type: \"issue\", title: string, body: string }]",
+    "",
+    isProductGap
+      ? "Product-gap escalation: decision must be \"needs-human\". Provide 2-4 options and 1-3 crisp approval questions."
+      : "",
     "",
     ...contextLines,
     ...blocks,
@@ -249,14 +381,30 @@ export function buildConsultantPrompt(input: EscalationConsultantInput): string 
 
 export function buildFallbackPacket(input: EscalationConsultantInput): ParsedConsultantResponse {
   const reason = sanitizeEscalationText(input.reason, MAX_REASON_CHARS);
+  const isProductGap = input.escalationType === "product-gap" || hasProductGap(input.noteContent ?? "");
+  const currentState = `Task '${input.taskName}' escalated (${input.escalationType}).`;
+  const whatsMissing = isProductGap
+    ? "Product documentation does not specify the required behavior."
+    : "Escalation requires human guidance to proceed.";
+  const options = [
+    "Provide guidance in the escalation Resolution section.",
+    "Defer until requirements are clarified on the issue.",
+  ];
+  const recommendation = isProductGap
+    ? "Approve a decision packet response to fill the product gap."
+    : "Provide guidance so the task can resume.";
+  const questions = ["Approve the recommendation?"];
   const briefLines = [
     `Trigger: ${reason || "Escalation created"}`,
-    `Current state: Task '${input.taskName}' escalated (${input.escalationType}).`,
+    `Current state: ${currentState}`,
+    `What's missing: ${whatsMissing}`,
     `Context: Issue ${input.issue} in ${input.repo}.`,
     "Options:",
     "- Needs human decision (provide guidance in Resolution section).",
     "- Defer until requirements clarified on the issue.",
-    "Recommendation: Needs human decision.",
+    `Recommendation: ${recommendation}`,
+    "Questions:",
+    "- Approve the recommendation?",
   ];
 
   const decision: ConsultantDecision = {
@@ -264,6 +412,11 @@ export function buildFallbackPacket(input: EscalationConsultantInput): ParsedCon
     decision: "needs-human",
     confidence: "low",
     requires_approval: true,
+    current_state: sanitizeEscalationText(currentState, MAX_CURRENT_STATE_CHARS),
+    whats_missing: sanitizeEscalationText(whatsMissing, MAX_WHATS_MISSING_CHARS),
+    options: options.map((option) => sanitizeEscalationText(option, MAX_OPTION_CHARS)),
+    recommendation: sanitizeEscalationText(recommendation, MAX_RECOMMENDATION_CHARS),
+    questions: questions.map((question) => sanitizeEscalationText(question, MAX_QUESTION_CHARS)),
     proposed_resolution_text: "Provide guidance in the escalation Resolution section and requeue when ready.",
     reason: reason || "Missing or invalid consultant output; defaulting to human decision.",
     followups: [],
