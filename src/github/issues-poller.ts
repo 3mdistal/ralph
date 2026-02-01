@@ -1,12 +1,21 @@
 import { type RepoConfig } from "../config";
 import { isRepoAllowed } from "../github-app-auth";
 import { shouldLog } from "../logging";
+import type { SchedulerTimers } from "../scheduler";
 import { getRepoGithubIssueLastSyncAt } from "../state";
 import { reconcileEscalationResolutions } from "./escalation-resolution";
 import { syncRepoIssuesOnce } from "./issues-sync-service";
 import type { SyncResult } from "./issues-sync-types";
 
 type PollerHandle = { stop: () => void };
+
+type RepoPollerDeps = {
+  nowMs: () => number;
+  random: () => number;
+  timers: SchedulerTimers;
+  syncOnce: typeof syncRepoIssuesOnce;
+  getLastSyncAt: (repo: string) => string | null;
+};
 
 const DEFAULT_JITTER_PCT = 0.2;
 const DEFAULT_BACKOFF_MULTIPLIER = 1.5;
@@ -15,10 +24,29 @@ const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
 const ESCALATION_RECONCILE_MIN_INTERVAL_MS = 60_000;
 
-function applyJitter(valueMs: number, pct = DEFAULT_JITTER_PCT): number {
+const DEFAULT_REPO_POLLER_DEPS: RepoPollerDeps = {
+  nowMs: () => Date.now(),
+  random: () => Math.random(),
+  timers: { setTimeout, clearTimeout },
+  syncOnce: syncRepoIssuesOnce,
+  getLastSyncAt: getRepoGithubIssueLastSyncAt,
+};
+
+function resolveRepoPollerDeps(overrides?: Partial<RepoPollerDeps>): RepoPollerDeps {
+  if (!overrides) return DEFAULT_REPO_POLLER_DEPS;
+  return {
+    nowMs: overrides.nowMs ?? DEFAULT_REPO_POLLER_DEPS.nowMs,
+    random: overrides.random ?? DEFAULT_REPO_POLLER_DEPS.random,
+    timers: overrides.timers ?? DEFAULT_REPO_POLLER_DEPS.timers,
+    syncOnce: overrides.syncOnce ?? DEFAULT_REPO_POLLER_DEPS.syncOnce,
+    getLastSyncAt: overrides.getLastSyncAt ?? DEFAULT_REPO_POLLER_DEPS.getLastSyncAt,
+  };
+}
+
+function applyJitter(valueMs: number, pct = DEFAULT_JITTER_PCT, random = Math.random): number {
   const clamped = Math.max(valueMs, MIN_DELAY_MS);
   const variance = clamped * pct;
-  const delta = (Math.random() * 2 - 1) * variance;
+  const delta = (random() * 2 - 1) * variance;
   return Math.max(MIN_DELAY_MS, Math.round(clamped + delta));
 }
 
@@ -53,7 +81,10 @@ function startRepoPoller(params: {
   baseIntervalMs: number;
   log: (msg: string) => void;
   onSync?: (payload: { repo: string; result: SyncResult }) => void;
+  deps?: Partial<RepoPollerDeps>;
 }): PollerHandle {
+  const deps = resolveRepoPollerDeps(params.deps);
+  const timers = deps.timers;
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let delayMs = resolveBaseIntervalMs(params.baseIntervalMs);
@@ -63,19 +94,25 @@ function startRepoPoller(params: {
 
   const scheduleNext = (nextDelayMsValue: number, applyJitterValue = true) => {
     if (stopped) return;
-    const delay = applyJitterValue ? applyJitter(nextDelayMsValue) : Math.max(MIN_DELAY_MS, nextDelayMsValue);
-    timer = setTimeout(() => {
+    const delay = applyJitterValue
+      ? applyJitter(nextDelayMsValue, DEFAULT_JITTER_PCT, deps.random)
+      : Math.max(MIN_DELAY_MS, nextDelayMsValue);
+    if (timer) {
+      timers.clearTimeout(timer);
+      timer = null;
+    }
+    timer = timers.setTimeout(() => {
       void tick();
     }, delay);
   };
 
   const tick = async () => {
     if (stopped) return;
-    const lastSyncAt = getRepoGithubIssueLastSyncAt(repoName);
+    const lastSyncAt = deps.getLastSyncAt(repoName);
 
     const autoQueue = (params.repo as any).autoQueue as { enabled?: boolean; scope?: string } | undefined;
     const storeAllOpen = Boolean(autoQueue?.enabled && autoQueue?.scope === "all-open");
-    const result = await syncRepoIssuesOnce({
+    const result = await deps.syncOnce({
       repo: repoName,
       repoPath: params.repo.path,
       botBranch: params.repo.botBranch,
@@ -98,7 +135,7 @@ function startRepoPoller(params: {
           `delayMs=${delayMs}`
       );
 
-      const nowMs = Date.now();
+      const nowMs = deps.nowMs();
       const elapsedMs = nowMs - lastEscalationReconcileAt;
       if (elapsedMs < ESCALATION_RECONCILE_MIN_INTERVAL_MS) {
         if (shouldLog(`ralph:gh-sync:${repoLabel}:escalation-defer`, ESCALATION_RECONCILE_MIN_INTERVAL_MS)) {
@@ -125,7 +162,7 @@ function startRepoPoller(params: {
     }
 
     if (result.rateLimitResetMs) {
-      const nowMs = Date.now();
+      const nowMs = deps.nowMs();
       const resetDelay = resolveRateLimitDelayMs(result.rateLimitResetMs, nowMs);
       delayMs = Math.max(delayMs, resetDelay);
       params.log(`[ralph:gh-sync:${repoLabel}] rate-limit reset in ${Math.round(resetDelay / 1000)}s (delayMs=${delayMs})`);
@@ -148,10 +185,20 @@ function startRepoPoller(params: {
   return {
     stop: () => {
       stopped = true;
-      if (timer) clearTimeout(timer);
+      if (timer) timers.clearTimeout(timer);
       timer = null;
     },
   };
+}
+
+export function __testOnlyStartRepoPoller(params: {
+  repo: RepoConfig;
+  baseIntervalMs: number;
+  log: (msg: string) => void;
+  onSync?: (payload: { repo: string; result: SyncResult }) => void;
+  deps?: Partial<RepoPollerDeps>;
+}): PollerHandle {
+  return startRepoPoller(params);
 }
 
 export function startGitHubIssuePollers(params: {
