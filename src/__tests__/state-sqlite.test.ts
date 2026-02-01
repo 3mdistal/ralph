@@ -75,7 +75,6 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       releaseLock = null;
     }
   });
-
   test("migrates schema from v3", () => {
     const dbPath = getRalphStateDbPath();
     const db = new Database(dbPath);
