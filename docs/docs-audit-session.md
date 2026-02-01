@@ -266,6 +266,14 @@ This document captures decisions and discoveries made during an interactive audi
   - `minimal` preset ensures required `ralph:*` labels and creates bot branch.
   - `parity` preset is best-effort; failures become warnings and do not block provisioning.
 
+### SQLite Policy (2026-02-01)
+
+- Promoted additional SQLite migration claims:
+  - Migrations are transactional (no partial state).
+  - Schema changes bump `SCHEMA_VERSION`.
+  - No downgrades; newer schema fails closed.
+  - Safe reset by deleting `~/.ralph/state.sqlite`.
+
 ### Clarification (2026-02-01)
 
 - `PRODUCT GAP:` remains a deterministic escalation marker (cross-cutting, not a "stage").

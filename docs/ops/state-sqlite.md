@@ -15,3 +15,7 @@ It also stores deterministic gate state for each run (`ralph_run_gate_results`) 
 - Apply migrations inside a single transaction.
 - No downgrades. If `meta.schema_version` is newer than the running binary, fail closed.
 - Safe reset: deleting `state.sqlite` recreates a fresh database on next startup.
+
+## Claims
+
+Canonical claims live in `claims/canonical.jsonl`.
