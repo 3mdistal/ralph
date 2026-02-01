@@ -10,6 +10,7 @@ import { getRalphStateDbPath, getSessionEventsPathFromDir } from "../paths";
 
 describe("metrics persistence", () => {
   test("stores run and step metrics from session events", async () => {
+    closeStateDbForTests();
     const root = await mkdtemp(join(tmpdir(), "ralph-metrics-"));
     const statePath = join(root, "state.sqlite");
     const sessionsDir = join(root, "sessions");
@@ -76,6 +77,7 @@ describe("metrics persistence", () => {
   });
 
   test("marks too-large traces with quality", async () => {
+    closeStateDbForTests();
     const root = await mkdtemp(join(tmpdir(), "ralph-metrics-"));
     const statePath = join(root, "state.sqlite");
     const sessionsDir = join(root, "sessions");
