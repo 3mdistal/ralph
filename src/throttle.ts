@@ -770,7 +770,7 @@ export async function getThrottleDecision(
   const cfg = getConfig().throttle;
 
   const openaiSource: "localLogs" | "remoteUsage" =
-    cfg?.openaiSource === "remoteUsage" || cfg?.openaiSource === "localLogs" ? cfg.openaiSource : "localLogs";
+    cfg?.openaiSource === "remoteUsage" || cfg?.openaiSource === "localLogs" ? cfg.openaiSource : "remoteUsage";
 
   const { effectiveProfile, xdgDataHome, messagesRootDir } = resolveOpencodeMessagesRootDir(opts?.opencodeProfile);
   const perProfileCfg = effectiveProfile ? cfg?.perProfile?.[effectiveProfile] : undefined;

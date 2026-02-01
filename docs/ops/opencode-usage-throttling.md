@@ -21,7 +21,7 @@ Ensure Ralph never consumes more than a configurable fraction of the operator's 
 
 Ralph can use remote usage meters for OpenAI when enabled and falls back to local OpenCode logs when remote usage is unavailable or fails.
 
-- Default: `openaiSource=localLogs`.
+- Default: `openaiSource=remoteUsage`.
 - If `openaiSource=remoteUsage`, attempt remote usage meters and fall back to `localLogs` on failure.
 - If `openaiSource=localLogs`, never attempt remote usage.
 
