@@ -105,7 +105,13 @@ GitHub label writes are best-effort. When throttled/blocked by GitHub rate limit
 
 `ralph:status:done` is derived from merged PR evidence:
 
-- If Ralph can detect a merged PR that closes the issue and is reconciled onto the repo default branch, it sets `ralph:status:done` and closes the issue.
+- Ralph uses GitHub issue timeline events to identify the closing PR.
+- Ralph then verifies the merge commit SHA (or equivalent head SHA) is reachable from the repo default branch head.
+- If verified, it sets `ralph:status:done` and closes the issue.
+
+## Label bootstrap
+
+Ralph ensures all required `ralph:status:*` and `ralph:cmd:*` labels exist in the repo, and enforces their label descriptions/colors to match the version shipped with Ralph.
 
 ## Stop semantics
 
