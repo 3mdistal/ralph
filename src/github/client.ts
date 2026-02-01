@@ -11,6 +11,7 @@ export class GitHubApiError extends Error {
   readonly status: number;
   readonly requestId: string | null;
   readonly responseText: string;
+  readonly resumeAtTs: number | null;
 
   constructor(params: {
     message: string;
@@ -18,6 +19,7 @@ export class GitHubApiError extends Error {
     status: number;
     requestId: string | null;
     responseText: string;
+    resumeAtTs?: number | null;
   }) {
     super(params.message);
     this.name = "GitHubApiError";
@@ -25,6 +27,7 @@ export class GitHubApiError extends Error {
     this.status = params.status;
     this.requestId = params.requestId;
     this.responseText = params.responseText;
+    this.resumeAtTs = typeof params.resumeAtTs === "number" && Number.isFinite(params.resumeAtTs) ? params.resumeAtTs : null;
   }
 }
 
@@ -135,6 +138,16 @@ function parseRateLimitResetMs(headers: Headers): number | null {
   return Math.round(seconds * 1000);
 }
 
+function parseRateLimitTimestampFromBody(text: string): number | null {
+  // Example:
+  // "... include the request ID ... and timestamp 2026-01-31 19:34:17 UTC. ..."
+  const match = text.match(/\btimestamp\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+UTC\b/i);
+  if (!match) return null;
+  const iso = `${match[1]}T${match[2]}Z`;
+  const ts = Date.parse(iso);
+  return Number.isFinite(ts) ? ts : null;
+}
+
 function extractInstallationId(text: string): string | null {
   const match = text.match(/installation\s+id\s+(\d+)/i);
   return match?.[1] ?? null;
@@ -243,7 +256,7 @@ export class GitHubClient {
     }
     const now = Date.now();
     if (resumeAt <= now) return;
-    const delayMs = Math.min(resumeAt - now, 10 * 60_000);
+    const delayMs = Math.min(resumeAt - now, 20 * 60_000);
     await this.sleepMsImpl(delayMs);
   }
 
@@ -363,12 +376,15 @@ export class GitHubClient {
       let untilTs: number | null = null;
       if (isRateLimited) {
         const now = Date.now();
+        const timestampMs = parseRateLimitTimestampFromBody(text);
         untilTs =
           retryAfterMs != null
             ? now + retryAfterMs
             : resetMs != null
               ? resetMs
-              : now + 60_000;
+              : timestampMs != null && timestampMs > now
+                ? timestampMs
+                : now + 60_000;
         this.recordBackoff({ untilTs, installationId: extractInstallationId(text), tokenKey });
       }
 
@@ -383,6 +399,7 @@ export class GitHubClient {
         status: res.status,
         requestId: res.headers.get("x-github-request-id"),
         responseText: text,
+        resumeAtTs: untilTs,
       });
     }
 
