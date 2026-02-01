@@ -6,7 +6,7 @@ import { Database } from "bun:sqlite";
 
 import { closeStateDbForTests, createRalphRun, initStateDb, recordRalphRunSessionUse } from "../state";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
-import { getRalphStateDbPath, getSessionEventsPathFromDir } from "../paths";
+import { getSessionEventsPathFromDir } from "../paths";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 describe("metrics persistence", () => {
@@ -52,7 +52,11 @@ describe("metrics persistence", () => {
 
       await computeAndStoreRunMetrics({ runId, sessionsDir });
 
-      const db = new Database(getRalphStateDbPath());
+      // Some runners (notably CI) have shown flaky visibility of writes when
+      // reading the same sqlite file from a fresh connection.
+      closeStateDbForTests();
+
+      const db = new Database(statePath);
       try {
         const runRow = db
           .query("SELECT quality, tool_call_count as tool_calls, wall_time_ms as wall_time FROM ralph_run_metrics WHERE run_id = $run_id")
@@ -113,7 +117,11 @@ describe("metrics persistence", () => {
 
       await computeAndStoreRunMetrics({ runId, maxBytesPerSession: 10, sessionsDir });
 
-      const db = new Database(getRalphStateDbPath());
+      // Some runners (notably CI) have shown flaky visibility of writes when
+      // reading the same sqlite file from a fresh connection.
+      closeStateDbForTests();
+
+      const db = new Database(statePath);
       try {
         const runRow = db
           .query("SELECT quality FROM ralph_run_metrics WHERE run_id = $run_id")
