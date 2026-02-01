@@ -39,7 +39,7 @@ describe("github bypass guardrails", () => {
     const allowlist = new Set([
       join(SRC_ROOT, "github", "client.ts"),
       join(SRC_ROOT, "github-app-auth.ts"),
-      join(SRC_ROOT, "github-issues-sync.ts"),
+      join(SRC_ROOT, "github", "issues-rest.ts"),
     ]);
 
     const files = await listFiles(SRC_ROOT);
