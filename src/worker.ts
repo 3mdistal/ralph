@@ -55,6 +55,7 @@ import {
   type IssueMetadata,
 } from "./escalation";
 import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationContext } from "./notify";
+import { buildWorkerFailureAlert, type WorkerFailureKind } from "./alerts/worker-failure-core";
 import { drainQueuedNudges } from "./nudge";
 import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
@@ -1587,12 +1588,6 @@ export class RepoWorker {
       ].join("\n"),
     });
 
-    await this.notify.notifyError(`Worker isolation guardrail: ${task.name}`, message, {
-      taskName: task.name,
-      repo: task.repo,
-      issue: task.issue,
-    });
-
     const error = new Error(reason) as Error & { ralphRootDirty?: boolean };
     error.ralphRootDirty = true;
     throw error;
@@ -1615,7 +1610,7 @@ export class RepoWorker {
       source = "runtime-error";
     }
     const nowIso = new Date().toISOString();
-    const { patch, didEnterBlocked, reasonSummary } = computeBlockedPatch(task, {
+    const { patch, didEnterBlocked, reasonSummary, detailsSummary } = computeBlockedPatch(task, {
       source,
       reason: opts?.reason,
       details: opts?.details,
@@ -1636,6 +1631,7 @@ export class RepoWorker {
         return false;
       })
     );
+    const priorWorktreePath = task["worktree-path"]?.trim() || "";
     const updatePatch = { ...sanitizedExtraFields, ...patch };
     const updated = await this.queue.updateTaskStatus(task, "blocked", updatePatch);
 
@@ -1665,7 +1661,70 @@ export class RepoWorker {
       });
     }
 
+    if (updated && didEnterBlocked) {
+      const kind: WorkerFailureKind = source === "runtime-error" ? "runtime-error" : "blocked";
+      const reason = reasonSummary || `Blocked: ${source}`;
+      await this.notifyTaskFailure(task, {
+        kind,
+        stage: `blocked:${source}`,
+        reason,
+        details: detailsSummary || undefined,
+        sessionId: opts?.sessionId,
+        runLogPath: opts?.runLogPath,
+        worktreePath: priorWorktreePath || undefined,
+      });
+    }
+
     return updated;
+  }
+
+  private buildFailurePointers(
+    task: AgentTask,
+    overrides?: { sessionId?: string; runLogPath?: string; worktreePath?: string }
+  ) {
+    return {
+      sessionId: overrides?.sessionId ?? task["session-id"]?.trim() ?? null,
+      worktreePath: overrides?.worktreePath ?? task["worktree-path"]?.trim() ?? null,
+      runLogPath: overrides?.runLogPath ?? task["run-log-path"]?.trim() ?? null,
+      workerId: task["worker-id"]?.trim() ?? null,
+      repoSlot: task["repo-slot"]?.trim() ?? null,
+    };
+  }
+
+  private async notifyTaskFailure(
+    task: AgentTask,
+    params: {
+      kind: WorkerFailureKind;
+      stage: string;
+      reason: string;
+      details?: string;
+      sessionId?: string;
+      runLogPath?: string;
+      worktreePath?: string;
+    }
+  ): Promise<void> {
+    const alert = buildWorkerFailureAlert({
+      kind: params.kind,
+      stage: params.stage,
+      reason: params.reason,
+      details: params.details,
+      pointers: this.buildFailurePointers(task, {
+        sessionId: params.sessionId,
+        runLogPath: params.runLogPath,
+        worktreePath: params.worktreePath,
+      }),
+    });
+
+    await this.notify.notifyError(`${params.stage} ${task.name}`, params.details ?? params.reason, {
+      taskName: task.name,
+      repo: task.repo,
+      issue: task.issue,
+      alertOverride: {
+        fingerprintSeed: alert.fingerprintSeed,
+        summary: alert.summary,
+        details: alert.details ?? undefined,
+      },
+    });
   }
 
   private async markTaskUnblocked(task: AgentTask): Promise<boolean> {
@@ -5425,12 +5484,6 @@ ${guidance}`
         details,
         sessionId: recoveryResult.sessionId ?? task["session-id"]?.trim(),
       });
-      await this.notify.notifyError(`${stage} ${task.name}`, blocked.notifyBody, {
-        taskName: task.name,
-        repo: task.repo,
-        issue: task.issue,
-      });
-
       return {
         taskName: task.name,
         repo: this.repo,
@@ -5972,12 +6025,6 @@ ${guidance}`
         },
       });
 
-      await this.notify.notifyError(params.notifyTitle, reason, {
-        taskName: params.task.name,
-        repo: params.task.repo,
-        issue: params.task.issue,
-      });
-
       return {
         ok: false,
         run: {
@@ -6020,12 +6067,6 @@ ${guidance}`
           "stall-retries": "",
           ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
         },
-      });
-
-      await this.notify.notifyError(params.notifyTitle, reason, {
-        taskName: params.task.name,
-        repo: params.task.repo,
-        issue: params.task.issue,
       });
 
       return {
@@ -6087,12 +6128,6 @@ ${guidance}`
             const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
             console.warn(`[ralph:worker:${this.repo}] ${reason}`);
             await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-            await this.notify.notifyError(params.notifyTitle, reason, {
-              taskName: params.task.name,
-              repo: params.task.repo,
-              issue: params.task.issue,
-            });
-
             return {
               ok: false,
               run: {
@@ -6211,12 +6246,6 @@ ${guidance}`
           // best-effort
         }
         await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
-        await this.notify.notifyError(params.notifyTitle, reason, {
-          taskName: params.task.name,
-          repo: params.task.repo,
-          issue: params.task.issue,
-        });
-
         return {
           ok: false,
           run: {
@@ -7821,11 +7850,6 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Resuming ${task.name}`, error?.message ?? String(error), {
-          taskName: task.name,
-          repo: task.repo,
-          issue: task.issue,
-        });
       }
 
       return {
@@ -8069,8 +8093,6 @@ ${guidance}`
           sessionId: planResult.sessionId,
           runLogPath: planRunLogPath,
         });
-        await this.notify.notifyError(`Processing ${task.name}`, reason, task.name);
-
         return {
           taskName: task.name,
           repo: this.repo,
@@ -8775,11 +8797,6 @@ ${guidance}`
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
-        await this.notify.notifyError(`Processing ${task.name}`, error?.message ?? String(error), {
-          taskName: task.name,
-          repo: task.repo,
-          issue: task.issue,
-        });
       }
 
       return {
