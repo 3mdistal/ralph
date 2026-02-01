@@ -121,4 +121,9 @@ describe("computeRalphLabelSync", () => {
       },
     ]);
   });
+
+  test("stuck label uses remediation description", () => {
+    const stuck = RALPH_WORKFLOW_LABELS.find((label) => label.name === "ralph:stuck");
+    expect(stuck?.description).toBe("Recovery/remediation in progress");
+  });
 });

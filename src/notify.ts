@@ -3,6 +3,7 @@ import { createAgentTask, normalizeBwrbNoteRef, resolveAgentTaskByIssue } from "
 import { sanitizeEscalationText } from "./escalation-consultant/core";
 import { appendConsultantPacket } from "./escalation-consultant/io";
 import type { TaskPriority } from "./queue/priority";
+import type { EscalationType } from "./github/escalation-constants";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { appendBwrbNoteBody, buildEscalationPayload, buildIdeaPayload, createBwrbNote } from "./bwrb/artifacts";
@@ -180,7 +181,7 @@ export interface EscalationContext {
   /** OpenCode session ID (for resuming after resolution) */
   sessionId?: string;
   reason: string;
-  escalationType: "product-gap" | "low-confidence" | "ambiguous-requirements" | "blocked" | "other";
+  escalationType: EscalationType;
   planOutput?: string;
   githubCommentUrl?: string;
   routing?: {

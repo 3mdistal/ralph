@@ -3,6 +3,7 @@ import { appendFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import { $ } from "bun";
 import { getBwrbVaultForStorage, getBwrbVaultIfValid } from "../queue-backend";
+import type { EscalationType } from "../github/escalation-constants";
 
 type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
 
@@ -104,7 +105,7 @@ export function buildEscalationPayload(params: {
   issue: string;
   repo: string;
   sessionId: string;
-  escalationType: string;
+  escalationType: EscalationType;
   status: string;
   creationDate: string;
   scope: string;

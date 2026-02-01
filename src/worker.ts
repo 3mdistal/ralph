@@ -93,6 +93,7 @@ import {
 } from "./github/merge-conflict-comment";
 import {
   buildMergeConflictCommentLines,
+  buildMergeConflictEscalationDetails,
   buildMergeConflictSignature,
   computeMergeConflictDecision,
   formatMergeConflictPaths,
@@ -4302,51 +4303,6 @@ ${guidance}`
     };
   }
 
-  private buildMergeConflictEscalationSummary(params: {
-    prUrl: string;
-    baseRefName: string | null;
-    headRefName: string | null;
-    attempts: MergeConflictAttempt[];
-    reason: string;
-  }): string {
-    const lines: string[] = [];
-    const base = params.baseRefName || "(unknown)";
-    const head = params.headRefName || "(unknown)";
-    lines.push("Merge-conflict escalation summary", "", `PR: ${params.prUrl}`, `Base: ${base}`, `Head: ${head}`, "", "Reason:", params.reason, "");
-
-    if (params.attempts.length > 0) {
-      lines.push("Attempts:");
-      for (const attempt of params.attempts) {
-        const when = attempt.completedAt || attempt.startedAt;
-        const conflictCount = typeof attempt.conflictCount === "number" ? `, ${attempt.conflictCount} files` : "";
-        lines.push(
-          `- Attempt ${attempt.attempt} (${attempt.status ?? "unknown"}, ${when})${conflictCount}: ${
-            attempt.signature || "(no signature)"
-          }`
-        );
-        if (attempt.conflictPaths && attempt.conflictPaths.length > 0) {
-          lines.push(...attempt.conflictPaths.map((file) => `  - ${file}`));
-        }
-      }
-      lines.push("");
-    }
-
-    lines.push(
-      "Next action:",
-      "- Resolve conflicts on the PR branch, push updates, then re-add `ralph:queued` (or comment `RALPH RESOLVED:`) to resume."
-    );
-
-    return lines.join("\n");
-  }
-
-  private async writeMergeConflictEscalationComment(params: { issueNumber: number; body: string }): Promise<void> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    await this.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments`, {
-      method: "POST",
-      body: { body: params.body },
-    });
-  }
-
   private async finalizeMergeConflictEscalation(params: {
     task: AgentTask;
     issueNumber: string;
@@ -4364,21 +4320,25 @@ ${guidance}`
 
     await this.clearMergeConflictLabels(issueRef);
 
-    const escalationBody = this.buildMergeConflictEscalationSummary({
+    const escalationBody = buildMergeConflictEscalationDetails({
       prUrl: params.prUrl,
       baseRefName: params.baseRefName,
       headRefName: params.headRefName,
       attempts: params.attempts,
       reason: params.reason,
+      botBranch: getRepoBotBranch(this.repo),
     });
-    await this.writeMergeConflictEscalationComment({ issueNumber: Number(params.issueNumber), body: escalationBody });
 
     const wasEscalated = params.task.status === "escalated";
     const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
     if (escalated) {
       applyTaskPatch(params.task, "escalated", {});
     }
-    await this.writeEscalationWriteback(params.task, { reason: params.reason, escalationType: "blocked" });
+    await this.writeEscalationWriteback(params.task, {
+      reason: params.reason,
+      details: escalationBody,
+      escalationType: "merge-conflict",
+    });
     await this.notify.notifyEscalation({
       taskName: params.task.name,
       taskFileName: params.task._name,
@@ -4387,7 +4347,7 @@ ${guidance}`
       repo: this.repo,
       sessionId: params.sessionId,
       reason: params.reason,
-      escalationType: "blocked",
+      escalationType: "merge-conflict",
       planOutput: escalationBody,
     });
 
