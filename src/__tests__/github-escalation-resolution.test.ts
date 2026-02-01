@@ -181,6 +181,150 @@ describe("escalation resolution reconciliation", () => {
     expect(added).toEqual(expect.arrayContaining(["/repos/3mdistal/ralph/issues/11/labels"]));
   });
 
+  test("translates RALPH APPROVE into RALPH RESOLVED using consultant proposed resolution", async () => {
+    const requests: Array<{ path: string; method: string; body?: any }> = [];
+
+    const consultantComment = [
+      "<!-- ralph-escalation:id=deadbeef -->",
+      "Ralph needs a decision.",
+      "",
+      "---",
+      "",
+      "<!-- ralph-consultant:v1 -->",
+      "## Consultant Brief",
+      "Keep going.",
+      "",
+      "## Consultant Decision (machine)",
+      "```json",
+      JSON.stringify(
+        {
+          schema_version: 1,
+          decision: "needs-human",
+          confidence: "high",
+          requires_approval: true,
+          proposed_resolution_text: "Proceed with GitHub-first implementation; ignore bwrb.",
+          reason: "User confirmed GH+SQLite",
+          followups: [],
+        },
+        null,
+        2
+      ),
+      "```",
+      "",
+    ].join("\n");
+
+    const github = {
+      request: async (path: string, opts: { method?: string; body?: any } = {}) => {
+        requests.push({ path, method: opts.method ?? "GET", body: opts.body });
+
+        if (path.startsWith("/repos/3mdistal/ralph/labels")) {
+          return { data: [] };
+        }
+
+        if (path === "/graphql") {
+          const number = opts.body?.variables?.number;
+          const nodes =
+            number === 13
+              ? [
+                  {
+                    body: consultantComment,
+                    databaseId: 300,
+                    createdAt: "2026-01-11T00:00:00.000Z",
+                    author: { login: "teenylilralph" },
+                    authorAssociation: "CONTRIBUTOR",
+                  },
+                  {
+                    body: "RALPH APPROVE",
+                    databaseId: 301,
+                    createdAt: "2026-01-11T00:01:00.000Z",
+                    author: { login: "3mdistal" },
+                    authorAssociation: "OWNER",
+                  },
+                ]
+              : [];
+          return {
+            data: {
+              data: {
+                repository: {
+                  issue: {
+                    comments: { nodes },
+                  },
+                },
+              },
+            },
+          };
+        }
+
+        if (path === "/repos/3mdistal/ralph/issues/13/comments" && (opts.method ?? "GET") === "POST") {
+          return {
+            data: {
+              id: 999,
+              created_at: "2026-01-11T00:02:00.000Z",
+              html_url: "https://github.com/3mdistal/ralph/issues/13#issuecomment-999",
+            },
+          };
+        }
+
+        return { data: {} };
+      },
+    } as any;
+
+    const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
+      if (labels.includes("ralph:queued")) return [];
+      return [{ repo: "3mdistal/ralph", number: 13 }];
+    };
+
+    const task = {
+      _path: "orchestration/tasks/3mdistal-ralph-13.md",
+      _name: "3mdistal/ralph#13",
+      type: "agent-task" as const,
+      "creation-date": "2026-01-11",
+      scope: "builder",
+      issue: "3mdistal/ralph#13",
+      repo: "3mdistal/ralph",
+      status: "escalated" as const,
+      name: "Task 13",
+    };
+
+    const updated: string[] = [];
+    const resolveAgentTaskByIssue = async () => task as any;
+    const updateTaskStatus = async (_task: any, status: string) => {
+      updated.push(status);
+      return true;
+    };
+
+    await reconcileEscalationResolutions({
+      repo: "3mdistal/ralph",
+      deps: {
+        github,
+        listIssuesWithAllLabels,
+        resolveAgentTaskByIssue,
+        updateTaskStatus,
+        getIssueSnapshotByNumber: (_repo, issueNumber) => ({
+          repo: "3mdistal/ralph",
+          number: issueNumber,
+          title: null,
+          state: null,
+          url: null,
+          githubNodeId: null,
+          githubUpdatedAt: "2026-01-11T00:00:00.000Z",
+          labels: [],
+        }),
+        getEscalationCommentCheckState: () => null,
+        recordEscalationCommentCheckState: () => {},
+      },
+      log: () => {},
+    });
+
+    expect(updated).toEqual(["queued"]);
+
+    const postComment = requests.find(
+      (req) => req.method === "POST" && req.path === "/repos/3mdistal/ralph/issues/13/comments"
+    );
+    expect(postComment?.body?.body).toContain("RALPH RESOLVED:");
+    expect(postComment?.body?.body).toContain("Proceed with GitHub-first implementation; ignore bwrb.");
+  });
+
   test("ignores RALPH RESOLVED from non-operator", async () => {
     const github = {
       request: async (path: string, opts: { method?: string; body?: any } = {}) => {

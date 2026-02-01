@@ -18,6 +18,7 @@ let originalAddIssueLabel: ((payload: any, label: string) => Promise<void>) | nu
 let originalRemoveIssueLabel: ((payload: any, label: string) => Promise<void>) | null = null;
 let originalFetchRepoDefaultBranch: (() => Promise<string | null>) | null = null;
 let originalGetPullRequestBaseBranch: ((prUrl: string) => Promise<string | null>) | null = null;
+let originalGetPullRequestFiles: ((prUrl: string) => Promise<string[]>) | null = null;
 
 const lifecycleTimeoutMs = 20_000;
 
@@ -216,10 +217,14 @@ describe("integration-ish harness: full task lifecycle", () => {
     if (!originalGetPullRequestBaseBranch) {
       originalGetPullRequestBaseBranch = (RepoWorker as any).prototype.getPullRequestBaseBranch;
     }
+    if (!originalGetPullRequestFiles) {
+      originalGetPullRequestFiles = (RepoWorker as any).prototype.getPullRequestFiles;
+    }
     (RepoWorker as any).prototype.addIssueLabel = async () => {};
     (RepoWorker as any).prototype.removeIssueLabel = async () => {};
     (RepoWorker as any).prototype.fetchRepoDefaultBranch = async () => "main";
     (RepoWorker as any).prototype.getPullRequestBaseBranch = async () => "bot/integration";
+    (RepoWorker as any).prototype.getPullRequestFiles = async () => ["src/index.ts"];
   });
 
   afterEach(async () => {
@@ -240,6 +245,9 @@ describe("integration-ish harness: full task lifecycle", () => {
     }
     if (originalGetPullRequestBaseBranch) {
       (RepoWorker as any).prototype.getPullRequestBaseBranch = originalGetPullRequestBaseBranch;
+    }
+    if (originalGetPullRequestFiles) {
+      (RepoWorker as any).prototype.getPullRequestFiles = originalGetPullRequestFiles;
     }
     releaseLock?.();
     releaseLock = null;
@@ -605,6 +613,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).isPrBehind = isPrBehindMock;
+    (worker as any).deleteMergedPrHeadBranchBestEffort = async () => {};
 
     const addIssueLabelMock = mock(async () => {});
     const removeIssueLabelMock = mock(async () => {});
@@ -817,6 +826,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
     (worker as any).isPrBehind = isPrBehindMock;
+    (worker as any).deleteMergedPrHeadBranchBestEffort = async () => {};
 
     (worker as any).createAgentRun = async () => {};
 
@@ -892,6 +902,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).mergePullRequest = mergePullRequestMock;
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
     (worker as any).isPrBehind = isPrBehindMock;
+    (worker as any).deleteMergedPrHeadBranchBestEffort = async () => {};
 
     (worker as any).createAgentRun = async () => {};
 
@@ -1067,6 +1078,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).deleteMergedPrHeadBranchBestEffort = async () => {};
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
@@ -1128,6 +1140,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     (worker as any).updatePullRequestBranch = updatePullRequestBranchMock;
     (worker as any).waitForRequiredChecks = waitForRequiredChecksMock;
     (worker as any).mergePullRequest = mergePullRequestMock;
+    (worker as any).deleteMergedPrHeadBranchBestEffort = async () => {};
     (worker as any).createAgentRun = async () => {};
 
     const result = await worker.processTask(createMockTask());
