@@ -68,6 +68,7 @@ import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
+import { ensureEscalationCommentHasConsultantPacket } from "./github/escalation-consultant-writeback";
 import {
   buildParentVerificationPrompt as buildParentVerificationPromptLegacy,
   evaluateParentVerificationEligibility,
@@ -2222,7 +2223,38 @@ export class RepoWorker {
           log: (message) => console.log(message),
         }
       );
-      return result.commentUrl ?? null;
+      const commentUrl = result.commentUrl ?? null;
+
+      if (commentUrl) {
+        try {
+          const repoPath = task["worktree-path"]?.trim() || this.repoPath;
+          await ensureEscalationCommentHasConsultantPacket({
+            github: this.github,
+            repo: escalationIssueRef.repo,
+            escalationCommentUrl: commentUrl,
+            repoPath,
+            input: {
+              issue: task.issue,
+              repo: escalationIssueRef.repo,
+              taskName: task.name,
+              taskPath: task._path ?? task.name,
+              escalationType: params.escalationType,
+              reason: params.reason,
+              sessionId: task["session-id"]?.trim() || null,
+              githubCommentUrl: commentUrl,
+            },
+            log: (m) => console.log(m),
+          });
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Failed to attach consultant packet to escalation comment: ${
+              error?.message ?? String(error)
+            }`
+          );
+        }
+      }
+
+      return commentUrl;
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Escalation writeback failed for ${task.issue}: ${error?.message ?? String(error)}`

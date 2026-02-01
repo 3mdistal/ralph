@@ -2,9 +2,11 @@ import { resolveAgentTaskByIssue, updateTaskStatus } from "../queue-backend";
 import {
   getEscalationCommentCheckState,
   getIssueSnapshotByNumber,
+  hasIdempotencyKey,
   initStateDb,
   listIssuesWithAllLabels,
   recordEscalationCommentCheckState,
+  recordIdempotencyKey,
 } from "../state";
 import { GitHubClient, splitRepoFullName } from "./client";
 import { shouldLog } from "../logging";
@@ -16,6 +18,7 @@ import {
   RALPH_LABEL_QUEUED,
   RALPH_RESOLVED_REGEX,
 } from "./escalation-constants";
+import { CONSULTANT_MARKER } from "../escalation-consultant/core";
 
 type EscalatedIssue = { repo: string; number: number };
 
@@ -35,6 +38,10 @@ const DEFAULT_ESCALATION_RECHECK_INTERVAL_MS = 10 * 60_000;
 const ESCALATION_DEFER_LOG_INTERVAL_MS = 60_000;
 const AUTHORIZED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 
+const RALPH_APPROVE_REGEX = /\bRALPH\s+APPROVE\b/i;
+const RALPH_OVERRIDE_REGEX = /\bRALPH\s+OVERRIDE\s*:\s*([\s\S]*)/i;
+const CONSULTANT_JSON_BLOCK_REGEX = /```json\s*([\s\S]*?)```/i;
+
 type IssueCommentNode = {
   body?: string | null;
   author?: { login?: string | null } | null;
@@ -47,6 +54,15 @@ type IssueCommentsResponse = {
   data?: { repository?: { issue?: { comments?: { nodes?: IssueCommentNode[] } } } };
 };
 
+type ConsultantDecision = {
+  schema_version?: number;
+  decision?: string;
+  confidence?: string;
+  requires_approval?: boolean;
+  proposed_resolution_text?: string;
+  reason?: string;
+};
+
 function issueKey(issue: EscalatedIssue): string {
   return `${issue.repo}#${issue.number}`;
 }
@@ -55,6 +71,108 @@ function parseIsoMs(value: string | null | undefined): number | null {
   if (!value) return null;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isAuthorizedComment(params: { repoOwner: string; authorLogin: string | null; authorAssociation: string | null }): boolean {
+  const author = params.authorLogin?.toLowerCase() ?? "";
+  const association = params.authorAssociation?.toUpperCase() ?? "";
+  return (params.repoOwner && author === params.repoOwner) || AUTHORIZED_ASSOCIATIONS.has(association);
+}
+
+function extractOverrideText(body: string): string | null {
+  const match = body.match(RALPH_OVERRIDE_REGEX);
+  const raw = match?.[1] ?? "";
+  const trimmed = raw.trim();
+  return trimmed ? trimmed : null;
+}
+
+function parseConsultantDecisionFromBody(body: string): ConsultantDecision | null {
+  if (!body.includes(CONSULTANT_MARKER)) return null;
+  const afterMarker = body.split(CONSULTANT_MARKER)[1] ?? "";
+  const match = afterMarker.match(CONSULTANT_JSON_BLOCK_REGEX);
+  if (!match?.[1]) return null;
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (!parsed || typeof parsed !== "object") return null;
+    const obj = parsed as Record<string, unknown>;
+    return {
+      schema_version: typeof obj.schema_version === "number" ? obj.schema_version : undefined,
+      decision: typeof obj.decision === "string" ? obj.decision : undefined,
+      confidence: typeof obj.confidence === "string" ? obj.confidence : undefined,
+      requires_approval: typeof obj.requires_approval === "boolean" ? obj.requires_approval : undefined,
+      proposed_resolution_text: typeof obj.proposed_resolution_text === "string" ? obj.proposed_resolution_text : undefined,
+      reason: typeof obj.reason === "string" ? obj.reason : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function findLatestConsultantDecision(comments: IssueCommentNode[]): ConsultantDecision | null {
+  for (let i = comments.length - 1; i >= 0; i -= 1) {
+    const body = comments[i]?.body ?? "";
+    const parsed = parseConsultantDecisionFromBody(body);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function findLatestApprovalCommand(params: {
+  repoOwner: string;
+  comments: IssueCommentNode[];
+}):
+  | { kind: "approve"; databaseId: number | null; createdAt: string | null }
+  | { kind: "override"; databaseId: number | null; createdAt: string | null; overrideText: string }
+  | null
+{
+  for (let i = params.comments.length - 1; i >= 0; i -= 1) {
+    const entry = params.comments[i];
+    const body = entry?.body ?? "";
+    if (!body) continue;
+    if (body.includes(RALPH_ESCALATION_MARKER_PREFIX)) continue;
+    if (!isAuthorizedComment({
+      repoOwner: params.repoOwner,
+      authorLogin: entry?.author?.login ?? null,
+      authorAssociation: entry?.authorAssociation ?? null,
+    })) {
+      continue;
+    }
+
+    if (RALPH_APPROVE_REGEX.test(body)) {
+      return { kind: "approve", databaseId: typeof entry?.databaseId === "number" ? entry.databaseId : null, createdAt: entry?.createdAt ?? null };
+    }
+
+    const overrideText = extractOverrideText(body);
+    if (overrideText) {
+      return {
+        kind: "override",
+        databaseId: typeof entry?.databaseId === "number" ? entry.databaseId : null,
+        createdAt: entry?.createdAt ?? null,
+        overrideText,
+      };
+    }
+  }
+  return null;
+}
+
+async function createIssueComment(params: {
+  github: GitHubClient;
+  repo: string;
+  issueNumber: number;
+  body: string;
+}): Promise<{ id: number | null; createdAt: string | null; url: string | null }> {
+  const { owner, name } = splitRepoFullName(params.repo);
+  const response = await params.github.request<{ id?: number | null; created_at?: string | null; html_url?: string | null }>(
+    `/repos/${owner}/${name}/issues/${params.issueNumber}/comments`,
+    {
+      method: "POST",
+      body: { body: params.body },
+    }
+  );
+  const id = typeof response.data?.id === "number" ? response.data.id : null;
+  const createdAt = response.data?.created_at ?? null;
+  const url = response.data?.html_url ?? null;
+  return { id, createdAt, url };
 }
 
 function shouldFetchEscalationComments(params: {
@@ -315,6 +433,65 @@ export async function reconcileEscalationResolutions(params: {
       lastCheckedAt: nowIso,
       lastSeenUpdatedAt: githubUpdatedAt ?? checkState.lastSeenUpdatedAt,
     });
+
+     // Consultant approval flow: if a consultant packet is present and the operator comments
+     // `RALPH APPROVE` / `RALPH OVERRIDE: ...`, translate it into a normal resolution and requeue.
+     const approval = findLatestApprovalCommand({ repoOwner, comments: bodies });
+     if (approval) {
+       const key = `gh-consultant-approval:${issue.repo}#${issue.number}:${approval.databaseId ?? "noid"}`;
+       if (!hasIdempotencyKey(key)) {
+         const consultant = findLatestConsultantDecision(bodies);
+         const decision = (consultant?.decision ?? "").toLowerCase();
+         const requiresApproval = consultant?.requires_approval !== false;
+         const proposed = (consultant?.proposed_resolution_text ?? "").trim();
+
+         if (requiresApproval && decision === "needs-human" && proposed) {
+           const guidance = approval.kind === "override" ? approval.overrideText : proposed;
+           const resolvedCommentBody = [`RALPH RESOLVED:`, guidance].join("\n");
+
+           try {
+             const created = await createIssueComment({
+               github: deps.github,
+               repo: issue.repo,
+               issueNumber: issue.number,
+               body: resolvedCommentBody,
+             });
+
+             await resolveEscalation({
+               deps,
+               repo: issue.repo,
+               issueNumber: issue.number,
+               ensureQueued: true,
+               log,
+               reason: approval.kind === "override" ? "RALPH OVERRIDE" : "RALPH APPROVE",
+             });
+
+             recordIdempotencyKey({
+               key,
+               scope: "gh-consultant-approval",
+               payloadJson: JSON.stringify({ approval: approval.databaseId ?? null, resolved: created.id ?? null }),
+             });
+
+             deps.recordEscalationCommentCheckState({
+               repo: params.repo,
+               issueNumber: issue.number,
+               lastCheckedAt: nowIso,
+               lastSeenUpdatedAt: githubUpdatedAt ?? checkState.lastSeenUpdatedAt,
+               lastResolvedCommentId: created.id,
+               lastResolvedCommentAt: created.createdAt,
+             });
+
+             continue;
+           } catch (error: any) {
+             log(
+               `[ralph:gh-escalation:${params.repo}] Failed to apply consultant approval for #${issue.number}: ${
+                 error?.message ?? String(error)
+               }`
+             );
+           }
+         }
+       }
+     }
     let resolution:
       | {
           databaseId: number | null;

@@ -196,6 +196,11 @@ Default-branch unknown fallback:
 - If the marker comment is not discoverable within the comment scan window, Ralph posts a fresh canonical escalation
   comment to ensure the latest required input is visible.
 - Operator @mention defaults to the repo owner handle (e.g. `@owner`); if no owner can be parsed, omit the mention.
+- Consultant approval (when present):
+  - Ralph may attach a consultant packet to the escalation comment (`<!-- ralph-consultant:v1 -->`) including a proposed resolution.
+  - Operators can resolve consultant `needs-human` escalations in one step by commenting either:
+    - `RALPH APPROVE` (accepts the consultant `proposed_resolution_text`)
+    - `RALPH OVERRIDE: <your guidance>` (overrides with operator text)
 - Resolution signals (either is sufficient):
   - A new operator comment contains `RALPH RESOLVED:` (only honored when authored by the repo owner or an `OWNER`/`MEMBER`/`COLLABORATOR`).
   - The operator re-adds `ralph:queued`.

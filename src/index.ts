@@ -857,6 +857,7 @@ async function startTask(opts: {
       const sessionId = claimedTask["session-id"]?.trim() || "";
       const shouldResumeMergeConflict = sessionId && blockedSource === "merge-conflict";
       const shouldResumeStall = sessionId && blockedSource === "stall";
+      const shouldResumeQueuedSession = sessionId && !shouldResumeMergeConflict && !shouldResumeStall;
 
       if (shouldResumeMergeConflict) {
         console.log(
@@ -935,6 +936,58 @@ async function startTask(opts: {
           .resumeTask(claimedTask, {
             resumeMessage:
               `You have been idle for ~${idleMinutes}m. Decide next action: continue, rerun the last command, or escalate with a question. Then proceed.`,
+            repoSlot: slot,
+          })
+          .then(async (run: AgentRun) => {
+            if (run.outcome === "success" && run.pr) {
+              try {
+                recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: PR_STATE_MERGED });
+              } catch {
+                // best-effort
+              }
+
+              await rollupMonitor.recordMerge(repo, run.pr);
+            }
+          })
+          .catch((e) => {
+            console.error(`[ralph] Error resuming task ${claimedTask.name}:`, e);
+          })
+          .finally(() => {
+            inFlightTasks.delete(key);
+            forgetOwnedTask(claimedTask);
+            releaseSlot?.();
+            releaseGlobal();
+            releaseRepo();
+            if (!isShuttingDown) {
+              scheduleQueuedTasksSoon();
+              void checkIdleRollups();
+            }
+          });
+
+        return true;
+      }
+
+      if (shouldResumeQueuedSession) {
+        console.log(`[ralph] Requeued task ${claimedTask.name}; resuming existing session ${sessionId}`);
+
+        await updateTaskStatus(claimedTask, "in-progress", {
+          "assigned-at": new Date().toISOString().split("T")[0],
+          "session-id": sessionId,
+          "throttled-at": "",
+          "resume-at": "",
+          "usage-snapshot": "",
+          "blocked-source": "",
+          "blocked-reason": "",
+          "blocked-details": "",
+          "blocked-at": "",
+          "blocked-checked-at": "",
+        });
+
+        void getOrCreateWorkerForSlot(repo, slot)
+          .resumeTask(claimedTask, {
+            resumeMessage:
+              "This task already has an OpenCode session. Resume from where you left off. " +
+              "If the issue has a recent `RALPH RESOLVED:` comment (or a `RALPH APPROVE`/`RALPH OVERRIDE:` flow), apply that human guidance.",
             repoSlot: slot,
           })
           .then(async (run: AgentRun) => {
