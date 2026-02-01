@@ -6,6 +6,7 @@ import { join } from "path";
 import { RepoWorker } from "../worker";
 import type { IssueRelationshipProvider, IssueRelationshipSnapshot } from "../github/issue-relationships";
 import { closeStateDbForTests, getParentVerificationState, initStateDb } from "../state";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 const updateTaskStatusMock = mock(async () => true);
 
@@ -196,9 +197,11 @@ describe("syncBlockedStateForTasks", () => {
 
   test("sets parent verification pending when deps unblock", async () => {
     updateTaskStatusMock.mockClear();
+    const releaseLock = await acquireGlobalTestLock();
     const priorStateDb = process.env.RALPH_STATE_DB_PATH;
     const stateDir = await mkdtemp(join(tmpdir(), "ralph-state-"));
     process.env.RALPH_STATE_DB_PATH = join(stateDir, "state.sqlite");
+    closeStateDbForTests();
     initStateDb();
 
     try {
@@ -229,6 +232,7 @@ describe("syncBlockedStateForTasks", () => {
       if (priorStateDb === undefined) delete process.env.RALPH_STATE_DB_PATH;
       else process.env.RALPH_STATE_DB_PATH = priorStateDb;
       await rm(stateDir, { recursive: true, force: true });
+      releaseLock();
     }
   });
 
