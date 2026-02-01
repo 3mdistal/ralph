@@ -13,6 +13,7 @@ import {
   RALPH_LABEL_STUCK,
   RALPH_ESCALATION_MARKER_REGEX,
   RALPH_RESOLVED_TEXT,
+  type EscalationType,
 } from "./escalation-constants";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./client";
 import { ensureRalphWorkflowLabelsOnce } from "./ensure-ralph-workflow-labels";
@@ -25,7 +26,7 @@ export type EscalationWritebackContext = {
   taskPath: string;
   reason: string;
   details?: string;
-  escalationType: string;
+  escalationType: EscalationType;
   ownerHandle?: string;
 };
 
@@ -156,7 +157,7 @@ export function sanitizeEscalationReason(input: string): string {
 function buildEscalationMarkerId(params: {
   repo: string;
   issueNumber: number;
-  escalationType: string;
+  escalationType: EscalationType;
 }): string {
   const base = [params.repo, params.issueNumber, params.escalationType].join("|");
   return `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
@@ -165,7 +166,7 @@ function buildEscalationMarkerId(params: {
 export function buildEscalationMarker(params: {
   repo: string;
   issueNumber: number;
-  escalationType: string;
+  escalationType: EscalationType;
 }): string {
   const markerId = buildEscalationMarkerId(params);
   return `<!-- ralph-escalation:id=${markerId} -->`;

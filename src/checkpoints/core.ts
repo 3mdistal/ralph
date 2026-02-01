@@ -52,6 +52,7 @@ export function onCheckpointReached(params: {
   checkpoint: RalphCheckpoint;
   state: CheckpointState;
   pauseRequested: boolean;
+  pauseAtCheckpoint?: RalphCheckpoint | null;
   workerId: string;
 }): { state: CheckpointState; effects: CheckpointEffect[] } {
   if (params.pauseRequested && params.state.pausedAtCheckpoint === params.checkpoint) {
@@ -64,11 +65,14 @@ export function onCheckpointReached(params: {
     };
   }
 
+  const shouldPause =
+    params.pauseRequested && (!params.pauseAtCheckpoint || params.pauseAtCheckpoint === params.checkpoint);
+
   const nextSeq = params.state.checkpointSeq + 1;
   const nextState: CheckpointState = {
     lastCheckpoint: params.checkpoint,
     checkpointSeq: nextSeq,
-    pausedAtCheckpoint: params.pauseRequested ? params.checkpoint : null,
+    pausedAtCheckpoint: shouldPause ? params.checkpoint : null,
     pauseRequested: params.pauseRequested,
   };
 
@@ -100,7 +104,7 @@ export function onCheckpointReached(params: {
     });
   }
 
-  if (params.pauseRequested) {
+  if (shouldPause) {
     effects.push({
       kind: "emit",
       eventType: "worker.pause.reached",

@@ -14,6 +14,7 @@ describe("checkpoint state machine", () => {
       checkpoint: "planned",
       state,
       pauseRequested: false,
+      pauseAtCheckpoint: null,
       workerId: "worker-1",
     });
 
@@ -29,6 +30,7 @@ describe("checkpoint state machine", () => {
       checkpoint: "routed",
       state,
       pauseRequested: true,
+      pauseAtCheckpoint: "routed",
       workerId: "worker-1",
     });
 
@@ -53,11 +55,30 @@ describe("checkpoint state machine", () => {
       checkpoint: "routed",
       state,
       pauseRequested: true,
+      pauseAtCheckpoint: "pr_ready",
       workerId: "worker-1",
     });
 
     expect(result.state.checkpointSeq).toBe(3);
     expect(result.effects).toEqual([{ kind: "wait", reason: "pause" } satisfies CheckpointEffect]);
+  });
+
+  test("does not pause until reaching pauseAtCheckpoint", () => {
+    const state = buildCheckpointState();
+    const result = onCheckpointReached({
+      checkpoint: "planned",
+      state,
+      pauseRequested: true,
+      pauseAtCheckpoint: "pr_ready",
+      workerId: "worker-1",
+    });
+
+    expect(result.state.pauseRequested).toBeTrue();
+    expect(result.state.pausedAtCheckpoint).toBeNull();
+    expect(result.effects.some((effect) => effect.kind === "wait")).toBeFalse();
+
+    const eventTypes = result.effects.filter((effect) => effect.kind === "emit").map((effect) => effect.eventType);
+    expect(eventTypes).toEqual(["worker.checkpoint.reached", "worker.pause.requested"]);
   });
 
   test("clears pause when resume requested", () => {
