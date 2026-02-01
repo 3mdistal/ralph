@@ -255,6 +255,11 @@ This document captures decisions and discoveries made during an interactive audi
 - Gate record required fields locked (preflight, product/devex review, CI, derived ready_for_pr).
 - Retry budgets are per-lane configurable; policy does not assume default numbers.
 
+### Clarification (2026-02-01)
+
+- `PRODUCT GAP:` remains a deterministic escalation marker (cross-cutting, not a "stage").
+- Plan-stage product review is an agent gate; when it fails due to missing guidance it should emit both `RALPH_PLAN_REVIEW` (fail) and a single `PRODUCT GAP:` marker.
+
 ### Repo Scan (code reality) (2026-02-01)
 
 - bwrb is still heavily present in implementation (`src/queue.ts`, `src/queue-backend.ts`, `src/bwrb/*`, `src/notify.ts`, `src/escalation-notes.ts`, and multiple tests).

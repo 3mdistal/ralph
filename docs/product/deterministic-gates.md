@@ -125,6 +125,15 @@ Ralph treats any response without this marker as `fail` and routes via `docs/esc
 
 Product plan review runs for every task to catch drift from the claims ledger before implementation.
 
+This is not an extra human checkpoint: it is an agent gate that happens before implementation work starts.
+
+Interaction with `PRODUCT GAP:`
+
+- `PRODUCT GAP:` / `NO PRODUCT GAP:` markers are still the canonical, deterministic escalation signals (see `docs/escalation-policy.md`).
+- When product plan review fails specifically due to missing product guidance, the product plan-review agent should:
+  - emit `RALPH_PLAN_REVIEW` with `status=fail`, and
+  - include a single `PRODUCT GAP:` marker.
+
 Deterministic plan-review output contract:
 
 - The final line of the product plan-review agent response must include exactly one machine-parseable marker:
