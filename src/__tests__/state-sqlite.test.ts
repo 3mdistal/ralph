@@ -165,7 +165,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("13");
+      expect(meta.value).toBe("14");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -185,6 +185,13 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_issue_sync'")
         .get() as { name?: string } | undefined;
       expect(cursorTable?.name).toBe("repo_github_issue_sync");
+
+      const bootstrapCursorTable = migrated
+        .query(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'repo_github_issue_sync_bootstrap_cursor'"
+        )
+        .get() as { name?: string } | undefined;
+      expect(bootstrapCursorTable?.name).toBe("repo_github_issue_sync_bootstrap_cursor");
 
       const runsTable = migrated
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ralph_runs'")

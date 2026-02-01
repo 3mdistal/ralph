@@ -6,9 +6,12 @@ import { shouldLog } from "./logging";
 import { Semaphore, type ReleaseFn } from "./semaphore";
 import {
   getRepoGithubIssueLastSyncAt,
+  getRepoGithubIssueBootstrapCursor,
   hasIssueSnapshot,
+  clearRepoGithubIssueBootstrapCursor,
   recordIssueLabelsSnapshot,
   recordIssueSnapshot,
+  recordRepoGithubIssueBootstrapCursor,
   recordRepoGithubIssueSync,
   runInStateTransaction,
 } from "./state";
@@ -40,6 +43,15 @@ export type SyncResult = {
   ralphCount: number;
   newLastSyncAt: string | null;
   hadChanges: boolean;
+  progressed: boolean;
+  limitHit?: {
+    kind: "maxPages" | "maxIssues";
+    pagesFetched: number;
+    issuesFetched: number;
+    maxPages: number;
+    maxIssues: number;
+  };
+  cursorInvalid?: boolean;
   rateLimitResetMs?: number;
   error?: string;
 };
@@ -55,6 +67,8 @@ const MIN_DELAY_MS = 1000;
 const ESCALATION_RECONCILE_MIN_INTERVAL_MS = 60_000;
 
 const DEFAULT_ISSUE_SYNC_MAX_INFLIGHT = 2;
+const DEFAULT_ISSUE_SYNC_MAX_PAGES_PER_TICK = 2;
+const DEFAULT_ISSUE_SYNC_MAX_ISSUES_PER_TICK = 200;
 
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -100,6 +114,33 @@ function computeSince(lastSyncAt: string | null, skewSeconds = DEFAULT_SKEW_SECO
   }
 
   return new Date(parsed - skewSeconds * 1000).toISOString();
+}
+
+function buildIssuesListUrl(repo: string): URL {
+  const url = new URL(`https://api.github.com/repos/${repo}/issues`);
+  url.searchParams.set("state", "all");
+  url.searchParams.set("sort", "updated");
+  url.searchParams.set("direction", "desc");
+  url.searchParams.set("per_page", "100");
+  return url;
+}
+
+const ALLOWED_ISSUE_CURSOR_PARAMS = new Set(["state", "sort", "direction", "per_page", "page", "since"]);
+
+function validateIssuesCursor(raw: string, repo: string): URL | null {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:") return null;
+    if (url.username || url.password) return null;
+    if (url.hostname !== "api.github.com") return null;
+    if (url.pathname !== `/repos/${repo}/issues`) return null;
+    for (const key of url.searchParams.keys()) {
+      if (!ALLOWED_ISSUE_CURSOR_PARAMS.has(key)) return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
 }
 
 
@@ -269,6 +310,14 @@ export async function syncRepoIssuesOnce(params: {
   const now = deps.now ? deps.now() : new Date();
   const nowIso = now.toISOString();
   const since = computeSince(params.lastSyncAt);
+  const maxPages = Math.max(
+    1,
+    readEnvInt("RALPH_GITHUB_ISSUES_SYNC_MAX_PAGES_PER_TICK", DEFAULT_ISSUE_SYNC_MAX_PAGES_PER_TICK)
+  );
+  const maxIssues = Math.max(
+    1,
+    readEnvInt("RALPH_GITHUB_ISSUES_SYNC_MAX_ISSUES_PER_TICK", DEFAULT_ISSUE_SYNC_MAX_ISSUES_PER_TICK)
+  );
 
   let releaseSync: ReleaseFn | null = null;
 
@@ -286,91 +335,263 @@ export async function syncRepoIssuesOnce(params: {
         ralphCount: 0,
         newLastSyncAt: params.lastSyncAt ?? null,
         hadChanges: false,
+        progressed: false,
       };
     }
-    const fetchResult = await fetchIssuesSince({
-      repo: params.repo,
-      since,
-      token,
-      fetchImpl,
-    });
+    if (since) {
+      const fetchResult = await fetchIssuesSince({
+        repo: params.repo,
+        since,
+        token,
+        fetchImpl,
+      });
 
-    if (!fetchResult.ok) {
+      if (!fetchResult.ok) {
+        return {
+          ok: false,
+          fetched: fetchResult.fetched,
+          stored: 0,
+          ralphCount: 0,
+          newLastSyncAt: null,
+          hadChanges: false,
+          progressed: false,
+          rateLimitResetMs: fetchResult.rateLimitResetMs,
+          error: fetchResult.error,
+        };
+      }
+
+      const hasRows = fetchResult.fetched > 0;
+      const newLastSyncAt = hasRows
+        ? fetchResult.maxUpdatedAt ?? params.lastSyncAt ?? nowIso
+        : params.lastSyncAt ?? null;
+
+      let stored = 0;
+      let ralphCount = 0;
+      runInStateTransaction(() => {
+        for (const issue of fetchResult.issues) {
+          const number = issue.number ? String(issue.number) : "";
+          if (!number) continue;
+
+          const labels = extractLabelNames(issue.labels);
+          const issueRef = `${params.repo}#${number}`;
+          const hasRalph = hasRalphLabel(labels);
+          if (hasRalph) ralphCount += 1;
+
+          const normalizedState = issue.state ? issue.state.toUpperCase() : undefined;
+          const isClosed = normalizedState === "CLOSED";
+          const shouldStore =
+            hasRalph ||
+            hasIssueSnapshot(params.repo, issueRef) ||
+            (params.storeAllOpen && !isClosed);
+          if (!shouldStore) continue;
+
+          recordIssueSnapshot({
+            repo: params.repo,
+            issue: issueRef,
+            title: issue.title ?? undefined,
+            state: normalizedState,
+            url: issue.html_url ?? undefined,
+            githubNodeId: issue.node_id ?? undefined,
+            githubUpdatedAt: issue.updated_at ?? undefined,
+            at: nowIso,
+          });
+
+          recordIssueLabelsSnapshot({
+            repo: params.repo,
+            issue: issueRef,
+            labels,
+            at: nowIso,
+          });
+
+          stored += 1;
+        }
+
+        if (params.persistCursor && newLastSyncAt && newLastSyncAt !== params.lastSyncAt) {
+          recordRepoGithubIssueSync({
+            repo: params.repo,
+            repoPath: params.repoPath,
+            botBranch: params.botBranch,
+            lastSyncAt: newLastSyncAt,
+          });
+        }
+      });
+
       return {
-        ok: false,
+        ok: true,
         fetched: fetchResult.fetched,
-        stored: 0,
-        ralphCount: 0,
-        newLastSyncAt: null,
-        hadChanges: false,
-        rateLimitResetMs: fetchResult.rateLimitResetMs,
-        error: fetchResult.error,
+        stored,
+        ralphCount,
+        newLastSyncAt,
+        hadChanges: stored > 0,
+        progressed: fetchResult.fetched > 0,
       };
     }
 
-    const hasRows = fetchResult.fetched > 0;
-    const newLastSyncAt = hasRows
-      ? fetchResult.maxUpdatedAt ?? params.lastSyncAt ?? nowIso
-      : params.lastSyncAt ?? null;
+    const bootstrapState = getRepoGithubIssueBootstrapCursor(params.repo);
+    let cursorInvalid = false;
+    let bootstrapHighWatermark = bootstrapState?.highWatermarkUpdatedAt ?? null;
+    let url: URL | null = null;
+    if (bootstrapState?.nextUrl) {
+      const validated = validateIssuesCursor(bootstrapState.nextUrl, params.repo);
+      if (validated) {
+        url = validated;
+      } else {
+        cursorInvalid = true;
+        if (params.persistCursor) {
+          clearRepoGithubIssueBootstrapCursor({ repo: params.repo });
+        }
+        bootstrapHighWatermark = null;
+        url = buildIssuesListUrl(params.repo);
+      }
+    } else {
+      url = buildIssuesListUrl(params.repo);
+    }
 
     let stored = 0;
     let ralphCount = 0;
-    runInStateTransaction(() => {
-      for (const issue of fetchResult.issues) {
-        const number = issue.number ? String(issue.number) : "";
-        if (!number) continue;
+    let fetched = 0;
+    let pagesFetched = 0;
+    let limitHit: SyncResult["limitHit"];
+    let newLastSyncAt: string | null = null;
 
-        const labels = extractLabelNames(issue.labels);
-        const issueRef = `${params.repo}#${number}`;
-        const hasRalph = hasRalphLabel(labels);
-        if (hasRalph) ralphCount += 1;
+    while (url && pagesFetched < maxPages && fetched < maxIssues) {
+      const result = await fetchJson<IssuePayload[]>(fetchImpl, url.toString(), {
+        method: "GET",
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `token ${token}`,
+          "User-Agent": "ralph-loop",
+        },
+      });
 
-        const normalizedState = issue.state ? issue.state.toUpperCase() : undefined;
-        const isClosed = normalizedState === "CLOSED";
-        const shouldStore =
-          hasRalph ||
-          hasIssueSnapshot(params.repo, issueRef) ||
-          (params.storeAllOpen && !isClosed);
-        if (!shouldStore) continue;
-
-        recordIssueSnapshot({
-          repo: params.repo,
-          issue: issueRef,
-          title: issue.title ?? undefined,
-          state: normalizedState,
-          url: issue.html_url ?? undefined,
-          githubNodeId: issue.node_id ?? undefined,
-          githubUpdatedAt: issue.updated_at ?? undefined,
-          at: nowIso,
-        });
-
-        recordIssueLabelsSnapshot({
-          repo: params.repo,
-          issue: issueRef,
-          labels,
-          at: nowIso,
-        });
-
-        stored += 1;
+      if (!result.ok) {
+        const resetAt = resolveRateLimitResetMs(result.headers, result.body);
+        return {
+          ok: false,
+          fetched,
+          stored,
+          ralphCount,
+          newLastSyncAt: null,
+          hadChanges: false,
+          progressed: pagesFetched > 0,
+          rateLimitResetMs: resetAt ?? undefined,
+          error: `HTTP ${result.status}: ${result.body.slice(0, 400)}`,
+          cursorInvalid: cursorInvalid || undefined,
+        };
       }
 
-      if (params.persistCursor && newLastSyncAt && newLastSyncAt !== params.lastSyncAt) {
-        recordRepoGithubIssueSync({
-          repo: params.repo,
-          repoPath: params.repoPath,
-          botBranch: params.botBranch,
-          lastSyncAt: newLastSyncAt,
-        });
+      const rows = Array.isArray(result.data) ? result.data : [];
+      fetched += rows.length;
+      pagesFetched += 1;
+
+      let pageMaxUpdatedAt: string | null = null;
+      for (const row of rows) {
+        pageMaxUpdatedAt = computeMaxUpdatedAt(pageMaxUpdatedAt, row.updated_at);
       }
-    });
+
+      if (!bootstrapHighWatermark && pageMaxUpdatedAt) {
+        bootstrapHighWatermark = pageMaxUpdatedAt;
+      }
+
+      const nonPrRows = rows.filter((row) => !isPullRequest(row));
+      const links = parseLinkHeader(result.headers.get("link"));
+      const nextUrlRaw = links.next ?? null;
+
+      runInStateTransaction(() => {
+        for (const issue of nonPrRows) {
+          const number = issue.number ? String(issue.number) : "";
+          if (!number) continue;
+
+          const labels = extractLabelNames(issue.labels);
+          const issueRef = `${params.repo}#${number}`;
+          const hasRalph = hasRalphLabel(labels);
+          if (hasRalph) ralphCount += 1;
+
+          const normalizedState = issue.state ? issue.state.toUpperCase() : undefined;
+          const isClosed = normalizedState === "CLOSED";
+          const shouldStore =
+            hasRalph ||
+            hasIssueSnapshot(params.repo, issueRef) ||
+            (params.storeAllOpen && !isClosed);
+          if (!shouldStore) continue;
+
+          recordIssueSnapshot({
+            repo: params.repo,
+            issue: issueRef,
+            title: issue.title ?? undefined,
+            state: normalizedState,
+            url: issue.html_url ?? undefined,
+            githubNodeId: issue.node_id ?? undefined,
+            githubUpdatedAt: issue.updated_at ?? undefined,
+            at: nowIso,
+          });
+
+          recordIssueLabelsSnapshot({
+            repo: params.repo,
+            issue: issueRef,
+            labels,
+            at: nowIso,
+          });
+
+          stored += 1;
+        }
+
+        if (params.persistCursor) {
+          if (nextUrlRaw) {
+            recordRepoGithubIssueBootstrapCursor({
+              repo: params.repo,
+              repoPath: params.repoPath,
+              botBranch: params.botBranch,
+              nextUrl: nextUrlRaw,
+              highWatermarkUpdatedAt: bootstrapHighWatermark ?? nowIso,
+              updatedAt: nowIso,
+            });
+          } else {
+            const finalSyncAt = bootstrapHighWatermark ?? nowIso;
+            recordRepoGithubIssueSync({
+              repo: params.repo,
+              repoPath: params.repoPath,
+              botBranch: params.botBranch,
+              lastSyncAt: finalSyncAt,
+            });
+            clearRepoGithubIssueBootstrapCursor({ repo: params.repo });
+            newLastSyncAt = finalSyncAt;
+          }
+        } else if (!nextUrlRaw) {
+          newLastSyncAt = bootstrapHighWatermark ?? nowIso;
+        }
+      });
+
+      const reachedMaxIssues = fetched >= maxIssues;
+      const reachedMaxPages = pagesFetched >= maxPages;
+      if (nextUrlRaw && (reachedMaxIssues || reachedMaxPages)) {
+        limitHit = {
+          kind: reachedMaxIssues ? "maxIssues" : "maxPages",
+          pagesFetched,
+          issuesFetched: fetched,
+          maxPages,
+          maxIssues,
+        };
+        break;
+      }
+
+      if (nextUrlRaw) {
+        url = new URL(nextUrlRaw);
+      } else {
+        url = null;
+      }
+    }
 
     return {
       ok: true,
-      fetched: fetchResult.fetched,
+      fetched,
       stored,
       ralphCount,
       newLastSyncAt,
       hadChanges: stored > 0,
+      progressed: pagesFetched > 0,
+      limitHit,
+      cursorInvalid: cursorInvalid || undefined,
     };
   } catch (error: any) {
     return {
@@ -380,6 +601,7 @@ export async function syncRepoIssuesOnce(params: {
       ralphCount: 0,
       newLastSyncAt: null,
       hadChanges: false,
+      progressed: false,
       error: error?.message ?? String(error),
     };
   } finally {
@@ -435,14 +657,19 @@ function startRepoPoller(params: {
       delayMs = nextDelayMs({
         baseMs: params.baseIntervalMs,
         previousMs: delayMs,
-        hadChanges: result.hadChanges,
+        hadChanges: result.hadChanges || result.progressed,
         hadError: false,
       });
 
+      const limitInfo = result.limitHit
+        ? ` limitHit=${result.limitHit.kind} pages=${result.limitHit.pagesFetched}/${result.limitHit.maxPages} ` +
+          `issues=${result.limitHit.issuesFetched}/${result.limitHit.maxIssues}`
+        : "";
+      const cursorInvalidInfo = result.cursorInvalid ? " cursorInvalid=true" : "";
       params.log(
         `[ralph:gh-sync:${repoLabel}] fetched=${result.fetched} stored=${result.stored} ` +
           `ralph=${result.ralphCount} cursor=${lastSyncAt ?? "none"}->${result.newLastSyncAt ?? "none"} ` +
-          `delayMs=${delayMs}`
+          `delayMs=${delayMs}${limitInfo}${cursorInvalidInfo}`
       );
 
       const nowMs = Date.now();
