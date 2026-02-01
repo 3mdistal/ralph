@@ -92,6 +92,7 @@ const ARTIFACT_MAX_CHARS = 20_000;
 const ARTIFACT_MAX_PER_GATE_KIND = 10;
 
 let db: Database | null = null;
+let dbPath: string | null = null;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -452,7 +453,6 @@ function ensureSchema(database: Database): void {
           );
         `);
       }
-
       if (existingVersion < 13) {
         database.exec(`
           CREATE TABLE IF NOT EXISTS parent_verification_state (
@@ -471,6 +471,46 @@ function ensureSchema(database: Database): void {
           );
           CREATE INDEX IF NOT EXISTS idx_parent_verification_state_repo_status
             ON parent_verification_state(repo_id, status, updated_at_ms);
+
+          CREATE TABLE IF NOT EXISTS ralph_run_metrics (
+            run_id TEXT PRIMARY KEY,
+            wall_time_ms INTEGER,
+            tool_call_count INTEGER NOT NULL DEFAULT 0,
+            tool_time_ms INTEGER,
+            anomaly_count INTEGER NOT NULL DEFAULT 0,
+            anomaly_recent_burst INTEGER NOT NULL DEFAULT 0,
+            tokens_total REAL,
+            tokens_complete INTEGER NOT NULL DEFAULT 0,
+            event_count INTEGER NOT NULL DEFAULT 0,
+            parse_error_count INTEGER NOT NULL DEFAULT 0,
+            quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+            computed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+          );
+          CREATE TABLE IF NOT EXISTS ralph_run_step_metrics (
+            run_id TEXT NOT NULL,
+            step_title TEXT NOT NULL,
+            wall_time_ms INTEGER,
+            tool_call_count INTEGER NOT NULL DEFAULT 0,
+            tool_time_ms INTEGER,
+            anomaly_count INTEGER NOT NULL DEFAULT 0,
+            anomaly_recent_burst INTEGER NOT NULL DEFAULT 0,
+            tokens_total REAL,
+            event_count INTEGER NOT NULL DEFAULT 0,
+            parse_error_count INTEGER NOT NULL DEFAULT 0,
+            quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+            computed_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(run_id, step_title),
+            FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+          );
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_step_metrics_run
+            ON ralph_run_step_metrics(run_id);
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_quality
+            ON ralph_run_metrics(quality);
         `);
       }
     })();
@@ -685,6 +725,46 @@ function ensureSchema(database: Database): void {
       FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS ralph_run_metrics (
+      run_id TEXT PRIMARY KEY,
+      wall_time_ms INTEGER,
+      tool_call_count INTEGER NOT NULL DEFAULT 0,
+      tool_time_ms INTEGER,
+      anomaly_count INTEGER NOT NULL DEFAULT 0,
+      anomaly_recent_burst INTEGER NOT NULL DEFAULT 0,
+      tokens_total REAL,
+      tokens_complete INTEGER NOT NULL DEFAULT 0,
+      event_count INTEGER NOT NULL DEFAULT 0,
+      parse_error_count INTEGER NOT NULL DEFAULT 0,
+      quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+      computed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS ralph_run_step_metrics (
+      run_id TEXT NOT NULL,
+      step_title TEXT NOT NULL,
+      wall_time_ms INTEGER,
+      tool_call_count INTEGER NOT NULL DEFAULT 0,
+      tool_time_ms INTEGER,
+      anomaly_count INTEGER NOT NULL DEFAULT 0,
+      anomaly_recent_burst INTEGER NOT NULL DEFAULT 0,
+      tokens_total REAL,
+      event_count INTEGER NOT NULL DEFAULT 0,
+      parse_error_count INTEGER NOT NULL DEFAULT 0,
+      quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+      computed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, step_title),
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_step_metrics_run
+      ON ralph_run_step_metrics(run_id);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_quality
+      ON ralph_run_metrics(quality);
+
     CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
       run_id TEXT NOT NULL,
       gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
@@ -782,9 +862,12 @@ function ensureSchema(database: Database): void {
 }
 
 export function initStateDb(): void {
-  if (db) return;
-
   const stateDbPath = getRalphStateDbPath();
+  if (db) {
+    if (dbPath === stateDbPath) return;
+    db.close();
+    db = null;
+  }
   if (!process.env.RALPH_STATE_DB_PATH?.trim()) {
     mkdirSync(getRalphHomeDir(), { recursive: true });
   }
@@ -794,6 +877,7 @@ export function initStateDb(): void {
   ensureSchema(database);
 
   db = database;
+  dbPath = stateDbPath;
 }
 
 export function isStateDbInitialized(): boolean {
@@ -804,6 +888,7 @@ export function closeStateDbForTests(): void {
   if (!db) return;
   db.close();
   db = null;
+  dbPath = null;
 }
 
 function parseIssueNumber(issueRef: string): number | null {
