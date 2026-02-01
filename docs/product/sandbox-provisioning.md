@@ -1,5 +1,9 @@
 # Sandbox Provisioning (v1)
 
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 This document defines the v1 contract for sandbox provisioning. It is the canonical reference for the config surface, CLI commands, seed spec, and manifest schema.
 
 ## Goals
@@ -48,7 +52,9 @@ Newest manifest selection:
 
 ### `minimal` (must be reliable)
 - Create repo from template (private).
-- Ensure `ralph:*` workflow labels exist.
+- Ensure Ralph workflow labels exist:
+  - all `ralph:status:*` labels defined in `docs/product/orchestration-contract.md`
+  - all `ralph:cmd:*` labels defined in `docs/product/orchestration-contract.md`
 - Ensure the default branch exists.
 - Create bot branch (e.g. `bot/integration`) from default branch if missing.
 
@@ -71,7 +77,7 @@ Seed specs are JSON with `schemaVersion = 1`.
       "key": "baseline-issue",
       "title": "Sandbox baseline issue",
       "body": "Optional body",
-      "labels": ["ralph:queued"],
+      "labels": ["ralph:status:queued"],
       "comments": [{"body": "Comment body"}]
     }
   ],

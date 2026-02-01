@@ -1,0 +1,10 @@
+{
+  "domains": [
+    { "id": "orchestration", "description": "Queue, labels, operator UX" },
+    { "id": "worktree", "description": "Isolation + worktree lifecycle" },
+    { "id": "gates", "description": "Deterministic gates + merge policy" },
+    { "id": "state", "description": "SQLite durability and migrations" },
+    { "id": "opencode", "description": "Managed config + run control" },
+    { "id": "throttle", "description": "Usage throttling policy" }
+  ]
+}

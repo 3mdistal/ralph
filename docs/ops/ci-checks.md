@@ -1,5 +1,9 @@
 # CI Checks (Derived Reference)
 
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 This doc summarizes the CI checks that run for this repo. It is a reference
 derived from the workflow and scripts below, not the authoritative source for
 required checks. If you change `.github/workflows/ci.yml` or the referenced

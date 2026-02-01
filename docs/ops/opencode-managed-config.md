@@ -1,5 +1,9 @@
 # Managed OpenCode Config (Ralph Daemon)
 
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 Ralph daemon runs use a Ralph-managed OpenCode config directory instead of any user-global or repo-local OpenCode config. This keeps agent behavior deterministic across machines.
 
 ## Defaults

@@ -1,5 +1,9 @@
 # state.sqlite policy
 
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 `~/.ralph/state.sqlite` is Ralph's internal durable store for operational metadata (sessions, worktrees, cursors).
 
 It also stores deterministic gate state for each run (`ralph_run_gate_results`) and bounded, redacted artifacts (`ralph_run_gate_artifacts`).

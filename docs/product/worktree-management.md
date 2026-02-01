@@ -1,5 +1,9 @@
 # Worktree Management
 
+Status: non-canonical (reference)
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 Ralph isolates task work in per-repo worktrees under:
 
 ```

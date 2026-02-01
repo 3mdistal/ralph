@@ -1,5 +1,9 @@
 # Parent verification lane
 
+Status: non-canonical (lane spec)
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 When dependency or sub-issue blockers clear, queued parent issues can be runnable but already satisfied. The parent verification lane is a lightweight pre-implementation check that confirms whether any work remains before entering the full plan/build pipeline.
 
 ## Trigger (deterministic)

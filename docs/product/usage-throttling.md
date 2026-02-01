@@ -1,9 +1,9 @@
 # Ralph: Usage throttling policy
 
-**Status:** draft (policy)
-**Owner:** @3mdistal
-**Last updated:** 2026-01-10
-**Related:** `docs/product/vision.md`, `docs/ops/opencode-usage-throttling.md`
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+Related: `docs/product/vision.md`, `docs/ops/opencode-usage-throttling.md`, `docs/product/orchestration-contract.md`
 
 ## Summary
 
@@ -93,13 +93,11 @@ Hard throttle is enforced at safe checkpoints (control boundaries), not by inter
 
 When hard throttle triggers, Ralph persists throttling state at the task level so it is visible, explainable, and survives daemon restarts.
 
-### Task status + fields
+Throttle is a daemon-level condition. Do not add per-issue GitHub status labels for throttling.
 
-- Set task `status: throttled`.
-- Persist the following frontmatter fields (string-typed):
-  - `throttled-at`: ISO timestamp when Ralph paused the task.
-  - `resume-at`: ISO timestamp when Ralph expects it is safe to resume (best-effort).
-  - `usage-snapshot`: JSON string describing the throttle decision.
+- Persist a durable throttle snapshot in SQLite (computedAt, windows, resumeAt).
+- `bun run status` surfaces current throttle state and `resumeAt`.
+- In-flight tasks pause only at safe checkpoints; their GitHub status remains `ralph:status:in-progress` unless/until they escalate.
 
 ### Snapshot schema (best-effort)
 
