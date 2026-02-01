@@ -19,6 +19,11 @@ export type RalphEventType =
   | "worker.anomaly.updated"
   | "worker.summary.updated"
   | "worker.context_compact.triggered"
+  | "message.queued"
+  | "message.detected"
+  | "message.delivery.attempted"
+  | "message.delivery.deferred"
+  | "message.delivery.blocked"
   | "log.ralph"
   | "log.worker"
   | "log.opencode.event"
@@ -65,6 +70,11 @@ export type RalphEvent =
   | RalphEventEnvelope<"worker.anomaly.updated", { total?: number; recentBurst?: boolean }>
   | RalphEventEnvelope<"worker.summary.updated", { text: string; confidence?: number; top_activities?: string[] }>
   | RalphEventEnvelope<"worker.context_compact.triggered", { stepTitle?: string; attempt?: number }>
+  | RalphEventEnvelope<"message.queued", { id: string; len: number; preview: string }>
+  | RalphEventEnvelope<"message.detected", { count: number; blocked?: boolean }>
+  | RalphEventEnvelope<"message.delivery.attempted", { id: string; len: number; preview: string; success: boolean; error?: string }>
+  | RalphEventEnvelope<"message.delivery.deferred", { id?: string; reason: string }>
+  | RalphEventEnvelope<"message.delivery.blocked", { id: string; failedAttempts: number; maxAttempts: number }>
   | RalphEventEnvelope<"log.ralph", { message: string }>
   | RalphEventEnvelope<"log.worker", { message: string }>
   | RalphEventEnvelope<"log.opencode.event", { event: unknown }>
@@ -90,6 +100,11 @@ const EVENT_TYPES: ReadonlySet<string> = new Set<string>([
   "worker.anomaly.updated",
   "worker.summary.updated",
   "worker.context_compact.triggered",
+  "message.queued",
+  "message.detected",
+  "message.delivery.attempted",
+  "message.delivery.deferred",
+  "message.delivery.blocked",
   "log.ralph",
   "log.worker",
   "log.opencode.event",
@@ -105,6 +120,15 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 function isStringOrUndefined(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string";
+}
+
+function isBooleanOrUndefined(value: unknown): value is boolean | undefined {
+  return value === undefined || typeof value === "boolean";
+}
+
+function isMessagePreview(value: unknown): value is { id: string; len: number; preview: string } {
+  if (!isObject(value)) return false;
+  return typeof value.id === "string" && typeof value.len === "number" && typeof value.preview === "string";
 }
 
 export function isRalphCheckpoint(value: unknown): value is RalphCheckpoint {
@@ -170,6 +194,34 @@ export function isRalphEvent(value: unknown): value is RalphEvent {
       (Array.isArray(topActivities) && topActivities.every((entry) => typeof entry === "string"));
 
     return typeof text === "string" && confidenceOk && topActivitiesOk;
+  }
+
+  if (type === "message.queued") {
+    return isMessagePreview(data);
+  }
+
+  if (type === "message.detected") {
+    return typeof (data as any).count === "number" && isBooleanOrUndefined((data as any).blocked);
+  }
+
+  if (type === "message.delivery.attempted") {
+    if (!isMessagePreview(data)) return false;
+    const success = (data as any).success;
+    const error = (data as any).error;
+    return typeof success === "boolean" && isStringOrUndefined(error);
+  }
+
+  if (type === "message.delivery.deferred") {
+    const reason = (data as any).reason;
+    const id = (data as any).id;
+    return typeof reason === "string" && isStringOrUndefined(id);
+  }
+
+  if (type === "message.delivery.blocked") {
+    const id = (data as any).id;
+    const failedAttempts = (data as any).failedAttempts;
+    const maxAttempts = (data as any).maxAttempts;
+    return typeof id === "string" && typeof failedAttempts === "number" && typeof maxAttempts === "number";
   }
 
   if (type === "error") {
