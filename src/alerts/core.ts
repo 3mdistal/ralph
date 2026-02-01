@@ -19,9 +19,9 @@ export type PlannedAlertRecord = {
   fingerprint: string;
 };
 
-export const ALERT_SUMMARY_MAX_CHARS = 300;
-export const ALERT_DETAILS_MAX_CHARS = 4000;
-export const ALERT_FINGERPRINT_MAX_CHARS = 2000;
+const ALERT_SUMMARY_MAX_CHARS = 300;
+const ALERT_DETAILS_MAX_CHARS = 4000;
+const ALERT_FINGERPRINT_MAX_CHARS = 2000;
 
 function truncateText(input: string, maxChars: number): string {
   const trimmed = input.trim();
