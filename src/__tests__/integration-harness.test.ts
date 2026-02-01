@@ -18,6 +18,7 @@ let originalAddIssueLabel: ((payload: any, label: string) => Promise<void>) | nu
 let originalRemoveIssueLabel: ((payload: any, label: string) => Promise<void>) | null = null;
 let originalFetchRepoDefaultBranch: (() => Promise<string | null>) | null = null;
 let originalGetPullRequestBaseBranch: ((prUrl: string) => Promise<string | null>) | null = null;
+let originalDeleteMergedPrHeadBranchBestEffort: ((prUrl: string) => Promise<void>) | null = null;
 let originalGetPullRequestFiles: ((prUrl: string) => Promise<string[]>) | null = null;
 
 const lifecycleTimeoutMs = 20_000;
@@ -217,6 +218,9 @@ describe("integration-ish harness: full task lifecycle", () => {
     if (!originalGetPullRequestBaseBranch) {
       originalGetPullRequestBaseBranch = (RepoWorker as any).prototype.getPullRequestBaseBranch;
     }
+    if (!originalDeleteMergedPrHeadBranchBestEffort) {
+      originalDeleteMergedPrHeadBranchBestEffort = (RepoWorker as any).prototype.deleteMergedPrHeadBranchBestEffort;
+    }
     if (!originalGetPullRequestFiles) {
       originalGetPullRequestFiles = (RepoWorker as any).prototype.getPullRequestFiles;
     }
@@ -225,6 +229,9 @@ describe("integration-ish harness: full task lifecycle", () => {
     (RepoWorker as any).prototype.fetchRepoDefaultBranch = async () => "main";
     (RepoWorker as any).prototype.getPullRequestBaseBranch = async () => "bot/integration";
     (RepoWorker as any).prototype.getPullRequestFiles = async () => ["src/index.ts"];
+
+    // Prevent accidental live GitHub calls in tests.
+    (RepoWorker as any).prototype.deleteMergedPrHeadBranchBestEffort = async () => {};
   });
 
   afterEach(async () => {
@@ -245,6 +252,9 @@ describe("integration-ish harness: full task lifecycle", () => {
     }
     if (originalGetPullRequestBaseBranch) {
       (RepoWorker as any).prototype.getPullRequestBaseBranch = originalGetPullRequestBaseBranch;
+    }
+    if (originalDeleteMergedPrHeadBranchBestEffort) {
+      (RepoWorker as any).prototype.deleteMergedPrHeadBranchBestEffort = originalDeleteMergedPrHeadBranchBestEffort;
     }
     if (originalGetPullRequestFiles) {
       (RepoWorker as any).prototype.getPullRequestFiles = originalGetPullRequestFiles;
@@ -396,11 +406,11 @@ describe("integration-ish harness: full task lifecycle", () => {
 
     expect(addIssueLabelMock).toHaveBeenCalledWith(
       expect.objectContaining({ repo: "3mdistal/ralph", number: 102 }),
-      "ralph:in-bot"
+      "ralph:status:in-bot"
     );
     expect(removeIssueLabelMock).toHaveBeenCalledWith(
       expect.objectContaining({ repo: "3mdistal/ralph", number: 102 }),
-      "ralph:in-progress"
+      "ralph:status:in-progress"
     );
   }, lifecycleTimeoutMs);
 
@@ -424,6 +434,36 @@ describe("integration-ish harness: full task lifecycle", () => {
       closedAt: null,
       stateReason: null,
     });
+
+    // Prevent accidental real GitHub API calls.
+    (worker as any).getPullRequestMergeState = mock(async () => ({
+      number: 999,
+      url: "https://github.com/3mdistal/ralph/pull/999",
+      mergeStateStatus: "CLEAN",
+      isCrossRepository: false,
+      headRefName: "feature-branch",
+      headRepoFullName: "3mdistal/ralph",
+      baseRefName: "bot/integration",
+      labels: [],
+    }));
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).waitForRequiredChecks = mock(async () => ({
+      headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "bot/integration",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+      timedOut: false,
+    }));
+    (worker as any).mergePullRequest = mock(async () => {});
+    (worker as any).isPrBehind = mock(async () => false);
+    (worker as any).addIssueLabel = mock(async () => {});
+    (worker as any).removeIssueLabel = mock(async () => {});
 
     setParentVerificationPending({ repo: "3mdistal/ralph", issueNumber: 102, nowMs: Date.now() });
 

@@ -41,7 +41,7 @@ describe("GitHub queue blocked label reconciliation", () => {
     releaseLock = null;
   });
 
-  test("adds ralph:blocked for queued issues with open dependencies when autoQueue enabled", async () => {
+  test("moves queued issues to blocked when dependencies are open (autoQueue enabled)", async () => {
     const now = new Date("2026-01-11T00:00:00.000Z");
     await writeJson(getRalphConfigJsonPath(), {
       queueBackend: "github",
@@ -73,7 +73,7 @@ describe("GitHub queue blocked label reconciliation", () => {
     stateMod.recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#1",
-      labels: ["ralph:queued"],
+      labels: ["ralph:status:queued"],
       at: now.toISOString(),
     });
 
@@ -97,7 +97,7 @@ describe("GitHub queue blocked label reconciliation", () => {
       }),
       io: {
         ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
-        listIssueLabels: async () => ["ralph:queued"],
+        listIssueLabels: async () => ["ralph:status:queued"],
         reopenIssue: async () => {},
         addIssueLabel: async () => {},
         addIssueLabels: async () => {},
@@ -110,11 +110,18 @@ describe("GitHub queue blocked label reconciliation", () => {
     });
 
     const queued = await driver.getQueuedTasks();
-    expect(queued.map((t) => t.issue)).toEqual(["3mdistal/ralph#1"]);
-    expect(calls).toEqual([{ repo: "3mdistal/ralph", issueNumber: 1, add: ["ralph:blocked"], remove: [] }]);
+    expect(queued.map((t) => t.issue)).toEqual([]);
+    expect(calls).toEqual([
+      {
+        repo: "3mdistal/ralph",
+        issueNumber: 1,
+        add: ["ralph:status:blocked"],
+        remove: ["ralph:status:queued"],
+      },
+    ]);
   });
 
-  test("removes ralph:blocked for queued issues once dependencies are clear when autoQueue enabled", async () => {
+  test("moves blocked issues back to queued once dependencies clear (autoQueue enabled)", async () => {
     const now = new Date("2026-01-11T00:00:00.000Z");
     await writeJson(getRalphConfigJsonPath(), {
       queueBackend: "github",
@@ -146,7 +153,7 @@ describe("GitHub queue blocked label reconciliation", () => {
     stateMod.recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#2",
-      labels: ["ralph:queued", "ralph:blocked"],
+      labels: ["ralph:status:blocked"],
       at: now.toISOString(),
     });
 
@@ -163,7 +170,7 @@ describe("GitHub queue blocked label reconciliation", () => {
       }),
       io: {
         ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
-        listIssueLabels: async () => ["ralph:queued", "ralph:blocked"],
+        listIssueLabels: async () => ["ralph:status:blocked"],
         reopenIssue: async () => {},
         addIssueLabel: async () => {},
         addIssueLabels: async () => {},
@@ -177,10 +184,17 @@ describe("GitHub queue blocked label reconciliation", () => {
 
     const queued = await driver.getQueuedTasks();
     expect(queued.map((t) => t.issue)).toEqual(["3mdistal/ralph#2"]);
-    expect(calls).toEqual([{ repo: "3mdistal/ralph", issueNumber: 2, add: [], remove: ["ralph:blocked"] }]);
+    expect(calls).toEqual([
+      {
+        repo: "3mdistal/ralph",
+        issueNumber: 2,
+        add: ["ralph:status:queued"],
+        remove: ["ralph:status:blocked"],
+      },
+    ]);
   });
 
-  test("does not add ralph:blocked when dependency coverage is unknown", async () => {
+  test("does not mark blocked when dependency coverage is unknown", async () => {
     const now = new Date("2026-01-11T00:00:00.000Z");
     await writeJson(getRalphConfigJsonPath(), {
       queueBackend: "github",
@@ -212,7 +226,7 @@ describe("GitHub queue blocked label reconciliation", () => {
     stateMod.recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#3",
-      labels: ["ralph:queued"],
+      labels: ["ralph:status:queued"],
       at: now.toISOString(),
     });
 
@@ -229,7 +243,7 @@ describe("GitHub queue blocked label reconciliation", () => {
       }),
       io: {
         ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
-        listIssueLabels: async () => ["ralph:queued"],
+        listIssueLabels: async () => ["ralph:status:queued"],
         reopenIssue: async () => {},
         addIssueLabel: async () => {},
         addIssueLabels: async () => {},

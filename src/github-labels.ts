@@ -10,23 +10,66 @@ export interface ExistingLabelSpec {
   description?: string | null;
 }
 
-export const RALPH_LABEL_QUEUED = "ralph:queued";
-export const RALPH_LABEL_IN_PROGRESS = "ralph:in-progress";
-export const RALPH_LABEL_IN_BOT = "ralph:in-bot";
-export const RALPH_LABEL_BLOCKED = "ralph:blocked";
-export const RALPH_LABEL_STUCK = "ralph:stuck";
-export const RALPH_LABEL_DONE = "ralph:done";
-export const RALPH_LABEL_ESCALATED = "ralph:escalated";
+// Legacy workflow labels (pre vNext taxonomy).
+// NOTE: These are NOT supported by the scheduler after the big-bang cutover.
+const RALPH_LEGACY_WORKFLOW_LABELS = [
+  "ralph:queued",
+  "ralph:in-progress",
+  "ralph:blocked",
+  "ralph:escalated",
+  "ralph:stuck",
+  "ralph:in-bot",
+  "ralph:done",
+] as const;
+
+export type RalphLegacyWorkflowLabel = (typeof RALPH_LEGACY_WORKFLOW_LABELS)[number];
+
+export const RALPH_STATUS_LABEL_PREFIX = "ralph:status:";
+
+export const RALPH_LABEL_STATUS_QUEUED = "ralph:status:queued";
+export const RALPH_LABEL_STATUS_IN_PROGRESS = "ralph:status:in-progress";
+export const RALPH_LABEL_STATUS_BLOCKED = "ralph:status:blocked";
+export const RALPH_LABEL_STATUS_PAUSED = "ralph:status:paused";
+export const RALPH_LABEL_STATUS_THROTTLED = "ralph:status:throttled";
+export const RALPH_LABEL_STATUS_IN_BOT = "ralph:status:in-bot";
+export const RALPH_LABEL_STATUS_DONE = "ralph:status:done";
 
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
-  { name: RALPH_LABEL_QUEUED, color: "0366D6", description: "In queue; claimable when not blocked or escalated" },
-  { name: RALPH_LABEL_IN_PROGRESS, color: "FBCA04", description: "Ralph is actively working" },
-  { name: RALPH_LABEL_IN_BOT, color: "0E8A16", description: "Task PR merged to bot/integration" },
-  { name: RALPH_LABEL_BLOCKED, color: "D73A4A", description: "Blocked by dependencies" },
-  { name: RALPH_LABEL_STUCK, color: "F9A825", description: "Recovery/remediation in progress" },
-  { name: RALPH_LABEL_DONE, color: "1A7F37", description: "Task merged to default branch" },
-  { name: RALPH_LABEL_ESCALATED, color: "B60205", description: "Waiting on human input" },
+  // Status (Ralph-managed)
+  { name: RALPH_LABEL_STATUS_QUEUED, color: "0366D6", description: "In queue; claimable" },
+  { name: RALPH_LABEL_STATUS_IN_PROGRESS, color: "FBCA04", description: "Ralph is actively working" },
+  { name: RALPH_LABEL_STATUS_BLOCKED, color: "D73A4A", description: "Waiting on dependencies or human input" },
+  { name: RALPH_LABEL_STATUS_PAUSED, color: "6A737D", description: "Operator pause; do not claim or resume" },
+  { name: RALPH_LABEL_STATUS_THROTTLED, color: "F9A825", description: "Throttled; will resume later" },
+  { name: RALPH_LABEL_STATUS_IN_BOT, color: "0E8A16", description: "Task PR merged to bot/integration" },
+  { name: RALPH_LABEL_STATUS_DONE, color: "1A7F37", description: "Task merged to default branch" },
+
+  // Intent (operator-owned)
+  { name: "ralph:intent:implement", color: "0B5FFF", description: "Implementation pipeline" },
+  { name: "ralph:intent:review-fix", color: "0B5FFF", description: "PR review-fix autopilot" },
+  { name: "ralph:intent:research", color: "5319E7", description: "Research pipeline" },
+  { name: "ralph:intent:write", color: "5319E7", description: "Writing pipeline" },
+  { name: "ralph:intent:brainstorm", color: "5319E7", description: "Brainstorm pipeline" },
+  { name: "ralph:intent:spec", color: "5319E7", description: "Spec pipeline" },
+  { name: "ralph:intent:triage", color: "5319E7", description: "Triage pipeline" },
+
+  // Artifact (operator-owned)
+  { name: "ralph:artifact:comment", color: "1D76DB", description: "Output: comment" },
+  { name: "ralph:artifact:pr", color: "1D76DB", description: "Output: PR" },
+  { name: "ralph:artifact:merged-pr", color: "1D76DB", description: "Output: merged PR" },
+  { name: "ralph:artifact:markdown", color: "1D76DB", description: "Output: markdown" },
+  { name: "ralph:artifact:pr-review-replies", color: "1D76DB", description: "Output: PR review replies" },
+  { name: "ralph:artifact:subissues", color: "1D76DB", description: "Output: sub-issues" },
 ] as const;
+
+export function detectLegacyWorkflowLabels(labels: string[]): RalphLegacyWorkflowLabel[] {
+  const normalized = new Set(labels.map((label) => label.trim().toLowerCase()).filter(Boolean));
+  const out: RalphLegacyWorkflowLabel[] = [];
+  for (const legacy of RALPH_LEGACY_WORKFLOW_LABELS) {
+    if (normalized.has(legacy)) out.push(legacy);
+  }
+  return out;
+}
 
 function normalizeLabelName(name: string): string {
   return name.trim().toLowerCase();

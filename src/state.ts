@@ -276,6 +276,19 @@ function ensureSchema(database: Database): void {
           "CREATE TABLE IF NOT EXISTS repo_github_issue_sync_bootstrap_cursor (repo_id INTEGER PRIMARY KEY, next_url TEXT NOT NULL, high_watermark_updated_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
         );
       }
+      if (existingVersion < 15) {
+        if (tableExists("repos")) {
+          try {
+            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_error_code TEXT");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_error_details TEXT");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_checked_at TEXT");
+          } catch {}
+        }
+      }
       if (existingVersion < 9) {
         database.exec(
           "CREATE TABLE IF NOT EXISTS issue_escalation_comment_checks (" +
@@ -557,6 +570,9 @@ function ensureSchema(database: Database): void {
       bot_branch TEXT,
       label_write_blocked_until_ms INTEGER,
       label_write_last_error TEXT,
+      label_scheme_error_code TEXT,
+      label_scheme_error_details TEXT,
+      label_scheme_checked_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -1798,6 +1814,83 @@ export function listRepoLabelWriteStates(): RepoLabelWriteState[] {
       };
     })
     .filter((row): row is RepoLabelWriteState => Boolean(row));
+}
+
+export type RepoLabelSchemeState = {
+  repo: string;
+  errorCode: string | null;
+  errorDetails: string | null;
+  checkedAt: string | null;
+};
+
+export function getRepoLabelSchemeState(repo: string): RepoLabelSchemeState {
+  const database = requireDb();
+  const row = database
+    .query(
+      "SELECT label_scheme_error_code as error_code, label_scheme_error_details as error_details, label_scheme_checked_at as checked_at FROM repos WHERE name = $name"
+    )
+    .get({ $name: repo }) as
+    | { error_code?: string | null; error_details?: string | null; checked_at?: string | null }
+    | undefined;
+
+  return {
+    repo,
+    errorCode: row?.error_code ?? null,
+    errorDetails: row?.error_details ?? null,
+    checkedAt: row?.checked_at ?? null,
+  };
+}
+
+export function setRepoLabelSchemeState(params: {
+  repo: string;
+  errorCode: string | null;
+  errorDetails?: string | null;
+  checkedAt?: string;
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+  const checkedAt = params.checkedAt ?? at;
+
+  database
+    .query(
+      `UPDATE repos
+          SET label_scheme_error_code = $error_code,
+              label_scheme_error_details = $error_details,
+              label_scheme_checked_at = $checked_at,
+              updated_at = $updated_at
+        WHERE id = $repo_id`
+    )
+    .run({
+      $repo_id: repoId,
+      $error_code: params.errorCode,
+      $error_details: params.errorDetails ?? null,
+      $checked_at: checkedAt,
+      $updated_at: at,
+    });
+}
+
+export function listRepoLabelSchemeStates(): RepoLabelSchemeState[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      "SELECT name, label_scheme_error_code as error_code, label_scheme_error_details as error_details, label_scheme_checked_at as checked_at FROM repos"
+    )
+    .all() as Array<{ name?: string | null; error_code?: string | null; error_details?: string | null; checked_at?: string | null }>;
+
+  return rows
+    .map((row) => {
+      const repo = row?.name ?? "";
+      if (!repo) return null;
+      return {
+        repo,
+        errorCode: row.error_code ?? null,
+        errorDetails: row.error_details ?? null,
+        checkedAt: row.checked_at ?? null,
+      };
+    })
+    .filter((row): row is RepoLabelSchemeState => Boolean(row));
 }
 
 export function createRalphRun(params: {

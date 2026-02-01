@@ -2,6 +2,7 @@ import type { RepoConfig } from "../config";
 import { shouldLog } from "../logging";
 import {
   getRepoGithubDoneReconcileCursor,
+  getRepoLabelSchemeState,
   recordRepoGithubDoneReconcileCursor,
   type RepoGithubDoneCursor,
 } from "../state";
@@ -9,7 +10,7 @@ import { isRepoAllowed } from "../github-app-auth";
 import { createRalphWorkflowLabelsEnsurer, ensureRalphWorkflowLabelsOnce, type EnsureOutcome } from "./ensure-ralph-workflow-labels";
 import { GitHubClient, splitRepoFullName } from "./client";
 import { executeIssueLabelOps, planIssueLabelOps } from "./issue-label-io";
-import { RALPH_LABEL_DONE } from "../github-labels";
+import { RALPH_LABEL_STATUS_DONE } from "../github-labels";
 
 type PollerHandle = { stop: () => void };
 type TimeoutHandle = ReturnType<typeof setTimeout>;
@@ -50,8 +51,15 @@ const MIN_DELAY_MS = 1000;
 const DEFAULT_DEFAULT_BRANCH_CACHE_TTL_MS = 10 * 60_000;
 const IDLE_LOG_INTERVAL_MS = 60_000;
 
-const DONE_LABEL = RALPH_LABEL_DONE;
-const TRANSITION_LABELS = ["ralph:queued", "ralph:in-progress", "ralph:in-bot", "ralph:blocked", "ralph:escalated"];
+const DONE_LABEL = RALPH_LABEL_STATUS_DONE;
+const TRANSITION_LABELS = [
+  "ralph:status:queued",
+  "ralph:status:in-progress",
+  "ralph:status:in-bot",
+  "ralph:status:blocked",
+  "ralph:status:paused",
+  "ralph:status:throttled",
+];
 
 function applyJitter(valueMs: number): number {
   const clamped = Math.max(valueMs, MIN_DELAY_MS);
@@ -303,6 +311,12 @@ export async function reconcileRepoDoneState(params: {
 
   if (!isRepoAllowed(repo)) {
     log(`${prefix} Skipping repo (owner not in allowlist)`);
+    return { ok: true, processedPrs: 0, updatedIssues: 0 };
+  }
+
+  const scheme = getRepoLabelSchemeState(repo);
+  if (scheme.errorCode === "legacy-workflow-labels") {
+    log(`${prefix} Repo unschedulable due to legacy workflow labels; skipping done reconciler. See docs/ops/label-scheme-migration.md`);
     return { ok: true, processedPrs: 0, updatedIssues: 0 };
   }
 

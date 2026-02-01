@@ -13,7 +13,7 @@ import * as bwrbQueue from "./queue";
 import type { QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
 import type { TaskPriority } from "./queue/priority";
 import { createGitHubQueueDriver } from "./github-queue";
-import { isStateDbInitialized, listRepoLabelWriteStates } from "./state";
+import { isStateDbInitialized, listRepoLabelSchemeStates, listRepoLabelWriteStates } from "./state";
 
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
 
@@ -171,22 +171,35 @@ export function getQueueBackendStateWithLabelHealth(nowMs: number = Date.now()):
   if (base.backend !== "github" || base.health === "unavailable") return base;
   if (!isStateDbInitialized()) return base;
 
-  const states = listRepoLabelWriteStates();
-  const blocked = states
+  let diagnostics = base.diagnostics;
+  let degraded = false;
+
+  const labelWriteStates = listRepoLabelWriteStates();
+  const blocked = labelWriteStates
     .map((state) => ({ repo: state.repo, blockedUntilMs: state.blockedUntilMs, lastError: state.lastError }))
     .filter((entry) => typeof entry.blockedUntilMs === "number" && entry.blockedUntilMs > nowMs);
-  if (blocked.length === 0) return base;
+  if (blocked.length > 0) {
+    degraded = true;
+    const nextBlockedUntilMs = Math.min(...blocked.map((entry) => entry.blockedUntilMs as number));
+    const untilIso = new Date(nextBlockedUntilMs).toISOString();
+    const detail =
+      blocked.length === 1
+        ? `label writes blocked until ${untilIso}`
+        : `label writes blocked for ${blocked.length} repos (next ${untilIso})`;
+    diagnostics = diagnostics ? `${diagnostics} ${detail}` : detail;
+  }
 
-  const nextBlockedUntilMs = Math.min(...blocked.map((entry) => entry.blockedUntilMs as number));
-  const untilIso = new Date(nextBlockedUntilMs).toISOString();
-  const detail = blocked.length === 1 ? `label writes blocked until ${untilIso}` : `label writes blocked for ${blocked.length} repos (next ${untilIso})`;
-  const diagnostics = base.diagnostics ? `${base.diagnostics} ${detail}` : detail;
+  const schemeStates = listRepoLabelSchemeStates();
+  const schemeErrors = schemeStates.filter((state) => Boolean(state.errorCode));
+  if (schemeErrors.length > 0) {
+    degraded = true;
+    const lines = ["Repo label scheme errors:", ...schemeErrors.map((s) => `- ${s.repo}: ${s.errorDetails ?? s.errorCode}`)];
+    const detail = lines.join("\n");
+    diagnostics = diagnostics ? `${diagnostics}\n${detail}` : detail;
+  }
 
-  return {
-    ...base,
-    health: "degraded",
-    diagnostics,
-  };
+  if (!degraded) return base;
+  return { ...base, health: "degraded", diagnostics };
 }
 
 function logQueueBackendNote(action: string, state: QueueBackendState): void {

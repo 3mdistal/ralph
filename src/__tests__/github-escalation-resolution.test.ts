@@ -88,7 +88,7 @@ describe("escalation resolution reconciliation", () => {
     } as any;
 
     const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
-      if (labels.includes("ralph:queued")) {
+      if (labels.includes("ralph:status:queued")) {
         return [{ repo: "3mdistal/ralph", number: 10 }];
       }
       return [
@@ -172,8 +172,8 @@ describe("escalation resolution reconciliation", () => {
     const removed = requests.filter((req) => req.method === "DELETE").map((req) => req.path);
     expect(removed).toEqual(
       expect.arrayContaining([
-        "/repos/3mdistal/ralph/issues/10/labels/ralph%3Aescalated",
-        "/repos/3mdistal/ralph/issues/11/labels/ralph%3Aescalated",
+        "/repos/3mdistal/ralph/issues/10/labels/ralph%3Astatus%3Ablocked",
+        "/repos/3mdistal/ralph/issues/11/labels/ralph%3Astatus%3Ablocked",
       ])
     );
 
@@ -270,7 +270,7 @@ describe("escalation resolution reconciliation", () => {
     } as any;
 
     const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
-      if (labels.includes("ralph:queued")) return [];
+      if (labels.includes("ralph:status:queued")) return [];
       return [{ repo: "3mdistal/ralph", number: 13 }];
     };
 
@@ -359,7 +359,7 @@ describe("escalation resolution reconciliation", () => {
     } as any;
 
     const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
-      if (labels.includes("ralph:queued")) return [];
+      if (labels.includes("ralph:status:queued")) return [];
       return [{ repo: "3mdistal/ralph", number: 12 }];
     };
 
@@ -446,7 +446,7 @@ describe("escalation resolution reconciliation", () => {
     } as any;
 
     const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
-      if (labels.includes("ralph:queued")) return [];
+      if (labels.includes("ralph:status:queued")) return [];
       return [{ repo: "3mdistal/ralph", number: 42 }];
     };
 
@@ -520,7 +520,7 @@ describe("escalation resolution reconciliation", () => {
     recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#77",
-      labels: ["ralph:escalated"],
+      labels: ["ralph:status:blocked"],
       at: "2026-01-11T00:00:00.000Z",
     });
     recordEscalationCommentCheckState({
@@ -593,7 +593,7 @@ describe("escalation resolution reconciliation", () => {
     } as any;
 
     const listIssuesWithAllLabels = ({ labels }: { labels: string[] }) => {
-      if (labels.includes("ralph:queued")) return [];
+      if (labels.includes("ralph:status:queued")) return [];
       return [{ repo: "3mdistal/ralph", number: 99 }];
     };
 
