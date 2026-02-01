@@ -11,7 +11,6 @@ import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 describe("metrics persistence", () => {
   test("stores run and step metrics from session events", async () => {
-    closeStateDbForTests();
     const releaseLock = await acquireGlobalTestLock();
     const root = await mkdtemp(join(tmpdir(), "ralph-metrics-"));
     const statePath = join(root, "state.sqlite");
@@ -21,6 +20,7 @@ describe("metrics persistence", () => {
     process.env.RALPH_STATE_DB_PATH = statePath;
 
     try {
+      closeStateDbForTests();
       initStateDb();
       const runId = createRalphRun({
         repo: "3mdistal/ralph",
@@ -73,14 +73,14 @@ describe("metrics persistence", () => {
       }
     } finally {
       closeStateDbForTests();
-      process.env.RALPH_STATE_DB_PATH = priorState;
+      if (priorState === undefined) delete process.env.RALPH_STATE_DB_PATH;
+      else process.env.RALPH_STATE_DB_PATH = priorState;
       releaseLock();
       await rm(root, { recursive: true, force: true });
     }
   });
 
   test("marks too-large traces with quality", async () => {
-    closeStateDbForTests();
     const releaseLock = await acquireGlobalTestLock();
     const root = await mkdtemp(join(tmpdir(), "ralph-metrics-"));
     const statePath = join(root, "state.sqlite");
@@ -90,6 +90,7 @@ describe("metrics persistence", () => {
     process.env.RALPH_STATE_DB_PATH = statePath;
 
     try {
+      closeStateDbForTests();
       initStateDb();
       const runId = createRalphRun({
         repo: "3mdistal/ralph",
@@ -123,7 +124,8 @@ describe("metrics persistence", () => {
       }
     } finally {
       closeStateDbForTests();
-      process.env.RALPH_STATE_DB_PATH = priorState;
+      if (priorState === undefined) delete process.env.RALPH_STATE_DB_PATH;
+      else process.env.RALPH_STATE_DB_PATH = priorState;
       releaseLock();
       await rm(root, { recursive: true, force: true });
     }
