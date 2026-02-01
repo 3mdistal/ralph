@@ -113,6 +113,11 @@ GitHub label writes are best-effort. When throttled/blocked by GitHub rate limit
 
 Ralph ensures all required `ralph:status:*` and `ralph:cmd:*` labels exist in the repo, and enforces their label descriptions/colors to match the version shipped with Ralph.
 
+Required set (vNext):
+
+- Statuses: `ralph:status:queued`, `ralph:status:in-progress`, `ralph:status:paused`, `ralph:status:escalated`, `ralph:status:in-bot`, `ralph:status:done`, `ralph:status:stopped`
+- Commands: `ralph:cmd:queue`, `ralph:cmd:pause`, `ralph:cmd:stop`, `ralph:cmd:satisfy`
+
 ## Stop semantics
 
 When `ralph:cmd:stop` is applied:

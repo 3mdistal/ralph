@@ -237,6 +237,10 @@ This document captures decisions and discoveries made during an interactive audi
 - Done evidence chain: use GitHub issue timeline events to identify the closing PR, then verify the relevant commit SHA is on the repo default branch.
 - Label bootstrap: Ralph ensures required `ralph:status:*` and `ralph:cmd:*` labels exist and enforces their descriptions/colors.
 
+### Interview 12 (2026-02-01)
+
+- Required label set becomes an explicit canonical claim (enumerated status + command labels).
+
 ### Repo Scan (code reality) (2026-02-01)
 
 - bwrb is still heavily present in implementation (`src/queue.ts`, `src/queue-backend.ts`, `src/bwrb/*`, `src/notify.ts`, `src/escalation-notes.ts`, and multiple tests).
