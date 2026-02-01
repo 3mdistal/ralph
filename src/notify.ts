@@ -6,7 +6,7 @@ import type { TaskPriority } from "./queue/priority";
 import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
 import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { appendBwrbNoteBody, buildEscalationPayload, buildIdeaPayload, createBwrbNote } from "./bwrb/artifacts";
-import { recordIssueErrorAlert, recordRepoErrorAlert, recordRollupReadyAlert } from "./alerts/service";
+import { recordIssueAlert, recordIssueErrorAlert, recordRepoErrorAlert, recordRollupReadyAlert } from "./alerts/service";
 import { parseIssueRef } from "./github/issue-ref";
 
 const sanitizeNoteTitle = sanitizeNoteName;
@@ -17,6 +17,11 @@ export type ErrorNotificationContext = {
   repo?: string | null;
   issue?: string | null;
   taskName?: string | null;
+  alertOverride?: {
+    fingerprintSeed: string;
+    summary: string;
+    details?: string | null;
+  };
 };
 
 type ErrorNotificationInput = ErrorNotificationContext | string | null | undefined;
@@ -557,13 +562,26 @@ export async function notifyError(context: string, error: string, input?: ErrorN
 
   if (issueRef) {
     try {
-      await recordIssueErrorAlert({
-        repo: issueRef.repo,
-        issueNumber: issueRef.number,
-        taskName: taskName ?? undefined,
-        context,
-        error,
-      });
+      const override = normalizedInput?.alertOverride;
+      if (override) {
+        await recordIssueAlert({
+          repo: issueRef.repo,
+          issueNumber: issueRef.number,
+          taskName: taskName ?? undefined,
+          kind: "error",
+          fingerprintSeed: override.fingerprintSeed,
+          summary: override.summary,
+          details: override.details ?? null,
+        });
+      } else {
+        await recordIssueErrorAlert({
+          repo: issueRef.repo,
+          issueNumber: issueRef.number,
+          taskName: taskName ?? undefined,
+          context,
+          error,
+        });
+      }
     } catch (error: any) {
       console.warn(
         `[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
