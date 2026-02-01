@@ -34,6 +34,21 @@ import { computeStaleInProgressRecovery, deriveTaskView, planClaim, statusToRalp
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 const WATCH_MIN_INTERVAL_MS = 1000;
 
+const DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO = 25;
+
+function readEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.floor(parsed);
+}
+
+function clampPositiveInt(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
+
 type GitHubQueueDeps = {
   now?: () => Date;
   io?: GitHubQueueIO;
@@ -215,19 +230,33 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       const autoQueueEnabled = getRepoAutoQueueConfig(repo)?.enabled ?? false;
       if (!autoQueueEnabled) continue;
 
+      const maxIssues = clampPositiveInt(
+        readEnvInt("RALPH_GITHUB_QUEUE_BLOCKED_SWEEP_MAX_ISSUES", DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO),
+        DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO
+      );
+
+      const provider = relationshipsProviderFactory(repo);
+      let processed = 0;
+
       const issues = listIssueSnapshotsWithRalphLabels(repo);
       for (const issue of issues) {
         if (stopRequested) return;
+        if (processed >= maxIssues) break;
         if ((issue.state ?? "").toUpperCase() === "CLOSED") continue;
         if (!issue.labels.includes("ralph:queued")) continue;
 
         try {
-          const provider = relationshipsProviderFactory(repo);
           const snapshot = await provider.getSnapshot({ repo, number: issue.number });
           const resolved = resolveRelationshipSignals(snapshot);
           const decision = computeBlockedDecision(resolved.signals);
 
-          const shouldBeBlocked = decision.blocked || decision.confidence === "unknown";
+          // IMPORTANT: unknown dependency coverage should NOT cause blocked label churn.
+          // Only write the blocked label when we are certain the issue is blocked.
+          if (decision.confidence === "unknown") {
+            continue;
+          }
+
+          const shouldBeBlocked = decision.blocked;
           const hasBlocked = issue.labels.includes("ralph:blocked");
           const add = shouldBeBlocked && !hasBlocked ? ["ralph:blocked"] : [];
           const remove = !shouldBeBlocked && hasBlocked ? ["ralph:blocked"] : [];
@@ -247,6 +276,8 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           console.warn(
             `[ralph:queue:github] Failed to reconcile blocked label for ${repo}#${issue.number}: ${error?.message ?? String(error)}`
           );
+        } finally {
+          processed += 1;
         }
       }
     }
@@ -579,11 +610,20 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               const snapshot = await relationships.getSnapshot(issueRef);
               const resolved = resolveRelationshipSignals(snapshot);
               const decision = computeBlockedDecision(resolved.signals);
-              if (decision.blocked || decision.confidence === "unknown") {
+
+              if (decision.confidence === "unknown") {
+                // Unknown dependency coverage is not a blocker for claiming.
+                // Treat it as best-effort signal gathering rather than a hard gate.
+                if (shouldLog(`deps:unknown:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+                  console.warn(
+                    `[ralph:queue:github] Dependency coverage unknown for ${issueRef.repo}#${issueRef.number}; proceeding without blocked label gating`
+                  );
+                }
+              } else if (decision.blocked) {
                 const reason =
-                  decision.blocked && decision.reasons.length > 0
+                  decision.reasons.length > 0
                     ? `Issue blocked by dependencies (${decision.reasons.join(", ")})`
-                    : "Dependency coverage unknown; treating issue as blocked";
+                    : "Issue blocked by dependencies";
 
                 // Best-effort: materialize blocked label for visibility.
                 if (autoQueueEnabled && !liveLabels.includes("ralph:blocked")) {
