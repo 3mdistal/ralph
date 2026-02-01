@@ -24,7 +24,7 @@ The label descriptions and colors are enforced to match `src/github-labels.ts` (
 | `ralph:in-progress` | Ralph is actively working | `FBCA04` |
 | `ralph:in-bot` | Task PR merged to `bot/integration` | `0E8A16` |
 | `ralph:blocked` | Blocked by dependencies | `D73A4A` |
-| `ralph:stuck` | CI remediation in progress | `F9A825` |
+| `ralph:stuck` | Recovery/remediation in progress | `F9A825` |
 | `ralph:done` | Task merged to default branch | `1A7F37` |
 | `ralph:escalated` | Waiting on human input | `B60205` |
 
@@ -128,10 +128,11 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
 - `dirty-repo` - repo root has uncommitted changes (only blocks when a task would run in the main checkout; isolated worktrees may proceed)
 - `merge-target` - PR targets protected base (e.g. main without override)
 - `ci-only` - CI-only PR for non-CI issue
-- `merge-conflict` - PR has merge conflicts
 - `auto-update` - failure while auto-updating PR branch
 - `ci-failure` - required checks failed or non-actionable
 - `runtime-error` - unexpected runtime failure while processing/resuming a task
+
+Merge conflicts are handled via the merge-conflict recovery lane: apply `ralph:stuck` during bounded recovery attempts and `ralph:escalated` if recovery fails.
 
 Blocked metadata (agent-task frontmatter):
 - `blocked-at` - ISO timestamp for when the task entered blocked (resets only when the blocked signature changes)

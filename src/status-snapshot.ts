@@ -58,6 +58,19 @@ export type StatusDaemonSnapshot = {
   command: string[] | null;
 };
 
+export type StatusTriageRun = {
+  runId: string;
+  repo: string;
+  issueNumber: number | null;
+  outcome: string | null;
+  score: number;
+  reasons: string[];
+  tokensTotal: number | null;
+  toolCallCount: number;
+  wallTimeMs: number | null;
+  computedAt: string;
+};
+
 import type { StatusUsageSnapshot } from "./status-usage";
 
 export type StatusSnapshot = {
@@ -68,6 +81,7 @@ export type StatusSnapshot = {
   activeProfile: string | null;
   throttle: unknown;
   usage?: StatusUsageSnapshot;
+  triageRuns?: StatusTriageRun[];
   escalations: { pending: number };
   inProgress: StatusInProgressTask[];
   starting: StatusTaskBase[];
