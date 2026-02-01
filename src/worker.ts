@@ -374,6 +374,10 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
     details.prUrl = result.pr;
   }
 
+  if (result.completion) {
+    details.completionKind = result.completion;
+  }
+
   if (result.outcome === "escalated") {
     details.reasonCode = "escalated";
   }
@@ -5336,6 +5340,14 @@ ${guidance}`
       childRefs: eligibility.childRefs,
       github: this.github,
     });
+
+    const hasEvidence = hasRequiredParentEvidence(context.children);
+    if (!hasEvidence) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Parent verification skipped; missing merge evidence for ${task.issue}`
+      );
+      return null;
+    }
 
     const cleanBefore = await ensureCleanWorktree(taskRepoPath);
     if (!cleanBefore.clean) {
