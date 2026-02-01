@@ -6751,9 +6751,20 @@ ${guidance}`
   }
 
   private readPauseRequested(): boolean {
+    return this.readPauseControl().pauseRequested;
+  }
+
+  private readPauseControl(): { pauseRequested: boolean; pauseAtCheckpoint: RalphCheckpoint | null } {
     const defaults = getConfig().control;
     const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-    return control.pauseRequested === true;
+
+    const pauseRequested = control.pauseRequested === true;
+    const pauseAtCheckpoint =
+      typeof control.pauseAtCheckpoint === "string" && isRalphCheckpoint(control.pauseAtCheckpoint)
+        ? (control.pauseAtCheckpoint as RalphCheckpoint)
+        : null;
+
+    return { pauseRequested, pauseAtCheckpoint };
   }
 
   private async waitForPauseCleared(opts?: { signal?: AbortSignal }): Promise<void> {
@@ -6820,6 +6831,8 @@ ${guidance}`
       waitUntilCleared: (opts?: { signal?: AbortSignal }) => this.waitForPauseCleared(opts),
     };
 
+    const pauseAtCheckpoint = this.readPauseControl().pauseAtCheckpoint;
+
     const emitter = {
       emit: (event: RalphEvent, key: string) => this.checkpointEvents.emit(event, key),
       hasEmitted: (key: string) => this.checkpointEvents.hasEmitted(key),
@@ -6827,6 +6840,7 @@ ${guidance}`
 
     await applyCheckpointReached({
       checkpoint,
+      pauseAtCheckpoint,
       state,
       context: {
         workerId,
