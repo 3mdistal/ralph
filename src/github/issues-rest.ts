@@ -1,6 +1,8 @@
 import { fetchJson, parseLinkHeader } from "./http";
 import type { IssuePayload } from "./issues-sync-types";
 
+const ALLOWED_ISSUE_CURSOR_PARAMS = new Set(["state", "sort", "direction", "per_page", "page", "since"]);
+
 type FetchIssuesParams = {
   repo: string;
   since: string | null;
@@ -12,6 +14,42 @@ type FetchIssuesParams = {
 export type FetchIssuesResult =
   | { ok: true; issues: IssuePayload[]; fetched: number; maxUpdatedAt: string | null }
   | { ok: false; fetched: number; maxUpdatedAt: string | null; rateLimitResetMs?: number; error: string };
+
+export type FetchIssuesPageResult =
+  | {
+      ok: true;
+      rows: IssuePayload[];
+      nonPrRows: IssuePayload[];
+      fetched: number;
+      pageMaxUpdatedAt: string | null;
+      nextUrlRaw: string | null;
+    }
+  | { ok: false; rateLimitResetMs?: number; error: string };
+
+export function buildIssuesListUrl(repo: string): URL {
+  const url = new URL(`https://api.github.com/repos/${repo}/issues`);
+  url.searchParams.set("state", "all");
+  url.searchParams.set("sort", "updated");
+  url.searchParams.set("direction", "desc");
+  url.searchParams.set("per_page", "100");
+  return url;
+}
+
+export function validateIssuesCursor(raw: string, repo: string): URL | null {
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "https:") return null;
+    if (url.username || url.password) return null;
+    if (url.hostname !== "api.github.com") return null;
+    if (url.pathname !== `/repos/${repo}/issues`) return null;
+    for (const key of url.searchParams.keys()) {
+      if (!ALLOWED_ISSUE_CURSOR_PARAMS.has(key)) return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+}
 
 function parseIsoMs(value?: string): number | null {
   if (!value) return null;
@@ -70,6 +108,51 @@ function resolveRateLimitResetMs(headers: Headers, body: string, nowMs: number):
 
 function isPullRequest(issue: IssuePayload): boolean {
   return Boolean(issue.pull_request);
+}
+
+export async function fetchIssuesPage(params: {
+  url: URL;
+  token: string;
+  fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  nowMs?: number;
+}): Promise<FetchIssuesPageResult> {
+  const result = await fetchJson<IssuePayload[]>(params.fetchImpl, params.url.toString(), {
+    method: "GET",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `token ${params.token}`,
+      "User-Agent": "ralph-loop",
+    },
+  });
+
+  if (!result.ok) {
+    const nowMs = typeof params.nowMs === "number" ? params.nowMs : Date.now();
+    const resetAt = resolveRateLimitResetMs(result.headers, result.body, nowMs);
+    return {
+      ok: false,
+      rateLimitResetMs: resetAt ?? undefined,
+      error: `HTTP ${result.status}: ${result.body.slice(0, 400)}`,
+    };
+  }
+
+  const rows = Array.isArray(result.data) ? result.data : [];
+  const nonPrRows = rows.filter((row) => !isPullRequest(row));
+  let pageMaxUpdatedAt: string | null = null;
+  for (const row of rows) {
+    pageMaxUpdatedAt = computeMaxUpdatedAt(pageMaxUpdatedAt, row.updated_at);
+  }
+
+  const links = parseLinkHeader(result.headers.get("link"));
+  const nextUrlRaw = links.next ?? null;
+
+  return {
+    ok: true,
+    rows,
+    nonPrRows,
+    fetched: rows.length,
+    pageMaxUpdatedAt,
+    nextUrlRaw,
+  };
 }
 
 export async function fetchIssuesSince(params: FetchIssuesParams): Promise<FetchIssuesResult> {

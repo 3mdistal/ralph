@@ -125,14 +125,19 @@ function startRepoPoller(params: {
       delayMs = nextDelayMs({
         baseMs: params.baseIntervalMs,
         previousMs: delayMs,
-        hadChanges: result.hadChanges,
+        hadChanges: result.hadChanges || result.progressed,
         hadError: false,
       });
 
+      const limitInfo = result.limitHit
+        ? ` limitHit=${result.limitHit.kind} pages=${result.limitHit.pagesFetched}/${result.limitHit.maxPages} ` +
+          `issues=${result.limitHit.issuesFetched}/${result.limitHit.maxIssues}`
+        : "";
+      const cursorInvalidInfo = result.cursorInvalid ? " cursorInvalid=true" : "";
       params.log(
         `[ralph:gh-sync:${repoLabel}] fetched=${result.fetched} stored=${result.stored} ` +
           `ralph=${result.ralphCount} cursor=${lastSyncAt ?? "none"}->${result.newLastSyncAt ?? "none"} ` +
-          `delayMs=${delayMs}`
+          `delayMs=${delayMs}${limitInfo}${cursorInvalidInfo}`
       );
 
       const nowMs = deps.nowMs();
