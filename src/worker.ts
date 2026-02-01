@@ -59,7 +59,11 @@ import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationConte
 import { buildWorkerFailureAlert, type WorkerFailureKind } from "./alerts/worker-failure-core";
 import { buildNudgePreview, drainQueuedNudges, type NudgeDeliveryOutcome } from "./nudge";
 import { redactSensitiveText } from "./redaction";
-import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
+import {
+  RALPH_LABEL_STATUS_BLOCKED,
+  RALPH_LABEL_STATUS_IN_PROGRESS,
+  RALPH_LABEL_STATUS_QUEUED,
+} from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
 import { computeGitHubRateLimitPause } from "./github/rate-limit-throttle";
@@ -2660,10 +2664,12 @@ ${guidance}`
         }
 
         try {
-          await this.addIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
+          await this.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
         } catch (error: any) {
           console.warn(
-            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
+            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+              error?.message ?? String(error)
+            }`
           );
         }
         continue;
@@ -2674,7 +2680,7 @@ ${guidance}`
         const shouldSetParentVerification =
           labels.length === 0
             ? true
-            : labels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_QUEUED);
+            : labels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_QUEUED);
         let shouldRemoveBlockedLabel = true;
         for (const task of entry.tasks) {
           if (task.status !== "blocked") continue;
@@ -2703,10 +2709,12 @@ ${guidance}`
 
         if (shouldRemoveBlockedLabel) {
           try {
-            await this.removeIssueLabel(entry.issue, RALPH_LABEL_BLOCKED);
+            await this.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
           } catch (error: any) {
             console.warn(
-              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label: ${error?.message ?? String(error)}`
+              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+                error?.message ?? String(error)
+              }`
             );
           }
         }
@@ -4052,20 +4060,24 @@ ${guidance}`
 
   private async applyCiDebugLabels(issue: IssueRef): Promise<void> {
     try {
-      await this.addIssueLabel(issue, RALPH_LABEL_STUCK);
+      await this.addIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
     }
 
     try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_BLOCKED);
+      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_BLOCKED);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
@@ -4074,10 +4086,12 @@ ${guidance}`
 
   private async clearCiDebugLabels(issue: IssueRef): Promise<void> {
     try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_STUCK);
+      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
@@ -4225,20 +4239,24 @@ ${guidance}`
 
   private async applyMergeConflictLabels(issue: IssueRef): Promise<void> {
     try {
-      await this.addIssueLabel(issue, RALPH_LABEL_STUCK);
+      await this.addIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
     }
 
     try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_BLOCKED);
+      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_BLOCKED);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_BLOCKED} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
@@ -4247,10 +4265,12 @@ ${guidance}`
 
   private async clearMergeConflictLabels(issue: IssueRef): Promise<void> {
     try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_STUCK);
+      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STUCK} label for ${formatIssueRef(issue)}: ${
+        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
+          issue
+        )}: ${
           error?.message ?? String(error)
         }`
       );
@@ -5210,9 +5230,9 @@ ${guidance}`
 
     if (!this.isGitHubQueueTask(task)) return null;
 
-    // Escalated issues are explicitly waiting on humans; do not attempt autonomous CI remediation.
+    // Escalated tasks are explicitly waiting on humans; do not attempt autonomous CI remediation.
     const issueLabels = issueMeta.labels ?? [];
-    if (task.status === "escalated" || issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_ESCALATED)) {
+    if (task.status === "escalated") {
       return null;
     }
 

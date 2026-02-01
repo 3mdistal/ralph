@@ -12,7 +12,7 @@ export interface ExistingLabelSpec {
 
 // Legacy workflow labels (pre vNext taxonomy).
 // NOTE: These are NOT supported by the scheduler after the big-bang cutover.
-export const RALPH_LEGACY_WORKFLOW_LABELS = [
+const RALPH_LEGACY_WORKFLOW_LABELS = [
   "ralph:queued",
   "ralph:in-progress",
   "ralph:blocked",
@@ -33,35 +33,6 @@ export const RALPH_LABEL_STATUS_PAUSED = "ralph:status:paused";
 export const RALPH_LABEL_STATUS_THROTTLED = "ralph:status:throttled";
 export const RALPH_LABEL_STATUS_IN_BOT = "ralph:status:in-bot";
 export const RALPH_LABEL_STATUS_DONE = "ralph:status:done";
-
-// Back-compat alias exports (internal-only).
-// Prefer the explicit RALPH_LABEL_STATUS_* constants in new code.
-export const RALPH_LABEL_QUEUED = RALPH_LABEL_STATUS_QUEUED;
-export const RALPH_LABEL_IN_PROGRESS = RALPH_LABEL_STATUS_IN_PROGRESS;
-export const RALPH_LABEL_BLOCKED = RALPH_LABEL_STATUS_BLOCKED;
-export const RALPH_LABEL_STUCK = RALPH_LABEL_STATUS_IN_PROGRESS;
-export const RALPH_LABEL_IN_BOT = RALPH_LABEL_STATUS_IN_BOT;
-export const RALPH_LABEL_DONE = RALPH_LABEL_STATUS_DONE;
-export const RALPH_LABEL_ESCALATED = RALPH_LABEL_STATUS_BLOCKED;
-
-export const RALPH_INTENT_LABELS = [
-  "ralph:intent:implement",
-  "ralph:intent:review-fix",
-  "ralph:intent:research",
-  "ralph:intent:write",
-  "ralph:intent:brainstorm",
-  "ralph:intent:spec",
-  "ralph:intent:triage",
-] as const;
-
-export const RALPH_ARTIFACT_LABELS = [
-  "ralph:artifact:comment",
-  "ralph:artifact:pr",
-  "ralph:artifact:merged-pr",
-  "ralph:artifact:markdown",
-  "ralph:artifact:pr-review-replies",
-  "ralph:artifact:subissues",
-] as const;
 
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   // Status (Ralph-managed)

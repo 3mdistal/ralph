@@ -1,4 +1,4 @@
-import { RALPH_LABEL_IN_BOT, RALPH_LABEL_IN_PROGRESS } from "./github-labels";
+import { RALPH_LABEL_STATUS_IN_BOT, RALPH_LABEL_STATUS_IN_PROGRESS } from "./github-labels";
 import { computeMidpointLabelPlan } from "./midpoint-labels";
 import type { IssueRef } from "./github/issue-ref";
 import type { ErrorNotificationContext } from "./notify";
@@ -69,28 +69,28 @@ export async function applyMidpointLabelsBestEffort(input: MidpointLabelerInput)
   if (plan.addInBot) {
     try {
       await withTimeout(
-        input.addIssueLabel(input.issueRef, RALPH_LABEL_IN_BOT),
+        input.addIssueLabel(input.issueRef, RALPH_LABEL_STATUS_IN_BOT),
         MIDPOINT_LABEL_TIMEOUT_MS,
-        `add ${RALPH_LABEL_IN_BOT}`
+        `add ${RALPH_LABEL_STATUS_IN_BOT}`
       );
     } catch (error: any) {
       const message = error?.message ?? String(error);
-      errors.push(`add ${RALPH_LABEL_IN_BOT}: ${message}`);
-      warn(`Failed to add ${RALPH_LABEL_IN_BOT} label: ${message}`);
+      errors.push(`add ${RALPH_LABEL_STATUS_IN_BOT}: ${message}`);
+      warn(`Failed to add ${RALPH_LABEL_STATUS_IN_BOT} label: ${message}`);
     }
   }
 
   if (plan.removeInProgress) {
     try {
       await withTimeout(
-        input.removeIssueLabel(input.issueRef, RALPH_LABEL_IN_PROGRESS),
+        input.removeIssueLabel(input.issueRef, RALPH_LABEL_STATUS_IN_PROGRESS),
         MIDPOINT_LABEL_TIMEOUT_MS,
-        `remove ${RALPH_LABEL_IN_PROGRESS}`
+        `remove ${RALPH_LABEL_STATUS_IN_PROGRESS}`
       );
     } catch (error: any) {
       const message = error?.message ?? String(error);
-      errors.push(`remove ${RALPH_LABEL_IN_PROGRESS}: ${message}`);
-      warn(`Failed to remove ${RALPH_LABEL_IN_PROGRESS} label: ${message}`);
+      errors.push(`remove ${RALPH_LABEL_STATUS_IN_PROGRESS}: ${message}`);
+      warn(`Failed to remove ${RALPH_LABEL_STATUS_IN_PROGRESS} label: ${message}`);
     }
   }
 
