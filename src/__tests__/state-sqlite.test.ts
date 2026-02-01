@@ -53,6 +53,29 @@ let priorStateDbPath: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 describe("State SQLite (~/.ralph/state.sqlite)", () => {
+  beforeEach(async () => {
+    priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
+    releaseLock = await acquireGlobalTestLock();
+    homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
+    process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
+    closeStateDbForTests();
+  });
+
+  afterEach(async () => {
+    try {
+      closeStateDbForTests();
+      await rm(homeDir, { recursive: true, force: true });
+    } finally {
+      if (priorStateDbPath === undefined) {
+        delete process.env.RALPH_STATE_DB_PATH;
+      } else {
+        process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
+      }
+      releaseLock?.();
+      releaseLock = null;
+    }
+  });
+
   test("migrates schema from v3", () => {
     const dbPath = getRalphStateDbPath();
     const db = new Database(dbPath);
@@ -644,29 +667,6 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     const sessions = listRalphRunSessionIds(run1);
     expect(sessions).toEqual(["ses_new_a", "ses_new_b"]);
-  });
-
-  beforeEach(async () => {
-    priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
-    releaseLock = await acquireGlobalTestLock();
-    homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
-    process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
-    closeStateDbForTests();
-  });
-
-  afterEach(async () => {
-    try {
-      closeStateDbForTests();
-      await rm(homeDir, { recursive: true, force: true });
-    } finally {
-      if (priorStateDbPath === undefined) {
-        delete process.env.RALPH_STATE_DB_PATH;
-      } else {
-        process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
-      }
-      releaseLock?.();
-      releaseLock = null;
-    }
   });
 
   test("initializes schema and supports metadata writes", () => {
