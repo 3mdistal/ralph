@@ -13,27 +13,34 @@ Migration policy for `state.sqlite`: see `docs/ops/state-sqlite.md`.
   and last-sync cursors. These do not round-trip to GitHub.
 - bwrb notes (if present) are optional audit artifacts, not the queue source of truth.
 
-## Ralph-managed labels
+## Label taxonomy (vNext)
 
-Ralph only manages namespaced labels under `ralph:*` and never edits unrelated labels.
-The label descriptions and colors are enforced to match `src/github-labels.ts` (`RALPH_WORKFLOW_LABELS`); the "Meaning" column is the exact GitHub label `description` Ralph applies.
+Canonical scheme: `docs/product/intent-artifact-orchestration.md`.
+
+Ralph only mutates `ralph:status:*` labels and never edits unrelated labels.
+Ralph bootstraps the starter set of `ralph:intent:*` / `ralph:artifact:*` labels, but treats them as read-only inputs.
+
+Status labels (Ralph-managed):
 
 | Label | Meaning | Color |
 | --- | --- | --- |
-| `ralph:queued` | In queue; claimable when not blocked or escalated | `0366D6` |
-| `ralph:in-progress` | Ralph is actively working | `FBCA04` |
-| `ralph:in-bot` | Task PR merged to `bot/integration` | `0E8A16` |
-| `ralph:blocked` | Blocked by dependencies | `D73A4A` |
-| `ralph:stuck` | Recovery/remediation in progress | `F9A825` |
-| `ralph:done` | Task merged to default branch | `1A7F37` |
-| `ralph:escalated` | Waiting on human input | `B60205` |
+| `ralph:status:queued` | In queue; claimable | `0366D6` |
+| `ralph:status:in-progress` | Ralph is actively working | `FBCA04` |
+| `ralph:status:blocked` | Waiting on dependencies or human input | `D73A4A` |
+| `ralph:status:paused` | Operator pause; do not claim or resume | `6A737D` |
+| `ralph:status:throttled` | Throttled; will resume later | `F9A825` |
+| `ralph:status:in-bot` | Task PR merged to `bot/integration` | `0E8A16` |
+| `ralph:status:done` | Task merged to default branch | `1A7F37` |
+
+Legacy workflow labels (e.g. `ralph:queued`, `ralph:in-progress`, `ralph:blocked`, `ralph:escalated`, `ralph:stuck`, `ralph:in-bot`, `ralph:done`) are a migration error and make the repo unschedulable.
+Cutover is manual: see `docs/ops/label-scheme-migration.md`.
 
 ### Degraded mode: label writes unavailable
 
 GitHub label writes are best-effort. When label mutations are throttled or blocked by GitHub (secondary rate limits, abuse detection, or temporary blocks), Ralph continues scheduling based on local SQLite ownership/heartbeat state and records a label-write backoff window.
 
 Behavior:
-- GitHub labels may temporarily drift from local truth (for example, `ralph:in-progress` may remain visible while the local slot is released).
+- GitHub labels may temporarily drift from local truth (for example, `ralph:status:in-progress` may remain visible while the local slot is released).
 - Scheduling and slot release must not depend on GitHub label writes.
 - Ralph emits a degraded-mode signal in logs/status: `Queue backend: github (degraded)` with diagnostics like `label writes blocked until <iso>`.
 - Labels converge via best-effort reconciliation once GitHub writes resume.
@@ -58,12 +65,12 @@ Note: scheduler "priority tasks" are reserved for resume work and are separate f
 
 ## Claim semantics + daemon model
 
-- Ralph treats `ralph:queued` as the only claimable state once it is not blocked or escalated. Claiming means applying `ralph:in-progress` and removing `ralph:queued`.
+- Ralph treats `ralph:status:queued` as the only claimable state. Claiming means applying `ralph:status:in-progress` and removing `ralph:status:queued`.
 - Claiming is best-effort and not transactional across multiple GitHub label updates.
 - Deployment model: **single daemon per queue**. Running multiple daemons against the same GitHub queue is unsupported.
-- Stale recovery: Ralph only re-queues `ralph:in-progress` issues when the stored `heartbeat-at` exists and is stale beyond `ownershipTtlMs`.
+- Stale recovery: Ralph only re-queues `ralph:status:in-progress` issues when the stored `heartbeat-at` exists and is stale beyond `ownershipTtlMs`.
   Missing or invalid heartbeats do not trigger automatic recovery.
-- Orphan PR reconciliation: if an issue is `ralph:queued` but already has an open PR authored by the configured Ralph GitHub App that closes the issue (e.g. `Fixes #123`) and is mergeable into `bot/integration`, Ralph merges it and applies `ralph:in-bot`.
+- Orphan PR reconciliation: if an issue is `ralph:status:queued` but already has an open PR authored by the configured Ralph GitHub App that closes the issue (e.g. `Fixes #123`) and is mergeable into `bot/integration`, Ralph merges it and applies `ralph:status:in-bot`.
 
 ## Auto-queue (optional)
 
@@ -77,8 +84,8 @@ Config (`repos[].autoQueue`):
 
 Behavior (when enabled):
 - Evaluates open issues for dependency/sub-issue blockers using GitHub-native relationships (body parsing is fallback).
-- Adds/removes `ralph:blocked` and `ralph:queued` labels based on blocked state.
-- Skips issues already in `ralph:in-progress`, `ralph:escalated`, or `ralph:done` states.
+- Adds/removes `ralph:status:blocked` and `ralph:status:queued` labels based on blocked state.
+- Skips issues already in `ralph:status:in-progress`, `ralph:status:blocked`, or `ralph:status:done` states.
 
 ## Dependency encoding
 
@@ -114,8 +121,8 @@ Rules:
 - Sub-issues: a parent issue is blocked while any sub-issue is open; sub-issues are not blocked by their parent.
 
 Blocked enforcement:
-- Blocked issues get the `ralph:blocked` label and their agent-task status is set to `blocked`.
-- When unblocked, Ralph removes `ralph:blocked` and re-queues only tasks that were blocked due to dependencies.
+- Blocked issues get the `ralph:status:blocked` label and their agent-task status is set to `blocked`.
+- When unblocked, Ralph removes `ralph:status:blocked` and re-queues only tasks that were blocked due to dependencies.
 
 Parent verification lane:
 - When dependency blockers clear, Ralph runs a lightweight parent verification lane before full implementation.
@@ -132,7 +139,7 @@ Blocked attribution (`blocked-source` in agent-task frontmatter):
 - `ci-failure` - required checks failed or non-actionable
 - `runtime-error` - unexpected runtime failure while processing/resuming a task
 
-Merge conflicts are handled via the merge-conflict recovery lane: apply `ralph:stuck` during bounded recovery attempts and `ralph:escalated` if recovery fails.
+Merge conflicts are handled via the merge-conflict recovery lane: keep `ralph:status:in-progress` during bounded recovery attempts and set `ralph:status:blocked` if recovery fails.
 
 Blocked metadata (agent-task frontmatter):
 - `blocked-at` - ISO timestamp for when the task entered blocked (resets only when the blocked signature changes)
@@ -141,44 +148,44 @@ Blocked metadata (agent-task frontmatter):
 - `blocked-checked-at` - last time blocked state was evaluated
 
 Requeue resolution (non-dependency blocked tasks):
-- Operators requeue by re-adding `ralph:queued` on the issue.
-- Ralph removes the `ralph:blocked` label when it claims the issue again.
+- Operators requeue by re-adding `ralph:status:queued` on the issue.
+- Ralph removes the `ralph:status:blocked` label when it claims the issue again.
 - When Ralph claims the task again, it clears all `blocked-*` metadata and resumes work.
 - If a `session-id` exists, Ralph resumes the prior OpenCode session; otherwise it starts a fresh session.
 - Requeue does not override dependency blockers; if dependencies are still open, Ralph keeps the issue blocked.
-- In that case Ralph leaves `ralph:queued` in place and rechecks when dependencies change.
+- When dependency coverage is unknown, Ralph avoids label churn and will re-check on the next sync tick.
 
 ## Done semantics (Pattern A)
 
 - Issue remains open until the rollup PR merges to `main`.
-- When a task PR merges to `bot/integration`, Ralph applies `ralph:in-bot` and clears `ralph:in-progress`.
-- When the rollup PR merges to `main`, Ralph applies `ralph:done` and clears transitional labels (`ralph:in-bot`, `ralph:in-progress`, `ralph:blocked`, `ralph:escalated`, `ralph:queued`).
+- When a task PR merges to `bot/integration`, Ralph applies `ralph:status:in-bot` and clears `ralph:status:in-progress`.
+- When the rollup PR merges to the default branch, Ralph applies `ralph:status:done` and clears transitional status labels.
 - Closing the issue remains a separate policy decision (not required for done).
 
 ### Verification-only completion (parent issues)
 
 When a parent issue becomes runnable after all sub-issues close, Ralph runs a verification-only pass seeded with child issues + linked PRs/merges.
 
-- If verification shows the parent is already satisfied, Ralph posts a single canonical comment: "Verification complete — no changes required" with evidence links, removes `ralph:queued` (if present) + `ralph:escalated`, and closes the issue.
-- This path completes the task without a PR URL and does **not** imply `ralph:done` merge semantics.
+- If verification shows the parent is already satisfied, Ralph posts a single canonical comment: "Verification complete — no changes required" with evidence links, removes `ralph:status:queued` (if present) and closes the issue.
+- This path completes the task without a PR URL and does **not** imply `ralph:status:done` merge semantics.
 - If verification finds remaining work (or is inconclusive), Ralph proceeds with the normal implement + PR flow.
 
 Direct-to-main (override / Pattern B):
 - If a task PR is merged directly to `main` (or the repo config sets `botBranch: main`), Ralph does **not** apply the
-  `ralph:in-bot` midpoint label, but **does** clear `ralph:in-progress` as part of the merge step.
+  `ralph:status:in-bot` midpoint label, but **does** clear `ralph:status:in-progress` as part of the merge step.
 - Direct-to-main merges leave the issue open; closing behavior is handled by a separate policy (manual or future
   automation).
-- `ralph:done` is applied once the merge to the default branch is reconciled, regardless of whether it was a rollup
+- `ralph:status:done` is applied once the merge to the default branch is reconciled, regardless of whether it was a rollup
   or direct-to-main merge.
-- If a task PR merges to a non-default branch (for example, a release branch), Ralph clears `ralph:in-progress` but does
-  not apply `ralph:in-bot`.
+- If a task PR merges to a non-default branch (for example, a release branch), Ralph clears `ralph:status:in-progress` but does
+  not apply `ralph:status:in-bot`.
 - Midpoint label updates are best-effort and do not block merges; failures are surfaced via non-blocking notifications
   so operators can resolve GitHub permission/config issues without interrupting the queue.
 
 Default-branch unknown fallback:
 - If Ralph cannot determine the repo default branch (e.g. GitHub API auth failure), it applies the midpoint
-  `ralph:in-bot` label only when the configured bot branch name is clearly a bot branch (currently `bot/integration`
-  or any `bot/*` branch). In all other cases it avoids applying `ralph:in-bot`.
+  `ralph:status:in-bot` label only when the configured bot branch name is clearly a bot branch (currently `bot/integration`
+  or any `bot/*` branch). In all other cases it avoids applying `ralph:status:in-bot`.
 
 ## Duplicate PR handling
 
@@ -188,7 +195,7 @@ Default-branch unknown fallback:
 
 ## Escalation protocol
 
-- Ralph removes `ralph:in-progress` and `ralph:queued`, then adds `ralph:escalated`.
+- Ralph removes `ralph:status:in-progress` and `ralph:status:queued`, then adds `ralph:status:blocked`.
 - Ralph posts a comment containing a stable hidden marker (e.g. `<!-- ralph-escalation:id=... -->`),
   the operator @mention, and resolution instructions.
 - If the issue re-escalates and the marker comment is discoverable, Ralph updates the existing escalation comment
@@ -203,5 +210,5 @@ Default-branch unknown fallback:
     - `RALPH OVERRIDE: <your guidance>` (overrides with operator text)
 - Resolution signals (either is sufficient):
   - A new operator comment contains `RALPH RESOLVED:` (only honored when authored by the repo owner or an `OWNER`/`MEMBER`/`COLLABORATOR`).
-  - The operator re-adds `ralph:queued`.
-- When resolved, Ralph removes `ralph:escalated` (and keeps `ralph:queued` if it was added).
+  - The operator re-adds `ralph:status:queued`.
+- When resolved, Ralph removes `ralph:status:blocked` (and keeps `ralph:status:queued` if it was added).

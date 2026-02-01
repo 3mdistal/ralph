@@ -71,7 +71,7 @@ Seed specs are JSON with `schemaVersion = 1`.
       "key": "baseline-issue",
       "title": "Sandbox baseline issue",
       "body": "Optional body",
-      "labels": ["ralph:queued"],
+      "labels": ["ralph:status:queued"],
       "comments": [{"body": "Comment body"}]
     }
   ],

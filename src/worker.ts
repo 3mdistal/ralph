@@ -4870,7 +4870,7 @@ ${guidance}`
     lines.push(
       "",
       "Next action:",
-      "- Inspect the failing check runs linked above, fix or rerun as needed, then re-add `ralph:queued` (or comment `RALPH RESOLVED:`) to resume."
+      "- Inspect the failing check runs linked above, fix or rerun as needed, then re-add `ralph:status:queued` (or comment `RALPH RESOLVED:`) to resume."
     );
 
     return lines.join("\n");

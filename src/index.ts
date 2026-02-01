@@ -60,7 +60,7 @@ import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessi
 import { removeDaemonRecord, writeDaemonRecord } from "./daemon-record";
 import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
-import { initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
+import { getRepoLabelSchemeState, initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
 import { releaseTaskSlot } from "./state";
 import { updateControlFile } from "./control-file";
 import { buildNudgePreview, queueNudge } from "./nudge";
@@ -301,6 +301,32 @@ function requireBwrbQueueOrExit(action: string): void {
 
   const reason = state.diagnostics ? ` ${state.diagnostics}` : "";
   console.error(`[ralph] bwrb queue backend unavailable.${reason}`);
+  process.exit(1);
+}
+
+function maybeExitIfAllReposUnschedulableDueToLegacyLabels(repos: string[]): void {
+  if (repos.length === 0) return;
+
+  // Avoid exiting while work is in-flight; surfacing the diagnostics is enough.
+  if (inFlightTasks.size > 0 || ownedTasks.size > 0) return;
+
+  let checkedCount = 0;
+  let legacyCount = 0;
+
+  for (const repo of repos) {
+    const state = getRepoLabelSchemeState(repo);
+    if (!state.checkedAt) continue;
+    checkedCount += 1;
+    if (state.errorCode === "legacy-workflow-labels") legacyCount += 1;
+  }
+
+  // Only make this fatal once we've actually checked every configured repo.
+  if (checkedCount !== repos.length) return;
+  if (legacyCount !== repos.length) return;
+
+  console.error(
+    "[ralph] All configured repos are unschedulable due to legacy workflow labels. Manual cutover required: see docs/ops/label-scheme-migration.md"
+  );
   process.exit(1);
 }
 
@@ -1675,6 +1701,7 @@ async function main(): Promise<void> {
       if (repoConfig && autoQueueRunner) {
         autoQueueRunner.schedule(repoConfig, "sync");
       }
+      maybeExitIfAllReposUnschedulableDueToLegacyLabels(config.repos.map((entry) => entry.name));
       if (!result.hadChanges) return;
       scheduleQueuedTasksSoon();
     },
@@ -2727,8 +2754,6 @@ if (args[0] === "watch") {
     printCommandHelp("watch");
     process.exit(0);
   }
-
-  requireBwrbQueueOrExit("watch");
 
   console.log("[ralph] Watching in-progress task status (Ctrl+C to stop)...");
 
