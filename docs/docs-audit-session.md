@@ -255,6 +255,17 @@ This document captures decisions and discoveries made during an interactive audi
 - Gate record required fields locked (preflight, product/devex review, CI, derived ready_for_pr).
 - Retry budgets are per-lane configurable; policy does not assume default numbers.
 
+### Interview 15 (2026-02-01)
+
+- Sandbox provisioning claims promoted (v1):
+  - Private repo per run from a template.
+  - Deterministic repo naming rule.
+  - Private-only visibility (non-private hard error).
+  - Manifest written to `~/.ralph/sandbox/manifests/<runId>.json`.
+  - Seed determinism + idempotency by `key`.
+  - `minimal` preset ensures required `ralph:*` labels and creates bot branch.
+  - `parity` preset is best-effort; failures become warnings and do not block provisioning.
+
 ### Clarification (2026-02-01)
 
 - `PRODUCT GAP:` remains a deterministic escalation marker (cross-cutting, not a "stage").
