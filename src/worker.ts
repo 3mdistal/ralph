@@ -61,6 +61,7 @@ import { redactSensitiveText } from "./redaction";
 import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { computeGitHubRateLimitPause } from "./github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "./github/dx-survey-writeback";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
@@ -6883,6 +6884,89 @@ ${guidance}`
     await this.recordCheckpoint(task, "implementation_step_complete", sessionId);
   }
 
+  private async pauseIfGitHubRateLimited(
+    task: AgentTask,
+    stage: string,
+    error: unknown,
+    opts?: { sessionId?: string; runLogPath?: string }
+  ): Promise<AgentRun | null> {
+    const pause = computeGitHubRateLimitPause({
+      nowMs: Date.now(),
+      stage,
+      error,
+      priorResumeAtIso: task["resume-at"]?.trim() || null,
+    });
+
+    if (!pause) return null;
+
+    const sid = opts?.sessionId?.trim() || task["session-id"]?.trim() || "";
+
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.requested",
+        level: "warn",
+        data: { reason: `github-rate-limit:${stage}` },
+      },
+      { sessionId: sid || undefined }
+    );
+
+    const extraFields: Record<string, string> = {
+      "throttled-at": pause.throttledAtIso,
+      "resume-at": pause.resumeAtIso,
+      "usage-snapshot": pause.usageSnapshotJson,
+    };
+
+    if (sid) extraFields["session-id"] = sid;
+
+    const enteringThrottled = task.status !== "throttled";
+    const updated = await this.queue.updateTaskStatus(task, "throttled", extraFields);
+    if (!updated) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to mark task throttled after GitHub rate limit at stage=${stage}`);
+      return null;
+    }
+
+    applyTaskPatch(task, "throttled", extraFields);
+
+    if (enteringThrottled) {
+      const bodyPrefix = buildAgentRunBodyPrefix({
+        task,
+        headline: `Throttled: GitHub rate limit (${stage})`,
+        reason: `Resume at: ${pause.resumeAtIso}`,
+        details: pause.usageSnapshotJson,
+        sessionId: sid || undefined,
+        runLogPath: opts?.runLogPath ?? task["run-log-path"]?.trim() ?? undefined,
+      });
+      const runTime = new Date();
+      await this.createAgentRun(task, {
+        outcome: "throttled",
+        sessionId: sid || undefined,
+        started: runTime,
+        completed: runTime,
+        bodyPrefix,
+      });
+    }
+
+    console.log(
+      `[ralph:worker:${this.repo}] GitHub rate limit active; pausing at stage=${stage} resumeAt=${pause.resumeAtIso}`
+    );
+
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.reached",
+        level: "warn",
+        data: {},
+      },
+      { sessionId: sid || undefined }
+    );
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "throttled",
+      sessionId: sid || undefined,
+    };
+  }
+
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
     const pinned = this.getPinnedOpencodeProfileName(task);
     const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
@@ -7991,6 +8075,12 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
       if (!error?.ralphRootDirty) {
+        const paused = await this.pauseIfGitHubRateLimited(task, "resume", error, {
+          sessionId: task["session-id"]?.trim() || undefined,
+          runLogPath: task["run-log-path"]?.trim() || undefined,
+        });
+        if (paused) return paused;
+
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
@@ -9136,6 +9226,12 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
       if (!error?.ralphRootDirty) {
+        const paused = await this.pauseIfGitHubRateLimited(task, "process", error, {
+          sessionId: task["session-id"]?.trim() || undefined,
+          runLogPath: task["run-log-path"]?.trim() || undefined,
+        });
+        if (paused) return paused;
+
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
