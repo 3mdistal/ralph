@@ -37,6 +37,10 @@ describe("metrics persistence", () => {
         at: "2026-01-31T09:01:00.000Z",
       });
 
+      // Ensure cross-connection visibility for the DB writes (CI can be flaky
+      // when a second sqlite connection reads before the writer is closed).
+      closeStateDbForTests();
+
       const eventsPath = getSessionEventsPathFromDir(sessionsDir, "ses_metrics");
       await mkdir(dirname(eventsPath), { recursive: true });
       await writeFile(
@@ -110,6 +114,10 @@ describe("metrics persistence", () => {
         stepTitle: "plan",
         at: "2026-01-31T09:11:00.000Z",
       });
+
+      // Ensure cross-connection visibility for the DB writes (CI can be flaky
+      // when a second sqlite connection reads before the writer is closed).
+      closeStateDbForTests();
 
       const eventsPath = getSessionEventsPathFromDir(sessionsDir, "ses_big");
       await mkdir(dirname(eventsPath), { recursive: true });
