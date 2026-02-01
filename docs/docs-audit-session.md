@@ -246,7 +246,14 @@ This document captures decisions and discoveries made during an interactive audi
 - Deterministic gates decisions:
   - Promote core gates claims (preflight, review marker contract, CI triage lanes, persisted gate state).
   - Make `ralph gates <repo> <issueNumber> [--json]` a canonical planned CLI surface.
-  - Avoid duplicate opencode determinism claims; keep `opencode.managed-config` as the single canonical claim.
+- Avoid duplicate opencode determinism claims; keep `opencode.managed-config` as the single canonical claim.
+
+### Interview 14 (2026-02-01)
+
+- Plan-stage product review is required for every task to catch claims drift.
+  - New marker: `RALPH_PLAN_REVIEW: {"status":"pass"|"fail","reason":"..."}` (exactly one on final line; missing == fail).
+- Gate record required fields locked (preflight, product/devex review, CI, derived ready_for_pr).
+- Retry budgets are per-lane configurable; policy does not assume default numbers.
 
 ### Repo Scan (code reality) (2026-02-01)
 

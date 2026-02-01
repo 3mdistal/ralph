@@ -63,6 +63,7 @@ Note: gate persistence should be stored in `~/.ralph/state.sqlite`. Treat this l
 - `preflight.status`: `pending|pass|fail|skipped`
 - `preflight.command`: string (exact commands run)
 - `preflight.skip_reason`: string (required when `skipped`)
+- `plan_review.status`: `pending|pass|fail|skipped`
 - `product_review.status`: `pending|pass|fail|skipped`
 - `devex_review.status`: `pending|pass|fail|skipped`
 - `ci.status`: `pending|pass|fail|skipped`
@@ -120,6 +121,18 @@ Deterministic review output contract:
 
 Ralph treats any response without this marker as `fail` and routes via `docs/escalation-policy.md`.
 
+## Plan-stage product review (required)
+
+Product plan review runs for every task to catch drift from the claims ledger before implementation.
+
+Deterministic plan-review output contract:
+
+- The final line of the product plan-review agent response must include exactly one machine-parseable marker:
+
+  `RALPH_PLAN_REVIEW: {"status":"pass"|"fail","reason":"..."}`
+
+Ralph treats any response without this marker as `fail`.
+
 ## Gate 3: CI (Full Suite + Required Checks)
 
 Default: required.
@@ -166,6 +179,8 @@ Behavior:
 - Comment: post a single canonical GitHub **issue** comment listing failing required check names + links, base/head refs, and the action statement: “Ralph is spawning a dedicated CI-debug run to make required checks green.” Edit this comment as CI state changes (no duplicates).
 - Run: spawn a dedicated CI-debug run immediately with a fresh worktree and fresh OpenCode session (no planning phase). Seed the prompt with failing check names/URLs/refs and a brief failure summary.
 - Retries: allow bounded retries (2–3). If the same failure signature repeats across attempts, stop early and escalate.
+
+Retries are per-lane configurable; do not assume a default count.
 - GitHub status: keep `ralph:status:in-progress` while remediation attempts continue. Set `ralph:status:escalated` only after bounded CI-debug attempts fail.
 - Escalation: post a final comment summarizing what failed, what was tried (links to attempts), and the exact next human action.
 
@@ -179,6 +194,8 @@ Behavior:
 - Run: spawn a dedicated merge-conflict recovery run with a fresh worktree and fresh OpenCode session (no planning phase). Merge base into head (no rebase / no force-push), resolve conflicts, run tests/typecheck/build/knip, then push updates.
 - Wait: after pushing, wait for `mergeStateStatus != DIRTY` and for required checks to appear for the new head SHA before resuming merge-gate logic.
 - Retries: bounded attempts (2–3). If the same conflict signature repeats across attempts, stop early and escalate.
+
+Retries are per-lane configurable; do not assume a default count.
 - GitHub status: keep `ralph:status:in-progress` while recovery attempts continue. Set `ralph:status:escalated` only after bounded attempts fail.
 - Escalation: post a final comment summarizing the conflict files and the exact next human action needed.
 
