@@ -8,6 +8,9 @@ import { resolveRequestedOpencodeProfile, type RequestedOpencodeProfile } from "
 export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
 import type { WatchdogConfig } from "./watchdog";
 
+export type { LoopDetectionConfig, LoopDetectionThresholds } from "./loop-detection/core";
+import type { LoopDetectionConfig, LoopDetectionThresholds } from "./loop-detection/core";
+
 export type AutoQueueScope = "labeled-only" | "all-open";
 
 export type AutoQueueConfig = {
@@ -51,7 +54,16 @@ export interface RepoConfig {
   autoUpdateBehindMinMinutes?: number;
   /** Auto-queue configuration (defaults to disabled). */
   autoQueue?: Partial<AutoQueueConfig>;
+  /** Optional per-repo edit-churn loop detection configuration. */
+  loopDetection?: LoopDetectionConfigInput;
 }
+
+export type LoopDetectionConfigInput = {
+  enabled?: boolean;
+  gateMatchers?: string[];
+  recommendedGateCommand?: string;
+  thresholds?: Partial<LoopDetectionThresholds>;
+};
 
 
 export interface ThrottleWindowConfig {
@@ -279,6 +291,8 @@ export interface RalphConfig {
     /** Max restart attempts before escalating (default: 1). */
     maxRestarts?: number;
   };
+  /** Optional global edit-churn loop detection configuration (can be overridden per repo). */
+  loopDetection?: LoopDetectionConfigInput;
   throttle?: ThrottleConfig;
   opencode?: OpencodeConfig;
   control?: ControlConfig;
@@ -296,6 +310,14 @@ const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 const DEFAULT_AUTO_QUEUE_SCOPE: AutoQueueScope = "labeled-only";
 const DEFAULT_AUTO_QUEUE_MAX_PER_TICK = 200;
+
+const DEFAULT_LOOP_DETECTION_GATE_MATCHERS = ["bun test", "bun run typecheck", "bun run build", "bun run knip"] as const;
+const DEFAULT_LOOP_DETECTION_THRESHOLDS: LoopDetectionThresholds = {
+  minEdits: 20,
+  minElapsedMsWithoutGate: 8 * 60_000,
+  minTopFileTouches: 8,
+  minTopFileShare: 0.6,
+};
 
 const DEFAULT_THROTTLE_PROVIDER_ID = "openai";
 const DEFAULT_THROTTLE_OPENAI_SOURCE: "localLogs" | "remoteUsage" = "remoteUsage";
@@ -465,6 +487,115 @@ function toPctOrNull(value: unknown): number | null {
 
 function toBooleanOrNull(value: unknown): boolean | null {
   return typeof value === "boolean" ? value : null;
+}
+
+function toLoopDetectionConfigPatchOrThrow(raw: any, label: string): LoopDetectionConfigInput {
+  if (raw == null) return {};
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    throw new RalphConfigError("RALPH_CONFIG_INVALID", `[ralph] Invalid config ${label}=${JSON.stringify(raw)}; expected object.`);
+  }
+
+  const out: LoopDetectionConfigInput = {};
+
+  const rawEnabled = raw.enabled;
+  if (rawEnabled !== undefined) {
+    if (typeof rawEnabled !== "boolean") {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_INVALID",
+        `[ralph] Invalid config ${label}.enabled=${JSON.stringify(rawEnabled)}; expected boolean.`
+      );
+    }
+    out.enabled = rawEnabled;
+  }
+
+  const rawGateMatchers = raw.gateMatchers;
+  if (rawGateMatchers !== undefined) {
+    const parsed = toStringArrayOrNull(rawGateMatchers);
+    if (parsed === null) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_INVALID",
+        `[ralph] Invalid config ${label}.gateMatchers=${JSON.stringify(rawGateMatchers)}; expected string[].`
+      );
+    }
+    out.gateMatchers = parsed;
+  }
+
+  const rawRecommended = raw.recommendedGateCommand;
+  if (rawRecommended !== undefined) {
+    if (typeof rawRecommended !== "string" || !rawRecommended.trim()) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_INVALID",
+        `[ralph] Invalid config ${label}.recommendedGateCommand=${JSON.stringify(rawRecommended)}; expected non-empty string.`
+      );
+    }
+    out.recommendedGateCommand = rawRecommended.trim();
+  }
+
+  const rawThresholds = raw.thresholds;
+  if (rawThresholds !== undefined) {
+    if (rawThresholds == null || typeof rawThresholds !== "object" || Array.isArray(rawThresholds)) {
+      throw new RalphConfigError(
+        "RALPH_CONFIG_INVALID",
+        `[ralph] Invalid config ${label}.thresholds=${JSON.stringify(rawThresholds)}; expected object.`
+      );
+    }
+
+    const patch: Partial<LoopDetectionThresholds> = {};
+
+    const rawMinEdits = (rawThresholds as any).minEdits;
+    if (rawMinEdits !== undefined) {
+      const parsed = toPositiveIntFromUnknownOrNull(rawMinEdits);
+      if (!parsed) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_INVALID",
+          `[ralph] Invalid config ${label}.thresholds.minEdits=${JSON.stringify(rawMinEdits)}; expected positive integer.`
+        );
+      }
+      patch.minEdits = parsed;
+    }
+
+    const rawMinElapsed = (rawThresholds as any).minElapsedMsWithoutGate;
+    if (rawMinElapsed !== undefined) {
+      const parsed = toPositiveIntFromUnknownOrNull(rawMinElapsed);
+      if (!parsed) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_INVALID",
+          `[ralph] Invalid config ${label}.thresholds.minElapsedMsWithoutGate=${JSON.stringify(
+            rawMinElapsed
+          )}; expected positive integer (ms).`
+        );
+      }
+      patch.minElapsedMsWithoutGate = parsed;
+    }
+
+    const rawMinTouches = (rawThresholds as any).minTopFileTouches;
+    if (rawMinTouches !== undefined) {
+      const parsed = toPositiveIntFromUnknownOrNull(rawMinTouches);
+      if (!parsed) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_INVALID",
+          `[ralph] Invalid config ${label}.thresholds.minTopFileTouches=${JSON.stringify(rawMinTouches)}; expected positive integer.`
+        );
+      }
+      patch.minTopFileTouches = parsed;
+    }
+
+    const rawShare = (rawThresholds as any).minTopFileShare;
+    if (rawShare !== undefined) {
+      const parsed = toPctOrNull(typeof rawShare === "string" ? Number(rawShare) : rawShare);
+      if (parsed == null) {
+        throw new RalphConfigError(
+          "RALPH_CONFIG_INVALID",
+          `[ralph] Invalid config ${label}.thresholds.minTopFileShare=${JSON.stringify(rawShare)}; expected number 0..1.`
+        );
+      }
+      patch.minTopFileShare = parsed;
+    }
+
+    out.thresholds = patch;
+  }
+
+  return out;
 }
 
 function validateConfig(loaded: RalphConfig): RalphConfig {
@@ -662,6 +793,19 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
 
     if (Object.keys(updates).length === 0) return repo;
     return { ...repo, ...updates };
+  });
+
+  // Loop detection config blocks: strict validation + shallow normalization.
+  const rawGlobalLoop = (loaded as any).loopDetection;
+  if (rawGlobalLoop !== undefined) {
+    loaded.loopDetection = toLoopDetectionConfigPatchOrThrow(rawGlobalLoop, "loopDetection");
+  }
+
+  loaded.repos = (loaded.repos ?? []).map((repo) => {
+    const rawLoop = (repo as any).loopDetection;
+    if (rawLoop === undefined) return repo;
+    const parsed = toLoopDetectionConfigPatchOrThrow(rawLoop, `repos[${repo.name}].loopDetection`);
+    return { ...repo, loopDetection: parsed };
   });
 
   // Guardrail allowlist. Default to [owner].
@@ -1665,6 +1809,40 @@ export function getRepoSetupCommands(repoName: string): string[] | null {
     return null;
   }
   return parsed;
+}
+
+export function getRepoLoopDetectionConfig(repoName: string): LoopDetectionConfig | null {
+  const cfg = getConfig();
+  const repo = cfg.repos.find((r) => r.name === repoName);
+
+  const global = cfg.loopDetection ?? {};
+  const override = repo?.loopDetection ?? {};
+
+  const enabled =
+    typeof override.enabled === "boolean" ? override.enabled : typeof global.enabled === "boolean" ? global.enabled : false;
+  if (!enabled) return null;
+
+  const gateMatchers =
+    override.gateMatchers ?? global.gateMatchers ?? Array.from(DEFAULT_LOOP_DETECTION_GATE_MATCHERS).map((v) => String(v));
+  if (!Array.isArray(gateMatchers) || gateMatchers.length === 0) {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_INVALID",
+      `[ralph] loopDetection enabled for ${repoName} but gateMatchers is empty; configure loopDetection.gateMatchers.`
+    );
+  }
+
+  const thresholdsPatch = { ...(global.thresholds ?? {}), ...(override.thresholds ?? {}) };
+  const thresholds: LoopDetectionThresholds = { ...DEFAULT_LOOP_DETECTION_THRESHOLDS, ...thresholdsPatch };
+
+  const recommendedGateCommand =
+    override.recommendedGateCommand ?? global.recommendedGateCommand ?? gateMatchers[0] ?? "bun test";
+
+  return {
+    enabled: true,
+    gateMatchers,
+    recommendedGateCommand,
+    thresholds,
+  };
 }
 
 export function getGlobalMaxWorkers(): number {
