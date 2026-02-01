@@ -11,9 +11,13 @@ const SENSITIVE_RULES: Array<{ re: RegExp; replacement: string }> = [
   { re: /ghp_[A-Za-z0-9]{20,}/g, replacement: "ghp_[REDACTED]" },
   { re: /github_pat_[A-Za-z0-9_]{20,}/g, replacement: "github_pat_[REDACTED]" },
   { re: /sk-[A-Za-z0-9]{20,}/g, replacement: "sk-[REDACTED]" },
+  { re: /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, replacement: "[REDACTED_JWT]" },
   { re: /xox[baprs]-[A-Za-z0-9-]{10,}/g, replacement: "xox-[REDACTED]" },
   { re: /(Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
   { re: /(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
+  { re: /("access_token"\s*:\s*")([^"]+)(")/gi, replacement: "$1[REDACTED]$3" },
+  { re: /("refresh_token"\s*:\s*")([^"]+)(")/gi, replacement: "$1[REDACTED]$3" },
+  { re: /("id_token"\s*:\s*")([^"]+)(")/gi, replacement: "$1[REDACTED]$3" },
 ];
 
 export function redactSensitiveText(value: string, opts?: { homeDir?: string }): string {

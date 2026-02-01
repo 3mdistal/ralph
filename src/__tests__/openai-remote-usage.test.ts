@@ -235,6 +235,61 @@ describe("openai remote usage", () => {
       expect(persisted.openai.refresh).toBe("tok_new_refresh");
       expect(typeof persisted.openai.expires).toBe("number");
       expect(persisted.openai.expires).toBeGreaterThan(now);
+
+      const backup = JSON.parse(await readFile(join(root, "opencode", "auth.json.bak"), "utf8"));
+      expect(backup.openai.access).toBe("tok_old");
+    } finally {
+      globalThis.fetch = priorFetch;
+      await rm(root, { recursive: true, force: true });
+      __clearRemoteOpenaiUsageCacheForTests();
+    }
+  });
+
+  test("times out and trips failure cooldown", async () => {
+    const root = await mkdtemp(join(tmpdir(), "ralph-openai-remote-usage-"));
+    const authPath = join(root, "opencode", "auth.json");
+    const now = Date.parse("2026-01-24T12:00:00Z");
+
+    const priorFetch = globalThis.fetch;
+    __clearRemoteOpenaiUsageCacheForTests();
+
+    try {
+      await writeJson(authPath, {
+        openai: {
+          type: "oauth",
+          access: "tok_access",
+          refresh: "tok_refresh",
+          expires: now + 30 * 60_000,
+        },
+      });
+
+      const fetchMock = mock(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/backend-api/wham/usage")) {
+          return new Promise<Response>((_, reject) => {
+            const signal = init?.signal as AbortSignal | undefined;
+            if (signal?.aborted) reject(new Error("aborted"));
+            signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          });
+        }
+        if (url.includes("/oauth/token")) return new Response("unexpected", { status: 500 });
+        return new Response("unexpected", { status: 500 });
+      });
+
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const baseOpts = {
+        authFilePath: authPath,
+        now,
+        skipCache: true,
+        timeoutMs: 5,
+        failureThreshold: 2,
+        failureCooldownMs: 60_000,
+      };
+
+      await expect(getRemoteOpenaiUsage(baseOpts)).rejects.toThrow();
+      await expect(getRemoteOpenaiUsage(baseOpts)).rejects.toThrow();
+      await expect(getRemoteOpenaiUsage(baseOpts)).rejects.toThrow("Remote usage temporarily disabled");
     } finally {
       globalThis.fetch = priorFetch;
       await rm(root, { recursive: true, force: true });

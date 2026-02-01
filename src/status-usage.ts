@@ -1,4 +1,5 @@
 import type { ThrottleDecision, ThrottleSnapshot, ThrottleState } from "./throttle";
+import { redactSensitiveText } from "./redaction";
 
 export type StatusUsageSource = "remoteUsage" | "localLogs";
 
@@ -42,8 +43,9 @@ function sanitizeError(value: string | null): string | null {
   if (!value) return null;
   const trimmed = value.trim();
   if (!trimmed) return null;
-  if (trimmed.length <= ERROR_TRUNCATE_MAX) return trimmed;
-  return trimmed.slice(0, ERROR_TRUNCATE_MAX - 1).trimEnd() + "…";
+  const redacted = redactSensitiveText(trimmed);
+  if (redacted.length <= ERROR_TRUNCATE_MAX) return redacted;
+  return redacted.slice(0, ERROR_TRUNCATE_MAX - 1).trimEnd() + "…";
 }
 
 function toIso(ts: number | null | undefined): string | null {
