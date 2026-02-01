@@ -18,6 +18,7 @@ export type RalphRunDetails = {
   errorCode?: string;
   escalationType?: string;
   prUrl?: string;
+  completionKind?: "pr" | "verified";
   watchdogTimeout?: boolean;
 };
 
@@ -123,11 +124,13 @@ function sanitizeRalphRunDetails(details?: RalphRunDetails | null): RalphRunDeta
   const errorCode = sanitizeRunDetailString(details.errorCode, 120);
   const escalationType = sanitizeRunDetailString(details.escalationType, 120);
   const prUrl = sanitizeRunDetailString(details.prUrl, 500);
+  const completionKind = details.completionKind === "verified" ? "verified" : details.completionKind === "pr" ? "pr" : undefined;
 
   if (reasonCode) sanitized.reasonCode = reasonCode;
   if (errorCode) sanitized.errorCode = errorCode;
   if (escalationType) sanitized.escalationType = escalationType;
   if (prUrl) sanitized.prUrl = prUrl;
+  if (completionKind) sanitized.completionKind = completionKind;
   if (details.watchdogTimeout) sanitized.watchdogTimeout = true;
 
   return Object.keys(sanitized).length ? sanitized : null;
@@ -2981,6 +2984,38 @@ export function listOpenPrCandidatesForIssue(repo: string, issueNumber: number):
          AND url IS NOT NULL
          AND TRIM(url) != ''
          AND (state = 'open' OR state IS NULL)
+       ORDER BY updated_at DESC, created_at DESC`
+    )
+    .all({
+      $repo_id: repoRow.id,
+      $issue_number: issueNumber,
+    }) as Array<{
+    url?: string | null;
+    pr_number?: number | null;
+    state?: string | null;
+    created_at?: string | null;
+    updated_at?: string | null;
+  }>;
+
+  return formatPrSnapshotRows(rows);
+}
+
+export function listMergedPrCandidatesForIssue(repo: string, issueNumber: number): PrSnapshotRow[] {
+  const database = requireDb();
+  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: repo,
+  }) as { id?: number } | undefined;
+  if (!repoRow?.id) return [];
+
+  const rows = database
+    .query(
+      `SELECT url, pr_number, state, created_at, updated_at
+       FROM prs
+       WHERE repo_id = $repo_id
+         AND issue_number = $issue_number
+         AND url IS NOT NULL
+         AND TRIM(url) != ''
+         AND state = 'merged'
        ORDER BY updated_at DESC, created_at DESC`
     )
     .all({
