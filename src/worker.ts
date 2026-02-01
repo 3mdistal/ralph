@@ -1707,7 +1707,7 @@ export class RepoWorker {
       });
     }
 
-    if (updated && didEnterBlocked) {
+    if (updated && didEnterBlocked && source !== "allowlist") {
       const kind: WorkerFailureKind = source === "runtime-error" ? "runtime-error" : "blocked";
       const reason = reasonSummary || `Blocked: ${source}`;
       await this.notifyTaskFailure(task, {
