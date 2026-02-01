@@ -4,6 +4,8 @@ import { tmpdir } from "os";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { __testOnlyStartRepoPoller, type SyncResult } from "../github-issues-sync";
+
+type SyncOnce = typeof import("../github/issues-sync-service").syncRepoIssuesOnce;
 import { closeStateDbForTests, initStateDb } from "../state";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
@@ -82,7 +84,8 @@ describe("github issue poller", () => {
       return 0.75;
     };
 
-    const syncOnce = async (): Promise<SyncResult> => ({
+    const syncOnce: SyncOnce = async () => ({
+      status: "ok",
       ok: true,
       fetched: 0,
       stored: 0,
@@ -122,5 +125,52 @@ describe("github issue poller", () => {
 
     await run(1);
     expect(records.length).toBe(2);
+  });
+
+  test("stop aborts inflight sync and prevents reschedule", async () => {
+    const { timers, records, run } = createRecordingTimers();
+    let receivedSignal: AbortSignal | null = null;
+    let resolveSync: ((value: SyncResult) => void) | null = null;
+
+    const syncOnce: SyncOnce = async (params) => {
+      receivedSignal = params.signal ?? null;
+      return await new Promise<SyncResult>((resolve) => {
+        resolveSync = resolve;
+      });
+    };
+
+    const repo = { name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" };
+
+    const poller = __testOnlyStartRepoPoller({
+      repo,
+      baseIntervalMs: 10_000,
+      log: () => {},
+      deps: {
+        timers,
+        random: () => 0.5,
+        syncOnce,
+        nowMs: () => 0,
+        getLastSyncAt: () => null,
+      },
+    });
+
+    await run(0);
+    expect(receivedSignal).not.toBeNull();
+
+    poller.stop();
+    expect(receivedSignal?.aborted).toBe(true);
+
+    resolveSync?.({
+      status: "aborted",
+      ok: false,
+      fetched: 0,
+      stored: 0,
+      ralphCount: 0,
+      newLastSyncAt: null,
+      hadChanges: false,
+    });
+
+    await Promise.resolve();
+    expect(records.length).toBe(1);
   });
 });

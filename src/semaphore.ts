@@ -1,3 +1,5 @@
+import { createAbortError } from "./abort";
+
 export type ReleaseFn = () => void;
 
 /**
@@ -58,7 +60,7 @@ export class Semaphore {
 
     const signal = opts?.signal;
     if (signal?.aborted) {
-      throw new Error("Semaphore acquire aborted");
+      throw createAbortError("Semaphore acquire aborted");
     }
 
     return await new Promise<ReleaseFn>((resolve, reject) => {
@@ -73,7 +75,7 @@ export class Semaphore {
         entry.onAbort = () => {
           const idx = this.waiters.indexOf(entry);
           if (idx >= 0) this.waiters.splice(idx, 1);
-          reject(new Error("Semaphore acquire aborted"));
+          reject(createAbortError("Semaphore acquire aborted"));
         };
         signal.addEventListener("abort", entry.onAbort, { once: true });
       }

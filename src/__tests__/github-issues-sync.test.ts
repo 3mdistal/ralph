@@ -4,6 +4,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
 
+import { createAbortError } from "../abort";
 import { closeStateDbForTests, initStateDb } from "../state";
 import { getRalphStateDbPath } from "../paths";
 import { syncRepoIssuesOnce } from "../github-issues-sync";
@@ -96,6 +97,7 @@ describe("github issue sync", () => {
     });
 
     expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.stored).toBe(1);
     expect(result.ralphCount).toBe(1);
     expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
@@ -174,6 +176,7 @@ describe("github issue sync", () => {
     });
 
     expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.stored).toBe(1);
 
     const db = new Database(getRalphStateDbPath());
@@ -219,6 +222,7 @@ describe("github issue sync", () => {
     });
 
     expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.fetched).toBe(3);
     expect(result.stored).toBe(3);
     expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
@@ -235,6 +239,7 @@ describe("github issue sync", () => {
     });
 
     expect(result.ok).toBe(false);
+    expect(result.status).toBe("error");
     expect(result.newLastSyncAt).toBe(null);
 
     const db = new Database(getRalphStateDbPath());
@@ -261,8 +266,127 @@ describe("github issue sync", () => {
       });
 
       expect(result.ok).toBe(false);
+      expect(result.status).toBe("rate_limited");
       expect(result.rateLimitResetMs).toBe(1_000_000 + 120_000);
       expect(result.error ?? "").toContain("HTTP 403");
     });
+  });
+
+  test("returns aborted when signal already aborted", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    let stateWrites = 0;
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      signal: controller.signal,
+      deps: {
+        state: {
+          runInStateTransaction: () => {
+            stateWrites += 1;
+          },
+          hasIssueSnapshot: () => false,
+          recordIssueSnapshot: () => {
+            stateWrites += 1;
+          },
+          recordIssueLabelsSnapshot: () => {
+            stateWrites += 1;
+          },
+          recordRepoGithubIssueSync: () => {
+            stateWrites += 1;
+          },
+        },
+      },
+    });
+
+    expect(result.status).toBe("aborted");
+    expect(stateWrites).toBe(0);
+  });
+
+  test("returns aborted when fetch is canceled", async () => {
+    const controller = new AbortController();
+    let fetchStartedResolve: (() => void) | null = null;
+    const fetchStarted = new Promise<void>((resolve) => {
+      fetchStartedResolve = resolve;
+    });
+
+    const fetchMock: FetchLike = async (_input: RequestInfo | URL, init?: RequestInit) => {
+      fetchStartedResolve?.();
+      return await new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal as AbortSignal | undefined;
+        if (signal?.aborted) {
+          reject(createAbortError("Fetch aborted"));
+          return;
+        }
+        signal?.addEventListener("abort", () => reject(createAbortError("Fetch aborted")), { once: true });
+      });
+    };
+
+    const promise = syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      signal: controller.signal,
+      deps: {
+        fetch: fetchMock,
+        getToken: async () => "token",
+        state: {
+          runInStateTransaction: () => {
+            throw new Error("unexpected write");
+          },
+          hasIssueSnapshot: () => false,
+          recordIssueSnapshot: () => {},
+          recordIssueLabelsSnapshot: () => {},
+          recordRepoGithubIssueSync: () => {},
+        },
+      },
+    });
+
+    await fetchStarted;
+    controller.abort();
+    const result = await promise;
+    expect(result.status).toBe("aborted");
+  });
+
+  test("returns aborted while waiting on semaphore", async () => {
+    const deferreds: Array<{ resolve: (value: Response) => void }> = [];
+    const fetchMock: FetchLike = async () =>
+      await new Promise<Response>((resolve) => {
+        deferreds.push({ resolve });
+      });
+
+    const deps = {
+      fetch: fetchMock,
+      getToken: async () => "token",
+      state: {
+        runInStateTransaction: (fn: () => void) => fn(),
+        hasIssueSnapshot: () => false,
+        recordIssueSnapshot: () => {},
+        recordIssueLabelsSnapshot: () => {},
+        recordRepoGithubIssueSync: () => {},
+      },
+    };
+
+    const first = syncRepoIssuesOnce({ repo, lastSyncAt: null, deps });
+    const second = syncRepoIssuesOnce({ repo, lastSyncAt: null, deps });
+
+    while (deferreds.length < 2) {
+      await Promise.resolve();
+    }
+
+    const controller = new AbortController();
+    const third = syncRepoIssuesOnce({ repo, lastSyncAt: null, deps, signal: controller.signal });
+    controller.abort();
+
+    const thirdResult = await third;
+    expect(thirdResult.status).toBe("aborted");
+
+    const response = new Response(JSON.stringify([]), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+    deferreds.forEach((item) => item.resolve(response.clone()));
+
+    await Promise.all([first, second]);
   });
 });
