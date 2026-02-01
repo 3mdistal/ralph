@@ -83,7 +83,7 @@ describe("github issue poller", () => {
     };
 
     const syncOnce = async (): Promise<SyncResult> => ({
-      ok: true,
+      status: "ok",
       fetched: 0,
       stored: 0,
       ralphCount: 0,
@@ -122,5 +122,59 @@ describe("github issue poller", () => {
 
     await run(1);
     expect(records.length).toBe(2);
+  });
+
+  test("stop aborts an in-flight tick and avoids rescheduling", async () => {
+    const { timers, records, run } = createRecordingTimers();
+    const logMessages: string[] = [];
+    let startedResolve: (() => void) | null = null;
+    const started = new Promise<void>((resolve) => {
+      startedResolve = resolve;
+    });
+    let seenSignal: AbortSignal | null = null;
+
+    const syncOnce = async ({ signal }: { signal?: AbortSignal }): Promise<SyncResult> => {
+      seenSignal = signal ?? null;
+      startedResolve?.();
+      await new Promise<void>((resolve) => {
+        if (!signal) return resolve();
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return {
+        status: "aborted",
+        fetched: 0,
+        stored: 0,
+        ralphCount: 0,
+        newLastSyncAt: null,
+        hadChanges: false,
+      };
+    };
+
+    const repo = { name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" };
+
+    const poller = __testOnlyStartRepoPoller({
+      repo,
+      baseIntervalMs: 10_000,
+      log: (msg) => logMessages.push(msg),
+      deps: {
+        timers,
+        random: () => 0.5,
+        syncOnce,
+        nowMs: () => 0,
+        getLastSyncAt: () => null,
+      },
+    });
+
+    expect(records.length).toBe(1);
+    const runPromise = run(0);
+    await started;
+    poller.stop();
+    await runPromise;
+
+    expect(seenSignal?.aborted).toBe(true);
+    expect(records.length).toBe(1);
+    expect(records[0].cleared).toBe(true);
+    expect(logMessages.length).toBe(0);
   });
 });

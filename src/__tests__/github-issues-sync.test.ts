@@ -95,7 +95,7 @@ describe("github issue sync", () => {
       },
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.stored).toBe(1);
     expect(result.ralphCount).toBe(1);
     expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
@@ -173,7 +173,7 @@ describe("github issue sync", () => {
       deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.stored).toBe(1);
 
     const db = new Database(getRalphStateDbPath());
@@ -218,7 +218,7 @@ describe("github issue sync", () => {
       deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
-    expect(result.ok).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.fetched).toBe(3);
     expect(result.stored).toBe(3);
     expect(result.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
@@ -234,13 +234,108 @@ describe("github issue sync", () => {
       deps: { fetch: fetchMock, getToken: async () => "token" },
     });
 
-    expect(result.ok).toBe(false);
+    expect(result.status).toBe("error");
     expect(result.newLastSyncAt).toBe(null);
 
     const db = new Database(getRalphStateDbPath());
     try {
       const issueCount = db.query("SELECT COUNT(*) as n FROM issues").get() as { n: number };
       expect(issueCount.n).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("returns aborted when signal aborts while waiting on semaphore", async () => {
+    let startedResolve: (() => void) | null = null;
+    const started = new Promise<void>((resolve) => {
+      startedResolve = resolve;
+    });
+
+    const acquireSyncPermit = async ({ signal }: { signal?: AbortSignal } = {}) => {
+      startedResolve?.();
+      return await new Promise<() => void>((_resolve, reject) => {
+        if (signal?.aborted) return reject(new Error("Semaphore acquire aborted"));
+        signal?.addEventListener("abort", () => reject(new Error("Semaphore acquire aborted")), { once: true });
+      });
+    };
+
+    const fetchMock: FetchLike = async () => {
+      throw new Error("fetch should not be called");
+    };
+
+    const controller = new AbortController();
+    const resultPromise = syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: "2026-01-11T00:00:00.000Z",
+      deps: {
+        fetch: fetchMock,
+        getToken: async () => "token",
+        acquireSyncPermit,
+      },
+      signal: controller.signal,
+    });
+
+    await started;
+    controller.abort();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("aborted");
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      const issueCount = db.query("SELECT COUNT(*) as n FROM issues").get() as { n: number };
+      expect(issueCount.n).toBe(0);
+      const cursorCount = db.query("SELECT COUNT(*) as n FROM repo_github_issue_sync").get() as { n: number };
+      expect(cursorCount.n).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("returns aborted when signal aborts during fetch", async () => {
+    let startedResolve: (() => void) | null = null;
+    const started = new Promise<void>((resolve) => {
+      startedResolve = resolve;
+    });
+
+    const fetchMock: FetchLike = async (_input, init) =>
+      await new Promise<Response>((_resolve, reject) => {
+        startedResolve?.();
+        if (init?.signal?.aborted) {
+          return reject(new DOMException("Aborted", "AbortError"));
+        }
+        init?.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true }
+        );
+      });
+
+    const controller = new AbortController();
+    const resultPromise = syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: "2026-01-11T00:00:00.000Z",
+      deps: {
+        fetch: fetchMock,
+        getToken: async () => "token",
+        acquireSyncPermit: async () => () => {},
+      },
+      signal: controller.signal,
+    });
+
+    await started;
+    controller.abort();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("aborted");
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      const issueCount = db.query("SELECT COUNT(*) as n FROM issues").get() as { n: number };
+      expect(issueCount.n).toBe(0);
+      const cursorCount = db.query("SELECT COUNT(*) as n FROM repo_github_issue_sync").get() as { n: number };
+      expect(cursorCount.n).toBe(0);
     } finally {
       db.close();
     }
@@ -260,7 +355,8 @@ describe("github issue sync", () => {
         deps: { fetch: fetchMock, getToken: async () => "token" },
       });
 
-      expect(result.ok).toBe(false);
+      expect(result.status).toBe("error");
+      if (result.status !== "error") throw new Error("expected error result");
       expect(result.rateLimitResetMs).toBe(1_000_000 + 120_000);
       expect(result.error ?? "").toContain("HTTP 403");
     });

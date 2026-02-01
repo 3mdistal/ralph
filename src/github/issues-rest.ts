@@ -7,6 +7,7 @@ type FetchIssuesParams = {
   token: string;
   fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   nowMs?: number;
+  signal?: AbortSignal;
 };
 
 export type FetchIssuesResult =
@@ -92,6 +93,7 @@ export async function fetchIssuesSince(params: FetchIssuesParams): Promise<Fetch
         Authorization: `token ${params.token}`,
         "User-Agent": "ralph-loop",
       },
+      signal: params.signal,
     });
 
     if (!result.ok) {

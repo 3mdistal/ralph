@@ -15,15 +15,33 @@ export type SyncDeps = {
   fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   getToken?: () => Promise<string | null>;
   now?: () => Date;
+  acquireSyncPermit?: (opts?: { signal?: AbortSignal }) => Promise<() => void>;
 };
 
-export type SyncResult = {
-  ok: boolean;
-  fetched: number;
-  stored: number;
-  ralphCount: number;
-  newLastSyncAt: string | null;
-  hadChanges: boolean;
-  rateLimitResetMs?: number;
-  error?: string;
-};
+export type SyncResult =
+  | {
+      status: "ok";
+      fetched: number;
+      stored: number;
+      ralphCount: number;
+      newLastSyncAt: string | null;
+      hadChanges: boolean;
+    }
+  | {
+      status: "error";
+      fetched: number;
+      stored: number;
+      ralphCount: number;
+      newLastSyncAt: string | null;
+      hadChanges: boolean;
+      rateLimitResetMs?: number;
+      error: string;
+    }
+  | {
+      status: "aborted";
+      fetched: number;
+      stored: number;
+      ralphCount: number;
+      newLastSyncAt: string | null;
+      hadChanges: false;
+    };

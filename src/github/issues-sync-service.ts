@@ -14,6 +14,14 @@ import type { SyncDeps, SyncResult } from "./issues-sync-types";
 
 const DEFAULT_ISSUE_SYNC_MAX_INFLIGHT = 2;
 
+function isAbortLike(error: unknown): boolean {
+  if (!error) return false;
+  if (typeof error === "object" && "name" in error && (error as { name?: string }).name === "AbortError") {
+    return true;
+  }
+  return error instanceof Error && error.message === "Semaphore acquire aborted";
+}
+
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -33,6 +41,7 @@ export async function syncRepoIssuesOnce(params: {
   lastSyncAt: string | null;
   persistCursor?: boolean;
   storeAllOpen?: boolean;
+  signal?: AbortSignal;
   deps?: SyncDeps;
 }): Promise<SyncResult> {
   const deps = params.deps ?? {};
@@ -42,18 +51,30 @@ export async function syncRepoIssuesOnce(params: {
   const nowIso = now.toISOString();
   const nowMs = Date.now();
   const since = computeSince(params.lastSyncAt);
+  const signal = params.signal;
+  const acquireSyncPermit = deps.acquireSyncPermit ?? ((opts?: { signal?: AbortSignal }) => issueSyncSemaphore.acquire(opts));
+
+  const abortedResult = (): SyncResult => ({
+    status: "aborted",
+    fetched: 0,
+    stored: 0,
+    ralphCount: 0,
+    newLastSyncAt: params.lastSyncAt ?? null,
+    hadChanges: false,
+  });
 
   let releaseSync: ReleaseFn | null = null;
 
   try {
-    releaseSync = await issueSyncSemaphore.acquire();
+    if (signal?.aborted) return abortedResult();
+    releaseSync = await acquireSyncPermit({ signal });
     const token = await getToken();
     if (!token) {
       if (shouldLog(`github-sync:auth-missing:${params.repo}`, 60_000)) {
         console.warn(`[ralph:gh-sync] GitHub auth is not configured; skipping issue sync for ${params.repo}`);
       }
       return {
-        ok: true,
+        status: "ok",
         fetched: 0,
         stored: 0,
         ralphCount: 0,
@@ -68,11 +89,12 @@ export async function syncRepoIssuesOnce(params: {
       token,
       fetchImpl,
       nowMs,
+      signal,
     });
 
     if (!fetchResult.ok) {
       return {
-        ok: false,
+        status: "error",
         fetched: fetchResult.fetched,
         stored: 0,
         ralphCount: 0,
@@ -82,6 +104,8 @@ export async function syncRepoIssuesOnce(params: {
         error: fetchResult.error,
       };
     }
+
+    if (signal?.aborted) return abortedResult();
 
     const newLastSyncAt = computeNewLastSyncAt({
       fetched: fetchResult.fetched,
@@ -133,7 +157,7 @@ export async function syncRepoIssuesOnce(params: {
     const finalPlan = plan ?? { plans: [], ralphCount: 0 };
 
     return {
-      ok: true,
+      status: "ok",
       fetched: fetchResult.fetched,
       stored: finalPlan.plans.length,
       ralphCount: finalPlan.ralphCount,
@@ -141,8 +165,11 @@ export async function syncRepoIssuesOnce(params: {
       hadChanges: finalPlan.plans.length > 0,
     };
   } catch (error: any) {
+    if (isAbortLike(error)) {
+      return abortedResult();
+    }
     return {
-      ok: false,
+      status: "error",
       fetched: 0,
       stored: 0,
       ralphCount: 0,
