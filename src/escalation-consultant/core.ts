@@ -1,4 +1,5 @@
 import { redactSensitiveText } from "../redaction";
+import type { EscalationType } from "../github/escalation-constants";
 
 export const CONSULTANT_SCHEMA_VERSION = 1;
 export const CONSULTANT_MARKER = "<!-- ralph-consultant:v1 -->";
@@ -37,7 +38,7 @@ export type EscalationConsultantInput = {
   repo: string;
   taskName: string;
   taskPath?: string | null;
-  escalationType: string;
+  escalationType: EscalationType;
   reason: string;
   sessionId?: string | null;
   githubCommentUrl?: string | null;

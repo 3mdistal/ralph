@@ -65,11 +65,17 @@ describe("metrics persistence", () => {
       const db = new Database(statePath);
       try {
         const runRow = db
-          .query("SELECT quality, tool_call_count as tool_calls, wall_time_ms as wall_time FROM ralph_run_metrics WHERE run_id = $run_id")
-          .get({ $run_id: runId }) as { quality?: string; tool_calls?: number; wall_time?: number } | undefined;
+          .query(
+            "SELECT quality, tool_call_count as tool_calls, wall_time_ms as wall_time, triage_score as triage_score, triage_reasons_json as triage_reasons_json FROM ralph_run_metrics WHERE run_id = $run_id"
+          )
+          .get({ $run_id: runId }) as
+          | { quality?: string; tool_calls?: number; wall_time?: number; triage_score?: number; triage_reasons_json?: string }
+          | undefined;
         expect(runRow?.tool_calls).toBe(1);
         expect(runRow?.wall_time).toBe(40);
         expect(runRow?.quality).toBe("partial");
+        expect(typeof runRow?.triage_score).toBe("number");
+        expect(JSON.parse(runRow?.triage_reasons_json ?? "[]").includes("metrics_incomplete")).toBe(true);
 
         const stepRow = db
           .query(

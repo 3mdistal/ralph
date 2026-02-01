@@ -529,7 +529,7 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - Enable drain: set `mode` to `draining`
 - Disable drain: set `mode` to `running`
 - Pause all scheduling: set `mode` to `paused`
-- Pause at checkpoint: set `pause_requested=true` and optionally `pause_at_checkpoint`
+- Pause at checkpoint: set `pause_requested=true` (pauses at the next checkpoint). If you set `pause_at_checkpoint`, Ralph will keep running until it reaches that named checkpoint, then pause.
 - Active OpenCode profile: set `[opencode].defaultProfile` in `~/.ralph/config.toml` (affects new tasks only; tasks pin their profile on start)
 - Reload: daemon polls ~1s; send `SIGUSR1` for immediate reload
 - Observability: logs emit `Control mode: draining|running|paused`, and `ralph status` shows `Mode: ...`
