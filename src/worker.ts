@@ -61,6 +61,7 @@ import { redactSensitiveText } from "./redaction";
 import { RALPH_LABEL_BLOCKED, RALPH_LABEL_ESCALATED, RALPH_LABEL_QUEUED, RALPH_LABEL_STUCK } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client";
+import { planGitHubRateLimitThrottle } from "./github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "./github/dx-survey-writeback";
 import { createGhRunner } from "./github/gh-runner";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
@@ -6883,6 +6884,66 @@ ${guidance}`
     await this.recordCheckpoint(task, "implementation_step_complete", sessionId);
   }
 
+  private async pauseForGitHubRateLimit(
+    task: AgentTask,
+    error: unknown,
+    stage: string,
+    sessionId?: string
+  ): Promise<AgentRun | null> {
+    const plan = planGitHubRateLimitThrottle(Date.now(), error);
+    if (!plan) return null;
+
+    const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
+    const extraFields: Record<string, string> = {
+      "throttled-at": plan.throttledAt,
+      "resume-at": plan.resumeAt,
+      "usage-snapshot": JSON.stringify(plan.snapshot),
+      "blocked-source": "",
+      "blocked-reason": "",
+      "blocked-details": "",
+      "blocked-at": "",
+      "blocked-checked-at": "",
+    };
+
+    if (sid) extraFields["session-id"] = sid;
+
+    const enteringThrottled = task.status !== "throttled";
+    const updated = await this.queue.updateTaskStatus(task, "throttled", extraFields);
+    if (updated) {
+      applyTaskPatch(task, "throttled", extraFields);
+    }
+
+    if (updated && enteringThrottled) {
+      const bodyPrefix = buildAgentRunBodyPrefix({
+        task,
+        headline: `Throttled: GitHub rate limit (${stage})`,
+        reason: `Resume at: ${plan.resumeAt}`,
+        details: JSON.stringify(plan.snapshot),
+        sessionId: sid || undefined,
+        runLogPath: task["run-log-path"]?.trim() || undefined,
+      });
+      const runTime = new Date();
+      await this.createAgentRun(task, {
+        outcome: "throttled",
+        sessionId: sid || undefined,
+        started: runTime,
+        completed: runTime,
+        bodyPrefix,
+      });
+    }
+
+    console.warn(
+      `[ralph:worker:${this.repo}] GitHub rate limited; pausing at stage=${stage} resumeAt=${plan.resumeAt}`
+    );
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "throttled",
+      sessionId: sid || undefined,
+    };
+  }
+
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
     const pinned = this.getPinnedOpencodeProfileName(task);
     const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
@@ -7991,6 +8052,8 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
 
       if (!error?.ralphRootDirty) {
+        const throttled = await this.pauseForGitHubRateLimit(task, error, "resume");
+        if (throttled) return throttled;
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
@@ -9136,6 +9199,8 @@ ${guidance}`
       console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
 
       if (!error?.ralphRootDirty) {
+        const throttled = await this.pauseForGitHubRateLimit(task, error, "process");
+        if (throttled) return throttled;
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
         await this.markTaskBlocked(task, "runtime-error", { reason, details });
