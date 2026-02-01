@@ -7,10 +7,12 @@ import { Database } from "bun:sqlite";
 import { closeStateDbForTests, createRalphRun, initStateDb, recordRalphRunSessionUse } from "../state";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
 import { getRalphStateDbPath, getSessionEventsPathFromDir } from "../paths";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 describe("metrics persistence", () => {
   test("stores run and step metrics from session events", async () => {
     closeStateDbForTests();
+    const releaseLock = await acquireGlobalTestLock();
     const root = await mkdtemp(join(tmpdir(), "ralph-metrics-"));
     const statePath = join(root, "state.sqlite");
     const sessionsDir = join(root, "sessions");
@@ -72,12 +74,14 @@ describe("metrics persistence", () => {
     } finally {
       closeStateDbForTests();
       process.env.RALPH_STATE_DB_PATH = priorState;
+      releaseLock();
       await rm(root, { recursive: true, force: true });
     }
   });
 
   test("marks too-large traces with quality", async () => {
     closeStateDbForTests();
+    const releaseLock = await acquireGlobalTestLock();
     const root = await mkdtemp(join(tmpdir(), "ralph-metrics-"));
     const statePath = join(root, "state.sqlite");
     const sessionsDir = join(root, "sessions");
@@ -120,6 +124,7 @@ describe("metrics persistence", () => {
     } finally {
       closeStateDbForTests();
       process.env.RALPH_STATE_DB_PATH = priorState;
+      releaseLock();
       await rm(root, { recursive: true, force: true });
     }
   });
