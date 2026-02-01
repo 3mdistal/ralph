@@ -64,7 +64,7 @@ import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow
 import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import {
-  buildParentVerificationPrompt,
+  buildParentVerificationPrompt as buildParentVerificationPromptLegacy,
   evaluateParentVerificationEligibility,
   parseParentVerificationOutput,
 } from "./parent-verification/core";
@@ -7868,7 +7868,7 @@ ${guidance}`
       );
     }
 
-    const prompt = buildParentVerificationPrompt({
+    const prompt = buildParentVerificationPromptLegacy({
       repo: this.repo,
       issueNumber: Number(params.issueNumber),
       issueUrl,
@@ -8169,20 +8169,6 @@ ${guidance}`
         opencodeSessionOptions,
       });
       if (ciFailureRun) return ciFailureRun;
-
-      const parentVerifyRun = await this.maybeHandleParentVerification({
-        task,
-        issueNumber,
-        issueMeta,
-        cacheKey,
-        startTime,
-        opencodeXdg,
-        opencodeSessionOptions,
-        worktreePath,
-        workerId,
-        allocatedSlot,
-      });
-      if (parentVerifyRun) return parentVerifyRun;
 
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
