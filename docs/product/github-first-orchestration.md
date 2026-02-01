@@ -154,15 +154,13 @@ Requeue resolution (non-dependency blocked tasks):
 - When the rollup PR merges to `main`, Ralph applies `ralph:done` and clears transitional labels (`ralph:in-bot`, `ralph:in-progress`, `ralph:blocked`, `ralph:escalated`, `ralph:queued`).
 - Closing the issue remains a separate policy decision (not required for done).
 
-### Parent verification completion (no PR)
+### Verification-only completion (parent issues)
 
-When a parent issue becomes runnable after all sub-issues close, Ralph runs a verification-only pass seeded with the child issues and their linked merges. If verification confirms the parent is already satisfied, Ralph must:
+When a parent issue becomes runnable after all sub-issues close, Ralph runs a verification-only pass seeded with child issues + linked PRs/merges.
 
-- Post a "Verification complete — no changes required" comment that links to the child issues and the specific merged PRs/commits as evidence.
-- Remove `ralph:queued` (if present) and `ralph:escalated` (best-effort).
-- Close the parent issue.
-
-No PR URL is required for this completion path. If verification cannot prove satisfaction (missing evidence or inconclusive output), Ralph proceeds with the normal implementation + PR flow.
+- If verification shows the parent is already satisfied, Ralph posts a single canonical comment: "Verification complete — no changes required" with evidence links, removes `ralph:queued` (if present) + `ralph:escalated`, and closes the issue.
+- This path completes the task without a PR URL and does **not** imply `ralph:done` merge semantics.
+- If verification finds remaining work (or is inconclusive), Ralph proceeds with the normal implement + PR flow.
 
 Direct-to-main (override / Pattern B):
 - If a task PR is merged directly to `main` (or the repo config sets `botBranch: main`), Ralph does **not** apply the
