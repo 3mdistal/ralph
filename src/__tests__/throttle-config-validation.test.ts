@@ -85,7 +85,7 @@ describe("throttle config validation", () => {
 
     expect(cfg.throttle?.enabled).toBe(true);
     expect(cfg.throttle?.providerID).toBe("openai");
-    expect(cfg.throttle?.openaiSource).toBe("localLogs");
+    expect(cfg.throttle?.openaiSource).toBe("remoteUsage");
     expect(cfg.throttle?.softPct).toBe(0.5);
     expect(cfg.throttle?.hardPct).toBe(0.9);
     expect(cfg.throttle?.minCheckIntervalMs).toBe(0);
@@ -133,7 +133,7 @@ describe("throttle config validation", () => {
     const cfg = cfgMod.loadConfig().config;
 
     expect(cfg.throttle?.providerID).toBe("openai");
-    expect(cfg.throttle?.openaiSource).toBe("localLogs");
+    expect(cfg.throttle?.openaiSource).toBe("remoteUsage");
     expect(cfg.throttle?.softPct).toBe(0.65);
     expect(cfg.throttle?.hardPct).toBe(0.75);
     expect(cfg.throttle?.minCheckIntervalMs).toBe(15_000);
