@@ -215,6 +215,13 @@ This document captures decisions and discoveries made during an interactive audi
   - Remove devex-before-escalate; devex belongs in deterministic gates.
   - Remove non-`ralph:*` label sensitivity rules; only `ralph:*` drives escalation sensitivity.
 
+### Interview 9 (2026-02-01)
+
+- Escalation-policy claims promoted:
+  - Resolution via `ralph:cmd:queue`.
+  - Low confidence alone does not trigger escalation.
+- Dropped vague `escalation.markers-deterministic` claim in favor of explicit `product-gap.*` claims.
+
 ### Repo Scan (code reality) (2026-02-01)
 
 - bwrb is still heavily present in implementation (`src/queue.ts`, `src/queue-backend.ts`, `src/bwrb/*`, `src/notify.ts`, `src/escalation-notes.ts`, and multiple tests).

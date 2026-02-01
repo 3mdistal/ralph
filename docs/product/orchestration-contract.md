@@ -22,7 +22,7 @@ This doc is intended to supersede label/queue semantics in older docs.
 ## Invariants
 
 - Ralph never edits non-`ralph:*` labels.
-- Exactly one bot-owned status label is present per issue at any time.
+- Ralph never intentionally sets multiple `ralph:status:*` labels; on any successful reconciliation pass it enforces exactly one status label.
 - Operator intent is expressed only via `ralph:cmd:*` labels + normal GitHub comments.
 - Dependency-blocked is internal-only metadata (not a GitHub-visible status).
 - Ralph scheduling must not depend on GitHub label writes (degraded mode must continue safely).
@@ -92,7 +92,7 @@ GitHub label writes are best-effort. When throttled/blocked by GitHub rate limit
 
 ## Issue closure policy (target)
 
-- Ralph should close issues when `ralph:status:done` is reached (default).
+- Ralph closes issues when `ralph:status:done` is reached.
 - Rollup PRs may also close issues via `Fixes #N`, but the operator-visible definition is "done == reconciled to default branch".
 
 ## Legacy mapping (to be removed)
