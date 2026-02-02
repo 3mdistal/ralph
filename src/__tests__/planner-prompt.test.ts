@@ -7,7 +7,8 @@ describe("planner prompt", () => {
     const prompt = buildPlannerPrompt({ repo: "3mdistal/ralph", issueNumber: 65 });
 
     expect(prompt).toContain("Planner prompt v1");
-    expect(prompt).toContain("GH_PAGER=cat gh issue view 65 --repo 3mdistal/ralph --comments");
+    expect(prompt).toContain("gh api repos/3mdistal/ralph/issues/65");
+    expect(prompt).toContain("gh api repos/3mdistal/ralph/issues/65/comments --paginate");
     expect(prompt).toContain("consult @product");
     expect(prompt).toContain("consult @devex");
     expect(prompt).toContain("\"decision\": \"proceed\" | \"escalate\"");
