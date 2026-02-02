@@ -2,6 +2,8 @@
  * Routing decision parser for planning output
  */
 
+import { hasProductGap } from "./product-gap";
+
 export interface RoutingDecision {
   decision: "proceed" | "escalate";
   confidence: "high" | "medium" | "low";
@@ -95,17 +97,7 @@ function normalizeDecision(obj: Record<string, any>): RoutingDecision | null {
   };
 }
 
-/**
- * Check if the output indicates a product gap (should escalate)
- */
-export function hasProductGap(output: string): boolean {
-  // IMPORTANT: Keep this conservative.
-  // Only treat an explicit marker as a product gap (no fuzzy heuristics).
-  // This must never match "NO PRODUCT GAP:".
-  const productGapMarker = /^(?!\s*(?:[-*]\s+)?NO\s+PRODUCT\s+GAP\s*:)\s*(?:[-*]\s+)?PRODUCT\s+GAP\s*:/im;
-
-  return productGapMarker.test(output);
-}
+export { hasProductGap };
 
 /**
  * Extract PR URL from session output
