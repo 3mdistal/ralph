@@ -56,6 +56,8 @@ Notes:
 | `ralph:cmd:stop` | Cancel / stop work | Ralph transitions status to `stopped`, cleans up best-effort, then removes the command label. |
 | `ralph:cmd:satisfy` | Mark satisfied for dependency graph | Ralph records dependency satisfaction (internal) and removes the command label. This does not imply merge/close. |
 
+Note: `ralph:cmd:satisfy` does not change the issue `ralph:status:*` label.
+
 Command processing requirements:
 
 - Ralph must be idempotent and avoid comment spam.
@@ -117,6 +119,14 @@ Required set (vNext):
 
 - Statuses: `ralph:status:queued`, `ralph:status:in-progress`, `ralph:status:paused`, `ralph:status:escalated`, `ralph:status:in-bot`, `ralph:status:done`, `ralph:status:stopped`
 - Commands: `ralph:cmd:queue`, `ralph:cmd:pause`, `ralph:cmd:stop`, `ralph:cmd:satisfy`
+
+## Priority (operator input)
+
+Priority is expressed via `ralph:priority:p0`..`ralph:priority:p4` labels.
+
+- Default priority is `p2` when no priority label is present.
+- Priority affects dequeue order among `ralph:status:queued` issues only.
+- Priority labels do not change status and do not imply queueing.
 
 ## Stop semantics
 

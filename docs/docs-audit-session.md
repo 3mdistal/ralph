@@ -279,6 +279,14 @@ This document captures decisions and discoveries made during an interactive audi
 - Dashboard/control plane is a long-term idea; near-term operator UX is increasingly GitHub-native (issues + projects) plus better observability.
 - We promoted only minimal dashboard safety/integration claims (auth, local bind, additive-only state schema, redaction) and left the rest as candidates.
 
+### Dependency + Scheduling (2026-02-01)
+
+- Queue model: single daemon per queue is canonical (until transactional claiming exists).
+- Dependency graph: GitHub-native relationships are the only source of truth (no issue-body parsing).
+- `ralph:cmd:satisfy`: deps-only and does not change issue status label.
+- Parent verification lane is mandatory when a parent becomes unblocked.
+- Priority: use `ralph:priority:p0`..`ralph:priority:p4` labels; default `p2`; queue-order only among `ralph:status:queued`.
+
 ### SQLite Policy (2026-02-01)
 
 - Promoted additional SQLite migration claims:
