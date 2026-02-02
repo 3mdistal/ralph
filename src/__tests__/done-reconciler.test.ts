@@ -70,7 +70,7 @@ describe("done reconciler", () => {
                           number: 317,
                           url: "https://github.com/3mdistal/ralph/issues/317",
                           state: "OPEN",
-                          labels: { nodes: [{ name: "ralph:in-bot" }, { name: "dx" }] },
+                          labels: { nodes: [{ name: "ralph:status:in-bot" }, { name: "dx" }] },
                         },
                         {
                           number: 999,
@@ -123,6 +123,6 @@ describe("done reconciler", () => {
 
     const postCalls = requests.filter((call) => call.method === "POST" && /\/issues\/317\/labels$/.test(call.path));
     expect(postCalls.length).toBe(1);
-    expect(postCalls[0]?.body).toEqual({ labels: ["ralph:done"] });
+    expect(postCalls[0]?.body).toEqual({ labels: ["ralph:status:done"] });
   });
 });

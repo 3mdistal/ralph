@@ -1,6 +1,7 @@
 import { readFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import type { AgentEscalationNote } from "../escalation-notes";
+import { normalizeEscalationType } from "../github/escalation-constants";
 import type { EscalationConsultantInput } from "./core";
 import { appendConsultantPacket } from "./io";
 
@@ -30,8 +31,8 @@ function parseEscalationReason(text: string): string {
   return parseSummaryField(text, "Reason") || "Escalation created";
 }
 
-function parseEscalationType(text: string): string {
-  return parseSummaryField(text, "Type") || "other";
+function parseEscalationType(text: string): ReturnType<typeof normalizeEscalationType> {
+  return normalizeEscalationType(parseSummaryField(text, "Type"));
 }
 
 function toTimestamp(value: string | undefined): number {
@@ -48,7 +49,9 @@ function buildInputFromEscalation(params: {
   const noteContent = params.noteContent;
   const creationDate = typeof meta["creation-date"] === "string" ? (meta["creation-date"] as string) : null;
   const escalationType =
-    typeof meta["escalation-type"] === "string" ? (meta["escalation-type"] as string) : parseEscalationType(noteContent);
+    typeof meta["escalation-type"] === "string"
+      ? normalizeEscalationType(meta["escalation-type"] as string)
+      : parseEscalationType(noteContent);
 
   return {
     issue: params.escalation.issue ?? "",

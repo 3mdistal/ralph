@@ -1,4 +1,5 @@
 import { redactSensitiveText } from "../redaction";
+import type { EscalationType } from "../github/escalation-constants";
 import { hasProductGap } from "../product-gap";
 
 export const CONSULTANT_SCHEMA_VERSION = 2;
@@ -52,7 +53,7 @@ export type EscalationConsultantInput = {
   repo: string;
   taskName: string;
   taskPath?: string | null;
-  escalationType: string;
+  escalationType: EscalationType;
   reason: string;
   sessionId?: string | null;
   githubCommentUrl?: string | null;

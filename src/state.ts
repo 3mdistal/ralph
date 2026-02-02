@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 15;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
@@ -271,6 +271,24 @@ function ensureSchema(database: Database): void {
       if (existingVersion < 8) {
         database.exec("ALTER TABLE tasks ADD COLUMN session_events_path TEXT");
       }
+      if (existingVersion < 14) {
+        database.exec(
+          "CREATE TABLE IF NOT EXISTS repo_github_issue_sync_bootstrap_cursor (repo_id INTEGER PRIMARY KEY, next_url TEXT NOT NULL, high_watermark_updated_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
+        );
+      }
+      if (existingVersion < 15) {
+        if (tableExists("repos")) {
+          try {
+            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_error_code TEXT");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_error_details TEXT");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_checked_at TEXT");
+          } catch {}
+        }
+      }
       if (existingVersion < 9) {
         database.exec(
           "CREATE TABLE IF NOT EXISTS issue_escalation_comment_checks (" +
@@ -484,6 +502,9 @@ function ensureSchema(database: Database): void {
             event_count INTEGER NOT NULL DEFAULT 0,
             parse_error_count INTEGER NOT NULL DEFAULT 0,
             quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+            triage_score REAL,
+            triage_reasons_json TEXT NOT NULL DEFAULT '[]',
+            triage_computed_at TEXT,
             computed_at TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -511,7 +532,27 @@ function ensureSchema(database: Database): void {
             ON ralph_run_step_metrics(run_id);
           CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_quality
             ON ralph_run_metrics(quality);
+          CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_triage_score
+            ON ralph_run_metrics(triage_score);
         `);
+      }
+
+      if (existingVersion < 15) {
+        if (tableExists("ralph_run_metrics")) {
+          try {
+            database.exec("ALTER TABLE ralph_run_metrics ADD COLUMN triage_score REAL");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE ralph_run_metrics ADD COLUMN triage_reasons_json TEXT NOT NULL DEFAULT '[]'");
+          } catch {}
+          try {
+            database.exec("ALTER TABLE ralph_run_metrics ADD COLUMN triage_computed_at TEXT");
+          } catch {}
+
+          database.exec(
+            "CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_triage_score ON ralph_run_metrics(triage_score)"
+          );
+        }
       }
     })();
   }
@@ -529,6 +570,9 @@ function ensureSchema(database: Database): void {
       bot_branch TEXT,
       label_write_blocked_until_ms INTEGER,
       label_write_last_error TEXT,
+      label_scheme_error_code TEXT,
+      label_scheme_error_details TEXT,
+      label_scheme_checked_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -626,6 +670,14 @@ function ensureSchema(database: Database): void {
     CREATE TABLE IF NOT EXISTS repo_github_issue_sync (
       repo_id INTEGER PRIMARY KEY,
       last_sync_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS repo_github_issue_sync_bootstrap_cursor (
+      repo_id INTEGER PRIMARY KEY,
+      next_url TEXT NOT NULL,
+      high_watermark_updated_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
 
@@ -737,6 +789,9 @@ function ensureSchema(database: Database): void {
       event_count INTEGER NOT NULL DEFAULT 0,
       parse_error_count INTEGER NOT NULL DEFAULT 0,
       quality TEXT NOT NULL CHECK (quality IN ('ok', 'missing', 'partial', 'too_large', 'timeout', 'error')),
+      triage_score REAL,
+      triage_reasons_json TEXT NOT NULL DEFAULT '[]',
+      triage_computed_at TEXT,
       computed_at TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
@@ -764,6 +819,8 @@ function ensureSchema(database: Database): void {
       ON ralph_run_step_metrics(run_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_quality
       ON ralph_run_metrics(quality);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_triage_score
+      ON ralph_run_metrics(triage_score);
 
     CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
       run_id TEXT NOT NULL,
@@ -980,6 +1037,72 @@ export function getRepoGithubIssueLastSyncAt(repo: string): string | null {
     .get({ $name: repo }) as { last_sync_at?: string } | undefined;
 
   return typeof row?.last_sync_at === "string" ? row.last_sync_at : null;
+}
+
+export type RepoGithubIssueBootstrapCursor = {
+  nextUrl: string;
+  highWatermarkUpdatedAt: string;
+  updatedAt: string;
+};
+
+export function getRepoGithubIssueBootstrapCursor(repo: string): RepoGithubIssueBootstrapCursor | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT bc.next_url as next_url, bc.high_watermark_updated_at as high_watermark_updated_at, bc.updated_at as updated_at
+       FROM repo_github_issue_sync_bootstrap_cursor bc
+       JOIN repos r ON r.id = bc.repo_id
+       WHERE r.name = $name`
+    )
+    .get({ $name: repo }) as
+    | { next_url?: string; high_watermark_updated_at?: string; updated_at?: string }
+    | undefined;
+
+  if (!row?.next_url || !row?.high_watermark_updated_at || !row?.updated_at) return null;
+  return {
+    nextUrl: row.next_url,
+    highWatermarkUpdatedAt: row.high_watermark_updated_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export function recordRepoGithubIssueBootstrapCursor(params: {
+  repo: string;
+  repoPath?: string;
+  botBranch?: string;
+  nextUrl: string;
+  highWatermarkUpdatedAt: string;
+  updatedAt?: string;
+}): void {
+  const database = requireDb();
+  const at = params.updatedAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, repoPath: params.repoPath, botBranch: params.botBranch, at });
+
+  database
+    .query(
+      `INSERT INTO repo_github_issue_sync_bootstrap_cursor(repo_id, next_url, high_watermark_updated_at, updated_at)
+       VALUES ($repo_id, $next_url, $high_watermark_updated_at, $updated_at)
+       ON CONFLICT(repo_id) DO UPDATE SET
+         next_url = excluded.next_url,
+         high_watermark_updated_at = excluded.high_watermark_updated_at,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $next_url: params.nextUrl,
+      $high_watermark_updated_at: params.highWatermarkUpdatedAt,
+      $updated_at: at,
+    });
+}
+
+export function clearRepoGithubIssueBootstrapCursor(params: { repo: string }): void {
+  const database = requireDb();
+  database
+    .query(
+      `DELETE FROM repo_github_issue_sync_bootstrap_cursor
+       WHERE repo_id = (SELECT id FROM repos WHERE name = $name)`
+    )
+    .run({ $name: params.repo });
 }
 
 export type RepoGithubDoneCursor = { lastMergedAt: string; lastPrNumber: number };
@@ -1691,6 +1814,83 @@ export function listRepoLabelWriteStates(): RepoLabelWriteState[] {
       };
     })
     .filter((row): row is RepoLabelWriteState => Boolean(row));
+}
+
+export type RepoLabelSchemeState = {
+  repo: string;
+  errorCode: string | null;
+  errorDetails: string | null;
+  checkedAt: string | null;
+};
+
+export function getRepoLabelSchemeState(repo: string): RepoLabelSchemeState {
+  const database = requireDb();
+  const row = database
+    .query(
+      "SELECT label_scheme_error_code as error_code, label_scheme_error_details as error_details, label_scheme_checked_at as checked_at FROM repos WHERE name = $name"
+    )
+    .get({ $name: repo }) as
+    | { error_code?: string | null; error_details?: string | null; checked_at?: string | null }
+    | undefined;
+
+  return {
+    repo,
+    errorCode: row?.error_code ?? null,
+    errorDetails: row?.error_details ?? null,
+    checkedAt: row?.checked_at ?? null,
+  };
+}
+
+export function setRepoLabelSchemeState(params: {
+  repo: string;
+  errorCode: string | null;
+  errorDetails?: string | null;
+  checkedAt?: string;
+  at?: string;
+}): void {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+  const checkedAt = params.checkedAt ?? at;
+
+  database
+    .query(
+      `UPDATE repos
+          SET label_scheme_error_code = $error_code,
+              label_scheme_error_details = $error_details,
+              label_scheme_checked_at = $checked_at,
+              updated_at = $updated_at
+        WHERE id = $repo_id`
+    )
+    .run({
+      $repo_id: repoId,
+      $error_code: params.errorCode,
+      $error_details: params.errorDetails ?? null,
+      $checked_at: checkedAt,
+      $updated_at: at,
+    });
+}
+
+export function listRepoLabelSchemeStates(): RepoLabelSchemeState[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      "SELECT name, label_scheme_error_code as error_code, label_scheme_error_details as error_details, label_scheme_checked_at as checked_at FROM repos"
+    )
+    .all() as Array<{ name?: string | null; error_code?: string | null; error_details?: string | null; checked_at?: string | null }>;
+
+  return rows
+    .map((row) => {
+      const repo = row?.name ?? "";
+      if (!repo) return null;
+      return {
+        repo,
+        errorCode: row.error_code ?? null,
+        errorDetails: row.error_details ?? null,
+        checkedAt: row.checked_at ?? null,
+      };
+    })
+    .filter((row): row is RepoLabelSchemeState => Boolean(row));
 }
 
 export function createRalphRun(params: {
@@ -2410,6 +2610,111 @@ export function getRalphRunTokenTotals(runId: string): RalphRunTokenTotals | nul
     sessionCount: typeof row.session_count === "number" ? row.session_count : 0,
     updatedAt: row.updated_at,
   };
+}
+
+export type RalphRunTriageSummary = {
+  runId: string;
+  repo: string;
+  issueNumber: number | null;
+  startedAt: string;
+  completedAt: string | null;
+  outcome: RalphRunOutcome | null;
+  score: number;
+  reasons: string[];
+  tokensTotal: number | null;
+  toolCallCount: number;
+  wallTimeMs: number | null;
+  quality: string;
+  computedAt: string;
+};
+
+function safeParseJsonStringList(value: unknown): string[] {
+  if (typeof value !== "string" || !value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item) => String(item ?? "").trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+export function listTopRalphRunTriages(params?: { limit?: number; sinceDays?: number }): RalphRunTriageSummary[] {
+  const database = requireDb();
+  const limit =
+    typeof params?.limit === "number" && Number.isFinite(params.limit) ? Math.max(1, Math.floor(params.limit)) : 10;
+  const sinceDays =
+    typeof params?.sinceDays === "number" && Number.isFinite(params.sinceDays) ? Math.max(0, Math.floor(params.sinceDays)) : 14;
+
+  const sinceIso = sinceDays > 0 ? new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString() : null;
+
+  const where: string[] = ["m.triage_score IS NOT NULL", "m.computed_at IS NOT NULL"];
+  if (sinceIso) where.push("r.started_at >= $since");
+
+  const rows = database
+    .query(
+      `SELECT
+         r.run_id as run_id,
+         repo.name as repo,
+         r.issue_number as issue_number,
+         r.started_at as started_at,
+         r.completed_at as completed_at,
+         r.outcome as outcome,
+         m.triage_score as triage_score,
+         m.triage_reasons_json as triage_reasons_json,
+         m.tokens_total as tokens_total,
+         m.tool_call_count as tool_call_count,
+         m.wall_time_ms as wall_time_ms,
+         m.quality as quality,
+         m.computed_at as computed_at
+       FROM ralph_run_metrics m
+       JOIN ralph_runs r ON r.run_id = m.run_id
+       JOIN repos repo ON repo.id = r.repo_id
+       WHERE ${where.join(" AND ")}
+       ORDER BY m.triage_score DESC, r.started_at DESC, r.run_id DESC
+       LIMIT $limit`
+    )
+    .all({ $limit: limit, $since: sinceIso }) as Array<{
+    run_id?: string;
+    repo?: string;
+    issue_number?: number | null;
+    started_at?: string;
+    completed_at?: string | null;
+    outcome?: RalphRunOutcome | null;
+    triage_score?: number | null;
+    triage_reasons_json?: string | null;
+    tokens_total?: number | null;
+    tool_call_count?: number | null;
+    wall_time_ms?: number | null;
+    quality?: string;
+    computed_at?: string;
+  }>;
+
+  return rows
+    .map((row) => {
+      const runId = row.run_id ?? "";
+      const repo = row.repo ?? "";
+      const startedAt = row.started_at ?? "";
+      const computedAt = row.computed_at ?? "";
+      const score = typeof row.triage_score === "number" ? row.triage_score : null;
+      if (!runId || !repo || !startedAt || !computedAt || score == null) return null;
+      return {
+        runId,
+        repo,
+        issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
+        startedAt,
+        completedAt: row.completed_at ?? null,
+        outcome: row.outcome ?? null,
+        score,
+        reasons: safeParseJsonStringList(row.triage_reasons_json),
+        tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+        toolCallCount: typeof row.tool_call_count === "number" ? row.tool_call_count : 0,
+        wallTimeMs: typeof row.wall_time_ms === "number" ? row.wall_time_ms : null,
+        quality: typeof row.quality === "string" && row.quality ? row.quality : "missing",
+        computedAt,
+      } satisfies RalphRunTriageSummary;
+    })
+    .filter((row): row is RalphRunTriageSummary => Boolean(row));
 }
 
 const LABEL_SEPARATOR = "\u0001";

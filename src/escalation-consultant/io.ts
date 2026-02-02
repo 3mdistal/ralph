@@ -9,6 +9,7 @@ import {
   buildFallbackPacket,
   parseConsultantResponse,
   renderConsultantPacket,
+  type ParsedConsultantResponse,
   type EscalationConsultantInput,
 } from "./core";
 
@@ -74,6 +75,20 @@ async function runConsultantAgent(
     cacheKey: `escalation-consultant:${input.repo}:${input.issue}:${input.escalationType}`,
   };
   return runner(repoPath, "general", prompt, options);
+}
+
+export async function generateConsultantPacket(
+  input: EscalationConsultantInput,
+  deps: ConsultantAppendDeps = {}
+): Promise<{ packet: ParsedConsultantResponse; session: SessionResult }> {
+  const repoPath = deps.repoPath ?? ".";
+  const session = await runConsultantAgent(repoPath, input, deps);
+  const parsed = session.success ? parseConsultantResponse(session.output) : null;
+  const packet = parsed ?? buildFallbackPacket(input);
+  if (!session.success) {
+    logMessage(deps.log, `[ralph:consultant] consultant run failed; using fallback (${session.errorCode ?? "error"})`);
+  }
+  return { packet, session };
 }
 
 export async function appendConsultantPacket(
