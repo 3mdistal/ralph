@@ -285,6 +285,7 @@ This document captures decisions and discoveries made during an interactive audi
 - Dependency graph: GitHub-native relationships are the only source of truth (no issue-body parsing).
 - `ralph:cmd:satisfy`: deps-only and does not change issue status label.
 - Parent verification lane is mandatory when a parent becomes unblocked.
+- Parent verification closure policy is hybrid: auto-close when confidence/evidence are strong; otherwise escalate.
 - Priority: use `ralph:priority:p0`..`ralph:priority:p4` labels; default `p2`; queue-order only among `ralph:status:queued`.
 
 ### Label Bootstrap (2026-02-01)
