@@ -1,6 +1,7 @@
 import type { ExistingLabelSpec, LabelSpec } from "../github-labels";
 import { getProfile, getSandboxProfileConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
+import { invalidateInstallationTokenCache } from "../github-app-auth";
 import { Semaphore, type ReleaseFn } from "../semaphore";
 import { SandboxTripwireError, assertSandboxWriteAllowed } from "./sandbox-tripwire";
 
@@ -51,6 +52,8 @@ type ClientOptions = {
   getToken?: () => Promise<string | null>;
   /** Injected for tests / custom backoff behavior. */
   sleepMs?: (ms: number) => Promise<void>;
+  /** Request timeout for GitHub API fetches (ms). 0 disables. */
+  requestTimeoutMs?: number;
 };
 
 type GitHubConcurrencyConfig = {
@@ -60,6 +63,7 @@ type GitHubConcurrencyConfig = {
 
 const DEFAULT_MAX_INFLIGHT = 16;
 const DEFAULT_MAX_INFLIGHT_WRITES = 2;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -172,6 +176,7 @@ export class GitHubClient {
   private readonly tokenOverride: string | null;
   private readonly getToken: () => Promise<string | null>;
   private readonly sleepMsImpl: (ms: number) => Promise<void>;
+  private readonly requestTimeoutMs: number;
 
   private installationId: string | null = null;
 
@@ -238,6 +243,10 @@ export class GitHubClient {
       (async (ms) => {
         await new Promise((resolve) => setTimeout(resolve, ms));
       });
+    this.requestTimeoutMs =
+      typeof opts?.requestTimeoutMs === "number" && Number.isFinite(opts.requestTimeoutMs)
+        ? Math.max(0, Math.floor(opts.requestTimeoutMs))
+        : readEnvInt("RALPH_GITHUB_REQUEST_TIMEOUT_MS", DEFAULT_REQUEST_TIMEOUT_MS);
   }
 
   private getBackoffKeys(tokenKey?: string | null): string[] {
@@ -292,9 +301,6 @@ export class GitHubClient {
   }
 
   async request<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T>> {
-    const token = this.tokenOverride ?? (await this.getToken());
-    const tokenKey = token ? fnv1a32(token) : null;
-    await this.waitForBackoff(tokenKey);
     const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
     const method = (opts.method ?? "GET").toUpperCase();
     const profile = getProfile();
@@ -330,84 +336,152 @@ export class GitHubClient {
     if (method === "PUT" && isIssueLabelsCollectionPath(path)) {
       throw new Error(`Refusing to replace issue labels via PUT ${path}`);
     }
-    const init: RequestInit = {
-      method,
-      headers: this.buildHeaders(opts, token),
-    };
-
-    if (opts.body !== undefined) {
-      init.body = JSON.stringify(opts.body);
-    }
-
     const isWrite = method !== "GET" && method !== "HEAD";
     const semaphores = GitHubClient.resolveSemaphores();
-    const releaseRequest: ReleaseFn = await semaphores.request.acquire();
-    let releaseWrite: ReleaseFn | null = null;
-    if (isWrite) {
-      releaseWrite = await semaphores.write.acquire();
-    }
 
-    let res: Response;
-    try {
-      res = await fetch(url, init);
-    } finally {
-      releaseWrite?.();
-      releaseRequest();
-    }
-    if (opts.allowNotFound && res.status === 404) {
-      return { data: null, etag: res.headers.get("etag"), status: res.status };
-    }
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const token = this.tokenOverride ?? (await this.getToken());
+      const tokenKey = token ? fnv1a32(token) : null;
+      await this.waitForBackoff(tokenKey);
 
-    const text = await res.text();
-    if (!res.ok) {
-      const baseCode = classifyStatus(res.status);
-      const retryAfterMs = parseRetryAfterMs(res.headers);
-      const resetMs = parseRateLimitResetMs(res.headers);
-      const remaining = res.headers.get("x-ratelimit-remaining");
-      const remainingZero = typeof remaining === "string" && remaining.trim() === "0";
-      const isRateLimited =
-        res.status === 429 ||
-        retryAfterMs != null ||
-        isSecondaryRateLimitText(text) ||
-        (res.status === 403 && (isPrimaryRateLimitText(text) || remainingZero));
+      const init: RequestInit = {
+        method,
+        headers: this.buildHeaders(opts, token),
+      };
 
-      const code: GitHubErrorCode = isRateLimited ? "rate_limit" : baseCode;
-
-      let untilTs: number | null = null;
-      if (isRateLimited) {
-        const now = Date.now();
-        const timestampMs = parseRateLimitTimestampFromBody(text);
-        untilTs =
-          retryAfterMs != null
-            ? now + retryAfterMs
-            : resetMs != null
-              ? resetMs
-              : timestampMs != null && timestampMs > now
-                ? timestampMs
-                : now + 60_000;
-        this.recordBackoff({ untilTs, installationId: extractInstallationId(text), tokenKey });
+      if (opts.body !== undefined) {
+        init.body = JSON.stringify(opts.body);
       }
 
-      const resumeAt = untilTs != null && untilTs > Date.now() ? ` resumeAt=${new Date(untilTs).toISOString()}` : "";
+      const controller = this.requestTimeoutMs > 0 ? new AbortController() : null;
+      const timeoutId =
+        controller && this.requestTimeoutMs > 0
+          ? setTimeout(() => {
+              controller.abort();
+            }, this.requestTimeoutMs)
+          : null;
+      if (controller) (init as any).signal = controller.signal;
 
-      const missingTokenHint =
-        code === "auth" && !token ? "Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests. " : "";
+      const releaseRequest: ReleaseFn = await semaphores.request.acquire();
+      let releaseWrite: ReleaseFn | null = null;
+      if (isWrite) {
+        releaseWrite = await semaphores.write.acquire();
+      }
 
-      throw new GitHubApiError({
-        message: `${missingTokenHint}GitHub API ${init.method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}${resumeAt}`.trim(),
-        code,
+      let res: Response;
+      try {
+        res = await fetch(url, init);
+      } catch (error: any) {
+        const aborted = error?.name === "AbortError" || error?.code === "ABORT_ERR";
+        const message = aborted
+          ? `GitHub API ${method} ${path} timed out after ${this.requestTimeoutMs}ms.`
+          : `GitHub API ${method} ${path} request failed. ${error?.message ?? String(error)}`;
+        throw new GitHubApiError({
+          message,
+          code: "unknown",
+          status: 0,
+          requestId: null,
+          responseText: "",
+          resumeAtTs: null,
+        });
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+        releaseWrite?.();
+        releaseRequest();
+      }
+
+      if (opts.allowNotFound && res.status === 404) {
+        return { data: null, etag: res.headers.get("etag"), status: res.status };
+      }
+
+      const text = await res.text();
+
+      if (!res.ok) {
+        if (res.status === 401 && attempt === 0 && !this.tokenOverride && invalidateInstallationTokenCache()) {
+          continue;
+        }
+
+        const baseCode = classifyStatus(res.status);
+        const retryAfterMs = parseRetryAfterMs(res.headers);
+        const resetMs = parseRateLimitResetMs(res.headers);
+        const remaining = res.headers.get("x-ratelimit-remaining");
+        const remainingZero = typeof remaining === "string" && remaining.trim() === "0";
+        const isRateLimited =
+          res.status === 429 ||
+          retryAfterMs != null ||
+          isSecondaryRateLimitText(text) ||
+          (res.status === 403 && (isPrimaryRateLimitText(text) || remainingZero));
+
+        const code: GitHubErrorCode = isRateLimited ? "rate_limit" : baseCode;
+
+        let untilTs: number | null = null;
+        if (isRateLimited) {
+          const now = Date.now();
+          const timestampMs = parseRateLimitTimestampFromBody(text);
+          untilTs =
+            retryAfterMs != null
+              ? now + retryAfterMs
+              : resetMs != null
+                ? resetMs
+                : timestampMs != null && timestampMs > now
+                  ? timestampMs
+                  : now + 60_000;
+          this.recordBackoff({ untilTs, installationId: extractInstallationId(text), tokenKey });
+        }
+
+        const resumeAt = untilTs != null && untilTs > Date.now() ? ` resumeAt=${new Date(untilTs).toISOString()}` : "";
+
+        const missingTokenHint =
+          code === "auth" && !token ? "Missing GH_TOKEN/GITHUB_TOKEN for GitHub API requests. " : "";
+
+        throw new GitHubApiError({
+          message: `${missingTokenHint}GitHub API ${method} ${path} failed (HTTP ${res.status}). ${text.slice(0, 400)}${resumeAt}`.trim(),
+          code,
+          status: res.status,
+          requestId: res.headers.get("x-github-request-id"),
+          responseText: text,
+          resumeAtTs: untilTs,
+        });
+      }
+
+      return {
+        data: safeJsonParse<T>(text),
+        etag: res.headers.get("etag"),
         status: res.status,
-        requestId: res.headers.get("x-github-request-id"),
-        responseText: text,
-        resumeAtTs: untilTs,
-      });
+      };
     }
 
-    return {
-      data: safeJsonParse<T>(text),
-      etag: res.headers.get("etag"),
-      status: res.status,
-    };
+    throw new GitHubApiError({
+      message: `GitHub API ${method} ${path} failed after retries.`,
+      code: "unknown",
+      status: 0,
+      requestId: null,
+      responseText: "",
+    });
+  }
+
+  async getIssue(issueNumber: number): Promise<unknown> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const response = await this.request(`/repos/${owner}/${name}/issues/${issueNumber}`);
+    return response.data;
+  }
+
+  async listIssueComments(issueNumber: number, opts?: { maxPages?: number; perPage?: number }): Promise<unknown[]> {
+    const { owner, name } = splitRepoFullName(this.repo);
+    const results: unknown[] = [];
+    const maxPages = Math.max(1, Math.min(10, Math.floor(opts?.maxPages ?? 3)));
+    const perPage = Math.max(1, Math.min(100, Math.floor(opts?.perPage ?? 100)));
+    let page = 1;
+    while (page <= maxPages) {
+      const response = await this.request<unknown[]>(
+        `/repos/${owner}/${name}/issues/${issueNumber}/comments?per_page=${perPage}&page=${page}`
+      );
+      const comments = Array.isArray(response.data) ? response.data : [];
+      results.push(...comments);
+      if (comments.length < perPage) break;
+      page += 1;
+    }
+    return results;
   }
 
   async listLabels(): Promise<string[]> {

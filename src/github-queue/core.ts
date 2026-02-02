@@ -1,39 +1,46 @@
 import type { AgentTask, QueueTaskStatus } from "../queue/types";
 import { inferPriorityFromLabels } from "../queue/priority";
 import type { IssueSnapshot, TaskOpState } from "../state";
+import {
+  RALPH_LABEL_STATUS_BLOCKED,
+  RALPH_LABEL_STATUS_DONE,
+  RALPH_LABEL_STATUS_IN_BOT,
+  RALPH_LABEL_STATUS_IN_PROGRESS,
+  RALPH_LABEL_STATUS_PAUSED,
+  RALPH_LABEL_STATUS_QUEUED,
+  RALPH_LABEL_STATUS_THROTTLED,
+} from "../github-labels";
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
 const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
-  queued: "ralph:queued",
-  "in-progress": "ralph:in-progress",
-  blocked: "ralph:blocked",
-  escalated: "ralph:escalated",
-  done: "ralph:in-bot",
-  starting: "ralph:in-progress",
-  throttled: null,
+  queued: RALPH_LABEL_STATUS_QUEUED,
+  "in-progress": RALPH_LABEL_STATUS_IN_PROGRESS,
+  blocked: RALPH_LABEL_STATUS_BLOCKED,
+  escalated: RALPH_LABEL_STATUS_BLOCKED,
+  done: RALPH_LABEL_STATUS_DONE,
+  starting: RALPH_LABEL_STATUS_IN_PROGRESS,
+  throttled: RALPH_LABEL_STATUS_THROTTLED,
 };
 
-const RALPH_LABEL_DONE = "ralph:done";
-const KNOWN_RALPH_LABELS = Array.from(
-  new Set([...Object.values(RALPH_STATUS_LABELS).filter(Boolean), RALPH_LABEL_DONE])
+const KNOWN_RALPH_STATUS_LABELS = Array.from(
+  new Set([
+    ...Object.values(RALPH_STATUS_LABELS).filter(Boolean),
+    RALPH_LABEL_STATUS_PAUSED,
+    RALPH_LABEL_STATUS_IN_BOT,
+  ])
 ) as string[];
-const RALPH_LABEL_QUEUED = RALPH_STATUS_LABELS.queued ?? "ralph:queued";
-// Preserve queued intent while blocked; claimability is determined at the queue layer.
-const PRESERVE_LABELS_BY_STATUS: Partial<Record<QueueTaskStatus, readonly string[]>> = {
-  blocked: [RALPH_LABEL_QUEUED],
-};
 
 export function deriveRalphStatus(labels: string[], issueState?: string | null): QueueTaskStatus | null {
   const normalizedState = issueState?.toUpperCase();
   if (normalizedState === "CLOSED") return "done";
-  if (labels.includes(RALPH_LABEL_DONE)) return "done";
-  if (labels.includes("ralph:in-bot")) return "done";
-  if (labels.includes("ralph:escalated")) return "escalated";
-  if (labels.includes("ralph:blocked") && labels.includes("ralph:queued")) return "queued";
-  if (labels.includes("ralph:blocked")) return "blocked";
-  if (labels.includes("ralph:in-progress")) return "in-progress";
-  if (labels.includes("ralph:queued")) return "queued";
+  if (labels.includes(RALPH_LABEL_STATUS_DONE)) return "done";
+  if (labels.includes(RALPH_LABEL_STATUS_IN_BOT)) return "done";
+  if (labels.includes(RALPH_LABEL_STATUS_THROTTLED)) return "throttled";
+  if (labels.includes(RALPH_LABEL_STATUS_PAUSED)) return "blocked";
+  if (labels.includes(RALPH_LABEL_STATUS_BLOCKED)) return "blocked";
+  if (labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) return "in-progress";
+  if (labels.includes(RALPH_LABEL_STATUS_QUEUED)) return "queued";
   return null;
 }
 
@@ -47,13 +54,7 @@ export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: 
   const labelSet = new Set(currentLabels);
   const add: string[] = [];
   if (!labelSet.has(target)) add.push(target);
-  if (status === "blocked" && !labelSet.has(RALPH_LABEL_QUEUED)) {
-    add.push(RALPH_LABEL_QUEUED);
-  }
-  const preserved = new Set(PRESERVE_LABELS_BY_STATUS[status] ?? []);
-  const remove = KNOWN_RALPH_LABELS.filter(
-    (label) => label !== target && labelSet.has(label) && !preserved.has(label)
-  );
+  const remove = KNOWN_RALPH_STATUS_LABELS.filter((label) => label !== target && labelSet.has(label));
   return { add, remove };
 }
 
@@ -63,30 +64,21 @@ export function planClaim(currentLabels: string[]): {
   reason?: string;
 } {
   const labelSet = new Set(currentLabels);
-  if (labelSet.has(RALPH_LABEL_DONE)) {
-    return { claimable: false, steps: [], reason: "Issue already done" };
-  }
-  if (labelSet.has("ralph:escalated")) {
-    return { claimable: false, steps: [], reason: "Issue is escalated" };
-  }
-  if (labelSet.has("ralph:in-bot")) {
-    return { claimable: false, steps: [], reason: "Issue already in bot" };
-  }
-  if (labelSet.has("ralph:in-progress")) {
-    return { claimable: false, steps: [], reason: "Issue already in progress" };
-  }
-  if (labelSet.has("ralph:blocked")) {
-    return { claimable: false, steps: [], reason: "Issue is blocked" };
-  }
-  if (!labelSet.has("ralph:queued")) {
-    return { claimable: false, steps: [], reason: "Missing ralph:queued label" };
+  if (labelSet.has(RALPH_LABEL_STATUS_DONE)) return { claimable: false, steps: [], reason: "Issue already done" };
+  if (labelSet.has(RALPH_LABEL_STATUS_IN_BOT)) return { claimable: false, steps: [], reason: "Issue already in bot" };
+  if (labelSet.has(RALPH_LABEL_STATUS_THROTTLED)) return { claimable: false, steps: [], reason: "Issue is throttled" };
+  if (labelSet.has(RALPH_LABEL_STATUS_PAUSED)) return { claimable: false, steps: [], reason: "Issue is paused" };
+  if (labelSet.has(RALPH_LABEL_STATUS_BLOCKED)) return { claimable: false, steps: [], reason: "Issue is blocked" };
+  if (labelSet.has(RALPH_LABEL_STATUS_IN_PROGRESS)) return { claimable: false, steps: [], reason: "Issue already in progress" };
+  if (!labelSet.has(RALPH_LABEL_STATUS_QUEUED)) {
+    return { claimable: false, steps: [], reason: "Missing ralph:status:queued label" };
   }
 
   return {
     claimable: true,
     steps: [
-      { action: "add", label: "ralph:in-progress" },
-      { action: "remove", label: "ralph:queued" },
+      { action: "add", label: RALPH_LABEL_STATUS_IN_PROGRESS },
+      { action: "remove", label: RALPH_LABEL_STATUS_QUEUED },
     ],
   };
 }
@@ -104,7 +96,7 @@ export function computeStaleInProgressRecovery(params: {
   nowMs: number;
   ttlMs: number;
 }): { shouldRecover: boolean; reason?: StaleInProgressRecoveryReason } {
-  if (!params.labels.includes("ralph:in-progress")) return { shouldRecover: false };
+  if (!params.labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) return { shouldRecover: false };
   if (typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs)) {
     return { shouldRecover: false };
   }

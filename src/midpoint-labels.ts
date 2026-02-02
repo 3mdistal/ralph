@@ -22,7 +22,7 @@ export function computeMidpointLabelPlan(input: {
     // If we cannot determine the default branch (e.g. auth failure / API outage),
     // fall back to a convention-based heuristic:
     // - If we're merging to an explicit bot branch (e.g. bot/integration), treat it
-    //   as a midpoint and apply ralph:in-bot.
+    //   as a midpoint and apply ralph:status:in-bot.
     // - Otherwise, avoid applying the midpoint label (mislabeling a default-branch
     //   merge as "in-bot" is worse than missing it).
     const isBotBranch = normalizedBot === "bot/integration" || normalizedBot.startsWith("bot/");

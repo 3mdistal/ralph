@@ -254,6 +254,17 @@ export async function getInstallationToken(profile: RalphProfile = getProfile())
   return fresh.token;
 }
 
+export function invalidateInstallationTokenCache(profile: RalphProfile = getProfile()): boolean {
+  const cfg = getConfig();
+  const app = getGitHubAppConfigForProfile(profile, cfg);
+  if (!app) return false;
+
+  const cacheKey = buildTokenCacheKey(profile, app);
+  const had = tokenCache.delete(cacheKey);
+  inFlightToken.delete(cacheKey);
+  return had;
+}
+
 export async function resolveGhTokenEnv(): Promise<string | null> {
   const profile = getProfile();
   const cfg = getConfig();

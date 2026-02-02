@@ -5,6 +5,7 @@ import { isAbsolute, join } from "path";
 import { aggregateRunMetrics, computeSessionMetrics } from "./core";
 import { readSessionEventLines } from "./io";
 import { parseEventsFromLines } from "./parse";
+import { computeRunTriage } from "./triage";
 import type { MetricsQuality, SessionMetrics } from "./types";
 
 const DEFAULT_MAX_BYTES = 2_000_000;
@@ -157,14 +158,31 @@ export async function computeAndStoreRunMetrics(params: {
     const finalQuality = timedOut ? preferQuality(run.quality, "timeout") : run.quality;
     const computedAt = new Date().toISOString();
 
+    const runOutcomeRow = stateDb
+      .query("SELECT outcome as outcome FROM ralph_runs WHERE run_id = $run_id")
+      .get({ $run_id: runId }) as { outcome?: string | null } | undefined;
+    const outcome =
+      runOutcomeRow?.outcome === "success" ||
+      runOutcomeRow?.outcome === "throttled" ||
+      runOutcomeRow?.outcome === "escalated" ||
+      runOutcomeRow?.outcome === "failed"
+        ? runOutcomeRow.outcome
+        : null;
+
+    const triage = computeRunTriage({ run: { ...run, quality: finalQuality }, steps, outcome });
+
     stateDb
       .query(
         `INSERT INTO ralph_run_metrics(
            run_id, wall_time_ms, tool_call_count, tool_time_ms, anomaly_count, anomaly_recent_burst,
-           tokens_total, tokens_complete, event_count, parse_error_count, quality, computed_at, created_at, updated_at
+           tokens_total, tokens_complete, event_count, parse_error_count, quality,
+           triage_score, triage_reasons_json, triage_computed_at,
+           computed_at, created_at, updated_at
          ) VALUES (
            $run_id, $wall_time_ms, $tool_call_count, $tool_time_ms, $anomaly_count, $anomaly_recent_burst,
-           $tokens_total, $tokens_complete, $event_count, $parse_error_count, $quality, $computed_at, $created_at, $updated_at
+           $tokens_total, $tokens_complete, $event_count, $parse_error_count, $quality,
+           $triage_score, $triage_reasons_json, $triage_computed_at,
+           $computed_at, $created_at, $updated_at
          )
          ON CONFLICT(run_id) DO UPDATE SET
            wall_time_ms = excluded.wall_time_ms,
@@ -177,6 +195,9 @@ export async function computeAndStoreRunMetrics(params: {
            event_count = excluded.event_count,
            parse_error_count = excluded.parse_error_count,
            quality = excluded.quality,
+           triage_score = excluded.triage_score,
+           triage_reasons_json = excluded.triage_reasons_json,
+           triage_computed_at = excluded.triage_computed_at,
            computed_at = excluded.computed_at,
            updated_at = excluded.updated_at`
       )
@@ -192,6 +213,9 @@ export async function computeAndStoreRunMetrics(params: {
         $event_count: Number.isFinite(run.eventCount) ? Math.max(0, Math.floor(run.eventCount)) : 0,
         $parse_error_count: Number.isFinite(run.parseErrorCount) ? Math.max(0, Math.floor(run.parseErrorCount)) : 0,
         $quality: finalQuality,
+        $triage_score: triage.score,
+        $triage_reasons_json: JSON.stringify(triage.reasons),
+        $triage_computed_at: computedAt,
         $computed_at: computedAt,
         $created_at: computedAt,
         $updated_at: computedAt,

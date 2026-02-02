@@ -18,8 +18,8 @@ describe("github issues sync core", () => {
 
   test("extractLabelNames normalizes strings and objects", () => {
     expect(extractLabelNames(undefined)).toEqual([]);
-    expect(extractLabelNames([" ralph:queued ", { name: " dx " }, { name: "" }])).toEqual([
-      "ralph:queued",
+    expect(extractLabelNames([" ralph:status:queued ", { name: " dx " }, { name: "" }])).toEqual([
+      "ralph:status:queued",
       "dx",
     ]);
   });
@@ -44,7 +44,7 @@ describe("github issues sync core", () => {
       {
         number: 1,
         state: "open",
-        labels: [{ name: "ralph:queued" }],
+        labels: [{ name: "ralph:status:queued" }],
         title: "Issue 1",
       },
       {
