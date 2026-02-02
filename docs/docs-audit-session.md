@@ -313,6 +313,14 @@ Note:
   - No downgrades; newer schema fails closed.
   - Safe reset by deleting `~/.ralph/state.sqlite`.
 
+### OpenCode Managed Config (2026-02-01)
+
+- Canonicalized managed OpenCode config safety + determinism:
+  - Managed config precedence (env override > config override > default) and ignoring `OPENCODE_CONFIG_DIR`.
+  - Marker-based safety to avoid overwriting non-managed directories.
+  - Managed config files are overwritten to match shipped templates.
+  - Isolated `XDG_CACHE_HOME` for OpenCode runs.
+
 ### Clarification (2026-02-01)
 
 - `PRODUCT GAP:` remains a deterministic escalation marker (cross-cutting, not a "stage").

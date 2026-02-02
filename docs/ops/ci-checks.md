@@ -39,3 +39,7 @@ shown in GitHub branch protection for this workflow. GitHub required checks are
 job/check-run contexts (not individual steps), and the UI often shows them in a
 `<workflow> / <job>` format. If you need the precise string, copy it from branch
 protection settings or from Ralph logs that list `Available check contexts`.
+
+## Claims
+
+This document is a derived reference. Canonical claims about deterministic gates live in `claims/canonical.jsonl`.
