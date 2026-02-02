@@ -18,7 +18,6 @@ import {
   RALPH_LABEL_QUEUED,
   RALPH_RESOLVED_REGEX,
 } from "./escalation-constants";
-import { CONSULTANT_MARKER } from "../escalation-consultant/core";
 
 type EscalatedIssue = { repo: string; number: number };
 
@@ -41,6 +40,7 @@ const AUTHORIZED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const RALPH_APPROVE_REGEX = /\bRALPH\s+APPROVE\b/i;
 const RALPH_OVERRIDE_REGEX = /\bRALPH\s+OVERRIDE\s*:\s*([\s\S]*)/i;
 const CONSULTANT_JSON_BLOCK_REGEX = /```json\s*([\s\S]*?)```/i;
+const CONSULTANT_MARKER_REGEX = /<!--\s*ralph-consultant:v\d+\s*-->/i;
 
 type IssueCommentNode = {
   body?: string | null;
@@ -87,8 +87,9 @@ function extractOverrideText(body: string): string | null {
 }
 
 function parseConsultantDecisionFromBody(body: string): ConsultantDecision | null {
-  if (!body.includes(CONSULTANT_MARKER)) return null;
-  const afterMarker = body.split(CONSULTANT_MARKER)[1] ?? "";
+  const marker = body.match(CONSULTANT_MARKER_REGEX);
+  if (!marker) return null;
+  const afterMarker = body.slice((marker.index ?? 0) + marker[0].length);
   const match = afterMarker.match(CONSULTANT_JSON_BLOCK_REGEX);
   if (!match?.[1]) return null;
   try {
