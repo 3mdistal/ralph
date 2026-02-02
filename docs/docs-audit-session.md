@@ -288,6 +288,19 @@ This document captures decisions and discoveries made during an interactive audi
 - Parent verification closure policy is hybrid: auto-close when confidence/evidence are strong; otherwise escalate.
 - Priority: use `ralph:priority:p0`..`ralph:priority:p4` labels; default `p2`; queue-order only among `ralph:status:queued`.
 
+### Worktrees (2026-02-01)
+
+- Canonicalized worktree invariants:
+  - Managed worktree root (`~/.ralph/worktrees`) with `RALPH_WORKTREES_DIR` override.
+  - Stable worktree layout (`<repoKey>/slot-<slot>/<issueNumber>/<taskKey>`).
+  - Refuse to run/resume tasks in repo root or without `worktree-path`.
+  - Stale worktree-path triggers best-effort cleanup and task reset to queued.
+- Legacy worktrees are warn-only by default; explicit CLI exists to cleanup/migrate safe legacy worktrees.
+
+Note:
+
+- The legacy worktrees CLI is treated as non-essential going forward (operator already cleaned up legacy worktrees). We keep the warn-only behavior as canonical, but do not rely on the legacy CLI as a required contract.
+
 ### Label Bootstrap (2026-02-01)
 
 - Label bootstrap includes priority labels; `labels.required.set` now enumerates `ralph:priority:p0`..`ralph:priority:p4` as part of the required label set.

@@ -4,10 +4,26 @@ Status: non-canonical (reference)
 Owner: @3mdistal
 Last updated: 2026-02-01
 
+Ralph isolates task work in per-repo worktrees.
+
+Canonical claims live in `claims/canonical.jsonl`.
+
+## Managed worktree root
+
+Default:
+
+- `~/.ralph/worktrees`
+
+Override:
+
+- `RALPH_WORKTREES_DIR` (absolute path, or relative to current working directory).
+
+## Layout
+
 Ralph isolates task work in per-repo worktrees under:
 
 ```
-~/.ralph/worktrees/<owner-repo>/<slot>/<issue>/<task>
+~/.ralph/worktrees/<repoKey>/slot-<slot>/<issueNumber>/<taskKey>
 ```
 
 ## Legacy worktrees
