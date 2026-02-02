@@ -55,6 +55,7 @@ Newest manifest selection:
 - Ensure Ralph workflow labels exist:
   - all `ralph:status:*` labels defined in `docs/product/orchestration-contract.md`
   - all `ralph:cmd:*` labels defined in `docs/product/orchestration-contract.md`
+  - all `ralph:priority:*` labels defined in `docs/product/orchestration-contract.md`
 - Ensure the default branch exists.
 - Create bot branch (e.g. `bot/integration`) from default branch if missing.
 

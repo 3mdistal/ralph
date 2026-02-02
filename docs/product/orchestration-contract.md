@@ -119,6 +119,7 @@ Required set (vNext):
 
 - Statuses: `ralph:status:queued`, `ralph:status:in-progress`, `ralph:status:paused`, `ralph:status:escalated`, `ralph:status:in-bot`, `ralph:status:done`, `ralph:status:stopped`
 - Commands: `ralph:cmd:queue`, `ralph:cmd:pause`, `ralph:cmd:stop`, `ralph:cmd:satisfy`
+- Priority: `ralph:priority:p0`, `ralph:priority:p1`, `ralph:priority:p2`, `ralph:priority:p3`, `ralph:priority:p4`
 
 ## Priority (operator input)
 

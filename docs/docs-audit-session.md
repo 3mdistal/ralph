@@ -287,6 +287,10 @@ This document captures decisions and discoveries made during an interactive audi
 - Parent verification lane is mandatory when a parent becomes unblocked.
 - Priority: use `ralph:priority:p0`..`ralph:priority:p4` labels; default `p2`; queue-order only among `ralph:status:queued`.
 
+### Label Bootstrap (2026-02-01)
+
+- Label bootstrap includes priority labels; `labels.required.set` now enumerates `ralph:priority:p0`..`ralph:priority:p4` as part of the required label set.
+
 ### SQLite Policy (2026-02-01)
 
 - Promoted additional SQLite migration claims:
