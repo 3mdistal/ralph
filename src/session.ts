@@ -225,6 +225,9 @@ function buildOpencodeSpawnEnvironment(opts?: OpencodeSpawnOptions): { env: Reco
   });
   mkdirSync(xdgCacheHome, { recursive: true });
 
+  const xdgConfigHome = opencodeXdg?.configHome?.trim() ? opencodeXdg.configHome.trim() : join(xdgCacheHome, "xdg-config");
+  mkdirSync(xdgConfigHome, { recursive: true });
+
   const opencodeConfigDir = ensureManagedOpencodeConfigInstalled();
 
   return {
@@ -233,7 +236,7 @@ function buildOpencodeSpawnEnvironment(opts?: OpencodeSpawnOptions): { env: Reco
       ...process.env,
       OPENCODE_CONFIG_DIR: opencodeConfigDir,
       ...(opencodeXdg?.dataHome ? { XDG_DATA_HOME: opencodeXdg.dataHome } : {}),
-      ...(opencodeXdg?.configHome ? { XDG_CONFIG_HOME: opencodeXdg.configHome } : {}),
+      XDG_CONFIG_HOME: xdgConfigHome,
       ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
       XDG_CACHE_HOME: xdgCacheHome,
     },

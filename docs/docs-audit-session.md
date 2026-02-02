@@ -321,6 +321,12 @@ Note:
   - Managed config files are overwritten to match shipped templates.
   - Isolated `XDG_CACHE_HOME` for OpenCode runs.
 
+Addendum:
+
+- Prefer managed config isolation over precedence:
+  - Default isolate `XDG_CONFIG_HOME` for daemon runs.
+  - Keep `XDG_DATA_HOME` shared by default to preserve OpenAI OAuth tokens.
+
 ### Clarification (2026-02-01)
 
 - `PRODUCT GAP:` remains a deterministic escalation marker (cross-cutting, not a "stage").

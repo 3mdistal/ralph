@@ -29,6 +29,12 @@ Safety:
 
 Ralph overwrites managed files on startup to keep them in sync with the version shipped in this repo.
 
+## Isolation
+
+Daemon runs isolate `XDG_CONFIG_HOME` by default so changes in user-global config do not leak into Ralph.
+
+Ralph does not override `XDG_DATA_HOME` by default (to preserve OpenAI OAuth tokens under `XDG_DATA_HOME/opencode/auth.json`).
+
 ## Claims
 
 Canonical claims live in `claims/canonical.jsonl`.
