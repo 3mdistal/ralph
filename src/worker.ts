@@ -42,6 +42,8 @@ import { ensureWorktreeSetup, type SetupFailure } from "./worktree-setup";
 import { LogLimiter, formatDuration } from "./logging";
 import { buildWorktreePath } from "./worktree-paths";
 
+import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "./pr-create-lease";
+
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { readControlStateSnapshot } from "./drain";
 import { buildCheckpointState, type CheckpointState } from "./checkpoints/core";
@@ -133,8 +135,11 @@ import {
   getIssueLabels,
   getLatestRunIdForSession,
   getRalphRunTokenTotals,
+  getIdempotencyRecord,
   getIdempotencyPayload,
   listRalphRunSessionTokenTotals,
+  recordIdempotencyKey,
+  deleteIdempotencyKey,
   recordParentVerificationAttemptFailure,
   recordRalphRunGateArtifact,
   upsertIdempotencyKey,
@@ -191,6 +196,12 @@ export function __prBodyClosesIssueForTests(body: string, issueNumber: string): 
 
 const ghRead = (repo: string) => createGhRunner({ repo, mode: "read" });
 const ghWrite = (repo: string) => createGhRunner({ repo, mode: "write" });
+
+const PR_CREATE_LEASE_TTL_MS = 20 * 60_000;
+const PR_CREATE_CONFLICT_WAIT_MS = 2 * 60_000;
+const PR_CREATE_CONFLICT_POLL_MS = 15_000;
+const PR_CREATE_CONFLICT_THROTTLE_MS = 5 * 60_000;
+
 type PullRequestMergeStateStatus =
   | "BEHIND"
   | "BLOCKED"
@@ -1932,6 +1943,170 @@ export class RepoWorker {
     return promise;
   }
 
+  private buildPrCreateLeaseKey(issueNumber: string, botBranch: string): string {
+    return buildPrCreateLeaseKey({ repo: this.repo, issueNumber, baseBranch: botBranch });
+  }
+
+  private tryClaimPrCreateLease(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    sessionId?: string | null;
+    stage: string;
+  }): { key: string; claimed: boolean; staleDeleted: boolean; existingCreatedAt: string | null } {
+    const key = this.buildPrCreateLeaseKey(params.issueNumber, params.botBranch);
+    const nowMs = Date.now();
+    const existing = getIdempotencyRecord(key);
+    const existingCreatedAt = existing?.createdAt ?? null;
+    let staleDeleted = false;
+
+    if (
+      existing &&
+      isLeaseStale({
+        createdAtIso: existing.createdAt,
+        nowMs,
+        ttlMs: PR_CREATE_LEASE_TTL_MS,
+      })
+    ) {
+      try {
+        deleteIdempotencyKey(key);
+        staleDeleted = true;
+      } catch {
+        // ignore
+      }
+    }
+
+    const payloadJson = JSON.stringify({
+      repo: this.repo,
+      issue: `${this.repo}#${params.issueNumber}`,
+      base: normalizeGitRef(params.botBranch),
+      stage: params.stage,
+      workerId: params.task["worker-id"]?.trim() ?? "",
+      daemonId: params.task["daemon-id"]?.trim() ?? "",
+      sessionId: params.sessionId?.trim() ?? "",
+      claimedAt: new Date(nowMs).toISOString(),
+    });
+
+    const claimed = recordIdempotencyKey({ key, scope: PR_CREATE_LEASE_SCOPE, payloadJson });
+    return { key, claimed, staleDeleted, existingCreatedAt };
+  }
+
+  private async waitForExistingPrDuringPrCreateConflict(params: {
+    issueNumber: string;
+    maxWaitMs: number;
+  }): Promise<ResolvedIssuePr | null> {
+    const deadline = Date.now() + Math.max(0, Math.floor(params.maxWaitMs));
+    while (Date.now() < deadline) {
+      const resolved = await this.getIssuePrResolution(params.issueNumber);
+      if (resolved.selectedUrl) return resolved;
+      await this.sleepMs(PR_CREATE_CONFLICT_POLL_MS);
+    }
+    return null;
+  }
+
+  private async throttleForPrCreateConflict(params: {
+    task: AgentTask;
+    issueNumber: string;
+    sessionId?: string | null;
+    leaseKey: string;
+    existingCreatedAt?: string | null;
+    stage: string;
+  }): Promise<AgentRun | null> {
+    const sid = params.sessionId?.trim() || params.task["session-id"]?.trim() || "";
+    const enteringThrottled = params.task.status !== "throttled";
+    const throttledAt = new Date().toISOString();
+    const resumeAt = new Date(Date.now() + PR_CREATE_CONFLICT_THROTTLE_MS).toISOString();
+
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.requested",
+        level: "warn",
+        data: { reason: `pr-create-conflict:${params.stage}` },
+      },
+      { sessionId: sid || undefined }
+    );
+
+    const details = JSON.stringify({
+      reason: "pr-create-lease-conflict",
+      leaseKey: params.leaseKey,
+      existingCreatedAt: params.existingCreatedAt ?? null,
+      stage: params.stage,
+      waitMs: PR_CREATE_CONFLICT_WAIT_MS,
+      ttlMs: PR_CREATE_LEASE_TTL_MS,
+    });
+
+    const extraFields: Record<string, string> = {
+      "throttled-at": throttledAt,
+      "resume-at": resumeAt,
+      "usage-snapshot": details,
+    };
+    if (sid) extraFields["session-id"] = sid;
+
+    const updated = await this.queue.updateTaskStatus(params.task, "throttled", extraFields);
+    if (!updated) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to throttle task after PR-create conflict (lease=${params.leaseKey}, issue=${this.repo}#${params.issueNumber})`
+      );
+      return null;
+    }
+
+    applyTaskPatch(params.task, "throttled", extraFields);
+
+    if (enteringThrottled) {
+      const runTime = new Date();
+      const bodyPrefix = buildAgentRunBodyPrefix({
+        task: params.task,
+        headline: `Throttled: PR creation conflict (${params.stage})`,
+        reason: `Resume at: ${resumeAt}`,
+        details,
+        sessionId: sid || undefined,
+        runLogPath: params.task["run-log-path"]?.trim() || undefined,
+      });
+
+      await this.createAgentRun(params.task, {
+        outcome: "throttled",
+        sessionId: sid || undefined,
+        started: runTime,
+        completed: runTime,
+        bodyPrefix,
+      });
+    }
+
+    console.warn(
+      `[ralph:worker:${this.repo}] PR-create lease conflict; throttling (lease=${params.leaseKey}, resumeAt=${resumeAt})`
+    );
+
+    this.publishDashboardEvent(
+      {
+        type: "worker.pause.reached",
+        level: "warn",
+        data: {},
+      },
+      { sessionId: sid || undefined }
+    );
+
+    return {
+      taskName: params.task.name,
+      repo: this.repo,
+      outcome: "throttled",
+      sessionId: sid || undefined,
+    };
+  }
+
+  private async markIssueInProgressForOpenPrBestEffort(task: AgentTask, prUrl: string): Promise<void> {
+    const issueRef = parseIssueRef(task.issue, this.repo);
+    if (!issueRef) return;
+    try {
+      await this.addIssueLabel(issueRef, RALPH_LABEL_STATUS_IN_PROGRESS);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to apply ${RALPH_LABEL_STATUS_IN_PROGRESS} for open PR ${prUrl}: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
+  }
+
   /**
    * Reconciliation lane: if a queued issue already has a Ralph-authored PR that is mergeable,
    * merge it and apply midpoint labels. This avoids "orphan" PRs when the daemon restarts
@@ -3063,17 +3238,21 @@ ${guidance}`
 
     return [
       `No PR URL found. Create a PR targeting '${botBranch}' and paste the PR URL.`,
+      "IMPORTANT: Before creating a new PR, check if one already exists for this issue.",
       "",
       "Commands (run in the task worktree):",
       "```bash",
       "git status",
       "git push -u origin HEAD",
+      issueNumber
+        ? `gh pr list --state open --search "fixes #${issueNumber} OR closes #${issueNumber} OR resolves #${issueNumber}" --json url,baseRefName,headRefName --limit 10`
+        : "",
       `gh pr create --base ${botBranch} --fill --body \"${fixes}\"`,
       "```",
       "",
       "If a PR already exists:",
       "```bash",
-      "gh pr list --head $(git branch --show-current) --json url --limit 1",
+      "gh pr list --head $(git branch --show-current) --json url,baseRefName,headRefName --limit 10",
       "```",
     ].join("\n");
   }
@@ -3334,6 +3513,29 @@ ${guidance}`
       "",
     ].join("\n");
 
+    const lease = this.tryClaimPrCreateLease({
+      task,
+      issueNumber,
+      botBranch,
+      sessionId: task["session-id"]?.trim() || null,
+      stage: "recovery",
+    });
+
+    if (!lease.claimed) {
+      diagnostics.push(`- PR-create lease already held; skipping auto-create (lease=${lease.key})`);
+      const waited = await this.waitForExistingPrDuringPrCreateConflict({
+        issueNumber,
+        maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
+      });
+      if (waited?.selectedUrl) {
+        diagnostics.push(...waited.diagnostics);
+        return { prUrl: waited.selectedUrl, diagnostics: diagnostics.join("\n") };
+      }
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    diagnostics.push(`- Acquired PR-create lease: ${lease.key}`);
+
     try {
       const created = await ghWrite(this.repo)`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
         .cwd(candidate.worktreePath)
@@ -3342,7 +3544,14 @@ ${guidance}`
       const prUrl = selectPrUrl({ output: created.stdout.toString(), repo: this.repo }) ?? null;
       diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
 
-      if (prUrl) return { prUrl, diagnostics: diagnostics.join("\n") };
+      if (prUrl) {
+        try {
+          deleteIdempotencyKey(lease.key);
+        } catch {
+          // ignore
+        }
+        return { prUrl, diagnostics: diagnostics.join("\n") };
+      }
     } catch (e: any) {
       diagnostics.push(`- gh pr create failed: ${e?.message ?? String(e)}`);
     }
@@ -7747,6 +7956,7 @@ ${guidance}`
             existingPr.source ?? "unknown"
           })`
         );
+        await this.markIssueInProgressForOpenPrBestEffort(task, existingPr.selectedUrl);
         if (existingPr.duplicates.length > 0) {
           console.log(
             `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
@@ -7860,6 +8070,7 @@ ${guidance}`
       let continueAttempts = 0;
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
+      let prCreateLeaseKey: string | null = null;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
         await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
@@ -7993,6 +8204,7 @@ ${guidance}`
               canonical.source ?? "unknown"
             })`
           );
+          await this.markIssueInProgressForOpenPrBestEffort(task, canonical.selectedUrl);
           if (canonical.duplicates.length > 0) {
             console.log(
               `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
@@ -8001,6 +8213,55 @@ ${guidance}`
           prRecoveryDiagnostics = [prRecoveryDiagnostics, canonical.diagnostics.join("\n")].filter(Boolean).join("\n\n");
           prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
           break;
+        }
+
+        if (!prCreateLeaseKey) {
+          const lease = this.tryClaimPrCreateLease({
+            task,
+            issueNumber,
+            botBranch,
+            sessionId: buildResult.sessionId,
+            stage: "resume",
+          });
+
+          if (!lease.claimed) {
+            console.warn(
+              `[ralph:worker:${this.repo}] PR-create lease already held; waiting instead of creating duplicate (lease=${lease.key})`
+            );
+
+            const waited = await this.waitForExistingPrDuringPrCreateConflict({
+              issueNumber,
+              maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
+            });
+
+            if (waited?.selectedUrl) {
+              await this.markIssueInProgressForOpenPrBestEffort(task, waited.selectedUrl);
+              prRecoveryDiagnostics = [prRecoveryDiagnostics, waited.diagnostics.join("\n")].filter(Boolean).join("\n\n");
+              prUrl = this.updateOpenPrSnapshot(task, prUrl, waited.selectedUrl);
+              break;
+            }
+
+            const throttled = await this.throttleForPrCreateConflict({
+              task,
+              issueNumber,
+              sessionId: buildResult.sessionId,
+              leaseKey: lease.key,
+              existingCreatedAt: lease.existingCreatedAt,
+              stage: "resume",
+            });
+            if (throttled) return throttled;
+
+            prRecoveryDiagnostics = [
+              prRecoveryDiagnostics,
+              `PR-create conflict: lease=${lease.key} (createdAt=${lease.existingCreatedAt ?? "unknown"})`,
+            ]
+              .filter(Boolean)
+              .join("\n\n");
+            break;
+          }
+
+          prCreateLeaseKey = lease.key;
+          console.log(`[ralph:worker:${this.repo}] pr_mode=create lease=${lease.key}`);
         }
 
         continueAttempts++;
@@ -8127,6 +8388,15 @@ ${guidance}`
           sessionId: buildResult.sessionId,
           escalationReason: reason,
         };
+      }
+
+      if (prUrl && prCreateLeaseKey) {
+        try {
+          deleteIdempotencyKey(prCreateLeaseKey);
+        } catch {
+          // ignore
+        }
+        prCreateLeaseKey = null;
       }
 
       const canonical = await this.getIssuePrResolution(issueNumber);
@@ -8972,6 +9242,7 @@ ${guidance}`
             existingPr.source ?? "unknown"
           })`
         );
+        await this.markIssueInProgressForOpenPrBestEffort(task, existingPr.selectedUrl);
         if (existingPr.duplicates.length > 0) {
           console.log(
             `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
@@ -9055,6 +9326,7 @@ ${guidance}`
       let continueAttempts = 0;
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
+      let prCreateLeaseKey: string | null = null;
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
         await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build", opencodeXdg);
@@ -9187,6 +9459,7 @@ ${guidance}`
               canonical.source ?? "unknown"
             })`
           );
+          await this.markIssueInProgressForOpenPrBestEffort(task, canonical.selectedUrl);
           if (canonical.duplicates.length > 0) {
             console.log(
               `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
@@ -9195,6 +9468,55 @@ ${guidance}`
           prRecoveryDiagnostics = [prRecoveryDiagnostics, canonical.diagnostics.join("\n")].filter(Boolean).join("\n\n");
           prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
           break;
+        }
+
+        if (!prCreateLeaseKey) {
+          const lease = this.tryClaimPrCreateLease({
+            task,
+            issueNumber,
+            botBranch,
+            sessionId: buildResult.sessionId,
+            stage: "build",
+          });
+
+          if (!lease.claimed) {
+            console.warn(
+              `[ralph:worker:${this.repo}] PR-create lease already held; waiting instead of creating duplicate (lease=${lease.key})`
+            );
+
+            const waited = await this.waitForExistingPrDuringPrCreateConflict({
+              issueNumber,
+              maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
+            });
+
+            if (waited?.selectedUrl) {
+              await this.markIssueInProgressForOpenPrBestEffort(task, waited.selectedUrl);
+              prRecoveryDiagnostics = [prRecoveryDiagnostics, waited.diagnostics.join("\n")].filter(Boolean).join("\n\n");
+              prUrl = this.updateOpenPrSnapshot(task, prUrl, waited.selectedUrl);
+              break;
+            }
+
+            const throttled = await this.throttleForPrCreateConflict({
+              task,
+              issueNumber,
+              sessionId: buildResult.sessionId,
+              leaseKey: lease.key,
+              existingCreatedAt: lease.existingCreatedAt,
+              stage: "build",
+            });
+            if (throttled) return throttled;
+
+            prRecoveryDiagnostics = [
+              prRecoveryDiagnostics,
+              `PR-create conflict: lease=${lease.key} (createdAt=${lease.existingCreatedAt ?? "unknown"})`,
+            ]
+              .filter(Boolean)
+              .join("\n\n");
+            break;
+          }
+
+          prCreateLeaseKey = lease.key;
+          console.log(`[ralph:worker:${this.repo}] pr_mode=create lease=${lease.key}`);
         }
 
         continueAttempts++;
@@ -9318,6 +9640,15 @@ ${guidance}`
           sessionId: buildResult.sessionId,
           escalationReason: reason,
         };
+      }
+
+      if (prUrl && prCreateLeaseKey) {
+        try {
+          deleteIdempotencyKey(prCreateLeaseKey);
+        } catch {
+          // ignore
+        }
+        prCreateLeaseKey = null;
       }
 
       const canonical = await this.getIssuePrResolution(issueNumber);
