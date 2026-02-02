@@ -4,7 +4,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
 
-import { closeStateDbForTests, initStateDb } from "../state";
+import { closeStateDbForTests, getRepoLabelSchemeState, initStateDb, recordRepoGithubIssueBootstrapCursor } from "../state";
 import { getRalphStateDbPath } from "../paths";
 import { syncRepoIssuesOnce } from "../github-issues-sync";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
@@ -23,6 +23,31 @@ async function withPatchedNow<T>(nowMs: number, fn: () => Promise<T> | T): Promi
     return await fn();
   } finally {
     Date.now = original;
+  }
+}
+
+async function withEnv<T>(vars: Record<string, string | undefined>, fn: () => Promise<T> | T): Promise<T> {
+  const original: Record<string, string | undefined> = {};
+  for (const key of Object.keys(vars)) {
+    original[key] = process.env[key];
+    const nextValue = vars[key];
+    if (nextValue === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = nextValue;
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const key of Object.keys(vars)) {
+      const prior = original[key];
+      if (prior === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = prior;
+      }
+    }
   }
 }
 
@@ -77,7 +102,7 @@ describe("github issue sync", () => {
       calls.push(String(input));
       return new Response(
         JSON.stringify([
-          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] }),
           buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["dx", "chore"] }),
           buildIssue({ number: 3, updatedAt: "2026-01-11T00:00:03.000Z", isPr: true }),
         ]),
@@ -117,15 +142,41 @@ describe("github issue sync", () => {
         )
         .all() as Array<{ issue_number: number; name: string }>;
 
-      expect(labels).toEqual([{ issue_number: 1, name: "ralph:queued" }]);
+      expect(labels).toEqual([{ issue_number: 1, name: "ralph:status:queued" }]);
     } finally {
       db.close();
     }
   });
 
+  test("records legacy workflow label scheme errors", async () => {
+    const fetchMock: FetchLike = async () =>
+      new Response(
+        JSON.stringify([
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", isPr: true, labels: ["ralph:queued"] }),
+        ]),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      deps: {
+        fetch: fetchMock,
+        getToken: async () => "token",
+        now: () => new Date("2026-01-11T00:00:10.000Z"),
+      },
+    });
+
+    expect(result.ok).toBe(true);
+    const scheme = getRepoLabelSchemeState(repo);
+    expect(scheme.errorCode).toBe("legacy-workflow-labels");
+    expect(scheme.errorDetails ?? "").toContain("ralph:queued");
+  });
+
   test("clears labels when removed", async () => {
     const responses = [
-      [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] })],
+      [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] })],
       [buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:02.000Z", labels: [] })],
     ];
     let idx = 0;
@@ -192,15 +243,15 @@ describe("github issue sync", () => {
       calls.push(url);
       if (url.includes("page=2")) {
         return new Response(
-          JSON.stringify([buildIssue({ number: 4, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:queued"] })]),
+          JSON.stringify([buildIssue({ number: 4, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
           { status: 200, headers: { "Content-Type": "application/json" } }
         );
       }
 
       return new Response(
         JSON.stringify([
-          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:queued"] }),
-          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["ralph:queued"] }),
+          buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:01.000Z", labels: ["ralph:status:queued"] }),
+          buildIssue({ number: 2, updatedAt: "2026-01-11T00:00:02.000Z", labels: ["ralph:status:queued"] }),
         ]),
         {
           status: 200,
@@ -264,5 +315,177 @@ describe("github issue sync", () => {
       expect(result.rateLimitResetMs).toBe(1_000_000 + 120_000);
       expect(result.error ?? "").toContain("HTTP 403");
     });
+  });
+
+  test("bootstrap stops at cap, persists cursor, does not advance last_sync_at", async () => {
+    await withEnv(
+      {
+        RALPH_GITHUB_ISSUES_SYNC_MAX_PAGES_PER_TICK: "1",
+        RALPH_GITHUB_ISSUES_SYNC_MAX_ISSUES_PER_TICK: "200",
+      },
+      async () => {
+        const calls: string[] = [];
+        const fetchMock: FetchLike = async (input: RequestInfo | URL) => {
+          const url = String(input);
+          calls.push(url);
+          return new Response(
+            JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
+            {
+              status: 200,
+              headers: {
+                "Content-Type": "application/json",
+                Link: '<https://api.github.com/repos/3mdistal/ralph/issues?page=2>; rel="next"',
+              },
+            }
+          );
+        };
+
+        const result = await syncRepoIssuesOnce({
+          repo,
+          lastSyncAt: null,
+          persistCursor: true,
+          deps: { fetch: fetchMock, getToken: async () => "token" },
+        });
+
+        expect(result.ok).toBe(true);
+        expect(result.limitHit?.kind).toBe("maxPages");
+        expect(result.newLastSyncAt).toBe(null);
+        expect(calls).toHaveLength(1);
+
+        const db = new Database(getRalphStateDbPath());
+        try {
+          const syncRow = db
+            .query(
+              `SELECT rs.last_sync_at as last_sync_at
+               FROM repo_github_issue_sync rs
+               JOIN repos r ON r.id = rs.repo_id
+               WHERE r.name = $name`
+            )
+            .get({ $name: repo }) as { last_sync_at?: string } | undefined;
+          expect(syncRow?.last_sync_at).toBeUndefined();
+
+          const cursorRow = db
+            .query(
+              `SELECT bc.next_url as next_url, bc.high_watermark_updated_at as high_watermark_updated_at
+               FROM repo_github_issue_sync_bootstrap_cursor bc
+               JOIN repos r ON r.id = bc.repo_id
+               WHERE r.name = $name`
+            )
+            .get({ $name: repo }) as { next_url?: string; high_watermark_updated_at?: string } | undefined;
+          expect(cursorRow?.next_url ?? "").toContain("page=2");
+          expect(cursorRow?.high_watermark_updated_at).toBe("2026-01-11T00:00:03.000Z");
+        } finally {
+          db.close();
+        }
+      }
+    );
+  });
+
+  test("bootstrap resumes from stored cursor and completes", async () => {
+    await withEnv({ RALPH_GITHUB_ISSUES_SYNC_MAX_PAGES_PER_TICK: "1" }, async () => {
+      const calls: string[] = [];
+      const fetchMock: FetchLike = async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls.push(url);
+        if (url.includes("page=2")) {
+          return new Response(
+            JSON.stringify([buildIssue({ number: 2, updatedAt: "2026-01-10T00:00:01.000Z", labels: ["ralph:status:queued"] })]),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        return new Response(
+          JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              Link: '<https://api.github.com/repos/3mdistal/ralph/issues?page=2>; rel="next"',
+            },
+          }
+        );
+      };
+
+      const first = await syncRepoIssuesOnce({
+        repo,
+        lastSyncAt: null,
+        persistCursor: true,
+        deps: { fetch: fetchMock, getToken: async () => "token" },
+      });
+
+      expect(first.ok).toBe(true);
+      expect(first.limitHit?.kind).toBe("maxPages");
+
+      const second = await syncRepoIssuesOnce({
+        repo,
+        lastSyncAt: null,
+        persistCursor: true,
+        deps: { fetch: fetchMock, getToken: async () => "token" },
+      });
+
+      expect(second.ok).toBe(true);
+      expect(second.newLastSyncAt).toBe("2026-01-11T00:00:03.000Z");
+      expect(calls).toHaveLength(2);
+
+      const db = new Database(getRalphStateDbPath());
+      try {
+        const cursorRow = db
+          .query(
+            `SELECT bc.next_url as next_url
+             FROM repo_github_issue_sync_bootstrap_cursor bc
+             JOIN repos r ON r.id = bc.repo_id
+             WHERE r.name = $name`
+          )
+          .get({ $name: repo }) as { next_url?: string } | undefined;
+        expect(cursorRow?.next_url).toBeUndefined();
+      } finally {
+        db.close();
+      }
+    });
+  });
+
+  test("bootstrap reports progress even when stored=0", async () => {
+    const fetchMock: FetchLike = async () =>
+      new Response(JSON.stringify([buildIssue({ number: 9, updatedAt: "2026-01-11T00:00:01.000Z" })]), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      deps: { fetch: fetchMock, getToken: async () => "token" },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.hadChanges).toBe(false);
+    expect(result.progressed).toBe(true);
+  });
+
+  test("invalid bootstrap cursor is detected and recovered", async () => {
+    recordRepoGithubIssueBootstrapCursor({
+      repo,
+      nextUrl: "https://example.com/bad",
+      highWatermarkUpdatedAt: "2026-01-11T00:00:03.000Z",
+    });
+
+    const calls: string[] = [];
+    const fetchMock: FetchLike = async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return new Response(
+        JSON.stringify([buildIssue({ number: 1, updatedAt: "2026-01-11T00:00:03.000Z", labels: ["ralph:status:queued"] })]),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    };
+
+    const result = await syncRepoIssuesOnce({
+      repo,
+      lastSyncAt: null,
+      persistCursor: true,
+      deps: { fetch: fetchMock, getToken: async () => "token" },
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.cursorInvalid).toBe(true);
+    expect(calls[0] ?? "").toContain("api.github.com/repos/3mdistal/ralph/issues");
   });
 });

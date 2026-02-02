@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from "bun:test";
 
-import { RALPH_LABEL_IN_PROGRESS } from "../github-labels";
+import { RALPH_LABEL_STATUS_IN_PROGRESS } from "../github-labels";
 import { applyMidpointLabelsBestEffort } from "../midpoint-labeler";
 
 const issueRef = {
@@ -31,7 +31,7 @@ describe("midpoint labeler", () => {
     });
 
     expect(addIssueLabelMock).not.toHaveBeenCalled();
-    expect(removeIssueLabelMock).toHaveBeenCalledWith(issueRef, RALPH_LABEL_IN_PROGRESS);
+    expect(removeIssueLabelMock).toHaveBeenCalledWith(issueRef, RALPH_LABEL_STATUS_IN_PROGRESS);
     expect(notifyErrorMock).not.toHaveBeenCalled();
   });
 

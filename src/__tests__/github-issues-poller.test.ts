@@ -89,6 +89,7 @@ describe("github issue poller", () => {
       ralphCount: 0,
       newLastSyncAt: null,
       hadChanges: false,
+      progressed: false,
     });
 
     const repo = { name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" };

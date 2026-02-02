@@ -1,7 +1,13 @@
 import { type RepoConfig, getRepoAutoQueueConfig } from "../config";
 import { isRepoAllowed } from "../github-app-auth";
 import { shouldLog } from "../logging";
-import { getIssueLabels, listIssueSnapshots, recordIssueLabelsSnapshot, type IssueSnapshot } from "../state";
+import {
+  getIssueLabels,
+  getRepoLabelSchemeState,
+  listIssueSnapshots,
+  recordIssueLabelsSnapshot,
+  type IssueSnapshot,
+} from "../state";
 import { computeBlockedDecision, type BlockedDecision } from "./issue-blocking-core";
 import { addIssueLabel, applyIssueLabelOps, planIssueLabelOps, removeIssueLabel } from "./issue-label-io";
 import { GitHubClient } from "./client";
@@ -9,12 +15,11 @@ import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels
 import { GitHubRelationshipProvider } from "./issue-relationships";
 import { resolveRelationshipSignals } from "./relationship-signals";
 
-const RALPH_LABEL_QUEUED = "ralph:queued";
-const RALPH_LABEL_BLOCKED = "ralph:blocked";
-const RALPH_LABEL_DONE = "ralph:done";
-const RALPH_LABEL_IN_BOT = "ralph:in-bot";
-const RALPH_LABEL_IN_PROGRESS = "ralph:in-progress";
-const RALPH_LABEL_ESCALATED = "ralph:escalated";
+const RALPH_LABEL_QUEUED = "ralph:status:queued";
+const RALPH_LABEL_BLOCKED = "ralph:status:blocked";
+const RALPH_LABEL_DONE = "ralph:status:done";
+const RALPH_LABEL_IN_BOT = "ralph:status:in-bot";
+const RALPH_LABEL_IN_PROGRESS = "ralph:status:in-progress";
 
 const AUTO_QUEUE_DEBOUNCE_MS = 500;
 
@@ -38,7 +43,6 @@ function shouldSkipIssue(issue: IssueSnapshot): { skip: boolean; reason?: string
     return { skip: true, reason: "done" };
   }
   if (labels.includes(RALPH_LABEL_IN_PROGRESS)) return { skip: true, reason: "in-progress" };
-  if (labels.includes(RALPH_LABEL_ESCALATED)) return { skip: true, reason: "escalated" };
   return { skip: false };
 }
 
@@ -68,6 +72,7 @@ export function computeAutoQueueLabelPlan(params: {
 
   if (params.blocked.blocked) {
     if (!hasBlocked) add.push(RALPH_LABEL_BLOCKED);
+    if (hasQueued) remove.push(RALPH_LABEL_QUEUED);
     return { add, remove, blocked: params.blocked, runnable: false, skipped: add.length === 0 };
   }
 
@@ -254,6 +259,20 @@ export function createAutoQueueRunner(params: {
   const schedule = (repo: RepoConfig, reason: "startup" | "sync") => {
     const config = getRepoAutoQueueConfig(repo.name);
     if (!config || !config.enabled) return;
+
+    const scheme = getRepoLabelSchemeState(repo.name);
+    if (!scheme.checkedAt) {
+      // Auto-queue depends on the GitHub issue sync state; defer until a sync tick has run.
+      return;
+    }
+    if (scheme.errorCode === "legacy-workflow-labels") {
+      if (shouldLog(`auto-queue:legacy:${repo.name}`, 60_000)) {
+        console.warn(
+          `[ralph:auto-queue:${repo.name}] Repo unschedulable due to legacy workflow labels; skipping auto-queue. See docs/ops/label-scheme-migration.md`
+        );
+      }
+      return;
+    }
 
     const key = repo.name;
     if (pending.has(key)) return;

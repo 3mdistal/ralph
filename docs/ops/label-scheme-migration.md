@@ -1,0 +1,102 @@
+# Label Scheme Migration: Legacy -> vNext
+
+Ralph vNext uses namespaced labels:
+
+- `ralph:status:*` (Ralph-managed)
+- `ralph:intent:*` (operator-owned)
+- `ralph:artifact:*` (operator-owned)
+
+Legacy workflow labels (unqualified `ralph:<state>`) are not supported after cutover. If any OPEN issue/PR in a repo has a legacy label, Ralph treats the repo as **unschedulable** and will not claim work.
+
+Canonical spec: `docs/product/intent-artifact-orchestration.md`.
+
+## Legacy Label Set (Migration Errors)
+
+- `ralph:queued`
+- `ralph:in-progress`
+- `ralph:blocked`
+- `ralph:escalated`
+- `ralph:stuck`
+- `ralph:in-bot`
+- `ralph:done`
+
+## Mapping
+
+Relabel by removing the legacy label and adding the vNext label:
+
+- `ralph:queued` -> `ralph:status:queued`
+- `ralph:in-progress` -> `ralph:status:in-progress`
+- `ralph:blocked` -> `ralph:status:blocked`
+- `ralph:escalated` -> `ralph:status:blocked`
+- `ralph:stuck` -> `ralph:status:in-progress`
+- `ralph:in-bot` -> `ralph:status:in-bot`
+- `ralph:done` -> `ralph:status:done`
+
+## Checklist
+
+1. Ensure the vNext labels exist.
+   - Easiest: run the daemon once with GitHub auth configured; Ralph will bootstrap `ralph:status:*` + starter `ralph:intent:*`/`ralph:artifact:*`.
+2. Find any OPEN issues/PRs with legacy labels.
+3. Apply the mapping above (remove legacy, add vNext).
+4. Re-run `bun run status` and confirm the legacy-label diagnostic is gone.
+
+## Script Snippet (gh + jq)
+
+This snippet relabels OPEN issues and PRs in-place.
+
+Requirements:
+
+- `gh auth status` succeeds for the target repo.
+- `jq` installed.
+
+```bash
+set -euo pipefail
+
+REPO="OWNER/REPO"
+
+declare -a LEGACY=(
+  "ralph:queued"
+  "ralph:in-progress"
+  "ralph:blocked"
+  "ralph:escalated"
+  "ralph:stuck"
+  "ralph:in-bot"
+  "ralph:done"
+)
+
+map_label() {
+  case "$1" in
+    "ralph:queued") echo "ralph:status:queued" ;;
+    "ralph:in-progress") echo "ralph:status:in-progress" ;;
+    "ralph:blocked") echo "ralph:status:blocked" ;;
+    "ralph:escalated") echo "ralph:status:blocked" ;;
+    "ralph:stuck") echo "ralph:status:in-progress" ;;
+    "ralph:in-bot") echo "ralph:status:in-bot" ;;
+    "ralph:done") echo "ralph:status:done" ;;
+    *) return 1 ;;
+  esac
+}
+
+for legacy in "${LEGACY[@]}"; do
+  next="$(map_label "$legacy")"
+
+  # Issues
+  gh issue list --repo "$REPO" --state open --label "$legacy" --json number --limit 1000 |
+    jq -r '.[].number' |
+    while read -r n; do
+      gh issue edit "$n" --repo "$REPO" --remove-label "$legacy" --add-label "$next"
+    done
+
+  # PRs
+  gh pr list --repo "$REPO" --state open --label "$legacy" --json number --limit 1000 |
+    jq -r '.[].number' |
+    while read -r n; do
+      gh pr edit "$n" --repo "$REPO" --remove-label "$legacy" --add-label "$next"
+    done
+done
+```
+
+Notes:
+
+- The mapping is intentionally manual/big-bang: there is no auto-translation in Ralph.
+- `ralph:status:queued` is the only claimable state.
