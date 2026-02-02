@@ -274,6 +274,11 @@ This document captures decisions and discoveries made during an interactive audi
 - GitHub API pacing is a separate canonical policy doc:
   - `docs/ops/github-rate-limiting.md` (backoff + caching + coalescing writes).
 
+### Dashboard vs GitHub-as-Dashboard (2026-02-01)
+
+- Dashboard/control plane is a long-term idea; near-term operator UX is increasingly GitHub-native (issues + projects) plus better observability.
+- We promoted only minimal dashboard safety/integration claims (auth, local bind, additive-only state schema, redaction) and left the rest as candidates.
+
 ### SQLite Policy (2026-02-01)
 
 - Promoted additional SQLite migration claims:
