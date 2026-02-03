@@ -48,6 +48,8 @@ type RequestOptions = {
   body?: unknown;
   allowNotFound?: boolean;
   etag?: string;
+  /** Optional caller tag for github.request telemetry (e.g. "label-reconciler"). */
+  source?: string;
 };
 
 type ClientOptions = {
@@ -330,6 +332,7 @@ export class GitHubClient {
     requestId?: string | null;
     allowNotFound?: boolean;
     graphqlOperation?: "query" | "mutation" | null;
+    source?: string;
     backoffWaitMs?: number;
     backoffResumeAtTs?: number | null;
     backoffSetUntilTs?: number | null;
@@ -492,6 +495,7 @@ export class GitHubClient {
             attempt: attempt + 1,
             allowNotFound: Boolean(opts.allowNotFound),
             graphqlOperation,
+            source: typeof opts.source === "string" ? opts.source : undefined,
             backoffWaitMs: backoffInfo.waitedMs,
             backoffResumeAtTs: backoffInfo.resumeAtTs,
             errorCode: "network",
@@ -530,6 +534,7 @@ export class GitHubClient {
             requestId: res.headers.get("x-github-request-id"),
             allowNotFound: true,
             graphqlOperation,
+            source: typeof opts.source === "string" ? opts.source : undefined,
             backoffWaitMs: backoffInfo.waitedMs,
             backoffResumeAtTs: backoffInfo.resumeAtTs,
             rateLimit: {
@@ -578,6 +583,7 @@ export class GitHubClient {
               requestId: res.headers.get("x-github-request-id"),
               allowNotFound: Boolean(opts.allowNotFound),
               graphqlOperation,
+              source: typeof opts.source === "string" ? opts.source : undefined,
               backoffWaitMs: backoffInfo.waitedMs,
               backoffResumeAtTs: backoffInfo.resumeAtTs,
               rateLimited: isRateLimited,
@@ -636,6 +642,7 @@ export class GitHubClient {
             requestId: res.headers.get("x-github-request-id"),
             allowNotFound: Boolean(opts.allowNotFound),
             graphqlOperation,
+            source: typeof opts.source === "string" ? opts.source : undefined,
             backoffWaitMs: backoffInfo.waitedMs,
             backoffResumeAtTs: backoffInfo.resumeAtTs,
             backoffSetUntilTs: untilTs,
@@ -685,6 +692,7 @@ export class GitHubClient {
             requestId: res.headers.get("x-github-request-id"),
             allowNotFound: Boolean(opts.allowNotFound),
             graphqlOperation,
+            source: typeof opts.source === "string" ? opts.source : undefined,
             backoffWaitMs: backoffInfo.waitedMs,
             backoffResumeAtTs: backoffInfo.resumeAtTs,
             rateLimit: {

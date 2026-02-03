@@ -142,6 +142,20 @@ describe("dashboard event schema", () => {
 
     expect(isRalphEvent(ok)).toBe(true);
 
+    const okWithSource: any = {
+      ...ok,
+      data: { ...(ok as any).data, source: "label-reconciler" },
+    };
+
+    expect(isRalphEvent(okWithSource)).toBe(true);
+
+    const badSource: any = {
+      ...ok,
+      data: { ...(ok as any).data, source: 123 },
+    };
+
+    expect(isRalphEvent(badSource)).toBe(false);
+
     const bad: any = {
       ...ok,
       data: { ...ok.data, durationMs: -1 },
