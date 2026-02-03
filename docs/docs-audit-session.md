@@ -327,6 +327,10 @@ Addendum:
   - Default isolate `XDG_CONFIG_HOME` for daemon runs.
   - Keep `XDG_DATA_HOME` shared by default to preserve OpenAI OAuth tokens.
 
+Follow-up:
+
+- Updated `README.md` to reflect XDG isolation posture.
+
 ### Candidates Sweep (2026-02-01)
 
 - Promoted from candidates to canonical:

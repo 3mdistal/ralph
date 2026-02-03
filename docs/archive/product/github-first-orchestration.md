@@ -44,8 +44,9 @@ Behavior:
 
 ## Operator-owned priority labels
 
-Operators can influence queue ordering by applying `p0`-`p4` labels on GitHub issues. Ralph infers task priority from
-these labels but does not create or manage them.
+Operators can influence queue ordering by applying Ralph-owned priority labels.
+
+Legacy note: this doc previously referenced non-`ralph:*` `p0`-`p4` labels. The vNext contract uses `ralph:priority:p0`..`ralph:priority:p4` instead.
 
 Rules:
 - Any label whose name starts with `p0`, `p1`, `p2`, `p3`, or `p4` (case-insensitive) is treated as a priority label.
