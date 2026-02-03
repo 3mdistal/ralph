@@ -89,4 +89,39 @@ describe("escalation consultant io", () => {
     expect(second.status).toBe("skipped");
     expect(content).toContain(CONSULTANT_MARKER);
   });
+
+  test("skips when legacy consultant marker exists", async () => {
+    const notePath = join(tempDir, "escalation.md");
+    const legacy = [
+      "## Escalation Summary",
+      "",
+      "<!-- ralph-consultant:v1 -->",
+      "## Consultant Decision (machine)",
+      "```json",
+      "{}",
+      "```",
+      "",
+    ].join("\n");
+    await writeFile(notePath, legacy, "utf8");
+
+    const runAgent = async () => ({
+      sessionId: "ses_test",
+      output: "",
+      success: true,
+    });
+
+    const result = await appendConsultantPacket(
+      notePath,
+      {
+        issue: "3mdistal/ralph#1",
+        repo: "3mdistal/ralph",
+        taskName: "Test task",
+        escalationType: "other",
+        reason: "Needs guidance",
+      },
+      { runAgent }
+    );
+
+    expect(result.status).toBe("skipped");
+  });
 });
