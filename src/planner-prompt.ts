@@ -15,6 +15,7 @@ export function buildPlannerPrompt(options: PlannerPromptOptions): string {
     `I need to work on task #${issueNumber} in ${repo}.`,
     "",
     "IMPORTANT: This runs in a non-interactive daemon. Do NOT ask the user questions. If you would normally ask a question, make a reasonable default choice and proceed, clearly stating any assumptions.",
+    "If a 'Child completion dossier' section is present, verify whether the parent issue is already satisfied by child work before implementing. Do NOT redo child work.",
     "",
     "GitHub issue context is provided below (prefetched by the orchestrator when possible).",
     "Treat explicit decisions/policies in comments as authoritative product guidance.",
