@@ -27,6 +27,45 @@ Example:
 }
 ```
 
+## Decision surfaces (routing vs consultant)
+
+Ralph has **two distinct decision surfaces**:
+
+1) **Planner routing decision JSON** (`decision: "proceed" | "escalate"`)
+   - Used to decide whether work continues autonomously or escalates.
+2) **Escalation consultant decision packet** (`decision: "needs-human"` for product-gap)
+   - Used to package a human-approvable decision when an escalation occurs.
+
+These are intentionally separate and must not be conflated.
+
+## Escalation consultant decision packet (machine JSON)
+
+When an escalation note is created, the consultant appends a machine-parseable decision packet.
+This packet is the human-facing decision summary and must be deterministic and bounded.
+
+Required fields:
+
+- `schema_version`: integer
+- `decision`: `"auto-resolve"` or `"needs-human"`
+- `confidence`: `"high"`, `"medium"`, or `"low"`
+- `requires_approval`: `true`
+- `current_state`: string
+- `whats_missing`: string
+- `options`: string[] (2-4 entries)
+- `recommendation`: string
+- `questions`: string[] (1-3 entries)
+- `proposed_resolution_text`: string
+- `reason`: string
+- `followups`: array of `{ type: "issue", title: string, body: string }`
+
+### Product-gap packet requirements
+
+When escalation type is `product-gap` **or** the triggering output includes a line-start `PRODUCT GAP:` marker:
+
+- `decision` must be `"needs-human"`
+- Include `current_state`, `whats_missing`, `options` (2-4), `recommendation`, and `questions` (1-3)
+- Questions must be crisp approval questions (avoid open-ended research requests)
+
 ## Product gap markers (deterministic)
 
 Only explicit, line-start markers are authoritative.

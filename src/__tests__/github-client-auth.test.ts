@@ -207,4 +207,74 @@ describe("github client auth", () => {
     expect(tokenCalls).toBe(2);
     expect(auths).toEqual(["token tok_1", "token tok_2"]);
   });
+
+  test("re-mints GitHub App token on HTTP 401 and retries once", async () => {
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+      githubApp: {
+        appId: 123,
+        installationId: 456,
+        privateKeyPath: "/does/not/matter.pem",
+      },
+    });
+    __resetConfigForTests();
+
+    let tokenCalls = 0;
+    __setGitHubAuthDepsForTests({
+      readFile: mock(async () => "PEM") as any,
+      createSign: (() => ({
+        update: () => {},
+        end: () => {},
+        sign: () => new Uint8Array([1, 2, 3]),
+      })) as any,
+      fetch: mock(async (url: string) => {
+        if (url.includes("/access_tokens")) {
+          tokenCalls += 1;
+          return new Response(
+            JSON.stringify({
+              token: `tok_${tokenCalls}`,
+              // Far-future expiry so a retry only happens via explicit invalidation.
+              expires_at: new Date(Date.now() + 60 * 60_000).toISOString(),
+            }),
+            { status: 201, headers: { "Content-Type": "application/json" } }
+          );
+        }
+        throw new Error(`Unexpected fetch: ${url}`);
+      }) as any,
+    });
+
+    let apiCalls = 0;
+    const auths: Array<string | null> = [];
+    const fetchMock = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      apiCalls += 1;
+      auths.push(getHeader(init?.headers, "Authorization"));
+      if (apiCalls === 1) {
+        return new Response(JSON.stringify({ message: "Bad credentials" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const client = new GitHubClient("3mdistal/ralph");
+    const result = await client.request<{ ok: boolean }>("/rate_limit");
+
+    expect(result.data?.ok).toBe(true);
+    expect(apiCalls).toBe(2);
+    expect(tokenCalls).toBe(2);
+    expect(auths).toEqual(["token tok_1", "token tok_2"]);
+  });
 });

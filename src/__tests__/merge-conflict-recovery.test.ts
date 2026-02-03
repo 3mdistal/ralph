@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { MergeConflictAttempt } from "../github/merge-conflict-comment";
 import {
   buildMergeConflictCommentLines,
+  buildMergeConflictEscalationDetails,
   buildMergeConflictSignature,
   computeMergeConflictDecision,
 } from "../merge-conflict-recovery";
@@ -52,5 +53,32 @@ describe("merge-conflict recovery helpers", () => {
     });
     expect(lines.join("\n")).toContain("Action:");
     expect(lines.join("\n")).toContain("Attempts:");
+  });
+
+  test("buildMergeConflictEscalationDetails includes commands and bounded file sample", () => {
+    const details = buildMergeConflictEscalationDetails({
+      prUrl: "https://github.com/3mdistal/ralph/pull/1",
+      baseRefName: "bot/integration",
+      headRefName: "feature",
+      attempts: [
+        {
+          attempt: 1,
+          signature: "sig",
+          startedAt: "now",
+          status: "failed",
+          conflictCount: 10,
+          conflictPaths: ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", "g.txt", "h.txt", "i.txt"],
+        },
+      ],
+      reason: "Conflicts remain",
+      botBranch: "bot/integration",
+    });
+
+    expect(details).toContain("git merge --no-edit origin/bot/integration");
+    expect(details).toContain("git push origin HEAD:feature");
+    expect(details).toContain("Do not rebase or force-push");
+    expect(details).toContain("- a.txt");
+    expect(details).toContain("- h.txt");
+    expect(details).not.toContain("- i.txt");
   });
 });

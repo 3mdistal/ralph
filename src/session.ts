@@ -39,6 +39,7 @@ import { ensureManagedOpencodeConfigInstalled } from "./opencode-managed-config"
 import { registerOpencodeRun, unregisterOpencodeRun, updateOpencodeRun } from "./opencode-process-registry";
 import { DEFAULT_WATCHDOG_THRESHOLDS_MS, type WatchdogThresholdMs, type WatchdogThresholdsMs } from "./watchdog";
 import { resolveGhTokenEnv } from "./github-app-auth";
+import { createLoopDetector, type LoopDetectionConfig, type LoopDetectionThresholds, type LoopTripInfo } from "./loop-detection/core";
 
 export interface ServerHandle {
   url: string;
@@ -74,6 +75,7 @@ export interface SessionResult {
   exitCode?: number;
   watchdogTimeout?: WatchdogTimeoutInfo;
   stallTimeout?: StallTimeoutInfo;
+  loopTrip?: LoopTripInfo;
   /** Best-effort PR URL discovered from structured JSON events. */
   prUrl?: string;
   errorCode?: "context_length_exceeded";
@@ -684,6 +686,65 @@ async function runSession(
     }
   };
 
+  const toolInputFromEvent = (event: any): unknown => {
+    return (
+      event?.tool?.input ??
+      event?.tool?.args ??
+      event?.tool?.arguments ??
+      event?.part?.tool?.input ??
+      event?.part?.tool?.args ??
+      event?.part?.toolCall?.input ??
+      event?.part?.toolCall?.args ??
+      event?.part?.tool_call?.input ??
+      event?.part?.tool_call?.args ??
+      undefined
+    );
+  };
+
+  const parseToolInputObject = (value: unknown): unknown => {
+    if (typeof value !== "string") return value;
+    const trimmed = value.trim();
+    if (!trimmed) return value;
+    if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) return value;
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return value;
+    }
+  };
+
+  const mergeLoopThresholds = (value?: Partial<LoopDetectionThresholds>): LoopDetectionThresholds => {
+    const defaults: LoopDetectionThresholds = {
+      minEdits: 20,
+      minElapsedMsWithoutGate: 8 * 60_000,
+      minTopFileTouches: 8,
+      minTopFileShare: 0.6,
+    };
+
+    const merged: LoopDetectionThresholds = { ...defaults };
+    const raw = value ?? {};
+    if (typeof raw.minEdits === "number" && Number.isFinite(raw.minEdits) && raw.minEdits > 0) merged.minEdits = Math.floor(raw.minEdits);
+    if (
+      typeof raw.minElapsedMsWithoutGate === "number" &&
+      Number.isFinite(raw.minElapsedMsWithoutGate) &&
+      raw.minElapsedMsWithoutGate > 0
+    ) {
+      merged.minElapsedMsWithoutGate = Math.floor(raw.minElapsedMsWithoutGate);
+    }
+    if (typeof raw.minTopFileTouches === "number" && Number.isFinite(raw.minTopFileTouches) && raw.minTopFileTouches > 0) {
+      merged.minTopFileTouches = Math.floor(raw.minTopFileTouches);
+    }
+    if (
+      typeof raw.minTopFileShare === "number" &&
+      Number.isFinite(raw.minTopFileShare) &&
+      raw.minTopFileShare >= 0 &&
+      raw.minTopFileShare <= 1
+    ) {
+      merged.minTopFileShare = raw.minTopFileShare;
+    }
+    return merged;
+  };
+
   const extractToolIdentity = (event: any): { toolName?: string; callId?: string } => {
     const toolName =
       event?.tool?.name ??
@@ -1070,6 +1131,19 @@ async function runSession(
   const stallIdleMs = options?.stall?.idleMs ?? 5 * 60_000;
   const stallContext = options?.stall?.context ?? context;
 
+  const loopCfg = options?.loopDetection;
+  const loopEnabled = loopCfg?.enabled ?? false;
+  const loopDetectionConfig: LoopDetectionConfig | null = loopEnabled
+    ? {
+        enabled: true,
+        gateMatchers: Array.isArray(loopCfg?.gateMatchers)
+          ? (loopCfg?.gateMatchers as any[]).filter((v) => typeof v === "string" && v.trim()).map((v) => String(v).trim())
+          : ["bun test", "bun run typecheck", "bun run build", "bun run knip"],
+        recommendedGateCommand: typeof loopCfg?.recommendedGateCommand === "string" ? loopCfg.recommendedGateCommand.trim() : "bun test",
+        thresholds: mergeLoopThresholds(loopCfg?.thresholds),
+      }
+    : null;
+
   let stdout = "";
   let stderr = "";
 
@@ -1209,6 +1283,9 @@ async function runSession(
 
   let watchdogTimeout: WatchdogTimeoutInfo | undefined;
   let stallTimeout: StallTimeoutInfo | undefined;
+  let loopTrip: LoopTripInfo | undefined;
+
+  const loopDetector = loopDetectionConfig ? createLoopDetector({ config: loopDetectionConfig, startTs: scheduler.now() }) : null;
 
   proc.stdout?.on("data", (data: Buffer) => {
     lastActivityTs = scheduler.now();
@@ -1305,6 +1382,35 @@ async function runSession(
 
         if (tool) {
           const now = reducerInput.now;
+
+          if (loopDetector && !loopTrip && tool.phase === "start") {
+            const toolName = String(tool.toolName ?? "");
+            if (toolName === "bash" || toolName === "apply_patch") {
+              const rawInput = parseToolInputObject(toolInputFromEvent(event));
+              const trip = loopDetector.onToolStart({ toolName, input: rawInput, now });
+              if (trip) {
+                loopTrip = trip;
+                try {
+                  writeEvent({
+                    type: "loop-trip",
+                    ts: now,
+                    editsSinceGate: trip.metrics.editsSinceGate,
+                    gateCommandCount: trip.metrics.gateCommandCount,
+                    elapsedMsWithoutGate: trip.elapsedMsWithoutGate,
+                    topFiles: trip.metrics.topFiles,
+                  });
+                } catch {
+                  // ignore
+                }
+                console.warn(
+                  `[ralph:loop] Loop detection tripped: editsSinceGate=${trip.metrics.editsSinceGate} elapsedWithoutGate=${Math.round(
+                    trip.elapsedMsWithoutGate / 1000
+                  )}s; killing opencode process`
+                );
+                requestKill();
+              }
+            }
+          }
 
           if (tool.phase === "start") {
             inFlight = {
@@ -1427,6 +1533,51 @@ async function runSession(
   });
 
   await closeRunLogStream();
+
+  if (loopDetector && sessionId && isSafeSessionId(sessionId)) {
+    try {
+      ensureEventStream(sessionId);
+      const metrics = loopDetector.getMetrics();
+      writeEvent({
+        type: "loop-metrics",
+        ts: scheduler.now(),
+        editsTotal: metrics.editsTotal,
+        editsSinceGate: metrics.editsSinceGate,
+        gateCommandCount: metrics.gateCommandCount,
+        topFiles: metrics.topFiles,
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  if (loopTrip) {
+    const header = [
+      `Loop detection tripped: ${loopTrip.reason}`,
+      `editsSinceGate=${loopTrip.metrics.editsSinceGate}, gateCommands=${loopTrip.metrics.gateCommandCount}, elapsedWithoutGate=${Math.round(
+        loopTrip.elapsedMsWithoutGate / 1000
+      )}s`,
+    ].join("\n");
+    const enriched = await appendOpencodeLogTail(header);
+
+    if (sessionId) {
+      ensureEventStream(sessionId);
+      writeEvent({ type: "run-end", ts: scheduler.now(), success: false, exitCode, loopTrip: true });
+      try {
+        await closeEventStream();
+      } catch {
+        // ignore
+      }
+    }
+
+    await writeIntrospectionSummary(scheduler.now());
+
+    if (sessionId) {
+      await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
+    }
+
+    return { sessionId, output: enriched, success: false, exitCode, loopTrip, prUrl: prUrlFromEvents ?? undefined };
+  }
 
   if (stallTimeout) {
     const header = [
@@ -1600,6 +1751,12 @@ export type RunSessionOptionsBase = {
     /** Kill the run if there is no stdout/stderr activity for this long. */
     idleMs?: number;
     context?: string;
+  };
+  loopDetection?: {
+    enabled?: boolean;
+    gateMatchers?: string[];
+    recommendedGateCommand?: string;
+    thresholds?: Partial<LoopDetectionThresholds>;
   };
   onEvent?: (event: any) => void;
 };

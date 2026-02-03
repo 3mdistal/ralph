@@ -187,7 +187,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("14");
+      expect(meta.value).toBe("15");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -307,7 +307,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("14");
+      expect(meta.value).toBe("15");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -720,7 +720,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#59",
-      labels: ["ralph:queued", "dx"],
+      labels: ["ralph:status:queued", "dx"],
       at: "2026-01-11T00:00:00.750Z",
     });
 
@@ -775,7 +775,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("14");
+      expect(meta.value).toBe("15");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -798,7 +798,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const labelRows = db
         .query("SELECT name FROM issue_labels ORDER BY name")
         .all() as Array<{ name: string }>;
-      expect(labelRows).toEqual([{ name: "dx" }, { name: "ralph:queued" }]);
+      expect(labelRows).toEqual([{ name: "dx" }, { name: "ralph:status:queued" }]);
 
       const taskRows = db
         .query("SELECT worker_id, repo_slot, daemon_id, heartbeat_at FROM tasks ORDER BY task_path")
@@ -924,20 +924,20 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#10",
-      labels: ["ralph:escalated", "ralph:queued"],
+      labels: ["ralph:status:blocked", "ralph:status:queued"],
       at: "2026-01-11T00:00:00.000Z",
     });
 
     recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#11",
-      labels: ["ralph:escalated"],
+      labels: ["ralph:status:blocked"],
       at: "2026-01-11T00:00:01.000Z",
     });
 
     const matches = listIssuesWithAllLabels({
       repo: "3mdistal/ralph",
-      labels: ["ralph:escalated", "ralph:queued"],
+      labels: ["ralph:status:blocked", "ralph:status:queued"],
     });
 
     expect(matches).toEqual([{ repo: "3mdistal/ralph", number: 10 }]);
