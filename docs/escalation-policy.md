@@ -125,6 +125,8 @@ Escalation sensitivity inputs:
 - Only `ralph:*` labels plus deterministic markers and contract-surface detection affect escalation behavior.
 - Non-`ralph:*` labels are ignored for escalation sensitivity.
 
+This policy is also captured as a canonical claim: `escalation.bias-proceed`.
+
 ## Updating policy
 
 If policy changes, update **only this file** and link to it elsewhere (avoid duplicating rules in multiple docs).

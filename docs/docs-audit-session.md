@@ -327,6 +327,19 @@ Addendum:
   - Default isolate `XDG_CONFIG_HOME` for daemon runs.
   - Keep `XDG_DATA_HOME` shared by default to preserve OpenAI OAuth tokens.
 
+### Candidates Sweep (2026-02-01)
+
+- Promoted from candidates to canonical:
+  - `workerid.not-repo`
+  - `state.sqlite-authoritative`
+  - `escalation.bias-proceed`
+- Dropped redundant/non-essential candidates:
+  - Removed redundant cache-isolation candidate (covered by implemented `opencode.xdg-cache.isolated`).
+  - Dropped legacy worktrees CLI claim.
+- Kept as candidates:
+  - OpenCode server-per-worktree (future)
+  - Dashboard events/replay/retention (long-term)
+
 ### Clarification (2026-02-01)
 
 - `PRODUCT GAP:` remains a deterministic escalation marker (cross-cutting, not a "stage").
