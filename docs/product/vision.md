@@ -1,16 +1,16 @@
 # Ralph Loop - Product Vision
 
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 ## What is Ralph?
 
 Ralph Loop is an autonomous orchestration layer that manages a queue of coding tasks across repos, dispatches work to OpenCode agents, and surfaces only the decisions that require human judgment.
 
 ## Core Principle
 
-**Minimize human interrupt surface.** Only escalate for:
-- Documentation gaps (product agent says "this isn't documented")
-- Blocked issues
-- DX issue recommendations (batched)
-- Rollup PR review
+**Minimize human interrupt surface.** Ralph should proceed autonomously, and escalate only when human intervention is required.
 
 Everything else should proceed autonomously.
 
@@ -18,18 +18,13 @@ Everything else should proceed autonomously.
 
 Escalation marker parsing must be deterministic and machine-parseable.
 
-Canonical spec: `docs/escalation-policy.md`.
+Canonical spec: `docs/escalation-policy.md` and `claims/canonical.jsonl`.
 
 Keep this doc focused on product intent; update routing/escalation policy in one place.
 
 ## Related Product Docs
 
-- `docs/product/dashboard-mvp-control-plane-tui.md`
-- `docs/product/graceful-drain-rolling-restart.md`
-- `docs/product/deterministic-gates.md`
-- `docs/product/usage-throttling.md`
-- `docs/product/worktree-management.md`
-- `docs/product/parent-verification-lane.md`
+- `docs/product/initiatives.md`
 
 ## The Problem We're Solving
 
@@ -44,30 +39,12 @@ When reviewing ~40 PRs/day and almost never rejecting them, the human becomes a 
 
 ## Architecture Decisions
 
-### Task note naming
+### 1. GitHub-first orchestration
 
-Task note filenames are derived from note names. Ralph sanitizes names before creating bwrb notes:
-- Replace path separators (`/` and `\`) with ` - `
-- Replace other forbidden filename characters (`:*?"<>|`) with `-`
-- Collapse whitespace, trim ends, and cap length to 180 characters
-- If sanitization yields an empty name, use `Untitled`
-- If a note already exists, append a short UUID suffix
+GitHub Issues + comments are the operator UX and source of truth for queue membership.
+SQLite under `~/.ralph` stores durable internal state (sessions, worktrees, cursors, run records).
 
-### 1. Queue Lives in GitHub Issues (migration: bwrb optional)
-
-GitHub Issues are the source of truth for queue state and dependency relationships.
-SQLite under `~/.ralph` stores operational state (session IDs, worktree paths, cursors).
-
-See `docs/product/github-first-orchestration.md` for the canonical contract.
-
-bwrb remains supported as a legacy backend during the migration:
-- Enable via `queueBackend = "bwrb"` in `~/.ralph/config.toml` or `~/.ralph/config.json`
-- GitHub remains authoritative when both are configured (no dual-write in v0.1.0)
-- GitHub queue sync/claim semantics are supported in v0.1.x; use bwrb as an optional fallback
-- GitHub queue claim is best-effort and requires a single daemon per queue in v0.1.x
-- When GitHub queue support is unavailable, Ralph falls back to bwrb if a valid vault is configured
-- When GitHub is unavailable and no bwrb vault exists, Ralph runs in idle/no-queue mode and surfaces diagnostics
-- Escalation notes and agent-run records are best-effort bwrb output only in v0.1.x; GitHub issue writeback (labels/comments) is supported in the meantime
+Canonical contract: `docs/product/orchestration-contract.md`.
 
 ### 2. Bot Branch Strategy
 
@@ -96,13 +73,12 @@ Operational details (merge recovery, worktree cleanup): see `docs/escalation-pol
 ### 3. Escalation-First Design
 
 The system should bias toward proceeding, not asking. Escalate only when:
-- Product documentation is genuinely missing
+
+- Product documentation is genuinely missing (`PRODUCT GAP:`)
 - Requirements are ambiguous and can't be resolved from context
 - External blockers prevent progress
 
-Most tasks should be treated as "implementation-ish" and proceed autonomously unless explicitly labeled `product`, `ux`, or `breaking-change` (labels increase escalation sensitivity; absence should not).
-
-Implementation-ish tasks (including `dx`, `refactor`, `bug`) should almost never escalate on low-level details like error message wording.
+Escalation sensitivity is driven only by `ralph:*` labels plus deterministic markers and contract-surface detection.
 
 ### 4. Session Persistence
 
@@ -118,7 +94,7 @@ Log tool calls and detect when agents get stuck (tool-result-as-text loops). Aut
 
 **Diagnostics policy:** When OpenCode crashes and prints a log file path, Ralph may attach a redacted tail of that log to the error note to preserve debugging context before logs rotate. Redact obvious tokens (GitHub tokens, Bearer tokens, etc.), redact the local home directory in paths and attached excerpts (replace with `~`), and keep the attachment bounded (e.g. ~200 lines / 20k chars). These logs are local diagnostics artifacts and should not be posted externally (issues/PRs) without manual review.
 
-**Stability policy:** To support safe parallelism, Ralph should avoid shared mutable tool caches between concurrent OpenCode runs (e.g. isolate `XDG_CACHE_HOME` per repo/task).
+**Stability policy:** OpenCode runs isolate `XDG_CACHE_HOME` for safe parallelism.
 
 ### 6. Managed OpenCode Config Contract
 
@@ -129,24 +105,21 @@ For daemon runs, Ralph owns the OpenCode agent configuration to keep behavior de
 - The managed directory is overwritten on daemon startup to match the version shipped with Ralph.
 - Overrides are allowed only via explicit Ralph configuration (`opencode.managedConfigDir`) or `RALPH_OPENCODE_CONFIG_DIR`.
 - Operators should not edit the managed directory directly; changes must come from Ralph template updates.
-- Running multiple daemons on the same machine is unsupported; the managed config is a shared resource and the latest daemon startup wins.
+- Daemon runs isolate `XDG_CONFIG_HOME` by default so global user config does not leak into daemon runs.
+- Multiple daemons on the same machine may contend for managed resources; do not rely on stable behavior when running multiple daemons.
 
 ## Success Metrics
 
 - **Escalation rate**: Should be <10% of tasks
 - **PR acceptance rate**: Should be >95% (agents making good decisions)
-- **Time to completion**: Tasks should complete without human intervention
+- **Merge rate**: % of queued tasks merged without human intervention should trend upward
 - **Recovery rate**: Should resume successfully after restarts
 
 ## Future Enhancements
 
 ### Async Agent Communication
 
-Agents leave notes for each other via bwrb:
-- @devex: "The build system is fragile, be careful with X"
-- @product: "Deprioritize feature Y, user research suggests Z"
-
-This builds institutional knowledge that persists across sessions.
+Agents should leave durable, discoverable notes for each other (e.g. GitHub comments or future claim artifacts) to build institutional knowledge that persists across sessions.
 
 ### AI Agents as E2E Testers
 
@@ -170,5 +143,5 @@ Every agent session dumps full chat history for:
 ## Non-Goals
 
 - **Real-time collaboration**: Ralph is async, queue-based
-- **User-facing UI**: No end-user UI; operator tooling (local dashboard/control plane and TUI) is in-scope, with interaction still centered on bwrb notes and PRs
+- **User-facing UI**: No end-user UI; operator tooling (local dashboard/control plane and TUI) is in-scope
 - **Multi-tenant**: Single-user orchestration for now

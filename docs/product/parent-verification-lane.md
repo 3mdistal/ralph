@@ -1,10 +1,16 @@
 # Parent verification lane
 
+Status: non-canonical (lane spec)
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 When dependency or sub-issue blockers clear, queued parent issues can be runnable but already satisfied. The parent verification lane is a lightweight pre-implementation check that confirms whether any work remains before entering the full plan/build pipeline.
 
 ## Trigger (deterministic)
 
-Run parent verification when a task transitions from `blocked` (source `deps`) to unblocked and is still queued/runnable. The transition is detected in the blocked-state sync loop. Label reads are best-effort; if labels are unavailable, rely on the local queued state.
+Run parent verification when dependency/sub-issue blockers clear for a parent issue and the issue is queued/runnable.
+
+Dependency detection uses GitHub-native relationships only (no issue-body parsing).
 
 ## Ordering
 
@@ -16,13 +22,26 @@ The verifier must emit a last-line marker:
 
 `RALPH_PARENT_VERIFY: {"version":1,"work_remains":true|false,"reason":"..."}`
 
+The JSON object may include additional keys for observability, for example:
+
+- `confidence`: `high|medium|low`
+- `evidence`: array of URLs/issue references that support the determination
+
 ## Outcomes
 
 - `work_remains=true`: record outcome and proceed to the normal implementation pipeline.
-- `work_remains=false`: record outcome and escalate with a "close or clarify" summary.
+- `work_remains=false`: record outcome and either:
+  - close the issue automatically when confidence and evidence are strong, or
+  - escalate with a "close or clarify" summary when the result is opinionated/inconclusive.
 
 ## Failure handling
 
 - Bounded attempts with backoff.
-- After max attempts, record `skipped` and proceed to implementation (verification is an optimization, not a blocker).
+- After max attempts, record `skipped` and proceed to implementation (verification is a non-blocking optimization).
 - Degraded mode (label writes/reads unavailable) must not block the lane.
+
+When proceeding after a failed/inconclusive parent verification, seed the implementation context with:
+
+- the list of relevant child issues (and their done/satisfied state)
+- links to any child PRs or rollups
+- a short statement: "parent verification was inconclusive; verify acceptance criteria against child evidence"
