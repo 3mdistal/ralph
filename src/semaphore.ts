@@ -55,13 +55,13 @@ export class Semaphore {
   }
 
   async acquire(opts?: { signal?: AbortSignal }): Promise<ReleaseFn> {
-    const release = this.tryAcquire();
-    if (release) return release;
-
     const signal = opts?.signal;
     if (signal?.aborted) {
       throw createAbortError("Semaphore acquire aborted");
     }
+
+    const release = this.tryAcquire();
+    if (release) return release;
 
     return await new Promise<ReleaseFn>((resolve, reject) => {
       const entry = {
