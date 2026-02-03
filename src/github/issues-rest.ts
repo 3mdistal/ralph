@@ -8,6 +8,7 @@ type FetchIssuesParams = {
   since: string | null;
   token: string;
   fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+  signal?: AbortSignal;
   nowMs?: number;
 };
 
@@ -115,6 +116,7 @@ export async function fetchIssuesPage(params: {
   token: string;
   fetchImpl: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   nowMs?: number;
+  signal?: AbortSignal;
 }): Promise<FetchIssuesPageResult> {
   const result = await fetchJson<IssuePayload[]>(params.fetchImpl, params.url.toString(), {
     method: "GET",
@@ -123,6 +125,7 @@ export async function fetchIssuesPage(params: {
       Authorization: `token ${params.token}`,
       "User-Agent": "ralph-loop",
     },
+    signal: params.signal,
   });
 
   if (!result.ok) {
@@ -175,6 +178,7 @@ export async function fetchIssuesSince(params: FetchIssuesParams): Promise<Fetch
         Authorization: `token ${params.token}`,
         "User-Agent": "ralph-loop",
       },
+      signal: params.signal,
     });
 
     if (!result.ok) {

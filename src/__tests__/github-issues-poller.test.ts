@@ -4,6 +4,8 @@ import { tmpdir } from "os";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { __testOnlyStartRepoPoller, type SyncResult } from "../github-issues-sync";
+
+type SyncOnce = typeof import("../github/issues-sync-service").syncRepoIssuesOnce;
 import { closeStateDbForTests, initStateDb } from "../state";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
@@ -82,7 +84,8 @@ describe("github issue poller", () => {
       return 0.75;
     };
 
-    const syncOnce = async (): Promise<SyncResult> => ({
+    const syncOnce: SyncOnce = async () => ({
+      status: "ok",
       ok: true,
       fetched: 0,
       stored: 0,
@@ -123,5 +126,61 @@ describe("github issue poller", () => {
 
     await run(1);
     expect(records.length).toBe(2);
+  });
+
+  test("stop aborts inflight sync and prevents reschedule", async () => {
+    const { timers, records, run } = createRecordingTimers();
+    type Captured = {
+      signal: { aborted: boolean };
+      resolve: (value: SyncResult) => void;
+    };
+
+    let capture: ((payload: Captured) => void) | null = null;
+    const inflight = new Promise<Captured>((resolve) => {
+      capture = resolve;
+    });
+
+    const syncOnce: SyncOnce = async (params) => {
+      return await new Promise<SyncResult>((resolve) => {
+        const signal = params.signal as unknown as { aborted: boolean } | undefined;
+        if (!signal) throw new Error("expected poller to pass an AbortSignal");
+        capture?.({ signal, resolve });
+      });
+    };
+
+    const repo = { name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" };
+
+    const poller = __testOnlyStartRepoPoller({
+      repo,
+      baseIntervalMs: 10_000,
+      log: () => {},
+      deps: {
+        timers,
+        random: () => 0.5,
+        syncOnce,
+        nowMs: () => 0,
+        getLastSyncAt: () => null,
+      },
+    });
+
+    await run(0);
+    const { signal, resolve } = await inflight;
+
+    poller.stop();
+    expect(signal.aborted).toBe(true);
+
+    resolve({
+      status: "aborted",
+      ok: false,
+      fetched: 0,
+      stored: 0,
+      ralphCount: 0,
+      newLastSyncAt: null,
+      hadChanges: false,
+      progressed: false,
+    });
+
+    await Promise.resolve();
+    expect(records.length).toBe(1);
   });
 });
