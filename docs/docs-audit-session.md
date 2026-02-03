@@ -106,7 +106,7 @@ This document captures decisions and discoveries made during an interactive audi
   - `docs/product/vision.md` still includes bwrb queue/notes semantics.
   - `docs/product/dashboard-mvp-control-plane-tui.md` still assumes bwrb-backed task IDs and priority edits.
   - Code still contains bwrb queue backend; docs will describe target state instead and link gaps.
-- Sandbox provisioning uses `ralph:queued` in seed examples (`docs/product/sandbox-provisioning.md`), which likely conflicts with vNext `ralph:status:*` naming.
+- Sandbox provisioning seed examples were updated to use `ralph:status:queued` (no longer a drift source).
 
 ### Edits Applied (so far) (2026-02-01)
 
