@@ -38,6 +38,10 @@ export type GitHubResponse<T> = {
   status: number;
 };
 
+export type GitHubResponseMeta<T> = GitHubResponse<T> & {
+  link: string | null;
+};
+
 type RequestOptions = {
   method?: string;
   body?: unknown;
@@ -300,7 +304,7 @@ export class GitHubClient {
     return headers;
   }
 
-  async request<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T>> {
+  private async requestInternal<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T> & { headers: Headers }> {
     const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
     const method = (opts.method ?? "GET").toUpperCase();
     const profile = getProfile();
@@ -391,7 +395,7 @@ export class GitHubClient {
       }
 
       if (opts.allowNotFound && res.status === 404) {
-        return { data: null, etag: res.headers.get("etag"), status: res.status };
+        return { data: null, etag: res.headers.get("etag"), status: res.status, headers: res.headers };
       }
 
       const text = await res.text();
@@ -448,6 +452,7 @@ export class GitHubClient {
         data: safeJsonParse<T>(text),
         etag: res.headers.get("etag"),
         status: res.status,
+        headers: res.headers,
       };
     }
 
@@ -458,6 +463,16 @@ export class GitHubClient {
       requestId: null,
       responseText: "",
     });
+  }
+
+  async request<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T>> {
+    const response = await this.requestInternal<T>(path, opts);
+    return { data: response.data, etag: response.etag, status: response.status };
+  }
+
+  async requestWithMeta<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponseMeta<T>> {
+    const response = await this.requestInternal<T>(path, opts);
+    return { data: response.data, etag: response.etag, status: response.status, link: response.headers.get("link") };
   }
 
   async getIssue(issueNumber: number): Promise<unknown> {
