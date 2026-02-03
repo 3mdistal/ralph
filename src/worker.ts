@@ -233,6 +233,7 @@ import {
   type RestrictionList,
   type RemediationFailureContext,
 } from "./worker/lanes/required-checks";
+import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./worker/lanes/pause";
 import type { ThrottleAdapter } from "./worker/ports";
 
 function prBodyClosesIssue(body: string, issueNumber: string): boolean {
@@ -7707,182 +7708,35 @@ ${guidance}`
     error: unknown,
     opts?: { sessionId?: string; runLogPath?: string }
   ): Promise<AgentRun | null> {
-    const pause = computeGitHubRateLimitPause({
-      nowMs: Date.now(),
+    return pauseIfGitHubRateLimited({
+      task,
       stage,
       error,
-      priorResumeAtIso: task["resume-at"]?.trim() || null,
-    });
-
-    if (!pause) return null;
-
-    const sid = opts?.sessionId?.trim() || task["session-id"]?.trim() || "";
-
-    this.publishDashboardEvent(
-      {
-        type: "worker.pause.requested",
-        level: "warn",
-        data: { reason: `github-rate-limit:${stage}` },
-      },
-      { sessionId: sid || undefined }
-    );
-
-    const extraFields: Record<string, string> = {
-      "throttled-at": pause.throttledAtIso,
-      "resume-at": pause.resumeAtIso,
-      "usage-snapshot": pause.usageSnapshotJson,
-    };
-
-    if (sid) extraFields["session-id"] = sid;
-
-    const enteringThrottled = task.status !== "throttled";
-    const updated = await this.queue.updateTaskStatus(task, "throttled", extraFields);
-    if (!updated) {
-      console.warn(`[ralph:worker:${this.repo}] Failed to mark task throttled after GitHub rate limit at stage=${stage}`);
-      return null;
-    }
-
-    applyTaskPatch(task, "throttled", extraFields);
-
-    if (enteringThrottled) {
-      const bodyPrefix = buildAgentRunBodyPrefix({
-        task,
-        headline: `Throttled: GitHub rate limit (${stage})`,
-        reason: `Resume at: ${pause.resumeAtIso}`,
-        details: pause.usageSnapshotJson,
-        sessionId: sid || undefined,
-        runLogPath: opts?.runLogPath ?? task["run-log-path"]?.trim() ?? undefined,
-      });
-      const runTime = new Date();
-      await this.createAgentRun(task, {
-        outcome: "throttled",
-        sessionId: sid || undefined,
-        started: runTime,
-        completed: runTime,
-        bodyPrefix,
-      });
-    }
-
-    console.log(
-      `[ralph:worker:${this.repo}] GitHub rate limit active; pausing at stage=${stage} resumeAt=${pause.resumeAtIso}`
-    );
-
-    this.publishDashboardEvent(
-      {
-        type: "worker.pause.reached",
-        level: "warn",
-        data: {},
-      },
-      { sessionId: sid || undefined }
-    );
-
-    return {
-      taskName: task.name,
       repo: this.repo,
-      outcome: "throttled",
-      sessionId: sid || undefined,
-    };
+      sessionId: opts?.sessionId,
+      runLogPath: opts?.runLogPath,
+      publishDashboardEvent: this.publishDashboardEvent.bind(this),
+      updateTaskStatus: this.queue.updateTaskStatus,
+      applyTaskPatch,
+      buildAgentRunBodyPrefix,
+      createAgentRun: this.createAgentRun.bind(this),
+    });
   }
 
   private async pauseIfHardThrottled(task: AgentTask, stage: string, sessionId?: string): Promise<AgentRun | null> {
-    const pinned = this.getPinnedOpencodeProfileName(task);
-    const sid = sessionId?.trim() || task["session-id"]?.trim() || "";
-    const hasSession = !!sid;
-
-    let decision: Awaited<ReturnType<typeof getThrottleDecision>>;
-
-    if (pinned) {
-      decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: pinned });
-    } else {
-      const requestedProfile = getRequestedOpencodeProfileName(null);
-
-      if (requestedProfile === "auto") {
-        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
-          getThrottleDecision: this.throttle.getThrottleDecision,
-        });
-
-        decision = await this.throttle.getThrottleDecision(Date.now(), {
-          opencodeProfile: chosen ?? null,
-        });
-      } else if (!hasSession) {
-        // Safe to fail over between profiles before starting a new session.
-        decision = (
-          await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile || null, {
-            getThrottleDecision: this.throttle.getThrottleDecision,
-          })
-        ).decision;
-      } else {
-        // Do not fail over while a session is in flight/resuming.
-        decision = await this.throttle.getThrottleDecision(Date.now(), { opencodeProfile: requestedProfile || null });
-      }
-    }
-
-    if (decision.state !== "hard") return null;
-
-    const throttledAt = new Date().toISOString();
-    const resumeAt = decision.resumeAtTs ? new Date(decision.resumeAtTs).toISOString() : "";
-
-    this.publishDashboardEvent(
-      {
-        type: "worker.pause.requested",
-        level: "warn",
-        data: { reason: `hard-throttle:${stage}` },
-      },
-      { sessionId: sid || undefined }
-    );
-
-    const extraFields: Record<string, string> = {
-      "throttled-at": throttledAt,
-      "resume-at": resumeAt,
-      "usage-snapshot": JSON.stringify(decision.snapshot),
-    };
-
-    if (sid) extraFields["session-id"] = sid;
-
-    const enteringThrottled = task.status !== "throttled";
-    const updated = await this.queue.updateTaskStatus(task, "throttled", extraFields);
-    if (updated) {
-      applyTaskPatch(task, "throttled", extraFields);
-    }
-
-    if (updated && enteringThrottled) {
-      const bodyPrefix = buildAgentRunBodyPrefix({
-        task,
-        headline: `Throttled: hard limit (${stage})`,
-        reason: `Resume at: ${resumeAt || "unknown"}`,
-        details: JSON.stringify(decision.snapshot),
-        sessionId: sid || undefined,
-        runLogPath: task["run-log-path"]?.trim() || undefined,
-      });
-      const runTime = new Date();
-      await this.createAgentRun(task, {
-        outcome: "throttled",
-        sessionId: sid || undefined,
-        started: runTime,
-        completed: runTime,
-        bodyPrefix,
-      });
-    }
-
-    console.log(
-      `[ralph:worker:${this.repo}] Hard throttle active; pausing at checkpoint stage=${stage} resumeAt=${resumeAt || "unknown"}`
-    );
-
-    this.publishDashboardEvent(
-      {
-        type: "worker.pause.reached",
-        level: "warn",
-        data: {},
-      },
-      { sessionId: sid || undefined }
-    );
-
-    return {
-      taskName: task.name,
+    return pauseIfHardThrottled({
+      task,
+      stage,
       repo: this.repo,
-      outcome: "throttled",
-      sessionId: sid || undefined,
-    };
+      throttle: this.throttle,
+      getPinnedOpencodeProfileName: this.getPinnedOpencodeProfileName.bind(this),
+      publishDashboardEvent: this.publishDashboardEvent.bind(this),
+      updateTaskStatus: this.queue.updateTaskStatus,
+      applyTaskPatch,
+      buildAgentRunBodyPrefix,
+      createAgentRun: this.createAgentRun.bind(this),
+      sessionId,
+    });
   }
 
   private async drainNudges(
