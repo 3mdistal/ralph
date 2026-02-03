@@ -62,7 +62,7 @@ export async function syncRepoIssuesOnce(params: {
   const signal = params.signal;
   const fetchImpl = deps.fetch ?? fetch;
   const getToken = deps.getToken ?? resolveGitHubToken;
-  const now = deps.now ? deps.now() : new Date();
+  const now = deps.now ? deps.now() : new Date(Date.now());
   const nowIso = now.toISOString();
   const nowMs = now.getTime();
   const since = computeSince(params.lastSyncAt);
@@ -170,7 +170,7 @@ export async function syncRepoIssuesOnce(params: {
       let newLastSyncAt: string | null = null;
 
       while (url && pagesFetched < maxPages && fetched < maxIssues) {
-        const page = await fetchIssuesPage({ url, token, fetchImpl, nowMs });
+        const page = await fetchIssuesPage({ url, token, fetchImpl, nowMs, signal });
 
         if (!page.ok) {
           return {
