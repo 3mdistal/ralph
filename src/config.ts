@@ -269,6 +269,8 @@ export interface RalphConfig {
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
   /** ms between done reconciliation checks (default: 300000) */
   doneReconcileIntervalMs: number;
+  /** ms between label reconciliation ticks (default: 300000) */
+  labelReconcileIntervalMs: number;
   /** Ownership TTL in ms for task heartbeats (default: 60000). */
   ownershipTtlMs: number;
   /** Queue backend selection (default: "github"). */
@@ -325,6 +327,7 @@ const MIN_REPO_SCHEDULER_PRIORITY = 0.1;
 const MAX_REPO_SCHEDULER_PRIORITY = 10;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_LABEL_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 const DEFAULT_AUTO_QUEUE_SCOPE: AutoQueueScope = "labeled-only";
 const DEFAULT_AUTO_QUEUE_MAX_PER_TICK = 200;
@@ -418,6 +421,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   batchSize: 10,
   pollInterval: 30000,
   doneReconcileIntervalMs: DEFAULT_DONE_RECONCILE_INTERVAL_MS,
+  labelReconcileIntervalMs: DEFAULT_LABEL_RECONCILE_INTERVAL_MS,
   ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
   queueBackend: "github",
   bwrbVault: detectDefaultBwrbVault(),
@@ -746,6 +750,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       );
     }
     loaded.doneReconcileIntervalMs = DEFAULT_DONE_RECONCILE_INTERVAL_MS;
+  }
+
+  const labelInterval = toPositiveIntOrNull((loaded as any).labelReconcileIntervalMs);
+  if (!labelInterval) {
+    const raw = (loaded as any).labelReconcileIntervalMs;
+    if (raw !== undefined) {
+      console.warn(
+        `[ralph] Invalid config labelReconcileIntervalMs=${JSON.stringify(raw)}; falling back to default ${DEFAULT_LABEL_RECONCILE_INTERVAL_MS}`
+      );
+    }
+    loaded.labelReconcileIntervalMs = DEFAULT_LABEL_RECONCILE_INTERVAL_MS;
   }
 
   const rawQueueBackend = (loaded as any).queueBackend;

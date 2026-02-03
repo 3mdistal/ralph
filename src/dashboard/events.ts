@@ -227,6 +227,11 @@ export function isRalphEvent(value: unknown): value is RalphEvent {
       return false;
     }
 
+    const source = (data as any).source;
+    if (source !== undefined && source !== null && typeof source !== "string") {
+      return false;
+    }
+
     const rateLimit = (data as any).rateLimit;
     if (rateLimit !== undefined && rateLimit !== null && !isObject(rateLimit)) return false;
 
