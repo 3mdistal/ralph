@@ -140,6 +140,7 @@ import {
   getRalphRunTokenTotals,
   getIdempotencyRecord,
   getIdempotencyPayload,
+  isStateDbInitialized,
   listRalphRunSessionTokenTotals,
   recordIdempotencyKey,
   deleteIdempotencyKey,
@@ -148,6 +149,7 @@ import {
   upsertIdempotencyKey,
   recordIssueSnapshot,
   recordPrSnapshot,
+  recordIssueLabelsSnapshot,
   listOpenPrCandidatesForIssue,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
@@ -1851,6 +1853,10 @@ export class RepoWorker {
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
     }
+
+    if (result.add.length > 0 || result.remove.length > 0) {
+      this.recordIssueLabelDelta(issue, { add: result.add, remove: result.remove });
+    }
   }
 
   private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
@@ -1877,6 +1883,25 @@ export class RepoWorker {
         return;
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
+    }
+
+    if (result.add.length > 0 || result.remove.length > 0) {
+      this.recordIssueLabelDelta(issue, { add: result.add, remove: result.remove });
+    }
+  }
+
+  private recordIssueLabelDelta(issue: IssueRef, delta: { add: string[]; remove: string[] }): void {
+    try {
+      const nowIso = new Date().toISOString();
+      const current = getIssueLabels(issue.repo, issue.number);
+      const set = new Set(current);
+      for (const label of delta.remove) set.delete(label);
+      for (const label of delta.add) set.add(label);
+      recordIssueLabelsSnapshot({ repo: issue.repo, issue: `${issue.repo}#${issue.number}`, labels: Array.from(set), at: nowIso });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to record label snapshot for ${formatIssueRef(issue)}: ${error?.message ?? String(error)}`
+      );
     }
   }
 
@@ -2762,6 +2787,8 @@ ${guidance}`
     }
 
     for (const entry of byIssue.values()) {
+      const labelsKnown = isStateDbInitialized();
+      const issueLabels = getIssueLabels(entry.issue.repo, entry.issue.number);
       const snapshot = await this.getRelationshipSnapshot(entry.issue, allowRefresh);
       if (!snapshot) continue;
 
@@ -2778,20 +2805,23 @@ ${guidance}`
           await this.markTaskBlocked(task, "deps", { reason, details: reason });
         }
 
-        try {
-          await this.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${
-              error?.message ?? String(error)
-            }`
-          );
+        const hasBlockedLabel = issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_BLOCKED);
+        if (!labelsKnown || !hasBlockedLabel) {
+          try {
+            await this.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
+          } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+                error?.message ?? String(error)
+              }`
+            );
+          }
         }
         continue;
       }
 
       if (!decision.blocked && decision.confidence === "certain") {
-        const labels = getIssueLabels(this.repo, entry.issue.number);
+        const labels = issueLabels;
         const shouldSetParentVerification =
           labels.length === 0
             ? true
@@ -2823,14 +2853,17 @@ ${guidance}`
         }
 
         if (shouldRemoveBlockedLabel) {
-          try {
-            await this.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
-          } catch (error: any) {
-            console.warn(
-              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${
-                error?.message ?? String(error)
-              }`
-            );
+          const hasBlockedLabel = issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_BLOCKED);
+          if (!labelsKnown || hasBlockedLabel) {
+            try {
+              await this.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
+            } catch (error: any) {
+              console.warn(
+                `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+                  error?.message ?? String(error)
+                }`
+              );
+            }
           }
         }
       }
