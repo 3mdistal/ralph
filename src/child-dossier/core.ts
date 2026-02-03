@@ -109,7 +109,7 @@ export function resolveChildCompletionLimits(
   return {
     maxChildren: Math.max(1, Math.min(100, Math.floor(overrides?.maxChildren ?? DEFAULT_LIMITS.maxChildren))),
     maxPrsPerChild: Math.max(1, Math.min(10, Math.floor(overrides?.maxPrsPerChild ?? DEFAULT_LIMITS.maxPrsPerChild))),
-    maxExcerptChars: Math.max(80, Math.min(1200, Math.floor(overrides?.maxExcerptChars ?? DEFAULT_LIMITS.maxExcerptChars))),
+    maxExcerptChars: Math.max(8, Math.min(1200, Math.floor(overrides?.maxExcerptChars ?? DEFAULT_LIMITS.maxExcerptChars))),
     maxChars: Math.max(2_000, Math.min(20_000, Math.floor(overrides?.maxChars ?? DEFAULT_LIMITS.maxChars))),
   };
 }
@@ -160,10 +160,18 @@ export function compileChildCompletionDossier(params: {
   limits?: Partial<ChildCompletionDossierLimits>;
 }): { dossier: ChildCompletionDossier; text: string } {
   const limits = resolveChildCompletionLimits(params.limits);
-  const children = params.children.map((child) => ({
-    ...child,
-    prs: normalizePrCandidates(child.prs, limits.maxPrsPerChild),
-  }));
+  const children = [...params.children]
+    .sort((a, b) => {
+      const repoCompare = a.issue.repo.localeCompare(b.issue.repo);
+      if (repoCompare !== 0) return repoCompare;
+      const numberCompare = a.issue.number - b.issue.number;
+      if (numberCompare !== 0) return numberCompare;
+      return a.url.localeCompare(b.url);
+    })
+    .map((child) => ({
+      ...child,
+      prs: normalizePrCandidates(child.prs, limits.maxPrsPerChild),
+    }));
 
   const dossier: ChildCompletionDossier = {
     children,
