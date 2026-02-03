@@ -90,7 +90,10 @@ import {
   updateCiDebugComment,
   type CiDebugAttempt,
   type CiDebugCommentState,
+  type CiTriageCommentState,
 } from "./github/ci-debug-comment";
+import { buildCiTriageDecision, type CiFailureClassification, type CiNextAction, type CiTriageDecision } from "./ci-triage/core";
+import { buildCiFailureSignatureV2, type CiFailureSignatureV2 } from "./ci-triage/signature";
 import {
   buildMergeConflictCommentBody,
   createMergeConflictComment,
@@ -625,6 +628,19 @@ type CiDebugRecoveryOutcome =
       run: AgentRun;
     };
 
+type CiFailureTriageOutcome =
+  | {
+      status: "success";
+      prUrl: string;
+      sessionId: string;
+      headSha: string;
+      summary: RequiredChecksSummary;
+    }
+  | {
+      status: "failed" | "escalated" | "throttled";
+      run: AgentRun;
+    };
+
 type ResolvedRequiredChecks = {
   checks: string[];
   source: "config" | "protection" | "none";
@@ -943,6 +959,22 @@ type RemediationFailureContext = {
   failedChecks: FailedCheck[];
   logs: FailedCheckLog[];
   logWarnings: string[];
+  commands: string[];
+};
+
+type CiTriageRecord = {
+  version: 1;
+  signatureVersion: 2;
+  signature: string;
+  classification: CiFailureClassification;
+  classificationReason: string;
+  action: CiNextAction;
+  actionReason: string;
+  timedOut: boolean;
+  attempt: number;
+  maxAttempts: number;
+  priorSignature: string | null;
+  failingChecks: Array<{ name: string; rawState: string; detailsUrl?: string | null }>;
   commands: string[];
 };
 
@@ -2084,6 +2116,67 @@ export class RepoWorker {
       },
       { sessionId: sid || undefined }
     );
+
+    return {
+      taskName: params.task.name,
+      repo: this.repo,
+      outcome: "throttled",
+      sessionId: sid || undefined,
+    };
+  }
+
+  private async throttleForCiQuarantine(params: {
+    task: AgentTask;
+    sessionId?: string | null;
+    resumeAt: string;
+    reason: string;
+    details: string;
+  }): Promise<AgentRun> {
+    const sid = params.sessionId?.trim() || params.task["session-id"]?.trim() || "";
+    const enteringThrottled = params.task.status !== "throttled";
+    const throttledAt = new Date().toISOString();
+
+    const extraFields: Record<string, string> = {
+      "throttled-at": throttledAt,
+      "resume-at": params.resumeAt,
+      "usage-snapshot": params.details,
+    };
+    if (sid) extraFields["session-id"] = sid;
+
+    const updated = await this.queue.updateTaskStatus(params.task, "throttled", extraFields);
+    if (!updated) {
+      console.warn(`[ralph:worker:${this.repo}] Failed to throttle task for CI quarantine (${params.reason})`);
+      return {
+        taskName: params.task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sid || undefined,
+        escalationReason: params.reason,
+      };
+    }
+
+    applyTaskPatch(params.task, "throttled", extraFields);
+
+    if (enteringThrottled) {
+      const bodyPrefix = buildAgentRunBodyPrefix({
+        task: params.task,
+        headline: "Throttled: CI quarantine",
+        reason: `Resume at: ${params.resumeAt}`,
+        details: params.details,
+        sessionId: sid || undefined,
+        runLogPath: params.task["run-log-path"]?.trim() || undefined,
+      });
+      const runTime = new Date();
+      await this.createAgentRun(params.task, {
+        outcome: "throttled",
+        sessionId: sid || undefined,
+        started: runTime,
+        completed: runTime,
+        bodyPrefix,
+      });
+    }
+
+    console.warn(`[ralph:worker:${this.repo}] CI quarantine; throttling until ${params.resumeAt}`);
 
     return {
       taskName: params.task.name,
@@ -4021,6 +4114,55 @@ ${guidance}`
     }
   }
 
+  private recordCiTriageArtifact(record: CiTriageRecord): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    try {
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "ci",
+        kind: "note",
+        content: JSON.stringify(record),
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist CI triage artifact: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
+  private buildCiTriageRecord(params: {
+    signature: CiFailureSignatureV2;
+    decision: CiTriageDecision;
+    timedOut: boolean;
+    attempt: number;
+    maxAttempts: number;
+    priorSignature: string | null;
+    failedChecks: FailedCheck[];
+    commands: string[];
+  }): CiTriageRecord {
+    return {
+      version: 1,
+      signatureVersion: params.signature.version,
+      signature: params.signature.signature,
+      classification: params.decision.classification,
+      classificationReason: params.decision.classificationReason,
+      action: params.decision.action,
+      actionReason: params.decision.actionReason,
+      timedOut: params.timedOut,
+      attempt: params.attempt,
+      maxAttempts: params.maxAttempts,
+      priorSignature: params.priorSignature,
+      failingChecks: params.failedChecks.map((check) => ({
+        name: check.name,
+        rawState: check.rawState,
+        detailsUrl: check.detailsUrl ?? null,
+      })),
+      commands: params.commands,
+    };
+  }
+
   private async getCheckLog(runId: string): Promise<CheckLogResult> {
     try {
       const result = await ghRead(this.repo)`gh run view ${runId} --repo ${this.repo} --log-failed`.quiet();
@@ -4277,6 +4419,38 @@ ${guidance}`
       .join("\n");
   }
 
+  private buildCiResumePrompt(params: {
+    prUrl: string;
+    baseRefName: string | null;
+    headRefName: string | null;
+    summary: RequiredChecksSummary;
+    remediationContext: string;
+  }): string {
+    const base = params.baseRefName || "(unknown)";
+    const head = params.headRefName || "(unknown)";
+
+    return [
+      "CI fix for an existing PR with failing required checks.",
+      `PR: ${params.prUrl}`,
+      `Base: ${base}`,
+      `Head: ${head}`,
+      "",
+      "Ralph is resuming the existing session to fix failing checks.",
+      "Do NOT create a new PR.",
+      "",
+      params.remediationContext,
+      "",
+      "Commands (run in the task worktree):",
+      "```bash",
+      "git fetch origin",
+      `gh pr checkout ${params.prUrl}`,
+      "git status",
+      "```",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
   private buildCiDebugCommentLines(params: {
     prUrl: string;
     baseRefName: string | null;
@@ -4314,6 +4488,53 @@ ${guidance}`
       `Attempts: ${params.attemptCount}/${params.maxAttempts}`
     );
 
+    lines.push("", formatRequiredChecksForHumans(params.summary));
+    return lines;
+  }
+
+  private buildCiTriageCommentLines(params: {
+    prUrl: string;
+    baseRefName: string | null;
+    headRefName: string | null;
+    summary: RequiredChecksSummary;
+    timedOut: boolean;
+    action: CiNextAction;
+    attemptCount: number;
+    maxAttempts: number;
+    resumeAt?: string | null;
+  }): string[] {
+    const base = params.baseRefName || "(unknown)";
+    const head = params.headRefName || "(unknown)";
+    const lines: string[] = [];
+
+    lines.push("CI triage status");
+    lines.push("", `PR: ${params.prUrl}`, `Base: ${base}`, `Head: ${head}`);
+
+    const failing = params.summary.required.filter((check) => check.state === "FAILURE");
+    lines.push("", "Failing required checks:");
+    if (failing.length === 0) {
+      lines.push("- (none listed)");
+    } else {
+      for (const check of failing) {
+        const details = check.detailsUrl ? ` (${check.detailsUrl})` : "";
+        lines.push(`- ${check.name}: ${check.rawState}${details}`);
+      }
+    }
+
+    if (params.timedOut) {
+      lines.push("", "Timed out waiting for required checks to complete.");
+    }
+
+    if (params.action === "resume") {
+      lines.push("", "Action: Ralph is resuming the existing session to fix failing checks.");
+    } else if (params.action === "quarantine") {
+      const resumeAt = params.resumeAt ? `Retry after: ${params.resumeAt}` : "Retry scheduled.";
+      lines.push("", "Action: Ralph is quarantining this failure as suspected flake/infra.", resumeAt);
+    } else {
+      lines.push("", "Action: Ralph is spawning a dedicated CI-debug run to make required checks green.");
+    }
+
+    lines.push(`Attempts: ${params.attemptCount}/${params.maxAttempts}`);
     lines.push("", formatRequiredChecksForHumans(params.summary));
     return lines;
   }
@@ -5202,6 +5423,347 @@ ${guidance}`
     return lines.join("\n");
   }
 
+  private async runCiFailureTriage(params: {
+    task: AgentTask;
+    issueNumber: string;
+    cacheKey: string;
+    prUrl: string;
+    requiredChecks: string[];
+    issueMeta: IssueMetadata;
+    botBranch: string;
+    timedOut: boolean;
+    repoPath: string;
+    sessionId?: string | null;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+  }): Promise<CiFailureTriageOutcome> {
+    const issueRef = parseIssueRef(params.task.issue, params.task.repo) ?? {
+      repo: this.repo,
+      number: Number(params.issueNumber),
+    };
+    const maxAttempts = this.resolveCiFixAttempts();
+    const sessionId = params.sessionId?.trim() || params.task["session-id"]?.trim() || "";
+    const hasSession = Boolean(sessionId);
+
+    let summary: RequiredChecksSummary;
+    let headSha = "";
+    let baseRefName: string | null = null;
+    let headRefName: string | null = null;
+
+    try {
+      const prStatus = await this.getPullRequestChecks(params.prUrl);
+      summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
+      headSha = prStatus.headSha;
+      baseRefName = prStatus.baseRefName;
+      const prState = await this.getPullRequestMergeState(params.prUrl);
+      headRefName = prState.headRefName || null;
+      this.recordCiGateSummary(params.prUrl, summary);
+    } catch (error: any) {
+      const reason = `CI triage preflight failed for ${params.prUrl}: ${this.formatGhError(error)}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return {
+        status: "failed",
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: sessionId || undefined,
+          escalationReason: reason,
+        },
+      };
+    }
+
+    const remediation = await this.buildRemediationFailureContext(summary, { includeLogs: true });
+    const failureEntries = remediation.logs.length > 0
+      ? remediation.logs
+      : remediation.failedChecks.map((check) => ({ ...check, logExcerpt: null }));
+    const signature = buildCiFailureSignatureV2({
+      timedOut: params.timedOut,
+      failures: failureEntries.map((entry) => ({
+        name: entry.name,
+        rawState: entry.rawState,
+        excerpt: entry.logExcerpt ?? null,
+      })),
+    });
+
+    const commentMatch = await findCiDebugComment({
+      github: this.github,
+      repo: this.repo,
+      issueNumber: Number(params.issueNumber),
+      limit: CI_DEBUG_COMMENT_SCAN_LIMIT,
+    });
+    const existingState = commentMatch.state ?? ({ version: 1 } satisfies CiDebugCommentState);
+    const existingTriage = existingState.triage ?? ({ version: 1, attemptCount: 0 } satisfies CiTriageCommentState);
+    const attemptNumber = Math.max(0, existingTriage.attemptCount ?? 0) + 1;
+    const priorSignature = existingTriage.lastSignature ?? null;
+
+    const decision = buildCiTriageDecision({
+      timedOut: params.timedOut,
+      failures: failureEntries.map((entry) => ({
+        name: entry.name,
+        rawState: entry.rawState,
+        excerpt: entry.logExcerpt ? redactSensitiveText(entry.logExcerpt) : null,
+      })),
+      commands: remediation.commands,
+      attempt: attemptNumber,
+      maxAttempts,
+      hasSession,
+      signature: signature.signature,
+      priorSignature,
+    });
+
+    const triageRecord = this.buildCiTriageRecord({
+      signature,
+      decision,
+      timedOut: params.timedOut,
+      attempt: attemptNumber,
+      maxAttempts,
+      priorSignature,
+      failedChecks: remediation.failedChecks,
+      commands: remediation.commands,
+    });
+    this.recordCiTriageArtifact(triageRecord);
+
+    console.log(
+      `[ralph:worker:${this.repo}] CI triage decision action=${decision.action} classification=${decision.classification} ` +
+        `signature=${signature.signature} pr=${params.prUrl}`
+    );
+
+    const nextTriageState: CiTriageCommentState = {
+      version: 1,
+      attemptCount: attemptNumber,
+      lastSignature: signature.signature,
+      lastClassification: decision.classification,
+      lastAction: decision.action,
+      lastUpdatedAt: new Date().toISOString(),
+    };
+
+    if (attemptNumber > maxAttempts) {
+      const reason = `Required checks not passing after ${maxAttempts} triage attempt(s); refusing to merge ${params.prUrl}`;
+      return this.escalateCiDebugRecovery({
+        task: params.task,
+        issueNumber: Number(params.issueNumber),
+        issueRef,
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        summary,
+        timedOut: params.timedOut,
+        attempts: [...(existingState.attempts ?? [])],
+        signature: this.formatCiDebugSignature(summary, params.timedOut),
+        maxAttempts,
+        reason,
+      });
+    }
+
+    if (decision.action === "spawn") {
+      return this.runCiDebugRecovery({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        cacheKey: params.cacheKey,
+        prUrl: params.prUrl,
+        requiredChecks: params.requiredChecks,
+        issueMeta: params.issueMeta,
+        botBranch: params.botBranch,
+        timedOut: params.timedOut,
+        opencodeXdg: params.opencodeXdg,
+        opencodeSessionOptions: params.opencodeSessionOptions,
+        remediationContext: remediation,
+        triageState: nextTriageState,
+      });
+    }
+
+    if (decision.action === "resume" && !hasSession) {
+      return this.runCiDebugRecovery({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        cacheKey: params.cacheKey,
+        prUrl: params.prUrl,
+        requiredChecks: params.requiredChecks,
+        issueMeta: params.issueMeta,
+        botBranch: params.botBranch,
+        timedOut: params.timedOut,
+        opencodeXdg: params.opencodeXdg,
+        opencodeSessionOptions: params.opencodeSessionOptions,
+        remediationContext: remediation,
+        triageState: nextTriageState,
+      });
+    }
+
+    const nextState: CiDebugCommentState = {
+      ...existingState,
+      version: 1,
+      triage: nextTriageState,
+    };
+
+    if (decision.action === "quarantine") {
+      const backoffMs = this.computeCiRemediationBackoffMs(attemptNumber);
+      const resumeAt = new Date(Date.now() + backoffMs).toISOString();
+      const lines = this.buildCiTriageCommentLines({
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        summary,
+        timedOut: params.timedOut,
+        action: "quarantine",
+        attemptCount: attemptNumber,
+        maxAttempts,
+        resumeAt,
+      });
+      await this.upsertCiDebugComment({ issueNumber: Number(params.issueNumber), lines, state: nextState });
+      await this.clearCiDebugLabels(issueRef);
+
+      const run = await this.throttleForCiQuarantine({
+        task: params.task,
+        sessionId,
+        resumeAt,
+        reason: "ci-quarantine",
+        details: JSON.stringify({
+          signature: signature.signature,
+          classification: decision.classification,
+          action: decision.action,
+          resumeAt,
+        }),
+      });
+
+      return { status: run.outcome === "throttled" ? "throttled" : "failed", run };
+    }
+
+    const resumeLines = this.buildCiTriageCommentLines({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      summary,
+      timedOut: params.timedOut,
+      action: "resume",
+      attemptCount: attemptNumber,
+      maxAttempts,
+    });
+    await this.upsertCiDebugComment({ issueNumber: Number(params.issueNumber), lines: resumeLines, state: nextState });
+    await this.applyCiDebugLabels(issueRef);
+
+    const remediationContext = this.formatRemediationFailureContext(remediation);
+    const prompt = this.buildCiResumePrompt({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      summary,
+      remediationContext,
+    });
+    const runLogPath = await this.recordRunLogPath(
+      params.task,
+      params.issueNumber,
+      `ci-resume-${attemptNumber}`,
+      "in-progress"
+    );
+
+    let sessionResult = await this.session.continueSession(params.repoPath, sessionId, prompt, {
+      repo: this.repo,
+      cacheKey: params.cacheKey,
+      runLogPath,
+      introspection: {
+        repo: this.repo,
+        issue: params.task.issue,
+        taskName: params.task.name,
+        step: 5,
+        stepTitle: `ci-resume attempt ${attemptNumber}`,
+      },
+      ...this.buildWatchdogOptions(params.task, `ci-resume-${attemptNumber}`),
+      ...this.buildStallOptions(params.task, `ci-resume-${attemptNumber}`),
+      ...this.buildLoopDetectionOptions(params.task, `ci-resume-${attemptNumber}`),
+      ...params.opencodeSessionOptions,
+    });
+
+    const pausedAfter = await this.pauseIfHardThrottled(
+      params.task,
+      `ci-resume-${attemptNumber} (post)`,
+      sessionResult.sessionId
+    );
+    if (pausedAfter) {
+      return { status: "throttled", run: pausedAfter };
+    }
+
+    if (sessionResult.watchdogTimeout) {
+      const run = await this.handleWatchdogTimeout(
+        params.task,
+        params.cacheKey,
+        `ci-resume-${attemptNumber}`,
+        sessionResult,
+        params.opencodeXdg
+      );
+      return { status: "failed", run };
+    }
+
+    if (sessionResult.stallTimeout) {
+      const run = await this.handleStallTimeout(params.task, params.cacheKey, `ci-resume-${attemptNumber}`, sessionResult);
+      return { status: "failed", run };
+    }
+
+    if (sessionResult.sessionId) {
+      await this.queue.updateTaskStatus(params.task, "in-progress", { "session-id": sessionResult.sessionId });
+    }
+
+    try {
+      const prStatus = await this.getPullRequestChecks(params.prUrl);
+      summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
+      headSha = prStatus.headSha;
+      this.recordCiGateSummary(params.prUrl, summary);
+    } catch (error: any) {
+      const reason = `Failed to re-check CI status after resume: ${this.formatGhError(error)}`;
+      console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+      return {
+        status: "failed",
+        run: {
+          taskName: params.task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: (sessionResult.sessionId ?? sessionId) || undefined,
+          escalationReason: reason,
+        },
+      };
+    }
+
+    if (summary.status === "success") {
+      await this.clearCiDebugLabels(issueRef);
+      return {
+        status: "success",
+        prUrl: params.prUrl,
+        sessionId: sessionResult.sessionId || sessionId,
+        headSha,
+        summary,
+      };
+    }
+
+    if (attemptNumber >= maxAttempts) {
+      const reason = `Required checks not passing after ${maxAttempts} triage attempt(s); refusing to merge ${params.prUrl}`;
+      return this.escalateCiDebugRecovery({
+        task: params.task,
+        issueNumber: Number(params.issueNumber),
+        issueRef,
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        summary,
+        timedOut: false,
+        attempts: [...(existingState.attempts ?? [])],
+        signature: this.formatCiDebugSignature(summary, false),
+        maxAttempts,
+        reason,
+      });
+    }
+
+    const backoffMs = this.computeCiRemediationBackoffMs(attemptNumber);
+    if (backoffMs > 0) {
+      await this.sleepMs(backoffMs);
+    }
+
+    return this.runCiFailureTriage({
+      ...params,
+      timedOut: false,
+      sessionId: sessionResult.sessionId || sessionId,
+    });
+  }
+
   private async runCiDebugRecovery(params: {
     task: AgentTask;
     issueNumber: string;
@@ -5213,6 +5775,8 @@ ${guidance}`
     timedOut: boolean;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     opencodeSessionOptions: { opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } };
+    remediationContext?: RemediationFailureContext;
+    triageState?: CiTriageCommentState;
   }): Promise<CiDebugRecoveryOutcome> {
     const issueRef = parseIssueRef(params.task.issue, params.task.repo) ?? {
       repo: this.repo,
@@ -5255,6 +5819,7 @@ ${guidance}`
       limit: CI_DEBUG_COMMENT_SCAN_LIMIT,
     });
     const existingState = commentMatch.state ?? ({ version: 1 } satisfies CiDebugCommentState);
+    const triageState = params.triageState ?? existingState.triage;
     const attempts = [...(existingState.attempts ?? [])];
     if (attempts.length >= maxAttempts) {
       const reason = `Required checks not passing after ${maxAttempts} attempt(s); refusing to merge ${params.prUrl}`;
@@ -5306,6 +5871,7 @@ ${guidance}`
       lease: this.buildCiDebugLease(workerId, nowMs),
       attempts: [...attempts, attempt],
       lastSignature: signature,
+      triage: triageState,
     };
 
     const lines = this.buildCiDebugCommentLines({
@@ -5321,7 +5887,7 @@ ${guidance}`
     await this.applyCiDebugLabels(issueRef);
 
     const remediationContext = this.formatRemediationFailureContext(
-      await this.buildRemediationFailureContext(summary, { includeLogs: true })
+      params.remediationContext ?? (await this.buildRemediationFailureContext(summary, { includeLogs: true }))
     );
     const prompt = this.buildCiDebugPrompt({
       prUrl: params.prUrl,
@@ -5411,6 +5977,7 @@ ${guidance}`
         version: 1,
         attempts: [...attempts, attempt],
         lastSignature: signature,
+        triage: triageState,
       };
       await this.upsertCiDebugComment({ issueNumber: Number(params.issueNumber), lines, state: failedState });
       await this.cleanupGitWorktree(worktreePath);
@@ -5446,6 +6013,7 @@ ${guidance}`
       version: 1,
       attempts: finalAttempts,
       lastSignature: signatureAfter,
+      triage: triageState,
     };
     const finalLines = this.buildCiDebugCommentLines({
       prUrl: params.prUrl,
@@ -5514,6 +6082,7 @@ ${guidance}`
     return this.runCiDebugRecovery({
       ...params,
       timedOut: false,
+      triageState: params.triageState,
     });
   }
 
@@ -5714,7 +6283,7 @@ ${guidance}`
 
     this.updateOpenPrSnapshot(task, null, existingPr.selectedUrl);
 
-    const recovery = await this.runCiDebugRecovery({
+    const recovery = await this.runCiFailureTriage({
       task,
       issueNumber,
       cacheKey,
@@ -5723,6 +6292,8 @@ ${guidance}`
       issueMeta,
       botBranch,
       timedOut: false,
+      repoPath: taskRepoPath,
+      sessionId: task["session-id"]?.trim() || null,
       opencodeXdg,
       opencodeSessionOptions,
     });
@@ -6599,7 +7170,7 @@ ${guidance}`
             return await mergeWhenReady(refreshed.headSha);
           }
 
-          const ciDebug = await this.runCiDebugRecovery({
+          const ciDebug = await this.runCiFailureTriage({
             task: params.task,
             issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
             cacheKey: params.cacheKey,
@@ -6608,6 +7179,8 @@ ${guidance}`
             issueMeta: params.issueMeta,
             botBranch: params.botBranch,
             timedOut: refreshed.timedOut,
+            repoPath: params.repoPath,
+            sessionId,
             opencodeXdg: params.opencodeXdg,
             opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
           });
@@ -6721,7 +7294,7 @@ ${guidance}`
       return await mergeWhenReady(checkResult.headSha);
     }
 
-    const ciDebug = await this.runCiDebugRecovery({
+    const ciDebug = await this.runCiFailureTriage({
       task: params.task,
       issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
       cacheKey: params.cacheKey,
@@ -6730,6 +7303,8 @@ ${guidance}`
       issueMeta: params.issueMeta,
       botBranch: params.botBranch,
       timedOut: checkResult.timedOut,
+      repoPath: params.repoPath,
+      sessionId,
       opencodeXdg: params.opencodeXdg,
       opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
     });

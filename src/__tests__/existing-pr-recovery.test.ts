@@ -67,7 +67,7 @@ describe("existing PR recovery", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
     const task = { ...baseTask, "session-id": "ses_123" };
 
-    let observedStage: "merge-conflict" | "ci-debug" | null = null;
+    let observedStage: "merge-conflict" | "ci-triage" | null = null;
     (worker as any).getIssuePrResolution = async () => ({
       selectedUrl: "https://github.com/3mdistal/ralph/pull/456",
       duplicates: [],
@@ -91,8 +91,8 @@ describe("existing PR recovery", () => {
         },
       ],
     });
-    (worker as any).runCiDebugRecovery = async () => {
-      observedStage = "ci-debug";
+    (worker as any).runCiFailureTriage = async () => {
+      observedStage = "ci-triage";
       return { status: "failed", run: { taskName: task.name, repo: task.repo, outcome: "failed" } };
     };
 
@@ -110,7 +110,7 @@ describe("existing PR recovery", () => {
     if (!observedStage) {
       throw new Error("Expected ci-failure recovery stage to be set.");
     }
-    expect(observedStage as unknown as string).toBe("ci-debug");
+    expect(observedStage as unknown as string).toBe("ci-triage");
     expect(result?.outcome).toBe("failed");
   });
 
@@ -118,9 +118,9 @@ describe("existing PR recovery", () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
     const task = { ...baseTask };
 
-    let ciDebugCalled = false;
-    (worker as any).runCiDebugRecovery = async () => {
-      ciDebugCalled = true;
+    let ciTriageCalled = false;
+    (worker as any).runCiFailureTriage = async () => {
+      ciTriageCalled = true;
       return { status: "failed", run: { taskName: task.name, repo: task.repo, outcome: "failed" } };
     };
 
@@ -135,7 +135,7 @@ describe("existing PR recovery", () => {
       opencodeSessionOptions: {},
     });
 
-    expect(ciDebugCalled).toBe(false);
+    expect(ciTriageCalled).toBe(false);
     expect(result).toBe(null);
   });
 });
