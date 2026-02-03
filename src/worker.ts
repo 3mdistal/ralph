@@ -73,6 +73,7 @@ import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client
 import { computeGitHubRateLimitPause } from "./github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "./github/dx-survey-writeback";
 import { createGhRunner } from "./github/gh-runner";
+import { getProtectionContexts, resolveRequiredChecks, type BranchProtection, type ResolvedRequiredChecks } from "./github/required-checks";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
@@ -627,12 +628,6 @@ type CiDebugRecoveryOutcome =
       run: AgentRun;
     };
 
-type ResolvedRequiredChecks = {
-  checks: string[];
-  source: "config" | "protection" | "none";
-  branch?: string;
-};
-
 type FailedCheck = {
   name: string;
   state: RequiredCheckState;
@@ -654,31 +649,6 @@ type RestrictionList = {
   apps?: RestrictionEntry[] | null;
 };
 
-type BranchProtection = {
-  required_status_checks?: {
-    strict?: boolean | null;
-    contexts?: string[] | null;
-    checks?: Array<{ context?: string | null }> | null;
-  } | null;
-  enforce_admins?: { enabled?: boolean | null } | boolean | null;
-  required_pull_request_reviews?: {
-    dismissal_restrictions?: RestrictionList | null;
-    dismiss_stale_reviews?: boolean | null;
-    require_code_owner_reviews?: boolean | null;
-    required_approving_review_count?: number | null;
-    require_last_push_approval?: boolean | null;
-    bypass_pull_request_allowances?: RestrictionList | null;
-  } | null;
-  restrictions?: RestrictionList | null;
-  required_linear_history?: { enabled?: boolean | null } | boolean | null;
-  allow_force_pushes?: { enabled?: boolean | null } | boolean | null;
-  allow_deletions?: { enabled?: boolean | null } | boolean | null;
-  block_creations?: { enabled?: boolean | null } | boolean | null;
-  required_conversation_resolution?: { enabled?: boolean | null } | boolean | null;
-  required_signatures?: { enabled?: boolean | null } | boolean | null;
-  lock_branch?: { enabled?: boolean | null } | boolean | null;
-  allow_fork_syncing?: { enabled?: boolean | null } | boolean | null;
-};
 
 type CheckRunsResponse = {
   check_runs?: Array<{ name?: string | null }> | null;
@@ -744,12 +714,6 @@ function hasBypassAllowances(source: RestrictionList | null | undefined): boolea
   return normalized.users.length > 0 || normalized.teams.length > 0 || normalized.apps.length > 0;
 }
 
-function getProtectionContexts(protection: BranchProtection | null): string[] {
-  const contexts = protection?.required_status_checks?.contexts ?? [];
-  const checks = protection?.required_status_checks?.checks ?? [];
-  const checkContexts = checks.map((check) => check?.context ?? "");
-  return toSortedUniqueStrings([...contexts, ...checkContexts]);
-}
 
 function extractPullRequestNumber(url: string): number | null {
   const match = url.match(/\/pull\/(\d+)(?:$|\b|\/)/);
@@ -2612,43 +2576,17 @@ export class RepoWorker {
       }
 
       const botBranch = getRepoBotBranch(this.repo);
-      const protectionErrors: Array<{ branch: string; error: unknown }> = [];
-      let fallbackBranch = botBranch;
-      const tryFetchProtection = async (branch: string): Promise<BranchProtection | null> => {
-        try {
-          return await this.fetchBranchProtection(branch);
-        } catch (e: any) {
-          protectionErrors.push({ branch, error: e });
-          return null;
-        }
-      };
-
-      const botProtection = await tryFetchProtection(botBranch);
-      if (botProtection) {
-        return { checks: getProtectionContexts(botProtection), source: "protection", branch: botBranch };
-      }
-
-      fallbackBranch = await this.resolveFallbackBranch(botBranch);
-      if (fallbackBranch !== botBranch) {
-        const fallbackProtection = await tryFetchProtection(fallbackBranch);
-        if (fallbackProtection) {
-          return { checks: getProtectionContexts(fallbackProtection), source: "protection", branch: fallbackBranch };
-        }
-      }
-
-      if (protectionErrors.length > 0) {
-        for (const entry of protectionErrors) {
-          const msg = (entry.error as any)?.message ?? String(entry.error);
-          console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${entry.branch}: ${msg}`);
-        }
-      } else {
-        const attempted = Array.from(new Set([botBranch, fallbackBranch])).join(", ");
-        console.log(
-          `[ralph:worker:${this.repo}] No branch protection found for ${attempted}; merge gating disabled.`
-        );
-      }
-
-      return { checks: [], source: "none" };
+      const fallbackBranch = await this.resolveFallbackBranch(botBranch);
+      return resolveRequiredChecks({
+        override,
+        primaryBranch: botBranch,
+        fallbackBranch,
+        fetchBranchProtection: (branch) => this.fetchBranchProtection(branch),
+        logger: {
+          warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
+          info: (message) => console.log(`[ralph:worker:${this.repo}] ${message}`),
+        },
+      });
     })();
 
     return this.requiredChecksForMergePromise;
