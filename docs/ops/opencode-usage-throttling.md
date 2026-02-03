@@ -1,9 +1,9 @@
 # Ralph: OpenCode usage throttling (Codex 5h + weekly)
 
-**Status:** draft (ops notes)
-**Owner:** @3mdistal
-**Last updated:** 2026-01-10
-**Canonical policy:** `docs/product/usage-throttling.md` (this doc is implementation notes + calibration)
+Status: non-canonical (implementation notes)
+Owner: @3mdistal
+Last updated: 2026-02-01
+Canonical policy: `docs/product/usage-throttling.md` (this doc is implementation notes + calibration)
 
 ## Goal
 Ensure Ralph never consumes more than a configurable fraction of the operator's available plan usage, while preserving predictable availability for interactive use.
@@ -109,12 +109,12 @@ Operationally, this becomes: “before each new OpenCode message Ralph wants to 
 ## Ralph UX / Queue Integration
 Add an explicit queue state and resume metadata.
 
-- New status: `throttled`
-- Store: `throttledAt`, `resumeAt`, `throttleReason`, and a `usageSnapshot` (used %, caps, reset times)
+- New daemon mode: `soft-throttled` / `hard-throttled`
+- Store: `throttledAt`, `resumeAt`, `throttleReason`, and a `usageSnapshot` (used %, caps, reset times) in SQLite
 
 Behavior:
 - Soft throttle: don’t start new tasks; keep queued tasks queued.
-- Hard throttle: mark currently in-progress tasks as `throttled` (preserve `session-id`) and stop processing.
+- Hard throttle: stop all model sends; in-progress tasks pause only at safe checkpoints.
 
 ## Config Surface
 Add a throttle config section to Ralph:

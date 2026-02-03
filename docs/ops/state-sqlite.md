@@ -1,6 +1,10 @@
 # state.sqlite policy
 
-`~/.ralph/state.sqlite` is Ralph's internal durable store for operational metadata (sessions, worktrees, cursors).
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+
+`~/.ralph/state.sqlite` is Ralph's internal durable store for operational metadata (sessions, worktrees, cursors, run records).
 
 It also stores deterministic gate state for each run (`ralph_run_gate_results`) and bounded, redacted artifacts (`ralph_run_gate_artifacts`).
 
@@ -11,3 +15,7 @@ It also stores deterministic gate state for each run (`ralph_run_gate_results`) 
 - Apply migrations inside a single transaction.
 - No downgrades. If `meta.schema_version` is newer than the running binary, fail closed.
 - Safe reset: deleting `state.sqlite` recreates a fresh database on next startup.
+
+## Claims
+
+Canonical claims live in `claims/canonical.jsonl`.

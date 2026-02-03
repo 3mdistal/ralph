@@ -2,9 +2,13 @@
 
 Ralph's primary goal is to reduce micromanagement by making the "last mile" of agent work machine-checkable and repeatable.
 
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+
 This doc defines the deterministic gates the orchestrator enforces so individual workers can stay focused on implementation, while Ralph retains oversight across the whole repo.
 
-Status: target spec (some pieces exist today; see "Current State")
+Implementation status: target spec (some pieces exist today; see "Current State")
 
 ## Goals
 
@@ -54,11 +58,12 @@ Ralph daemon runs must be deterministic and repo-agnostic. For all daemon runs, 
 
 Persist gate metadata on an authoritative run record so Ralph can be strict and deterministic.
 
-Note: `agent-run` frontmatter in `.bwrb/schema.json` is currently modeled as a completed record and does not yet include these fields. Treat this list as the intended schema, not a statement of current implementation.
+Note: gate persistence should be stored in `~/.ralph/state.sqlite`. Treat this list as the intended schema, not a statement of current implementation.
 
 - `preflight.status`: `pending|pass|fail|skipped`
 - `preflight.command`: string (exact commands run)
 - `preflight.skip_reason`: string (required when `skipped`)
+- `plan_review.status`: `pending|pass|fail|skipped`
 - `product_review.status`: `pending|pass|fail|skipped`
 - `devex_review.status`: `pending|pass|fail|skipped`
 - `ci.status`: `pending|pass|fail|skipped`
@@ -116,6 +121,27 @@ Deterministic review output contract:
 
 Ralph treats any response without this marker as `fail` and routes via `docs/escalation-policy.md`.
 
+## Plan-stage product review (required)
+
+Product plan review runs for every task to catch drift from the claims ledger before implementation.
+
+This is not an extra human checkpoint: it is an agent gate that happens before implementation work starts.
+
+Interaction with `PRODUCT GAP:`
+
+- `PRODUCT GAP:` / `NO PRODUCT GAP:` markers are still the canonical, deterministic escalation signals (see `docs/escalation-policy.md`).
+- When product plan review fails specifically due to missing product guidance, the product plan-review agent should:
+  - emit `RALPH_PLAN_REVIEW` with `status=fail`, and
+  - include a single `PRODUCT GAP:` marker.
+
+Deterministic plan-review output contract:
+
+- The final line of the product plan-review agent response must include exactly one machine-parseable marker:
+
+  `RALPH_PLAN_REVIEW: {"status":"pass"|"fail","reason":"..."}`
+
+Ralph treats any response without this marker as `fail`.
+
 ## Gate 3: CI (Full Suite + Required Checks)
 
 Default: required.
@@ -158,11 +184,14 @@ Escalation policy:
 When an issue already has an open PR and required checks are failing or timed out, Ralph must treat CI-debug as a first-class recovery path.
 
 Behavior:
-- Detect: if required checks are failing or timed out, do **not** end in `ralph:status:blocked`.
+- Detect: if required checks are failing or timed out, do not escalate until bounded remediation attempts complete.
 - Comment: post a single canonical GitHub **issue** comment listing failing required check names + links, base/head refs, and the action statement: “Ralph is spawning a dedicated CI-debug run to make required checks green.” Edit this comment as CI state changes (no duplicates).
 - Run: spawn a dedicated CI-debug run immediately with a fresh worktree and fresh OpenCode session (no planning phase). Seed the prompt with failing check names/URLs/refs and a brief failure summary.
-- Retries: allow bounded retries (2–3). If the same failure signature repeats across attempts, stop early and escalate.
-- Labels: while CI-debug is in progress, keep `ralph:status:in-progress` and avoid `ralph:status:blocked`. After bounded CI-debug attempts fail, set `ralph:status:blocked` with a clear next human action.
+- Retries: bounded attempts; if the same failure signature repeats across attempts, stop early and escalate.
+
+Retries are per-lane configurable; do not assume a default count.
+
+- GitHub status: keep `ralph:status:in-progress` while remediation attempts continue. Set `ralph:status:escalated` only after bounded CI-debug attempts fail.
 - Escalation: post a final comment summarizing what failed, what was tried (links to attempts), and the exact next human action.
 
 ## Merge-conflict recovery lane (mergeStateStatus=DIRTY)
@@ -170,12 +199,15 @@ Behavior:
 When an issue already has an open PR with merge conflicts, Ralph must treat merge-conflict recovery as a first-class lane (like CI-debug).
 
 Behavior:
-- Detect: if the PR is `mergeStateStatus=DIRTY`, do **not** end in `ralph:status:blocked` without attempting recovery.
+- Detect: if the PR is `mergeStateStatus=DIRTY`, attempt bounded recovery before escalating.
 - Comment: post a single canonical GitHub **issue** comment with PR/base/head refs, conflict file count/sample, and the action statement. Edit the same comment as state changes (no duplicates).
 - Run: spawn a dedicated merge-conflict recovery run with a fresh worktree and fresh OpenCode session (no planning phase). Merge base into head (no rebase / no force-push), resolve conflicts, run tests/typecheck/build/knip, then push updates.
 - Wait: after pushing, wait for `mergeStateStatus != DIRTY` and for required checks to appear for the new head SHA before resuming merge-gate logic.
 - Retries: bounded attempts (2–3). If the same conflict signature repeats across attempts, stop early and escalate.
-- Labels: while recovery is in progress, keep `ralph:status:in-progress` and avoid `ralph:status:blocked`. After bounded attempts fail, set `ralph:status:blocked` with a clear next human action.
+
+Retries are per-lane configurable; do not assume a default count.
+
+- GitHub status: keep `ralph:status:in-progress` while recovery attempts continue. Set `ralph:status:escalated` only after bounded attempts fail.
 - Escalation: post a final comment summarizing the conflict files and the exact next human action needed.
 
 ## Test Philosophy (Agentic Coding)
