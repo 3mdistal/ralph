@@ -156,7 +156,18 @@ export function createGhRunner(params: { repo: string; mode: "read" | "write" })
           try {
             const proc = getDefaultGhRunner()(strings, ...values);
             const configured = cwdPath ? proc.cwd(cwdPath) : proc;
-            return await configured.quiet();
+            try {
+              return await configured.quiet();
+            } catch (error: any) {
+              // Attach context for higher-signal diagnostics and classification.
+              // Mutate in-place to preserve stack when possible.
+              if (error && typeof error === "object") {
+                if ((error as any).ghCommand === undefined) (error as any).ghCommand = command;
+                if ((error as any).ghRepo === undefined) (error as any).ghRepo = params.repo;
+                if ((error as any).ghMode === undefined) (error as any).ghMode = params.mode;
+              }
+              throw error;
+            }
           } finally {
             restore();
           }

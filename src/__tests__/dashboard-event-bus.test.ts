@@ -122,4 +122,31 @@ describe("dashboard event schema", () => {
 
     expect(isRalphEvent(bad)).toBe(false);
   });
+
+  test("validates github.request payload", () => {
+    const ok = buildRalphEvent({
+      type: "github.request",
+      level: "info",
+      repo: "3mdistal/ralph",
+      data: {
+        method: "GET",
+        path: "/repos/3mdistal/ralph/issues/1",
+        status: 200,
+        ok: true,
+        write: false,
+        durationMs: 12,
+        attempt: 1,
+        requestId: "ABC:123",
+      },
+    });
+
+    expect(isRalphEvent(ok)).toBe(true);
+
+    const bad: any = {
+      ...ok,
+      data: { ...ok.data, durationMs: -1 },
+    };
+
+    expect(isRalphEvent(bad)).toBe(false);
+  });
 });
