@@ -192,6 +192,48 @@ import {
   viewPullRequestMergeCandidate,
   type PullRequestSearchResult,
 } from "./github/pr";
+import {
+  REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS,
+  REQUIRED_CHECKS_DEFER_RETRY_MS,
+  REQUIRED_CHECKS_JITTER_PCT,
+  REQUIRED_CHECKS_LOG_INTERVAL_MS,
+  REQUIRED_CHECKS_MAX_POLL_MS,
+  applyRequiredChecksJitter,
+  areStringArraysEqual,
+  buildRequiredChecksSignature,
+  computeRequiredChecksDelay,
+  decideBranchProtection,
+  extractPullRequestNumber,
+  formatRequiredChecksForHumans,
+  formatRequiredChecksGuidance,
+  hasBypassAllowances,
+  isCiOnlyChangeSet,
+  isCiRelatedIssue,
+  isMainMergeAllowed,
+  isMainMergeOverride,
+  normalizeEnabledFlag,
+  normalizeRequiredCheckState,
+  normalizeRestrictions,
+  summarizeRequiredChecks,
+  toSortedUniqueStrings,
+  type BranchProtectionDecision,
+  type CheckLogResult,
+  type CheckRunsResponse,
+  type CommitStatusResponse,
+  type FailedCheck,
+  type FailedCheckLog,
+  type GitRef,
+  type PrCheck,
+  type PullRequestDetails,
+  type PullRequestDetailsNormalized,
+  type RepoDetails,
+  type RequiredCheckState,
+  type RequiredChecksGuidanceInput,
+  type RequiredChecksSummary,
+  type RestrictionList,
+  type RemediationFailureContext,
+} from "./worker/lanes/required-checks";
+import type { ThrottleAdapter } from "./worker/ports";
 
 function prBodyClosesIssue(body: string, issueNumber: string): boolean {
   const normalized = body.replace(/\r\n/g, "\n");
@@ -243,6 +285,19 @@ type MergeConflictRecoveryOutcome =
   | { status: "success"; prUrl: string; sessionId: string; headSha: string }
   | { status: "failed" | "escalated"; run: AgentRun };
 
+type CiDebugRecoveryOutcome =
+  | {
+      status: "success";
+      prUrl: string;
+      sessionId: string;
+      headSha: string;
+      summary: RequiredChecksSummary;
+    }
+  | {
+      status: "failed" | "escalated";
+      run: AgentRun;
+    };
+
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
   runAgent,
   continueSession,
@@ -258,10 +313,6 @@ type NotifyAdapter = {
   notifyEscalation: typeof notifyEscalation;
   notifyError: typeof notifyError;
   notifyTaskComplete: typeof notifyTaskComplete;
-};
-
-type ThrottleAdapter = {
-  getThrottleDecision: typeof getThrottleDecision;
 };
 
 const DEFAULT_QUEUE_ADAPTER: QueueAdapter = {
@@ -603,405 +654,19 @@ function resolveVaultPath(p: string): string {
   if (!vault) return p;
   return isAbsolute(p) ? p : join(vault, p);
 }
-
-type RequiredCheckState = "SUCCESS" | "PENDING" | "FAILURE" | "UNKNOWN";
-
-type PrCheck = {
-  name: string;
-  state: RequiredCheckState;
-  rawState: string;
-  detailsUrl?: string | null;
-};
-
-type RequiredChecksSummary = {
-  status: "success" | "pending" | "failure";
-  required: Array<{ name: string; state: RequiredCheckState; rawState: string; detailsUrl?: string | null }>;
-  available: string[];
-};
-
-type CiDebugRecoveryOutcome =
-  | {
-      status: "success";
-      prUrl: string;
-      sessionId: string;
-      headSha: string;
-      summary: RequiredChecksSummary;
-    }
-  | {
-      status: "failed" | "escalated";
-      run: AgentRun;
-    };
-
-type CiFailureTriageOutcome =
-  | {
-      status: "success";
-      prUrl: string;
-      sessionId: string;
-      headSha: string;
-      summary: RequiredChecksSummary;
-    }
-  | {
-      status: "failed" | "escalated" | "throttled";
-      run: AgentRun;
-    };
-type FailedCheck = {
-  name: string;
-  state: RequiredCheckState;
-  rawState: string;
-  detailsUrl?: string | null;
-};
-
-type FailedCheckLog = FailedCheck & {
-  runId?: string;
-  runUrl?: string;
-  logExcerpt?: string;
-};
-
-type RestrictionEntry = { login?: string | null; slug?: string | null };
-
-type RestrictionList = {
-  users?: RestrictionEntry[] | null;
-  teams?: RestrictionEntry[] | null;
-  apps?: RestrictionEntry[] | null;
-};
-
-
-type CheckRunsResponse = {
-  check_runs?: Array<{ name?: string | null }> | null;
-};
-
-type CommitStatusResponse = {
-  statuses?: Array<{ context?: string | null }> | null;
-};
-
-type RepoDetails = {
-  default_branch?: string | null;
-};
-
-type PullRequestDetails = {
-  number?: number | null;
-  url?: string | null;
-  merged?: boolean | null;
-  merged_at?: string | null;
-  base?: { ref?: string | null } | null;
-  head?: { ref?: string | null; sha?: string | null; repo?: { full_name?: string | null } | null } | null;
-};
-
-type PullRequestDetailsNormalized = {
-  number: number;
-  url: string;
-  merged: boolean;
-  baseRefName: string;
-  headRefName: string;
-  headRepoFullName: string;
-  headSha: string;
-};
-
-type GitRef = {
-  object?: { sha?: string | null } | null;
-};
-
-function toSortedUniqueStrings(values: Array<string | null | undefined>): string[] {
-  const normalized = values.map((value) => (value ?? "").trim()).filter(Boolean);
-  return Array.from(new Set(normalized)).sort();
-}
-
-function areStringArraysEqual(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) return false;
-  return a.every((value, index) => value === b[index]);
-}
-
-function normalizeEnabledFlag(value: { enabled?: boolean | null } | boolean | null | undefined): boolean {
-  if (typeof value === "boolean") return value;
-  return Boolean(value?.enabled);
-}
-
-function normalizeRestrictions(source: RestrictionList | null | undefined): { users: string[]; teams: string[]; apps: string[] } | null {
-  const users = toSortedUniqueStrings(source?.users?.map((entry) => entry?.login ?? "") ?? []);
-  const teams = toSortedUniqueStrings(source?.teams?.map((entry) => entry?.slug ?? "") ?? []);
-  const apps = toSortedUniqueStrings(source?.apps?.map((entry) => entry?.slug ?? "") ?? []);
-  if (users.length === 0 && teams.length === 0 && apps.length === 0) return null;
-  return { users, teams, apps };
-}
-
-function hasBypassAllowances(source: RestrictionList | null | undefined): boolean {
-  const normalized = normalizeRestrictions(source);
-  if (!normalized) return false;
-  return normalized.users.length > 0 || normalized.teams.length > 0 || normalized.apps.length > 0;
-}
-
-
-function extractPullRequestNumber(url: string): number | null {
-  const match = url.match(/\/pull\/(\d+)(?:$|\b|\/)/);
-  if (!match) return null;
-  return Number.parseInt(match[1], 10);
-}
-
-const CI_ONLY_PATH_PREFIXES = [".github/workflows/", ".github/actions/"] as const;
-const CI_ONLY_PATH_EXACT = [".github/action.yml", ".github/action.yaml"] as const;
-const CI_LABEL_KEYWORDS = ["ci", "build", "infra"] as const;
-
-function isCiOnlyPath(path: string): boolean {
-  const normalized = path.replace(/\\/g, "/").trim();
-  if (!normalized) return false;
-  if (CI_ONLY_PATH_EXACT.includes(normalized as (typeof CI_ONLY_PATH_EXACT)[number])) return true;
-  return CI_ONLY_PATH_PREFIXES.some((prefix) => normalized.startsWith(prefix));
-}
-
-function isCiOnlyChangeSet(files: string[]): boolean {
-  const normalized = files.map((file) => file.trim()).filter(Boolean);
-  if (normalized.length === 0) return false;
-  return normalized.every((file) => isCiOnlyPath(file));
-}
-
-function isCiRelatedIssue(labels: string[]): boolean {
-  return labels.some((label) => {
-    const normalized = label.toLowerCase();
-    return CI_LABEL_KEYWORDS.some((keyword) => {
-      const re = new RegExp(`(^|[-_/])${keyword}($|[-_/])`);
-      return re.test(normalized);
-    });
-  });
-}
-
-export function __isCiOnlyChangeSetForTests(files: string[]): boolean {
-  return isCiOnlyChangeSet(files);
-}
-
-export function __isCiRelatedIssueForTests(labels: string[]): boolean {
-  return isCiRelatedIssue(labels);
-}
-
-function normalizeRequiredCheckState(raw: string | null | undefined): RequiredCheckState {
-  const val = String(raw ?? "").toUpperCase();
-  if (!val) return "UNKNOWN";
-  if (val === "SUCCESS") return "SUCCESS";
-
-  // Common non-success terminal states.
-  if (["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE"].includes(val)) {
-    return "FAILURE";
-  }
-
-  // Treat everything else (including IN_PROGRESS, QUEUED, PENDING) as pending.
-  return "PENDING";
-}
-
-function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: string[]): RequiredChecksSummary {
-  const available = Array.from(new Set(allChecks.map((c) => c.name))).sort();
-
-  const required = requiredChecks.map((name) => {
-    const match = allChecks.find((c) => c.name === name);
-    if (!match) return { name, state: "UNKNOWN" as const, rawState: "missing" };
-    return { name, state: match.state, rawState: match.rawState, detailsUrl: match.detailsUrl };
-  });
-
-  if (requiredChecks.length === 0) {
-    return { status: "success", required: [], available };
-  }
-
-  const hasFailure = required.some((c) => c.state === "FAILURE");
-  if (hasFailure) return { status: "failure", required, available };
-
-  const allSuccess = required.length > 0 && required.every((c) => c.state === "SUCCESS");
-  if (allSuccess) return { status: "success", required, available };
-
-  return { status: "pending", required, available };
-}
-
-const REQUIRED_CHECKS_BACKOFF_MULTIPLIER = 1.5;
-const REQUIRED_CHECKS_MAX_POLL_MS = 120_000;
-const REQUIRED_CHECKS_JITTER_PCT = 0.2;
-const REQUIRED_CHECKS_LOG_INTERVAL_MS = 60_000;
-
-function applyRequiredChecksJitter(valueMs: number, jitterPct = REQUIRED_CHECKS_JITTER_PCT): number {
-  const clamped = Math.max(1000, valueMs);
-  const variance = clamped * jitterPct;
-  const delta = (Math.random() * 2 - 1) * variance;
-  return Math.max(1000, Math.round(clamped + delta));
-}
-
-function buildRequiredChecksSignature(summary: RequiredChecksSummary): string {
-  return JSON.stringify({
-    status: summary.status,
-    required: summary.required.map((check) => ({
-      name: check.name,
-      state: check.state,
-      rawState: check.rawState,
-    })),
-  });
-}
-
-function computeRequiredChecksDelay(params: {
-  baseIntervalMs: number;
-  maxIntervalMs: number;
-  attempt: number;
-  lastSignature: string | null;
-  nextSignature: string;
-  pending: boolean;
-}): { delayMs: number; nextAttempt: number; reason: "progress" | "backoff" } {
-  if (!params.pending) {
-    return { delayMs: params.baseIntervalMs, nextAttempt: 0, reason: "progress" };
-  }
-
-  if (params.lastSignature && params.lastSignature === params.nextSignature) {
-    const nextAttempt = params.attempt + 1;
-    const delay = Math.min(
-      Math.round(params.baseIntervalMs * Math.pow(REQUIRED_CHECKS_BACKOFF_MULTIPLIER, nextAttempt)),
-      params.maxIntervalMs
-    );
-    return { delayMs: delay, nextAttempt, reason: "backoff" };
-  }
-
-  return { delayMs: params.baseIntervalMs, nextAttempt: 0, reason: "progress" };
-}
-
-export function __computeRequiredChecksDelayForTests(
-  params: Parameters<typeof computeRequiredChecksDelay>[0]
-): ReturnType<typeof computeRequiredChecksDelay> {
-  return computeRequiredChecksDelay(params);
-}
-
-export function __summarizeRequiredChecksForTests(
-  allChecks: PrCheck[],
-  requiredChecks: string[]
-): RequiredChecksSummary {
-  return summarizeRequiredChecks(allChecks, requiredChecks);
-}
-
-export const __TEST_ONLY_DEFAULT_BRANCH = "__default_branch__";
-
-export const __TEST_ONLY_DEFAULT_SHA = "__default_sha__";
-
-export function __buildRepoDefaultBranchResponse(): RepoDetails {
-  return { default_branch: __TEST_ONLY_DEFAULT_BRANCH };
-}
-
-export function __buildGitRefResponse(sha: string): GitRef {
-  return { object: { sha } };
-}
-
-export function __buildCheckRunsResponse(names: string[]): CheckRunsResponse {
-  return { check_runs: names.map((name) => ({ name })) };
-}
-
-function formatRequiredChecksForHumans(summary: RequiredChecksSummary): string {
-  const lines: string[] = [];
-  lines.push(`Required checks: ${summary.required.map((c) => c.name).join(", ") || "(none)"}`);
-  for (const chk of summary.required) {
-    const details = chk.detailsUrl ? ` (${chk.detailsUrl})` : "";
-    lines.push(`- ${chk.name}: ${chk.rawState}${details}`);
-  }
-
-  if (summary.available.length > 0) {
-    lines.push("", "Available check contexts:", ...summary.available.map((c) => `- ${c}`));
-  }
-
-  return lines.join("\n");
-}
-
-type RequiredChecksGuidanceInput = {
-  repo: string;
-  branch: string;
-  requiredChecks: string[];
-  missingChecks: string[];
-  availableChecks: string[];
-};
-
-type BranchProtectionDecisionKind = "ok" | "defer" | "fail";
-
-type BranchProtectionDecision = {
-  kind: BranchProtectionDecisionKind;
-  missingChecks: string[];
-};
-
-type CheckLogResult = {
-  runId?: string;
-  runUrl?: string;
-  logExcerpt?: string;
-};
-
-type RemediationFailureContext = {
-  summary: RequiredChecksSummary;
-  failedChecks: FailedCheck[];
-  logs: FailedCheckLog[];
-  logWarnings: string[];
-  commands: string[];
-};
-
-type CiTriageRecord = {
-  version: 1;
-  signatureVersion: 2;
-  signature: string;
-  classification: CiFailureClassification;
-  classificationReason: string;
-  action: CiNextAction;
-  actionReason: string;
-  timedOut: boolean;
-  attempt: number;
-  maxAttempts: number;
-  priorSignature: string | null;
-  failingChecks: Array<{ name: string; rawState: string; detailsUrl?: string | null }>;
-  commands: string[];
-};
-
-function formatRequiredChecksGuidance(input: RequiredChecksGuidanceInput): string {
-  const lines = [
-    `Repo: ${input.repo}`,
-    `Branch: ${input.branch}`,
-    `Required checks: ${input.requiredChecks.join(", ") || "(none)"}`,
-    `Missing checks: ${input.missingChecks.join(", ") || "(none)"}`,
-    `Available check contexts: ${input.availableChecks.join(", ") || "(none)"}`,
-    "Next steps: trigger CI on this branch (push a commit or rerun workflows), or update repos[].requiredChecks (set [] to disable gating).",
-  ];
-
-  return lines.join("\n");
-}
-
-const REQUIRED_CHECKS_DEFER_RETRY_MS = 60_000;
-const REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS = 60_000;
-
-function decideBranchProtection(input: {
-  requiredChecks: string[];
-  availableChecks: string[];
-}): BranchProtectionDecision {
-  const missingChecks = input.requiredChecks.filter((check) => !input.availableChecks.includes(check));
-
-  if (input.requiredChecks.length === 0) {
-    return { kind: "ok", missingChecks: [] };
-  }
-
-  if (missingChecks.length > 0) {
-    return { kind: "defer", missingChecks };
-  }
-
-  return { kind: "ok", missingChecks: [] };
-}
-
-const MAIN_MERGE_OVERRIDE_LABEL = "allow-main";
-
-function isMainMergeOverride(labels: string[]): boolean {
-  return labels.some((label) => label.toLowerCase() === MAIN_MERGE_OVERRIDE_LABEL);
-}
-
-function isMainMergeAllowed(baseBranch: string | null, botBranch: string, labels: string[]): boolean {
-  if (!baseBranch) return true;
-  if (baseBranch !== "main") return true;
-  if (botBranch === "main") return true;
-  if (isMainMergeOverride(labels)) return true;
-  return false;
-}
-
-export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuidanceInput): string {
-  return formatRequiredChecksGuidance(input);
-}
-
-export function __decideBranchProtectionForTests(input: {
-  requiredChecks: string[];
-  availableChecks: string[];
-}): BranchProtectionDecision {
-  return decideBranchProtection(input);
-}
-
+export {
+  __TEST_ONLY_DEFAULT_BRANCH,
+  __TEST_ONLY_DEFAULT_SHA,
+  __buildCheckRunsResponse,
+  __buildGitRefResponse,
+  __buildRepoDefaultBranchResponse,
+  __computeRequiredChecksDelayForTests,
+  __decideBranchProtectionForTests,
+  __formatRequiredChecksGuidanceForTests,
+  __isCiOnlyChangeSetForTests,
+  __isCiRelatedIssueForTests,
+  __summarizeRequiredChecksForTests,
+} from "./worker/lanes/required-checks";
 export class RepoWorker {
   private session: SessionAdapter;
   private baseSession: SessionAdapter;
