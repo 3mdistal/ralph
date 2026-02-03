@@ -374,6 +374,16 @@ Machine-readable output:
 ralph repos --json
 ```
 
+### GitHub API usage summary (telemetry)
+
+Reads `github.request` events from `~/.ralph/events/YYYY-MM-DD.jsonl` and summarizes hottest endpoints and rate-limit/backoff behavior.
+
+```bash
+ralph github-usage --since 24h
+ralph github-usage --date 2026-02-03
+ralph github-usage --since 6h --json
+```
+
 ### Sandbox provisioning
 
 ```bash
