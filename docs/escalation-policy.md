@@ -2,7 +2,11 @@
 
 This document is the **single source of truth** for Ralph’s escalation and routing policy.
 
-Goal: **minimize human interrupt surface**. Most tasks should proceed autonomously; escalate only when human judgment is required.
+Status: canonical
+Owner: @3mdistal
+Last updated: 2026-02-01
+
+Goal: **minimize human interrupt surface**. Most tasks should proceed autonomously; escalate only when human intervention is required.
 
 ## Routing decision format
 
@@ -22,6 +26,45 @@ Example:
   "escalation_reason": null
 }
 ```
+
+## Decision surfaces (routing vs consultant)
+
+Ralph has **two distinct decision surfaces**:
+
+1) **Planner routing decision JSON** (`decision: "proceed" | "escalate"`)
+   - Used to decide whether work continues autonomously or escalates.
+2) **Escalation consultant decision packet** (`decision: "needs-human"` for product-gap)
+   - Used to package a human-approvable decision when an escalation occurs.
+
+These are intentionally separate and must not be conflated.
+
+## Escalation consultant decision packet (machine JSON)
+
+When an escalation note is created, the consultant appends a machine-parseable decision packet.
+This packet is the human-facing decision summary and must be deterministic and bounded.
+
+Required fields:
+
+- `schema_version`: integer
+- `decision`: `"auto-resolve"` or `"needs-human"`
+- `confidence`: `"high"`, `"medium"`, or `"low"`
+- `requires_approval`: `true`
+- `current_state`: string
+- `whats_missing`: string
+- `options`: string[] (2-4 entries)
+- `recommendation`: string
+- `questions`: string[] (1-3 entries)
+- `proposed_resolution_text`: string
+- `reason`: string
+- `followups`: array of `{ type: "issue", title: string, body: string }`
+
+### Product-gap packet requirements
+
+When escalation type is `product-gap` **or** the triggering output includes a line-start `PRODUCT GAP:` marker:
+
+- `decision` must be `"needs-human"`
+- Include `current_state`, `whats_missing`, `options` (2-4), `recommendation`, and `questions` (1-3)
+- Questions must be crisp approval questions (avoid open-ended research requests)
 
 ## Product gap markers (deterministic)
 
@@ -55,7 +98,14 @@ Precedence rule:
 
 ## When to escalate
 
-Escalate only for:
+Escalate when the task cannot proceed without a human.
+
+Default stance:
+
+- Prefer deterministic remediation lanes and bounded retries.
+- Escalate only when Ralph believes it will not resolve the issue without human help.
+
+Common cases:
 
 ### 1) Product documentation gap
 
@@ -65,9 +115,12 @@ If product guidance is genuinely missing, the product agent must emit a line-sta
 
 If progress is blocked by an external dependency (missing access, broken upstream, missing credentials, etc.), escalate with a clear blocker reason.
 
-### 3) Contract-surface questions (immediate escalate)
+### 3) Contract-surface questions
 
-If an open question affects a user-facing **contract surface**, route to escalation immediately.
+If an open question affects a user-facing **contract surface**, Ralph uses a hybrid policy:
+
+- Proceed when a change can be made additive and low-complexity (preserve compatibility).
+- Escalate when it would require a breaking change or would add unreasonable compatibility complexity.
 
 Contract surface indicators include:
 - CLI flags/args
@@ -78,6 +131,22 @@ Contract surface indicators include:
 - Schema changes
 - Public error strings
 
+### 4) Any other needs-human intervention
+
+If Ralph has exhausted deterministic remediation lanes (CI-debug, merge-conflict recovery, rate-limit backoff, retry budget, etc.) and still cannot make forward progress, escalate with:
+
+- what failed
+- what was tried (bounded)
+- the exact next human action
+
+## Escalation resolution protocol
+
+- Ralph escalates by setting `ralph:status:escalated` and posting a clear instruction comment.
+- Operator responds with normal GitHub comments.
+- Operator re-queues by applying `ralph:cmd:queue`.
+
+Canonical label/command contract: `docs/product/orchestration-contract.md`.
+
 Notes:
 - “Contract surface” is about **compatibility promises** (especially anything scripts or downstream tooling might rely on).
 - Public error strings are contract surface only when they are explicitly stable (documented) and/or used by downstream tooling for machine parsing.
@@ -85,36 +154,17 @@ Notes:
 
 ## Low confidence handling
 
-Low confidence alone must **not** trigger escalation for implementation-ish tasks.
+Low confidence alone must **not** trigger escalation for routine tasks.
 
 Default behavior:
-- If the task is implementation-ish and there is no product gap marker and no contract-surface question, the routing decision should usually be `decision=proceed` even when `confidence=low`.
+- If there is no product gap marker and no contract-surface question, the routing decision should usually be `decision=proceed` even when `confidence=low`.
 
-Labels that increase escalation sensitivity:
-- `product`, `ux`, `breaking-change` (absence of these labels should bias toward “implementation-ish”).
+Escalation sensitivity inputs:
 
-## Determining task type
+- Only `ralph:*` labels plus deterministic markers and contract-surface detection affect escalation behavior.
+- Non-`ralph:*` labels are ignored for escalation sensitivity.
 
-Default rule (deterministic):
-- If the GitHub Issue has any of the labels `product`, `ux`, or `breaking-change`, treat it as **not** implementation-ish.
-- Otherwise, treat it as **implementation-ish**.
-
-Fallback rule:
-- If issue labels are unavailable, default to **implementation-ish** unless the task source explicitly marks it otherwise.
-
-## Devex-before-escalate (implementation-ish tasks)
-
-For implementation-ish tasks (not labeled `product`, `ux`, or `breaking-change`):
-
-Consult @devex **before** escalating when:
-- The routing result is low confidence (`confidence=low`), or
-- The model wants to escalate but cannot do so with high confidence (i.e. an `escalate` request with `confidence=low|medium`).
-
-Exceptions (escalate immediately; do not devex-first):
-- Product gap markers (`PRODUCT GAP:`)
-- Contract-surface questions
-
-Rationale: devex consult is a remediation attempt to keep work flowing while still capturing maintainability/quality concerns.
+This policy is also captured as a canonical claim: `escalation.bias-proceed`.
 
 ## Updating policy
 

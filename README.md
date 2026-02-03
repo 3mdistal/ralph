@@ -554,7 +554,12 @@ The daemon writes this file on startup (PID, daemonId, and start command). Use `
 
 ## Managed OpenCode config (daemon runs)
 
-Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `$HOME/.ralph/opencode`. This directory is owned by Ralph and overwritten on startup to match the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Override precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. Overrides must be absolute paths (no `~` expansion). For safety, Ralph refuses to manage non-managed directories unless they already contain the `.ralph-managed-opencode` marker file. This does not change OpenCode profile storage; profiles still control XDG roots for auth/storage/usage logs.
+Ralph always runs OpenCode with `OPENCODE_CONFIG_DIR` pointing at `$HOME/.ralph/opencode`. This directory is owned by Ralph and overwritten on startup to match the version shipped in this repo (agents + a minimal `opencode.json`). Repo-local OpenCode config is ignored for daemon runs. Ralph ignores any pre-set `OPENCODE_CONFIG_DIR` and uses `RALPH_OPENCODE_CONFIG_DIR` instead. Override precedence is `RALPH_OPENCODE_CONFIG_DIR` (env) > `opencode.managedConfigDir` (config) > default. Overrides must be absolute paths (no `~` expansion). For safety, Ralph refuses to manage non-managed directories unless they already contain the `.ralph-managed-opencode` marker file.
+
+Isolation:
+
+- Daemon runs isolate `XDG_CONFIG_HOME` by default so changes in user-global config do not leak into Ralph.
+- Daemon runs keep `XDG_DATA_HOME` shared by default to preserve OpenAI OAuth tokens under `XDG_DATA_HOME/opencode/auth.json`.
 
 Daemon runs do not rely on `~/.config/opencode` plugins. Ralph emits its own introspection artifacts at `~/.ralph/sessions/<sessionId>/events.jsonl` and `~/.ralph/sessions/<sessionId>/summary.json` for watchdog/anomaly detection.
 

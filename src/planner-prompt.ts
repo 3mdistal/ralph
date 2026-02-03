@@ -1,11 +1,13 @@
 type PlannerPromptOptions = {
   repo: string;
   issueNumber: string | number;
+  issueContext?: string | null;
 };
 
 export function buildPlannerPrompt(options: PlannerPromptOptions): string {
   const issueNumber = String(options.issueNumber).trim();
   const repo = options.repo.trim();
+  const issueContext = String(options.issueContext ?? "").trim();
 
   return [
     "Planner prompt v1",
@@ -14,10 +16,18 @@ export function buildPlannerPrompt(options: PlannerPromptOptions): string {
     "",
     "IMPORTANT: This runs in a non-interactive daemon. Do NOT ask the user questions. If you would normally ask a question, make a reasonable default choice and proceed, clearly stating any assumptions.",
     "",
-    "First, gather context from the GitHub issue itself:",
-    "- Read the issue body",
-    `- Read the issue comments (use 'GH_PAGER=cat gh issue view ${issueNumber} --repo ${repo} --comments' to fetch the full thread; prioritize latest maintainer/owner comments)`,
-    "- Treat explicit decisions/policies in comments as authoritative product guidance",
+    "GitHub issue context is provided below (prefetched by the orchestrator when possible).",
+    "Treat explicit decisions/policies in comments as authoritative product guidance.",
+    "",
+    issueContext ? "---" : null,
+    issueContext ? issueContext : null,
+    issueContext ? "---" : null,
+    "",
+    "If issue context is missing/unavailable, fetch it via REST (avoid `gh issue view`, which uses GraphQL):",
+    "```bash",
+    `gh api repos/${repo}/issues/${issueNumber}`,
+    `gh api repos/${repo}/issues/${issueNumber}/comments --paginate`,
+    "```",
     "",
     "Then, consult @product to get context on this task. Product should review the GitHub Issue (including comments) and relevant product docs, understand how it fits into the product vision, and explain:",
     "- Why this task matters",

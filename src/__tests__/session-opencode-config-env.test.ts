@@ -43,6 +43,12 @@ describe("OpenCode config env", () => {
     expect(env.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
   });
 
+  test("sets XDG_CONFIG_HOME to an isolated dir by default", () => {
+    const env = __buildOpencodeEnvForTests({ repo: "demo", cacheKey: "abc" });
+    expect(typeof env.XDG_CONFIG_HOME).toBe("string");
+    expect(env.XDG_CONFIG_HOME).toContain("ralph-opencode");
+  });
+
   test("respects RALPH_OPENCODE_CONFIG_DIR override", () => {
     const override = join(homeDir, "custom-opencode");
     process.env.RALPH_OPENCODE_CONFIG_DIR = override;

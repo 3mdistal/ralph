@@ -1,3 +1,11 @@
+import type {
+  hasIssueSnapshot,
+  recordIssueLabelsSnapshot,
+  recordIssueSnapshot,
+  recordRepoGithubIssueSync,
+  runInStateTransaction,
+} from "../state";
+
 export type IssueLabel = { name?: string } | string;
 
 export type IssuePayload = {
@@ -15,9 +23,21 @@ export type SyncDeps = {
   fetch?: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   getToken?: () => Promise<string | null>;
   now?: () => Date;
+  state?: Partial<SyncStateDeps>;
 };
 
+export type SyncStateDeps = {
+  runInStateTransaction: typeof runInStateTransaction;
+  hasIssueSnapshot: typeof hasIssueSnapshot;
+  recordIssueSnapshot: typeof recordIssueSnapshot;
+  recordIssueLabelsSnapshot: typeof recordIssueLabelsSnapshot;
+  recordRepoGithubIssueSync: typeof recordRepoGithubIssueSync;
+};
+
+export type SyncStatus = "ok" | "error" | "rate_limited" | "aborted";
+
 export type SyncResult = {
+  status: SyncStatus;
   ok: boolean;
   fetched: number;
   stored: number;
