@@ -133,6 +133,7 @@ import { isIntrospectionSummary, type IntrospectionSummary } from "./introspecti
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "./run-recording-session-adapter";
 import { redactHomePathForDisplay } from "./redaction";
 import { isSafeSessionId } from "./session-id";
+import { buildDashboardContext, resolveDashboardContext } from "./worker/dashboard-context";
 import {
   completeParentVerification,
   completeRalphRun,
@@ -793,16 +794,7 @@ export class RepoWorker {
   }
 
   private buildDashboardContext(task: AgentTask, runId?: string | null): DashboardEventContext {
-    const taskId = task._path || task._name || task.name || undefined;
-    const workerId = task["worker-id"]?.trim() || (taskId ? `${this.repo}#${taskId}` : undefined);
-    const sessionId = task["session-id"]?.trim() || undefined;
-    return {
-      runId: runId ?? undefined,
-      workerId,
-      repo: this.repo,
-      taskId,
-      sessionId,
-    };
+    return buildDashboardContext({ task, repo: this.repo, runId });
   }
 
   private withDashboardContext<T>(context: DashboardEventContext, run: () => Promise<T>): Promise<T> {
@@ -817,7 +809,7 @@ export class RepoWorker {
     event: Omit<RalphEvent, "ts"> & { ts?: string },
     overrides?: Partial<DashboardEventContext>
   ): void {
-    const context = this.activeDashboardContext ? { ...this.activeDashboardContext, ...overrides } : overrides;
+    const context = resolveDashboardContext(this.activeDashboardContext, overrides);
     publishDashboardEvent(event, context);
   }
 
