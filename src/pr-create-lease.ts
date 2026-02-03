@@ -1,7 +1,7 @@
 import { normalizeGitRef } from "./midpoint-labels";
 
 export const PR_CREATE_LEASE_SCOPE = "pr-create";
-export const PR_CREATE_LEASE_VERSION = 1;
+const PR_CREATE_LEASE_VERSION = 1;
 
 export function buildPrCreateLeaseKey(input: {
   repo: string;
@@ -14,7 +14,7 @@ export function buildPrCreateLeaseKey(input: {
   return `pr-create:v${PR_CREATE_LEASE_VERSION}:${repo}#${issue}:${base}`;
 }
 
-export function parseIsoMs(value: string | null | undefined): number | null {
+function parseIsoMs(value: string | null | undefined): number | null {
   const raw = typeof value === "string" ? value.trim() : "";
   if (!raw) return null;
   const ms = Date.parse(raw);
