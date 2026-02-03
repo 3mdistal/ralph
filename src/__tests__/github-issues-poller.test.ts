@@ -130,13 +130,21 @@ describe("github issue poller", () => {
 
   test("stop aborts inflight sync and prevents reschedule", async () => {
     const { timers, records, run } = createRecordingTimers();
-    let receivedSignal: AbortSignal | null = null;
-    let resolveSync: ((value: SyncResult) => void) | null = null;
+    type Captured = {
+      signal: { aborted: boolean };
+      resolve: (value: SyncResult) => void;
+    };
+
+    let capture: ((payload: Captured) => void) | null = null;
+    const inflight = new Promise<Captured>((resolve) => {
+      capture = resolve;
+    });
 
     const syncOnce: SyncOnce = async (params) => {
-      receivedSignal = params.signal ?? null;
       return await new Promise<SyncResult>((resolve) => {
-        resolveSync = resolve;
+        const signal = params.signal as unknown as { aborted: boolean } | undefined;
+        if (!signal) throw new Error("expected poller to pass an AbortSignal");
+        capture?.({ signal, resolve });
       });
     };
 
@@ -156,12 +164,12 @@ describe("github issue poller", () => {
     });
 
     await run(0);
-    expect(receivedSignal).not.toBeNull();
+    const { signal, resolve } = await inflight;
 
     poller.stop();
-    expect(receivedSignal?.aborted).toBe(true);
+    expect(signal.aborted).toBe(true);
 
-    resolveSync?.({
+    resolve({
       status: "aborted",
       ok: false,
       fetched: 0,
@@ -169,6 +177,7 @@ describe("github issue poller", () => {
       ralphCount: 0,
       newLastSyncAt: null,
       hadChanges: false,
+      progressed: false,
     });
 
     await Promise.resolve();
