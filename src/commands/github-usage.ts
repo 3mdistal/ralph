@@ -664,7 +664,7 @@ function formatTopEndpoints(rows: GithubUsageEndpointRow[]): string[] {
   return lines;
 }
 
-export function formatGithubUsageHuman(summary: GithubUsageSummary): string {
+function formatGithubUsageHuman(summary: GithubUsageSummary): string {
   const filesPresent = summary.files.filter((f) => !f.missing).length;
   const totalBytes = summary.files.reduce((acc, f) => acc + (typeof f.byteCount === "number" ? f.byteCount : 0), 0);
   const maxBackoff = summary.backoff.maxWindowRemainingMs > 0 ? formatDuration(summary.backoff.maxWindowRemainingMs) : "0s";
