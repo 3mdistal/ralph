@@ -4032,6 +4032,24 @@ ${guidance}`
     }
   }
 
+  private recordMergeFailureArtifact(prUrl: string, details: string): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    try {
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "ci",
+        kind: "note",
+        content: [`Merge failure while attempting to merge ${prUrl}`, "", details].join("\n").trim(),
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist merge failure artifact for ${prUrl}: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
   private recordCiFailureArtifacts(logs: FailedCheckLog[]): void {
     const runId = this.activeRunId;
     if (!runId) return;
@@ -4192,15 +4210,45 @@ ${guidance}`
   }
 
   private isOutOfDateMergeError(error: any): boolean {
-    const message = String(error?.stderr ?? error?.message ?? "");
+    const message = this.getGhErrorSearchText(error);
     if (!message) return false;
     return /not up to date with the base branch/i.test(message);
   }
 
   private isRequiredChecksExpectedMergeError(error: any): boolean {
-    const message = String(error?.stderr ?? error?.message ?? "");
+    const message = this.getGhErrorSearchText(error);
     if (!message) return false;
     return /required status checks are expected/i.test(message);
+  }
+
+  private getGhErrorSearchText(error: any): string {
+    const parts: string[] = [];
+    const message = String(error?.message ?? "").trim();
+    const stderr = this.stringifyGhOutput(error?.stderr);
+    const stdout = this.stringifyGhOutput(error?.stdout);
+
+    if (message) parts.push(message);
+    if (stderr) parts.push(stderr);
+    if (stdout) parts.push(stdout);
+
+    return parts.join("\n").trim();
+  }
+
+  private stringifyGhOutput(value: unknown): string {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "string") return value.trim();
+    if (typeof (value as any)?.toString === "function") {
+      try {
+        return String((value as any).toString()).trim();
+      } catch {
+        return "";
+      }
+    }
+    try {
+      return String(value).trim();
+    } catch {
+      return "";
+    }
   }
 
   private shouldFallbackToWorktreeUpdate(message: string): boolean {
@@ -4215,9 +4263,26 @@ ${guidance}`
   }
 
   private formatGhError(error: any): string {
+    const lines: string[] = [];
+
+    const command = String(error?.ghCommand ?? error?.command ?? "").trim();
+    const redactedCommand = command ? redactSensitiveText(command).trim() : "";
+    if (redactedCommand) lines.push(`Command: ${redactedCommand}`);
+
+    const exitCodeRaw = error?.exitCode ?? error?.code ?? null;
+    const exitCode = exitCodeRaw === null || exitCodeRaw === undefined ? "" : String(exitCodeRaw).trim();
+    if (exitCode) lines.push(`Exit code: ${exitCode}`);
+
     const message = String(error?.message ?? "").trim();
-    const stderr = String(error?.stderr ?? "").trim();
-    return [message, stderr].filter(Boolean).join("\n");
+    if (message) lines.push(message);
+
+    const stderr = this.stringifyGhOutput(error?.stderr);
+    const stdout = this.stringifyGhOutput(error?.stdout);
+
+    if (stderr) lines.push("", "stderr:", summarizeForNote(stderr, 1600));
+    if (stdout) lines.push("", "stdout:", summarizeForNote(stdout, 1600));
+
+    return lines.join("\n").trim();
   }
 
   private buildMergeConflictPrompt(prUrl: string, baseRefName: string | null, botBranch: string): string {
@@ -6544,7 +6609,93 @@ ${guidance}`
       };
     }
 
-    const mergeWhenReady = async (headSha: string): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> => {
+    const mergeWhenReady = async (
+      headSha: string
+    ): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> => {
+      // Pre-merge guard: required checks and mergeability can change between polling and the merge API call.
+      try {
+        const status = await this.getPullRequestChecks(prUrl);
+        const summary = summarizeRequiredChecks(status.checks, REQUIRED_CHECKS);
+        this.recordCiGateSummary(prUrl, summary);
+
+        if (status.mergeStateStatus === "DIRTY") {
+          const recovery = await this.runMergeConflictRecovery({
+            task: params.task,
+            issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+            cacheKey: params.cacheKey,
+            prUrl,
+            issueMeta: params.issueMeta,
+            botBranch: params.botBranch,
+            opencodeXdg: params.opencodeXdg,
+            opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
+          });
+          if (recovery.status !== "success") return { ok: false, run: recovery.run };
+          sessionId = recovery.sessionId || sessionId;
+          return await this.mergePrWithRequiredChecks({
+            ...params,
+            prUrl: recovery.prUrl,
+            sessionId,
+          });
+        }
+
+        if (!didUpdateBranch && status.mergeStateStatus === "BEHIND") {
+          console.log(`[ralph:worker:${this.repo}] PR BEHIND at merge time; updating branch ${prUrl}`);
+          didUpdateBranch = true;
+          try {
+            await this.updatePullRequestBranch(prUrl, params.repoPath);
+          } catch (updateError: any) {
+            const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
+            console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+            await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
+            return {
+              ok: false,
+              run: {
+                taskName: params.task.name,
+                repo: this.repo,
+                outcome: "failed",
+                sessionId,
+                escalationReason: reason,
+              },
+            };
+          }
+
+          return await this.mergePrWithRequiredChecks({
+            ...params,
+            prUrl,
+            sessionId,
+          });
+        }
+
+        if (summary.status !== "success") {
+          if (summary.status === "pending") {
+            console.log(`[ralph:worker:${this.repo}] Required checks pending at merge time; resuming merge gate ${prUrl}`);
+            return await this.mergePrWithRequiredChecks({
+              ...params,
+              prUrl,
+              sessionId,
+            });
+          }
+
+          const reason = `Merge blocked: required checks not green for ${prUrl}`;
+          const details = [formatRequiredChecksForHumans(summary), "", "Merge attempt would be rejected by branch protection."].join("\n");
+          await this.markTaskBlocked(params.task, "ci-failure", { reason, details, sessionId });
+          return {
+            ok: false,
+            run: {
+              taskName: params.task.name,
+              repo: this.repo,
+              outcome: "failed",
+              sessionId,
+              escalationReason: reason,
+            },
+          };
+        }
+
+        headSha = status.headSha;
+      } catch (error: any) {
+        console.warn(`[ralph:worker:${this.repo}] Pre-merge guard failed (continuing): ${this.formatGhError(error)}`);
+      }
+
       console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
       try {
         await this.mergePullRequest(prUrl, headSha, params.repoPath);
@@ -6647,7 +6798,56 @@ ${guidance}`
           sessionId = ciDebug.sessionId || sessionId;
           return await mergeWhenReady(ciDebug.headSha);
         }
-        throw error;
+
+        const diagnostic = this.formatGhError(error);
+        this.recordMergeFailureArtifact(prUrl, diagnostic);
+
+        let source: BlockedSource = "runtime-error";
+        let reason = `Merge failed for ${prUrl}`;
+        let details = diagnostic;
+
+        try {
+          const status = await this.getPullRequestChecks(prUrl);
+          const summary = summarizeRequiredChecks(status.checks, REQUIRED_CHECKS);
+          this.recordCiGateSummary(prUrl, summary);
+
+          if (status.mergeStateStatus === "DIRTY") {
+            source = "merge-conflict";
+            reason = `Merge blocked by conflicts for ${prUrl}`;
+            details = `mergeStateStatus=DIRTY\n\n${diagnostic}`;
+          } else if (status.mergeStateStatus === "BEHIND") {
+            source = "auto-update";
+            reason = `Merge blocked: PR behind base for ${prUrl}`;
+            details = `mergeStateStatus=BEHIND\n\n${diagnostic}`;
+          } else if (summary.status !== "success") {
+            source = "ci-failure";
+            reason = `Merge blocked: required checks not green for ${prUrl}`;
+            details = [diagnostic, "", formatRequiredChecksForHumans(summary)].join("\n").trim();
+          } else if (this.isRequiredChecksExpectedMergeError(error)) {
+            source = "ci-failure";
+            reason = `Merge blocked: required checks expected for ${prUrl}`;
+          } else if (this.isOutOfDateMergeError(error)) {
+            source = "auto-update";
+            reason = `Merge blocked: PR not up to date with base for ${prUrl}`;
+          }
+        } catch (statusError: any) {
+          details = [diagnostic, "", `Additionally failed to refresh PR status: ${this.formatGhError(statusError)}`]
+            .join("\n")
+            .trim();
+        }
+
+        await this.markTaskBlocked(params.task, source, { reason, details, sessionId });
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            pr: prUrl ?? undefined,
+            sessionId,
+            escalationReason: reason,
+          },
+        };
       }
     };
 

@@ -13,6 +13,7 @@ function printGlobalHelp(): void {
       "  ralph status [--json]              Show daemon/task status",
       "  ralph gates <repo> <issue> [--json] Show deterministic gate state",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
+      "  ralph github-usage [--since 24h]   Summarize GitHub API request telemetry",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
@@ -88,6 +89,25 @@ function printCommandHelp(command: string): void {
           "Options:",
           "  --json                 Emit machine-readable JSON output.",
           "  --profile <name|auto>  Override the control/default profile for this command.",
+        ].join("\n")
+      );
+      return;
+
+    case "github-usage":
+      console.log(
+        [
+          "Usage:",
+          "  ralph github-usage [--since 24h] [--until <iso|ms>] [--date YYYY-MM-DD] [--limit N] [--json] [--events-dir <path>]",
+          "",
+          "Summarizes GitHubClient per-request telemetry from ~/.ralph/events/*.jsonl.",
+          "",
+          "Options:",
+          "  --since <duration|iso|ms>   Lookback window (default: 24h) or absolute timestamp.",
+          "  --until <iso|ms>            Range end (default: now).",
+          "  --date YYYY-MM-DD           Analyze a single UTC day (overrides --since/--until).",
+          "  --limit N                   Number of top endpoints to show (default: 20).",
+          "  --json                      Emit machine-readable JSON output.",
+          "  --events-dir <path>         Override events dir (default: ~/.ralph/events).",
         ].join("\n")
       );
       return;
@@ -234,6 +254,7 @@ if (
     cmd === "status" ||
     cmd === "gates" ||
     cmd === "usage" ||
+    cmd === "github-usage" ||
     cmd === "repos" ||
     cmd === "watch" ||
     cmd === "nudge" ||

@@ -112,4 +112,46 @@ describe("gh runner env scoping", () => {
     expect(process.env.GH_TOKEN).toBe("prod-token");
     expect(process.env.GITHUB_TOKEN).toBe("prod-token");
   });
+
+  test("annotates gh failures with ghCommand", async () => {
+    (globalThis as any).$ = ((strings: TemplateStringsArray, ...values: unknown[]) => {
+      const stub: any = {
+        cwd: () => stub,
+        quiet: async () => {
+          const err: any = new Error("ShellError: Failed with exit code 1");
+          err.stderr = "HTTP 405: Required status checks are expected.";
+          throw err;
+        },
+      };
+      return stub;
+    }) as any;
+
+    await writeJson(getRalphConfigJsonPath(), {
+      repos: [],
+      maxWorkers: 1,
+      batchSize: 10,
+      pollInterval: 30_000,
+      bwrbVault: "/tmp",
+      owner: "3mdistal",
+      allowedOwners: ["3mdistal"],
+      devDir: "/tmp",
+      profile: "prod",
+    });
+    __resetConfigForTests();
+
+    const ghModule = await import("../github/gh-runner");
+    const ghRead = ghModule.createGhRunner({ repo: "3mdistal/ralph", mode: "read" });
+
+    let caught: any = null;
+    try {
+      await ghRead`gh issue view 1 --repo 3mdistal/ralph`.quiet();
+    } catch (e: any) {
+      caught = e;
+    }
+
+    expect(caught).toBeTruthy();
+    expect(caught.ghCommand).toContain("gh issue view 1 --repo 3mdistal/ralph");
+    expect(caught.ghRepo).toBe("3mdistal/ralph");
+    expect(caught.ghMode).toBe("read");
+  });
 });
