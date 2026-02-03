@@ -344,6 +344,10 @@ Follow-up:
   - OpenCode server-per-worktree (future)
   - Dashboard events/replay/retention (long-term)
 
+### Consistency Pass (2026-02-01)
+
+- Updated `docs/product/vision.md` to remove non-`ralph:*` escalation sensitivity rules and to align stability/managed-config statements with canonical claims.
+
 ### Clarification (2026-02-01)
 
 - `PRODUCT GAP:` remains a deterministic escalation marker (cross-cutting, not a "stage").

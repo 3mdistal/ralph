@@ -18,7 +18,7 @@ Everything else should proceed autonomously.
 
 Escalation marker parsing must be deterministic and machine-parseable.
 
-Canonical spec: `docs/escalation-policy.md`.
+Canonical spec: `docs/escalation-policy.md` and `claims/canonical.jsonl`.
 
 Keep this doc focused on product intent; update routing/escalation policy in one place.
 
@@ -73,13 +73,12 @@ Operational details (merge recovery, worktree cleanup): see `docs/escalation-pol
 ### 3. Escalation-First Design
 
 The system should bias toward proceeding, not asking. Escalate only when:
-- Product documentation is genuinely missing
+
+- Product documentation is genuinely missing (`PRODUCT GAP:`)
 - Requirements are ambiguous and can't be resolved from context
 - External blockers prevent progress
 
-Most tasks should be treated as "implementation-ish" and proceed autonomously unless explicitly labeled `product`, `ux`, or `breaking-change` (labels increase escalation sensitivity; absence should not).
-
-Implementation-ish tasks (including `dx`, `refactor`, `bug`) should almost never escalate on low-level details like error message wording.
+Escalation sensitivity is driven only by `ralph:*` labels plus deterministic markers and contract-surface detection.
 
 ### 4. Session Persistence
 
@@ -95,7 +94,7 @@ Log tool calls and detect when agents get stuck (tool-result-as-text loops). Aut
 
 **Diagnostics policy:** When OpenCode crashes and prints a log file path, Ralph may attach a redacted tail of that log to the error note to preserve debugging context before logs rotate. Redact obvious tokens (GitHub tokens, Bearer tokens, etc.), redact the local home directory in paths and attached excerpts (replace with `~`), and keep the attachment bounded (e.g. ~200 lines / 20k chars). These logs are local diagnostics artifacts and should not be posted externally (issues/PRs) without manual review.
 
-**Stability policy:** To support safe parallelism, Ralph should avoid shared mutable tool caches between concurrent OpenCode runs (e.g. isolate `XDG_CACHE_HOME` per repo/task).
+**Stability policy:** OpenCode runs isolate `XDG_CACHE_HOME` for safe parallelism.
 
 ### 6. Managed OpenCode Config Contract
 
@@ -106,7 +105,8 @@ For daemon runs, Ralph owns the OpenCode agent configuration to keep behavior de
 - The managed directory is overwritten on daemon startup to match the version shipped with Ralph.
 - Overrides are allowed only via explicit Ralph configuration (`opencode.managedConfigDir`) or `RALPH_OPENCODE_CONFIG_DIR`.
 - Operators should not edit the managed directory directly; changes must come from Ralph template updates.
-- Running multiple daemons on the same machine is unsupported; the managed config is a shared resource and the latest daemon startup wins.
+- Daemon runs isolate `XDG_CONFIG_HOME` by default so global user config does not leak into daemon runs.
+- Multiple daemons on the same machine may contend for managed resources; do not rely on stable behavior when running multiple daemons.
 
 ## Success Metrics
 
