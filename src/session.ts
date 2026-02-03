@@ -23,7 +23,7 @@ const defaultScheduler: Scheduler = {
 import { chmodSync, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
-import { dirname, join } from "path";
+import { basename, dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
@@ -366,6 +366,64 @@ function redactHomePath(path: string): string {
   return path.split(home).join("~");
 }
 
+function expandHomePath(path: string): string {
+  const home = homedir();
+  if (!home) return path;
+  if (path === "~") return home;
+  if (path.startsWith("~/")) return join(home, path.slice(2));
+  return path;
+}
+
+function parseOpencodeLogTimestampMs(fileName: string): number | null {
+  const m = fileName.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})(\d{2})(\d{2})\.log$/);
+  if (!m) return null;
+  const [, y, mo, d, hh, mm, ss] = m;
+  const ms = new Date(`${y}-${mo}-${d}T${hh}:${mm}:${ss}`).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+async function resolveExistingOpencodeLogPath(path: string): Promise<string> {
+  if (existsSync(path)) return path;
+
+  const dir = dirname(path);
+  const base = basename(path);
+  const wantedMs = parseOpencodeLogTimestampMs(base);
+  if (wantedMs == null) return path;
+
+  let entries: string[] = [];
+  try {
+    entries = await readdir(dir);
+  } catch {
+    return path;
+  }
+
+  const logs = entries
+    .filter((name) => name.endsWith(".log"))
+    .filter((name) => parseOpencodeLogTimestampMs(name) != null)
+    .sort();
+
+  if (logs.length === 0) return path;
+  if (logs.includes(base)) return join(dir, base);
+
+  const insert = logs.findIndex((name) => name > base);
+  const candidates = [
+    insert > 0 ? logs[insert - 1] : null,
+    insert >= 0 && insert < logs.length ? logs[insert] : null,
+  ].filter(Boolean) as string[];
+
+  let best: { name: string; deltaMs: number } | null = null;
+  for (const candidate of candidates) {
+    const candidateMs = parseOpencodeLogTimestampMs(candidate);
+    if (candidateMs == null) continue;
+    const deltaMs = Math.abs(candidateMs - wantedMs);
+    if (!best || deltaMs < best.deltaMs) best = { name: candidate, deltaMs };
+  }
+
+  // Avoid attaching an unrelated log if the timestamp mismatch is too large.
+  if (!best || best.deltaMs > 5 * 60 * 1000) return path;
+  return join(dir, best.name);
+}
+
 function sanitizeOpencodeLog(text: string): string {
   // Strip ANSI escape codes.
   let out = text.replace(/\x1b\[[0-9;]*m/g, "");
@@ -543,10 +601,15 @@ async function appendOpencodeLogTail(output: string): Promise<string> {
   const logPath = extractOpencodeLogPath(output);
   if (!logPath) return output;
 
-  const displayPath = redactHomePath(logPath);
+  const requestedPath = expandHomePath(logPath);
+  const resolvedPath = await resolveExistingOpencodeLogPath(requestedPath);
+  const requestedDisplayPath = redactHomePath(requestedPath);
+  const resolvedDisplayPath = redactHomePath(resolvedPath);
+  const usingHintLine =
+    resolvedPath !== requestedPath ? `Using nearest log (requested \`${requestedDisplayPath}\`)` : null;
 
   try {
-    const raw = await readFile(logPath, "utf8");
+    const raw = await readFile(resolvedPath, "utf8");
     const lines = raw.split("\n");
     const tailLines = lines.slice(Math.max(0, lines.length - 200));
     const tail = sanitizeOpencodeLog(tailLines.join("\n")).slice(0, 20000);
@@ -555,7 +618,8 @@ async function appendOpencodeLogTail(output: string): Promise<string> {
       output.trimEnd(),
       "",
       "---",
-      `OpenCode log tail (${displayPath})`,
+      `OpenCode log tail (${resolvedDisplayPath})`,
+      ...(usingHintLine ? [usingHintLine] : []),
       "```",
       tail.trimEnd(),
       "```",
@@ -567,7 +631,8 @@ async function appendOpencodeLogTail(output: string): Promise<string> {
       output.trimEnd(),
       "",
       "---",
-      `OpenCode log tail unavailable (${displayPath})`,
+      `OpenCode log tail unavailable (${resolvedDisplayPath})`,
+      ...(usingHintLine ? [usingHintLine] : []),
       "```",
       message.trimEnd(),
       "```",
