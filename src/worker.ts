@@ -35,6 +35,8 @@ import {
 } from "./session";
 import { buildPlannerPrompt } from "./planner-prompt";
 import { buildParentVerificationPrompt } from "./parent-verification-prompt";
+import { appendChildDossierToIssueContext } from "./child-dossier/core";
+import { collectChildCompletionDossier } from "./child-dossier/io";
 import { getThrottleDecision } from "./throttle";
 import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
 import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
@@ -3327,6 +3329,36 @@ ${guidance}`
         return `Issue context (prefetched)\nRepo: ${repo}\nIssue: #${issueNumber}\n\nIssue context unavailable: ${error.code} HTTP ${error.status}${requestId}${resumeAt}\n${truncate(error.message, 800)}`;
       }
       return `Issue context (prefetched)\nRepo: ${repo}\nIssue: #${issueNumber}\n\nIssue context unavailable: ${truncate(error?.message ?? String(error), 800)}`;
+    }
+  }
+
+  private async buildChildCompletionDossierText(params: { issueRef: IssueRef }): Promise<string | null> {
+    if (process.env.BUN_TEST || process.env.NODE_ENV === "test") return null;
+
+    try {
+      const snapshot = await this.getRelationshipSnapshot(params.issueRef, true);
+      if (!snapshot) return null;
+      const signals = this.buildRelationshipSignals(snapshot);
+      const result = await collectChildCompletionDossier({
+        parent: params.issueRef,
+        snapshot,
+        signals,
+      });
+
+      if (result.diagnostics.length > 0) {
+        console.log(
+          `[ralph:worker:${this.repo}] Child dossier diagnostics for ${params.issueRef.repo}#${params.issueRef.number}:
+            result.diagnostics.join("\n")
+          }`
+        );
+      }
+
+      return result.text ? result.text : null;
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to build child completion dossier: ${error?.message ?? String(error)}`
+      );
+      return null;
     }
   }
 
@@ -9212,7 +9244,15 @@ ${guidance}`
       const pausedPlan = await this.pauseIfHardThrottled(task, "plan");
       if (pausedPlan) return pausedPlan;
 
-      const issueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber });
+      const baseIssueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber });
+      let issueContext = baseIssueContext;
+      const issueRef = parseIssueRef(task.issue, this.repo);
+      if (issueRef) {
+        const dossierText = await this.buildChildCompletionDossierText({ issueRef });
+        if (dossierText) {
+          issueContext = appendChildDossierToIssueContext(baseIssueContext, dossierText);
+        }
+      }
       const plannerPrompt = buildPlannerPrompt({ repo: this.repo, issueNumber, issueContext });
       const planRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan", "starting");
 
