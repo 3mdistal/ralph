@@ -25,6 +25,8 @@ import { normalizeGitRef } from "../midpoint-labels";
 import { computeHeadBranchDeletionDecision } from "../pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "../midpoint-labeler";
 import { getAllowedOwners, getConfiguredGitHubAppSlug, isRepoAllowed } from "../github-app-auth";
+import { safeNoteName } from "./names";
+import { createWorktreeManager, type ResolveTaskRepoPathResult } from "./worktrees";
 import {
   continueCommand,
   continueSession,
@@ -469,14 +471,6 @@ export interface AgentRun {
   surveyResults?: string;
 }
 
-function safeNoteName(name: string): string {
-  return name
-    .replace(/[\\/]/g, " - ")
-    .replace(/[:*?"<>|]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function summarizeForNote(text: string, maxChars = 900): string {
   const trimmed = text.trim();
   if (!trimmed) return "";
@@ -693,6 +687,7 @@ export class RepoWorker {
   private throttle: ThrottleAdapter;
   private github: GitHubClient;
   private labelEnsurer: ReturnType<typeof createRalphWorkflowLabelsEnsurer>;
+  private worktrees: ReturnType<typeof createWorktreeManager>;
   private contextRecoveryContext: { task: AgentTask; repoPath: string; planPath: string } | null = null;
   private contextCompactAttempts = new Map<string, number>();
 
@@ -712,6 +707,12 @@ export class RepoWorker {
     this.queue = opts?.queue ?? DEFAULT_QUEUE_ADAPTER;
     this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
     this.throttle = opts?.throttle ?? DEFAULT_THROTTLE_ADAPTER;
+    this.worktrees = createWorktreeManager({
+      repo: this.repo,
+      repoPath: this.repoPath,
+      worktreesDir: RALPH_WORKTREES_DIR,
+      queue: this.queue,
+    });
     this.github = new GitHubClient(this.repo);
     this.relationships = opts?.relationships ?? new GitHubRelationshipProvider(this.repo, this.github);
     this.labelEnsurer = createRalphWorkflowLabelsEnsurer({
@@ -732,6 +733,32 @@ export class RepoWorker {
   private checkpointEvents = new CheckpointEventDeduper();
   private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
+
+  // Keep thin wrapper methods on RepoWorker for test hooks.
+  // Tests frequently monkeypatch these via `(worker as any)`.
+  private buildParentVerificationWorktreePath(issueNumber: string): string {
+    return this.worktrees.buildParentVerificationWorktreePath(issueNumber);
+  }
+
+  private async ensureGitWorktree(worktreePath: string): Promise<void> {
+    return await this.worktrees.ensureGitWorktree(worktreePath);
+  }
+
+  private async safeRemoveWorktree(worktreePath: string, opts?: { allowDiskCleanup?: boolean }): Promise<void> {
+    return await this.worktrees.safeRemoveWorktree(worktreePath, opts);
+  }
+
+  private async resolveTaskRepoPath(
+    task: AgentTask,
+    issueNumber: string,
+    mode: "start" | "resume",
+    repoSlot?: number | null
+  ): Promise<ResolveTaskRepoPathResult> {
+    return await this.worktrees.resolveTaskRepoPath(task, issueNumber, mode, repoSlot, {
+      ensureGitWorktree: (worktreePath) => this.ensureGitWorktree(worktreePath),
+      safeRemoveWorktree: (worktreePath, opts) => this.safeRemoveWorktree(worktreePath, opts),
+    });
+  }
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
@@ -1306,7 +1333,7 @@ export class RepoWorker {
     if (!status) return;
 
     const worktreePath = task["worktree-path"]?.trim();
-    if (worktreePath && !this.isSameRepoRootPath(worktreePath)) {
+    if (worktreePath && !this.worktrees.isSameRepoRootPath(worktreePath)) {
       console.warn(
         `[ralph:worker:${this.repo}] Repo root dirty but task is isolated in worktree (${phase}); continuing.`
       );
@@ -2673,254 +2700,8 @@ ${guidance}`
     return resolved.signals;
   }
 
-  private async resolveWorktreeRef(): Promise<string> {
-    const botBranch = getRepoBotBranch(this.repo);
-    try {
-      await $`git rev-parse --verify ${botBranch}`.cwd(this.repoPath).quiet();
-      return botBranch;
-    } catch {
-      return "HEAD";
-    }
-  }
-
-  private buildParentVerificationWorktreePath(issueNumber: string): string {
-    const repoKey = safeNoteName(this.repo);
-    return join(RALPH_WORKTREES_DIR, repoKey, `parent-verify-${issueNumber}`);
-  }
-
-  private isManagedWorktreePath(worktreePath: string, baseDir = RALPH_WORKTREES_DIR): boolean {
-    return isPathUnderDir(worktreePath, baseDir);
-  }
-
-  private isRepoWorktreePath(worktreePath: string): boolean {
-    const repoSlug = this.repo.split("/")[1] ?? this.repo;
-    const repoKey = safeNoteName(this.repo);
-    return (
-      this.isManagedWorktreePath(worktreePath, join(RALPH_WORKTREES_DIR, repoSlug)) ||
-      this.isManagedWorktreePath(worktreePath, join(RALPH_WORKTREES_DIR, repoKey))
-    );
-  }
-
-  private isSameRepoRootPath(worktreePath: string): boolean {
-    return this.normalizeRepoRootPath(this.repoPath) === this.normalizeRepoRootPath(worktreePath);
-  }
-
-  private normalizeRepoRootPath(path: string): string {
-    try {
-      return realpathSync(path);
-    } catch {
-      return resolve(path);
-    }
-  }
-
-  private isHealthyWorktreePath(worktreePath: string): boolean {
-    return existsSync(worktreePath) && existsSync(join(worktreePath, ".git"));
-  }
-
-  private async safeRemoveWorktree(worktreePath: string, opts?: { allowDiskCleanup?: boolean }): Promise<void> {
-    const allowDiskCleanup = opts?.allowDiskCleanup ?? false;
-
-    try {
-      await $`git worktree remove --force ${worktreePath}`.cwd(this.repoPath).quiet();
-      return;
-    } catch (e: any) {
-      const msg = e?.message ?? String(e);
-      console.warn(`[ralph:worker:${this.repo}] Failed to remove worktree ${worktreePath}: ${msg}`);
-    }
-
-    if (!allowDiskCleanup) return;
-
-    try {
-      await rm(worktreePath, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-  }
-
-  private async ensureGitWorktree(worktreePath: string): Promise<void> {
-    const hasHealthyWorktree = () => this.isHealthyWorktreePath(worktreePath);
-
-    const cleanupBrokenWorktree = async (): Promise<void> => {
-      try {
-        await $`git worktree remove --force ${worktreePath}`.cwd(this.repoPath).quiet();
-      } catch {
-        // ignore
-      }
-
-      try {
-        await rm(worktreePath, { recursive: true, force: true });
-      } catch {
-        // ignore
-      }
-    };
-
-    // If git knows about the worktree but the path is broken, clean it up.
-    try {
-      const list = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
-      const out = list.stdout.toString();
-      if (out.includes(`worktree ${worktreePath}\n`)) {
-        if (hasHealthyWorktree()) return;
-        console.warn(`[ralph:worker:${this.repo}] Worktree registered but unhealthy; recreating: ${worktreePath}`);
-        await cleanupBrokenWorktree();
-      }
-    } catch {
-      // ignore and attempt create
-    }
-
-    // If the directory exists but is not a valid git worktree, remove it.
-    if (existsSync(worktreePath) && !hasHealthyWorktree()) {
-      console.warn(`[ralph:worker:${this.repo}] Worktree path exists but is not a worktree; recreating: ${worktreePath}`);
-      await cleanupBrokenWorktree();
-    }
-
-    await mkdir(dirname(worktreePath), { recursive: true });
-
-    const ref = await this.resolveWorktreeRef();
-    const create = async () => {
-      await $`git worktree add --detach ${worktreePath} ${ref}`.cwd(this.repoPath).quiet();
-      if (!hasHealthyWorktree()) {
-        throw new Error(`Worktree created but missing .git marker: ${worktreePath}`);
-      }
-    };
-
-    try {
-      await create();
-    } catch (e: any) {
-      // Retry once after forcing cleanup. This handles half-created directories or stale git metadata.
-      await cleanupBrokenWorktree();
-      await create();
-    }
-  }
-
   private async cleanupGitWorktree(worktreePath: string): Promise<void> {
     await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: true });
-  }
-
-  private async cleanupOrphanedWorktrees(): Promise<void> {
-    const entries = await this.getGitWorktrees();
-    const knownWorktrees = new Set(entries.map((entry) => entry.worktreePath));
-
-    if (entries.length > 0) {
-      for (const entry of entries) {
-        if (!this.isRepoWorktreePath(entry.worktreePath)) continue;
-        if (this.isHealthyWorktreePath(entry.worktreePath)) continue;
-
-        console.warn(
-          `[ralph:worker:${this.repo}] Worktree registered but unhealthy; pruning: ${entry.worktreePath}`
-        );
-        await this.safeRemoveWorktree(entry.worktreePath, { allowDiskCleanup: false });
-      }
-    }
-
-    const repoRoot = this.repoPath;
-    const repoRootManaged = this.isManagedWorktreePath(repoRoot);
-    if (repoRootManaged) return;
-
-    const repoSlug = this.repo.split("/")[1] ?? this.repo;
-    const repoKey = safeNoteName(this.repo);
-
-    const repoCandidates = [join(RALPH_WORKTREES_DIR, repoSlug), join(RALPH_WORKTREES_DIR, repoKey)];
-
-    for (const repoDir of repoCandidates) {
-      if (!existsSync(repoDir)) continue;
-
-      let issueDirs: { name: string; isDirectory(): boolean }[] = [];
-      try {
-        issueDirs = await readdir(repoDir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-
-      for (const issueEntry of issueDirs) {
-        if (!issueEntry.isDirectory()) continue;
-        const issueDir = join(repoDir, issueEntry.name);
-
-        let taskDirs: { name: string; isDirectory(): boolean }[] = [];
-        try {
-          taskDirs = await readdir(issueDir, { withFileTypes: true });
-        } catch {
-          continue;
-        }
-
-        for (const taskEntry of taskDirs) {
-          if (!taskEntry.isDirectory()) continue;
-          const worktreeDir = join(issueDir, taskEntry.name);
-          if (knownWorktrees.has(worktreeDir)) continue;
-          if (!existsSync(worktreeDir)) continue;
-          if (!this.isRepoWorktreePath(worktreeDir)) continue;
-          if (this.isManagedWorktreePath(repoRoot, worktreeDir)) continue;
-          if (this.isSameRepoRootPath(worktreeDir)) continue;
-
-          console.warn(`[ralph:worker:${this.repo}] Stale worktree directory; pruning: ${worktreeDir}`);
-          await this.safeRemoveWorktree(worktreeDir, { allowDiskCleanup: true });
-        }
-      }
-    }
-  }
-
-  private async resolveTaskRepoPath(
-    task: AgentTask,
-    issueNumber: string,
-    mode: "start" | "resume",
-    repoSlot?: number | null
-  ): Promise<{ kind: "ok"; repoPath: string; worktreePath?: string } | { kind: "reset"; reason: string }> {
-    const recorded = task["worktree-path"]?.trim();
-    if (recorded) {
-      if (this.isSameRepoRootPath(recorded)) {
-        throw new Error(`Recorded worktree-path matches repo root; refusing to run in main checkout: ${recorded}`);
-      }
-      if (!this.isRepoWorktreePath(recorded)) {
-        throw new Error(`Recorded worktree-path is outside managed worktrees dir: ${recorded}`);
-      }
-      if (this.isHealthyWorktreePath(recorded)) {
-        return { kind: "ok", repoPath: recorded, worktreePath: recorded };
-      }
-      const reason = !existsSync(recorded)
-        ? `Recorded worktree-path does not exist: ${recorded}`
-        : `Recorded worktree-path is not a valid git worktree: ${recorded}`;
-
-      if (mode === "resume") {
-        console.warn(`[ralph:worker:${this.repo}] ${reason} (resetting task for retry)`);
-        const updated = await this.queue.updateTaskStatus(task, "queued", {
-          "session-id": "",
-          "worktree-path": "",
-          "worker-id": "",
-          "repo-slot": "",
-          "daemon-id": "",
-          "heartbeat-at": "",
-          "watchdog-retries": "",
-          "stall-retries": "",
-        });
-        if (!updated) {
-          throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
-        }
-        await this.safeRemoveWorktree(recorded, { allowDiskCleanup: true });
-        return { kind: "reset", reason: `${reason} (task reset to queued)` };
-      }
-
-      console.warn(`[ralph:worker:${this.repo}] ${reason} (recreating worktree)`);
-      await this.safeRemoveWorktree(recorded, { allowDiskCleanup: true });
-    }
-
-    if (mode === "resume") {
-      throw new Error("Missing worktree-path for in-progress task; refusing to resume in main checkout");
-    }
-
-    const resolvedSlot = typeof repoSlot === "number" && Number.isFinite(repoSlot) ? repoSlot : 0;
-    const taskKey = task._path || task._name || task.name;
-    const worktreePath = buildWorktreePath({
-      repo: this.repo,
-      issueNumber,
-      taskKey,
-      repoSlot: resolvedSlot,
-    });
-
-    await this.ensureGitWorktree(worktreePath);
-    await this.queue.updateTaskStatus(task, task.status === "in-progress" ? "in-progress" : "starting", {
-      "worktree-path": worktreePath,
-    });
-
-    return { kind: "ok", repoPath: worktreePath, worktreePath };
   }
 
   /**
@@ -3110,12 +2891,7 @@ ${guidance}`
   }
 
   private async getGitWorktrees(): Promise<GitWorktreeEntry[]> {
-    try {
-      const result = await $`git worktree list --porcelain`.cwd(this.repoPath).quiet();
-      return parseGitWorktreeListPorcelain(result.stdout.toString());
-    } catch {
-      return [];
-    }
+    return await this.worktrees.getGitWorktrees();
   }
 
   private async cleanupWorktreesOnStartup(): Promise<void> {
@@ -3128,7 +2904,7 @@ ${guidance}`
     }
 
     try {
-      await this.cleanupOrphanedWorktrees();
+      await this.worktrees.cleanupOrphanedWorktrees();
     } catch (e: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to cleanup orphaned worktrees on startup: ${e?.message ?? String(e)}`
@@ -3146,7 +2922,7 @@ ${guidance}`
 
   private async warnLegacyWorktreesOnStartup(): Promise<void> {
     const config = getConfig();
-    const entries = await this.getGitWorktrees();
+    const entries = await this.worktrees.getGitWorktrees();
     const legacy = detectLegacyWorktrees(entries, {
       devDir: config.devDir,
       managedRoot: RALPH_WORKTREES_DIR,
@@ -3169,21 +2945,7 @@ ${guidance}`
   }
 
   private async cleanupWorktreesForTasks(tasks: AgentTask[]): Promise<void> {
-    const managedPaths = new Set<string>();
-    for (const task of tasks) {
-      const recorded = task["worktree-path"]?.trim();
-      if (recorded) managedPaths.add(recorded);
-    }
-
-    for (const worktreePath of managedPaths) {
-      if (!this.isRepoWorktreePath(worktreePath)) continue;
-      if (this.isHealthyWorktreePath(worktreePath)) continue;
-
-      console.warn(
-        `[ralph:worker:${this.repo}] Recorded worktree-path unhealthy; pruning: ${worktreePath}`
-      );
-      await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: false });
-    }
+    await this.worktrees.cleanupWorktreesForTasks(tasks);
   }
 
   async runStartupCleanup(): Promise<void> {
