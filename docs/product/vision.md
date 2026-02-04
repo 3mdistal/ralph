@@ -92,6 +92,10 @@ Log tool calls and detect when agents get stuck (tool-result-as-text loops). Aut
 - Soft timeout: log-only heartbeat (no interruption)
 - Hard timeout: kill the in-flight run, re-queue once with a cleared `session-id`, then escalate if it repeats
 
+**Long-run guardrail policy:** Prefer early checkpoints over hitting the session fallback timeout.
+- When wall time or tool churn crosses a threshold, interrupt before the fallback timeout and force a bounded checkpoint (PR URL or smaller plan).
+- If it repeats, escalate with a bounded decision packet (session id + run log path).
+
 **Diagnostics policy:** When OpenCode crashes and prints a log file path, Ralph may attach a redacted tail of that log to the error note to preserve debugging context before logs rotate. Redact obvious tokens (GitHub tokens, Bearer tokens, etc.), redact the local home directory in paths and attached excerpts (replace with `~`), and keep the attachment bounded (e.g. ~200 lines / 20k chars). These logs are local diagnostics artifacts and should not be posted externally (issues/PRs) without manual review.
 
 **Stability policy:** OpenCode runs isolate `XDG_CACHE_HOME` for safe parallelism.

@@ -31,6 +31,19 @@ const STATUS_TOKEN_TIMEOUT_MS = 5_000;
 const STATUS_TOKEN_CONCURRENCY = 3;
 const STATUS_TOKEN_BUDGET_MS = 4_000;
 
+const DISABLE_GITHUB_QUEUE_SWEEPS_ENV = "RALPH_GITHUB_QUEUE_DISABLE_SWEEPS";
+
+async function withEnv<T>(name: string, value: string, fn: () => Promise<T>): Promise<T> {
+  const prior = process.env[name];
+  process.env[name] = value;
+  try {
+    return await fn();
+  } finally {
+    if (prior === undefined) delete process.env[name];
+    else process.env[name] = prior;
+  }
+}
+
 export type StatusDrainState = {
   requestedAt: number | null;
   timeoutMs: number | null;
@@ -91,14 +104,19 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
           ? "soft-throttled"
           : "running";
 
-  const [starting, inProgress, queued, throttled, blocked, pendingEscalations] = await Promise.all([
-    getTasksByStatus("starting"),
-    getTasksByStatus("in-progress"),
-    getQueuedTasks(),
-    getTasksByStatus("throttled"),
-    getTasksByStatus("blocked"),
-    getEscalationsByStatus("pending"),
-  ]);
+  const [starting, inProgress, queued, throttled, blocked, pendingEscalations] = await withEnv(
+    DISABLE_GITHUB_QUEUE_SWEEPS_ENV,
+    "1",
+    async () =>
+      await Promise.all([
+        getTasksByStatus("starting"),
+        getTasksByStatus("in-progress"),
+        getQueuedTasks(),
+        getTasksByStatus("throttled"),
+        getTasksByStatus("blocked"),
+        getEscalationsByStatus("pending"),
+      ])
+  );
 
   const blockedSorted = [...blocked].sort((a, b) => {
     const priorityDelta = priorityRank(a.priority) - priorityRank(b.priority);

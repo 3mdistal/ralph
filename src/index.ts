@@ -532,7 +532,7 @@ function reserveRepoSlotForTask(task: AgentTask): { slot: number; release: () =>
 }
 
 async function seedRepoSlotReservations(): Promise<void> {
-  const statuses: AgentTask["status"][] = ["starting", "in-progress", "throttled"];
+  const statuses: AgentTask["status"][] = ["starting", "in-progress", "paused", "throttled"];
   const tasks = (await Promise.all(statuses.map((status) => getTasksByStatus(status)))).flat();
   if (tasks.length === 0) return;
 

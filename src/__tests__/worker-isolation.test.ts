@@ -1,9 +1,10 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, mock, test } from "bun:test";
 import { RepoWorker } from "../worker";
 
 describe("worker isolation guardrails", () => {
-  test("resume requires a recorded worktree path", async () => {
-    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+  test("resume resets missing worktree path without using repo root", async () => {
+    const updateTaskStatusMock = mock(async () => true);
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { queue: { updateTaskStatus: updateTaskStatusMock } });
     const task = {
       _path: "orchestration/tasks/test-task.md",
       _name: "test-task",
@@ -18,9 +19,10 @@ describe("worker isolation guardrails", () => {
       "session-id": "ses_123",
     } as any;
 
-    await expect((worker as any).resolveTaskRepoPath(task, "102", "resume")).rejects.toThrow(
-      "Missing worktree-path for in-progress task; refusing to resume in main checkout"
-    );
+    const result = await (worker as any).resolveTaskRepoPath(task, "102", "resume");
+
+    expect(result.kind).toBe("reset");
+    expect(updateTaskStatusMock.mock.calls.length).toBeGreaterThan(0);
   });
 
   test("rejects worktree path that matches repo root", async () => {
