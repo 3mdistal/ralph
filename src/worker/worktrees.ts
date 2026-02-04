@@ -234,6 +234,48 @@ export function createWorktreeManager(params: {
     const ensureWorktree = io?.ensureGitWorktree ?? ensureGitWorktree;
     const removeWorktree = io?.safeRemoveWorktree ?? safeRemoveWorktree;
 
+    const bestEffortResetQueued = async (reason: string): Promise<ResolveTaskRepoPathResult> => {
+      console.warn(`[ralph:worker:${params.repo}] ${reason} (resetting task for retry)`);
+      const patch: Record<string, string> = {
+        "session-id": "",
+        "worktree-path": "",
+        "worker-id": "",
+        "repo-slot": "",
+        "daemon-id": "",
+        "heartbeat-at": "",
+        "watchdog-retries": "",
+        "stall-retries": "",
+      };
+
+      // Best-effort: avoid throwing during resume path recovery.
+      // Retry once to handle transient queue write failures.
+      let updated = false;
+      try {
+        updated = await params.queue.updateTaskStatus(task, "queued", patch);
+      } catch {
+        // best-effort
+      }
+      if (!updated) {
+        try {
+          await params.queue.updateTaskStatus(task, "queued", patch);
+        } catch {
+          // best-effort
+        }
+      }
+
+      // Keep the in-memory task consistent with the reset signal.
+      try {
+        task.status = "queued";
+        for (const [k, v] of Object.entries(patch)) {
+          (task as unknown as Record<string, unknown>)[k] = v;
+        }
+      } catch {
+        // best-effort
+      }
+
+      return { kind: "reset", reason: `${reason} (task reset to queued)` };
+    };
+
     const recorded = task["worktree-path"]?.trim();
     if (recorded) {
       if (isSameRepoRootPath(recorded)) {
@@ -250,22 +292,9 @@ export function createWorktreeManager(params: {
         : `Recorded worktree-path is not a valid git worktree: ${recorded}`;
 
       if (mode === "resume") {
-        console.warn(`[ralph:worker:${params.repo}] ${reason} (resetting task for retry)`);
-        const updated = await params.queue.updateTaskStatus(task, "queued", {
-          "session-id": "",
-          "worktree-path": "",
-          "worker-id": "",
-          "repo-slot": "",
-          "daemon-id": "",
-          "heartbeat-at": "",
-          "watchdog-retries": "",
-          "stall-retries": "",
-        });
-        if (!updated) {
-          throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
-        }
+        const result = await bestEffortResetQueued(reason);
         await removeWorktree(recorded, { allowDiskCleanup: true });
-        return { kind: "reset", reason: `${reason} (task reset to queued)` };
+        return result;
       }
 
       console.warn(`[ralph:worker:${params.repo}] ${reason} (recreating worktree)`);
@@ -273,7 +302,7 @@ export function createWorktreeManager(params: {
     }
 
     if (mode === "resume") {
-      throw new Error("Missing worktree-path for in-progress task; refusing to resume in main checkout");
+      return await bestEffortResetQueued("Missing worktree-path for in-progress task; refusing to resume in main checkout");
     }
 
     const resolvedSlot = typeof repoSlot === "number" && Number.isFinite(repoSlot) ? repoSlot : 0;
