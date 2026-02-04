@@ -14,6 +14,7 @@ import { GitHubClient } from "./client";
 import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels";
 import { GitHubRelationshipProvider } from "./issue-relationships";
 import { resolveRelationshipSignals } from "./relationship-signals";
+import { logRelationshipDiagnostics } from "./relationship-diagnostics";
 
 const RALPH_LABEL_QUEUED = "ralph:status:queued";
 const RALPH_LABEL_BLOCKED = "ralph:status:blocked";
@@ -172,6 +173,7 @@ async function runAutoQueueOnce(params: {
     }
 
     const resolved = resolveRelationshipSignals(snapshot);
+    logRelationshipDiagnostics({ repo: issue.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "auto-queue" });
     const decision = computeBlockedDecision(resolved.signals);
     const plan = computeAutoQueueLabelPlan({ issue, blocked: decision, scope: autoQueue.scope });
 
