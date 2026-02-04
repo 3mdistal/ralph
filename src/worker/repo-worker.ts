@@ -156,7 +156,6 @@ import {
   recordRalphRunGateArtifact,
   upsertIdempotencyKey,
   recordIssueSnapshot,
-  recordPrSnapshot,
   recordIssueLabelsSnapshot,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
@@ -266,6 +265,10 @@ import {
   parseGhRunId,
 } from "./ci/ci-utils";
 import { runCiFailureTriage as runCiFailureTriageImpl } from "./ci/remediation";
+import {
+  recordPrSnapshotBestEffort as recordPrSnapshotBestEffortImpl,
+  updateOpenPrSnapshot as updateOpenPrSnapshotImpl,
+} from "./pr-snapshots";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -1580,20 +1583,13 @@ export class RepoWorker {
   }
 
   private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {
-    try {
-      recordPrSnapshot({ repo: this.repo, issue: input.issue, prUrl: input.prUrl, state: input.state });
-    } catch (error: any) {
-      console.warn(`[ralph:worker:${this.repo}] Failed to record PR snapshot: ${error?.message ?? String(error)}`);
-    }
+    return recordPrSnapshotBestEffortImpl({ repo: this.repo }, input);
   }
 
   private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string, nextPrUrl: string | null): string;
   private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string | null, nextPrUrl: string | null): string | null;
   private updateOpenPrSnapshot(task: AgentTask, currentPrUrl: string | null, nextPrUrl: string | null): string | null {
-    if (!nextPrUrl) return currentPrUrl;
-    if (nextPrUrl === currentPrUrl) return currentPrUrl;
-    this.recordPrSnapshotBestEffort({ issue: task.issue, prUrl: nextPrUrl, state: PR_STATE_OPEN });
-    return nextPrUrl;
+    return updateOpenPrSnapshotImpl({ repo: this.repo }, task, currentPrUrl, nextPrUrl);
   }
 
   private getIssuePrResolution(issueNumber: string): Promise<ResolvedIssuePr> {
