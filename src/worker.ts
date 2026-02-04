@@ -300,6 +300,35 @@ type CiDebugRecoveryOutcome =
       run: AgentRun;
     };
 
+type CiFailureTriageOutcome =
+  | {
+      status: "success";
+      prUrl: string;
+      sessionId: string;
+      headSha: string;
+      summary: RequiredChecksSummary;
+    }
+  | {
+      status: "failed" | "escalated" | "throttled";
+      run: AgentRun;
+    };
+
+type CiTriageRecord = {
+  version: 1;
+  signatureVersion: 2;
+  signature: string;
+  classification: CiFailureClassification;
+  classificationReason: string;
+  action: CiNextAction;
+  actionReason: string;
+  timedOut: boolean;
+  attempt: number;
+  maxAttempts: number;
+  priorSignature: string | null;
+  failingChecks: Array<{ name: string; rawState: string; detailsUrl?: string | null }>;
+  commands: string[];
+};
+
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
   runAgent,
   continueSession,
