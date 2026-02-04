@@ -48,6 +48,8 @@ export interface QueueTask {
   "watchdog-retries"?: string;
   /** Stall recovery attempts (string in frontmatter) */
   "stall-retries"?: string;
+  /** Long-run guardrail recovery attempts (string in frontmatter) */
+  "guardrail-retries"?: string;
   /** Blocked reason category */
   "blocked-source"?: BlockedSource;
   /** Short explanation of block reason */

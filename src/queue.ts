@@ -52,6 +52,7 @@ const TASK_FINGERPRINT_FIELDS = [
   "repo-slot",
   "watchdog-retries",
   "stall-retries",
+  "guardrail-retries",
   "blocked-source",
   "blocked-reason",
   "blocked-at",

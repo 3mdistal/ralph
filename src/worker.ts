@@ -119,6 +119,7 @@ import { buildLoopTripDetails } from "./loop-detection/format";
 import { BLOCKED_SOURCES, type BlockedSource } from "./blocked-sources";
 import { computeBlockedDecision, type RelationshipSignal } from "./github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "./github/issue-ref";
+import { DEFAULT_WATCHDOG_THRESHOLDS_MS } from "./watchdog";
 import {
   GitHubRelationshipProvider,
   type IssueRelationshipProvider,
@@ -4959,6 +4960,7 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(params.task, `merge-conflict-${attemptNumber}`),
       ...this.buildStallOptions(params.task, `merge-conflict-${attemptNumber}`),
+      ...this.buildGuardrailsOptions(params.task, `merge-conflict-${attemptNumber}`),
       ...this.buildLoopDetectionOptions(params.task, `merge-conflict-${attemptNumber}`),
       ...params.opencodeSessionOptions,
     });
@@ -4976,6 +4978,18 @@ ${guidance}`
     if (sessionResult.loopTrip) {
       await this.cleanupGitWorktree(worktreePath);
       const run = await this.handleLoopTrip(params.task, params.cacheKey, `merge-conflict-${attemptNumber}`, sessionResult);
+      return { status: "failed", run };
+    }
+
+    if (sessionResult.guardrailTimeout) {
+      await this.cleanupGitWorktree(worktreePath);
+      const run = await this.handleGuardrailTimeout(
+        params.task,
+        params.cacheKey,
+        `merge-conflict-${attemptNumber}`,
+        sessionResult,
+        params.opencodeXdg
+      );
       return { status: "failed", run };
     }
 
@@ -5410,6 +5424,7 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(params.task, `ci-resume-${attemptNumber}`),
       ...this.buildStallOptions(params.task, `ci-resume-${attemptNumber}`),
+      ...this.buildGuardrailsOptions(params.task, `ci-resume-${attemptNumber}`),
       ...this.buildLoopDetectionOptions(params.task, `ci-resume-${attemptNumber}`),
       ...params.opencodeSessionOptions,
     });
@@ -5425,6 +5440,17 @@ ${guidance}`
 
     if (sessionResult.watchdogTimeout) {
       const run = await this.handleWatchdogTimeout(
+        params.task,
+        params.cacheKey,
+        `ci-resume-${attemptNumber}`,
+        sessionResult,
+        params.opencodeXdg
+      );
+      return { status: "failed", run };
+    }
+
+    if (sessionResult.guardrailTimeout) {
+      const run = await this.handleGuardrailTimeout(
         params.task,
         params.cacheKey,
         `ci-resume-${attemptNumber}`,
@@ -5668,6 +5694,7 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(params.task, `ci-debug-${attemptNumber}`),
       ...this.buildStallOptions(params.task, `ci-debug-${attemptNumber}`),
+      ...this.buildGuardrailsOptions(params.task, `ci-debug-${attemptNumber}`),
       ...this.buildLoopDetectionOptions(params.task, `ci-debug-${attemptNumber}`),
       ...params.opencodeSessionOptions,
     });
@@ -5681,6 +5708,18 @@ ${guidance}`
     if (sessionResult.watchdogTimeout) {
       await this.cleanupGitWorktree(worktreePath);
       const run = await this.handleWatchdogTimeout(
+        params.task,
+        params.cacheKey,
+        `ci-debug-${attemptNumber}`,
+        sessionResult,
+        params.opencodeXdg
+      );
+      return { status: "failed", run };
+    }
+
+    if (sessionResult.guardrailTimeout) {
+      await this.cleanupGitWorktree(worktreePath);
+      const run = await this.handleGuardrailTimeout(
         params.task,
         params.cacheKey,
         `ci-debug-${attemptNumber}`,
@@ -5928,6 +5967,7 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(task, "survey"),
       ...this.buildStallOptions(task, "survey"),
+      ...this.buildGuardrailsOptions(task, "survey"),
       ...this.buildLoopDetectionOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
@@ -5936,6 +5976,10 @@ ${guidance}`
 
     if (!surveyResult.success && surveyResult.loopTrip) {
       return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
+    }
+
+    if (!surveyResult.success && surveyResult.guardrailTimeout) {
+      return await this.handleGuardrailTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
@@ -6074,6 +6118,7 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(task, "survey"),
       ...this.buildStallOptions(task, "survey"),
+      ...this.buildGuardrailsOptions(task, "survey"),
       ...this.buildLoopDetectionOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
@@ -6082,6 +6127,10 @@ ${guidance}`
 
     if (!surveyResult.success && surveyResult.loopTrip) {
       return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
+    }
+
+    if (!surveyResult.success && surveyResult.guardrailTimeout) {
+      return await this.handleGuardrailTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
@@ -6168,11 +6217,12 @@ ${guidance}`
             step: 2,
             stepTitle: stage,
           },
-          ...this.buildWatchdogOptions(task, stage),
-          ...this.buildStallOptions(task, stage),
-          ...this.buildLoopDetectionOptions(task, stage),
-          ...opencodeSessionOptions,
-        })
+           ...this.buildWatchdogOptions(task, stage),
+           ...this.buildStallOptions(task, stage),
+           ...this.buildGuardrailsOptions(task, stage),
+           ...this.buildLoopDetectionOptions(task, stage),
+           ...opencodeSessionOptions,
+         })
       : await this.session.runAgent(taskRepoPath, "general", prompt, {
           repo: this.repo,
           cacheKey,
@@ -6184,11 +6234,12 @@ ${guidance}`
             step: 2,
             stepTitle: stage,
           },
-          ...this.buildWatchdogOptions(task, stage),
-          ...this.buildStallOptions(task, stage),
-          ...this.buildLoopDetectionOptions(task, stage),
-          ...opencodeSessionOptions,
-        });
+           ...this.buildWatchdogOptions(task, stage),
+           ...this.buildStallOptions(task, stage),
+           ...this.buildGuardrailsOptions(task, stage),
+           ...this.buildLoopDetectionOptions(task, stage),
+           ...opencodeSessionOptions,
+         });
 
     if (resumeSessionId) {
       await this.recordImplementationCheckpoint(task, recoveryResult.sessionId || resumeSessionId);
@@ -6200,6 +6251,10 @@ ${guidance}`
     if (!recoveryResult.success) {
       if (recoveryResult.loopTrip) {
         return await this.handleLoopTrip(task, cacheKey, stage, recoveryResult);
+      }
+
+      if (recoveryResult.guardrailTimeout) {
+        return await this.handleGuardrailTimeout(task, cacheKey, stage, recoveryResult, opencodeXdg);
       }
       if (recoveryResult.watchdogTimeout) {
         return await this.handleWatchdogTimeout(task, cacheKey, stage, recoveryResult, opencodeXdg);
@@ -6265,6 +6320,7 @@ ${guidance}`
       },
       ...this.buildWatchdogOptions(task, "survey"),
       ...this.buildStallOptions(task, "survey"),
+      ...this.buildGuardrailsOptions(task, "survey"),
       ...this.buildLoopDetectionOptions(task, "survey"),
       ...opencodeSessionOptions,
     });
@@ -6280,6 +6336,10 @@ ${guidance}`
 
     if (!surveyResult.success && surveyResult.loopTrip) {
       return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
+    }
+
+    if (!surveyResult.success && surveyResult.guardrailTimeout) {
+      return await this.handleGuardrailTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
     }
 
     if (!surveyResult.success && surveyResult.watchdogTimeout) {
@@ -7314,6 +7374,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(params.task, "parent-verify"),
         ...this.buildStallOptions(params.task, "parent-verify"),
+        ...this.buildGuardrailsOptions(params.task, "parent-verify"),
         ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
         ...(params.opencodeSessionOptions ?? {}),
       });
@@ -7342,6 +7403,10 @@ ${guidance}`
 
     if (result.loopTrip) {
       return await this.handleLoopTrip(params.task, `parent-verify-${params.issueNumber}`, "parent-verify", result);
+    }
+
+    if (result.guardrailTimeout) {
+      return await this.deferParentVerification(params.task, "parent verification guardrail tripped");
     }
 
     if (!result.success) {
@@ -7482,6 +7547,12 @@ ${guidance}`
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
   }
 
+  private getGuardrailRetryCount(task: AgentTask): number {
+    const raw = task["guardrail-retries"];
+    const parsed = Number.parseInt(String(raw ?? "0"), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
   private buildWatchdogOptions(task: AgentTask, stage: string) {
     const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
@@ -7506,6 +7577,44 @@ ${guidance}`
       stall: {
         enabled: cfg?.enabled ?? true,
         idleMs,
+        context,
+      },
+    };
+  }
+
+  private buildGuardrailsOptions(task: AgentTask, stage: string, mode: "normal" | "checkpoint" = "normal") {
+    const watchdogCfg = getConfig().watchdog;
+    const bashHardMs =
+      watchdogCfg?.thresholdsMs?.bash?.hardMs ??
+      DEFAULT_WATCHDOG_THRESHOLDS_MS.bash.hardMs;
+
+    const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
+
+    if (mode === "checkpoint") {
+      return {
+        guardrails: {
+          enabled: true,
+          wallSoftMs: 2 * 60_000,
+          wallHardMs: 4 * 60_000,
+          toolCallsSoft: 150,
+          toolCallsHard: 250,
+          softLogIntervalMs: 30_000,
+          context,
+        },
+      };
+    }
+
+    const wallHardMs = Math.max(60_000, bashHardMs - 2 * 60_000);
+    const wallSoftMs = Math.max(30_000, wallHardMs - 5 * 60_000);
+
+    return {
+      guardrails: {
+        enabled: true,
+        wallSoftMs,
+        wallHardMs,
+        toolCallsSoft: 800,
+        toolCallsHard: 1400,
+        softLogIntervalMs: 60_000,
         context,
       },
     };
@@ -7795,6 +7904,7 @@ ${guidance}`
             runLogPath,
             ...this.buildWatchdogOptions(task, `nudge-${stage}`),
             ...this.buildStallOptions(task, `nudge-${stage}`),
+            ...this.buildGuardrailsOptions(task, `nudge-${stage}`, "checkpoint"),
             ...this.buildLoopDetectionOptions(task, `nudge-${stage}`),
             ...opencodeSessionOptions,
           });
@@ -8146,6 +8256,163 @@ ${guidance}`
     };
   }
 
+  private async handleGuardrailTimeout(
+    task: AgentTask,
+    cacheKey: string,
+    stage: string,
+    result: SessionResult,
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string }
+  ): Promise<AgentRun> {
+    const timeout = result.guardrailTimeout;
+    const retryCount = this.getGuardrailRetryCount(task);
+    const nextRetryCount = retryCount + 1;
+
+    const sessionId = (result.sessionId || task["session-id"]?.trim() || "").trim();
+    const worktreePath = (task["worktree-path"]?.trim() || "").trim();
+    const repoPath = worktreePath && existsSync(worktreePath) ? worktreePath : this.repoPath;
+
+    const reason = timeout
+      ? timeout.reason === "tool-churn"
+        ? `Session guardrail tripped: tool churn (${timeout.toolStartCount} tool starts) (${stage})`
+        : `Session guardrail tripped: wall time ${Math.round(timeout.elapsedMs / 1000)}s (${stage})`
+      : `Session guardrail tripped (${stage})`;
+
+    const issueNumber = task.issue.match(/#(\d+)$/)?.[1] ?? cacheKey;
+    const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
+
+    if (retryCount === 0) {
+      let checkpointOutput: string | null = null;
+
+      if (sessionId) {
+        const message = [
+          "Long-running guardrail tripped. Do NOT continue expanding scope.",
+          "",
+          "Do ONE of the following:",
+          "1) If you have meaningful partial progress: open a PR targeting bot/integration now and reply with the PR URL.",
+          "2) If not ready for a PR: write a small checkpoint plan (<=8 bullets) with exact next commands and file paths.",
+          "",
+          "Then stop.",
+        ].join("\n");
+
+        try {
+          const runLogPath = await this.recordRunLogPath(task, issueNumber, `guardrail-${stage}`, "in-progress");
+          const checkpointResult = await this.session.continueSession(repoPath, sessionId, message, {
+            repo: this.repo,
+            cacheKey,
+            runLogPath,
+            ...this.buildWatchdogOptions(task, `guardrail-${stage}`),
+            ...this.buildStallOptions(task, `guardrail-${stage}`),
+            ...this.buildGuardrailsOptions(task, `guardrail-${stage}`, "checkpoint"),
+            ...this.buildLoopDetectionOptions(task, `guardrail-${stage}`),
+            ...opencodeSessionOptions,
+          });
+
+          await this.recordImplementationCheckpoint(task, checkpointResult.sessionId || sessionId);
+          checkpointOutput = checkpointResult.output;
+        } catch (error: any) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Guardrail checkpoint prompt failed for ${task.issue}: ${error?.message ?? String(error)}`
+          );
+        }
+      }
+
+      const truncated = checkpointOutput
+        ? redactSensitiveText(String(checkpointOutput)).trim().slice(0, 800)
+        : null;
+
+      const details = [
+        timeout?.context ? `Context: ${timeout.context}` : null,
+        timeout?.reason ? `Reason: ${timeout.reason}` : null,
+        timeout?.elapsedMs != null ? `Elapsed: ${Math.round(timeout.elapsedMs / 1000)}s` : null,
+        timeout?.toolStartCount != null ? `Tool starts: ${timeout.toolStartCount}` : null,
+        truncated ? `Checkpoint output (truncated): ${truncated}` : null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      console.warn(`[ralph:worker:${this.repo}] Guardrail tripped; re-queuing for resume: ${reason}`);
+      await this.queue.updateTaskStatus(task, "queued", {
+        "session-id": sessionId,
+        "guardrail-retries": String(nextRetryCount),
+        "blocked-source": "guardrail",
+        "blocked-reason": reason,
+        "blocked-details": details,
+        "blocked-at": new Date().toISOString(),
+        "blocked-checked-at": new Date().toISOString(),
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: reason,
+      };
+    }
+
+    console.log(`[ralph:worker:${this.repo}] Guardrail repeated; escalating: ${reason}`);
+
+    const escalationFields: Record<string, string> = {
+      "guardrail-retries": String(nextRetryCount),
+    };
+    if (sessionId) escalationFields["session-id"] = sessionId;
+
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
+    if (escalated) {
+      applyTaskPatch(task, "escalated", escalationFields);
+    }
+
+    const details = [
+      timeout?.context ? `Context: ${timeout.context}` : null,
+      timeout?.reason ? `Reason: ${timeout.reason}` : null,
+      timeout?.elapsedMs != null ? `Elapsed: ${Math.round(timeout.elapsedMs / 1000)}s` : null,
+      timeout?.toolStartCount != null ? `Tool starts: ${timeout.toolStartCount}` : null,
+      sessionId ? `Session: ${sessionId}` : null,
+      task["run-log-path"]?.trim() ? `Run log: ${task["run-log-path"]?.trim()}` : null,
+      sessionId ? `Events: ${getSessionEventsPath(sessionId)}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const githubCommentUrl = await this.writeEscalationWriteback(task, {
+      reason,
+      details: details || undefined,
+      escalationType: "other",
+    });
+
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      sessionId: sessionId || undefined,
+      reason,
+      escalationType: "other",
+      githubCommentUrl: githubCommentUrl ?? undefined,
+      planOutput: result.output,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        sessionId: sessionId || undefined,
+        details: result.output,
+      });
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: sessionId || undefined,
+      escalationReason: reason,
+    };
+  }
+
   private async handleLoopTrip(task: AgentTask, cacheKey: string, stage: string, result: SessionResult): Promise<AgentRun> {
     const trip = result.loopTrip;
     const sessionId = result.sessionId || task["session-id"]?.trim() || "";
@@ -8402,6 +8669,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(task, "resume"),
         ...this.buildStallOptions(task, "resume"),
+        ...this.buildGuardrailsOptions(task, "resume"),
         ...this.buildLoopDetectionOptions(task, "resume"),
         ...opencodeSessionOptions,
       });
@@ -8414,6 +8682,9 @@ ${guidance}`
       if (!buildResult.success) {
         if (buildResult.loopTrip) {
           return await this.handleLoopTrip(task, cacheKey, "resume", buildResult);
+        }
+        if (buildResult.guardrailTimeout) {
+          return await this.handleGuardrailTimeout(task, cacheKey, "resume", buildResult, opencodeXdg);
         }
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult, opencodeXdg);
@@ -8555,6 +8826,7 @@ ${guidance}`
               },
               ...this.buildWatchdogOptions(task, "resume-loop-break"),
               ...this.buildStallOptions(task, "resume-loop-break"),
+              ...this.buildGuardrailsOptions(task, "resume-loop-break", "checkpoint"),
               ...this.buildLoopDetectionOptions(task, "resume-loop-break"),
               ...opencodeSessionOptions,
             }
@@ -8572,6 +8844,9 @@ ${guidance}`
             if (!buildResult.success) {
               if (buildResult.loopTrip) {
                 return await this.handleLoopTrip(task, cacheKey, "resume-loop-break", buildResult);
+              }
+              if (buildResult.guardrailTimeout) {
+                return await this.handleGuardrailTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
               }
               if (buildResult.watchdogTimeout) {
                 return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
@@ -8690,6 +8965,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, "resume-continue"),
           ...this.buildStallOptions(task, "resume-continue"),
+          ...this.buildGuardrailsOptions(task, "resume-continue", "checkpoint"),
           ...this.buildLoopDetectionOptions(task, "resume-continue"),
           ...opencodeSessionOptions,
         });
@@ -8706,6 +8982,9 @@ ${guidance}`
         if (!buildResult.success) {
           if (buildResult.loopTrip) {
             return await this.handleLoopTrip(task, cacheKey, "resume-continue", buildResult);
+          }
+          if (buildResult.guardrailTimeout) {
+            return await this.handleGuardrailTimeout(task, cacheKey, "resume-continue", buildResult, opencodeXdg);
           }
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult, opencodeXdg);
@@ -8861,6 +9140,7 @@ ${guidance}`
         runLogPath: resumeSurveyRunLogPath,
         ...this.buildWatchdogOptions(task, "resume-survey"),
         ...this.buildStallOptions(task, "resume-survey"),
+        ...this.buildGuardrailsOptions(task, "resume-survey"),
         ...this.buildLoopDetectionOptions(task, "resume-survey"),
         ...opencodeSessionOptions,
       });
@@ -8878,6 +9158,9 @@ ${guidance}`
       if (!surveyResult.success) {
         if (surveyResult.loopTrip) {
           return await this.handleLoopTrip(task, cacheKey, "resume-survey", surveyResult);
+        }
+        if (surveyResult.guardrailTimeout) {
+          return await this.handleGuardrailTimeout(task, cacheKey, "resume-survey", surveyResult, opencodeXdg);
         }
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult, opencodeXdg);
@@ -9047,6 +9330,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(params.task, "parent-verify"),
         ...this.buildStallOptions(params.task, "parent-verify"),
+        ...this.buildGuardrailsOptions(params.task, "parent-verify"),
         ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
         ...(params.opencodeSessionOptions ?? {}),
       });
@@ -9060,6 +9344,13 @@ ${guidance}`
 
       if (verifyResult.loopTrip) {
         return await this.handleLoopTrip(params.task, verifyCacheKey, "parent-verify", verifyResult);
+      }
+
+      if (verifyResult.guardrailTimeout) {
+        console.warn(
+          `[ralph:worker:${this.repo}] Parent verification guardrail tripped; continuing with normal flow for ${params.task.issue}.`
+        );
+        return null;
       }
 
       if (!verifyResult.success && verifyResult.watchdogTimeout) {
@@ -9340,6 +9631,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(task, "plan"),
         ...this.buildStallOptions(task, "plan"),
+        ...this.buildGuardrailsOptions(task, "plan"),
         ...this.buildLoopDetectionOptions(task, "plan"),
         ...opencodeSessionOptions,
       });
@@ -9353,6 +9645,10 @@ ${guidance}`
 
       if (!planResult.success && planResult.stallTimeout) {
         return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
+      }
+
+      if (!planResult.success && planResult.guardrailTimeout) {
+        return await this.handleGuardrailTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
       }
 
       if (!planResult.success && planResult.loopTrip) {
@@ -9377,6 +9673,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, "plan-retry"),
           ...this.buildStallOptions(task, "plan-retry"),
+          ...this.buildGuardrailsOptions(task, "plan-retry"),
           ...this.buildLoopDetectionOptions(task, "plan-retry"),
           ...opencodeSessionOptions,
         });
@@ -9392,6 +9689,10 @@ ${guidance}`
 
         if (planResult.stallTimeout) {
           return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
+        }
+
+        if (planResult.guardrailTimeout) {
+          return await this.handleGuardrailTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
         }
 
         const reason = `planner failed: ${planResult.output}`;
@@ -9463,6 +9764,7 @@ ${guidance}`
             stepTitle: "consult devex",
           },
           ...this.buildStallOptions(task, "consult devex"),
+          ...this.buildGuardrailsOptions(task, "consult devex", "checkpoint"),
           ...this.buildLoopDetectionOptions(task, "consult devex"),
           ...opencodeSessionOptions,
         });
@@ -9479,6 +9781,9 @@ ${guidance}`
         if (!devexResult.success) {
           if (devexResult.loopTrip) {
             return await this.handleLoopTrip(task, cacheKey, "consult devex", devexResult);
+          }
+          if (devexResult.guardrailTimeout) {
+            return await this.handleGuardrailTimeout(task, cacheKey, "consult devex", devexResult, opencodeXdg);
           }
           if (devexResult.stallTimeout) {
             return await this.handleStallTimeout(task, cacheKey, "consult devex", devexResult);
@@ -9528,6 +9833,7 @@ ${guidance}`
               stepTitle: "reroute after devex",
             },
             ...this.buildStallOptions(task, "reroute after devex"),
+            ...this.buildGuardrailsOptions(task, "reroute after devex", "checkpoint"),
             ...this.buildLoopDetectionOptions(task, "reroute after devex"),
             ...opencodeSessionOptions,
           });
@@ -9544,6 +9850,9 @@ ${guidance}`
           if (!rerouteResult.success) {
             if (rerouteResult.loopTrip) {
               return await this.handleLoopTrip(task, cacheKey, "reroute after devex", rerouteResult);
+            }
+            if (rerouteResult.guardrailTimeout) {
+              return await this.handleGuardrailTimeout(task, cacheKey, "reroute after devex", rerouteResult, opencodeXdg);
             }
             if (rerouteResult.stallTimeout) {
               return await this.handleStallTimeout(task, cacheKey, "reroute after devex", rerouteResult);
@@ -9678,6 +9987,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(task, "build"),
         ...this.buildStallOptions(task, "build"),
+        ...this.buildGuardrailsOptions(task, "build"),
         ...this.buildLoopDetectionOptions(task, "build"),
         ...opencodeSessionOptions,
       });
@@ -9690,6 +10000,9 @@ ${guidance}`
       if (!buildResult.success) {
         if (buildResult.loopTrip) {
           return await this.handleLoopTrip(task, cacheKey, "build", buildResult);
+        }
+        if (buildResult.guardrailTimeout) {
+          return await this.handleGuardrailTimeout(task, cacheKey, "build", buildResult, opencodeXdg);
         }
         if (buildResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult, opencodeXdg);
@@ -9823,6 +10136,7 @@ ${guidance}`
               },
               ...this.buildWatchdogOptions(task, "build-loop-break"),
               ...this.buildStallOptions(task, "build-loop-break"),
+              ...this.buildGuardrailsOptions(task, "build-loop-break", "checkpoint"),
               ...this.buildLoopDetectionOptions(task, "build-loop-break"),
               ...opencodeSessionOptions,
             }
@@ -9836,6 +10150,9 @@ ${guidance}`
             if (!buildResult.success) {
               if (buildResult.loopTrip) {
                 return await this.handleLoopTrip(task, cacheKey, "build-loop-break", buildResult);
+              }
+              if (buildResult.guardrailTimeout) {
+                return await this.handleGuardrailTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
               }
               if (buildResult.watchdogTimeout) {
                 return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
@@ -9954,6 +10271,7 @@ ${guidance}`
           },
           ...this.buildWatchdogOptions(task, "build-continue"),
           ...this.buildStallOptions(task, "build-continue"),
+          ...this.buildGuardrailsOptions(task, "build-continue", "checkpoint"),
           ...this.buildLoopDetectionOptions(task, "build-continue"),
           ...opencodeSessionOptions,
         });
@@ -9966,6 +10284,9 @@ ${guidance}`
         if (!buildResult.success) {
           if (buildResult.loopTrip) {
             return await this.handleLoopTrip(task, cacheKey, "build-continue", buildResult);
+          }
+          if (buildResult.guardrailTimeout) {
+            return await this.handleGuardrailTimeout(task, cacheKey, "build-continue", buildResult, opencodeXdg);
           }
           if (buildResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult, opencodeXdg);
@@ -10125,6 +10446,7 @@ ${guidance}`
         },
         ...this.buildWatchdogOptions(task, "survey"),
         ...this.buildStallOptions(task, "survey"),
+        ...this.buildGuardrailsOptions(task, "survey"),
         ...this.buildLoopDetectionOptions(task, "survey"),
         ...opencodeSessionOptions,
       });
@@ -10137,6 +10459,9 @@ ${guidance}`
       if (!surveyResult.success) {
         if (surveyResult.loopTrip) {
           return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
+        }
+        if (surveyResult.guardrailTimeout) {
+          return await this.handleGuardrailTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
         }
         if (surveyResult.watchdogTimeout) {
           return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
