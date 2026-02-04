@@ -241,6 +241,7 @@ import {
   type PullRequestMergeStateStatus,
 } from "./merge/pull-request-io";
 import { updatePullRequestBranch as updatePullRequestBranchImpl } from "./merge/update-branch";
+import { waitForRequiredChecks as waitForRequiredChecksImpl } from "./merge/wait-required-checks";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -2885,76 +2886,16 @@ ${guidance}`
     timedOut: boolean;
     stopReason?: "merge-conflict";
   }> {
-    const startedAt = Date.now();
-    let pollDelayMs = opts.pollIntervalMs;
-    let lastSignature: string | null = null;
-    let attempt = 0;
-    const prNumber = extractPullRequestNumber(prUrl);
-    const logKey = `ralph:checks:${this.repo}:${prNumber ?? prUrl}`;
-    let last: {
-      headSha: string;
-      mergeStateStatus: PullRequestMergeStateStatus | null;
-      baseRefName: string;
-      summary: RequiredChecksSummary;
-      checks: PrCheck[];
-    } | null = null;
-
-    while (Date.now() - startedAt < opts.timeoutMs) {
-      const { headSha, mergeStateStatus, baseRefName, checks } = await this.getPullRequestChecks(prUrl);
-      const summary = summarizeRequiredChecks(checks, requiredChecks);
-      last = { headSha, mergeStateStatus, baseRefName, summary, checks };
-
-      if (mergeStateStatus === "DIRTY") {
-        this.recordCiGateSummary(prUrl, summary);
-        return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false, stopReason: "merge-conflict" };
-      }
-
-      if (summary.status === "success" || summary.status === "failure") {
-        this.recordCiGateSummary(prUrl, summary);
-        return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
-      }
-
-      const signature = buildRequiredChecksSignature(summary);
-      const decision = computeRequiredChecksDelay({
-        baseIntervalMs: opts.pollIntervalMs,
-        maxIntervalMs: REQUIRED_CHECKS_MAX_POLL_MS,
-        attempt,
-        lastSignature,
-        nextSignature: signature,
-        pending: summary.status === "pending",
-      });
-      attempt = decision.nextAttempt;
-      pollDelayMs = decision.delayMs;
-      lastSignature = signature;
-
-      if (decision.reason === "backoff" && pollDelayMs > opts.pollIntervalMs) {
-        if (this.requiredChecksLogLimiter.shouldLog(logKey, REQUIRED_CHECKS_LOG_INTERVAL_MS)) {
-          console.log(
-            `[ralph:worker:${this.repo}] Required checks pending; backing off polling to ${Math.round(pollDelayMs / 1000)}s`
-          );
-        }
-      }
-
-      await new Promise((r) => setTimeout(r, applyRequiredChecksJitter(pollDelayMs)));
-    }
-
-    if (last) {
-      this.recordCiGateSummary(prUrl, last.summary);
-      return { ...last, timedOut: true };
-    }
-
-    // Should be unreachable, but keep types happy.
-    const fallback = await this.getPullRequestChecks(prUrl);
-    const fallbackSummary = summarizeRequiredChecks(fallback.checks, requiredChecks);
-    this.recordCiGateSummary(prUrl, fallbackSummary);
-    return {
-      headSha: fallback.headSha,
-      mergeStateStatus: fallback.mergeStateStatus,
-      baseRefName: fallback.baseRefName,
-      summary: fallbackSummary,
-      checks: fallback.checks,
-      timedOut: true,
-    };
+    return await waitForRequiredChecksImpl({
+      repo: this.repo,
+      prUrl,
+      requiredChecks,
+      opts,
+      getPullRequestChecks: async (url) => await this.getPullRequestChecks(url),
+      recordCiGateSummary: (url, summary) => this.recordCiGateSummary(url, summary),
+      shouldLogBackoff: (key) => this.requiredChecksLogLimiter.shouldLog(key, REQUIRED_CHECKS_LOG_INTERVAL_MS),
+      log: (message) => console.log(message),
+    });
   }
 
   private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
