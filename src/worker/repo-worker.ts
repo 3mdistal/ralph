@@ -176,14 +176,12 @@ import { parseLastLineJsonMarker } from "../markers";
 import { refreshRalphRunTokenTotals } from "../run-token-accounting";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
 import {
-  detectLegacyWorktrees,
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
   pickWorktreeForIssue,
   stripHeadsRef,
   type GitWorktreeEntry,
 } from "../git-worktree";
-import { formatLegacyWorktreeWarning } from "../legacy-worktrees";
 import {
   normalizePrUrl,
   viewPullRequestMergeCandidate,
@@ -275,6 +273,13 @@ import {
   recordIssueLabelDelta as recordIssueLabelDeltaImpl,
   removeIssueLabel as removeIssueLabelImpl,
 } from "./labels";
+import {
+  cleanupWorktreesForTasks as cleanupWorktreesForTasksImpl,
+  getGitWorktrees as getGitWorktreesImpl,
+  pruneGitWorktreesOnStartup as pruneGitWorktreesOnStartupImpl,
+  cleanupOrphanedWorktreesOnStartup as cleanupOrphanedWorktreesOnStartupImpl,
+  warnLegacyWorktreesOnStartup as warnLegacyWorktreesOnStartupImpl,
+} from "./worktree-cleanup";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -2491,12 +2496,12 @@ ${guidance}`
   }
 
   private async getGitWorktrees(): Promise<GitWorktreeEntry[]> {
-    return await this.worktrees.getGitWorktrees();
+    return (await getGitWorktreesImpl(this as any)) as any;
   }
 
   private async cleanupWorktreesOnStartup(): Promise<void> {
     try {
-      await $`git worktree prune`.cwd(this.repoPath).quiet();
+      await pruneGitWorktreesOnStartupImpl(this as any);
     } catch (e: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to prune git worktrees on startup: ${e?.message ?? String(e)}`
@@ -2504,7 +2509,7 @@ ${guidance}`
     }
 
     try {
-      await this.worktrees.cleanupOrphanedWorktrees();
+      await cleanupOrphanedWorktreesOnStartupImpl(this as any);
     } catch (e: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to cleanup orphaned worktrees on startup: ${e?.message ?? String(e)}`
@@ -2521,31 +2526,14 @@ ${guidance}`
   }
 
   private async warnLegacyWorktreesOnStartup(): Promise<void> {
-    const config = getConfig();
-    const entries = await this.worktrees.getGitWorktrees();
-    const legacy = detectLegacyWorktrees(entries, {
-      devDir: config.devDir,
+    await warnLegacyWorktreesOnStartupImpl(this as any, {
       managedRoot: RALPH_WORKTREES_DIR,
+      legacyLogIntervalMs: LEGACY_WORKTREES_LOG_INTERVAL_MS,
     });
-
-    if (legacy.length === 0) return;
-
-    const key = `${this.repo}:legacy-worktrees`;
-    if (!this.legacyWorktreesLogLimiter.shouldLog(key, LEGACY_WORKTREES_LOG_INTERVAL_MS)) return;
-
-    console.warn(
-      formatLegacyWorktreeWarning({
-        repo: this.repo,
-        repoPath: this.repoPath,
-        devDir: config.devDir,
-        managedRoot: RALPH_WORKTREES_DIR,
-        legacyPaths: legacy.map((entry) => entry.worktreePath),
-      })
-    );
   }
 
   private async cleanupWorktreesForTasks(tasks: AgentTask[]): Promise<void> {
-    await this.worktrees.cleanupWorktreesForTasks(tasks);
+    await cleanupWorktreesForTasksImpl(this as any, tasks);
   }
 
   async runStartupCleanup(): Promise<void> {
