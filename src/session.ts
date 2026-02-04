@@ -405,11 +405,12 @@ async function resolveExistingOpencodeLogPath(path: string): Promise<string> {
   if (logs.length === 0) return path;
   if (logs.includes(base)) return join(dir, base);
 
-  const insert = logs.findIndex((name) => name > base);
-  const candidates = [
-    insert > 0 ? logs[insert - 1] : null,
-    insert >= 0 && insert < logs.length ? logs[insert] : null,
-  ].filter(Boolean) as string[];
+  // logs is sorted lexicographically; with a fixed-width timestamp format, this matches chronological order.
+  let insert = logs.findIndex((name) => name > base);
+  if (insert === -1) insert = logs.length;
+  const candidates = [insert > 0 ? logs[insert - 1] : null, insert < logs.length ? logs[insert] : null].filter(
+    Boolean
+  ) as string[];
 
   let best: { name: string; deltaMs: number } | null = null;
   for (const candidate of candidates) {
