@@ -29,6 +29,7 @@ import { safeNoteName } from "./names";
 import { createWorktreeManager, type ResolveTaskRepoPathResult } from "./worktrees";
 import { buildIssueContextForAgent as buildIssueContextForAgentImpl, getIssueMetadata as getIssueMetadataImpl } from "./issue-context";
 import { createIssuePrResolver, type ResolvedIssuePr } from "./pr-reuse";
+import { createRelationshipResolver } from "./relationships";
 import {
   continueCommand,
   continueSession,
@@ -712,6 +713,12 @@ export class RepoWorker {
     });
     this.github = new GitHubClient(this.repo);
     this.relationships = opts?.relationships ?? new GitHubRelationshipProvider(this.repo, this.github);
+    this.relationshipResolver = createRelationshipResolver({
+      repo: this.repo,
+      provider: this.relationships,
+      ttlMs: ISSUE_RELATIONSHIP_TTL_MS,
+      warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
+    });
     this.labelEnsurer = createRalphWorkflowLabelsEnsurer({
       githubFactory: () => this.github,
     });
@@ -721,8 +728,7 @@ export class RepoWorker {
   private ensureBranchProtectionDeferUntil = 0;
   private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
   private relationships: IssueRelationshipProvider;
-  private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
-  private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
+  private relationshipResolver: ReturnType<typeof createRelationshipResolver>;
   private lastBlockedSyncAt = 0;
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
@@ -2527,40 +2533,11 @@ ${guidance}`
   }
 
   private async getRelationshipSnapshot(issue: IssueRef, allowRefresh: boolean): Promise<IssueRelationshipSnapshot | null> {
-    const key = `${issue.repo}#${issue.number}`;
-    const now = Date.now();
-    const cached = this.relationshipCache.get(key);
-    if (cached && (!allowRefresh || now - cached.ts < ISSUE_RELATIONSHIP_TTL_MS)) {
-      return cached.snapshot;
-    }
-
-    const inFlight = this.relationshipInFlight.get(key);
-    if (inFlight) return await inFlight;
-
-    const promise = this.relationships
-      .getSnapshot(issue)
-      .then((snapshot) => {
-        this.relationshipCache.set(key, { ts: Date.now(), snapshot });
-        return snapshot;
-      })
-      .catch((error) => {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to fetch relationship snapshot for ${formatIssueRef(issue)}: ${error?.message ?? String(error)}`
-        );
-        return null;
-      })
-      .finally(() => {
-        this.relationshipInFlight.delete(key);
-      });
-
-    this.relationshipInFlight.set(key, promise);
-    return await promise;
+    return await this.relationshipResolver.getSnapshot(issue, allowRefresh);
   }
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
-    const resolved = resolveRelationshipSignals(snapshot);
-    logRelationshipDiagnostics({ repo: this.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "worker" });
-    return resolved.signals;
+    return this.relationshipResolver.buildSignals(snapshot);
   }
 
   private async cleanupGitWorktree(worktreePath: string): Promise<void> {
