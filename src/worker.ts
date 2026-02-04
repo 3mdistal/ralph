@@ -8821,7 +8821,23 @@ ${guidance}`
       if (setupRun) return setupRun;
 
       const botBranch = getRepoBotBranch(this.repo);
-      const issueMeta = await this.getIssueMetadata(task.issue);
+
+      // Resume routing preflight: if an existing PR is in merge-conflict state,
+      // bypass session resume and enter merge-conflict recovery immediately.
+      if (issueNumber) {
+        const mergeConflictRun = await this.maybeHandleQueuedMergeConflict({
+          task,
+          issueNumber,
+          taskRepoPath,
+          cacheKey,
+          botBranch,
+          issueMeta,
+          startTime,
+          opencodeXdg,
+          opencodeSessionOptions,
+        });
+        if (mergeConflictRun) return mergeConflictRun;
+      }
 
       const defaultResumeMessage =
         "Ralph restarted while this task was in progress. " +
