@@ -29,6 +29,7 @@ import { createWorktreeManager, type ResolveTaskRepoPathResult } from "./worktre
 import { buildIssueContextForAgent as buildIssueContextForAgentImpl, getIssueMetadata as getIssueMetadataImpl } from "./issue-context";
 import { createIssuePrResolver, type ResolvedIssuePr } from "./pr-reuse";
 import { createRelationshipResolver } from "./relationships";
+import { createBranchProtectionManager } from "./branch-protection";
 import {
   continueCommand,
   continueSession,
@@ -77,11 +78,11 @@ import {
   RALPH_LABEL_STATUS_IN_PROGRESS,
   RALPH_LABEL_STATUS_QUEUED,
 } from "../github-labels";
-import { GitHubApiError, GitHubClient, splitRepoFullName } from "../github/client";
+import { GitHubClient } from "../github/client";
 import { computeGitHubRateLimitPause } from "../github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "../github/dx-survey-writeback";
 import { createGhRunner } from "../github/gh-runner";
-import { getProtectionContexts, resolveRequiredChecks, type BranchProtection, type ResolvedRequiredChecks } from "../github/required-checks";
+import type { ResolvedRequiredChecks } from "../github/required-checks";
 import { createRalphWorkflowLabelsEnsurer } from "../github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "../github/relationship-signals";
 import { logRelationshipDiagnostics } from "../github/relationship-diagnostics";
@@ -535,6 +536,11 @@ export class RepoWorker {
       },
     });
     this.github = new GitHubClient(this.repo);
+    this.branchProtection = createBranchProtectionManager({
+      repo: this.repo,
+      github: this.github,
+      shouldLogBackoff: (key: string, intervalMs: number) => this.requiredChecksLogLimiter.shouldLog(key, intervalMs),
+    });
     this.relationships = opts?.relationships ?? new GitHubRelationshipProvider(this.repo, this.github);
     this.relationshipResolver = createRelationshipResolver({
       repo: this.repo,
@@ -547,9 +553,7 @@ export class RepoWorker {
     });
   }
 
-  private ensureBranchProtectionPromise: Promise<void> | null = null;
-  private ensureBranchProtectionDeferUntil = 0;
-  private requiredChecksForMergePromise: Promise<ResolvedRequiredChecks> | null = null;
+  private branchProtection: ReturnType<typeof createBranchProtectionManager>;
   private relationships: IssueRelationshipProvider;
   private relationshipResolver: ReturnType<typeof createRelationshipResolver>;
   private lastBlockedSyncAt = 0;
@@ -1685,154 +1689,16 @@ export class RepoWorker {
     return await writeEscalationWritebackImpl(this as any, task, params);
   }
 
-  private isNoCommitFoundError(error: unknown): boolean {
-    if (!(error instanceof GitHubApiError)) return false;
-    if (error.status !== 422) return false;
-    return /No commit found for SHA/i.test(error.responseText);
-  }
-
-  private isRefAlreadyExistsError(error: unknown): boolean {
-    if (!(error instanceof GitHubApiError)) return false;
-    if (error.status !== 422) return false;
-    return /Reference already exists/i.test(error.responseText);
-  }
-
-  private buildMissingBranchError(error: GitHubApiError): Error {
-    const message = error.message || error.responseText || "Missing branch";
-    const missingBranchError = new Error(message);
-    missingBranchError.cause = "missing-branch";
-    return missingBranchError;
-  }
-  private async fetchCheckRunNames(branch: string): Promise<string[]> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    const encodedBranch = encodeURIComponent(branch);
-    try {
-      const payload = await this.githubApiRequest<CheckRunsResponse>(
-        `/repos/${owner}/${name}/commits/${encodedBranch}/check-runs?per_page=100`
-      );
-      return toSortedUniqueStrings(payload?.check_runs?.map((run) => run?.name ?? "") ?? []);
-    } catch (e: any) {
-      if (this.isNoCommitFoundError(e)) {
-        throw this.buildMissingBranchError(e);
-      }
-      throw e;
-    }
-  }
-
-  private async fetchStatusContextNames(branch: string): Promise<string[]> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    const encodedBranch = encodeURIComponent(branch);
-    try {
-      const payload = await this.githubApiRequest<CommitStatusResponse>(
-        `/repos/${owner}/${name}/commits/${encodedBranch}/status?per_page=100`
-      );
-      return toSortedUniqueStrings(payload?.statuses?.map((status) => status?.context ?? "") ?? []);
-    } catch (e: any) {
-      if (this.isNoCommitFoundError(e)) {
-        throw this.buildMissingBranchError(e);
-      }
-      throw e;
-    }
-  }
-
   private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
-    const errors: string[] = [];
-    let missingBranchError: Error | null = null;
-    let checkRuns: string[] = [];
-    let statusContexts: string[] = [];
-
-    try {
-      checkRuns = await this.fetchCheckRunNames(branch);
-    } catch (e: any) {
-      if (e?.cause === "missing-branch") {
-        missingBranchError = e;
-      } else {
-        errors.push(`check-runs: ${e?.message ?? String(e)}`);
-      }
-    }
-
-    try {
-      statusContexts = await this.fetchStatusContextNames(branch);
-    } catch (e: any) {
-      if (e?.cause === "missing-branch") {
-        missingBranchError = e;
-      } else {
-        errors.push(`status: ${e?.message ?? String(e)}`);
-      }
-    }
-
-    if (missingBranchError) throw missingBranchError;
-
-    const hasData = checkRuns.length > 0 || statusContexts.length > 0;
-    const hasAuthError = errors.some((entry) => /HTTP 401|HTTP 403|Missing GH_TOKEN/i.test(entry));
-
-    if (hasAuthError || (errors.length >= 2 && !hasData)) {
-      throw new Error(`Unable to read check contexts for ${branch}: ${errors.join(" | ")}`);
-    }
-
-    if (errors.length > 0) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to fetch some check contexts for ${branch}: ${errors.join(" | ")}`
-      );
-    }
-
-    return toSortedUniqueStrings([...checkRuns, ...statusContexts]);
+    return await this.branchProtection.fetchAvailableCheckContexts(branch);
   }
 
   private async fetchRepoDefaultBranch(): Promise<string | null> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    const payload = await this.githubApiRequest<RepoDetails>(`/repos/${owner}/${name}`);
-    const branch = payload?.default_branch ?? null;
-    return branch ? String(branch) : null;
+    return await this.branchProtection.fetchRepoDefaultBranch();
   }
 
   private async fetchGitRef(ref: string): Promise<GitRef | null> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    return this.githubApiRequest<GitRef>(`/repos/${owner}/${name}/git/ref/${ref}`, { allowNotFound: true });
-  }
-
-  private async createGitRef(ref: string, sha: string): Promise<void> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    await this.githubApiRequest(`/repos/${owner}/${name}/git/refs`, {
-      method: "POST",
-      body: { ref: `refs/${ref}`, sha },
-    });
-  }
-
-  private async ensureRemoteBranchExists(branch: string): Promise<boolean> {
-    const ref = `heads/${branch}`;
-    const existing = await this.fetchGitRef(ref);
-    if (existing?.object?.sha) return false;
-
-    const defaultBranch = await this.fetchRepoDefaultBranch();
-    if (!defaultBranch) {
-      throw new Error(`Unable to resolve default branch for ${this.repo}; cannot create ${branch}.`);
-    }
-
-    const defaultRef = await this.fetchGitRef(`heads/${defaultBranch}`);
-    const defaultSha = defaultRef?.object?.sha ? String(defaultRef.object.sha) : null;
-    if (!defaultSha) {
-      throw new Error(`Unable to resolve ${this.repo}@${defaultBranch} sha; cannot create ${branch}.`);
-    }
-
-    try {
-      await this.createGitRef(ref, defaultSha);
-      console.log(
-        `[ralph:worker:${this.repo}] Created missing branch ${branch} from ${defaultBranch} (${defaultSha}).`
-      );
-      return true;
-    } catch (e: any) {
-      if (this.isRefAlreadyExistsError(e)) return false;
-      throw e;
-    }
-  }
-
-  private async fetchBranchProtection(branch: string): Promise<BranchProtection | null> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    return this.githubApiRequest<BranchProtection>(
-      `/repos/${owner}/${name}/branches/${encodeURIComponent(branch)}/protection`,
-      { allowNotFound: true }
-    );
+    return await this.branchProtection.fetchGitRef(ref);
   }
 
   public async __testOnlyResolveRequiredChecksForMerge(): Promise<ResolvedRequiredChecks> {
@@ -1844,178 +1710,15 @@ export class RepoWorker {
   }
 
   private async resolveRequiredChecksForMerge(): Promise<ResolvedRequiredChecks> {
-    if (this.requiredChecksForMergePromise) return this.requiredChecksForMergePromise;
-
-    this.requiredChecksForMergePromise = (async () => {
-      const override = getRepoRequiredChecksOverride(this.repo);
-      if (override !== null) {
-        return { checks: override, source: "config" };
-      }
-
-      const botBranch = getRepoBotBranch(this.repo);
-      const fallbackBranch = await this.resolveFallbackBranch(botBranch);
-      return resolveRequiredChecks({
-        override,
-        primaryBranch: botBranch,
-        fallbackBranch,
-        fetchBranchProtection: (branch) => this.fetchBranchProtection(branch),
-        logger: {
-          warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
-          info: (message) => console.log(`[ralph:worker:${this.repo}] ${message}`),
-        },
-      });
-    })();
-
-    return this.requiredChecksForMergePromise;
-  }
-
-  private async resolveFallbackBranch(botBranch: string): Promise<string> {
-    try {
-      const defaultBranch = await this.fetchRepoDefaultBranch();
-      if (defaultBranch && defaultBranch !== botBranch) return defaultBranch;
-    } catch {
-      // ignore; fallback handled below
-    }
-
-    return "main";
+    return await this.branchProtection.resolveRequiredChecksForMerge();
   }
 
   private async ensureBranchProtectionForBranch(branch: string, requiredChecks: string[]): Promise<"ok" | "defer"> {
-    if (requiredChecks.length === 0) return "ok";
-
-    const botBranch = getRepoBotBranch(this.repo);
-    if (branch === botBranch) {
-      await this.ensureRemoteBranchExists(branch);
-    }
-
-    let availableChecks: string[] = [];
-    try {
-      availableChecks = await this.fetchAvailableCheckContexts(branch);
-    } catch (e: any) {
-      if (branch === botBranch && e?.cause === "missing-branch") {
-        await this.ensureRemoteBranchExists(branch);
-        availableChecks = await this.fetchAvailableCheckContexts(branch);
-      } else {
-        throw e;
-      }
-    }
-
-    const decision = decideBranchProtection({ requiredChecks, availableChecks });
-    if (decision.kind !== "ok") {
-      const guidance = formatRequiredChecksGuidance({
-        repo: this.repo,
-        branch,
-        requiredChecks,
-        missingChecks: decision.missingChecks,
-        availableChecks,
-      });
-      if (decision.kind === "defer") {
-        const logKey = `branch-protection-defer:${this.repo}:${branch}:${decision.missingChecks.join(",") || "none"}::${availableChecks.join(",") || "none"}`;
-        if (this.requiredChecksLogLimiter.shouldLog(logKey, REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS)) {
-          console.warn(
-            `[ralph:worker:${this.repo}] RALPH_BRANCH_PROTECTION_SKIPPED_MISSING_CHECKS ` +
-              `Required checks missing for ${this.repo}@${branch} ` +
-              `(required: ${requiredChecks.join(", ") || "(none)"}; ` +
-              `missing: ${decision.missingChecks.join(", ") || "(none)"}). ` +
-              `Proceeding without branch protection for now; will retry in ${formatDuration(
-                REQUIRED_CHECKS_DEFER_RETRY_MS
-              )}.
-${guidance}`
-          );
-        }
-        return "defer";
-      }
-
-      throw new Error(
-        `Required checks missing for ${this.repo}@${branch}. ` +
-          `The configured required check contexts are not present.
-${guidance}`
-      );
-    }
-
-    const existing = await this.fetchBranchProtection(branch);
-    const contexts = toSortedUniqueStrings([...getProtectionContexts(existing), ...requiredChecks]);
-    const strict = existing?.required_status_checks?.strict === true;
-    const reviews = existing?.required_pull_request_reviews;
-
-    const desiredReviews = {
-      dismissal_restrictions: normalizeRestrictions(reviews?.dismissal_restrictions),
-      dismiss_stale_reviews: reviews?.dismiss_stale_reviews ?? false,
-      require_code_owner_reviews: reviews?.require_code_owner_reviews ?? false,
-      required_approving_review_count: 0,
-      require_last_push_approval: reviews?.require_last_push_approval ?? false,
-      bypass_pull_request_allowances: { users: [], teams: [], apps: [] },
-    };
-
-    const desiredPayload = {
-      required_status_checks: { strict, contexts },
-      enforce_admins: true,
-      required_pull_request_reviews: desiredReviews,
-      restrictions: normalizeRestrictions(existing?.restrictions),
-      required_linear_history: normalizeEnabledFlag(existing?.required_linear_history),
-      allow_force_pushes: normalizeEnabledFlag(existing?.allow_force_pushes),
-      allow_deletions: normalizeEnabledFlag(existing?.allow_deletions),
-      block_creations: normalizeEnabledFlag(existing?.block_creations),
-      required_conversation_resolution: normalizeEnabledFlag(existing?.required_conversation_resolution),
-      required_signatures: normalizeEnabledFlag(existing?.required_signatures),
-      lock_branch: normalizeEnabledFlag(existing?.lock_branch),
-      allow_fork_syncing: normalizeEnabledFlag(existing?.allow_fork_syncing),
-    };
-
-    const existingContexts = getProtectionContexts(existing);
-    const needsStatusUpdate = !existing || !areStringArraysEqual(existingContexts, contexts);
-    const existingApprovals = reviews?.required_approving_review_count ?? null;
-    const needsReviewUpdate =
-      !reviews || existingApprovals !== 0 || hasBypassAllowances(reviews?.bypass_pull_request_allowances);
-    const needsAdminUpdate = !normalizeEnabledFlag(existing?.enforce_admins);
-
-    if (!existing || needsStatusUpdate || needsReviewUpdate || needsAdminUpdate) {
-      const { owner, name } = splitRepoFullName(this.repo);
-      await this.githubApiRequest(
-        `/repos/${owner}/${name}/branches/${encodeURIComponent(branch)}/protection`,
-        { method: "PUT", body: desiredPayload }
-      );
-      console.log(
-        `[ralph:worker:${this.repo}] Ensured branch protection for ${branch} (required checks: ${requiredChecks.join(", ")})`
-      );
-    }
-
-    return "ok";
+    return await this.branchProtection.ensureBranchProtectionForBranch(branch, requiredChecks);
   }
 
   private async ensureBranchProtectionOnce(): Promise<void> {
-    if (this.ensureBranchProtectionPromise) return this.ensureBranchProtectionPromise;
-
-    const now = Date.now();
-    if (now < this.ensureBranchProtectionDeferUntil) return;
-
-    this.ensureBranchProtectionPromise = (async () => {
-      const botBranch = getRepoBotBranch(this.repo);
-      const requiredChecksOverride = getRepoRequiredChecksOverride(this.repo);
-
-      if (requiredChecksOverride === null || requiredChecksOverride.length === 0) {
-        return;
-      }
-
-      const fallbackBranch = await this.resolveFallbackBranch(botBranch);
-      const branches = Array.from(new Set([botBranch, fallbackBranch]));
-
-      let deferred = false;
-
-      for (const branch of branches) {
-        const result = await this.ensureBranchProtectionForBranch(branch, requiredChecksOverride);
-        if (result === "defer") deferred = true;
-      }
-
-      return deferred;
-    })().then((deferred) => {
-      if (deferred) {
-        this.ensureBranchProtectionDeferUntil = Date.now() + REQUIRED_CHECKS_DEFER_RETRY_MS;
-        this.ensureBranchProtectionPromise = null;
-      }
-    });
-
-    return this.ensureBranchProtectionPromise;
+    return await this.branchProtection.ensureBranchProtectionOnce();
   }
 
   public async syncBlockedStateForTasks(tasks: AgentTask[]): Promise<Set<string>> {
