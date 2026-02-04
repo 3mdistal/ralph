@@ -245,6 +245,12 @@ import { getPullRequestMergeState as getPullRequestMergeStateImpl } from "./merg
 import { updatePullRequestBranchViaWorktree as updatePullRequestBranchViaWorktreeImpl } from "./merge/auto-update-worktree";
 import { getPullRequestFiles as getPullRequestFilesImpl } from "./merge/pull-request-files";
 import {
+  recordAutoUpdateAttempt as recordAutoUpdateAttemptImpl,
+  recordAutoUpdateFailure as recordAutoUpdateFailureImpl,
+  shouldAttemptProactiveUpdate as shouldAttemptProactiveUpdateImpl,
+  shouldRateLimitAutoUpdate as shouldRateLimitAutoUpdateImpl,
+} from "./merge/auto-update-gate";
+import {
   deleteMergedPrHeadBranchBestEffort as deleteMergedPrHeadBranchBestEffortImpl,
   deletePrHeadBranch as deletePrHeadBranchImpl,
   fetchMergedPullRequestDetails as fetchMergedPullRequestDetailsImpl,
@@ -5641,68 +5647,39 @@ ${guidance}`
   }
 
   private shouldAttemptProactiveUpdate(pr: PullRequestMergeState): { ok: boolean; reason?: string } {
-    if (pr.mergeStateStatus !== "BEHIND") {
-      return { ok: false, reason: `Merge state is ${pr.mergeStateStatus ?? "unknown"}` };
-    }
-
-    const baseRef = this.normalizeGitRef(pr.baseRefName);
-    const botBranch = this.normalizeGitRef(getRepoBotBranch(this.repo));
-    if (baseRef && baseRef !== botBranch) {
-      return { ok: false, reason: `PR base branch is ${pr.baseRefName}` };
-    }
-
-    if (pr.isCrossRepository || pr.headRepoFullName !== this.repo) {
-      return { ok: false, reason: "PR head repo is not the same as base repo" };
-    }
-
-    if (!pr.headRefName) {
-      return { ok: false, reason: "PR missing head ref" };
-    }
-
-    return { ok: true };
+    return shouldAttemptProactiveUpdateImpl({
+      repo: this.repo,
+      pr,
+      botBranch: getRepoBotBranch(this.repo),
+      normalizeGitRef: (ref) => this.normalizeGitRef(ref),
+    });
   }
 
   private shouldRateLimitAutoUpdate(pr: PullRequestMergeState, minMinutes: number): boolean {
-    const key = `autoUpdateBehind:${this.repo}:${pr.number}`;
-    let payload: string | null = null;
-
-    try {
-      payload = getIdempotencyPayload(key);
-    } catch {
-      return false;
-    }
-
-    if (!payload) return false;
-
-    try {
-      const parsed = JSON.parse(payload) as { lastAttemptAt?: number };
-      const lastAttemptAt = typeof parsed?.lastAttemptAt === "number" ? parsed.lastAttemptAt : 0;
-      if (!lastAttemptAt) return false;
-      const expiresMs = minMinutes * 60_000;
-      return Date.now() - lastAttemptAt < expiresMs;
-    } catch {
-      return false;
-    }
+    return shouldRateLimitAutoUpdateImpl({
+      repo: this.repo,
+      prNumber: pr.number,
+      minMinutes,
+      getIdempotencyPayload: (key) => getIdempotencyPayload(key),
+    });
   }
 
   private recordAutoUpdateAttempt(pr: PullRequestMergeState, minMinutes: number): void {
-    const key = `autoUpdateBehind:${this.repo}:${pr.number}`;
-    const payload = JSON.stringify({ lastAttemptAt: Date.now(), minMinutes });
-    try {
-      upsertIdempotencyKey({ key, scope: "auto-update-behind", payloadJson: payload });
-    } catch {
-      // best-effort
-    }
+    return recordAutoUpdateAttemptImpl({
+      repo: this.repo,
+      prNumber: pr.number,
+      minMinutes,
+      upsertIdempotencyKey: (input) => upsertIdempotencyKey(input),
+    });
   }
 
   private recordAutoUpdateFailure(pr: PullRequestMergeState, minMinutes: number): void {
-    const key = `autoUpdateBehind:${this.repo}:${pr.number}`;
-    const payload = JSON.stringify({ lastAttemptAt: Date.now(), minMinutes, status: "failed" });
-    try {
-      upsertIdempotencyKey({ key, scope: "auto-update-behind", payloadJson: payload });
-    } catch {
-      // best-effort
-    }
+    return recordAutoUpdateFailureImpl({
+      repo: this.repo,
+      prNumber: pr.number,
+      minMinutes,
+      upsertIdempotencyKey: (input) => upsertIdempotencyKey(input),
+    });
   }
 
   private normalizeGitRef(ref: string): string {
