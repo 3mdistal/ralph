@@ -144,6 +144,15 @@ import {
   type WorkerDashboardEventInput,
 } from "./events";
 import {
+  buildCheckpointPatch,
+  CHECKPOINT_SEQ_FIELD,
+  PAUSED_AT_CHECKPOINT_FIELD,
+  PAUSE_REQUESTED_FIELD,
+  parseCheckpointSeq,
+  parseCheckpointValue,
+  parsePauseRequested,
+} from "./checkpoint-fields";
+import {
   completeParentVerification,
   completeRalphRun,
   createRalphRun,
@@ -418,9 +427,6 @@ const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
 const CI_REMEDIATION_BACKOFF_BASE_MS = 30_000;
 const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 
-const CHECKPOINT_SEQ_FIELD = "checkpoint-seq";
-const PAUSE_REQUESTED_FIELD = "pause-requested";
-const PAUSED_AT_CHECKPOINT_FIELD = "paused-at-checkpoint";
 
 export interface AgentRun {
   taskName: string;
@@ -461,32 +467,6 @@ function applyTaskPatch(task: AgentTask, status: AgentTask["status"], patch: Rec
   for (const [key, value] of Object.entries(patch)) {
     (task as unknown as Record<string, unknown>)[key] = typeof value === "number" ? String(value) : value;
   }
-}
-
-function parseCheckpointSeq(value?: string): number {
-  const parsed = Number.parseInt(value ?? "", 10);
-  if (!Number.isFinite(parsed) || parsed < 0) return 0;
-  return parsed;
-}
-
-function parsePauseRequested(value?: string): boolean {
-  return value?.trim().toLowerCase() === "true";
-}
-
-function parseCheckpointValue(value?: string): RalphCheckpoint | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  return isRalphCheckpoint(trimmed) ? (trimmed as RalphCheckpoint) : null;
-}
-
-function buildCheckpointPatch(state: CheckpointState): Record<string, string> {
-  return {
-    checkpoint: state.lastCheckpoint ?? "",
-    [CHECKPOINT_SEQ_FIELD]: String(state.checkpointSeq),
-    [PAUSE_REQUESTED_FIELD]: state.pauseRequested ? "true" : "false",
-    [PAUSED_AT_CHECKPOINT_FIELD]: state.pausedAtCheckpoint ?? "",
-  };
 }
 
 function resolveVaultPath(p: string): string {
