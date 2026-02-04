@@ -173,6 +173,11 @@ describe("github queue core", () => {
     expect(status).toBe("done");
   });
 
+  test("deriveRalphStatus treats paused as paused", () => {
+    const status = deriveRalphStatus(["ralph:status:queued", "ralph:status:paused"], "OPEN");
+    expect(status).toBe("paused");
+  });
+
   test("computeStaleInProgressRecovery does not recover missing session id before grace", () => {
     const nowMs = Date.parse("2026-01-11T00:01:00.000Z");
     const ttlMs = 10 * 60_000;

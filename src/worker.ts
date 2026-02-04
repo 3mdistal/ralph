@@ -66,6 +66,7 @@ import { redactSensitiveText } from "./redaction";
 import {
   RALPH_LABEL_STATUS_BLOCKED,
   RALPH_LABEL_STATUS_IN_PROGRESS,
+  RALPH_LABEL_STATUS_PAUSED,
   RALPH_LABEL_STATUS_QUEUED,
 } from "./github-labels";
 import { executeIssueLabelOps, type LabelOp } from "./github/issue-label-io";
@@ -462,7 +463,7 @@ async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
 export interface AgentRun {
   taskName: string;
   repo: string;
-  outcome: "success" | "throttled" | "escalated" | "failed";
+  outcome: "success" | "paused" | "throttled" | "escalated" | "failed";
   pr?: string;
   completionKind?: "pr" | "verified";
   sessionId?: string;
@@ -747,6 +748,113 @@ export class RepoWorker {
   private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
 
+  private pauseGateLabelsByIssue = new Map<
+    string,
+    { labels: string[]; fetchedAtMs: number; errorUntilMs?: number; errorMessage?: string }
+  >();
+
+  private async listIssueLabelsForPauseGate(issue: IssueRef): Promise<string[]> {
+    const cacheKey = `${issue.repo}#${issue.number}`;
+    const nowMs = Date.now();
+    const ttlMs = 15_000;
+    const errorCooldownMs = 30_000;
+
+    const cached = this.pauseGateLabelsByIssue.get(cacheKey);
+    if (cached) {
+      if (cached.errorUntilMs && cached.errorUntilMs > nowMs) {
+        throw new Error(cached.errorMessage ?? "GitHub label fetch temporarily suppressed after failure");
+      }
+      if (ttlMs > 0 && nowMs - cached.fetchedAtMs < ttlMs) {
+        return [...cached.labels];
+      }
+    }
+
+    const { owner, name } = splitRepoFullName(issue.repo);
+    try {
+      const response = await this.github.request<Array<{ name?: string | null }>>(
+        `/repos/${owner}/${name}/issues/${issue.number}/labels?per_page=100`,
+        { source: "worker:pause-gate" }
+      );
+      const labels = (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+
+      const nowIso = new Date(nowMs).toISOString();
+      try {
+        recordIssueLabelsSnapshot({ repo: issue.repo, issue: `${issue.repo}#${issue.number}`, labels, at: nowIso });
+      } catch {
+        // best-effort
+      }
+
+      this.pauseGateLabelsByIssue.set(cacheKey, { labels, fetchedAtMs: nowMs });
+      return [...labels];
+    } catch (error: any) {
+      const message = error?.message ?? String(error);
+      this.pauseGateLabelsByIssue.set(cacheKey, {
+        labels: cached?.labels ?? [],
+        fetchedAtMs: cached?.fetchedAtMs ?? 0,
+        errorUntilMs: nowMs + errorCooldownMs,
+        errorMessage: message,
+      });
+      throw error;
+    }
+  }
+
+  private async assertNotPausedByLabel(task: AgentTask, stepKey: string, sessionId?: string): Promise<void> {
+    const issueRef = parseIssueRef(task.issue, task.repo);
+    if (!issueRef) return;
+
+    const snapshotLabels = getIssueLabels(issueRef.repo, issueRef.number);
+    const snapshotPaused = snapshotLabels.includes(RALPH_LABEL_STATUS_PAUSED);
+
+    try {
+      const liveLabels = await this.listIssueLabelsForPauseGate(issueRef);
+      if (liveLabels.includes(RALPH_LABEL_STATUS_PAUSED)) {
+        const error = new Error("Issue is paused") as Error & {
+          ralphPauseSwitch?: boolean;
+          ralphPauseStep?: string;
+          ralphPauseSessionId?: string;
+        };
+        error.ralphPauseSwitch = true;
+        error.ralphPauseStep = stepKey;
+        error.ralphPauseSessionId = sessionId;
+        throw error;
+      }
+      return;
+    } catch {
+      // best-effort: if live labels are unavailable, fall back to the durable snapshot.
+      if (!snapshotPaused) return;
+      const error = new Error("Issue is paused") as Error & {
+        ralphPauseSwitch?: boolean;
+        ralphPauseStep?: string;
+        ralphPauseSessionId?: string;
+      };
+      error.ralphPauseSwitch = true;
+      error.ralphPauseStep = stepKey;
+      error.ralphPauseSessionId = sessionId;
+      throw error;
+    }
+  }
+
+  private createPauseGateAdapter(base: SessionAdapter, task: AgentTask): SessionAdapter {
+    return {
+      runAgent: async (repoPath, agent, message, options, testOverrides) => {
+        const stepKey = options?.introspection?.stepTitle ?? `agent:${agent}`;
+        await this.assertNotPausedByLabel(task, stepKey, undefined);
+        return await base.runAgent(repoPath, agent, message, options, testOverrides);
+      },
+      continueSession: async (repoPath, sessionId, message, options) => {
+        const stepKey = options?.introspection?.stepTitle ?? `session:${sessionId}`;
+        await this.assertNotPausedByLabel(task, stepKey, sessionId);
+        return await base.continueSession(repoPath, sessionId, message, options);
+      },
+      continueCommand: async (repoPath, sessionId, command, args, options) => {
+        const stepKey = options?.introspection?.stepTitle ?? `command:${command}`;
+        await this.assertNotPausedByLabel(task, stepKey, sessionId);
+        return await base.continueCommand(repoPath, sessionId, command, args, options);
+      },
+      getRalphXdgCacheHome: base.getRalphXdgCacheHome,
+    };
+  }
+
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
     const completed = new Date();
     const completedAt = completed.toISOString().split("T")[0];
@@ -907,6 +1015,8 @@ export class RepoWorker {
       issue: task.issue,
     });
     const recordingSession = this.createContextRecoveryAdapter(recordingBase);
+    const pauseGatedBase = this.createPauseGateAdapter(recordingBase, task);
+    const pauseGatedSession = this.createPauseGateAdapter(recordingSession, task);
 
     let result: AgentRun | null = null;
     const context = this.buildDashboardContext(task, runId);
@@ -918,9 +1028,67 @@ export class RepoWorker {
           level: "info",
           data: { taskName: task.name, issue: task.issue },
         });
-        return await this.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, run);
+        return await this.withSessionAdapters({ baseSession: pauseGatedBase, session: pauseGatedSession }, run);
       });
       return result;
+    } catch (error: any) {
+      if (error?.ralphPauseSwitch) {
+        const stepKey = typeof error.ralphPauseStep === "string" ? error.ralphPauseStep : "paused";
+        const sessionId = typeof error.ralphPauseSessionId === "string" ? error.ralphPauseSessionId : (task["session-id"]?.trim() || "");
+        const checkpoint = parseCheckpointValue(task.checkpoint) ?? "implementation_step_complete";
+        const nowIso = new Date().toISOString();
+
+        this.logWorker(`Pause switch active; halting before model send (step=${stepKey})`, { sessionId: sessionId || undefined });
+        this.publishDashboardEvent(
+          {
+            type: "worker.pause.reached",
+            level: "info",
+            data: { checkpoint },
+          },
+          { sessionId: sessionId || undefined }
+        );
+
+        const updatePatch: Record<string, string> = {
+          [PAUSE_REQUESTED_FIELD]: "false",
+          [PAUSED_AT_CHECKPOINT_FIELD]: checkpoint,
+        };
+        try {
+          // Keep durable status queued so removing the pause label resumes scheduling.
+          const updated = await this.queue.updateTaskStatus(task, "queued", updatePatch);
+          if (updated) {
+            applyTaskPatch(task, "queued", updatePatch);
+          }
+        } catch {
+          // best-effort
+        }
+
+        const bodyPrefix = buildAgentRunBodyPrefix({
+          task,
+          headline: "Paused",
+          reason: "Issue has ralph:status:paused; refusing to send new model messages.",
+          details: `Step: ${stepKey}`,
+          sessionId: sessionId || undefined,
+          runLogPath: task["run-log-path"]?.trim() || undefined,
+        });
+        const runTime = new Date();
+        await this.createAgentRun(task, {
+          outcome: "paused",
+          sessionId: sessionId || undefined,
+          started: runTime,
+          completed: runTime,
+          bodyPrefix,
+        });
+
+        result = {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "paused",
+          sessionId: sessionId || undefined,
+          escalationReason: "Paused via ralph:status:paused",
+        };
+        return result;
+      }
+      throw error;
     } finally {
       this.publishDashboardEvent({
         type: "worker.became_idle",
@@ -10600,7 +10768,7 @@ ${guidance}`
     data: {
       sessionId?: string;
       pr?: string | null;
-      outcome: "success" | "throttled" | "escalated" | "failed";
+      outcome: "success" | "paused" | "throttled" | "escalated" | "failed";
       started: Date;
       completed: Date;
       surveyResults?: string;
