@@ -75,7 +75,7 @@ function isNonActionable(rawState: string): boolean {
   return NON_ACTIONABLE_RAW_STATES.some((marker) => normalized.includes(marker));
 }
 
-export function classifyCiFailure(input: CiTriageInput): {
+function classifyCiFailure(input: CiTriageInput): {
   classification: CiFailureClassification;
   reason: CiTriageClassificationReason;
 } {
@@ -114,7 +114,7 @@ export function classifyCiFailure(input: CiTriageInput): {
   return { classification: "regression", reason: "regression_unknown" };
 }
 
-export function decideCiNextAction(input: CiTriageInput, classification: CiFailureClassification): {
+function decideCiNextAction(input: CiTriageInput, classification: CiFailureClassification): {
   action: CiNextAction;
   reason: CiTriageActionReason;
 } {
