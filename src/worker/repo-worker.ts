@@ -79,8 +79,7 @@ import { getProtectionContexts, resolveRequiredChecks, type BranchProtection, ty
 import { createRalphWorkflowLabelsEnsurer } from "../github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "../github/relationship-signals";
 import { logRelationshipDiagnostics } from "../github/relationship-diagnostics";
-import { sanitizeEscalationReason, writeEscalationToGitHub } from "../github/escalation-writeback";
-import { ensureEscalationCommentHasConsultantPacket } from "../github/escalation-consultant-writeback";
+import { sanitizeEscalationReason } from "../github/escalation-writeback";
 import {
   buildParentVerificationPrompt as buildParentVerificationPromptLegacy,
   evaluateParentVerificationEligibility,
@@ -280,6 +279,7 @@ import {
   cleanupOrphanedWorktreesOnStartup as cleanupOrphanedWorktreesOnStartupImpl,
   warnLegacyWorktreesOnStartup as warnLegacyWorktreesOnStartupImpl,
 } from "./worktree-cleanup";
+import { writeEscalationWriteback as writeEscalationWritebackImpl } from "./escalation";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -1904,76 +1904,7 @@ export class RepoWorker {
     task: AgentTask,
     params: { reason: string; details?: string; escalationType: EscalationContext["escalationType"] }
   ): Promise<string | null> {
-    const escalationIssueRef = parseIssueRef(task.issue, task.repo);
-    if (!escalationIssueRef) {
-      console.warn(`[ralph:worker:${this.repo}] Cannot parse issue ref for escalation writeback: ${task.issue}`);
-      return null;
-    }
-
-    try {
-      await this.ensureRalphWorkflowLabelsOnce();
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to ensure ralph workflow labels before escalation writeback: ${
-          error?.message ?? String(error)
-        }`
-      );
-    }
-
-    try {
-      const result = await writeEscalationToGitHub(
-        {
-          repo: escalationIssueRef.repo,
-          issueNumber: escalationIssueRef.number,
-          taskName: task.name,
-          taskPath: task._path ?? task.name,
-          reason: params.reason,
-          details: params.details,
-          escalationType: params.escalationType,
-        },
-        {
-          github: this.github,
-          log: (message) => console.log(message),
-        }
-      );
-      const commentUrl = result.commentUrl ?? null;
-
-      if (commentUrl) {
-        try {
-          const repoPath = task["worktree-path"]?.trim() || this.repoPath;
-          await ensureEscalationCommentHasConsultantPacket({
-            github: this.github,
-            repo: escalationIssueRef.repo,
-            escalationCommentUrl: commentUrl,
-            repoPath,
-            input: {
-              issue: task.issue,
-              repo: escalationIssueRef.repo,
-              taskName: task.name,
-              taskPath: task._path ?? task.name,
-              escalationType: params.escalationType,
-              reason: params.reason,
-              sessionId: task["session-id"]?.trim() || null,
-              githubCommentUrl: commentUrl,
-            },
-            log: (m) => console.log(m),
-          });
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to attach consultant packet to escalation comment: ${
-              error?.message ?? String(error)
-            }`
-          );
-        }
-      }
-
-      return commentUrl;
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Escalation writeback failed for ${task.issue}: ${error?.message ?? String(error)}`
-      );
-    }
-    return null;
+    return await writeEscalationWritebackImpl(this as any, task, params);
   }
 
   private isNoCommitFoundError(error: unknown): boolean {
