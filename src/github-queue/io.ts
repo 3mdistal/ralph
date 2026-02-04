@@ -44,6 +44,10 @@ import {
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 const WATCH_MIN_INTERVAL_MS = 1000;
 
+const DEFAULT_LIVE_LABELS_CACHE_TTL_MS = 60_000;
+const DEFAULT_LIVE_LABELS_ERROR_COOLDOWN_MS = 60_000;
+const LIVE_LABELS_TELEMETRY_SOURCE = "queue:claim:labels";
+
 const DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO = 25;
 const DEFAULT_MISSING_SESSION_GRACE_MS = 2 * 60_000;
 
@@ -127,15 +131,60 @@ function createGitHubQueueIo(): GitHubQueueIO {
   });
   const labelIdCacheByRepo = new Map<string, Map<string, string>>();
 
+  const liveLabelsCacheTtlMs = clampNonNegativeInt(
+    readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_LIVE_LABELS_TTL_MS", DEFAULT_LIVE_LABELS_CACHE_TTL_MS),
+    DEFAULT_LIVE_LABELS_CACHE_TTL_MS
+  );
+  const liveLabelsErrorCooldownMs = clampNonNegativeInt(
+    readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_LIVE_LABELS_ERROR_COOLDOWN_MS", DEFAULT_LIVE_LABELS_ERROR_COOLDOWN_MS),
+    DEFAULT_LIVE_LABELS_ERROR_COOLDOWN_MS
+  );
+
+  type LiveLabelsCacheEntry = {
+    labels: string[];
+    fetchedAtMs: number;
+    errorUntilMs?: number;
+    errorMessage?: string;
+  };
+  const liveLabelsByIssue = new Map<string, LiveLabelsCacheEntry>();
+
   return {
     ensureWorkflowLabels: async (repo) => await labelEnsurer.ensure(repo),
     listIssueLabels: async (repo, issueNumber) => {
+      const nowMs = Date.now();
+      const cacheKey = `${repo}#${issueNumber}`;
+      const cached = liveLabelsByIssue.get(cacheKey);
+      if (cached) {
+        if (cached.errorUntilMs && cached.errorUntilMs > nowMs) {
+          throw new Error(cached.errorMessage ?? "GitHub label fetch temporarily suppressed after failure");
+        }
+        if (liveLabelsCacheTtlMs > 0 && nowMs - cached.fetchedAtMs < liveLabelsCacheTtlMs) {
+          return [...cached.labels];
+        }
+      }
+
       const { owner, name } = splitRepoFullName(repo);
       const client = await createGitHubClient(repo);
-      const response = await client.request<Array<{ name?: string | null }>>(
-        `/repos/${owner}/${name}/issues/${issueNumber}/labels?per_page=100`
-      );
-      return (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+
+      try {
+        const response = await client.request<Array<{ name?: string | null }>>(
+          `/repos/${owner}/${name}/issues/${issueNumber}/labels?per_page=100`,
+          { source: LIVE_LABELS_TELEMETRY_SOURCE }
+        );
+        const labels = (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+        liveLabelsByIssue.set(cacheKey, { labels, fetchedAtMs: nowMs });
+        return [...labels];
+      } catch (error: any) {
+        // Avoid spamming core REST when auth/rate-limit/backoff is already active.
+        const message = error?.message ?? String(error);
+        liveLabelsByIssue.set(cacheKey, {
+          labels: cached?.labels ?? [],
+          fetchedAtMs: cached?.fetchedAtMs ?? 0,
+          errorUntilMs: nowMs + liveLabelsErrorCooldownMs,
+          errorMessage: message,
+        });
+        throw error;
+      }
     },
     fetchIssue: async (repo, issueNumber) => {
       const client = await createGitHubClient(repo);
@@ -721,12 +770,21 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       };
 
       if (opts.task.status === "queued") {
-        let plan = planClaim(issue.labels);
+        const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
+        const snapshotLabels = issue.labels;
+        let plan = planClaim(snapshotLabels);
+        const shouldCheckDependencies = snapshotLabels.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
+
+        // Avoid repeated core REST reads on every claim attempt. The IO layer applies a TTL cache.
+        // We only request live labels when we may claim or when blocked-gating needs it.
+        let labelsForPlan = snapshotLabels;
         try {
-          const liveLabels = await io.listIssueLabels(issueRef.repo, issueRef.number);
-          const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
-          const shouldCheckDependencies = liveLabels.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
-          if (shouldCheckDependencies) {
+          if (plan.claimable || shouldCheckDependencies) {
+            labelsForPlan = await io.listIssueLabels(issueRef.repo, issueRef.number);
+          }
+
+          const shouldCheckDependenciesLive = labelsForPlan.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
+          if (shouldCheckDependenciesLive) {
             try {
               const relationships = relationshipsProviderFactory(issueRef.repo);
               const snapshot = await relationships.getSnapshot(issueRef);
@@ -746,10 +804,10 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
                 const reason =
                   decision.reasons.length > 0
                     ? `Issue blocked by dependencies (${decision.reasons.join(", ")})`
-                    : "Issue blocked by dependencies";
+                  : "Issue blocked by dependencies";
 
                 // Best-effort: materialize blocked label for visibility.
-                if (autoQueueEnabled && !liveLabels.includes(RALPH_LABEL_STATUS_BLOCKED)) {
+                if (autoQueueEnabled && !labelsForPlan.includes(RALPH_LABEL_STATUS_BLOCKED)) {
                   try {
                     const nowIso = new Date(opts.nowMs).toISOString();
                     const didMutate = await io.mutateIssueLabels({
@@ -778,7 +836,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               return { claimed: false, task: opts.task, reason: error?.message ?? String(error) };
             }
           }
-          plan = planClaim(liveLabels);
+          plan = planClaim(labelsForPlan);
           if (!plan.claimable) {
             return { claimed: false, task: opts.task, reason: plan.reason ?? "Task not claimable" };
           }
