@@ -126,15 +126,19 @@ import {
   type IssueRelationshipSnapshot,
 } from "../github/issue-relationships";
 import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessionEventsPath } from "../paths";
-import { ralphEventBus } from "../dashboard/bus";
 import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "../dashboard/events";
-import { publishDashboardEvent, type DashboardEventContext } from "../dashboard/publisher";
+import type { DashboardEventContext } from "../dashboard/publisher";
 import { cleanupSessionArtifacts } from "../introspection-traces";
 import { isIntrospectionSummary, type IntrospectionSummary } from "../introspection/summary";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-recording-session-adapter";
 import { redactHomePathForDisplay } from "../redaction";
 import { isSafeSessionId } from "../session-id";
-import { buildDashboardContext, resolveDashboardContext } from "./dashboard-context";
+import {
+  buildWorkerDashboardContext,
+  CheckpointEventDeduper,
+  publishWorkerDashboardEvent,
+  type WorkerDashboardEventInput,
+} from "./events";
 import {
   completeParentVerification,
   completeRalphRun,
@@ -625,32 +629,6 @@ function buildCheckpointPatch(state: CheckpointState): Record<string, string> {
   };
 }
 
-class CheckpointEventDeduper {
-  #seen = new Set<string>();
-  #order: string[] = [];
-  #limit: number;
-
-  constructor(limit = 5000) {
-    this.#limit = Math.max(0, Math.floor(limit));
-  }
-
-  hasEmitted(key: string): boolean {
-    return this.#seen.has(key);
-  }
-
-  emit(event: RalphEvent, key: string): void {
-    if (this.#seen.has(key)) return;
-    ralphEventBus.publish(event);
-    if (this.#limit === 0) return;
-    this.#seen.add(key);
-    this.#order.push(key);
-    if (this.#order.length > this.#limit) {
-      const oldest = this.#order.shift();
-      if (oldest) this.#seen.delete(oldest);
-    }
-  }
-}
-
 function buildAgentRunBodyPrefix(params: {
   task: AgentTask;
   headline: string;
@@ -888,7 +866,7 @@ export class RepoWorker {
   }
 
   private buildDashboardContext(task: AgentTask, runId?: string | null): DashboardEventContext {
-    return buildDashboardContext({ task, repo: this.repo, runId });
+    return buildWorkerDashboardContext({ repo: this.repo }, task, runId);
   }
 
   private withDashboardContext<T>(context: DashboardEventContext, run: () => Promise<T>): Promise<T> {
@@ -900,11 +878,10 @@ export class RepoWorker {
   }
 
   private publishDashboardEvent(
-    event: Omit<RalphEvent, "ts"> & { ts?: string },
+    event: WorkerDashboardEventInput,
     overrides?: Partial<DashboardEventContext>
   ): void {
-    const context = resolveDashboardContext(this.activeDashboardContext, overrides);
-    publishDashboardEvent(event, context);
+    publishWorkerDashboardEvent({ activeDashboardContext: this.activeDashboardContext }, event, overrides);
   }
 
   private publishCheckpoint(checkpoint: RalphCheckpoint, overrides?: Partial<DashboardEventContext>): void {
