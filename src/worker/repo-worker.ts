@@ -22,7 +22,6 @@ import {
   resolveOpencodeProfile,
 } from "../config";
 import { normalizeGitRef } from "../midpoint-labels";
-import { computeHeadBranchDeletionDecision } from "../pr-head-branch-cleanup";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "../midpoint-labeler";
 import { getAllowedOwners, getConfiguredGitHubAppSlug, isRepoAllowed } from "../github-app-auth";
 import { safeNoteName } from "./names";
@@ -245,6 +244,12 @@ import { waitForRequiredChecks as waitForRequiredChecksImpl } from "./merge/wait
 import { getPullRequestMergeState as getPullRequestMergeStateImpl } from "./merge/pull-request-state";
 import { updatePullRequestBranchViaWorktree as updatePullRequestBranchViaWorktreeImpl } from "./merge/auto-update-worktree";
 import { getPullRequestFiles as getPullRequestFilesImpl } from "./merge/pull-request-files";
+import {
+  deleteMergedPrHeadBranchBestEffort as deleteMergedPrHeadBranchBestEffortImpl,
+  deletePrHeadBranch as deletePrHeadBranchImpl,
+  fetchMergedPullRequestDetails as fetchMergedPullRequestDetailsImpl,
+  fetchPullRequestDetails as fetchPullRequestDetailsImpl,
+} from "./merge/pr-cleanup";
 import {
   clipLogExcerpt,
   extractCommandsFromLog,
@@ -5586,27 +5591,11 @@ ${guidance}`
   }
 
   private async fetchPullRequestDetails(prUrl: string): Promise<PullRequestDetailsNormalized> {
-    const prNumber = extractPullRequestNumber(prUrl);
-    if (!prNumber) {
-      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
-    }
-
-    const { owner, name } = splitRepoFullName(this.repo);
-    const payload = await this.githubApiRequest<PullRequestDetails>(`/repos/${owner}/${name}/pulls/${prNumber}`);
-
-    const mergedFlag = payload?.merged ?? null;
-    const mergedAt = payload?.merged_at ?? null;
-    const merged = mergedFlag === true || Boolean(mergedAt);
-
-    return {
-      number: Number(payload?.number ?? prNumber),
-      url: String(payload?.url ?? prUrl),
-      merged,
-      baseRefName: String(payload?.base?.ref ?? ""),
-      headRefName: String(payload?.head?.ref ?? ""),
-      headRepoFullName: String(payload?.head?.repo?.full_name ?? ""),
-      headSha: String(payload?.head?.sha ?? ""),
-    };
+    return await fetchPullRequestDetailsImpl({
+      repo: this.repo,
+      prUrl,
+      githubApiRequest: async (path) => await this.githubApiRequest(path),
+    });
   }
 
   private async fetchMergedPullRequestDetails(
@@ -5614,13 +5603,12 @@ ${guidance}`
     attempts: number,
     delayMs: number
   ): Promise<PullRequestDetailsNormalized> {
-    let last = await this.fetchPullRequestDetails(prUrl);
-    for (let attempt = 1; attempt < attempts; attempt += 1) {
-      if (last.merged) return last;
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-      last = await this.fetchPullRequestDetails(prUrl);
-    }
-    return last;
+    return await fetchMergedPullRequestDetailsImpl({
+      prUrl,
+      attempts,
+      delayMs,
+      fetchPullRequestDetails: async (url) => await this.fetchPullRequestDetails(url),
+    });
   }
 
   private async deleteMergedPrHeadBranchBestEffort(params: {
@@ -5628,85 +5616,28 @@ ${guidance}`
     botBranch: string;
     mergedHeadSha: string;
   }): Promise<void> {
-    const { prUrl } = params;
-    let details: PullRequestDetailsNormalized;
-    try {
-      details = await this.fetchMergedPullRequestDetails(prUrl, 3, 1000);
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to read PR details for head branch cleanup: ${this.formatGhError(error)}`
-      );
-      return;
-    }
-
-    if (!details.merged) {
-      console.log(`[ralph:worker:${this.repo}] Skipped PR head branch deletion (not merged): ${prUrl}`);
-      return;
-    }
-
-    let defaultBranch: string | null = null;
-    try {
-      defaultBranch = await this.fetchRepoDefaultBranch();
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to fetch default branch for cleanup: ${this.formatGhError(error)}`
-      );
-    }
-
-    let currentHeadSha: string | null = null;
-    if (details.headRefName) {
-      const headRef = await this.fetchGitRef(`heads/${details.headRefName}`);
-      currentHeadSha = headRef?.object?.sha ? String(headRef.object.sha) : null;
-    }
-
-    const sameRepo = details.headRepoFullName.trim().toLowerCase() === this.repo.toLowerCase();
-    const decision = computeHeadBranchDeletionDecision({
-      merged: details.merged,
-      isCrossRepository: !sameRepo,
-      headRepoFullName: details.headRepoFullName,
-      headRefName: details.headRefName,
-      baseRefName: details.baseRefName,
+    return await deleteMergedPrHeadBranchBestEffortImpl({
+      repo: this.repo,
+      prUrl: params.prUrl,
       botBranch: params.botBranch,
-      defaultBranch,
       mergedHeadSha: params.mergedHeadSha,
-      currentHeadSha,
+      fetchMergedPullRequestDetails: async (url, attempts, delayMs) =>
+        await this.fetchMergedPullRequestDetails(url, attempts, delayMs),
+      fetchRepoDefaultBranch: async () => await this.fetchRepoDefaultBranch(),
+      fetchGitRef: async (path) => await this.fetchGitRef(path),
+      deletePrHeadBranch: async (branch) => await this.deletePrHeadBranch(branch),
+      formatGhError: (error) => this.formatGhError(error),
+      log: (message) => console.log(message),
+      warn: (message) => console.warn(message),
     });
-
-    if (decision.action === "skip") {
-      console.log(
-        `[ralph:worker:${this.repo}] Skipped PR head branch deletion (${decision.reason}): ${prUrl}`
-      );
-      return;
-    }
-
-    try {
-      const result = await this.deletePrHeadBranch(decision.branch);
-      if (result === "missing") {
-        console.log(
-          `[ralph:worker:${this.repo}] PR head branch already missing (${decision.branch}): ${prUrl}`
-        );
-        return;
-      }
-      console.log(`[ralph:worker:${this.repo}] Deleted PR head branch ${decision.branch}: ${prUrl}`);
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to delete PR head branch ${decision.branch}: ${this.formatGhError(error)}`
-      );
-    }
   }
 
   private async deletePrHeadBranch(branch: string): Promise<"deleted" | "missing"> {
-    const { owner, name } = splitRepoFullName(this.repo);
-    const encoded = branch
-      .split("/")
-      .map((segment) => encodeURIComponent(segment))
-      .join("/");
-    const response = await this.github.request(`/repos/${owner}/${name}/git/refs/heads/${encoded}`, {
-      method: "DELETE",
-      allowNotFound: true,
+    return await deletePrHeadBranchImpl({
+      repo: this.repo,
+      branch,
+      githubRequest: async (path, opts) => await this.github.request(path, opts),
     });
-    if (response.status === 404) return "missing";
-    return "deleted";
   }
 
   private shouldAttemptProactiveUpdate(pr: PullRequestMergeState): { ok: boolean; reason?: string } {
