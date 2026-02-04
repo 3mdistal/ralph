@@ -63,6 +63,16 @@ type RepoAgg = {
   maxDurationMs: number;
 };
 
+type SourceAgg = {
+  source: string;
+  count: number;
+  okCount: number;
+  errorCount: number;
+  writeCount: number;
+  rateLimitedCount: number;
+  secondaryRateLimitedCount: number;
+};
+
 export type GithubUsageEndpointRow = {
   repo: string;
   method: string;
@@ -134,6 +144,7 @@ export type GithubUsageJsonOutput = {
     maxWindowRemainingMs: number;
   };
   repos: GithubUsageRepoRow[];
+  topSources: SourceAgg[];
   topEndpoints: GithubUsageEndpointRow[];
   topWriteEndpoints: GithubUsageEndpointRow[];
 };
@@ -271,6 +282,7 @@ function ingestGithubRequestLine(params: {
   untilMs: number;
   endpoints: Map<EndpointKey, EndpointAgg>;
   repos: Map<string, RepoAgg>;
+  sources: Map<string, SourceAgg>;
   backoff: BackoffAgg;
   totals: {
     requests: number;
@@ -315,6 +327,7 @@ function ingestGithubRequestLine(params: {
   const durationMs =
     typeof data.durationMs === "number" && Number.isFinite(data.durationMs) && data.durationMs >= 0 ? data.durationMs : 0;
   const requestId = typeof data.requestId === "string" && data.requestId.trim() ? data.requestId.trim() : null;
+  const source = typeof data.source === "string" && data.source.trim() ? data.source.trim() : "(none)";
 
   const rateLimited = data.rateLimited === true;
   const secondaryRateLimited = data.secondaryRateLimited === true;
@@ -417,6 +430,27 @@ function ingestGithubRequestLine(params: {
   repoAgg.totalDurationMs += durationMs;
   repoAgg.maxDurationMs = Math.max(repoAgg.maxDurationMs, durationMs);
 
+  let sourceAgg = params.sources.get(source);
+  if (!sourceAgg) {
+    sourceAgg = {
+      source,
+      count: 0,
+      okCount: 0,
+      errorCount: 0,
+      writeCount: 0,
+      rateLimitedCount: 0,
+      secondaryRateLimitedCount: 0,
+    };
+    params.sources.set(source, sourceAgg);
+  }
+
+  sourceAgg.count += 1;
+  if (ok) sourceAgg.okCount += 1;
+  else sourceAgg.errorCount += 1;
+  if (write) sourceAgg.writeCount += 1;
+  if (rateLimited) sourceAgg.rateLimitedCount += 1;
+  if (secondaryRateLimited) sourceAgg.secondaryRateLimitedCount += 1;
+
   return { matched: true, parseError: false };
 }
 
@@ -485,6 +519,7 @@ export async function collectGithubUsageSummary(opts: {
 
   const endpoints = new Map<EndpointKey, EndpointAgg>();
   const repos = new Map<string, RepoAgg>();
+  const sources = new Map<string, SourceAgg>();
   const backoff: BackoffAgg = {
     waitEventCount: 0,
     setEventCount: 0,
@@ -534,6 +569,7 @@ export async function collectGithubUsageSummary(opts: {
             untilMs,
             endpoints,
             repos,
+            sources,
             backoff,
             totals,
           });
@@ -606,6 +642,14 @@ export async function collectGithubUsageSummary(opts: {
       return a.repo.localeCompare(b.repo);
     });
 
+  const sourceRows = Array.from(sources.values())
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      if (b.writeCount !== a.writeCount) return b.writeCount - a.writeCount;
+      return a.source.localeCompare(b.source);
+    })
+    .slice(0, Math.max(1, opts.limit));
+
   return {
     version: 1,
     computedAt: new Date(nowMs).toISOString(),
@@ -637,6 +681,7 @@ export async function collectGithubUsageSummary(opts: {
       maxWindowRemainingMs: backoff.maxWindowRemainingMs,
     },
     repos: repoRows,
+    topSources: sourceRows,
     topEndpoints: byTotal.slice(0, Math.max(1, opts.limit)),
     topWriteEndpoints: byWrites.slice(0, Math.max(1, opts.limit)),
   };
@@ -678,6 +723,19 @@ function formatGithubUsageHuman(summary: GithubUsageSummary): string {
   lines.push(
     `Totals: requests=${summary.totals.requests} ok=${summary.totals.ok} errors=${summary.totals.errors} writes=${summary.totals.writes} rateLimited=${summary.totals.rateLimited} secondary=${summary.totals.secondaryRateLimited} parseErrors=${summary.totals.parseErrors}`
   );
+
+  lines.push("");
+  lines.push("Top sources:");
+  if (summary.topSources.length === 0) {
+    lines.push("  (none)");
+  } else {
+    for (const row of summary.topSources) {
+      const writes = row.writeCount > 0 ? ` writes=${row.writeCount}` : "";
+      const rl = row.rateLimitedCount > 0 ? ` rateLimited=${row.rateLimitedCount}` : "";
+      const srl = row.secondaryRateLimitedCount > 0 ? ` secondary=${row.secondaryRateLimitedCount}` : "";
+      lines.push(`  ${row.source}: count=${row.count} errors=${row.errorCount}${writes}${rl}${srl}`);
+    }
+  }
   lines.push(
     `Backoff: windows=${summary.backoff.windowCount} waitEvents=${summary.backoff.waitEventCount} maxWindow=${maxBackoff} maxWait=${maxWait} first=${summary.backoff.firstAt ?? "-"} last=${summary.backoff.lastAt ?? "-"}`
   );

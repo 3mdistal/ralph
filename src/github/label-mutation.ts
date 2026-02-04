@@ -18,6 +18,8 @@ export async function mutateIssueLabels(params: {
   issueNodeId?: string | null;
   plan: LabelMutationPlan;
   labelIdCache?: LabelIdCache;
+  /** Optional caller tag for github.request telemetry. */
+  telemetrySource?: string;
 }): Promise<LabelMutationResult> {
   if (!canAttemptLabelWrite(params.repo)) {
     return { ok: false, error: new Error("GitHub label writes temporarily blocked") };
@@ -35,6 +37,7 @@ export async function mutateIssueLabels(params: {
     repo: params.repo,
     labels: [...new Set([...add, ...remove])],
     cache: params.labelIdCache,
+    telemetrySource: params.telemetrySource,
   });
 
   if (labelIds.size === 0) return { ok: false, error: new Error("Missing label ids") };
@@ -48,6 +51,7 @@ export async function mutateIssueLabels(params: {
     if (addIds.length > 0) {
       await params.github.request("/graphql", {
         method: "POST",
+        source: params.telemetrySource,
         body: {
           query: "mutation($labelableId: ID!, $labelIds: [ID!]!) { addLabelsToLabelable(input: {labelableId: $labelableId, labelIds: $labelIds}) { clientMutationId } }",
           variables: { labelableId: nodeId, labelIds: addIds },
@@ -57,6 +61,7 @@ export async function mutateIssueLabels(params: {
     if (removeIds.length > 0) {
       await params.github.request("/graphql", {
         method: "POST",
+        source: params.telemetrySource,
         body: {
           query: "mutation($labelableId: ID!, $labelIds: [ID!]!) { removeLabelsFromLabelable(input: {labelableId: $labelableId, labelIds: $labelIds}) { clientMutationId } }",
           variables: { labelableId: nodeId, labelIds: removeIds },
@@ -76,6 +81,7 @@ async function resolveLabelIds(params: {
   repo: string;
   labels: string[];
   cache?: LabelIdCache;
+  telemetrySource?: string;
 }): Promise<Map<string, string>> {
   const cache = params.cache ?? new Map<string, string>();
   const remaining = params.labels.filter((label) => !cache.has(label));
@@ -90,6 +96,7 @@ async function resolveLabelIds(params: {
     };
   }> = await params.github.request("/graphql", {
     method: "POST",
+    source: params.telemetrySource,
     body: {
       query: "query($owner: String!, $name: String!, $first: Int!) { repository(owner: $owner, name: $name) { labels(first: $first) { nodes { id name } } } }",
       variables: { owner, name, first: 100 },

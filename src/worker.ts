@@ -76,6 +76,7 @@ import { createGhRunner } from "./github/gh-runner";
 import { getProtectionContexts, resolveRequiredChecks, type BranchProtection, type ResolvedRequiredChecks } from "./github/required-checks";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "./github/relationship-signals";
+import { logRelationshipDiagnostics } from "./github/relationship-diagnostics";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import { ensureEscalationCommentHasConsultantPacket } from "./github/escalation-consultant-writeback";
 import {
@@ -282,9 +283,7 @@ const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
 const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
-const IGNORED_BODY_DEPS_LOG_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const LEGACY_WORKTREES_LOG_INTERVAL_MS = 12 * 60 * 60 * 1000;
-const IGNORED_BODY_DEPS_LOG_MAX_KEYS = 2000;
 const BLOCKED_REASON_MAX_LEN = 200;
 const BLOCKED_DETAILS_MAX_LEN = 2000;
 const CI_DEBUG_LEASE_TTL_MS = 20 * 60_000;
@@ -1013,7 +1012,6 @@ export class RepoWorker {
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
-  private ignoredBodyDepsLogLimiter = new LogLimiter({ maxKeys: IGNORED_BODY_DEPS_LOG_MAX_KEYS });
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
@@ -2905,20 +2903,8 @@ ${guidance}`
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
     const resolved = resolveRelationshipSignals(snapshot);
-    if (resolved.ignoredBodyBlockers > 0) {
-      this.logIgnoredBodyBlockers(snapshot.issue, resolved.ignoredBodyBlockers, resolved.ignoreReason);
-    }
+    logRelationshipDiagnostics({ repo: this.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "worker" });
     return resolved.signals;
-  }
-
-  private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {
-    const key = `${issue.repo}#${issue.number}`;
-    if (!this.ignoredBodyDepsLogLimiter.shouldLog(key, IGNORED_BODY_DEPS_LOG_INTERVAL_MS)) return;
-    const reasonLabel = reason === "complete" ? "complete" : "partial";
-    console.log(
-      `[ralph:worker:${this.repo}] Ignoring ${ignoredCount} body blocker(s) for ${formatIssueRef(issue)} due to ${reasonLabel} ` +
-        `GitHub dependency coverage.`
-    );
   }
 
   private async resolveWorktreeRef(): Promise<string> {

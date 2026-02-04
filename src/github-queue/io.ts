@@ -7,6 +7,7 @@ import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
 import { GitHubRelationshipProvider, type IssueRelationshipProvider } from "../github/issue-relationships";
 import { resolveRelationshipSignals } from "../github/relationship-signals";
+import { logRelationshipDiagnostics } from "../github/relationship-diagnostics";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {
@@ -44,6 +45,7 @@ const SWEEP_INTERVAL_MS = 5 * 60_000;
 const WATCH_MIN_INTERVAL_MS = 1000;
 
 const DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO = 25;
+const DEFAULT_MISSING_SESSION_GRACE_MS = 2 * 60_000;
 
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -53,8 +55,21 @@ function readEnvInt(name: string, fallback: number): number {
   return Math.floor(parsed);
 }
 
+function readEnvNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.floor(parsed);
+}
+
 function clampPositiveInt(value: number, fallback: number): number {
   if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
+
+function clampNonNegativeInt(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value < 0) return fallback;
   return Math.floor(value);
 }
 
@@ -318,6 +333,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         try {
           const snapshot = await provider.getSnapshot({ repo, number: issue.number });
           const resolved = resolveRelationshipSignals(snapshot);
+          logRelationshipDiagnostics({ repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
           const decision = computeBlockedDecision(resolved.signals);
 
           // IMPORTANT: unknown dependency coverage should NOT cause blocked label churn.
@@ -507,6 +523,10 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     lastSweepAt = nowMs;
 
     const ttlMs = getConfig().ownershipTtlMs;
+    const missingSessionGraceMs = clampNonNegativeInt(
+      readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_MISSING_SESSION_GRACE_MS", DEFAULT_MISSING_SESSION_GRACE_MS),
+      DEFAULT_MISSING_SESSION_GRACE_MS
+    );
     const nowIso = getNowIso(deps);
 
     for (const repo of getConfig().repos.map((entry) => entry.name)) {
@@ -527,6 +547,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           opState,
           nowMs,
           ttlMs,
+          graceMs: missingSessionGraceMs,
         });
         if (!recovery.shouldRecover) continue;
 
@@ -710,6 +731,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               const relationships = relationshipsProviderFactory(issueRef.repo);
               const snapshot = await relationships.getSnapshot(issueRef);
               const resolved = resolveRelationshipSignals(snapshot);
+              logRelationshipDiagnostics({ repo: issueRef.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
               const decision = computeBlockedDecision(resolved.signals);
 
               if (decision.confidence === "unknown") {

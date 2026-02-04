@@ -1723,7 +1723,7 @@ async function main(): Promise<void> {
 
   if (queueState.backend === "github") {
     githubLabelReconciler = startGitHubLabelReconciler({
-      intervalMs: 60_000,
+      intervalMs: config.labelReconcileIntervalMs,
       log: (message) => console.log(message),
     });
   }

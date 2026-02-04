@@ -95,6 +95,7 @@ export function computeStaleInProgressRecovery(params: {
   opState?: TaskOpState | null;
   nowMs: number;
   ttlMs: number;
+  graceMs?: number;
 }): { shouldRecover: boolean; reason?: StaleInProgressRecoveryReason } {
   if (!params.labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) return { shouldRecover: false };
   if (typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs)) {
@@ -107,8 +108,23 @@ export function computeStaleInProgressRecovery(params: {
     return { shouldRecover: false, reason: "missing-op-state" };
   }
 
+  const graceMs = Number.isFinite(params.graceMs) ? Math.max(0, Math.floor(params.graceMs as number)) : 0;
+
   const sessionId = params.opState.sessionId?.trim() ?? "";
   if (!sessionId) {
+    const heartbeat = params.opState.heartbeatAt?.trim() ?? "";
+    const heartbeatMs = heartbeat ? Date.parse(heartbeat) : NaN;
+
+    // Grace period: newly claimed tasks may briefly lack a sessionId.
+    // If we have a recent heartbeat, defer recovery until grace elapses.
+    if (graceMs > 0 && Number.isFinite(heartbeatMs) && params.nowMs - heartbeatMs < graceMs) {
+      return { shouldRecover: false };
+    }
+
+    if (Number.isFinite(heartbeatMs) && params.nowMs - heartbeatMs > params.ttlMs) {
+      return { shouldRecover: true, reason: "stale-heartbeat" };
+    }
+
     return { shouldRecover: true, reason: "missing-session-id" };
   }
 
