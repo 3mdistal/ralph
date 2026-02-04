@@ -3,6 +3,7 @@ export type RalphEventLevel = "debug" | "info" | "warn" | "error";
 export type RalphEventType =
   | "daemon.started"
   | "daemon.stopped"
+  | "github.request"
   | "worker.created"
   | "worker.became_busy"
   | "worker.became_idle"
@@ -54,6 +55,37 @@ export type RalphEventEnvelope<TType extends RalphEventType, TData extends objec
 export type RalphEvent =
   | RalphEventEnvelope<"daemon.started", { version?: string }>
   | RalphEventEnvelope<"daemon.stopped", { reason?: string; code?: number }>
+  | RalphEventEnvelope<
+      "github.request",
+      {
+        method: string;
+        path: string;
+        status: number;
+        ok: boolean;
+        write: boolean;
+        durationMs: number;
+        attempt: number;
+        requestId?: string | null;
+        allowNotFound?: boolean;
+        graphqlOperation?: "query" | "mutation" | null;
+        backoffWaitMs?: number;
+        backoffResumeAtTs?: number | null;
+        backoffSetUntilTs?: number | null;
+        rateLimited?: boolean;
+        secondaryRateLimited?: boolean;
+        installationId?: string | null;
+        retryAfterMs?: number | null;
+        willRetry?: boolean;
+        rateLimit?: {
+          limit?: number | null;
+          remaining?: number | null;
+          used?: number | null;
+          resetAtTs?: number | null;
+          resource?: string | null;
+        };
+        errorCode?: string;
+      }
+    >
   | RalphEventEnvelope<"worker.created", { worktreePath?: string; repoSlot?: number }>
   | RalphEventEnvelope<"worker.became_busy", { taskName?: string; issue?: string }>
   | RalphEventEnvelope<"worker.became_idle", { reason?: string }>
@@ -84,6 +116,7 @@ export type RalphEvent =
 const EVENT_TYPES: ReadonlySet<string> = new Set<string>([
   "daemon.started",
   "daemon.stopped",
+  "github.request",
   "worker.created",
   "worker.became_busy",
   "worker.became_idle",
@@ -165,6 +198,44 @@ export function isRalphEvent(value: unknown): value is RalphEvent {
 
   if (type === "worker.checkpoint.reached") {
     return isRalphCheckpoint((data as any).checkpoint);
+  }
+
+  if (type === "github.request") {
+    const method = (data as any).method;
+    const path = (data as any).path;
+    const status = (data as any).status;
+    const ok = (data as any).ok;
+    const write = (data as any).write;
+    const durationMs = (data as any).durationMs;
+    const attempt = (data as any).attempt;
+
+    if (typeof method !== "string" || !method.trim()) return false;
+    if (typeof path !== "string" || !path.trim()) return false;
+    if (typeof status !== "number" || !Number.isFinite(status)) return false;
+    if (typeof ok !== "boolean") return false;
+    if (typeof write !== "boolean") return false;
+    if (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0) return false;
+    if (typeof attempt !== "number" || !Number.isFinite(attempt) || attempt < 1) return false;
+
+    const graphqlOperation = (data as any).graphqlOperation;
+    if (
+      graphqlOperation !== undefined &&
+      graphqlOperation !== null &&
+      graphqlOperation !== "query" &&
+      graphqlOperation !== "mutation"
+    ) {
+      return false;
+    }
+
+    const source = (data as any).source;
+    if (source !== undefined && source !== null && typeof source !== "string") {
+      return false;
+    }
+
+    const rateLimit = (data as any).rateLimit;
+    if (rateLimit !== undefined && rateLimit !== null && !isObject(rateLimit)) return false;
+
+    return true;
   }
 
   if (type === "worker.pause.reached") {

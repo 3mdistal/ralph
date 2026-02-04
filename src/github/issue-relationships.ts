@@ -36,8 +36,13 @@ type GraphIssueRef = {
   repository?: { nameWithOwner?: string | null } | null;
 };
 
+type GraphPageInfo = {
+  hasNextPage?: boolean | null;
+};
+
 type GraphConnection = {
   nodes?: Array<GraphIssueRef | null> | null;
+  pageInfo?: GraphPageInfo | null;
 };
 
 type GraphIssue = {
@@ -56,18 +61,30 @@ type GraphResponse = {
 
 type IssueStateRef = IssueRef & { state: "open" | "closed" | "unknown" };
 
+type PageSignal = {
+  hasNextPage: boolean | null;
+};
+
+type RelationshipResult = {
+  issues: IssueStateRef[];
+  page: PageSignal;
+};
+
+type RelationshipCapabilityResult =
+  | { supported: true; unavailable: false; issues: IssueStateRef[]; page: PageSignal }
+  | { supported: false; unavailable: boolean; issues: null };
+
 const REST_DEPENDENCIES_PATH = (owner: string, repo: string, number: number) =>
   `/repos/${owner}/${repo}/issues/${number}/dependencies`;
 const REST_SUB_ISSUES_PATH = (owner: string, repo: string, number: number) =>
   `/repos/${owner}/${repo}/issues/${number}/sub_issues`;
-
-const RELATIONSHIP_PAGE_SIZE = 100;
 
 const GRAPH_BLOCKED_BY_QUERY = `
   query($owner: String!, $name: String!, $number: Int!) {
     repository(owner: $owner, name: $name) {
       issue(number: $number) {
         blockedBy(first: 100) {
+          pageInfo { hasNextPage }
           nodes {
             number
             state
@@ -84,6 +101,7 @@ const GRAPH_SUB_ISSUES_QUERY = `
     repository(owner: $owner, name: $name) {
       issue(number: $number) {
         subIssues(first: 100) {
+          pageInfo { hasNextPage }
           nodes {
             number
             state
@@ -170,6 +188,24 @@ function mapIssueStatesToSignals(
   }));
 }
 
+function toPageSignal(hasNextPage?: boolean | null): PageSignal {
+  return { hasNextPage: typeof hasNextPage === "boolean" ? hasNextPage : null };
+}
+
+function extractGraphHasNextPage(connection: GraphConnection | null | undefined): PageSignal {
+  return toPageSignal(connection?.pageInfo?.hasNextPage ?? null);
+}
+
+function parseLinkHasNextPage(link: string | null): PageSignal {
+  if (!link) return { hasNextPage: false };
+  const hasNext = /<[^>]+>\s*;\s*rel\s*=\s*"?next"?/i.test(link);
+  return { hasNextPage: hasNext };
+}
+
+function isCoverageComplete(page: PageSignal): boolean {
+  return page.hasNextPage === false;
+}
+
 export class GitHubRelationshipProvider implements IssueRelationshipProvider {
   private github: GitHubClient;
   private depsCapability: RelationshipCapability = "unknown";
@@ -192,16 +228,14 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
 
     const blockedBy = await this.fetchBlockedBy(issue);
     if (blockedBy !== null) {
-      const truncated = blockedBy.length >= RELATIONSHIP_PAGE_SIZE;
-      signals.push(...mapIssueStatesToSignals(blockedBy, "blocked_by", "github"));
-      coverage.githubDepsComplete = !truncated;
+      signals.push(...mapIssueStatesToSignals(blockedBy.issues, "blocked_by", "github"));
+      coverage.githubDepsComplete = isCoverageComplete(blockedBy.page);
     }
 
     const subIssues = await this.fetchSubIssues(issue);
     if (subIssues !== null) {
-      const truncated = subIssues.length >= RELATIONSHIP_PAGE_SIZE;
-      signals.push(...mapIssueStatesToSignals(subIssues, "sub_issue", "github"));
-      coverage.githubSubIssuesComplete = !truncated;
+      signals.push(...mapIssueStatesToSignals(subIssues.issues, "sub_issue", "github"));
+      coverage.githubSubIssuesComplete = isCoverageComplete(subIssues.page);
     }
 
     return { issue, signals, coverage };
@@ -215,7 +249,7 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
     return { body: data.data?.body ?? "" };
   }
 
-  private async fetchBlockedBy(issue: IssueRef): Promise<IssueStateRef[] | null> {
+  private async fetchBlockedBy(issue: IssueRef): Promise<RelationshipResult | null> {
     const { owner, name } = splitRepoFullName(issue.repo);
     if (this.depsCapability === "unavailable") return null;
 
@@ -223,7 +257,7 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
       const rest = await this.fetchRestDependencies(owner, name, issue.number, issue.repo);
       if (rest.supported) {
         this.depsCapability = "rest";
-        return rest.issues;
+        return { issues: rest.issues, page: rest.page };
       }
       if (rest.unavailable) {
         this.depsRestUnavailable = true;
@@ -234,7 +268,7 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
       const graph = await this.fetchGraphBlockedBy(owner, name, issue.number, issue.repo);
       if (graph.supported) {
         this.depsCapability = "graphql";
-        return graph.issues;
+        return { issues: graph.issues, page: graph.page };
       }
       if (graph.unavailable) {
         this.depsCapability = "unavailable";
@@ -244,7 +278,7 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
     return null;
   }
 
-  private async fetchSubIssues(issue: IssueRef): Promise<IssueStateRef[] | null> {
+  private async fetchSubIssues(issue: IssueRef): Promise<RelationshipResult | null> {
     const { owner, name } = splitRepoFullName(issue.repo);
     if (this.subIssuesCapability === "unavailable") return null;
 
@@ -252,7 +286,7 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
       const rest = await this.fetchRestSubIssues(owner, name, issue.number, issue.repo);
       if (rest.supported) {
         this.subIssuesCapability = "rest";
-        return rest.issues;
+        return { issues: rest.issues, page: rest.page };
       }
       if (rest.unavailable) {
         this.subIssuesRestUnavailable = true;
@@ -263,7 +297,7 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
       const graph = await this.fetchGraphSubIssues(owner, name, issue.number, issue.repo);
       if (graph.supported) {
         this.subIssuesCapability = "graphql";
-        return graph.issues;
+        return { issues: graph.issues, page: graph.page };
       }
       if (graph.unavailable) {
         this.subIssuesCapability = "unavailable";
@@ -273,27 +307,39 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
     return null;
   }
 
-  private async fetchRestDependencies(owner: string, repo: string, number: number, baseRepo: string) {
+  private async fetchRestDependencies(
+    owner: string,
+    repo: string,
+    number: number,
+    baseRepo: string
+  ): Promise<RelationshipCapabilityResult> {
     try {
-      const response = await this.github.request<unknown>(REST_DEPENDENCIES_PATH(owner, repo, number), {
+      const response = await this.github.requestWithMeta<unknown>(REST_DEPENDENCIES_PATH(owner, repo, number), {
         allowNotFound: true,
       });
       if (response.status === 404) return { supported: false, unavailable: true, issues: null };
       const parsed = extractBlockedByFromRest(response.data, baseRepo);
       if (parsed === null) return { supported: false, unavailable: false, issues: null };
-      return { supported: true, unavailable: false, issues: parsed };
+      return { supported: true, unavailable: false, issues: parsed, page: parseLinkHasNextPage(response.link) };
     } catch (error) {
       return this.handleCapabilityError(error);
     }
   }
 
-  private async fetchRestSubIssues(owner: string, repo: string, number: number, baseRepo: string) {
+  private async fetchRestSubIssues(
+    owner: string,
+    repo: string,
+    number: number,
+    baseRepo: string
+  ): Promise<RelationshipCapabilityResult> {
     try {
-      const response = await this.github.request<unknown>(REST_SUB_ISSUES_PATH(owner, repo, number), { allowNotFound: true });
+      const response = await this.github.requestWithMeta<unknown>(REST_SUB_ISSUES_PATH(owner, repo, number), {
+        allowNotFound: true,
+      });
       if (response.status === 404) return { supported: false, unavailable: true, issues: null };
       const parsed = extractSubIssuesFromRest(response.data, baseRepo);
       if (parsed === null) return { supported: false, unavailable: false, issues: null };
-      return { supported: true, unavailable: false, issues: parsed };
+      return { supported: true, unavailable: false, issues: parsed, page: parseLinkHasNextPage(response.link) };
     } catch (error) {
       return this.handleCapabilityError(error);
     }
@@ -314,7 +360,7 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
     number: number,
     baseRepo: string,
     field: "blockedBy" | "subIssues"
-  ) {
+  ): Promise<RelationshipCapabilityResult> {
     try {
       const response = await this.github.request<GraphResponse>("/graphql", {
         method: "POST",
@@ -337,13 +383,13 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
           return { repo: repoName, number, state: normalizeIssueState(node?.state) };
         })
         .filter(Boolean) as IssueStateRef[];
-      return { supported: true, unavailable: false, issues };
+      return { supported: true, unavailable: false, issues, page: extractGraphHasNextPage(connection) };
     } catch (error) {
       return this.handleCapabilityError(error);
     }
   }
 
-  private handleCapabilityError(error: unknown) {
+  private handleCapabilityError(error: unknown): RelationshipCapabilityResult {
     if (error instanceof GitHubApiError && error.status === 404) {
       return { supported: false, unavailable: true, issues: null };
     }

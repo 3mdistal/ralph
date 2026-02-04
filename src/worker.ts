@@ -35,6 +35,8 @@ import {
 } from "./session";
 import { buildPlannerPrompt } from "./planner-prompt";
 import { buildParentVerificationPrompt } from "./parent-verification-prompt";
+import { appendChildDossierToIssueContext } from "./child-dossier/core";
+import { collectChildCompletionDossier } from "./child-dossier/io";
 import { getThrottleDecision } from "./throttle";
 import { buildContextResumePrompt, retryContextCompactOnce } from "./context-compact";
 import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "./worktree-artifacts";
@@ -71,6 +73,7 @@ import { GitHubApiError, GitHubClient, splitRepoFullName } from "./github/client
 import { computeGitHubRateLimitPause } from "./github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "./github/dx-survey-writeback";
 import { createGhRunner } from "./github/gh-runner";
+import { getProtectionContexts, resolveRequiredChecks, type BranchProtection, type ResolvedRequiredChecks } from "./github/required-checks";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "./github/relationship-signals";
 import { logRelationshipDiagnostics } from "./github/relationship-diagnostics";
@@ -138,6 +141,7 @@ import {
   getRalphRunTokenTotals,
   getIdempotencyRecord,
   getIdempotencyPayload,
+  isStateDbInitialized,
   listRalphRunSessionTokenTotals,
   recordIdempotencyKey,
   deleteIdempotencyKey,
@@ -146,6 +150,7 @@ import {
   upsertIdempotencyKey,
   recordIssueSnapshot,
   recordPrSnapshot,
+  recordIssueLabelsSnapshot,
   listOpenPrCandidatesForIssue,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
@@ -624,12 +629,6 @@ type CiDebugRecoveryOutcome =
       run: AgentRun;
     };
 
-type ResolvedRequiredChecks = {
-  checks: string[];
-  source: "config" | "protection" | "none";
-  branch?: string;
-};
-
 type FailedCheck = {
   name: string;
   state: RequiredCheckState;
@@ -651,31 +650,6 @@ type RestrictionList = {
   apps?: RestrictionEntry[] | null;
 };
 
-type BranchProtection = {
-  required_status_checks?: {
-    strict?: boolean | null;
-    contexts?: string[] | null;
-    checks?: Array<{ context?: string | null }> | null;
-  } | null;
-  enforce_admins?: { enabled?: boolean | null } | boolean | null;
-  required_pull_request_reviews?: {
-    dismissal_restrictions?: RestrictionList | null;
-    dismiss_stale_reviews?: boolean | null;
-    require_code_owner_reviews?: boolean | null;
-    required_approving_review_count?: number | null;
-    require_last_push_approval?: boolean | null;
-    bypass_pull_request_allowances?: RestrictionList | null;
-  } | null;
-  restrictions?: RestrictionList | null;
-  required_linear_history?: { enabled?: boolean | null } | boolean | null;
-  allow_force_pushes?: { enabled?: boolean | null } | boolean | null;
-  allow_deletions?: { enabled?: boolean | null } | boolean | null;
-  block_creations?: { enabled?: boolean | null } | boolean | null;
-  required_conversation_resolution?: { enabled?: boolean | null } | boolean | null;
-  required_signatures?: { enabled?: boolean | null } | boolean | null;
-  lock_branch?: { enabled?: boolean | null } | boolean | null;
-  allow_fork_syncing?: { enabled?: boolean | null } | boolean | null;
-};
 
 type CheckRunsResponse = {
   check_runs?: Array<{ name?: string | null }> | null;
@@ -741,12 +715,6 @@ function hasBypassAllowances(source: RestrictionList | null | undefined): boolea
   return normalized.users.length > 0 || normalized.teams.length > 0 || normalized.apps.length > 0;
 }
 
-function getProtectionContexts(protection: BranchProtection | null): string[] {
-  const contexts = protection?.required_status_checks?.contexts ?? [];
-  const checks = protection?.required_status_checks?.checks ?? [];
-  const checkContexts = checks.map((check) => check?.context ?? "");
-  return toSortedUniqueStrings([...contexts, ...checkContexts]);
-}
 
 function extractPullRequestNumber(url: string): number | null {
   const match = url.match(/\/pull\/(\d+)(?:$|\b|\/)/);
@@ -1883,6 +1851,10 @@ export class RepoWorker {
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
     }
+
+    if (result.add.length > 0 || result.remove.length > 0) {
+      this.recordIssueLabelDelta(issue, { add: result.add, remove: result.remove });
+    }
   }
 
   private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
@@ -1909,6 +1881,25 @@ export class RepoWorker {
         return;
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
+    }
+
+    if (result.add.length > 0 || result.remove.length > 0) {
+      this.recordIssueLabelDelta(issue, { add: result.add, remove: result.remove });
+    }
+  }
+
+  private recordIssueLabelDelta(issue: IssueRef, delta: { add: string[]; remove: string[] }): void {
+    try {
+      const nowIso = new Date().toISOString();
+      const current = getIssueLabels(issue.repo, issue.number);
+      const set = new Set(current);
+      for (const label of delta.remove) set.delete(label);
+      for (const label of delta.add) set.add(label);
+      recordIssueLabelsSnapshot({ repo: issue.repo, issue: `${issue.repo}#${issue.number}`, labels: Array.from(set), at: nowIso });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to record label snapshot for ${formatIssueRef(issue)}: ${error?.message ?? String(error)}`
+      );
     }
   }
 
@@ -2608,43 +2599,17 @@ export class RepoWorker {
       }
 
       const botBranch = getRepoBotBranch(this.repo);
-      const protectionErrors: Array<{ branch: string; error: unknown }> = [];
-      let fallbackBranch = botBranch;
-      const tryFetchProtection = async (branch: string): Promise<BranchProtection | null> => {
-        try {
-          return await this.fetchBranchProtection(branch);
-        } catch (e: any) {
-          protectionErrors.push({ branch, error: e });
-          return null;
-        }
-      };
-
-      const botProtection = await tryFetchProtection(botBranch);
-      if (botProtection) {
-        return { checks: getProtectionContexts(botProtection), source: "protection", branch: botBranch };
-      }
-
-      fallbackBranch = await this.resolveFallbackBranch(botBranch);
-      if (fallbackBranch !== botBranch) {
-        const fallbackProtection = await tryFetchProtection(fallbackBranch);
-        if (fallbackProtection) {
-          return { checks: getProtectionContexts(fallbackProtection), source: "protection", branch: fallbackBranch };
-        }
-      }
-
-      if (protectionErrors.length > 0) {
-        for (const entry of protectionErrors) {
-          const msg = (entry.error as any)?.message ?? String(entry.error);
-          console.warn(`[ralph:worker:${this.repo}] Unable to read branch protection for ${entry.branch}: ${msg}`);
-        }
-      } else {
-        const attempted = Array.from(new Set([botBranch, fallbackBranch])).join(", ");
-        console.log(
-          `[ralph:worker:${this.repo}] No branch protection found for ${attempted}; merge gating disabled.`
-        );
-      }
-
-      return { checks: [], source: "none" };
+      const fallbackBranch = await this.resolveFallbackBranch(botBranch);
+      return resolveRequiredChecks({
+        override,
+        primaryBranch: botBranch,
+        fallbackBranch,
+        fetchBranchProtection: (branch) => this.fetchBranchProtection(branch),
+        logger: {
+          warn: (message) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
+          info: (message) => console.log(`[ralph:worker:${this.repo}] ${message}`),
+        },
+      });
     })();
 
     return this.requiredChecksForMergePromise;
@@ -2820,6 +2785,8 @@ ${guidance}`
     }
 
     for (const entry of byIssue.values()) {
+      const labelsKnown = isStateDbInitialized();
+      const issueLabels = getIssueLabels(entry.issue.repo, entry.issue.number);
       const snapshot = await this.getRelationshipSnapshot(entry.issue, allowRefresh);
       if (!snapshot) continue;
 
@@ -2836,20 +2803,23 @@ ${guidance}`
           await this.markTaskBlocked(task, "deps", { reason, details: reason });
         }
 
-        try {
-          await this.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${
-              error?.message ?? String(error)
-            }`
-          );
+        const hasBlockedLabel = issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_BLOCKED);
+        if (!labelsKnown || !hasBlockedLabel) {
+          try {
+            await this.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
+          } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+                error?.message ?? String(error)
+              }`
+            );
+          }
         }
         continue;
       }
 
       if (!decision.blocked && decision.confidence === "certain") {
-        const labels = getIssueLabels(this.repo, entry.issue.number);
+        const labels = issueLabels;
         const shouldSetParentVerification =
           labels.length === 0
             ? true
@@ -2881,14 +2851,17 @@ ${guidance}`
         }
 
         if (shouldRemoveBlockedLabel) {
-          try {
-            await this.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
-          } catch (error: any) {
-            console.warn(
-              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${
-                error?.message ?? String(error)
-              }`
-            );
+          const hasBlockedLabel = issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_BLOCKED);
+          if (!labelsKnown || hasBlockedLabel) {
+            try {
+              await this.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
+            } catch (error: any) {
+              console.warn(
+                `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+                  error?.message ?? String(error)
+                }`
+              );
+            }
           }
         }
       }
@@ -3313,6 +3286,36 @@ ${guidance}`
         return `Issue context (prefetched)\nRepo: ${repo}\nIssue: #${issueNumber}\n\nIssue context unavailable: ${error.code} HTTP ${error.status}${requestId}${resumeAt}\n${truncate(error.message, 800)}`;
       }
       return `Issue context (prefetched)\nRepo: ${repo}\nIssue: #${issueNumber}\n\nIssue context unavailable: ${truncate(error?.message ?? String(error), 800)}`;
+    }
+  }
+
+  private async buildChildCompletionDossierText(params: { issueRef: IssueRef }): Promise<string | null> {
+    if (process.env.BUN_TEST || process.env.NODE_ENV === "test") return null;
+
+    try {
+      const snapshot = await this.getRelationshipSnapshot(params.issueRef, true);
+      if (!snapshot) return null;
+      const signals = this.buildRelationshipSignals(snapshot);
+      const result = await collectChildCompletionDossier({
+        parent: params.issueRef,
+        snapshot,
+        signals,
+      });
+
+      if (result.diagnostics.length > 0) {
+        console.log(
+          `[ralph:worker:${this.repo}] Child dossier diagnostics for ${params.issueRef.repo}#${params.issueRef.number}:
+            result.diagnostics.join("\n")
+          }`
+        );
+      }
+
+      return result.text ? result.text : null;
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to build child completion dossier: ${error?.message ?? String(error)}`
+      );
+      return null;
     }
   }
 
@@ -3986,6 +3989,24 @@ ${guidance}`
     }
   }
 
+  private recordMergeFailureArtifact(prUrl: string, details: string): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    try {
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "ci",
+        kind: "note",
+        content: [`Merge failure while attempting to merge ${prUrl}`, "", details].join("\n").trim(),
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist merge failure artifact for ${prUrl}: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
   private recordCiFailureArtifacts(logs: FailedCheckLog[]): void {
     const runId = this.activeRunId;
     if (!runId) return;
@@ -4146,15 +4167,45 @@ ${guidance}`
   }
 
   private isOutOfDateMergeError(error: any): boolean {
-    const message = String(error?.stderr ?? error?.message ?? "");
+    const message = this.getGhErrorSearchText(error);
     if (!message) return false;
     return /not up to date with the base branch/i.test(message);
   }
 
   private isRequiredChecksExpectedMergeError(error: any): boolean {
-    const message = String(error?.stderr ?? error?.message ?? "");
+    const message = this.getGhErrorSearchText(error);
     if (!message) return false;
     return /required status checks are expected/i.test(message);
+  }
+
+  private getGhErrorSearchText(error: any): string {
+    const parts: string[] = [];
+    const message = String(error?.message ?? "").trim();
+    const stderr = this.stringifyGhOutput(error?.stderr);
+    const stdout = this.stringifyGhOutput(error?.stdout);
+
+    if (message) parts.push(message);
+    if (stderr) parts.push(stderr);
+    if (stdout) parts.push(stdout);
+
+    return parts.join("\n").trim();
+  }
+
+  private stringifyGhOutput(value: unknown): string {
+    if (value === null || value === undefined) return "";
+    if (typeof value === "string") return value.trim();
+    if (typeof (value as any)?.toString === "function") {
+      try {
+        return String((value as any).toString()).trim();
+      } catch {
+        return "";
+      }
+    }
+    try {
+      return String(value).trim();
+    } catch {
+      return "";
+    }
   }
 
   private shouldFallbackToWorktreeUpdate(message: string): boolean {
@@ -4169,9 +4220,26 @@ ${guidance}`
   }
 
   private formatGhError(error: any): string {
+    const lines: string[] = [];
+
+    const command = String(error?.ghCommand ?? error?.command ?? "").trim();
+    const redactedCommand = command ? redactSensitiveText(command).trim() : "";
+    if (redactedCommand) lines.push(`Command: ${redactedCommand}`);
+
+    const exitCodeRaw = error?.exitCode ?? error?.code ?? null;
+    const exitCode = exitCodeRaw === null || exitCodeRaw === undefined ? "" : String(exitCodeRaw).trim();
+    if (exitCode) lines.push(`Exit code: ${exitCode}`);
+
     const message = String(error?.message ?? "").trim();
-    const stderr = String(error?.stderr ?? "").trim();
-    return [message, stderr].filter(Boolean).join("\n");
+    if (message) lines.push(message);
+
+    const stderr = this.stringifyGhOutput(error?.stderr);
+    const stdout = this.stringifyGhOutput(error?.stdout);
+
+    if (stderr) lines.push("", "stderr:", summarizeForNote(stderr, 1600));
+    if (stdout) lines.push("", "stdout:", summarizeForNote(stdout, 1600));
+
+    return lines.join("\n").trim();
   }
 
   private buildMergeConflictPrompt(prUrl: string, baseRefName: string | null, botBranch: string): string {
@@ -6498,7 +6566,93 @@ ${guidance}`
       };
     }
 
-    const mergeWhenReady = async (headSha: string): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> => {
+    const mergeWhenReady = async (
+      headSha: string
+    ): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> => {
+      // Pre-merge guard: required checks and mergeability can change between polling and the merge API call.
+      try {
+        const status = await this.getPullRequestChecks(prUrl);
+        const summary = summarizeRequiredChecks(status.checks, REQUIRED_CHECKS);
+        this.recordCiGateSummary(prUrl, summary);
+
+        if (status.mergeStateStatus === "DIRTY") {
+          const recovery = await this.runMergeConflictRecovery({
+            task: params.task,
+            issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+            cacheKey: params.cacheKey,
+            prUrl,
+            issueMeta: params.issueMeta,
+            botBranch: params.botBranch,
+            opencodeXdg: params.opencodeXdg,
+            opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
+          });
+          if (recovery.status !== "success") return { ok: false, run: recovery.run };
+          sessionId = recovery.sessionId || sessionId;
+          return await this.mergePrWithRequiredChecks({
+            ...params,
+            prUrl: recovery.prUrl,
+            sessionId,
+          });
+        }
+
+        if (!didUpdateBranch && status.mergeStateStatus === "BEHIND") {
+          console.log(`[ralph:worker:${this.repo}] PR BEHIND at merge time; updating branch ${prUrl}`);
+          didUpdateBranch = true;
+          try {
+            await this.updatePullRequestBranch(prUrl, params.repoPath);
+          } catch (updateError: any) {
+            const reason = `Failed while updating PR branch before merge: ${this.formatGhError(updateError)}`;
+            console.warn(`[ralph:worker:${this.repo}] ${reason}`);
+            await this.markTaskBlocked(params.task, "auto-update", { reason, details: reason, sessionId });
+            return {
+              ok: false,
+              run: {
+                taskName: params.task.name,
+                repo: this.repo,
+                outcome: "failed",
+                sessionId,
+                escalationReason: reason,
+              },
+            };
+          }
+
+          return await this.mergePrWithRequiredChecks({
+            ...params,
+            prUrl,
+            sessionId,
+          });
+        }
+
+        if (summary.status !== "success") {
+          if (summary.status === "pending") {
+            console.log(`[ralph:worker:${this.repo}] Required checks pending at merge time; resuming merge gate ${prUrl}`);
+            return await this.mergePrWithRequiredChecks({
+              ...params,
+              prUrl,
+              sessionId,
+            });
+          }
+
+          const reason = `Merge blocked: required checks not green for ${prUrl}`;
+          const details = [formatRequiredChecksForHumans(summary), "", "Merge attempt would be rejected by branch protection."].join("\n");
+          await this.markTaskBlocked(params.task, "ci-failure", { reason, details, sessionId });
+          return {
+            ok: false,
+            run: {
+              taskName: params.task.name,
+              repo: this.repo,
+              outcome: "failed",
+              sessionId,
+              escalationReason: reason,
+            },
+          };
+        }
+
+        headSha = status.headSha;
+      } catch (error: any) {
+        console.warn(`[ralph:worker:${this.repo}] Pre-merge guard failed (continuing): ${this.formatGhError(error)}`);
+      }
+
       console.log(`[ralph:worker:${this.repo}] Required checks passed; merging ${prUrl}`);
       try {
         await this.mergePullRequest(prUrl, headSha, params.repoPath);
@@ -6601,7 +6755,56 @@ ${guidance}`
           sessionId = ciDebug.sessionId || sessionId;
           return await mergeWhenReady(ciDebug.headSha);
         }
-        throw error;
+
+        const diagnostic = this.formatGhError(error);
+        this.recordMergeFailureArtifact(prUrl, diagnostic);
+
+        let source: BlockedSource = "runtime-error";
+        let reason = `Merge failed for ${prUrl}`;
+        let details = diagnostic;
+
+        try {
+          const status = await this.getPullRequestChecks(prUrl);
+          const summary = summarizeRequiredChecks(status.checks, REQUIRED_CHECKS);
+          this.recordCiGateSummary(prUrl, summary);
+
+          if (status.mergeStateStatus === "DIRTY") {
+            source = "merge-conflict";
+            reason = `Merge blocked by conflicts for ${prUrl}`;
+            details = `mergeStateStatus=DIRTY\n\n${diagnostic}`;
+          } else if (status.mergeStateStatus === "BEHIND") {
+            source = "auto-update";
+            reason = `Merge blocked: PR behind base for ${prUrl}`;
+            details = `mergeStateStatus=BEHIND\n\n${diagnostic}`;
+          } else if (summary.status !== "success") {
+            source = "ci-failure";
+            reason = `Merge blocked: required checks not green for ${prUrl}`;
+            details = [diagnostic, "", formatRequiredChecksForHumans(summary)].join("\n").trim();
+          } else if (this.isRequiredChecksExpectedMergeError(error)) {
+            source = "ci-failure";
+            reason = `Merge blocked: required checks expected for ${prUrl}`;
+          } else if (this.isOutOfDateMergeError(error)) {
+            source = "auto-update";
+            reason = `Merge blocked: PR not up to date with base for ${prUrl}`;
+          }
+        } catch (statusError: any) {
+          details = [diagnostic, "", `Additionally failed to refresh PR status: ${this.formatGhError(statusError)}`]
+            .join("\n")
+            .trim();
+        }
+
+        await this.markTaskBlocked(params.task, source, { reason, details, sessionId });
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: this.repo,
+            outcome: "failed",
+            pr: prUrl ?? undefined,
+            sessionId,
+            escalationReason: reason,
+          },
+        };
       }
     };
 
@@ -8998,7 +9201,15 @@ ${guidance}`
       const pausedPlan = await this.pauseIfHardThrottled(task, "plan");
       if (pausedPlan) return pausedPlan;
 
-      const issueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber });
+      const baseIssueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber });
+      let issueContext = baseIssueContext;
+      const issueRef = parseIssueRef(task.issue, this.repo);
+      if (issueRef) {
+        const dossierText = await this.buildChildCompletionDossierText({ issueRef });
+        if (dossierText) {
+          issueContext = appendChildDossierToIssueContext(baseIssueContext, dossierText);
+        }
+      }
       const plannerPrompt = buildPlannerPrompt({ repo: this.repo, issueNumber, issueContext });
       const planRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan", "starting");
 
