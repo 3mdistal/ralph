@@ -43,8 +43,7 @@ import { buildParentVerificationPrompt } from "../parent-verification-prompt";
 import { appendChildDossierToIssueContext } from "../child-dossier/core";
 import { collectChildCompletionDossier } from "../child-dossier/io";
 import { getThrottleDecision } from "../throttle";
-import { buildContextResumePrompt, retryContextCompactOnce } from "../context-compact";
-import { ensureRalphWorktreeArtifacts, RALPH_PLAN_RELATIVE_PATH } from "../worktree-artifacts";
+import { createContextRecoveryManager } from "./context-recovery";
 import { ensureWorktreeSetup, type SetupFailure } from "../worktree-setup";
 import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
@@ -234,6 +233,13 @@ import {
   type RestrictionList,
   type RemediationFailureContext,
 } from "./lanes/required-checks";
+import {
+  getPullRequestBaseBranch as getPullRequestBaseBranchImpl,
+  getPullRequestChecks as getPullRequestChecksImpl,
+  mergePullRequest as mergePullRequestImpl,
+  normalizeMergeStateStatus,
+  type PullRequestMergeStateStatus,
+} from "./merge/pull-request-io";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -254,16 +260,6 @@ const PR_CREATE_LEASE_TTL_MS = 20 * 60_000;
 const PR_CREATE_CONFLICT_WAIT_MS = 2 * 60_000;
 const PR_CREATE_CONFLICT_POLL_MS = 15_000;
 const PR_CREATE_CONFLICT_THROTTLE_MS = 5 * 60_000;
-
-type PullRequestMergeStateStatus =
-  | "BEHIND"
-  | "BLOCKED"
-  | "CLEAN"
-  | "DIRTY"
-  | "DRAFT"
-  | "HAS_HOOKS"
-  | "UNSTABLE"
-  | "UNKNOWN";
 
 type PullRequestMergeState = {
   number: number;
@@ -503,25 +499,6 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
   return Object.keys(details).length ? details : undefined;
 }
 
-function normalizeMergeStateStatus(value: unknown): PullRequestMergeStateStatus | null {
-  const trimmed = String(value ?? "").trim();
-  if (!trimmed) return null;
-  const upper = trimmed.toUpperCase();
-  switch (upper) {
-    case "BEHIND":
-    case "BLOCKED":
-    case "CLEAN":
-    case "DIRTY":
-    case "DRAFT":
-    case "HAS_HOOKS":
-    case "UNSTABLE":
-    case "UNKNOWN":
-      return upper as PullRequestMergeStateStatus;
-    default:
-      return "UNKNOWN";
-  }
-}
-
 function summarizeBlockedDetails(text: string): string {
   const trimmed = sanitizeDiagnosticsText(text).trim();
   if (!trimmed) return "";
@@ -681,6 +658,7 @@ export class RepoWorker {
   private worktrees: ReturnType<typeof createWorktreeManager>;
   private contextRecoveryContext: { task: AgentTask; repoPath: string; planPath: string } | null = null;
   private contextCompactAttempts = new Map<string, number>();
+  private contextRecovery: ReturnType<typeof createContextRecoveryManager>;
 
   constructor(
     public readonly repo: string,
@@ -694,6 +672,32 @@ export class RepoWorker {
     }
   ) {
     this.baseSession = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+    this.contextRecovery = createContextRecoveryManager({
+      repo: this.repo,
+      baseSession: this.baseSession,
+      attempts: this.contextCompactAttempts,
+      getContext: () => this.contextRecoveryContext,
+      setContext: (context) => {
+        this.contextRecoveryContext = context;
+      },
+      onCompactTriggered: (event, context) => {
+        this.publishDashboardEvent(
+          {
+            type: "worker.context_compact.triggered",
+            level: "info",
+            repo: this.repo,
+            taskId: context.task._path,
+            sessionId: event.sessionId,
+            data: {
+              stepTitle: event.stepKey,
+              attempt: event.attempt,
+            },
+          },
+          { sessionId: event.sessionId }
+        );
+      },
+      warn: (message) => console.warn(message),
+    });
     this.session = this.createContextRecoveryAdapter(this.baseSession);
     this.queue = opts?.queue ?? DEFAULT_QUEUE_ADAPTER;
     this.notify = opts?.notify ?? DEFAULT_NOTIFY_ADAPTER;
@@ -761,6 +765,10 @@ export class RepoWorker {
       ensureGitWorktree: (worktreePath) => this.ensureGitWorktree(worktreePath),
       safeRemoveWorktree: (worktreePath, opts) => this.safeRemoveWorktree(worktreePath, opts),
     });
+  }
+
+  private async getWorktreeStatusPorcelain(worktreePath: string): Promise<string> {
+    return await this.contextRecovery.getWorktreeStatusPorcelain(worktreePath);
   }
 
   private async blockDisallowedRepo(task: AgentTask, started: Date, phase: "start" | "resume"): Promise<AgentRun> {
@@ -1214,33 +1222,6 @@ export class RepoWorker {
     return { ...(options ?? {}), onEvent };
   }
 
-  private recordContextCompactAttempt(task: AgentTask, stepKey: string): { allowed: boolean; attempt: number } {
-    const key = `${task._path}:${stepKey}`;
-    const next = (this.contextCompactAttempts.get(key) ?? 0) + 1;
-    this.contextCompactAttempts.set(key, next);
-    return { allowed: next <= 1, attempt: next };
-  }
-
-  private buildContextRecoveryOptions(
-    options: RunSessionOptionsBase | undefined,
-    stepTitle: string
-  ): RunSessionOptionsBase {
-    const introspection = {
-      ...(options?.introspection ?? {}),
-      stepTitle,
-    };
-    return { ...(options ?? {}), introspection };
-  }
-
-  private async getWorktreeStatusPorcelain(worktreePath: string): Promise<string> {
-    try {
-      const status = await $`git status --porcelain`.cwd(worktreePath).quiet();
-      return status.stdout.toString().trim();
-    } catch (e: any) {
-      return `ERROR: ${e?.message ?? String(e)}`;
-    }
-  }
-
   private async maybeRecoverFromContextLengthExceeded(params: {
     repoPath: string;
     sessionId?: string;
@@ -1249,77 +1230,11 @@ export class RepoWorker {
     options?: RunSessionOptionsBase;
     command?: string;
   }): Promise<SessionResult> {
-    if (params.result.success || params.result.errorCode !== "context_length_exceeded") return params.result;
-    if (params.command === "compact") return params.result;
-
-    const context = this.contextRecoveryContext;
-    if (!context) return params.result;
-
-    const sessionId = params.result.sessionId?.trim() || params.sessionId?.trim();
-    if (!sessionId) return params.result;
-
-    const attempt = this.recordContextCompactAttempt(context.task, params.stepKey);
-    if (!attempt.allowed) return params.result;
-
-    const compactOptions = this.buildContextRecoveryOptions(
-      params.options,
-      `context compact (${params.stepKey})`
-    );
-    const resumeOptions = this.buildContextRecoveryOptions(
-      params.options,
-      `context resume (${params.stepKey})`
-    );
-
-    const gitStatus = await this.getWorktreeStatusPorcelain(params.repoPath);
-    const resumeMessage = buildContextResumePrompt({
-      planPath: context.planPath,
-      gitStatus,
-    });
-
-    const recovered = await retryContextCompactOnce({
-      session: this.baseSession,
-      repoPath: params.repoPath,
-      sessionId,
-      stepKey: params.stepKey,
-      attempt,
-      resumeMessage,
-      compactOptions,
-      resumeOptions,
-      onEvent: (event) => {
-        this.publishDashboardEvent(
-          {
-            type: "worker.context_compact.triggered",
-            level: "info",
-            repo: this.repo,
-            taskId: context.task._path,
-            sessionId: event.sessionId,
-            data: {
-              stepTitle: event.stepKey,
-              attempt: event.attempt,
-            },
-          },
-          { sessionId: event.sessionId }
-        );
-      },
-    });
-
-    return recovered ?? params.result;
+    return await this.contextRecovery.maybeRecoverFromContextLengthExceeded(params);
   }
 
   private async prepareContextRecovery(task: AgentTask, worktreePath: string): Promise<void> {
-    try {
-      await ensureRalphWorktreeArtifacts(worktreePath);
-    } catch (e: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to ensure worktree artifacts at ${worktreePath}: ${e?.message ?? String(e)}`
-      );
-    }
-
-    this.contextRecoveryContext = {
-      task,
-      repoPath: worktreePath,
-      planPath: RALPH_PLAN_RELATIVE_PATH,
-    };
+    return await this.contextRecovery.prepareContextRecovery(task, worktreePath);
   }
 
   private async getRepoRootStatusPorcelain(): Promise<string> {
@@ -2916,98 +2831,11 @@ ${guidance}`
     baseRefName: string;
     checks: PrCheck[];
   }> {
-    const prNumber = extractPullRequestNumber(prUrl);
-    if (!prNumber) {
-      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
-    }
-
-    const { owner, name } = splitRepoFullName(this.repo);
-
-    const query = [
-      "query($owner:String!,$name:String!,$number:Int!){",
-      "repository(owner:$owner,name:$name){",
-      "pullRequest(number:$number){",
-      "headRefOid",
-      "mergeStateStatus",
-      "baseRefName",
-      "statusCheckRollup{",
-      "contexts(first:100){nodes{__typename ... on CheckRun{name status conclusion detailsUrl} ... on StatusContext{context state targetUrl}}}",
-      "}",
-      "}",
-      "}",
-      "}",
-    ].join(" ");
-
-    const result = await ghRead(this.repo)`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
-    const parsed = JSON.parse(result.stdout.toString());
-
-    const pr = parsed?.data?.repository?.pullRequest;
-    const headSha = pr?.headRefOid as string | undefined;
-    if (!headSha) {
-      throw new Error(`Failed to read pull request head SHA for ${prUrl}`);
-    }
-
-    const mergeStateStatus = normalizeMergeStateStatus(pr?.mergeStateStatus);
-    const baseRefName = String(pr?.baseRefName ?? "").trim();
-    if (!baseRefName) {
-      throw new Error(`Failed to read pull request base branch for ${prUrl}`);
-    }
-
-    const nodes = pr?.statusCheckRollup?.contexts?.nodes;
-    const checksRaw = Array.isArray(nodes) ? nodes : [];
-
-    const checks: PrCheck[] = [];
-
-    for (const node of checksRaw) {
-      const type = String(node?.__typename ?? "");
-
-      if (type === "CheckRun") {
-        const name = String(node?.name ?? "").trim();
-        if (!name) continue;
-
-        const status = String(node?.status ?? "");
-        const conclusion = String(node?.conclusion ?? "");
-        const detailsUrl = node?.detailsUrl ? String(node.detailsUrl).trim() : null;
-
-        // If it's not completed yet, treat status as the state.
-        const rawState = status && status !== "COMPLETED" ? status : conclusion || status || "UNKNOWN";
-        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState), detailsUrl });
-        continue;
-      }
-
-      if (type === "StatusContext") {
-        const name = String(node?.context ?? "").trim();
-        if (!name) continue;
-
-        const rawState = String(node?.state ?? "UNKNOWN");
-        const detailsUrl = node?.targetUrl ? String(node.targetUrl).trim() : null;
-        checks.push({ name, rawState, state: normalizeRequiredCheckState(rawState), detailsUrl });
-        continue;
-      }
-    }
-
-    return { headSha, mergeStateStatus, baseRefName, checks };
+    return await getPullRequestChecksImpl({ repo: this.repo, prUrl });
   }
 
   private async getPullRequestBaseBranch(prUrl: string): Promise<string | null> {
-    const prNumber = extractPullRequestNumber(prUrl);
-    if (!prNumber) return null;
-
-    const { owner, name } = splitRepoFullName(this.repo);
-    const query = [
-      "query($owner:String!,$name:String!,$number:Int!){",
-      "repository(owner:$owner,name:$name){",
-      "pullRequest(number:$number){",
-      "baseRefName",
-      "}",
-      "}",
-      "}",
-    ].join(" ");
-
-    const result = await ghRead(this.repo)`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
-    const parsed = JSON.parse(result.stdout.toString());
-    const base = parsed?.data?.repository?.pullRequest?.baseRefName;
-    return typeof base === "string" && base.trim() ? base.trim() : null;
+    return await getPullRequestBaseBranchImpl({ repo: this.repo, prUrl });
   }
 
   private isMainMergeAllowed(baseBranch: string | null, botBranch: string, labels: string[]): boolean {
@@ -3129,18 +2957,7 @@ ${guidance}`
   }
 
   private async mergePullRequest(prUrl: string, headSha: string, cwd: string): Promise<void> {
-    const prNumber = extractPullRequestNumber(prUrl);
-    if (!prNumber) {
-      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
-    }
-
-    const { owner, name } = splitRepoFullName(this.repo);
-
-    // Never pass --admin or -d (delete branch). Branch cleanup is handled separately with guardrails.
-    // Use the merge REST API to avoid interactive gh pr merge behavior in daemon mode.
-    await ghWrite(this.repo)`gh api -X PUT /repos/${owner}/${name}/pulls/${prNumber}/merge -f merge_method=merge -f sha=${headSha}`
-      .cwd(cwd)
-      .quiet();
+    return await mergePullRequestImpl({ repo: this.repo, prUrl, headSha, cwd });
   }
 
   private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
