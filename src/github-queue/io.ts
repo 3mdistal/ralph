@@ -51,6 +51,15 @@ const LIVE_LABELS_TELEMETRY_SOURCE = "queue:claim:labels";
 const DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO = 25;
 const DEFAULT_MISSING_SESSION_GRACE_MS = 2 * 60_000;
 
+const DISABLE_SWEEPS_ENV = "RALPH_GITHUB_QUEUE_DISABLE_SWEEPS";
+
+function shouldRunSweeps(): boolean {
+  const raw = process.env[DISABLE_SWEEPS_ENV];
+  if (!raw) return true;
+  const normalized = raw.trim().toLowerCase();
+  return !(normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on");
+}
+
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
@@ -669,9 +678,11 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   };
 
   const listTasksByStatus = async (status: QueueTaskStatus): Promise<AgentTask[]> => {
-    await maybeSweepClosedIssues();
-    await maybeSweepStaleInProgress();
-    await maybeSweepBlockedLabels();
+    if (shouldRunSweeps()) {
+      await maybeSweepClosedIssues();
+      await maybeSweepStaleInProgress();
+      await maybeSweepBlockedLabels();
+    }
 
     const tasks: AgentTask[] = [];
     for (const repo of getConfig().repos.map((entry) => entry.name)) {
