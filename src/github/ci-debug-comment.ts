@@ -23,6 +23,16 @@ export type CiDebugCommentState = {
   lease?: CiDebugLease;
   attempts?: CiDebugAttempt[];
   lastSignature?: string;
+  triage?: CiTriageCommentState;
+};
+
+export type CiTriageCommentState = {
+  version: 1;
+  attemptCount: number;
+  lastSignature?: string;
+  lastClassification?: string;
+  lastAction?: string;
+  lastUpdatedAt?: string;
 };
 
 export type CiDebugCommentRecord = {
