@@ -3,6 +3,7 @@ import { appendFile, mkdir, readFile, readdir, rm } from "fs/promises";
 import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
+import { homedir } from "os";
 
 import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "./queue-backend";
 import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "./bwrb/artifacts";
@@ -18,6 +19,7 @@ import {
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
+  listOpencodeProfileNames,
   getConfig,
   resolveOpencodeProfile,
 } from "./config";
@@ -7869,7 +7871,8 @@ ${guidance}`
 
   private async resolveOpencodeXdgForTask(
     task: AgentTask,
-    phase: "start" | "resume"
+    phase: "start" | "resume",
+    sessionId?: string | null
   ): Promise<{
     profileName: string | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
@@ -7878,6 +7881,12 @@ ${guidance}`
     if (!isOpencodeProfilesEnabled()) return { profileName: null };
 
     const pinned = this.getPinnedOpencodeProfileName(task);
+
+    const home = (process.env.HOME ?? "").trim() || homedir();
+    const defaultAmbientXdg = {
+      dataHome: join(home, ".local", "share"),
+      stateHome: join(home, ".local", "state"),
+    };
 
     if (pinned) {
       const resolved = resolveOpencodeProfile(pinned);
@@ -7901,19 +7910,29 @@ ${guidance}`
       };
     }
 
+    const trimmedSessionId = (sessionId ?? task["session-id"] ?? "").trim();
+    if (phase === "resume" && trimmedSessionId) {
+      const detected = await this.findOpencodeXdgForExistingSession(trimmedSessionId);
+      if (detected) return detected;
+    }
+
     // Source of truth is config (opencode.defaultProfile). The control file no longer controls profile.
     const requested = getRequestedOpencodeProfileName(null);
 
     let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
 
     if (requested === "auto") {
-      const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
-        getThrottleDecision: this.throttle.getThrottleDecision,
-      });
       if (phase === "start") {
+        const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
+          getThrottleDecision: this.throttle.getThrottleDecision,
+        });
         console.log(`[ralph:worker:${this.repo}] Auto-selected OpenCode profile=${JSON.stringify(chosen ?? "")}`);
+        resolved = chosen ? resolveOpencodeProfile(chosen) : resolveOpencodeProfile(null);
+      } else {
+        // Never auto-switch profiles when resuming an existing session.
+        // If we couldn't detect a matching profile above, run with stable ambient XDG dirs.
+        return { profileName: null, opencodeXdg: defaultAmbientXdg };
       }
-      resolved = chosen ? resolveOpencodeProfile(chosen) : resolveOpencodeProfile(null);
     } else if (phase === "start") {
       const selection = await resolveOpencodeProfileForNewWork(Date.now(), requested || null, {
         getThrottleDecision: this.throttle.getThrottleDecision,
@@ -7936,7 +7955,7 @@ ${guidance}`
       if (phase === "start" && requested) {
         console.warn(`[ralph:worker:${this.repo}] Unable to resolve OpenCode profile for new task; running with ambient XDG dirs`);
       }
-      return { profileName: null };
+      return { profileName: null, opencodeXdg: defaultAmbientXdg };
     }
 
     return {
@@ -7948,6 +7967,73 @@ ${guidance}`
         cacheHome: resolved.xdgCacheHome,
       },
     };
+  }
+
+  private async findOpencodeXdgForExistingSession(
+    sessionId: string
+  ): Promise<{ profileName: string | null; opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string } } | null> {
+    const fileName = `${sessionId}.json`;
+
+    const hasSessionInDataHome = async (xdgDataHome: string): Promise<boolean> => {
+      const sessionDir = join(xdgDataHome, "opencode", "storage", "session");
+
+      try {
+        if (existsSync(join(sessionDir, fileName))) return true;
+      } catch {
+        // ignore
+      }
+
+      let entries: string[] = [];
+      try {
+        entries = await readdir(sessionDir);
+      } catch {
+        return false;
+      }
+
+      for (const entry of entries) {
+        const trimmed = (entry ?? "").trim();
+        if (!trimmed) continue;
+        try {
+          if (existsSync(join(sessionDir, trimmed, fileName))) return true;
+        } catch {
+          // ignore
+        }
+      }
+
+      return false;
+    };
+
+    // 1) Prefer an explicit configured profile that already contains this session.
+    for (const name of listOpencodeProfileNames()) {
+      const resolved = resolveOpencodeProfile(name);
+      if (!resolved) continue;
+      if (await hasSessionInDataHome(resolved.xdgDataHome)) {
+        return {
+          profileName: resolved.name,
+          opencodeXdg: {
+            dataHome: resolved.xdgDataHome,
+            configHome: resolved.xdgConfigHome,
+            stateHome: resolved.xdgStateHome,
+            cacheHome: resolved.xdgCacheHome,
+          },
+        };
+      }
+    }
+
+    // 2) Fall back to ambient XDG dirs if the session exists there.
+    const home = (process.env.HOME ?? "").trim() || homedir();
+    const ambientDataHome = join(home, ".local", "share");
+    if (await hasSessionInDataHome(ambientDataHome)) {
+      return {
+        profileName: null,
+        opencodeXdg: {
+          dataHome: ambientDataHome,
+          stateHome: join(home, ".local", "state"),
+        },
+      };
+    }
+
+    return null;
   }
 
   private readPauseRequested(): boolean {
@@ -8796,7 +8882,7 @@ ${guidance}`
 
       const eventWorkerId = task["worker-id"]?.trim();
 
-      const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
+      const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume", existingSessionId);
 
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
 
