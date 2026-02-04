@@ -152,6 +152,8 @@ import {
   parseCheckpointValue,
   parsePauseRequested,
 } from "./checkpoint-fields";
+import { applyTaskPatch } from "./task-patch";
+import { resolveVaultPath } from "./vault-paths";
 import {
   completeParentVerification,
   completeRalphRun,
@@ -462,18 +464,8 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
   return Object.keys(details).length ? details : undefined;
 }
 
-function applyTaskPatch(task: AgentTask, status: AgentTask["status"], patch: Record<string, string | number>): void {
-  task.status = status;
-  for (const [key, value] of Object.entries(patch)) {
-    (task as unknown as Record<string, unknown>)[key] = typeof value === "number" ? String(value) : value;
-  }
-}
-
-function resolveVaultPath(p: string): string {
-  const vault = getBwrbVaultIfValid();
-  if (!vault) return p;
-  return isAbsolute(p) ? p : join(vault, p);
-}
+// (applyTaskPatch extracted to src/worker/task-patch.ts)
+// (resolveVaultPath extracted to src/worker/vault-paths.ts)
 export class RepoWorker {
   private session: SessionAdapter;
   private baseSession: SessionAdapter;
