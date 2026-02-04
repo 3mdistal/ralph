@@ -16,17 +16,21 @@ describe("OpenCode GitHub scoping", () => {
   test("injects GH_TOKEN and non-interactive git auth into OpenCode env", async () => {
     const priorGh = process.env.GH_TOKEN;
     const priorGithub = process.env.GITHUB_TOKEN;
+    const priorBin = process.env.OPENCODE_BIN;
 
     const cacheRoot = await mkdtemp(join(tmpdir(), "ralph-opencode-gh-scope-"));
 
     try {
       process.env.GH_TOKEN = "gho_testtoken123456789012345";
       process.env.GITHUB_TOKEN = "";
+      process.env.OPENCODE_BIN = "/tmp/opencode-test-bin";
 
       let spawnedEnv: Record<string, string | undefined> | null = null;
+      let spawnedCmd: string | null = null;
 
-      const spawn = (_cmd: string, _args: string[], opts: any) => {
+      const spawn = (cmd: string, _args: string[], opts: any) => {
         spawnedEnv = opts?.env ?? null;
+        spawnedCmd = cmd;
 
         const emitter = new EventEmitter();
         const stdout = new Readable({ read() {} });
@@ -61,6 +65,8 @@ describe("OpenCode GitHub scoping", () => {
       const env: Record<string, string | undefined> = spawnedEnv ?? {};
       const xdgCacheHome = env["XDG_CACHE_HOME"] ?? "";
 
+      expect(spawnedCmd).toBe("/tmp/opencode-test-bin");
+
       expect(xdgCacheHome).toContain(cacheRoot);
       expect(env["GH_CONFIG_DIR"]).toBe(join(xdgCacheHome, "gh"));
       expect(env["GH_PROMPT_DISABLED"]).toBe("1");
@@ -73,6 +79,7 @@ describe("OpenCode GitHub scoping", () => {
     } finally {
       restoreEnvVar("GH_TOKEN", priorGh);
       restoreEnvVar("GITHUB_TOKEN", priorGithub);
+      restoreEnvVar("OPENCODE_BIN", priorBin);
       await rm(cacheRoot, { recursive: true, force: true });
     }
   });
