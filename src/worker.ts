@@ -2894,18 +2894,16 @@ ${guidance}`
 
       if (mode === "resume") {
         console.warn(`[ralph:worker:${this.repo}] ${reason} (resetting task for retry)`);
-        const updated = await this.queue.updateTaskStatus(task, "queued", {
-          "session-id": "",
-          "worktree-path": "",
-          "worker-id": "",
-          "repo-slot": "",
-          "daemon-id": "",
-          "heartbeat-at": "",
-          "watchdog-retries": "",
-          "stall-retries": "",
-        });
+        const resetPatch = this.buildQueuedResetPatch();
+        let updated = await this.queue.updateTaskStatus(task, "queued", resetPatch);
         if (!updated) {
-          throw new Error(`Failed to reset task after stale worktree-path: ${recorded}`);
+          await this.refreshIssueSnapshotBestEffort(task);
+          updated = await this.queue.updateTaskStatus(task, "queued", resetPatch);
+          if (!updated) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to reset task after stale worktree-path: ${recorded}`
+            );
+          }
         }
         await this.safeRemoveWorktree(recorded, { allowDiskCleanup: true });
         return { kind: "reset", reason: `${reason} (task reset to queued)` };
@@ -2916,7 +2914,18 @@ ${guidance}`
     }
 
     if (mode === "resume") {
-      throw new Error("Missing worktree-path for in-progress task; refusing to resume in main checkout");
+      const reason = "Missing worktree-path for in-progress task";
+      console.warn(`[ralph:worker:${this.repo}] ${reason} (resetting task for retry)`);
+      const resetPatch = this.buildQueuedResetPatch();
+      let updated = await this.queue.updateTaskStatus(task, "queued", resetPatch);
+      if (!updated) {
+        await this.refreshIssueSnapshotBestEffort(task);
+        updated = await this.queue.updateTaskStatus(task, "queued", resetPatch);
+        if (!updated) {
+          console.warn(`[ralph:worker:${this.repo}] Failed to reset task after missing worktree-path`);
+        }
+      }
+      return { kind: "reset", reason: `${reason} (task reset to queued)` };
     }
 
     const resolvedSlot = typeof repoSlot === "number" && Number.isFinite(repoSlot) ? repoSlot : 0;
@@ -3205,6 +3214,55 @@ ${guidance}`
 
   async runTaskCleanup(tasks: AgentTask[]): Promise<void> {
     await this.cleanupWorktreesForTasks(tasks);
+  }
+
+  private buildQueuedResetPatch(): Record<string, string> {
+    return {
+      "session-id": "",
+      "worktree-path": "",
+      "worker-id": "",
+      "repo-slot": "",
+      "daemon-id": "",
+      "heartbeat-at": "",
+      "watchdog-retries": "",
+      "stall-retries": "",
+    };
+  }
+
+  private async refreshIssueSnapshotBestEffort(task: AgentTask): Promise<void> {
+    const issueRef = parseIssueRef(task.issue, task.repo);
+    if (!issueRef) return;
+
+    try {
+      const data = await this.githubApiRequest<any>(`/repos/${issueRef.repo}/issues/${issueRef.number}`, {
+        allowNotFound: true,
+      });
+      if (!data || typeof data !== "object") return;
+
+      recordIssueSnapshot({
+        repo: issueRef.repo,
+        issue: `${issueRef.repo}#${issueRef.number}`,
+        title: typeof data.title === "string" ? data.title : "",
+        state: typeof data.state === "string" ? data.state : undefined,
+        url: typeof data.html_url === "string" ? data.html_url : undefined,
+      });
+
+      const labels = Array.isArray(data.labels)
+        ? data.labels.map((label: any) => String(label?.name ?? "").trim()).filter(Boolean)
+        : [];
+      recordIssueLabelsSnapshot({
+        repo: issueRef.repo,
+        issue: `${issueRef.repo}#${issueRef.number}`,
+        labels,
+        at: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to refresh issue snapshot for ${issueRef.repo}#${issueRef.number}: ${
+          error?.message ?? String(error)
+        }`
+      );
+    }
   }
 
   private buildWorkerId(task: AgentTask, taskId?: string | null): string | undefined {
