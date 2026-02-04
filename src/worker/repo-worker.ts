@@ -54,7 +54,12 @@ import { readControlStateSnapshot } from "../drain";
 import { buildCheckpointState, type CheckpointState } from "../checkpoints/core";
 import { applyCheckpointReached } from "../checkpoints/runtime";
 import { hasProductGap, parseRoutingDecision, selectPrUrl, type RoutingDecision } from "../routing";
-import { computeLiveAnomalyCountFromJsonl } from "../anomaly";
+import {
+  cleanupIntrospectionLogs,
+  hasRepeatedToolPattern,
+  readIntrospectionSummary,
+  readLiveAnomalyCount,
+} from "./introspection";
 import {
   isExplicitBlockerReason,
   isImplementationTaskFromIssue,
@@ -125,11 +130,9 @@ import {
   type IssueRelationshipProvider,
   type IssueRelationshipSnapshot,
 } from "../github/issue-relationships";
-import { getRalphRunLogPath, getRalphSessionDir, getRalphWorktreesDir, getSessionEventsPath } from "../paths";
+import { getRalphRunLogPath, getRalphWorktreesDir, getSessionEventsPath } from "../paths";
 import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "../dashboard/events";
 import type { DashboardEventContext } from "../dashboard/publisher";
-import { cleanupSessionArtifacts } from "../introspection-traces";
-import { isIntrospectionSummary, type IntrospectionSummary } from "../introspection/summary";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-recording-session-adapter";
 import { redactHomePathForDisplay } from "../redaction";
 import { isSafeSessionId } from "../session-id";
@@ -419,77 +422,6 @@ const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 const CHECKPOINT_SEQ_FIELD = "checkpoint-seq";
 const PAUSE_REQUESTED_FIELD = "pause-requested";
 const PAUSED_AT_CHECKPOINT_FIELD = "paused-at-checkpoint";
-interface LiveAnomalyCount {
-  total: number;
-  recentBurst: boolean;
-}
-
-async function readIntrospectionSummary(sessionId: string): Promise<IntrospectionSummary | null> {
-  if (!isSafeSessionId(sessionId)) return null;
-  const summaryPath = join(getRalphSessionDir(sessionId), "summary.json");
-  if (!existsSync(summaryPath)) return null;
-  
-  try {
-    const content = await readFile(summaryPath, "utf8");
-    const parsed = JSON.parse(content);
-    return isIntrospectionSummary(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Read live anomaly count from the session's events.jsonl.
- * Returns total count and whether there's been a recent burst.
- */
-async function readLiveAnomalyCount(sessionId: string): Promise<LiveAnomalyCount> {
-  if (!isSafeSessionId(sessionId)) return { total: 0, recentBurst: false };
-  const eventsPath = getSessionEventsPath(sessionId);
-  if (!existsSync(eventsPath)) return { total: 0, recentBurst: false };
-
-  try {
-    const content = await readFile(eventsPath, "utf8");
-    return computeLiveAnomalyCountFromJsonl(content, Date.now());
-  } catch {
-    return { total: 0, recentBurst: false };
-  }
-}
-
-function hasRepeatedToolPattern(recentEvents?: string[]): boolean {
-  if (!recentEvents?.length) return false;
-  const counts = new Map<string, number>();
-
-  for (const line of recentEvents) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-
-    let event: any;
-    try {
-      event = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-
-    if (!event || typeof event !== "object" || event.type !== "tool-start") continue;
-    const toolName = String(event.toolName ?? "");
-    if (!toolName) continue;
-    const argsPreview = typeof event.argsPreview === "string" ? event.argsPreview : "";
-    const key = `${toolName}:${argsPreview}`;
-    const nextCount = (counts.get(key) ?? 0) + 1;
-    if (nextCount >= 3) return true;
-    counts.set(key, nextCount);
-  }
-
-  return false;
-}
-
-async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
-  try {
-    await cleanupSessionArtifacts(sessionId);
-  } catch (e) {
-    console.warn(`[ralph:worker] Failed to cleanup introspection logs: ${e}`);
-  }
-}
 
 export interface AgentRun {
   taskName: string;
