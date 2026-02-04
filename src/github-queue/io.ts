@@ -669,7 +669,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   };
 
   const listTasksByStatus = async (status: QueueTaskStatus): Promise<AgentTask[]> => {
-    if (status === "starting" || status === "throttled") return [];
     await maybeSweepClosedIssues();
     await maybeSweepStaleInProgress();
     await maybeSweepBlockedLabels();
