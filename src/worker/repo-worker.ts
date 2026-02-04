@@ -243,6 +243,7 @@ import {
 import { updatePullRequestBranch as updatePullRequestBranchImpl } from "./merge/update-branch";
 import { waitForRequiredChecks as waitForRequiredChecksImpl } from "./merge/wait-required-checks";
 import { getPullRequestMergeState as getPullRequestMergeStateImpl } from "./merge/pull-request-state";
+import { updatePullRequestBranchViaWorktree as updatePullRequestBranchViaWorktreeImpl } from "./merge/auto-update-worktree";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -5634,59 +5635,16 @@ ${guidance}`
   }
 
   private async updatePullRequestBranchViaWorktree(prUrl: string): Promise<void> {
-    const pr = await this.getPullRequestMergeState(prUrl);
-    const botBranch = this.normalizeGitRef(getRepoBotBranch(this.repo));
-    const headRef = this.normalizeGitRef(pr.headRefName);
-    const baseRef = this.normalizeGitRef(pr.baseRefName || botBranch);
-    if (pr.isCrossRepository || pr.headRepoFullName !== this.repo) {
-      throw new Error(`Cannot update cross-repo PR ${prUrl}; requires same-repo branch access`);
-    }
-
-    if (pr.mergeStateStatus === "DIRTY") {
-      throw new Error(`Refusing to update PR with merge conflicts: ${prUrl}`);
-    }
-
-    if (pr.mergeStateStatus === "DRAFT") {
-      throw new Error(`Refusing to update draft PR: ${prUrl}`);
-    }
-
-    if (!headRef) {
-      throw new Error(`PR missing head ref for update: ${prUrl}`);
-    }
-
-    const worktreePath = await this.createAutoUpdateWorktree(prUrl);
-
-    try {
-      await $`git fetch origin`.cwd(worktreePath).quiet();
-      await $`git checkout ${headRef}`.cwd(worktreePath).quiet();
-      await $`git merge --no-edit origin/${baseRef}`.cwd(worktreePath).quiet();
-      await $`git push origin ${headRef}`.cwd(worktreePath).quiet();
-    } catch (error: any) {
-      const message = error?.message ?? String(error);
-      throw new Error(`Worktree update failed for ${prUrl}: ${message}`);
-    } finally {
-      await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: true });
-    }
-  }
-
-  private async createAutoUpdateWorktree(prUrl: string): Promise<string> {
-    const slug = safeNoteName(this.repo);
-    const prNumber = extractPullRequestNumber(prUrl) ?? "unknown";
-    const worktreePath = join(RALPH_WORKTREES_DIR, slug, `pr-${prNumber}-auto-update`);
-
-    if (existsSync(worktreePath)) {
-      try {
-        const status = await $`git status --porcelain`.cwd(worktreePath).quiet();
-        if (status.stdout.toString().trim()) {
-          await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: true });
-        }
-      } catch {
-        await this.safeRemoveWorktree(worktreePath, { allowDiskCleanup: true });
-      }
-    }
-
-    await this.ensureGitWorktree(worktreePath);
-    return worktreePath;
+    return await updatePullRequestBranchViaWorktreeImpl({
+      repo: this.repo,
+      prUrl,
+      worktreesDir: RALPH_WORKTREES_DIR,
+      botBranch: getRepoBotBranch(this.repo),
+      normalizeGitRef: (ref) => this.normalizeGitRef(ref),
+      getPullRequestMergeState: async (url) => await this.getPullRequestMergeState(url),
+      ensureGitWorktree: async (worktreePath) => await this.ensureGitWorktree(worktreePath),
+      safeRemoveWorktree: async (worktreePath, opts) => await this.safeRemoveWorktree(worktreePath, opts),
+    });
   }
 
   private async getPullRequestMergeState(prUrl: string): Promise<PullRequestMergeState> {
