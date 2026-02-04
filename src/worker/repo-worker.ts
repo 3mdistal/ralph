@@ -242,6 +242,7 @@ import {
 } from "./merge/pull-request-io";
 import { updatePullRequestBranch as updatePullRequestBranchImpl } from "./merge/update-branch";
 import { waitForRequiredChecks as waitForRequiredChecksImpl } from "./merge/wait-required-checks";
+import { getPullRequestMergeState as getPullRequestMergeStateImpl } from "./merge/pull-request-state";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -5689,51 +5690,7 @@ ${guidance}`
   }
 
   private async getPullRequestMergeState(prUrl: string): Promise<PullRequestMergeState> {
-    const prNumber = extractPullRequestNumber(prUrl);
-    if (!prNumber) {
-      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
-    }
-
-    const { owner, name } = splitRepoFullName(this.repo);
-    const query = [
-      "query($owner:String!,$name:String!,$number:Int!){",
-      "repository(owner:$owner,name:$name){",
-      "pullRequest(number:$number){",
-      "number",
-      "url",
-      "mergeStateStatus",
-      "isCrossRepository",
-      "headRefName",
-      "baseRefName",
-      "headRepository{ nameWithOwner }",
-      "labels(first:100){nodes{name}}",
-      "}",
-      "}",
-      "}",
-    ].join(" ");
-
-    const result = await ghRead(this.repo)`gh api graphql -f query=${query} -f owner=${owner} -f name=${name} -F number=${prNumber}`.quiet();
-    const parsed = JSON.parse(result.stdout.toString());
-    const pr = parsed?.data?.repository?.pullRequest;
-
-    if (!pr?.url) {
-      throw new Error(`Failed to read pull request metadata for ${prUrl}`);
-    }
-
-    const labels = Array.isArray(pr?.labels?.nodes)
-      ? pr.labels.nodes.map((node: any) => String(node?.name ?? "").trim()).filter(Boolean)
-      : [];
-
-    return {
-      number: Number(pr?.number ?? prNumber),
-      url: String(pr?.url ?? prUrl),
-      mergeStateStatus: normalizeMergeStateStatus(pr?.mergeStateStatus),
-      isCrossRepository: Boolean(pr?.isCrossRepository),
-      headRefName: String(pr?.headRefName ?? ""),
-      headRepoFullName: String(pr?.headRepository?.nameWithOwner ?? ""),
-      baseRefName: String(pr?.baseRefName ?? ""),
-      labels,
-    };
+    return await getPullRequestMergeStateImpl({ repo: this.repo, prUrl });
   }
 
   private async fetchPullRequestDetails(prUrl: string): Promise<PullRequestDetailsNormalized> {
