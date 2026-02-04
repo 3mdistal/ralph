@@ -13,6 +13,7 @@ import { mutateIssueLabels } from "./label-mutation";
 import { canAttemptLabelWrite } from "./label-write-backoff";
 import { statusToRalphLabelDelta, type LabelOp } from "../github-queue/core";
 import type { QueueTaskStatus } from "../queue/types";
+import { RALPH_LABEL_STATUS_PAUSED } from "../github-labels";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_MAX_ISSUES_PER_TICK = 10;
@@ -76,6 +77,7 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
   for (const issue of issues) {
     if (processed >= maxIssues) break;
     if ((issue.state ?? "").toUpperCase() === "CLOSED") continue;
+    if (issue.labels.includes(RALPH_LABEL_STATUS_PAUSED)) continue;
     const opState = opStateByIssue.get(issue.number);
     if (!opState) continue;
 

@@ -5,6 +5,7 @@ export type QueueTaskStatus =
   | "queued"
   | "starting"
   | "in-progress"
+  | "paused"
   | "throttled"
   | "blocked"
   | "escalated"

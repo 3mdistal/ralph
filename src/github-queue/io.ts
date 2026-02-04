@@ -37,6 +37,7 @@ import { computeStaleInProgressRecovery, deriveTaskView, planClaim, statusToRalp
 import {
   RALPH_LABEL_STATUS_BLOCKED,
   RALPH_LABEL_STATUS_IN_PROGRESS,
+  RALPH_LABEL_STATUS_PAUSED,
   RALPH_LABEL_STATUS_QUEUED,
   RALPH_STATUS_LABEL_PREFIX,
 } from "../github-labels";
@@ -774,12 +775,13 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         const snapshotLabels = issue.labels;
         let plan = planClaim(snapshotLabels);
         const shouldCheckDependencies = snapshotLabels.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
+        const shouldCheckPause = snapshotLabels.includes(RALPH_LABEL_STATUS_PAUSED);
 
         // Avoid repeated core REST reads on every claim attempt. The IO layer applies a TTL cache.
         // We only request live labels when we may claim or when blocked-gating needs it.
         let labelsForPlan = snapshotLabels;
         try {
-          if (plan.claimable || shouldCheckDependencies) {
+          if (plan.claimable || shouldCheckDependencies || shouldCheckPause) {
             labelsForPlan = await io.listIssueLabels(issueRef.repo, issueRef.number);
           }
 
@@ -919,6 +921,21 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         return { claimed: true, task: view };
       }
 
+      // Stop switch: if paused label is present, do not claim or heartbeat.
+      // Prefer live labels (TTL-cached) to reduce pause/unpause latency.
+      const snapshotPaused = issue.labels.includes(RALPH_LABEL_STATUS_PAUSED);
+      try {
+        const liveLabels = await io.listIssueLabels(issueRef.repo, issueRef.number);
+        if (liveLabels.includes(RALPH_LABEL_STATUS_PAUSED)) {
+          return { claimed: false, task: opts.task, reason: "Issue is paused" };
+        }
+      } catch {
+        // best-effort: fall back to snapshot gating
+        if (snapshotPaused) {
+          return { claimed: false, task: opts.task, reason: "Issue is paused" };
+        }
+      }
+
       const ttlMs = getConfig().ownershipTtlMs;
       if (
         !canActOnTask(
@@ -1048,7 +1065,9 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         return true;
       }
 
-      const delta = issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] };
+      const preservePausedLabel =
+        Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_PAUSED)) && status !== "paused" && status !== "done";
+      const delta = preservePausedLabel ? { add: [], remove: [] } : (issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] });
       const steps: LabelOp[] = [
         ...delta.add.map((label) => ({ action: "add" as const, label })),
         ...delta.remove.map((label) => ({ action: "remove" as const, label })),
@@ -1100,8 +1119,8 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
         daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
         heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
-        releasedAtMs: status === "in-progress" || status === "starting" || status === "throttled" ? null : undefined,
-        releasedReason: status === "in-progress" || status === "starting" || status === "throttled" ? null : undefined,
+        releasedAtMs: status === "in-progress" || status === "starting" || status === "paused" || status === "throttled" ? null : undefined,
+        releasedReason: status === "in-progress" || status === "starting" || status === "paused" || status === "throttled" ? null : undefined,
         at: nowIso,
       });
 
