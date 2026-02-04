@@ -65,6 +65,7 @@ describe("OpenCode GitHub scoping", () => {
       const env: Record<string, string | undefined> = spawnedEnv ?? {};
       const xdgCacheHome = env["XDG_CACHE_HOME"] ?? "";
 
+      if (spawnedCmd === null) throw new Error("spawn was not called");
       expect(spawnedCmd).toBe("/tmp/opencode-test-bin");
 
       expect(xdgCacheHome).toContain(cacheRoot);
