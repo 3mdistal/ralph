@@ -1723,7 +1723,7 @@ async function main(): Promise<void> {
 
   if (queueState.backend === "github") {
     githubLabelReconciler = startGitHubLabelReconciler({
-      intervalMs: 60_000,
+      intervalMs: config.labelReconcileIntervalMs,
       log: (message) => console.log(message),
     });
   }
@@ -2785,6 +2785,9 @@ if (args[0] === "watch") {
     printCommandHelp("watch");
     process.exit(0);
   }
+
+  // GitHub-backed queue queries require the SQLite state DB.
+  initStateDb();
 
   console.log("[ralph] Watching in-progress task status (Ctrl+C to stop)...");
 

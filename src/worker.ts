@@ -76,6 +76,7 @@ import { createGhRunner } from "./github/gh-runner";
 import { getProtectionContexts, resolveRequiredChecks, type BranchProtection, type ResolvedRequiredChecks } from "./github/required-checks";
 import { createRalphWorkflowLabelsEnsurer } from "./github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "./github/relationship-signals";
+import { logRelationshipDiagnostics } from "./github/relationship-diagnostics";
 import { sanitizeEscalationReason, writeEscalationToGitHub } from "./github/escalation-writeback";
 import { ensureEscalationCommentHasConsultantPacket } from "./github/escalation-consultant-writeback";
 import {
@@ -140,6 +141,7 @@ import {
   getRalphRunTokenTotals,
   getIdempotencyRecord,
   getIdempotencyPayload,
+  isStateDbInitialized,
   listRalphRunSessionTokenTotals,
   recordIdempotencyKey,
   deleteIdempotencyKey,
@@ -148,6 +150,7 @@ import {
   upsertIdempotencyKey,
   recordIssueSnapshot,
   recordPrSnapshot,
+  recordIssueLabelsSnapshot,
   listOpenPrCandidatesForIssue,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
@@ -280,9 +283,7 @@ const ANOMALY_BURST_THRESHOLD = 50; // Abort if this many anomalies detected
 const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
-const IGNORED_BODY_DEPS_LOG_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const LEGACY_WORKTREES_LOG_INTERVAL_MS = 12 * 60 * 60 * 1000;
-const IGNORED_BODY_DEPS_LOG_MAX_KEYS = 2000;
 const BLOCKED_REASON_MAX_LEN = 200;
 const BLOCKED_DETAILS_MAX_LEN = 2000;
 const CI_DEBUG_LEASE_TTL_MS = 20 * 60_000;
@@ -1011,7 +1012,6 @@ export class RepoWorker {
   private relationshipCache = new Map<string, { ts: number; snapshot: IssueRelationshipSnapshot }>();
   private relationshipInFlight = new Map<string, Promise<IssueRelationshipSnapshot | null>>();
   private lastBlockedSyncAt = 0;
-  private ignoredBodyDepsLogLimiter = new LogLimiter({ maxKeys: IGNORED_BODY_DEPS_LOG_MAX_KEYS });
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
@@ -1851,6 +1851,10 @@ export class RepoWorker {
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
     }
+
+    if (result.add.length > 0 || result.remove.length > 0) {
+      this.recordIssueLabelDelta(issue, { add: result.add, remove: result.remove });
+    }
   }
 
   private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
@@ -1877,6 +1881,25 @@ export class RepoWorker {
         return;
       }
       throw result.error instanceof Error ? result.error : new Error(String(result.error));
+    }
+
+    if (result.add.length > 0 || result.remove.length > 0) {
+      this.recordIssueLabelDelta(issue, { add: result.add, remove: result.remove });
+    }
+  }
+
+  private recordIssueLabelDelta(issue: IssueRef, delta: { add: string[]; remove: string[] }): void {
+    try {
+      const nowIso = new Date().toISOString();
+      const current = getIssueLabels(issue.repo, issue.number);
+      const set = new Set(current);
+      for (const label of delta.remove) set.delete(label);
+      for (const label of delta.add) set.add(label);
+      recordIssueLabelsSnapshot({ repo: issue.repo, issue: `${issue.repo}#${issue.number}`, labels: Array.from(set), at: nowIso });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to record label snapshot for ${formatIssueRef(issue)}: ${error?.message ?? String(error)}`
+      );
     }
   }
 
@@ -2762,6 +2785,8 @@ ${guidance}`
     }
 
     for (const entry of byIssue.values()) {
+      const labelsKnown = isStateDbInitialized();
+      const issueLabels = getIssueLabels(entry.issue.repo, entry.issue.number);
       const snapshot = await this.getRelationshipSnapshot(entry.issue, allowRefresh);
       if (!snapshot) continue;
 
@@ -2778,20 +2803,23 @@ ${guidance}`
           await this.markTaskBlocked(task, "deps", { reason, details: reason });
         }
 
-        try {
-          await this.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${
-              error?.message ?? String(error)
-            }`
-          );
+        const hasBlockedLabel = issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_BLOCKED);
+        if (!labelsKnown || !hasBlockedLabel) {
+          try {
+            await this.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
+          } catch (error: any) {
+            console.warn(
+              `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+                error?.message ?? String(error)
+              }`
+            );
+          }
         }
         continue;
       }
 
       if (!decision.blocked && decision.confidence === "certain") {
-        const labels = getIssueLabels(this.repo, entry.issue.number);
+        const labels = issueLabels;
         const shouldSetParentVerification =
           labels.length === 0
             ? true
@@ -2823,14 +2851,17 @@ ${guidance}`
         }
 
         if (shouldRemoveBlockedLabel) {
-          try {
-            await this.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
-          } catch (error: any) {
-            console.warn(
-              `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${
-                error?.message ?? String(error)
-              }`
-            );
+          const hasBlockedLabel = issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_BLOCKED);
+          if (!labelsKnown || hasBlockedLabel) {
+            try {
+              await this.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
+            } catch (error: any) {
+              console.warn(
+                `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${
+                  error?.message ?? String(error)
+                }`
+              );
+            }
           }
         }
       }
@@ -2872,20 +2903,8 @@ ${guidance}`
 
   private buildRelationshipSignals(snapshot: IssueRelationshipSnapshot): RelationshipSignal[] {
     const resolved = resolveRelationshipSignals(snapshot);
-    if (resolved.ignoredBodyBlockers > 0) {
-      this.logIgnoredBodyBlockers(snapshot.issue, resolved.ignoredBodyBlockers, resolved.ignoreReason);
-    }
+    logRelationshipDiagnostics({ repo: this.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "worker" });
     return resolved.signals;
-  }
-
-  private logIgnoredBodyBlockers(issue: IssueRef, ignoredCount: number, reason: "complete" | "partial"): void {
-    const key = `${issue.repo}#${issue.number}`;
-    if (!this.ignoredBodyDepsLogLimiter.shouldLog(key, IGNORED_BODY_DEPS_LOG_INTERVAL_MS)) return;
-    const reasonLabel = reason === "complete" ? "complete" : "partial";
-    console.log(
-      `[ralph:worker:${this.repo}] Ignoring ${ignoredCount} body blocker(s) for ${formatIssueRef(issue)} due to ${reasonLabel} ` +
-        `GitHub dependency coverage.`
-    );
   }
 
   private async resolveWorktreeRef(): Promise<string> {
