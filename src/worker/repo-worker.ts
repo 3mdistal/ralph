@@ -3,6 +3,7 @@ import { appendFile, mkdir, readFile, readdir, rm } from "fs/promises";
 import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
+import { homedir } from "os";
 
 import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "../queue-backend";
 import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "../bwrb/artifacts";
@@ -18,6 +19,7 @@ import {
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
   isOpencodeProfilesEnabled,
+  listOpencodeProfileNames,
   getConfig,
   resolveOpencodeProfile,
 } from "../config";
@@ -4567,13 +4569,22 @@ export class RepoWorker {
 
   private async resolveOpencodeXdgForTask(
     task: AgentTask,
-    phase: "start" | "resume"
+    phase: "start" | "resume",
+    sessionId?: string
   ): Promise<{
     profileName: string | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     error?: string;
   }> {
     if (!isOpencodeProfilesEnabled()) return { profileName: null };
+
+    const home = process.env.HOME ?? homedir();
+    const ambientXdg = {
+      dataHome: join(home, ".local", "share"),
+      configHome: join(home, ".config"),
+      stateHome: join(home, ".local", "state"),
+      cacheHome: join(home, ".cache"),
+    };
 
     const pinned = this.getPinnedOpencodeProfileName(task);
 
@@ -4597,6 +4608,42 @@ export class RepoWorker {
           cacheHome: resolved.xdgCacheHome,
         },
       };
+    }
+
+    if (phase === "resume") {
+      if (!sessionId) {
+        return { profileName: null, opencodeXdg: ambientXdg };
+      }
+
+      const candidates = listOpencodeProfileNames();
+      for (const name of candidates) {
+        const resolved = resolveOpencodeProfile(name);
+        if (!resolved) continue;
+        const base = join(resolved.xdgDataHome, "opencode", "storage", "session");
+        if (!existsSync(base)) continue;
+        try {
+          const dirs = await readdir(base, { withFileTypes: true });
+          for (const dir of dirs) {
+            if (!dir.isDirectory()) continue;
+            const sessionPath = join(base, dir.name, `${sessionId}.json`);
+            if (existsSync(sessionPath)) {
+              return {
+                profileName: resolved.name,
+                opencodeXdg: {
+                  dataHome: resolved.xdgDataHome,
+                  configHome: resolved.xdgConfigHome,
+                  stateHome: resolved.xdgStateHome,
+                  cacheHome: resolved.xdgCacheHome,
+                },
+              };
+            }
+          }
+        } catch {
+          // best-effort
+        }
+      }
+
+      return { profileName: null, opencodeXdg: ambientXdg };
     }
 
     // Source of truth is config (opencode.defaultProfile). The control file no longer controls profile.
@@ -5336,7 +5383,7 @@ export class RepoWorker {
 
       const eventWorkerId = task["worker-id"]?.trim();
 
-      const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume");
+      const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume", existingSessionId);
 
       if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
 
@@ -5361,7 +5408,18 @@ export class RepoWorker {
       if (setupRun) return setupRun;
 
       const botBranch = getRepoBotBranch(this.repo);
-      const issueMeta = await this.getIssueMetadata(task.issue);
+      const mergeConflictRun = await this.maybeHandleQueuedMergeConflict({
+        task,
+        issueNumber: issueNumber || cacheKey,
+        taskRepoPath,
+        cacheKey,
+        botBranch,
+        issueMeta,
+        startTime,
+        opencodeXdg,
+        opencodeSessionOptions,
+      });
+      if (mergeConflictRun) return mergeConflictRun;
 
       const defaultResumeMessage =
         "Ralph restarted while this task was in progress. " +
