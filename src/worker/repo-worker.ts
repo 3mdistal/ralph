@@ -28,6 +28,7 @@ import { getAllowedOwners, getConfiguredGitHubAppSlug, isRepoAllowed } from "../
 import { safeNoteName } from "./names";
 import { createWorktreeManager, type ResolveTaskRepoPathResult } from "./worktrees";
 import { buildIssueContextForAgent as buildIssueContextForAgentImpl, getIssueMetadata as getIssueMetadataImpl } from "./issue-context";
+import { createIssuePrResolver, type ResolvedIssuePr } from "./pr-reuse";
 import {
   continueCommand,
   continueSession,
@@ -158,7 +159,6 @@ import {
   recordIssueSnapshot,
   recordPrSnapshot,
   recordIssueLabelsSnapshot,
-  listOpenPrCandidatesForIssue,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
   type PrState,
@@ -179,7 +179,6 @@ import {
 import { parseLastLineJsonMarker } from "../markers";
 import { refreshRalphRunTokenTotals } from "../run-token-accounting";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
-import { selectCanonicalPr, type ResolvedPrCandidate } from "../pr-resolution";
 import {
   detectLegacyWorktrees,
   isPathUnderDir,
@@ -191,10 +190,7 @@ import {
 import { formatLegacyWorktreeWarning } from "../legacy-worktrees";
 import {
   normalizePrUrl,
-  searchOpenPullRequestsByIssueLink,
-  viewPullRequest,
   viewPullRequestMergeCandidate,
-  type PullRequestSearchResult,
 } from "../github/pr";
 import {
   REQUIRED_CHECKS_DEFER_LOG_INTERVAL_MS,
@@ -277,13 +273,6 @@ type PullRequestMergeState = {
   headRepoFullName: string;
   baseRefName: string;
   labels: string[];
-};
-
-type ResolvedIssuePr = {
-  selectedUrl: string | null;
-  duplicates: string[];
-  source: "db" | "gh-search" | null;
-  diagnostics: string[];
 };
 
 type MergeConflictRecoveryOutcome =
@@ -714,6 +703,13 @@ export class RepoWorker {
       worktreesDir: RALPH_WORKTREES_DIR,
       queue: this.queue,
     });
+    this.prResolver = createIssuePrResolver({
+      repo: this.repo,
+      formatGhError: (error) => this.formatGhError(error),
+      recordOpenPrSnapshot: (issueRef, prUrl) => {
+        this.recordPrSnapshotBestEffort({ issue: issueRef, prUrl, state: PR_STATE_OPEN });
+      },
+    });
     this.github = new GitHubClient(this.repo);
     this.relationships = opts?.relationships ?? new GitHubRelationshipProvider(this.repo, this.github);
     this.labelEnsurer = createRalphWorkflowLabelsEnsurer({
@@ -730,7 +726,7 @@ export class RepoWorker {
   private lastBlockedSyncAt = 0;
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
-  private prResolutionCache = new Map<string, Promise<ResolvedIssuePr>>();
+  private prResolver: ReturnType<typeof createIssuePrResolver>;
   private checkpointEvents = new CheckpointEventDeduper();
   private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
@@ -1654,15 +1650,7 @@ export class RepoWorker {
   }
 
   private getIssuePrResolution(issueNumber: string): Promise<ResolvedIssuePr> {
-    const cacheKey = `${this.repo}#${issueNumber}`;
-    const cached = this.prResolutionCache.get(cacheKey);
-    if (cached) return cached;
-    const promise = this.findExistingOpenPrForIssue(issueNumber).catch((error) => {
-      this.prResolutionCache.delete(cacheKey);
-      throw error;
-    });
-    this.prResolutionCache.set(cacheKey, promise);
-    return promise;
+    return this.prResolver.getIssuePrResolution(issueNumber);
   }
 
   private buildPrCreateLeaseKey(issueNumber: string, botBranch: string): string {
@@ -1986,132 +1974,6 @@ export class RepoWorker {
     });
 
     return { handled: true, merged: true, prUrl: merged.prUrl };
-  }
-
-  private async findExistingOpenPrForIssue(issueNumber: string): Promise<ResolvedIssuePr> {
-    const diagnostics: string[] = [];
-    const parsedIssue = Number(issueNumber);
-    if (!Number.isFinite(parsedIssue)) {
-      diagnostics.push("- Invalid issue number; skipping PR reuse");
-      return { selectedUrl: null, duplicates: [], source: null, diagnostics };
-    }
-
-    const dbCandidates = await this.resolveDbPrCandidates(parsedIssue, diagnostics);
-    if (dbCandidates.length > 0) {
-      const resolved = selectCanonicalPr(dbCandidates);
-      const result = this.buildResolvedIssuePr(issueNumber, resolved, "db", diagnostics);
-      this.recordResolvedPrSnapshots(issueNumber, resolved);
-      return result;
-    }
-
-    const searchCandidates = await this.resolveSearchPrCandidates(issueNumber, diagnostics);
-    if (searchCandidates.length > 0) {
-      const resolved = selectCanonicalPr(searchCandidates);
-      const result = this.buildResolvedIssuePr(issueNumber, resolved, "gh-search", diagnostics);
-      this.recordResolvedPrSnapshots(issueNumber, resolved);
-      return result;
-    }
-
-    return { selectedUrl: null, duplicates: [], source: null, diagnostics };
-  }
-
-  private buildResolvedIssuePr(
-    issueNumber: string,
-    resolved: { selected: ResolvedPrCandidate | null; duplicates: ResolvedPrCandidate[] },
-    source: "db" | "gh-search",
-    diagnostics: string[]
-  ): ResolvedIssuePr {
-    if (resolved.selected) {
-      diagnostics.push(`- Reusing PR: ${resolved.selected.url} (source=${source})`);
-      if (resolved.duplicates.length > 0) {
-        diagnostics.push(`- Duplicate PRs detected: ${resolved.duplicates.map((dup) => dup.url).join(", ")}`);
-      }
-    }
-
-    return {
-      selectedUrl: resolved.selected?.url ?? null,
-      duplicates: resolved.duplicates.map((dup) => dup.url),
-      source,
-      diagnostics,
-    };
-  }
-
-  private recordResolvedPrSnapshots(
-    issueNumber: string,
-    resolved: { selected: ResolvedPrCandidate | null; duplicates: ResolvedPrCandidate[] }
-  ): void {
-    const issueRef = `${this.repo}#${issueNumber}`;
-    if (resolved.selected) {
-      this.recordPrSnapshotBestEffort({ issue: issueRef, prUrl: resolved.selected.url, state: PR_STATE_OPEN });
-    }
-    for (const duplicate of resolved.duplicates) {
-      this.recordPrSnapshotBestEffort({ issue: issueRef, prUrl: duplicate.url, state: PR_STATE_OPEN });
-    }
-  }
-
-  private async resolveDbPrCandidates(issueNumber: number, diagnostics: string[]): Promise<ResolvedPrCandidate[]> {
-    const rows = listOpenPrCandidatesForIssue(this.repo, issueNumber);
-    if (rows.length === 0) return [];
-    diagnostics.push(`- DB PR candidates: ${rows.length}`);
-
-    const results: ResolvedPrCandidate[] = [];
-    const seen = new Set<string>();
-
-    for (const row of rows) {
-      const normalized = normalizePrUrl(row.url);
-      if (seen.has(normalized)) continue;
-      seen.add(normalized);
-
-      try {
-        const view = await viewPullRequest(this.repo, row.url);
-        if (!view) continue;
-        const state = String(view.state ?? "").toUpperCase();
-        if (state !== "OPEN") continue;
-        results.push({
-          url: view.url,
-          source: "db",
-          ghCreatedAt: view.createdAt,
-          ghUpdatedAt: view.updatedAt,
-          dbUpdatedAt: row.updatedAt,
-        });
-        if (view.isDraft) {
-          diagnostics.push(`- Existing PR is draft: ${view.url}`);
-        }
-      } catch (error: any) {
-        diagnostics.push(`- Failed to validate PR ${row.url}: ${this.formatGhError(error)}`);
-      }
-    }
-
-    return results;
-  }
-
-  private async resolveSearchPrCandidates(issueNumber: string, diagnostics: string[]): Promise<ResolvedPrCandidate[]> {
-    let searchResults: PullRequestSearchResult[] = [];
-    try {
-      searchResults = await searchOpenPullRequestsByIssueLink(this.repo, issueNumber);
-    } catch (error: any) {
-      diagnostics.push(`- GitHub PR search failed: ${this.formatGhError(error)}`);
-      return [];
-    }
-
-    if (searchResults.length === 0) return [];
-    diagnostics.push(`- GitHub PR search candidates: ${searchResults.length}`);
-
-    const results: ResolvedPrCandidate[] = [];
-    const seen = new Set<string>();
-    for (const result of searchResults) {
-      const normalized = normalizePrUrl(result.url);
-      if (seen.has(normalized)) continue;
-      seen.add(normalized);
-      results.push({
-        url: result.url,
-        source: "gh-search",
-        ghCreatedAt: result.createdAt,
-        ghUpdatedAt: result.updatedAt,
-      });
-    }
-
-    return results;
   }
 
   private isSamePrUrl(left: string | null | undefined, right: string | null | undefined): boolean {
