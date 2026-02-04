@@ -6,6 +6,7 @@ import { runAgent } from "../session";
 
 describe("runAgent", () => {
   test("spawns opencode run with agent and no command", async () => {
+    const priorBin = process.env.OPENCODE_BIN;
     let spawnedArgs: string[] | null = null;
 
     const spawn = (cmd: string, args: string[]) => {
@@ -27,7 +28,14 @@ describe("runAgent", () => {
       return proc as any;
     };
 
-    await runAgent("/tmp", "ralph-plan", "hello", {}, { spawn: spawn as any });
+    try {
+      // Force a stable command name for this test.
+      process.env.OPENCODE_BIN = "opencode";
+      await runAgent("/tmp", "ralph-plan", "hello", {}, { spawn: spawn as any });
+    } finally {
+      if (priorBin === undefined) delete (process.env as any).OPENCODE_BIN;
+      else process.env.OPENCODE_BIN = priorBin;
+    }
 
     const argsList = spawnedArgs ?? [];
     const argsText = argsList.join(" ");

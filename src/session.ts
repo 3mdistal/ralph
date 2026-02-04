@@ -23,7 +23,7 @@ const defaultScheduler: Scheduler = {
 import { chmodSync, createWriteStream, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { readdir, readFile, writeFile } from "fs/promises";
 import { homedir } from "os";
-import { basename, dirname, join } from "path";
+import { basename, delimiter, dirname, join } from "path";
 import type { Writable } from "stream";
 
 import { getRalphSessionLockPath, getSessionDir, getSessionEventsPath } from "./paths";
@@ -45,6 +45,16 @@ export interface ServerHandle {
   url: string;
   port: number;
   process: ChildProcess;
+}
+
+function ensurePathIncludes(env: Record<string, string | undefined>, dir: string): void {
+  const trimmed = dir.trim();
+  if (!trimmed) return;
+
+  const current = (env.PATH ?? "").trim();
+  const parts = current ? current.split(delimiter).filter(Boolean) : [];
+  if (parts.includes(trimmed)) return;
+  env.PATH = parts.length > 0 ? `${trimmed}${delimiter}${parts.join(delimiter)}` : trimmed;
 }
 
 export interface WatchdogTimeoutInfo {
@@ -105,7 +115,7 @@ async function spawnServer(repoPath: string): Promise<ServerHandle> {
     const port = 4000 + Math.floor(Math.random() * 1000);
     const { env } = buildOpencodeSpawnEnvironment({ repo: repoPath, cacheKey: "server" });
 
-    const proc = spawnFn("opencode", ["serve", "--port", String(port)], {
+    const proc = spawnFn(resolveOpencodeBin(), ["serve", "--port", String(port)], {
       cwd: repoPath,
       stdio: ["ignore", "pipe", "pipe"],
       env,
@@ -246,17 +256,19 @@ function buildOpencodeSpawnEnvironment(opts?: OpencodeSpawnOptions): { env: Reco
 
   const opencodeConfigDir = ensureManagedOpencodeConfigInstalled();
 
-  return {
-    xdgCacheHome,
-    env: {
-      ...process.env,
-      OPENCODE_CONFIG_DIR: opencodeConfigDir,
-      ...(opencodeXdg?.dataHome ? { XDG_DATA_HOME: opencodeXdg.dataHome } : {}),
-      XDG_CONFIG_HOME: xdgConfigHome,
-      ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
-      XDG_CACHE_HOME: xdgCacheHome,
-    },
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    OPENCODE_CONFIG_DIR: opencodeConfigDir,
+    ...(opencodeXdg?.dataHome ? { XDG_DATA_HOME: opencodeXdg.dataHome } : {}),
+    XDG_CONFIG_HOME: xdgConfigHome,
+    ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
+    XDG_CACHE_HOME: xdgCacheHome,
   };
+
+  // Daemon runs may have a sanitized PATH. Ensure user-installed binaries are discoverable.
+  ensurePathIncludes(env, join(homedir(), ".local", "bin"));
+
+  return { xdgCacheHome, env };
 }
 
 export function __buildOpencodeEnvForTests(opts?: OpencodeSpawnOptions): Record<string, string | undefined> {
@@ -924,7 +936,7 @@ async function runSession(
   const processKill = options?.__testOverrides?.processKill ?? process.kill;
   const useProcessGroup = process.platform !== "win32";
 
-  const proc = spawn("opencode", args, {
+  const proc = spawn(resolveOpencodeBin(), args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env,
@@ -2125,7 +2137,7 @@ async function* streamSession(
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const useProcessGroup = process.platform !== "win32";
 
-  const proc = spawn("opencode", args, {
+  const proc = spawn(resolveOpencodeBin(), args, {
     cwd: repoPath,
     stdio: ["ignore", "pipe", "pipe"],
     env,
