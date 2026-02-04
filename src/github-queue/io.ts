@@ -7,6 +7,7 @@ import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
 import { GitHubRelationshipProvider, type IssueRelationshipProvider } from "../github/issue-relationships";
 import { resolveRelationshipSignals } from "../github/relationship-signals";
+import { logRelationshipDiagnostics } from "../github/relationship-diagnostics";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {
@@ -289,6 +290,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         try {
           const snapshot = await provider.getSnapshot({ repo, number: issue.number });
           const resolved = resolveRelationshipSignals(snapshot);
+          logRelationshipDiagnostics({ repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
           const decision = computeBlockedDecision(resolved.signals);
 
           // IMPORTANT: unknown dependency coverage should NOT cause blocked label churn.
@@ -686,6 +688,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               const relationships = relationshipsProviderFactory(issueRef.repo);
               const snapshot = await relationships.getSnapshot(issueRef);
               const resolved = resolveRelationshipSignals(snapshot);
+              logRelationshipDiagnostics({ repo: issueRef.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
               const decision = computeBlockedDecision(resolved.signals);
 
               if (decision.confidence === "unknown") {
