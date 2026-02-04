@@ -11,7 +11,7 @@ import type { AlertKind, AlertTargetType } from "./alerts/core";
 const SCHEMA_VERSION = 15;
 
 export type PrState = "open" | "merged";
-export type RalphRunOutcome = "success" | "throttled" | "escalated" | "failed";
+export type RalphRunOutcome = "success" | "paused" | "throttled" | "escalated" | "failed";
 export type RalphRunAttemptKind = "process" | "resume";
 export type RalphRunDetails = {
   reasonCode?: string;

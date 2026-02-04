@@ -68,6 +68,19 @@ export interface StallTimeoutInfo {
   recentEvents?: string[];
 }
 
+export type GuardrailTripReason = "wall-time" | "tool-churn";
+
+export interface GuardrailTimeoutInfo {
+  kind: "guardrail-timeout";
+  reason: GuardrailTripReason;
+  elapsedMs: number;
+  softMs: number;
+  hardMs: number;
+  toolStartCount: number;
+  context?: string;
+  recentEvents?: string[];
+}
+
 export interface SessionResult {
   sessionId: string;
   output: string;
@@ -75,6 +88,7 @@ export interface SessionResult {
   exitCode?: number;
   watchdogTimeout?: WatchdogTimeoutInfo;
   stallTimeout?: StallTimeoutInfo;
+  guardrailTimeout?: GuardrailTimeoutInfo;
   loopTrip?: LoopTripInfo;
   /** Best-effort PR URL discovered from structured JSON events. */
   prUrl?: string;
@@ -1197,6 +1211,22 @@ async function runSession(
   const stallIdleMs = options?.stall?.idleMs ?? 5 * 60_000;
   const stallContext = options?.stall?.context ?? context;
 
+  const fallbackTimeoutCandidateMs = options?.timeoutMs ?? thresholds.bash.hardMs + 60_000;
+
+  const guardrailsEnabled = options?.guardrails?.enabled ?? false;
+  const guardrailsContext = options?.guardrails?.context ?? context;
+  const guardrailsSoftLogIntervalMs = options?.guardrails?.softLogIntervalMs ?? 60_000;
+  const guardrailsWallSoftMs = Math.max(
+    1_000,
+    options?.guardrails?.wallSoftMs ?? Math.max(1_000, fallbackTimeoutCandidateMs - 6 * 60_000)
+  );
+  const guardrailsWallHardMs = Math.max(
+    1_000,
+    options?.guardrails?.wallHardMs ?? Math.max(1_000, fallbackTimeoutCandidateMs - 2 * 60_000)
+  );
+  const guardrailsToolCallsSoft = Math.max(1, options?.guardrails?.toolCallsSoft ?? 800);
+  const guardrailsToolCallsHard = Math.max(1, options?.guardrails?.toolCallsHard ?? 1400);
+
   const loopCfg = options?.loopDetection;
   const loopEnabled = loopCfg?.enabled ?? false;
   const loopDetectionConfig: LoopDetectionConfig | null = loopEnabled
@@ -1333,9 +1363,14 @@ async function runSession(
   let buffer = "";
   let recentEvents: string[] = [];
 
+  let toolStartCount = 0;
+
   let lastActivityTs = scheduler.now();
 
   let lastSoftLogTs = 0;
+
+  let lastGuardrailLogTs = 0;
+  let lastGuardrailProgressTs = 0;
 
   let inFlight:
     | {
@@ -1349,6 +1384,7 @@ async function runSession(
 
   let watchdogTimeout: WatchdogTimeoutInfo | undefined;
   let stallTimeout: StallTimeoutInfo | undefined;
+  let guardrailTimeout: GuardrailTimeoutInfo | undefined;
   let loopTrip: LoopTripInfo | undefined;
 
   const loopDetector = loopDetectionConfig ? createLoopDetector({ config: loopDetectionConfig, startTs: scheduler.now() }) : null;
@@ -1448,6 +1484,10 @@ async function runSession(
 
         if (tool) {
           const now = reducerInput.now;
+
+          if (tool.phase === "start") {
+            toolStartCount += 1;
+          }
 
           if (loopDetector && !loopTrip && tool.phase === "start") {
             const toolName = String(tool.toolName ?? "");
@@ -1573,6 +1613,88 @@ async function runSession(
     }, 1000);
   }
 
+  let guardrailInterval: ReturnType<typeof setInterval> | undefined;
+  if (guardrailsEnabled) {
+    const startTs = scheduler.now();
+    guardrailInterval = scheduler.setInterval(() => {
+      if (guardrailTimeout || stallTimeout || watchdogTimeout || loopTrip) return;
+
+      const now = scheduler.now();
+      const elapsedMs = now - startTs;
+
+      if (sessionId && now - lastGuardrailProgressTs >= guardrailsSoftLogIntervalMs) {
+        lastGuardrailProgressTs = now;
+        try {
+          ensureEventStream(sessionId);
+          writeEvent({
+            type: "guardrail-progress",
+            ts: now,
+            elapsedMs,
+            toolStartCount,
+            inFlight: inFlight ? { toolName: inFlight.toolName, callId: inFlight.callId } : null,
+          });
+        } catch {
+          // ignore
+        }
+      }
+
+      const shouldLog = now - lastGuardrailLogTs >= guardrailsSoftLogIntervalMs;
+
+      if (elapsedMs >= guardrailsWallHardMs) {
+        guardrailTimeout = {
+          kind: "guardrail-timeout",
+          reason: "wall-time",
+          elapsedMs,
+          softMs: guardrailsWallSoftMs,
+          hardMs: guardrailsWallHardMs,
+          toolStartCount,
+          context: guardrailsContext ?? undefined,
+          recentEvents,
+        };
+        const ctx = guardrailsContext ? ` ${guardrailsContext}` : "";
+        console.warn(
+          `[ralph:guardrail] Hard timeout${ctx}: wall time ${Math.round(elapsedMs / 1000)}s exceeded ${Math.round(
+            guardrailsWallHardMs / 1000
+          )}s; killing opencode process`
+        );
+        requestKill();
+        return;
+      }
+
+      if (toolStartCount >= guardrailsToolCallsHard) {
+        guardrailTimeout = {
+          kind: "guardrail-timeout",
+          reason: "tool-churn",
+          elapsedMs,
+          softMs: guardrailsWallSoftMs,
+          hardMs: guardrailsWallHardMs,
+          toolStartCount,
+          context: guardrailsContext ?? undefined,
+          recentEvents,
+        };
+        const ctx = guardrailsContext ? ` ${guardrailsContext}` : "";
+        console.warn(
+          `[ralph:guardrail] Hard timeout${ctx}: tool calls ${toolStartCount} exceeded ${guardrailsToolCallsHard}; killing opencode process`
+        );
+        requestKill();
+        return;
+      }
+
+      if (shouldLog) {
+        lastGuardrailLogTs = now;
+        if (elapsedMs >= guardrailsWallSoftMs || toolStartCount >= guardrailsToolCallsSoft) {
+          const ctx = guardrailsContext ? ` ${guardrailsContext}` : "";
+          console.warn(
+            `[ralph:guardrail] Soft timeout${ctx}: elapsed=${Math.round(elapsedMs / 1000)}s ` +
+              `wallSoft=${Math.round(guardrailsWallSoftMs / 1000)}s wallHard=${Math.round(
+                guardrailsWallHardMs / 1000
+              )}s toolCalls=${toolStartCount} soft=${guardrailsToolCallsSoft} hard=${guardrailsToolCallsHard}`
+          );
+        }
+      }
+    }, 1000);
+  }
+
   const fallbackTimeoutMs = options?.timeoutMs ?? thresholds.bash.hardMs + 60_000;
 
   const exitCode = await new Promise<number>((resolve, reject) => {
@@ -1587,6 +1709,7 @@ async function runSession(
       if (timeout) scheduler.clearTimeout(timeout);
       if (watchdogInterval) scheduler.clearInterval(watchdogInterval);
       if (stallInterval) scheduler.clearInterval(stallInterval);
+      if (guardrailInterval) scheduler.clearInterval(guardrailInterval);
       reject(err);
     });
 
@@ -1594,6 +1717,7 @@ async function runSession(
       if (timeout) scheduler.clearTimeout(timeout);
       if (watchdogInterval) scheduler.clearInterval(watchdogInterval);
       if (stallInterval) scheduler.clearInterval(stallInterval);
+      if (guardrailInterval) scheduler.clearInterval(guardrailInterval);
       resolve(code ?? 0);
     });
   });
@@ -1719,6 +1843,44 @@ async function runSession(
     return { sessionId, output: enriched, success: false, exitCode, watchdogTimeout, prUrl: prUrlFromEvents ?? undefined };
   }
 
+  if (guardrailTimeout) {
+    const header = [
+      guardrailTimeout.reason === "tool-churn"
+        ? `Guardrail tripped: tool churn (${guardrailTimeout.toolStartCount} tool starts)`
+        : `Guardrail tripped: wall time (${Math.round(guardrailTimeout.elapsedMs / 1000)}s)`,
+      guardrailTimeout.context ? `Context: ${guardrailTimeout.context}` : null,
+      `Wall soft threshold: ${Math.round(guardrailTimeout.softMs / 1000)}s`,
+      `Wall hard threshold: ${Math.round(guardrailTimeout.hardMs / 1000)}s`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const recent = guardrailTimeout.recentEvents?.length
+      ? ["Recent OpenCode events (bounded):", ...guardrailTimeout.recentEvents.map((l) => `- ${l}`)].join("\n")
+      : "";
+
+    const combined = [header, recent].filter(Boolean).join("\n\n");
+    const enriched = await appendOpencodeLogTail(combined);
+
+    if (sessionId) {
+      ensureEventStream(sessionId);
+      writeEvent({ type: "run-end", ts: scheduler.now(), success: false, exitCode, guardrailTimeout: true });
+      try {
+        await closeEventStream();
+      } catch {
+        // ignore
+      }
+    }
+
+    await writeIntrospectionSummary(scheduler.now());
+
+    if (sessionId) {
+      await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
+    }
+
+    return { sessionId, output: enriched, success: false, exitCode, guardrailTimeout, prUrl: prUrlFromEvents ?? undefined };
+  }
+
   if (exitCode !== 0) {
     // Avoid dumping full stdout on failures: in JSON mode it can be extremely verbose.
     // Prefer stderr + bounded recent events (and preserve sessionId for debugging).
@@ -1816,6 +1978,24 @@ export type RunSessionOptionsBase = {
     enabled?: boolean;
     /** Kill the run if there is no stdout/stderr activity for this long. */
     idleMs?: number;
+    context?: string;
+  };
+  /**
+   * Guardrails for long-running sessions that are making progress but risk
+   * churning until the fallback timeout.
+   */
+  guardrails?: {
+    enabled?: boolean;
+    /** Log-only heartbeat once wall time exceeds this threshold. */
+    wallSoftMs?: number;
+    /** Kill the run once wall time exceeds this threshold. */
+    wallHardMs?: number;
+    /** Log-only heartbeat once tool-start count exceeds this threshold. */
+    toolCallsSoft?: number;
+    /** Kill the run once tool-start count exceeds this threshold. */
+    toolCallsHard?: number;
+    /** Progress/heartbeat log interval (default: 60s). */
+    softLogIntervalMs?: number;
     context?: string;
   };
   loopDetection?: {
