@@ -56,6 +56,7 @@ describe("GitHub queue label bootstrap", () => {
           return { ok: true, created: [], updated: [] };
         },
         listIssueLabels: async () => [],
+        fetchIssue: async () => null,
         reopenIssue: async () => {},
         addIssueLabel: async () => {},
         addIssueLabels: async () => {},
