@@ -240,6 +240,7 @@ import {
   normalizeMergeStateStatus,
   type PullRequestMergeStateStatus,
 } from "./merge/pull-request-io";
+import { updatePullRequestBranch as updatePullRequestBranchImpl } from "./merge/update-branch";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -2961,15 +2962,15 @@ ${guidance}`
   }
 
   private async updatePullRequestBranch(prUrl: string, cwd: string): Promise<void> {
-    try {
-      await ghWrite(this.repo)`gh pr update-branch ${prUrl} --repo ${this.repo}`.cwd(cwd).quiet();
-      return;
-    } catch (error: any) {
-      const message = this.formatGhError(error);
-      if (!this.shouldFallbackToWorktreeUpdate(message)) throw error;
-    }
-
-    await this.updatePullRequestBranchViaWorktree(prUrl);
+    return await updatePullRequestBranchImpl({
+      repo: this.repo,
+      prUrl,
+      cwd,
+      formatGhError: (error) => this.formatGhError(error),
+      updateViaWorktree: async (url) => {
+        await this.updatePullRequestBranchViaWorktree(url);
+      },
+    });
   }
 
   private parseCiFixAttempts(raw: string | undefined): number | null {
@@ -3322,17 +3323,6 @@ ${guidance}`
     } catch {
       return "";
     }
-  }
-
-  private shouldFallbackToWorktreeUpdate(message: string): boolean {
-    const lowered = message.toLowerCase();
-    if (!lowered) return false;
-    if (lowered.includes("unknown command")) return true;
-    if (lowered.includes("not a known command")) return true;
-    if (lowered.includes("could not resolve to a pull request")) return true;
-    if (lowered.includes("requires a GitHub Enterprise")) return true;
-    if (lowered.includes("not supported")) return true;
-    return false;
   }
 
   private formatGhError(error: any): string {
