@@ -93,6 +93,7 @@ import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImp
 import { computeDaemonGate } from "./daemon-gate";
 import { runGatesCommand } from "./commands/gates";
 import { collectStatusSnapshot, runStatusCommand, type StatusDrainState } from "./commands/status";
+import { runGithubUsageCommand } from "./commands/github-usage";
 import { runWorktreesCommand } from "./commands/worktrees";
 import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
@@ -1722,7 +1723,7 @@ async function main(): Promise<void> {
 
   if (queueState.backend === "github") {
     githubLabelReconciler = startGitHubLabelReconciler({
-      intervalMs: 60_000,
+      intervalMs: config.labelReconcileIntervalMs,
       log: (message) => console.log(message),
     });
   }
@@ -2044,6 +2045,7 @@ function printGlobalHelp(): void {
       "  ralph status [--json]              Show daemon/task status",
       "  ralph gates <repo> <issue> [--json] Show deterministic gate state",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
+      "  ralph github-usage [--since 24h]   Summarize GitHub API request telemetry",
       "  ralph repos [--json]               List accessible repos (GitHub App installation)",
       "  ralph queue release --repo <owner/repo> --issue <n>  Release a stuck task slot locally",
       "  ralph watch                        Stream status updates (Ctrl+C to stop)",
@@ -2136,6 +2138,25 @@ function printCommandHelp(command: string): void {
           "Options:",
           "  --json                 Emit machine-readable JSON output.",
           "  --profile <name|auto>  Override the control/default profile for this command.",
+        ].join("\n")
+      );
+      return;
+
+    case "github-usage":
+      console.log(
+        [
+          "Usage:",
+          "  ralph github-usage [--since 24h] [--until <iso|ms>] [--date YYYY-MM-DD] [--limit N] [--json] [--events-dir <path>]",
+          "",
+          "Summarizes GitHubClient per-request telemetry from ~/.ralph/events/*.jsonl.",
+          "",
+          "Options:",
+          "  --since <duration|iso|ms>   Lookback window (default: 24h) or absolute timestamp.",
+          "  --until <iso|ms>            Range end (default: now).",
+          "  --date YYYY-MM-DD           Analyze a single UTC day (overrides --since/--until).",
+          "  --limit N                   Number of top endpoints to show (default: 20).",
+          "  --json                      Emit machine-readable JSON output.",
+          "  --events-dir <path>         Override events dir (default: ~/.ralph/events).",
         ].join("\n")
       );
       return;
@@ -2648,6 +2669,16 @@ if (args[0] === "sandbox:seed") {
   process.exit(0);
 }
 
+if (args[0] === "github-usage") {
+  if (hasHelpFlag) {
+    printCommandHelp("github-usage");
+    process.exit(0);
+  }
+
+  await runGithubUsageCommand({ args });
+  process.exit(0);
+}
+
 if (args[0] === "repos") {
   if (hasHelpFlag) {
     printCommandHelp("repos");
@@ -2754,6 +2785,9 @@ if (args[0] === "watch") {
     printCommandHelp("watch");
     process.exit(0);
   }
+
+  // GitHub-backed queue queries require the SQLite state DB.
+  initStateDb();
 
   console.log("[ralph] Watching in-progress task status (Ctrl+C to stop)...");
 

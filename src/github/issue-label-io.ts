@@ -153,16 +153,20 @@ export async function removeIssueLabel(params: {
 }): Promise<{ removed: boolean }> {
   const label = normalizeLabel(params.label);
   if (!label) return { removed: false };
+  const allowNotFound = params.allowNotFound ?? true;
   assertRalphLabel(label, { allowNonRalph: params.allowNonRalph });
   const { owner, name } = splitRepoFullName(params.repo);
   const response: GitHubResponse<unknown> = await params.github.request(
     `/repos/${owner}/${name}/issues/${params.issueNumber}/labels/${encodeURIComponent(label)}`,
     {
       method: "DELETE",
-      allowNotFound: params.allowNotFound ?? true,
+      allowNotFound,
     }
   );
-  return { removed: response.status !== 404 };
+  // Treat label absence as already removed when allowNotFound is enabled.
+  // This is critical for convergence: callers rely on `removed` to update local label snapshots.
+  if (response.status === 404) return { removed: allowNotFound };
+  return { removed: true };
 }
 
 export async function executeIssueLabelOps(params: {

@@ -10,11 +10,17 @@ import { GitHubClient } from "./client";
 import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels";
 import { executeIssueLabelOps } from "./issue-label-io";
 import { mutateIssueLabels } from "./label-mutation";
+import { canAttemptLabelWrite } from "./label-write-backoff";
 import { statusToRalphLabelDelta, type LabelOp } from "../github-queue/core";
 import type { QueueTaskStatus } from "../queue/types";
 
-const DEFAULT_INTERVAL_MS = 60_000;
-const MAX_ISSUES_PER_TICK = 10;
+const DEFAULT_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_MAX_ISSUES_PER_TICK = 10;
+const DEFAULT_COOLDOWN_MS = 10 * 60_000;
+const TELEMETRY_SOURCE = "label-reconciler";
+
+type ReconcileCooldownState = { desiredStatus: QueueTaskStatus; appliedAtMs: number };
+const lastAppliedByIssue = new Map<string, ReconcileCooldownState>();
 
 function applyLabelDeltaSnapshot(params: {
   repo: string;
@@ -44,8 +50,9 @@ function toDesiredStatus(raw: string | null | undefined): QueueTaskStatus | null
   return raw as QueueTaskStatus;
 }
 
-async function reconcileRepo(repo: string, maxIssues: number): Promise<number> {
+async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number): Promise<number> {
   const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
   const opStates = listTaskOpStatesByRepo(repo);
   const opStateByIssue = new Map<number, (typeof opStates)[number]>();
   for (const op of opStates) {
@@ -76,6 +83,12 @@ async function reconcileRepo(repo: string, maxIssues: number): Promise<number> {
     const desiredStatus = released ? "queued" : toDesiredStatus(opState.status ?? null);
     if (!desiredStatus) continue;
 
+    const cooldownKey = `${repo}#${issue.number}`;
+    const cooldown = lastAppliedByIssue.get(cooldownKey);
+    if (cooldown && cooldown.desiredStatus === desiredStatus && nowMs - cooldown.appliedAtMs < cooldownMs) {
+      continue;
+    }
+
     const delta = statusToRalphLabelDelta(desiredStatus, issue.labels);
     if (delta.add.length === 0 && delta.remove.length === 0) continue;
 
@@ -85,6 +98,11 @@ async function reconcileRepo(repo: string, maxIssues: number): Promise<number> {
     ];
 
     let didApply = false;
+
+    // Respect repo-level label write backoff to avoid burning rate limit.
+    if (!canAttemptLabelWrite(repo)) {
+      continue;
+    }
     const graphResult = await mutateIssueLabels({
       github,
       repo,
@@ -92,6 +110,7 @@ async function reconcileRepo(repo: string, maxIssues: number): Promise<number> {
       issueNodeId: issue.githubNodeId,
       plan: { add: delta.add, remove: delta.remove },
       labelIdCache,
+      telemetrySource: TELEMETRY_SOURCE,
     });
     if (graphResult.ok) {
       applyLabelDeltaSnapshot({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
@@ -117,6 +136,10 @@ async function reconcileRepo(repo: string, maxIssues: number): Promise<number> {
       }
     }
 
+    if (didApply) {
+      lastAppliedByIssue.set(cooldownKey, { desiredStatus, appliedAtMs: nowMs });
+    }
+
     processed += 1;
   }
 
@@ -125,9 +148,13 @@ async function reconcileRepo(repo: string, maxIssues: number): Promise<number> {
 
 export function startGitHubLabelReconciler(params?: {
   intervalMs?: number;
+  maxIssuesPerTick?: number;
+  cooldownMs?: number;
   log?: (message: string) => void;
 }): { stop: () => void } {
   const intervalMs = Math.max(1_000, params?.intervalMs ?? DEFAULT_INTERVAL_MS);
+  const maxIssuesPerTick = Math.max(1, Math.floor(params?.maxIssuesPerTick ?? DEFAULT_MAX_ISSUES_PER_TICK));
+  const cooldownMs = Math.max(0, Math.floor(params?.cooldownMs ?? DEFAULT_COOLDOWN_MS));
   const log = params?.log ?? ((message: string) => console.log(message));
   let timer: ReturnType<typeof setTimeout> | null = null;
   let running = false;
@@ -142,10 +169,10 @@ export function startGitHubLabelReconciler(params?: {
     running = true;
     try {
       const repos = getConfig().repos.map((entry) => entry.name);
-      let remaining = MAX_ISSUES_PER_TICK;
+      let remaining = maxIssuesPerTick;
       for (const repo of repos) {
         if (remaining <= 0) break;
-        const processed = await reconcileRepo(repo, remaining);
+        const processed = await reconcileRepo(repo, remaining, cooldownMs);
         remaining -= processed;
       }
       if (shouldLog("labels:reconcile", 5 * 60_000)) {

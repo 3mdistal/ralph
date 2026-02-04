@@ -98,6 +98,7 @@ describe("GitHub queue blocked label reconciliation", () => {
       io: {
         ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
         listIssueLabels: async () => ["ralph:status:queued"],
+        fetchIssue: async () => null,
         reopenIssue: async () => {},
         addIssueLabel: async () => {},
         addIssueLabels: async () => {},
@@ -171,6 +172,7 @@ describe("GitHub queue blocked label reconciliation", () => {
       io: {
         ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
         listIssueLabels: async () => ["ralph:status:blocked"],
+        fetchIssue: async () => null,
         reopenIssue: async () => {},
         addIssueLabel: async () => {},
         addIssueLabels: async () => {},
@@ -244,6 +246,7 @@ describe("GitHub queue blocked label reconciliation", () => {
       io: {
         ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
         listIssueLabels: async () => ["ralph:status:queued"],
+        fetchIssue: async () => null,
         reopenIssue: async () => {},
         addIssueLabel: async () => {},
         addIssueLabels: async () => {},

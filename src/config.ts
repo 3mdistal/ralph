@@ -20,6 +20,22 @@ export type AutoQueueConfig = {
   dryRun: boolean;
 };
 
+export type RepoVerificationScenario = {
+  title?: string;
+  steps: string[];
+};
+
+export type RepoVerificationStaging = {
+  url: string;
+  expected?: string;
+};
+
+export type RepoVerificationConfig = {
+  preflight?: string[];
+  e2e?: RepoVerificationScenario[];
+  staging?: RepoVerificationStaging[];
+};
+
 export interface RepoConfig {
   name: string;      // "3mdistal/bwrb"
   path: string;      // "/Users/alicemoore/Developer/bwrb"
@@ -54,6 +70,8 @@ export interface RepoConfig {
   autoUpdateBehindMinMinutes?: number;
   /** Auto-queue configuration (defaults to disabled). */
   autoQueue?: Partial<AutoQueueConfig>;
+  /** Optional per-repo verification guidance for rollup PRs. */
+  verification?: RepoVerificationConfig;
   /** Optional per-repo edit-churn loop detection configuration. */
   loopDetection?: LoopDetectionConfigInput;
 }
@@ -251,6 +269,8 @@ export interface RalphConfig {
   pollInterval: number;    // ms between queue checks when polling (default: 30000)
   /** ms between done reconciliation checks (default: 300000) */
   doneReconcileIntervalMs: number;
+  /** ms between label reconciliation ticks (default: 300000) */
+  labelReconcileIntervalMs: number;
   /** Ownership TTL in ms for task heartbeats (default: 60000). */
   ownershipTtlMs: number;
   /** Queue backend selection (default: "github"). */
@@ -307,6 +327,7 @@ const MIN_REPO_SCHEDULER_PRIORITY = 0.1;
 const MAX_REPO_SCHEDULER_PRIORITY = 10;
 const DEFAULT_OWNERSHIP_TTL_MS = 60_000;
 const DEFAULT_DONE_RECONCILE_INTERVAL_MS = 5 * 60_000;
+const DEFAULT_LABEL_RECONCILE_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_AUTO_UPDATE_BEHIND_MIN_MINUTES = 30;
 const DEFAULT_AUTO_QUEUE_SCOPE: AutoQueueScope = "labeled-only";
 const DEFAULT_AUTO_QUEUE_MAX_PER_TICK = 200;
@@ -400,6 +421,7 @@ const DEFAULT_CONFIG: RalphConfig = {
   batchSize: 10,
   pollInterval: 30000,
   doneReconcileIntervalMs: DEFAULT_DONE_RECONCILE_INTERVAL_MS,
+  labelReconcileIntervalMs: DEFAULT_LABEL_RECONCILE_INTERVAL_MS,
   ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
   queueBackend: "github",
   bwrbVault: detectDefaultBwrbVault(),
@@ -598,6 +620,104 @@ function toLoopDetectionConfigPatchOrThrow(raw: any, label: string): LoopDetecti
   return out;
 }
 
+function toVerificationScenarioOrNull(raw: any, label: string): RepoVerificationScenario | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    console.warn(`[ralph] Invalid config ${label}=${JSON.stringify(raw)}; expected object.`);
+    return null;
+  }
+
+  const steps = toStringArrayOrNull(raw.steps);
+  if (steps === null) {
+    console.warn(`[ralph] Invalid config ${label}.steps=${JSON.stringify(raw.steps)}; expected string[].`);
+    return null;
+  }
+  if (steps.length === 0) {
+    console.warn(`[ralph] Invalid config ${label}.steps=[]; expected at least one step.`);
+    return null;
+  }
+
+  const scenario: RepoVerificationScenario = { steps };
+  if (raw.title !== undefined) {
+    const title = toNonEmptyStringOrNull(raw.title);
+    if (title) {
+      scenario.title = title;
+    } else {
+      console.warn(`[ralph] Invalid config ${label}.title=${JSON.stringify(raw.title)}; expected non-empty string.`);
+    }
+  }
+
+  return scenario;
+}
+
+function toRepoVerificationConfigOrNull(raw: any, label: string): RepoVerificationConfig | null {
+  if (raw == null) return null;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    console.warn(`[ralph] Invalid config ${label}=${JSON.stringify(raw)}; expected object.`);
+    return null;
+  }
+
+  const out: RepoVerificationConfig = {};
+
+  if (raw.preflight !== undefined) {
+    const parsed = toStringArrayOrNull(raw.preflight);
+    if (parsed === null) {
+      console.warn(`[ralph] Invalid config ${label}.preflight=${JSON.stringify(raw.preflight)}; expected string[].`);
+    } else {
+      out.preflight = parsed;
+    }
+  }
+
+  if (raw.e2e !== undefined) {
+    if (!Array.isArray(raw.e2e)) {
+      console.warn(`[ralph] Invalid config ${label}.e2e=${JSON.stringify(raw.e2e)}; expected array.`);
+    } else {
+      const scenarios: RepoVerificationScenario[] = [];
+      raw.e2e.forEach((entry: any, index: number) => {
+        const scenario = toVerificationScenarioOrNull(entry, `${label}.e2e[${index}]`);
+        if (scenario) scenarios.push(scenario);
+      });
+      if (scenarios.length > 0) {
+        out.e2e = scenarios;
+      }
+    }
+  }
+
+  if (raw.staging !== undefined) {
+    if (!Array.isArray(raw.staging)) {
+      console.warn(`[ralph] Invalid config ${label}.staging=${JSON.stringify(raw.staging)}; expected array.`);
+    } else {
+      const staging: RepoVerificationStaging[] = [];
+      raw.staging.forEach((entry: any, index: number) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          console.warn(`[ralph] Invalid config ${label}.staging[${index}]=${JSON.stringify(entry)}; expected object.`);
+          return;
+        }
+
+        const url = toNonEmptyStringOrNull(entry.url);
+        if (!url) {
+          console.warn(`[ralph] Invalid config ${label}.staging[${index}].url=${JSON.stringify(entry.url)}; expected non-empty string.`);
+          return;
+        }
+
+        const expected = entry.expected === undefined ? undefined : toNonEmptyStringOrNull(entry.expected) ?? undefined;
+        if (entry.expected !== undefined && expected === undefined) {
+          console.warn(
+            `[ralph] Invalid config ${label}.staging[${index}].expected=${JSON.stringify(entry.expected)}; expected non-empty string.`
+          );
+        }
+
+        staging.push(expected ? { url, expected } : { url });
+      });
+      if (staging.length > 0) {
+        out.staging = staging;
+      }
+    }
+  }
+
+  if (Object.keys(out).length === 0) return null;
+  return out;
+}
+
 function validateConfig(loaded: RalphConfig): RalphConfig {
   const global = toPositiveIntOrNull((loaded as any).maxWorkers);
   if (!global) {
@@ -630,6 +750,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       );
     }
     loaded.doneReconcileIntervalMs = DEFAULT_DONE_RECONCILE_INTERVAL_MS;
+  }
+
+  const labelInterval = toPositiveIntOrNull((loaded as any).labelReconcileIntervalMs);
+  if (!labelInterval) {
+    const raw = (loaded as any).labelReconcileIntervalMs;
+    if (raw !== undefined) {
+      console.warn(
+        `[ralph] Invalid config labelReconcileIntervalMs=${JSON.stringify(raw)}; falling back to default ${DEFAULT_LABEL_RECONCILE_INTERVAL_MS}`
+      );
+    }
+    loaded.labelReconcileIntervalMs = DEFAULT_LABEL_RECONCILE_INTERVAL_MS;
   }
 
   const rawQueueBackend = (loaded as any).queueBackend;
@@ -788,6 +919,16 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
         }
 
         updates.autoQueue = { enabled, scope, maxPerTick, dryRun };
+      }
+    }
+
+    const rawVerification = (repo as any).verification;
+    if (rawVerification !== undefined) {
+      const parsed = toRepoVerificationConfigOrNull(rawVerification, `repos[${repo.name}].verification`);
+      if (parsed) {
+        updates.verification = parsed;
+      } else {
+        updates.verification = undefined;
       }
     }
 
@@ -1809,6 +1950,12 @@ export function getRepoSetupCommands(repoName: string): string[] | null {
     return null;
   }
   return parsed;
+}
+
+export function getRepoVerificationConfig(repoName: string): RepoVerificationConfig | null {
+  const cfg = getConfig();
+  const repo = cfg.repos.find((r) => r.name === repoName);
+  return repo?.verification ?? null;
 }
 
 export function getRepoLoopDetectionConfig(repoName: string): LoopDetectionConfig | null {

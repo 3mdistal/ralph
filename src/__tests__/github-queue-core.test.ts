@@ -173,9 +173,10 @@ describe("github queue core", () => {
     expect(status).toBe("done");
   });
 
-  test("computeStaleInProgressRecovery recovers missing session id", () => {
-    const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
-    const ttlMs = 60_000;
+  test("computeStaleInProgressRecovery does not recover missing session id before grace", () => {
+    const nowMs = Date.parse("2026-01-11T00:01:00.000Z");
+    const ttlMs = 10 * 60_000;
+    const graceMs = 2 * 60_000;
 
     const recovery = computeStaleInProgressRecovery({
       labels: ["ralph:status:in-progress"],
@@ -188,6 +189,29 @@ describe("github queue core", () => {
       },
       nowMs,
       ttlMs,
+      graceMs,
+    });
+
+    expect(recovery.shouldRecover).toBe(false);
+  });
+
+  test("computeStaleInProgressRecovery recovers missing session id after grace", () => {
+    const nowMs = Date.parse("2026-01-11T00:03:00.000Z");
+    const ttlMs = 10 * 60_000;
+    const graceMs = 2 * 60_000;
+
+    const recovery = computeStaleInProgressRecovery({
+      labels: ["ralph:status:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 63,
+        taskPath: "github:3mdistal/ralph#63",
+        heartbeatAt: "2026-01-11T00:00:00.000Z",
+        sessionId: "",
+      },
+      nowMs,
+      ttlMs,
+      graceMs,
     });
 
     expect(recovery).toEqual({ shouldRecover: true, reason: "missing-session-id" });

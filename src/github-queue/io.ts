@@ -7,6 +7,7 @@ import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
 import { GitHubRelationshipProvider, type IssueRelationshipProvider } from "../github/issue-relationships";
 import { resolveRelationshipSignals } from "../github/relationship-signals";
+import { logRelationshipDiagnostics } from "../github/relationship-diagnostics";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
 import {
@@ -24,8 +25,10 @@ import {
   listOpenPrCandidatesForIssue,
   listTaskOpStatesByRepo,
   recordIssueLabelsSnapshot,
+  recordIssueSnapshot,
   recordTaskSnapshot,
   releaseTaskSlot,
+  runInStateTransaction,
   type IssueSnapshot,
   type TaskOpState,
 } from "../state";
@@ -41,7 +44,12 @@ import {
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 const WATCH_MIN_INTERVAL_MS = 1000;
 
+const DEFAULT_LIVE_LABELS_CACHE_TTL_MS = 60_000;
+const DEFAULT_LIVE_LABELS_ERROR_COOLDOWN_MS = 60_000;
+const LIVE_LABELS_TELEMETRY_SOURCE = "queue:claim:labels";
+
 const DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO = 25;
+const DEFAULT_MISSING_SESSION_GRACE_MS = 2 * 60_000;
 
 function readEnvInt(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -51,8 +59,21 @@ function readEnvInt(name: string, fallback: number): number {
   return Math.floor(parsed);
 }
 
+function readEnvNonNegativeInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.floor(parsed);
+}
+
 function clampPositiveInt(value: number, fallback: number): number {
   if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
+
+function clampNonNegativeInt(value: number, fallback: number): number {
+  if (!Number.isFinite(value) || value < 0) return fallback;
   return Math.floor(value);
 }
 
@@ -65,6 +86,7 @@ type GitHubQueueDeps = {
 type GitHubQueueIO = {
   ensureWorkflowLabels: (repo: string) => Promise<EnsureOutcome>;
   listIssueLabels: (repo: string, issueNumber: number) => Promise<string[]>;
+  fetchIssue: (repo: string, issueNumber: number) => Promise<IssueFetchResult | null>;
   reopenIssue: (repo: string, issueNumber: number) => Promise<void>;
   addIssueLabel: (repo: string, issueNumber: number, label: string) => Promise<void>;
   addIssueLabels: (repo: string, issueNumber: number, labels: string[]) => Promise<void>;
@@ -76,6 +98,15 @@ type GitHubQueueIO = {
     add: string[];
     remove: string[];
   }) => Promise<boolean>;
+};
+
+type IssueFetchResult = {
+  title: string | null;
+  state: string | null;
+  url: string | null;
+  githubNodeId: string | null;
+  githubUpdatedAt: string | null;
+  labels: string[];
 };
 
 function getNowIso(deps?: GitHubQueueDeps): string {
@@ -100,15 +131,65 @@ function createGitHubQueueIo(): GitHubQueueIO {
   });
   const labelIdCacheByRepo = new Map<string, Map<string, string>>();
 
+  const liveLabelsCacheTtlMs = clampNonNegativeInt(
+    readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_LIVE_LABELS_TTL_MS", DEFAULT_LIVE_LABELS_CACHE_TTL_MS),
+    DEFAULT_LIVE_LABELS_CACHE_TTL_MS
+  );
+  const liveLabelsErrorCooldownMs = clampNonNegativeInt(
+    readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_LIVE_LABELS_ERROR_COOLDOWN_MS", DEFAULT_LIVE_LABELS_ERROR_COOLDOWN_MS),
+    DEFAULT_LIVE_LABELS_ERROR_COOLDOWN_MS
+  );
+
+  type LiveLabelsCacheEntry = {
+    labels: string[];
+    fetchedAtMs: number;
+    errorUntilMs?: number;
+    errorMessage?: string;
+  };
+  const liveLabelsByIssue = new Map<string, LiveLabelsCacheEntry>();
+
   return {
     ensureWorkflowLabels: async (repo) => await labelEnsurer.ensure(repo),
     listIssueLabels: async (repo, issueNumber) => {
+      const nowMs = Date.now();
+      const cacheKey = `${repo}#${issueNumber}`;
+      const cached = liveLabelsByIssue.get(cacheKey);
+      if (cached) {
+        if (cached.errorUntilMs && cached.errorUntilMs > nowMs) {
+          throw new Error(cached.errorMessage ?? "GitHub label fetch temporarily suppressed after failure");
+        }
+        if (liveLabelsCacheTtlMs > 0 && nowMs - cached.fetchedAtMs < liveLabelsCacheTtlMs) {
+          return [...cached.labels];
+        }
+      }
+
       const { owner, name } = splitRepoFullName(repo);
       const client = await createGitHubClient(repo);
-      const response = await client.request<Array<{ name?: string | null }>>(
-        `/repos/${owner}/${name}/issues/${issueNumber}/labels?per_page=100`
-      );
-      return (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+
+      try {
+        const response = await client.request<Array<{ name?: string | null }>>(
+          `/repos/${owner}/${name}/issues/${issueNumber}/labels?per_page=100`,
+          { source: LIVE_LABELS_TELEMETRY_SOURCE }
+        );
+        const labels = (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+        liveLabelsByIssue.set(cacheKey, { labels, fetchedAtMs: nowMs });
+        return [...labels];
+      } catch (error: any) {
+        // Avoid spamming core REST when auth/rate-limit/backoff is already active.
+        const message = error?.message ?? String(error);
+        liveLabelsByIssue.set(cacheKey, {
+          labels: cached?.labels ?? [],
+          fetchedAtMs: cached?.fetchedAtMs ?? 0,
+          errorUntilMs: nowMs + liveLabelsErrorCooldownMs,
+          errorMessage: message,
+        });
+        throw error;
+      }
+    },
+    fetchIssue: async (repo, issueNumber) => {
+      const client = await createGitHubClient(repo);
+      const raw = await client.getIssue(issueNumber);
+      return parseIssueFetchResult(raw);
     },
     reopenIssue: async (repo, issueNumber) => {
       const { owner, name } = splitRepoFullName(repo);
@@ -186,10 +267,36 @@ function applyLabelDelta(params: {
 }
 
 
-function normalizeOptionalString(value: unknown): string | undefined {
+function normalizeTaskField(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : undefined;
+  return value.trim();
+}
+
+function normalizeTaskExtraFields(extraFields?: Record<string, string | number>): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  if (!extraFields) return normalized;
+  for (const [key, value] of Object.entries(extraFields)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      normalized[key] = String(value);
+    } else if (typeof value === "string") {
+      normalized[key] = value.trim();
+    }
+  }
+  return normalized;
+}
+
+function parseIssueFetchResult(raw: unknown): IssueFetchResult | null {
+  if (!raw || typeof raw !== "object") return null;
+  const data = raw as any;
+  const labels = Array.isArray(data.labels) ? data.labels.map((label: any) => label?.name ?? "").filter(Boolean) : [];
+  return {
+    title: typeof data.title === "string" ? data.title : null,
+    state: typeof data.state === "string" ? data.state : null,
+    url: typeof data.html_url === "string" ? data.html_url : null,
+    githubNodeId: typeof data.node_id === "string" ? data.node_id : null,
+    githubUpdatedAt: typeof data.updated_at === "string" ? data.updated_at : null,
+    labels,
+  };
 }
 
 function buildLabelOpsIo(io: GitHubQueueIO, repo: string, issueNumber: number) {
@@ -275,6 +382,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         try {
           const snapshot = await provider.getSnapshot({ repo, number: issue.number });
           const resolved = resolveRelationshipSignals(snapshot);
+          logRelationshipDiagnostics({ repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
           const decision = computeBlockedDecision(resolved.signals);
 
           // IMPORTANT: unknown dependency coverage should NOT cause blocked label churn.
@@ -464,6 +572,10 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     lastSweepAt = nowMs;
 
     const ttlMs = getConfig().ownershipTtlMs;
+    const missingSessionGraceMs = clampNonNegativeInt(
+      readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_MISSING_SESSION_GRACE_MS", DEFAULT_MISSING_SESSION_GRACE_MS),
+      DEFAULT_MISSING_SESSION_GRACE_MS
+    );
     const nowIso = getNowIso(deps);
 
     for (const repo of getConfig().repos.map((entry) => entry.name)) {
@@ -484,6 +596,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           opState,
           nowMs,
           ttlMs,
+          graceMs: missingSessionGraceMs,
         });
         if (!recovery.shouldRecover) continue;
 
@@ -657,16 +770,26 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       };
 
       if (opts.task.status === "queued") {
-        let plan = planClaim(issue.labels);
+        const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
+        const snapshotLabels = issue.labels;
+        let plan = planClaim(snapshotLabels);
+        const shouldCheckDependencies = snapshotLabels.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
+
+        // Avoid repeated core REST reads on every claim attempt. The IO layer applies a TTL cache.
+        // We only request live labels when we may claim or when blocked-gating needs it.
+        let labelsForPlan = snapshotLabels;
         try {
-          const liveLabels = await io.listIssueLabels(issueRef.repo, issueRef.number);
-          const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
-          const shouldCheckDependencies = liveLabels.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
-          if (shouldCheckDependencies) {
+          if (plan.claimable || shouldCheckDependencies) {
+            labelsForPlan = await io.listIssueLabels(issueRef.repo, issueRef.number);
+          }
+
+          const shouldCheckDependenciesLive = labelsForPlan.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
+          if (shouldCheckDependenciesLive) {
             try {
               const relationships = relationshipsProviderFactory(issueRef.repo);
               const snapshot = await relationships.getSnapshot(issueRef);
               const resolved = resolveRelationshipSignals(snapshot);
+              logRelationshipDiagnostics({ repo: issueRef.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
               const decision = computeBlockedDecision(resolved.signals);
 
               if (decision.confidence === "unknown") {
@@ -681,10 +804,10 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
                 const reason =
                   decision.reasons.length > 0
                     ? `Issue blocked by dependencies (${decision.reasons.join(", ")})`
-                    : "Issue blocked by dependencies";
+                  : "Issue blocked by dependencies";
 
                 // Best-effort: materialize blocked label for visibility.
-                if (autoQueueEnabled && !liveLabels.includes(RALPH_LABEL_STATUS_BLOCKED)) {
+                if (autoQueueEnabled && !labelsForPlan.includes(RALPH_LABEL_STATUS_BLOCKED)) {
                   try {
                     const nowIso = new Date(opts.nowMs).toISOString();
                     const didMutate = await io.mutateIssueLabels({
@@ -713,7 +836,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               return { claimed: false, task: opts.task, reason: error?.message ?? String(error) };
             }
           }
-          plan = planClaim(liveLabels);
+          plan = planClaim(labelsForPlan);
           if (!plan.claimable) {
             return { claimed: false, task: opts.task, reason: plan.reason ?? "Task not claimable" };
           }
@@ -864,27 +987,68 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       const issueRef = parseIssueRef(taskObj.issue, taskObj.repo);
       if (!issueRef) return false;
 
-      const issue = resolveIssueSnapshot(issueRef.repo, issueRef.number);
-      if (!issue) return false;
-
       const nowIso = getNowIso(deps);
-      if (issue.state?.toUpperCase() === "CLOSED" && status === "done") {
+      const normalizedExtra = normalizeTaskExtraFields(extraFields);
+      let issue = resolveIssueSnapshot(issueRef.repo, issueRef.number);
+      if (!issue) {
+        try {
+          const fetched = await io.fetchIssue(issueRef.repo, issueRef.number);
+          if (fetched) {
+            runInStateTransaction(() => {
+              recordIssueSnapshot({
+                repo: issueRef.repo,
+                issue: `${issueRef.repo}#${issueRef.number}`,
+                title: fetched.title ?? undefined,
+                state: fetched.state ?? undefined,
+                url: fetched.url ?? undefined,
+                githubNodeId: fetched.githubNodeId ?? undefined,
+                githubUpdatedAt: fetched.githubUpdatedAt ?? undefined,
+                at: nowIso,
+              });
+              recordIssueLabelsSnapshot({
+                repo: issueRef.repo,
+                issue: `${issueRef.repo}#${issueRef.number}`,
+                labels: fetched.labels,
+                at: nowIso,
+              });
+            });
+            issue = {
+              repo: issueRef.repo,
+              number: issueRef.number,
+              title: fetched.title,
+              state: fetched.state,
+              url: fetched.url,
+              githubNodeId: fetched.githubNodeId,
+              githubUpdatedAt: fetched.githubUpdatedAt,
+              labels: fetched.labels,
+            };
+          }
+        } catch (error) {
+          if (shouldLog(`ralph:queue:github:issue-fetch:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[ralph:queue:github] Failed to fetch issue ${issueRef.repo}#${issueRef.number}: ${message}`);
+          }
+        }
+      }
+
+      if (issue?.state?.toUpperCase() === "CLOSED" && status === "done") {
         recordTaskSnapshot({
           repo: issueRef.repo,
           issue: `${issueRef.repo}#${issueRef.number}`,
           taskPath: taskObj._path || `github:${issueRef.repo}#${issueRef.number}`,
           status,
-          sessionId: normalizeOptionalString(extraFields?.["session-id"]),
-          worktreePath: normalizeOptionalString(extraFields?.["worktree-path"]),
-          workerId: normalizeOptionalString(extraFields?.["worker-id"]),
-          repoSlot: normalizeOptionalString(extraFields?.["repo-slot"]),
-          daemonId: normalizeOptionalString(extraFields?.["daemon-id"]),
-          heartbeatAt: normalizeOptionalString(extraFields?.["heartbeat-at"]),
+          sessionId: normalizeTaskField(normalizedExtra["session-id"]),
+          worktreePath: normalizeTaskField(normalizedExtra["worktree-path"]),
+          workerId: normalizeTaskField(normalizedExtra["worker-id"]),
+          repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
+          daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
+          heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
           at: nowIso,
         });
         return true;
       }
-      const delta = statusToRalphLabelDelta(status, issue.labels);
+
+      const delta = issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] };
       const steps: LabelOp[] = [
         ...delta.add.map((label) => ({ action: "add" as const, label })),
         ...delta.remove.map((label) => ({ action: "remove" as const, label })),
@@ -893,37 +1057,35 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         add: steps.filter((step) => step.action === "add").map((step) => step.label),
         remove: steps.filter((step) => step.action === "remove").map((step) => step.label),
       };
-      const didMutate = await io.mutateIssueLabels({
-        repo: issueRef.repo,
-        issueNumber: issueRef.number,
-        issueNodeId: issue.githubNodeId,
-        add: updateDelta.add,
-        remove: updateDelta.remove,
-      });
-      if (!didMutate) {
-        const labelOps = await applyIssueLabelOps({
-          ops: steps,
-          io: buildLabelOpsIo(io, issueRef.repo, issueRef.number),
-          logLabel: `${issueRef.repo}#${issueRef.number}`,
-          log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+      if (issue && (updateDelta.add.length > 0 || updateDelta.remove.length > 0)) {
+        const didMutate = await io.mutateIssueLabels({
           repo: issueRef.repo,
-          ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
-          retryMissingLabelOnce: true,
+          issueNumber: issueRef.number,
+          issueNodeId: issue.githubNodeId,
+          add: updateDelta.add,
+          remove: updateDelta.remove,
         });
-        if (labelOps.ok) {
-          applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: labelOps.add, remove: labelOps.remove, nowIso });
-        } else if (labelOps.kind !== "transient") {
-          return false;
-        }
-      } else {
-        applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: updateDelta.add, remove: updateDelta.remove, nowIso });
-      }
-
-      const normalizedExtra: Record<string, string> = {};
-      if (extraFields) {
-        for (const [key, value] of Object.entries(extraFields)) {
-          if (typeof value === "number") normalizedExtra[key] = String(value);
-          else if (typeof value === "string") normalizedExtra[key] = value;
+        if (!didMutate) {
+          const labelOps = await applyIssueLabelOps({
+            ops: steps,
+            io: buildLabelOpsIo(io, issueRef.repo, issueRef.number),
+            logLabel: `${issueRef.repo}#${issueRef.number}`,
+            log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+            repo: issueRef.repo,
+            ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
+            retryMissingLabelOnce: true,
+          });
+          if (labelOps.ok) {
+            applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+          } else if (labelOps.kind !== "transient") {
+            if (shouldLog(`ralph:queue:github:label-ops:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+              console.warn(
+                `[ralph:queue:github] Label update failed for ${issueRef.repo}#${issueRef.number}: ${labelOps.kind}`
+              );
+            }
+          }
+        } else {
+          applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: updateDelta.add, remove: updateDelta.remove, nowIso });
         }
       }
 
@@ -932,12 +1094,12 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         issue: `${issueRef.repo}#${issueRef.number}`,
         taskPath: taskObj._path || `github:${issueRef.repo}#${issueRef.number}`,
         status,
-        sessionId: normalizeOptionalString(normalizedExtra["session-id"]),
-        worktreePath: normalizeOptionalString(normalizedExtra["worktree-path"]),
-        workerId: normalizeOptionalString(normalizedExtra["worker-id"]),
-        repoSlot: normalizeOptionalString(normalizedExtra["repo-slot"]),
-        daemonId: normalizeOptionalString(normalizedExtra["daemon-id"]),
-        heartbeatAt: normalizeOptionalString(normalizedExtra["heartbeat-at"]),
+        sessionId: normalizeTaskField(normalizedExtra["session-id"]),
+        worktreePath: normalizeTaskField(normalizedExtra["worktree-path"]),
+        workerId: normalizeTaskField(normalizedExtra["worker-id"]),
+        repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
+        daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
+        heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
         releasedAtMs: status === "in-progress" || status === "starting" || status === "throttled" ? null : undefined,
         releasedReason: status === "in-progress" || status === "starting" || status === "throttled" ? null : undefined,
         at: nowIso,

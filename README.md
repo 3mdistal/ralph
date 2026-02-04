@@ -243,8 +243,15 @@ ralph sandbox tag --failed --apply
   - `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
   - `dryRun` (boolean): compute decisions without mutating labels (default: false)
 - `repos[].setup` (array): optional setup commands to run in the task worktree before any agent execution (operator-owned)
+- `repos[].verification` (object, optional): rollup PR verification guidance
+  - `preflight` (array): fast local sanity commands (string[])
+  - `e2e` (array): human E2E scenarios (`[{ title?: string, steps: string[] }]`)
+  - `staging` (array): staging/preview checks (`[{ url: string, expected?: string }]`)
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.
 - Rollup PRs include closing directives for issues referenced in merged PR bodies (`Fixes`/`Closes`/`Resolves #N`) and list included PRs/issues.
+- Rollup PRs propagate a bounded "Manual checks" section from child PR bodies (if present). Supported formats in child PR bodies:
+  - Preferred markers: `<!-- ralph:manual-checks:start -->` ... `<!-- ralph:manual-checks:end -->`
+  - Fallback heading: `## Manual checks` (captured until the next heading of same-or-higher level)
 - `pollInterval` (number): ms between queue checks when polling (defaults to 30000)
 - `doneReconcileIntervalMs` (number): ms between GitHub done reconciliation checks (defaults to 300000)
 - `watchdog` (object, optional): hung tool call watchdog (see below)
@@ -372,6 +379,16 @@ Machine-readable output:
 
 ```bash
 ralph repos --json
+```
+
+### GitHub API usage summary (telemetry)
+
+Reads `github.request` events from `~/.ralph/events/YYYY-MM-DD.jsonl` and summarizes hottest endpoints and rate-limit/backoff behavior.
+
+```bash
+ralph github-usage --since 24h
+ralph github-usage --date 2026-02-03
+ralph github-usage --since 6h --json
 ```
 
 ### Sandbox provisioning
