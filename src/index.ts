@@ -2786,6 +2786,9 @@ if (args[0] === "watch") {
     process.exit(0);
   }
 
+  // GitHub-backed queue queries require the SQLite state DB.
+  initStateDb();
+
   console.log("[ralph] Watching in-progress task status (Ctrl+C to stop)...");
 
   const lastLines = new Map<string, string>();

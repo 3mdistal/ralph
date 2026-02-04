@@ -25,8 +25,10 @@ import {
   listOpenPrCandidatesForIssue,
   listTaskOpStatesByRepo,
   recordIssueLabelsSnapshot,
+  recordIssueSnapshot,
   recordTaskSnapshot,
   releaseTaskSlot,
+  runInStateTransaction,
   type IssueSnapshot,
   type TaskOpState,
 } from "../state";
@@ -84,6 +86,7 @@ type GitHubQueueDeps = {
 type GitHubQueueIO = {
   ensureWorkflowLabels: (repo: string) => Promise<EnsureOutcome>;
   listIssueLabels: (repo: string, issueNumber: number) => Promise<string[]>;
+  fetchIssue: (repo: string, issueNumber: number) => Promise<IssueFetchResult | null>;
   reopenIssue: (repo: string, issueNumber: number) => Promise<void>;
   addIssueLabel: (repo: string, issueNumber: number, label: string) => Promise<void>;
   addIssueLabels: (repo: string, issueNumber: number, labels: string[]) => Promise<void>;
@@ -95,6 +98,15 @@ type GitHubQueueIO = {
     add: string[];
     remove: string[];
   }) => Promise<boolean>;
+};
+
+type IssueFetchResult = {
+  title: string | null;
+  state: string | null;
+  url: string | null;
+  githubNodeId: string | null;
+  githubUpdatedAt: string | null;
+  labels: string[];
 };
 
 function getNowIso(deps?: GitHubQueueDeps): string {
@@ -174,6 +186,11 @@ function createGitHubQueueIo(): GitHubQueueIO {
         throw error;
       }
     },
+    fetchIssue: async (repo, issueNumber) => {
+      const client = await createGitHubClient(repo);
+      const raw = await client.getIssue(issueNumber);
+      return parseIssueFetchResult(raw);
+    },
     reopenIssue: async (repo, issueNumber) => {
       const { owner, name } = splitRepoFullName(repo);
       const client = await createGitHubClient(repo);
@@ -250,10 +267,36 @@ function applyLabelDelta(params: {
 }
 
 
-function normalizeOptionalString(value: unknown): string | undefined {
+function normalizeTaskField(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed ? trimmed : undefined;
+  return value.trim();
+}
+
+function normalizeTaskExtraFields(extraFields?: Record<string, string | number>): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  if (!extraFields) return normalized;
+  for (const [key, value] of Object.entries(extraFields)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      normalized[key] = String(value);
+    } else if (typeof value === "string") {
+      normalized[key] = value.trim();
+    }
+  }
+  return normalized;
+}
+
+function parseIssueFetchResult(raw: unknown): IssueFetchResult | null {
+  if (!raw || typeof raw !== "object") return null;
+  const data = raw as any;
+  const labels = Array.isArray(data.labels) ? data.labels.map((label: any) => label?.name ?? "").filter(Boolean) : [];
+  return {
+    title: typeof data.title === "string" ? data.title : null,
+    state: typeof data.state === "string" ? data.state : null,
+    url: typeof data.html_url === "string" ? data.html_url : null,
+    githubNodeId: typeof data.node_id === "string" ? data.node_id : null,
+    githubUpdatedAt: typeof data.updated_at === "string" ? data.updated_at : null,
+    labels,
+  };
 }
 
 function buildLabelOpsIo(io: GitHubQueueIO, repo: string, issueNumber: number) {
@@ -944,27 +987,68 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       const issueRef = parseIssueRef(taskObj.issue, taskObj.repo);
       if (!issueRef) return false;
 
-      const issue = resolveIssueSnapshot(issueRef.repo, issueRef.number);
-      if (!issue) return false;
-
       const nowIso = getNowIso(deps);
-      if (issue.state?.toUpperCase() === "CLOSED" && status === "done") {
+      const normalizedExtra = normalizeTaskExtraFields(extraFields);
+      let issue = resolveIssueSnapshot(issueRef.repo, issueRef.number);
+      if (!issue) {
+        try {
+          const fetched = await io.fetchIssue(issueRef.repo, issueRef.number);
+          if (fetched) {
+            runInStateTransaction(() => {
+              recordIssueSnapshot({
+                repo: issueRef.repo,
+                issue: `${issueRef.repo}#${issueRef.number}`,
+                title: fetched.title ?? undefined,
+                state: fetched.state ?? undefined,
+                url: fetched.url ?? undefined,
+                githubNodeId: fetched.githubNodeId ?? undefined,
+                githubUpdatedAt: fetched.githubUpdatedAt ?? undefined,
+                at: nowIso,
+              });
+              recordIssueLabelsSnapshot({
+                repo: issueRef.repo,
+                issue: `${issueRef.repo}#${issueRef.number}`,
+                labels: fetched.labels,
+                at: nowIso,
+              });
+            });
+            issue = {
+              repo: issueRef.repo,
+              number: issueRef.number,
+              title: fetched.title,
+              state: fetched.state,
+              url: fetched.url,
+              githubNodeId: fetched.githubNodeId,
+              githubUpdatedAt: fetched.githubUpdatedAt,
+              labels: fetched.labels,
+            };
+          }
+        } catch (error) {
+          if (shouldLog(`ralph:queue:github:issue-fetch:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[ralph:queue:github] Failed to fetch issue ${issueRef.repo}#${issueRef.number}: ${message}`);
+          }
+        }
+      }
+
+      if (issue?.state?.toUpperCase() === "CLOSED" && status === "done") {
         recordTaskSnapshot({
           repo: issueRef.repo,
           issue: `${issueRef.repo}#${issueRef.number}`,
           taskPath: taskObj._path || `github:${issueRef.repo}#${issueRef.number}`,
           status,
-          sessionId: normalizeOptionalString(extraFields?.["session-id"]),
-          worktreePath: normalizeOptionalString(extraFields?.["worktree-path"]),
-          workerId: normalizeOptionalString(extraFields?.["worker-id"]),
-          repoSlot: normalizeOptionalString(extraFields?.["repo-slot"]),
-          daemonId: normalizeOptionalString(extraFields?.["daemon-id"]),
-          heartbeatAt: normalizeOptionalString(extraFields?.["heartbeat-at"]),
+          sessionId: normalizeTaskField(normalizedExtra["session-id"]),
+          worktreePath: normalizeTaskField(normalizedExtra["worktree-path"]),
+          workerId: normalizeTaskField(normalizedExtra["worker-id"]),
+          repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
+          daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
+          heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
           at: nowIso,
         });
         return true;
       }
-      const delta = statusToRalphLabelDelta(status, issue.labels);
+
+      const delta = issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] };
       const steps: LabelOp[] = [
         ...delta.add.map((label) => ({ action: "add" as const, label })),
         ...delta.remove.map((label) => ({ action: "remove" as const, label })),
@@ -973,37 +1057,35 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         add: steps.filter((step) => step.action === "add").map((step) => step.label),
         remove: steps.filter((step) => step.action === "remove").map((step) => step.label),
       };
-      const didMutate = await io.mutateIssueLabels({
-        repo: issueRef.repo,
-        issueNumber: issueRef.number,
-        issueNodeId: issue.githubNodeId,
-        add: updateDelta.add,
-        remove: updateDelta.remove,
-      });
-      if (!didMutate) {
-        const labelOps = await applyIssueLabelOps({
-          ops: steps,
-          io: buildLabelOpsIo(io, issueRef.repo, issueRef.number),
-          logLabel: `${issueRef.repo}#${issueRef.number}`,
-          log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+      if (issue && (updateDelta.add.length > 0 || updateDelta.remove.length > 0)) {
+        const didMutate = await io.mutateIssueLabels({
           repo: issueRef.repo,
-          ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
-          retryMissingLabelOnce: true,
+          issueNumber: issueRef.number,
+          issueNodeId: issue.githubNodeId,
+          add: updateDelta.add,
+          remove: updateDelta.remove,
         });
-        if (labelOps.ok) {
-          applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: labelOps.add, remove: labelOps.remove, nowIso });
-        } else if (labelOps.kind !== "transient") {
-          return false;
-        }
-      } else {
-        applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: updateDelta.add, remove: updateDelta.remove, nowIso });
-      }
-
-      const normalizedExtra: Record<string, string> = {};
-      if (extraFields) {
-        for (const [key, value] of Object.entries(extraFields)) {
-          if (typeof value === "number") normalizedExtra[key] = String(value);
-          else if (typeof value === "string") normalizedExtra[key] = value;
+        if (!didMutate) {
+          const labelOps = await applyIssueLabelOps({
+            ops: steps,
+            io: buildLabelOpsIo(io, issueRef.repo, issueRef.number),
+            logLabel: `${issueRef.repo}#${issueRef.number}`,
+            log: (message) => console.warn(`[ralph:queue:github] ${message}`),
+            repo: issueRef.repo,
+            ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
+            retryMissingLabelOnce: true,
+          });
+          if (labelOps.ok) {
+            applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+          } else if (labelOps.kind !== "transient") {
+            if (shouldLog(`ralph:queue:github:label-ops:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+              console.warn(
+                `[ralph:queue:github] Label update failed for ${issueRef.repo}#${issueRef.number}: ${labelOps.kind}`
+              );
+            }
+          }
+        } else {
+          applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: updateDelta.add, remove: updateDelta.remove, nowIso });
         }
       }
 
@@ -1012,12 +1094,12 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         issue: `${issueRef.repo}#${issueRef.number}`,
         taskPath: taskObj._path || `github:${issueRef.repo}#${issueRef.number}`,
         status,
-        sessionId: normalizeOptionalString(normalizedExtra["session-id"]),
-        worktreePath: normalizeOptionalString(normalizedExtra["worktree-path"]),
-        workerId: normalizeOptionalString(normalizedExtra["worker-id"]),
-        repoSlot: normalizeOptionalString(normalizedExtra["repo-slot"]),
-        daemonId: normalizeOptionalString(normalizedExtra["daemon-id"]),
-        heartbeatAt: normalizeOptionalString(normalizedExtra["heartbeat-at"]),
+        sessionId: normalizeTaskField(normalizedExtra["session-id"]),
+        worktreePath: normalizeTaskField(normalizedExtra["worktree-path"]),
+        workerId: normalizeTaskField(normalizedExtra["worker-id"]),
+        repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
+        daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
+        heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
         releasedAtMs: status === "in-progress" || status === "starting" || status === "throttled" ? null : undefined,
         releasedReason: status === "in-progress" || status === "starting" || status === "throttled" ? null : undefined,
         at: nowIso,
