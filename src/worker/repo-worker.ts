@@ -71,7 +71,6 @@ import {
   RALPH_LABEL_STATUS_IN_PROGRESS,
   RALPH_LABEL_STATUS_QUEUED,
 } from "../github-labels";
-import { executeIssueLabelOps, type LabelOp } from "../github/issue-label-io";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "../github/client";
 import { computeGitHubRateLimitPause } from "../github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "../github/dx-survey-writeback";
@@ -156,7 +155,6 @@ import {
   recordRalphRunGateArtifact,
   upsertIdempotencyKey,
   recordIssueSnapshot,
-  recordIssueLabelsSnapshot,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
   type PrState,
@@ -269,6 +267,14 @@ import {
   recordPrSnapshotBestEffort as recordPrSnapshotBestEffortImpl,
   updateOpenPrSnapshot as updateOpenPrSnapshotImpl,
 } from "./pr-snapshots";
+import {
+  addIssueLabel as addIssueLabelImpl,
+  applyCiDebugLabels as applyCiDebugLabelsImpl,
+  clearCiDebugLabels as clearCiDebugLabelsImpl,
+  ensureRalphWorkflowLabelsOnce as ensureRalphWorkflowLabelsOnceImpl,
+  recordIssueLabelDelta as recordIssueLabelDeltaImpl,
+  removeIssueLabel as removeIssueLabelImpl,
+} from "./labels";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -1494,7 +1500,7 @@ export class RepoWorker {
   }
 
   private async ensureRalphWorkflowLabelsOnce(): Promise<void> {
-    await this.labelEnsurer.ensure(this.repo);
+    await ensureRalphWorkflowLabelsOnceImpl(this as any);
   }
 
   private async githubApiRequest<T>(
@@ -1506,80 +1512,15 @@ export class RepoWorker {
   }
 
   private async addIssueLabel(issue: IssueRef, label: string): Promise<void> {
-    const result = await executeIssueLabelOps({
-      github: this.github,
-      repo: issue.repo,
-      issueNumber: issue.number,
-      ops: [{ action: "add", label } satisfies LabelOp],
-      log: (message: string) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
-      logLabel: `${issue.repo}#${issue.number}`,
-      ensureLabels: async () => await this.labelEnsurer.ensure(issue.repo),
-      retryMissingLabelOnce: true,
-      ensureBefore: true,
-    });
-    if (!result.ok) {
-      if (result.kind === "policy") {
-        console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
-        return;
-      }
-      if (result.kind === "transient") {
-        console.warn(
-          `[ralph:worker:${this.repo}] GitHub label write skipped (transient): ${String(result.error)}`
-        );
-        return;
-      }
-      throw result.error instanceof Error ? result.error : new Error(String(result.error));
-    }
-
-    if (result.add.length > 0 || result.remove.length > 0) {
-      this.recordIssueLabelDelta(issue, { add: result.add, remove: result.remove });
-    }
+    await addIssueLabelImpl(this as any, issue, label);
   }
 
   private async removeIssueLabel(issue: IssueRef, label: string): Promise<void> {
-    const result = await executeIssueLabelOps({
-      github: this.github,
-      repo: issue.repo,
-      issueNumber: issue.number,
-      ops: [{ action: "remove", label } satisfies LabelOp],
-      log: (message: string) => console.warn(`[ralph:worker:${this.repo}] ${message}`),
-      logLabel: `${issue.repo}#${issue.number}`,
-      ensureLabels: async () => await this.labelEnsurer.ensure(issue.repo),
-      retryMissingLabelOnce: true,
-      ensureBefore: true,
-    });
-    if (!result.ok) {
-      if (result.kind === "policy") {
-        console.warn(`[ralph:worker:${this.repo}] ${String(result.error)}`);
-        return;
-      }
-      if (result.kind === "transient") {
-        console.warn(
-          `[ralph:worker:${this.repo}] GitHub label write skipped (transient): ${String(result.error)}`
-        );
-        return;
-      }
-      throw result.error instanceof Error ? result.error : new Error(String(result.error));
-    }
-
-    if (result.add.length > 0 || result.remove.length > 0) {
-      this.recordIssueLabelDelta(issue, { add: result.add, remove: result.remove });
-    }
+    await removeIssueLabelImpl(this as any, issue, label);
   }
 
   private recordIssueLabelDelta(issue: IssueRef, delta: { add: string[]; remove: string[] }): void {
-    try {
-      const nowIso = new Date().toISOString();
-      const current = getIssueLabels(issue.repo, issue.number);
-      const set = new Set(current);
-      for (const label of delta.remove) set.delete(label);
-      for (const label of delta.add) set.add(label);
-      recordIssueLabelsSnapshot({ repo: issue.repo, issue: `${issue.repo}#${issue.number}`, labels: Array.from(set), at: nowIso });
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to record label snapshot for ${formatIssueRef(issue)}: ${error?.message ?? String(error)}`
-      );
-    }
+    return recordIssueLabelDeltaImpl(this as any, issue, delta);
   }
 
   private recordPrSnapshotBestEffort(input: { issue: string; prUrl: string; state: PrState }): void {
@@ -3491,43 +3432,11 @@ ${guidance}`
   }
 
   private async applyCiDebugLabels(issue: IssueRef): Promise<void> {
-    try {
-      await this.addIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to add ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
-          issue
-        )}: ${
-          error?.message ?? String(error)
-        }`
-      );
-    }
-
-    try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_BLOCKED);
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label for ${formatIssueRef(
-          issue
-        )}: ${
-          error?.message ?? String(error)
-        }`
-      );
-    }
+    await applyCiDebugLabelsImpl(this as any, issue);
   }
 
   private async clearCiDebugLabels(issue: IssueRef): Promise<void> {
-    try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_IN_PROGRESS);
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_IN_PROGRESS} label for ${formatIssueRef(
-          issue
-        )}: ${
-          error?.message ?? String(error)
-        }`
-      );
-    }
+    await clearCiDebugLabelsImpl(this as any, issue);
   }
 
   private computeCiRemediationBackoffMs(attemptNumber: number): number {
