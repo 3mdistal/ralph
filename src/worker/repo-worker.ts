@@ -245,6 +245,13 @@ import { waitForRequiredChecks as waitForRequiredChecksImpl } from "./merge/wait
 import { getPullRequestMergeState as getPullRequestMergeStateImpl } from "./merge/pull-request-state";
 import { updatePullRequestBranchViaWorktree as updatePullRequestBranchViaWorktreeImpl } from "./merge/auto-update-worktree";
 import { getPullRequestFiles as getPullRequestFilesImpl } from "./merge/pull-request-files";
+import {
+  clipLogExcerpt,
+  extractCommandsFromLog,
+  isActionableCheckFailure,
+  parseCiFixAttempts,
+  parseGhRunId,
+} from "./ci/ci-utils";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -2896,65 +2903,12 @@ ${guidance}`
     });
   }
 
-  private parseCiFixAttempts(raw: string | undefined): number | null {
-    const trimmed = (raw ?? "").trim();
-    if (!trimmed) return null;
-    const parsed = Number.parseInt(trimmed, 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-  }
-
   private resolveCiFixAttempts(): number {
-    return this.parseCiFixAttempts(process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS) ?? 5;
+    return parseCiFixAttempts(process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS) ?? 5;
   }
 
   private resolveMergeConflictAttempts(): number {
-    return this.parseCiFixAttempts(process.env.RALPH_MERGE_CONFLICT_MAX_ATTEMPTS) ?? 2;
-  }
-
-  private isActionableCheckFailure(rawState: string): boolean {
-    const normalized = rawState.trim().toLowerCase();
-    if (!normalized) return false;
-    if (normalized.includes("action_required")) return false;
-    if (normalized.includes("stale")) return false;
-    if (normalized.includes("cancel")) return false;
-    return true;
-  }
-
-  private parseGhRunId(detailsUrl: string | null | undefined): string | null {
-    if (!detailsUrl) return null;
-    const match = detailsUrl.match(/\/actions\/runs\/(\d+)/);
-    if (!match) return null;
-    return match[1] ?? null;
-  }
-
-  private extractCommandsFromLog(log: string): string[] {
-    const lines = log.split("\n");
-    const commands = new Set<string>();
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const bunMatch = trimmed.match(/\b(bun\s+(?:run\s+)?[\w:.-]+(?:\s+[^\s].*)?)$/i);
-      if (bunMatch?.[1]) {
-        commands.add(bunMatch[1]);
-      }
-      const npmMatch = trimmed.match(/\b(npm\s+(?:run\s+)?[\w:.-]+(?:\s+[^\s].*)?)$/i);
-      if (npmMatch?.[1]) {
-        commands.add(npmMatch[1]);
-      }
-      const pnpmMatch = trimmed.match(/\b(pnpm\s+(?:run\s+)?[\w:.-]+(?:\s+[^\s].*)?)$/i);
-      if (pnpmMatch?.[1]) {
-        commands.add(pnpmMatch[1]);
-      }
-    }
-    return Array.from(commands).sort();
-  }
-
-  private clipLogExcerpt(log: string, maxLines = 120): string {
-    const lines = log.split("\n").filter((line) => line.trim().length > 0);
-    if (lines.length <= maxLines) return lines.join("\n");
-    const head = lines.slice(0, Math.floor(maxLines * 0.6));
-    const tail = lines.slice(lines.length - Math.ceil(maxLines * 0.4));
-    return [...head, "...", ...tail].join("\n");
+    return parseCiFixAttempts(process.env.RALPH_MERGE_CONFLICT_MAX_ATTEMPTS) ?? 2;
   }
 
   private recordCiGateSummary(prUrl: string, summary: RequiredChecksSummary): void {
@@ -3073,7 +3027,7 @@ ${guidance}`
       const result = await ghRead(this.repo)`gh run view ${runId} --repo ${this.repo} --log-failed`.quiet();
       const output = result.stdout.toString();
       if (!output.trim()) return { runId };
-      return { runId, logExcerpt: this.clipLogExcerpt(output) };
+      return { runId, logExcerpt: clipLogExcerpt(output) };
     } catch (error: any) {
       const message = this.formatGhError(error);
       console.warn(`[ralph:worker:${this.repo}] Failed to fetch CI logs for run ${runId}: ${message}`);
@@ -3096,7 +3050,7 @@ ${guidance}`
         continue;
       }
 
-      const runId = this.parseGhRunId(check.detailsUrl);
+      const runId = parseGhRunId(check.detailsUrl);
       if (!runId) {
         logs.push({ ...check });
         continue;
@@ -3104,14 +3058,14 @@ ${guidance}`
 
       const logResult = await this.getCheckLog(runId);
       if (logResult.logExcerpt) {
-        this.extractCommandsFromLog(logResult.logExcerpt).forEach((cmd) => commands.add(cmd));
+        extractCommandsFromLog(logResult.logExcerpt).forEach((cmd) => commands.add(cmd));
       }
 
       if (!logResult.logExcerpt) {
         logWarnings.push(`No failing log output captured for ${check.name} (run ${runId}).`);
       }
 
-      if (!this.isActionableCheckFailure(check.rawState)) {
+      if (!isActionableCheckFailure(check.rawState)) {
         logWarnings.push(`Check ${check.name} returned non-actionable status (${check.rawState}).`);
       }
 
@@ -3168,7 +3122,7 @@ ${guidance}`
     const failed = summary.required
       .filter((check) => check.state === "FAILURE")
       .map((check) => {
-        const runId = this.parseGhRunId(check.detailsUrl);
+        const runId = parseGhRunId(check.detailsUrl);
         const suffix = runId ? `:run:${runId}` : "";
         return `${check.name}:${check.rawState}${suffix}`;
       })
@@ -3197,7 +3151,7 @@ ${guidance}`
 
   private isActionableFailureContext(context: RemediationFailureContext): boolean {
     if (context.failedChecks.length === 0) return false;
-    if (!context.failedChecks.every((check) => this.isActionableCheckFailure(check.rawState))) return false;
+    if (!context.failedChecks.every((check) => isActionableCheckFailure(check.rawState))) return false;
     if (context.commands.length > 0) return true;
 
     return context.failedChecks.some((check) => {
