@@ -702,6 +702,13 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   return {
     name: "github" as const,
     initialPoll: async (): Promise<QueueTask[]> => {
+      // Bootstrap required workflow labels early so new repos become schedulable
+      // before any claim/write attempts.
+      const repos = getConfig().repos.map((entry) => entry.name);
+      if (repos.length > 0) {
+        await Promise.allSettled(repos.map(async (repo) => await io.ensureWorkflowLabels(repo)));
+      }
+
       await maybeSweepStaleInProgress();
       return await listTasksByStatus("queued");
     },
