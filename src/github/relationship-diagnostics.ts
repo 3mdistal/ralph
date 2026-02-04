@@ -11,7 +11,7 @@ type LogParams = {
   area: string;
 };
 
-export function formatRelationshipDiagnostics(params: {
+function formatRelationshipDiagnostics(params: {
   issue: IssueRef;
   diagnostics?: RelationshipResolutionDiagnostics;
 }): string | null {
