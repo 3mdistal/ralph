@@ -60,6 +60,7 @@ import {
   readIntrospectionSummary,
   readLiveAnomalyCount,
 } from "./introspection";
+import { buildAgentRunBodyPrefix, computeBlockedPatch, summarizeBlockedDetails, summarizeForNote } from "./run-notes";
 import {
   isExplicitBlockerReason,
   isImplementationTaskFromIssue,
@@ -405,8 +406,6 @@ const MAX_ANOMALY_ABORTS = 3; // Max times to abort and retry before escalating
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 const ISSUE_RELATIONSHIP_TTL_MS = 60_000;
 const LEGACY_WORKTREES_LOG_INTERVAL_MS = 12 * 60 * 60 * 1000;
-const BLOCKED_REASON_MAX_LEN = 200;
-const BLOCKED_DETAILS_MAX_LEN = 2000;
 const CI_DEBUG_LEASE_TTL_MS = 20 * 60_000;
 const CI_DEBUG_COMMENT_SCAN_LIMIT = 100;
 const CI_DEBUG_COMMENT_MIN_EDIT_MS = 60_000;
@@ -434,24 +433,6 @@ export interface AgentRun {
   surveyResults?: string;
 }
 
-function summarizeForNote(text: string, maxChars = 900): string {
-  const trimmed = text.trim();
-  if (!trimmed) return "";
-  if (trimmed.length <= maxChars) return trimmed;
-  return trimmed.slice(0, maxChars).trimEnd() + "…";
-}
-
-function sanitizeDiagnosticsText(text: string): string {
-  return sanitizeEscalationReason(text);
-}
-
-function summarizeBlockedReason(text: string): string {
-  const trimmed = sanitizeDiagnosticsText(text).trim();
-  if (!trimmed) return "";
-  if (trimmed.length <= BLOCKED_REASON_MAX_LEN) return trimmed;
-  return trimmed.slice(0, BLOCKED_REASON_MAX_LEN).trimEnd() + "…";
-}
-
 function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
   if (!result) return undefined;
   const details: RalphRunDetails = {};
@@ -473,59 +454,6 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
   }
 
   return Object.keys(details).length ? details : undefined;
-}
-
-function summarizeBlockedDetails(text: string): string {
-  const trimmed = sanitizeDiagnosticsText(text).trim();
-  if (!trimmed) return "";
-  if (trimmed.length <= BLOCKED_DETAILS_MAX_LEN) return trimmed;
-  return trimmed.slice(0, BLOCKED_DETAILS_MAX_LEN).trimEnd() + "…";
-}
-
-function buildBlockedSignature(source?: string, reason?: string): string {
-  return `${source ?? ""}::${reason ?? ""}`;
-}
-
-function computeBlockedPatch(
-  task: AgentTask,
-  opts: { source: BlockedSource; reason?: string; details?: string; nowIso: string }
-): {
-  patch: Record<string, string>;
-  didEnterBlocked: boolean;
-  reasonSummary: string;
-  detailsSummary: string;
-} {
-  const reasonSummary = opts.reason ? summarizeBlockedReason(opts.reason) : "";
-  const detailsSource = opts.details ?? opts.reason ?? "";
-  const detailsSummary = detailsSource ? summarizeBlockedDetails(detailsSource) : "";
-
-  // NOTE: GitHub-backed tasks do not currently persist blocked-* metadata in durable op-state.
-  // That means we can repeatedly rebuild AgentTask objects that have status=blocked but empty
-  // blocked-source/reason fields. Treating that as a "signature change" causes noisy re-entry
-  // notifications (blocked-deps spam) even though nothing changed.
-  const priorBlockedSource = typeof task["blocked-source"] === "string" ? task["blocked-source"].trim() : "";
-  const priorBlockedReason = typeof task["blocked-reason"] === "string" ? task["blocked-reason"].trim() : "";
-  const hasPriorBlockedSignature = Boolean(priorBlockedSource || priorBlockedReason);
-
-  const previousSignature = buildBlockedSignature(priorBlockedSource, priorBlockedReason);
-  const nextSignature = buildBlockedSignature(opts.source, reasonSummary);
-  const didChangeSignature = previousSignature !== nextSignature;
-
-  const didEnterBlocked =
-    task.status !== "blocked" ? true : (hasPriorBlockedSignature ? didChangeSignature : false);
-
-  const patch: Record<string, string> = {
-    "blocked-source": opts.source,
-    "blocked-reason": reasonSummary,
-    "blocked-details": detailsSummary,
-    "blocked-checked-at": opts.nowIso,
-  };
-
-  if (didEnterBlocked) {
-    patch["blocked-at"] = opts.nowIso;
-  }
-
-  return { patch, didEnterBlocked, reasonSummary, detailsSummary };
 }
 
 function applyTaskPatch(task: AgentTask, status: AgentTask["status"], patch: Record<string, string | number>): void {
@@ -559,37 +487,6 @@ function buildCheckpointPatch(state: CheckpointState): Record<string, string> {
     [PAUSE_REQUESTED_FIELD]: state.pauseRequested ? "true" : "false",
     [PAUSED_AT_CHECKPOINT_FIELD]: state.pausedAtCheckpoint ?? "",
   };
-}
-
-function buildAgentRunBodyPrefix(params: {
-  task: AgentTask;
-  headline: string;
-  reason?: string;
-  details?: string;
-  sessionId?: string;
-  runLogPath?: string;
-}): string {
-  const lines: string[] = [params.headline];
-  lines.push("", `Issue: ${params.task.issue}`, `Repo: ${params.task.repo}`);
-  if (params.sessionId) lines.push(`Session: ${params.sessionId}`);
-  if (params.runLogPath) lines.push(`Run log: ${redactHomePathForDisplay(params.runLogPath)}`);
-  if (params.sessionId && isSafeSessionId(params.sessionId)) {
-    const eventsPath = getSessionEventsPath(params.sessionId);
-    if (existsSync(eventsPath)) {
-      lines.push(`Trace: ${redactHomePathForDisplay(eventsPath)}`);
-    }
-  }
-
-  const sanitizedReason = params.reason ? sanitizeDiagnosticsText(params.reason) : "";
-  const reasonSummary = sanitizedReason ? summarizeForNote(sanitizedReason, 800) : "";
-  if (reasonSummary) lines.push("", `Reason: ${reasonSummary}`);
-
-  const sanitizedDetails = params.details ? sanitizeDiagnosticsText(params.details) : "";
-  const detailText =
-    sanitizedDetails && sanitizedDetails !== sanitizedReason ? summarizeForNote(sanitizedDetails, 1400) : "";
-  if (detailText) lines.push("", "Details:", detailText);
-
-  return lines.join("\n").trim();
 }
 
 function resolveVaultPath(p: string): string {
