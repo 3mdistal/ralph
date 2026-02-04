@@ -244,6 +244,7 @@ import { updatePullRequestBranch as updatePullRequestBranchImpl } from "./merge/
 import { waitForRequiredChecks as waitForRequiredChecksImpl } from "./merge/wait-required-checks";
 import { getPullRequestMergeState as getPullRequestMergeStateImpl } from "./merge/pull-request-state";
 import { updatePullRequestBranchViaWorktree as updatePullRequestBranchViaWorktreeImpl } from "./merge/auto-update-worktree";
+import { getPullRequestFiles as getPullRequestFilesImpl } from "./merge/pull-request-files";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
 import type { ThrottleAdapter } from "./ports";
 
@@ -2847,32 +2848,11 @@ ${guidance}`
   }
 
   private async getPullRequestFiles(prUrl: string): Promise<string[]> {
-    const prNumber = extractPullRequestNumber(prUrl);
-    if (!prNumber) {
-      throw new Error(`Could not parse pull request number from URL: ${prUrl}`);
-    }
-
-    const { owner, name } = splitRepoFullName(this.repo);
-    const files: string[] = [];
-    let page = 1;
-
-    while (true) {
-      const payload = await this.githubApiRequest<Array<{ filename?: string | null }>>(
-        `/repos/${owner}/${name}/pulls/${prNumber}/files?per_page=100&page=${page}`
-      );
-
-      if (!payload || payload.length === 0) break;
-
-      for (const entry of payload) {
-        const filename = String(entry?.filename ?? "").trim();
-        if (filename) files.push(filename);
-      }
-
-      if (payload.length < 100) break;
-      page += 1;
-    }
-
-    return files;
+    return await getPullRequestFilesImpl({
+      repo: this.repo,
+      prUrl,
+      githubApiRequest: async (path) => await this.githubApiRequest(path),
+    });
   }
 
   private async waitForRequiredChecks(
