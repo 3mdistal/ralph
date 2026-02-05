@@ -25,6 +25,7 @@ const RALPH_LEGACY_WORKFLOW_LABELS = [
 export type RalphLegacyWorkflowLabel = (typeof RALPH_LEGACY_WORKFLOW_LABELS)[number];
 
 export const RALPH_STATUS_LABEL_PREFIX = "ralph:status:";
+const RALPH_CMD_LABEL_PREFIX = "ralph:cmd:";
 
 export const RALPH_LABEL_STATUS_QUEUED = "ralph:status:queued";
 export const RALPH_LABEL_STATUS_IN_PROGRESS = "ralph:status:in-progress";
@@ -34,6 +35,11 @@ export const RALPH_LABEL_STATUS_IN_BOT = "ralph:status:in-bot";
 export const RALPH_LABEL_STATUS_DONE = "ralph:status:done";
 export const RALPH_LABEL_STATUS_STOPPED = "ralph:status:stopped";
 
+export const RALPH_LABEL_CMD_QUEUE = `${RALPH_CMD_LABEL_PREFIX}queue`;
+export const RALPH_LABEL_CMD_PAUSE = `${RALPH_CMD_LABEL_PREFIX}pause`;
+export const RALPH_LABEL_CMD_STOP = `${RALPH_CMD_LABEL_PREFIX}stop`;
+export const RALPH_LABEL_CMD_SATISFY = `${RALPH_CMD_LABEL_PREFIX}satisfy`;
+
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   // Status (Ralph-managed)
   { name: RALPH_LABEL_STATUS_QUEUED, color: "0366D6", description: "In queue; claimable when unblocked" },
@@ -42,7 +48,13 @@ export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   { name: RALPH_LABEL_STATUS_ESCALATED, color: "D73A4A", description: "Needs human intervention; see escalation note" },
   { name: RALPH_LABEL_STATUS_IN_BOT, color: "0E8A16", description: "Task PR merged to bot/integration" },
   { name: RALPH_LABEL_STATUS_DONE, color: "1A7F37", description: "Task merged to default branch" },
-  { name: RALPH_LABEL_STATUS_STOPPED, color: "6A737D", description: "Operator stop; do not claim or resume" },
+  { name: RALPH_LABEL_STATUS_STOPPED, color: "B60205", description: "Operator cancelled; do not proceed" },
+
+  // Commands (operator-owned; ephemeral)
+  { name: RALPH_LABEL_CMD_QUEUE, color: "C5DEF5", description: "Command: enqueue / re-enqueue" },
+  { name: RALPH_LABEL_CMD_PAUSE, color: "C5DEF5", description: "Command: pause" },
+  { name: RALPH_LABEL_CMD_STOP, color: "C5DEF5", description: "Command: stop" },
+  { name: RALPH_LABEL_CMD_SATISFY, color: "C5DEF5", description: "Command: mark satisfied" },
 
   // Intent (operator-owned)
   { name: "ralph:intent:implement", color: "0B5FFF", description: "Implementation pipeline" },

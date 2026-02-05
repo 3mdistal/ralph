@@ -17,4 +17,4 @@ Canonical claims: `claims/canonical.jsonl`.
 | `ralph:status:escalated` | Needs human intervention; see escalation note | `D73A4A` |
 | `ralph:status:in-bot` | Task PR merged to bot/integration | `0E8A16` |
 | `ralph:status:done` | Task merged to default branch | `1A7F37` |
-| `ralph:status:stopped` | Operator stop; do not claim or resume | `6A737D` |
+| `ralph:status:stopped` | Operator cancelled; do not proceed | `B60205` |

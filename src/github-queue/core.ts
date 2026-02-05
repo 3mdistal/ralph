@@ -29,6 +29,7 @@ const KNOWN_RALPH_STATUS_LABELS = Array.from(
   new Set([
     ...Object.values(RALPH_STATUS_LABELS).filter(Boolean),
     RALPH_LABEL_STATUS_PAUSED,
+    RALPH_LABEL_STATUS_STOPPED,
     RALPH_LABEL_STATUS_IN_BOT,
     "ralph:status:blocked",
     "ralph:status:throttled",
@@ -179,8 +180,11 @@ export function deriveTaskView(params: {
   const labelStatus = deriveRalphStatus(params.issue.labels, params.issue.state);
   const released = typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs);
   const opStatus = released ? "queued" : ((params.opState?.status as QueueTaskStatus | null) ?? null);
-  // Pause label is an operator stop switch and must not be overridden by durable op-state.
-  const status = labelStatus === "paused" ? "paused" : (opStatus ?? labelStatus ?? "queued");
+  // Pause/stopped labels are operator stop switches and must not be overridden by durable op-state.
+  const status =
+    labelStatus === "paused" || labelStatus === "stopped"
+      ? labelStatus
+      : (opStatus ?? labelStatus ?? "queued");
   const creationDate = params.issue.githubUpdatedAt ?? params.nowIso;
   const name = params.issue.title?.trim() ? params.issue.title : `Issue ${params.issue.number}`;
   const priority = inferPriorityFromLabels(params.issue.labels);
