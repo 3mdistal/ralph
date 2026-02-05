@@ -201,6 +201,7 @@ const VALID_TASK_STATUSES = new Set<QueueTaskStatus>([
   "starting",
   "in-progress",
   "paused",
+  "stopped",
   "throttled",
   "blocked",
   "escalated",
