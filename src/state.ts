@@ -3511,6 +3511,76 @@ export function deleteIdempotencyKey(key: string): void {
   database.query("DELETE FROM idempotency WHERE key = $key").run({ $key: key });
 }
 
+export type DependencySatisfactionOverride = {
+  key: string;
+  repo: string;
+  issueNumber: number;
+  createdAt: string;
+  satisfiedAt: string | null;
+  via: string | null;
+};
+
+const DEP_SATISFY_KEY_PREFIX = "ralph:satisfy:v1:";
+
+function parseDependencySatisfactionKey(key: string): { repo: string; issueNumber: number } | null {
+  if (!key.startsWith(DEP_SATISFY_KEY_PREFIX)) return null;
+  const rest = key.slice(DEP_SATISFY_KEY_PREFIX.length);
+  const hashIdx = rest.lastIndexOf("#");
+  if (hashIdx <= 0 || hashIdx >= rest.length - 1) return null;
+  const repo = rest.slice(0, hashIdx).trim();
+  const issueNumber = Number(rest.slice(hashIdx + 1));
+  if (!repo) return null;
+  if (!Number.isFinite(issueNumber) || issueNumber <= 0) return null;
+  return { repo, issueNumber: Math.floor(issueNumber) };
+}
+
+export function listDependencySatisfactionOverrides(params?: { limit?: number }): DependencySatisfactionOverride[] {
+  const database = requireDb();
+  const limit = Math.max(1, Math.min(500, Math.floor(params?.limit ?? 50)));
+  const rows = database
+    .query(
+      `SELECT key, created_at, payload_json
+       FROM idempotency
+       WHERE scope = 'dependency-satisfaction'
+       ORDER BY created_at DESC
+       LIMIT $limit`
+    )
+    .all({ $limit: limit }) as Array<{ key?: string | null; created_at?: string | null; payload_json?: string | null }>;
+
+  const out: DependencySatisfactionOverride[] = [];
+  for (const row of rows) {
+    const key = typeof row?.key === "string" ? row.key : "";
+    const createdAt = typeof row?.created_at === "string" ? row.created_at : "";
+    if (!key || !createdAt) continue;
+    const parsedKey = parseDependencySatisfactionKey(key);
+    if (!parsedKey) continue;
+
+    let satisfiedAt: string | null = null;
+    let via: string | null = null;
+    const payload = typeof row.payload_json === "string" ? row.payload_json : null;
+    if (payload) {
+      try {
+        const parsed = JSON.parse(payload) as any;
+        if (typeof parsed?.satisfiedAt === "string" && parsed.satisfiedAt.trim()) satisfiedAt = parsed.satisfiedAt.trim();
+        if (typeof parsed?.via === "string" && parsed.via.trim()) via = parsed.via.trim();
+      } catch {
+        // ignore invalid payload
+      }
+    }
+
+    out.push({
+      key,
+      repo: parsedKey.repo,
+      issueNumber: parsedKey.issueNumber,
+      createdAt,
+      satisfiedAt,
+      via,
+    });
+  }
+
+  return out;
+}
+
 export type RollupBatchStatus = "open" | "rolled-up";
 
 export type RollupBatch = {
