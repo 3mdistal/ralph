@@ -168,7 +168,7 @@ describe("syncBlockedStateForTasks", () => {
     expect(removeIssueLabelMock).not.toHaveBeenCalled();
   });
 
-  test("removes blocked label when deps unblock succeeds", async () => {
+  test("does not mutate GitHub status labels when deps unblock succeeds", async () => {
     updateTaskStatusMock.mockClear();
     const removeIssueLabelMock = mock(async () => {});
     const provider: IssueRelationshipProvider = {
@@ -192,7 +192,7 @@ describe("syncBlockedStateForTasks", () => {
     await worker.syncBlockedStateForTasks([task]);
 
     expect(updateTaskStatusMock).toHaveBeenCalledTimes(1);
-    expect(removeIssueLabelMock).toHaveBeenCalledTimes(1);
+    expect(removeIssueLabelMock).not.toHaveBeenCalled();
   });
 
   test("sets parent verification pending when deps unblock", async () => {
