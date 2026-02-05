@@ -6,9 +6,11 @@ export type QueueTaskStatus =
   | "starting"
   | "in-progress"
   | "paused"
+  | "stopped"
   | "throttled"
   | "blocked"
   | "escalated"
+  | "stopped"
   | "done";
 
 export interface QueueTask {

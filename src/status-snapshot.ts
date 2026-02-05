@@ -71,6 +71,14 @@ export type StatusTriageRun = {
   computedAt: string;
 };
 
+export type StatusDependencySatisfactionOverride = {
+  repo: string;
+  issueNumber: number;
+  createdAt: string;
+  satisfiedAt: string | null;
+  via: string | null;
+};
+
 import type { StatusUsageSnapshot } from "./status-usage";
 
 export type StatusSnapshot = {
@@ -82,6 +90,7 @@ export type StatusSnapshot = {
   throttle: unknown;
   usage?: StatusUsageSnapshot;
   triageRuns?: StatusTriageRun[];
+  dependencySatisfactionOverrides?: StatusDependencySatisfactionOverride[];
   escalations: { pending: number };
   inProgress: StatusInProgressTask[];
   starting: StatusTaskBase[];

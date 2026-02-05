@@ -1,9 +1,7 @@
 export const RALPH_LABEL_QUEUED = "ralph:status:queued";
 export const RALPH_LABEL_IN_PROGRESS = "ralph:status:in-progress";
 
-// vNext taxonomy does not use a dedicated "escalated" status label.
-// Escalations are represented as blocked + a durable marker comment.
-export const RALPH_LABEL_ESCALATED = "ralph:status:blocked";
+export const RALPH_LABEL_ESCALATED = "ralph:status:escalated";
 
 // Legacy "stuck" maps to "in-progress" in the vNext taxonomy.
 export const RALPH_LABEL_STUCK = "ralph:status:in-progress";

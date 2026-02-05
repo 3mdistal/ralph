@@ -12,7 +12,7 @@ describe("issue-label-io", () => {
       github,
       repo: "3mdistal/ralph",
       issueNumber: 123,
-      label: "ralph:status:blocked",
+      label: "ralph:status:escalated",
       allowNotFound: true,
     });
 
@@ -25,7 +25,7 @@ describe("issue-label-io", () => {
     } as any;
 
     const result = await applyIssueLabelOps({
-      ops: [{ action: "remove", label: "ralph:status:blocked" }],
+      ops: [{ action: "remove", label: "ralph:status:escalated" }],
       io: {
         addLabel: async () => {},
         removeLabel: async (label: string) =>
@@ -43,6 +43,6 @@ describe("issue-label-io", () => {
     });
 
     expect(result.ok).toBe(true);
-    expect(result.remove).toEqual(["ralph:status:blocked"]);
+    expect(result.remove).toEqual(["ralph:status:escalated"]);
   });
 });

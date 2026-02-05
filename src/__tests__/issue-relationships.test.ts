@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
+import { mkdtemp, rm } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
+
 import { GitHubClient } from "../github/client";
 import { GitHubRelationshipProvider } from "../github/issue-relationships";
+import { closeStateDbForTests, initStateDb, recordIssueLabelsSnapshot } from "../state";
+import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
@@ -44,6 +50,76 @@ function makeProvider() {
 
 describe("GitHubRelationshipProvider coverage", () => {
   const priorFetch = globalThis.fetch;
+
+  test("treats in-bot dependencies as satisfied (unblocked)", async () => {
+    const releaseLock = await acquireGlobalTestLock();
+    const priorHome = process.env.HOME;
+    const priorStateDb = process.env.RALPH_STATE_DB_PATH;
+    const homeDir = await mkdtemp(join(tmpdir(), "ralph-issue-relationships-"));
+    process.env.HOME = homeDir;
+    process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
+
+    try {
+      closeStateDbForTests();
+      initStateDb();
+      const at = new Date("2026-02-05T00:00:00.000Z").toISOString();
+      recordIssueLabelsSnapshot({
+        repo: "org/repo",
+        issue: "org/repo#2",
+        labels: ["ralph:status:in-bot"],
+        at,
+      });
+
+      const fetchMock: FetchLike = async (input) => {
+        const url = String(input);
+        if (url.includes("/issues/1/dependencies")) {
+          return new Response(
+            JSON.stringify([
+              {
+                number: 2,
+                state: "OPEN",
+                repository: { full_name: "org/repo" },
+              },
+            ]),
+            {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }
+          );
+        }
+        if (url.includes("/issues/1/sub_issues")) {
+          return new Response(JSON.stringify([]), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (url.includes("/issues/1")) {
+          return new Response(JSON.stringify({ body: "" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response("", { status: 500 });
+      };
+
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+      const provider = makeProvider();
+      const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
+
+      const dep = snapshot.signals.find(
+        (signal) => signal.kind === "blocked_by" && signal.source === "github" && signal.ref?.repo === "org/repo" && signal.ref?.number === 2
+      );
+      expect(dep?.state).toBe("closed");
+    } finally {
+      closeStateDbForTests();
+      await rm(homeDir, { recursive: true, force: true });
+      if (priorHome === undefined) delete process.env.HOME;
+      else process.env.HOME = priorHome;
+      if (priorStateDb === undefined) delete process.env.RALPH_STATE_DB_PATH;
+      else process.env.RALPH_STATE_DB_PATH = priorStateDb;
+      releaseLock();
+    }
+  });
 
   test("graphql uses hasNextPage=false to mark deps complete", async () => {
     const fetchMock: FetchLike = async (input, init) => {

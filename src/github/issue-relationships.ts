@@ -1,5 +1,7 @@
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./client";
 import { parseIssueBodyDependencies, type RelationshipSignal } from "./issue-blocking-core";
+import { getIssueLabels, hasIdempotencyKey, isStateDbInitialized } from "../state";
+import { RALPH_LABEL_STATUS_DONE, RALPH_LABEL_STATUS_IN_BOT } from "../github-labels";
 import type { IssueRef } from "./issue-ref";
 
 export type IssueRelationshipSnapshot = {
@@ -206,6 +208,19 @@ function isCoverageComplete(page: PageSignal): boolean {
   return page.hasNextPage === false;
 }
 
+function isDependencySatisfiedOverride(ref: IssueRef): boolean {
+  if (!isStateDbInitialized()) return false;
+  return hasIdempotencyKey(`ralph:satisfy:v1:${ref.repo}#${ref.number}`);
+}
+
+function isDependencySatisfiedByStatusLabel(ref: IssueRef): boolean {
+  if (!isStateDbInitialized()) return false;
+  const labels = getIssueLabels(ref.repo, ref.number);
+  if (!Array.isArray(labels) || labels.length === 0) return false;
+  const normalized = new Set(labels.map((label) => label.trim().toLowerCase()).filter(Boolean));
+  return normalized.has(RALPH_LABEL_STATUS_IN_BOT) || normalized.has(RALPH_LABEL_STATUS_DONE);
+}
+
 export class GitHubRelationshipProvider implements IssueRelationshipProvider {
   private github: GitHubClient;
   private depsCapability: RelationshipCapability = "unknown";
@@ -238,7 +253,14 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
       coverage.githubSubIssuesComplete = isCoverageComplete(subIssues.page);
     }
 
-    return { issue, signals, coverage };
+    const overridden = signals.map((signal) => {
+      if (!signal.ref) return signal;
+      if (signal.state !== "open") return signal;
+      if (!isDependencySatisfiedOverride(signal.ref) && !isDependencySatisfiedByStatusLabel(signal.ref)) return signal;
+      return { ...signal, state: "closed" as const };
+    });
+
+    return { issue, signals: overridden, coverage };
   }
 
   private async fetchIssueBasics(issue: IssueRef): Promise<IssueBasics> {

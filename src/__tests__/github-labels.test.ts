@@ -36,7 +36,7 @@ describe("computeRalphLabelSync", () => {
         currentName: "ralph:status:queued",
         patch: {
           color: "0366D6",
-          description: "In queue; claimable",
+          description: "In queue; claimable when unblocked",
         },
       },
     ]);
@@ -44,16 +44,16 @@ describe("computeRalphLabelSync", () => {
 
   test("updates color without changing matching descriptions", () => {
     const existing = [
-      { name: "ralph:status:queued", color: "0366D6", description: "In queue; claimable" },
+      { name: "ralph:status:queued", color: "0366D6", description: "In queue; claimable when unblocked" },
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
-      { name: "ralph:status:blocked", color: "000000", description: "Waiting on dependencies or human input" },
+      { name: "ralph:status:escalated", color: "000000", description: "Needs human intervention; see escalation note" },
       { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
     expect(toUpdate).toEqual([
       {
-        currentName: "ralph:status:blocked",
+        currentName: "ralph:status:escalated",
         patch: { color: "D73A4A" },
       },
     ]);
@@ -64,14 +64,14 @@ describe("computeRalphLabelSync", () => {
       { name: "Ralph:Status:Queued", color: "0366D6", description: "Queued" },
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
-      { name: "ralph:status:blocked", color: "D73A4A", description: "Waiting on dependencies or human input" },
+      { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
       { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
     expect(toUpdate).toEqual([
       {
         currentName: "Ralph:Status:Queued",
-        patch: { description: "In queue; claimable" },
+        patch: { description: "In queue; claimable when unblocked" },
       },
     ]);
   });
@@ -89,10 +89,10 @@ describe("computeRalphLabelSync", () => {
   test("prefers the canonical-cased label when duplicates exist", () => {
     const existing = [
       { name: "Ralph:Status:Queued", color: "0366D6", description: "Queued" },
-      { name: "ralph:status:queued", color: "0366D6", description: "In queue; claimable" },
+      { name: "ralph:status:queued", color: "0366D6", description: "In queue; claimable when unblocked" },
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
-      { name: "ralph:status:blocked", color: "D73A4A", description: "Waiting on dependencies or human input" },
+      { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
       { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
@@ -104,14 +104,14 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:status:queued", color: "0366D6", description: null },
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
-      { name: "ralph:status:blocked", color: "D73A4A", description: "Waiting on dependencies or human input" },
+      { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
       { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
     expect(toUpdate).toEqual([
       {
         currentName: "ralph:status:queued",
-        patch: { description: "In queue; claimable" },
+        patch: { description: "In queue; claimable when unblocked" },
       },
     ]);
   });

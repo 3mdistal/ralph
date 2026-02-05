@@ -130,7 +130,7 @@ describe("existing PR recovery", () => {
       taskRepoPath: "/tmp",
       cacheKey: "1",
       botBranch: "bot/integration",
-      issueMeta: { labels: ["ralph:status:blocked"], title: task.name },
+      issueMeta: { labels: ["ralph:status:escalated"], title: task.name },
       startTime: new Date(),
       opencodeSessionOptions: {},
     });
