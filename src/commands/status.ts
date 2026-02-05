@@ -10,7 +10,7 @@ import { buildStatusSnapshot, type StatusSnapshot } from "../status-snapshot";
 import { collectStatusUsageRows, formatStatusUsageSection } from "../status-usage";
 import { readRunTokenTotals } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
-import { initStateDb, listIssueAlertSummaries, listTopRalphRunTriages } from "../state";
+import { initStateDb, listDependencySatisfactionOverrides, listIssueAlertSummaries, listTopRalphRunTriages } from "../state";
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
 import { parseIssueRef } from "../github/issue-ref";
@@ -70,6 +70,13 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
   const config = getConfig();
 
   initStateDb();
+  const depSatisfaction = listDependencySatisfactionOverrides({ limit: 50 }).map((row) => ({
+    repo: row.repo,
+    issueNumber: row.issueNumber,
+    createdAt: row.createdAt,
+    satisfiedAt: row.satisfiedAt,
+    via: row.via,
+  }));
   const queueState = getQueueBackendStateWithLabelHealth();
 
   const daemonRecord = readDaemonRecord();
@@ -194,6 +201,7 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
     controlProfile: controlProfile || null,
     activeProfile: resolvedProfile ?? null,
     throttle: throttle.snapshot,
+    dependencySatisfactionOverrides: depSatisfaction,
     triageRuns: triageRuns.map((r) => ({
       runId: r.runId,
       repo: r.repo,
@@ -270,6 +278,13 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   // state, idempotency). The daemon initializes this during startup, but CLI
   // subcommands need to do it explicitly.
   initStateDb();
+  const depSatisfaction = listDependencySatisfactionOverrides({ limit: 50 }).map((row) => ({
+    repo: row.repo,
+    issueNumber: row.issueNumber,
+    createdAt: row.createdAt,
+    satisfiedAt: row.satisfiedAt,
+    via: row.via,
+  }));
 
   const queueState = getQueueBackendStateWithLabelHealth();
 
@@ -413,6 +428,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       activeProfile: resolvedProfile ?? null,
       throttle: throttle.snapshot,
       usage: { profiles: usageRows },
+      dependencySatisfactionOverrides: depSatisfaction,
       triageRuns: triageRuns.map((r) => ({
         runId: r.runId,
         repo: r.repo,
@@ -515,6 +531,13 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   for (const line of usageLines) console.log(line);
 
   console.log(`Escalations: ${pendingEscalations.length} pending`);
+
+  console.log(`Dependency satisfaction overrides: ${depSatisfaction.length}`);
+  for (const row of depSatisfaction.slice(0, 10)) {
+    const when = row.satisfiedAt ?? row.createdAt;
+    const via = row.via ? ` via=${row.via}` : "";
+    console.log(`  - ${row.repo}#${row.issueNumber} at=${when}${via}`);
+  }
 
   if (triageRuns.length > 0) {
     console.log(`Triage runs (last 14d): ${triageRuns.length}`);
