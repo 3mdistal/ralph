@@ -15,6 +15,7 @@ import {
   getRepoBotBranch,
   getRepoConcurrencySlots,
   getRepoLoopDetectionConfig,
+  getRepoPreflightCommands,
   getRepoRequiredChecksOverride,
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
@@ -51,12 +52,13 @@ import { ensureWorktreeSetup, type SetupFailure } from "../worktree-setup";
 import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
+import { runPreflightGate } from "../gates/preflight";
+
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "../opencode-auto-profile";
 import { readControlStateSnapshot } from "../drain";
-import { buildCheckpointState, type CheckpointState } from "../checkpoints/core";
-import { applyCheckpointReached } from "../checkpoints/runtime";
+import { createPauseControl, recordCheckpoint } from "./pause-control";
 import { hasProductGap, parseRoutingDecision, selectPrUrl, type RoutingDecision } from "../routing";
 import {
   cleanupIntrospectionLogs,
@@ -147,15 +149,7 @@ import {
   publishWorkerDashboardEvent,
   type WorkerDashboardEventInput,
 } from "./events";
-import {
-  buildCheckpointPatch,
-  CHECKPOINT_SEQ_FIELD,
-  PAUSED_AT_CHECKPOINT_FIELD,
-  PAUSE_REQUESTED_FIELD,
-  parseCheckpointSeq,
-  parseCheckpointValue,
-  parsePauseRequested,
-} from "./checkpoint-fields";
+import { PAUSED_AT_CHECKPOINT_FIELD, parseCheckpointValue } from "./checkpoint-fields";
 import { applyTaskPatch } from "./task-patch";
 import { resolveVaultPath } from "./vault-paths";
 import {
@@ -1782,6 +1776,10 @@ export class RepoWorker {
 
   private buildPrCreationNudge(botBranch: string, issueNumber: string, issueRef: string): string {
     const fixes = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${issueRef}`;
+    const preflight = getRepoPreflightCommands(this.repo);
+    const preflightLines = preflight.commands.length > 0
+      ? ["# Preflight (must pass before PR)", ...preflight.commands]
+      : [];
 
     return [
       `No PR URL found. Create a PR targeting '${botBranch}' and paste the PR URL.`,
@@ -1790,6 +1788,7 @@ export class RepoWorker {
       "Commands (run in the task worktree):",
       "```bash",
       "git status",
+      ...preflightLines,
       "git push -u origin HEAD",
       issueNumber
         ? `gh pr list --state open --search "fixes #${issueNumber} OR closes #${issueNumber} OR resolves #${issueNumber}" --json url,baseRefName,headRefName --limit 10`
@@ -2001,6 +2000,38 @@ export class RepoWorker {
     } catch (e: any) {
       diagnostics.push(`- git status failed: ${e?.message ?? String(e)}`);
       return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const preflightConfig = getRepoPreflightCommands(this.repo);
+    const runId = this.activeRunId;
+    if (runId) {
+      const skipReason =
+        preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
+          ? "preflight disabled (preflightCommand=[])"
+          : preflightConfig.configured
+            ? "preflight configured but empty"
+            : "no preflight configured";
+
+      const preflightResult = await runPreflightGate({
+        runId,
+        worktreePath: candidate.worktreePath,
+        commands: preflightConfig.commands,
+        skipReason,
+      });
+
+      if (preflightResult.status === "fail") {
+        diagnostics.push("- Preflight failed; refusing to create PR");
+        diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
+        return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      }
+
+      if (preflightResult.status === "skipped") {
+        diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
+      } else {
+        diagnostics.push("- Preflight passed");
+      }
+    } else if (preflightConfig.commands.length > 0) {
+      diagnostics.push("- WARNING: missing runId; skipping deterministic preflight gate recording");
     }
 
     try {
@@ -4695,107 +4726,43 @@ export class RepoWorker {
     };
   }
 
+  private getPauseControl() {
+    return createPauseControl({
+      readControlStateSnapshot,
+      defaults: getConfig().control,
+      isRalphCheckpoint,
+      log: (message) => console.warn(message),
+    });
+  }
+
   private readPauseRequested(): boolean {
-    return this.readPauseControl().pauseRequested;
+    return this.getPauseControl().readPauseRequested();
   }
 
   private readPauseControl(): { pauseRequested: boolean; pauseAtCheckpoint: RalphCheckpoint | null } {
-    const defaults = getConfig().control;
-    const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-
-    const pauseRequested = control.pauseRequested === true;
-    const pauseAtCheckpoint =
-      typeof control.pauseAtCheckpoint === "string" && isRalphCheckpoint(control.pauseAtCheckpoint)
-        ? (control.pauseAtCheckpoint as RalphCheckpoint)
-        : null;
-
-    return { pauseRequested, pauseAtCheckpoint };
+    return this.getPauseControl().readPauseControl();
   }
 
   private async waitForPauseCleared(opts?: { signal?: AbortSignal }): Promise<void> {
-    const minMs = 250;
-    const maxMs = 2000;
-    let delayMs = minMs;
-
-    while (this.readPauseRequested()) {
-      if (opts?.signal?.aborted) return;
-
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, delayMs);
-        if (opts?.signal) {
-          const onAbort = () => {
-            clearTimeout(timeout);
-            resolve();
-          };
-          opts.signal.addEventListener("abort", onAbort, { once: true });
-        }
-      });
-
-      const jitter = Math.floor(Math.random() * 125);
-      delayMs = Math.min(maxMs, Math.floor(delayMs * 1.6) + jitter);
-    }
-  }
-
-  private getCheckpointState(task: AgentTask): CheckpointState {
-    return buildCheckpointState({
-      lastCheckpoint: parseCheckpointValue(task.checkpoint),
-      checkpointSeq: parseCheckpointSeq(task[CHECKPOINT_SEQ_FIELD]),
-      pausedAtCheckpoint: parseCheckpointValue(task[PAUSED_AT_CHECKPOINT_FIELD]),
-      pauseRequested: parsePauseRequested(task[PAUSE_REQUESTED_FIELD]),
-    });
+    await this.getPauseControl().waitForPauseCleared(opts);
   }
 
   private async recordCheckpoint(task: AgentTask, checkpoint: RalphCheckpoint, sessionId?: string): Promise<void> {
     const workerId = await this.formatWorkerId(task, task._path);
-    const state = this.getCheckpointState(task);
-
-    const store = {
-      persist: async (nextState: CheckpointState) => {
-        const patch = buildCheckpointPatch(nextState);
-        try {
-          const updated = await this.queue.updateTaskStatus(task, task.status, patch);
-          if (!updated) {
-            console.warn(
-              `[ralph:worker:${this.repo}] Failed to persist checkpoint state (checkpoint=${checkpoint}, task=${task.issue})`
-            );
-            return;
-          }
-          applyTaskPatch(task, task.status, patch);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to persist checkpoint state (checkpoint=${checkpoint}, task=${task.issue}): ${
-              error?.message ?? String(error)
-            }`
-          );
-        }
-      },
-    };
-
-    const pauseSource = {
-      isPauseRequested: () => this.readPauseRequested(),
-      waitUntilCleared: (opts?: { signal?: AbortSignal }) => this.waitForPauseCleared(opts),
-    };
-
-    const pauseAtCheckpoint = this.readPauseControl().pauseAtCheckpoint;
-
-    const emitter = {
-      emit: (event: RalphEvent, key: string) => this.checkpointEvents.emit(event, key),
-      hasEmitted: (key: string) => this.checkpointEvents.hasEmitted(key),
-    };
-
-    await applyCheckpointReached({
+    await recordCheckpoint({
+      task,
       checkpoint,
-      pauseAtCheckpoint,
-      state,
-      context: {
-        workerId,
-        repo: this.repo,
-        taskId: task._path,
-        sessionId: sessionId ?? (task["session-id"]?.trim() || undefined),
+      workerId,
+      repo: this.repo,
+      sessionId,
+      pauseControl: this.getPauseControl(),
+      updateTaskStatus: this.queue.updateTaskStatus,
+      applyTaskPatch,
+      emitter: {
+        emit: (event: RalphEvent, key: string) => this.checkpointEvents.emit(event, key),
+        hasEmitted: (key: string) => this.checkpointEvents.hasEmitted(key),
       },
-      store,
-      pauseSource,
-      emitter,
+      log: (message) => console.warn(message),
     });
   }
 
