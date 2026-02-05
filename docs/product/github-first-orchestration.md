@@ -18,3 +18,4 @@ Canonical claims: `claims/canonical.jsonl`.
 | `ralph:status:throttled` | Throttled; will resume later | `F9A825` |
 | `ralph:status:in-bot` | Task PR merged to bot/integration | `0E8A16` |
 | `ralph:status:done` | Task merged to default branch | `1A7F37` |
+| `ralph:status:stopped` | Operator cancelled; do not proceed | `B60205` |

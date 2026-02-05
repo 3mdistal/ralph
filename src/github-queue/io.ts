@@ -38,6 +38,7 @@ import {
   RALPH_LABEL_STATUS_BLOCKED,
   RALPH_LABEL_STATUS_IN_PROGRESS,
   RALPH_LABEL_STATUS_PAUSED,
+  RALPH_LABEL_STATUS_STOPPED,
   RALPH_LABEL_STATUS_QUEUED,
   RALPH_STATUS_LABEL_PREFIX,
 } from "../github-labels";
@@ -1082,9 +1083,16 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         return true;
       }
 
-      const preservePausedLabel =
-        Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_PAUSED)) && status !== "paused" && status !== "done";
-      const delta = preservePausedLabel ? { add: [], remove: [] } : (issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] });
+      const preserveOperatorStopLabel =
+        Boolean(
+          issue?.labels?.includes(RALPH_LABEL_STATUS_PAUSED) || issue?.labels?.includes(RALPH_LABEL_STATUS_STOPPED)
+        ) &&
+        status !== "paused" &&
+        status !== "stopped" &&
+        status !== "done";
+      const delta = preserveOperatorStopLabel
+        ? { add: [], remove: [] }
+        : (issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] });
       const steps: LabelOp[] = [
         ...delta.add.map((label) => ({ action: "add" as const, label })),
         ...delta.remove.map((label) => ({ action: "remove" as const, label })),

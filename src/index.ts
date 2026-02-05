@@ -73,6 +73,7 @@ import { startGitHubIssuePollers } from "./github-issues-sync";
 import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import { startGitHubLabelReconciler } from "./github/label-reconciler";
+import { startGitHubCmdProcessor } from "./github/cmd-processor";
 import { resolveGitHubToken } from "./github-auth";
 import { GitHubClient } from "./github/client";
 import { parseIssueRef } from "./github/issue-ref";
@@ -130,6 +131,7 @@ let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
 let githubDoneReconciler: { stop: () => void } | null = null;
 let githubLabelReconciler: { stop: () => void } | null = null;
+let githubCmdProcessor: { stop: () => void } | null = null;
 let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
@@ -1726,6 +1728,10 @@ async function main(): Promise<void> {
       intervalMs: config.labelReconcileIntervalMs,
       log: (message) => console.log(message),
     });
+
+    githubCmdProcessor = startGitHubCmdProcessor({
+      log: (message) => console.log(message),
+    });
   }
 
   publishDashboardEvent({
@@ -1953,6 +1959,8 @@ async function main(): Promise<void> {
     githubDoneReconciler = null;
     githubLabelReconciler?.stop();
     githubLabelReconciler = null;
+    githubCmdProcessor?.stop();
+    githubCmdProcessor = null;
     if (escalationWatcher) {
       escalationWatcher.close();
       escalationWatcher = null;

@@ -8,6 +8,7 @@ import {
   RALPH_LABEL_STATUS_IN_PROGRESS,
   RALPH_LABEL_STATUS_PAUSED,
   RALPH_LABEL_STATUS_QUEUED,
+  RALPH_LABEL_STATUS_STOPPED,
   RALPH_LABEL_STATUS_THROTTLED,
 } from "../github-labels";
 
@@ -17,6 +18,7 @@ const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   queued: RALPH_LABEL_STATUS_QUEUED,
   "in-progress": RALPH_LABEL_STATUS_IN_PROGRESS,
   paused: RALPH_LABEL_STATUS_PAUSED,
+  stopped: RALPH_LABEL_STATUS_STOPPED,
   blocked: RALPH_LABEL_STATUS_BLOCKED,
   escalated: RALPH_LABEL_STATUS_BLOCKED,
   done: RALPH_LABEL_STATUS_DONE,
@@ -28,6 +30,7 @@ const KNOWN_RALPH_STATUS_LABELS = Array.from(
   new Set([
     ...Object.values(RALPH_STATUS_LABELS).filter(Boolean),
     RALPH_LABEL_STATUS_PAUSED,
+    RALPH_LABEL_STATUS_STOPPED,
     RALPH_LABEL_STATUS_IN_BOT,
   ])
 ) as string[];
@@ -38,6 +41,7 @@ export function deriveRalphStatus(labels: string[], issueState?: string | null):
   if (labels.includes(RALPH_LABEL_STATUS_DONE)) return "done";
   if (labels.includes(RALPH_LABEL_STATUS_IN_BOT)) return "done";
   if (labels.includes(RALPH_LABEL_STATUS_THROTTLED)) return "throttled";
+  if (labels.includes(RALPH_LABEL_STATUS_STOPPED)) return "stopped";
   if (labels.includes(RALPH_LABEL_STATUS_PAUSED)) return "paused";
   if (labels.includes(RALPH_LABEL_STATUS_BLOCKED)) return "blocked";
   if (labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) return "in-progress";
@@ -68,6 +72,7 @@ export function planClaim(currentLabels: string[]): {
   if (labelSet.has(RALPH_LABEL_STATUS_DONE)) return { claimable: false, steps: [], reason: "Issue already done" };
   if (labelSet.has(RALPH_LABEL_STATUS_IN_BOT)) return { claimable: false, steps: [], reason: "Issue already in bot" };
   if (labelSet.has(RALPH_LABEL_STATUS_THROTTLED)) return { claimable: false, steps: [], reason: "Issue is throttled" };
+  if (labelSet.has(RALPH_LABEL_STATUS_STOPPED)) return { claimable: false, steps: [], reason: "Issue is stopped" };
   if (labelSet.has(RALPH_LABEL_STATUS_PAUSED)) return { claimable: false, steps: [], reason: "Issue is paused" };
   if (labelSet.has(RALPH_LABEL_STATUS_BLOCKED)) return { claimable: false, steps: [], reason: "Issue is blocked" };
   if (labelSet.has(RALPH_LABEL_STATUS_IN_PROGRESS)) return { claimable: false, steps: [], reason: "Issue already in progress" };
@@ -156,8 +161,11 @@ export function deriveTaskView(params: {
   const labelStatus = deriveRalphStatus(params.issue.labels, params.issue.state);
   const released = typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs);
   const opStatus = released ? "queued" : ((params.opState?.status as QueueTaskStatus | null) ?? null);
-  // Pause label is an operator stop switch and must not be overridden by durable op-state.
-  const status = labelStatus === "paused" ? "paused" : (opStatus ?? labelStatus ?? "queued");
+  // Pause/stopped labels are operator stop switches and must not be overridden by durable op-state.
+  const status =
+    labelStatus === "paused" || labelStatus === "stopped"
+      ? labelStatus
+      : (opStatus ?? labelStatus ?? "queued");
   const creationDate = params.issue.githubUpdatedAt ?? params.nowIso;
   const name = params.issue.title?.trim() ? params.issue.title : `Issue ${params.issue.number}`;
   const priority = inferPriorityFromLabels(params.issue.labels);
