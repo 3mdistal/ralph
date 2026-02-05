@@ -1,9 +1,8 @@
 import { $ } from "bun";
-import { appendFile, mkdir, readFile, readdir, rm } from "fs/promises";
+import { appendFile, mkdir, readFile, rm } from "fs/promises";
 import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
-import { homedir } from "os";
 
 import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "../queue-backend";
 import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "../bwrb/artifacts";
@@ -11,7 +10,6 @@ import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
   getOpencodeDefaultProfileName,
-  getRequestedOpencodeProfileName,
   getRepoBotBranch,
   getRepoConcurrencySlots,
   getRepoLoopDetectionConfig,
@@ -19,10 +17,7 @@ import {
   getRepoRequiredChecksOverride,
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
-  isOpencodeProfilesEnabled,
-  listOpencodeProfileNames,
   getConfig,
-  resolveOpencodeProfile,
 } from "../config";
 import { normalizeGitRef } from "../midpoint-labels";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "../midpoint-labeler";
@@ -43,7 +38,7 @@ import {
   type SessionResult,
 } from "../session";
 import { buildPlannerPrompt } from "../planner-prompt";
-import { buildParentVerificationPrompt } from "../parent-verification-prompt";
+import { maybeRunParentVerificationLane } from "./parent-verification-lane";
 import { appendChildDossierToIssueContext } from "../child-dossier/core";
 import { collectChildCompletionDossier } from "../child-dossier/io";
 import { getThrottleDecision } from "../throttle";
@@ -56,7 +51,7 @@ import { runPreflightGate } from "../gates/preflight";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
-import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "../opencode-auto-profile";
+import { getPinnedOpencodeProfileName as getPinnedOpencodeProfileNameCore, resolveOpencodeXdgForTask as resolveOpencodeXdgForTaskCore } from "./opencode-profiles";
 import { readControlStateSnapshot } from "../drain";
 import { createPauseControl, recordCheckpoint } from "./pause-control";
 import { hasProductGap, parseRoutingDecision, selectPrUrl, type RoutingDecision } from "../routing";
@@ -144,6 +139,11 @@ import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-re
 import { redactHomePathForDisplay } from "../redaction";
 import { isSafeSessionId } from "../session-id";
 import {
+  createContextRecoveryAdapter as createContextRecoveryAdapterImpl,
+  withDashboardSessionOptions as withDashboardSessionOptionsImpl,
+  withRunContext as withRunContextImpl,
+} from "./run-context";
+import {
   buildWorkerDashboardContext,
   CheckpointEventDeduper,
   publishWorkerDashboardEvent,
@@ -177,15 +177,6 @@ import {
   tryClaimParentVerification,
   upsertRalphRunGateResult,
 } from "../state";
-import {
-  getParentVerificationBackoffMs,
-  getParentVerificationMaxAttempts,
-  isParentVerificationDisabled,
-  parseParentVerificationMarker,
-  PARENT_VERIFY_MARKER_PREFIX,
-  PARENT_VERIFY_MARKER_VERSION,
-} from "../parent-verification";
-import { parseLastLineJsonMarker } from "../markers";
 import { refreshRalphRunTokenTotals } from "../run-token-accounting";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
 import {
@@ -710,110 +701,37 @@ export class RepoWorker {
     attemptKind: RalphRunAttemptKind,
     run: () => Promise<AgentRun>
   ): Promise<AgentRun> {
-    let runId: string | null = null;
-    const previousRunId = this.activeRunId;
-
-    try {
-      runId = createRalphRun({
+    return await withRunContextImpl({
+      task,
+      attemptKind,
+      run,
+      ports: {
         repo: this.repo,
-        issue: task.issue,
-        taskPath: task._path,
-        attemptKind,
-      });
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to create run record for ${task.name}: ${error?.message ?? String(error)}`
-      );
-    }
-
-    if (!runId) {
-      return await run();
-    }
-
-    this.activeRunId = runId;
-    try {
-      ensureRalphRunGateRows({ runId });
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to initialize gate rows for ${task.name}: ${error?.message ?? String(error)}`
-      );
-    }
-
-    const recordingBase = createRunRecordingSessionAdapter({
-      base: this.baseSession,
-      runId,
-      repo: this.repo,
-      issue: task.issue,
+        getActiveRunId: () => this.activeRunId,
+        setActiveRunId: (runId) => {
+          this.activeRunId = runId;
+        },
+        baseSession: this.baseSession,
+        createRunRecordingSessionAdapter: (params) => createRunRecordingSessionAdapter(params),
+        createContextRecoveryAdapter: (base) => this.createContextRecoveryAdapter(base),
+        withDashboardContext: (context, runner) => this.withDashboardContext(context, runner),
+        withSessionAdapters: (next, runner) => this.withSessionAdapters(next, runner),
+        buildDashboardContext: (contextTask, runId) => this.buildDashboardContext(contextTask, runId),
+        publishDashboardEvent: (event, overrides) => this.publishDashboardEvent(event, overrides),
+        createRunRecord: (params) => createRalphRun(params),
+        ensureRunGateRows: (runId) => ensureRalphRunGateRows({ runId }),
+        completeRun: (params) => completeRalphRun(params),
+        buildRunDetails: (result) => buildRunDetails(result),
+        getPinnedOpencodeProfileName: (contextTask) => this.getPinnedOpencodeProfileName(contextTask),
+        refreshRalphRunTokenTotals: (params) => refreshRalphRunTokenTotals(params),
+        getRalphRunTokenTotals: (runId) => getRalphRunTokenTotals(runId),
+        listRalphRunSessionTokenTotals: (runId) => listRalphRunSessionTokenTotals(runId),
+        appendFile,
+        existsSync,
+        computeAndStoreRunMetrics: (params) => computeAndStoreRunMetrics(params),
+        warn: (message) => console.warn(message),
+      },
     });
-    const recordingSession = this.createContextRecoveryAdapter(recordingBase);
-
-    let result: AgentRun | null = null;
-    const context = this.buildDashboardContext(task, runId);
-
-    try {
-      result = await this.withDashboardContext(context, async () => {
-        this.publishDashboardEvent({
-          type: "worker.became_busy",
-          level: "info",
-          data: { taskName: task.name, issue: task.issue },
-        });
-        return await this.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, run);
-      });
-      return result;
-    } finally {
-      this.publishDashboardEvent({
-        type: "worker.became_idle",
-        level: "info",
-        data: { reason: result?.outcome },
-      });
-
-      try {
-        completeRalphRun({
-          runId,
-          outcome: result?.outcome ?? "failed",
-          details: buildRunDetails(result),
-        });
-      } catch (error: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to complete run record for ${task.name}: ${error?.message ?? String(error)}`
-        );
-      }
-
-      // Best-effort: persist token totals + append to the latest run log.
-      try {
-        const opencodeProfile = this.getPinnedOpencodeProfileName(task);
-        await refreshRalphRunTokenTotals({ runId, opencodeProfile });
-        const totals = getRalphRunTokenTotals(runId);
-        const runLogPath = task["run-log-path"]?.trim() || "";
-        if (totals && runLogPath && existsSync(runLogPath)) {
-          const totalLabel = totals.tokensComplete && typeof totals.tokensTotal === "number" ? totals.tokensTotal : "?";
-          const perSession = listRalphRunSessionTokenTotals(runId);
-          const missingCount = perSession.filter((s) => s.quality !== "ok").length;
-          const suffix = missingCount > 0 ? ` missingSessions=${missingCount}` : "";
-
-          await appendFile(
-            runLogPath,
-            "\n" +
-              [
-                "-----",
-                `Token usage: total=${totalLabel} complete=${totals.tokensComplete ? "true" : "false"} sessions=${totals.sessionCount}${suffix}`,
-              ].join("\n") +
-              "\n",
-            "utf8"
-          );
-        }
-      } catch {
-        // best-effort token accounting
-      }
-
-      try {
-        await computeAndStoreRunMetrics({ runId });
-      } catch {
-        // best-effort metrics persistence
-      }
-
-      this.activeRunId = previousRunId;
-    }
   }
 
   private formatSetupFailureReason(failure: SetupFailure): string {
@@ -951,90 +869,23 @@ export class RepoWorker {
   }
 
   private createContextRecoveryAdapter(base: SessionAdapter): SessionAdapter {
-    return {
-      runAgent: async (repoPath, agent, message, options, testOverrides) => {
-        const dashboardOptions = this.withDashboardSessionOptions(options);
-        const result = await base.runAgent(repoPath, agent, message, dashboardOptions, testOverrides);
-        return this.maybeRecoverFromContextLengthExceeded({
-          repoPath,
-          sessionId: result.sessionId,
-          stepKey: options?.introspection?.stepTitle ?? `agent:${agent}`,
-          result,
-          options: dashboardOptions,
-        });
-      },
-      continueSession: async (repoPath, sessionId, message, options) => {
-        const dashboardOptions = this.withDashboardSessionOptions(options, { sessionId });
-        const result = await base.continueSession(repoPath, sessionId, message, dashboardOptions);
-        return this.maybeRecoverFromContextLengthExceeded({
-          repoPath,
-          sessionId,
-          stepKey: options?.introspection?.stepTitle ?? `session:${sessionId}`,
-          result,
-          options: dashboardOptions,
-        });
-      },
-      continueCommand: async (repoPath, sessionId, command, args, options) => {
-        const dashboardOptions = this.withDashboardSessionOptions(options, { sessionId });
-        const result = await base.continueCommand(repoPath, sessionId, command, args, dashboardOptions);
-        return this.maybeRecoverFromContextLengthExceeded({
-          repoPath,
-          sessionId,
-          stepKey: options?.introspection?.stepTitle ?? `command:${command}`,
-          result,
-          options: dashboardOptions,
-          command,
-        });
-      },
-      getRalphXdgCacheHome: base.getRalphXdgCacheHome,
-    };
+    return createContextRecoveryAdapterImpl({
+      base,
+      withDashboardSessionOptions: (options, overrides) => this.withDashboardSessionOptions(options, overrides),
+      maybeRecoverFromContextLengthExceeded: async (params) => await this.maybeRecoverFromContextLengthExceeded(params),
+    });
   }
 
   private withDashboardSessionOptions(
     options?: RunSessionOptionsBase,
     overrides?: Partial<DashboardEventContext>
   ): RunSessionOptionsBase | undefined {
-    const context = this.activeDashboardContext ? { ...this.activeDashboardContext, ...overrides } : overrides;
-    if (!context) return options;
-
-    const existingOnEvent = options?.onEvent;
-    const onEvent = (event: any) => {
-      if (!event) return;
-      const eventSessionId = event.sessionID ?? event.sessionId;
-      const sessionId = typeof eventSessionId === "string" ? eventSessionId : context.sessionId;
-
-      this.publishDashboardEvent(
-        {
-          type: "log.opencode.event",
-          level: "info",
-          repo: context.repo,
-          taskId: context.taskId,
-          workerId: context.workerId,
-          sessionId,
-          data: { event },
-        },
-        { ...context, sessionId }
-      );
-
-      if (event.type === "text" && event.part?.text) {
-        this.publishDashboardEvent(
-          {
-            type: "log.opencode.text",
-            level: "info",
-            repo: context.repo,
-            taskId: context.taskId,
-            workerId: context.workerId,
-            sessionId,
-            data: { text: String(event.part.text) },
-          },
-          { ...context, sessionId }
-        );
-      }
-
-      existingOnEvent?.(event);
-    };
-
-    return { ...(options ?? {}), onEvent };
+    return withDashboardSessionOptionsImpl({
+      options,
+      overrides,
+      activeDashboardContext: this.activeDashboardContext,
+      publishDashboardEvent: (event, eventOverrides) => this.publishDashboardEvent(event, eventOverrides),
+    });
   }
 
   private async maybeRecoverFromContextLengthExceeded(params: {
@@ -4301,25 +4152,6 @@ export class RepoWorker {
     };
   }
 
-  private async deferParentVerification(task: AgentTask, reason: string): Promise<AgentRun> {
-    const patch: Record<string, string> = {
-      "daemon-id": "",
-      "heartbeat-at": "",
-    };
-    const updated = await this.queue.updateTaskStatus(task, "queued", patch);
-    if (updated) {
-      applyTaskPatch(task, "queued", patch);
-    }
-
-    console.log(`[ralph:worker:${this.repo}] Parent verification deferred: ${reason}`);
-    return {
-      taskName: task.name,
-      repo: this.repo,
-      outcome: "failed",
-      escalationReason: reason,
-    };
-  }
-
   private async maybeRunParentVerification(params: {
     task: AgentTask;
     issueNumber: string;
@@ -4327,201 +4159,32 @@ export class RepoWorker {
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     opencodeSessionOptions?: RunSessionOptionsBase;
   }): Promise<AgentRun | null> {
-    if (isParentVerificationDisabled()) return null;
-    const parsedIssueNumber = Number(params.issueNumber);
-    if (!Number.isFinite(parsedIssueNumber)) return null;
-
-    const state = getParentVerificationState({ repo: this.repo, issueNumber: parsedIssueNumber });
-    if (!state || state.status !== "pending") return null;
-
-    const nowMs = Date.now();
-    if (state.nextAttemptAtMs && state.nextAttemptAtMs > nowMs) {
-      return await this.deferParentVerification(
-        params.task,
-        `backoff active until ${new Date(state.nextAttemptAtMs).toISOString()}`
-      );
-    }
-
-    const maxAttempts = getParentVerificationMaxAttempts();
-    if (state.attemptCount >= maxAttempts) {
-      completeParentVerification({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        outcome: "skipped",
-        details: `max attempts (${maxAttempts}) reached`,
-        nowMs,
-      });
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification skipped (attempts=${state.attemptCount} max=${maxAttempts})`
-      );
-      return null;
-    }
-
-    const claimed = tryClaimParentVerification({ repo: this.repo, issueNumber: parsedIssueNumber, nowMs });
-    if (!claimed) {
-      return await this.deferParentVerification(params.task, "pending claim not acquired");
-    }
-
-    const attemptCount = claimed.attemptCount;
-    await this.recordRunLogPath(params.task, params.issueNumber, "parent-verify", "queued");
-    const issueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber: params.issueNumber });
-    const prompt = buildParentVerificationPrompt({ repo: this.repo, issueNumber: params.issueNumber, issueContext });
-    let result: SessionResult;
-    try {
-      result = await this.session.runAgent(this.repoPath, "ralph-parent-verify", prompt, {
-        repo: this.repo,
-        cacheKey: `parent-verify-${params.issueNumber}`,
-        introspection: {
-          repo: this.repo,
-          issue: params.task.issue,
-          taskName: params.task.name,
-          step: 0,
-          stepTitle: "parent verification",
-        },
-        ...this.buildWatchdogOptions(params.task, "parent-verify"),
-        ...this.buildStallOptions(params.task, "parent-verify"),
-        ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
-        ...(params.opencodeSessionOptions ?? {}),
-      });
-    } catch (error: any) {
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: error?.message ?? String(error),
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification failed; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification error");
-    }
-
-    if (result.loopTrip) {
-      return await this.handleLoopTrip(params.task, `parent-verify-${params.issueNumber}`, "parent-verify", result);
-    }
-
-    if (!result.success) {
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: result.output,
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification failed; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification failed");
-    }
-
-    const markerResult = parseLastLineJsonMarker(result.output ?? "", PARENT_VERIFY_MARKER_PREFIX);
-    const parsedMarker = markerResult.ok ? parseParentVerificationMarker(markerResult.value) : null;
-    if (!markerResult.ok || !parsedMarker || parsedMarker.version !== PARENT_VERIFY_MARKER_VERSION) {
-      const detail = markerResult.ok ? "invalid marker payload" : markerResult.error;
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: detail,
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification marker invalid; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification marker invalid");
-    }
-
-    if (parsedMarker.work_remains) {
-      completeParentVerification({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        outcome: "work_remains",
-        details: parsedMarker.reason,
-        nowMs,
-      });
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification: work remains for ${params.task.issue} (${parsedMarker.reason})`
-      );
-      return null;
-    }
-
-    completeParentVerification({
+    void params.opencodeXdg;
+    return await maybeRunParentVerificationLane({
       repo: this.repo,
-      issueNumber: parsedIssueNumber,
-      outcome: "no_work",
-      details: parsedMarker.reason,
-      nowMs,
+      repoPath: this.repoPath,
+      task: params.task,
+      issueNumber: params.issueNumber,
+      issueMeta: params.issueMeta,
+      opencodeSessionOptions: params.opencodeSessionOptions,
+      nowMs: () => Date.now(),
+      getParentVerificationState,
+      tryClaimParentVerification,
+      recordParentVerificationAttemptFailure,
+      completeParentVerification,
+      recordRunLogPath: this.recordRunLogPath.bind(this),
+      buildIssueContextForAgent: this.buildIssueContextForAgent.bind(this),
+      runAgent: this.session.runAgent.bind(this.session),
+      buildWatchdogOptions: this.buildWatchdogOptions.bind(this),
+      buildStallOptions: this.buildStallOptions.bind(this),
+      buildLoopDetectionOptions: this.buildLoopDetectionOptions.bind(this),
+      handleLoopTrip: this.handleLoopTrip.bind(this),
+      updateTaskStatus: this.queue.updateTaskStatus.bind(this.queue),
+      applyTaskPatch,
+      writeEscalationWriteback: this.writeEscalationWriteback.bind(this),
+      notifyEscalation: this.notify.notifyEscalation.bind(this.notify),
+      recordEscalatedRunNote: this.recordEscalatedRunNote.bind(this),
     });
-
-    const reason = `Parent verification: no remaining work. ${parsedMarker.reason}`;
-    const wasEscalated = params.task.status === "escalated";
-    const escalated = await this.queue.updateTaskStatus(params.task, "escalated", {
-      "daemon-id": "",
-      "heartbeat-at": "",
-    });
-    if (escalated) {
-      applyTaskPatch(params.task, "escalated", {
-        "daemon-id": "",
-        "heartbeat-at": "",
-      });
-    }
-
-    await this.writeEscalationWriteback(params.task, { reason, details: parsedMarker.reason, escalationType: "other" });
-    await this.notify.notifyEscalation({
-      taskName: params.task.name,
-      taskFileName: params.task._name,
-      taskPath: params.task._path,
-      issue: params.task.issue,
-      repo: this.repo,
-      sessionId: result.sessionId || params.task["session-id"]?.trim() || undefined,
-      reason,
-      escalationType: "other",
-      planOutput: result.output,
-    });
-
-    if (escalated && !wasEscalated) {
-      await this.recordEscalatedRunNote(params.task, {
-        reason,
-        sessionId: result.sessionId,
-        details: result.output,
-      });
-    }
-
-    return {
-      taskName: params.task.name,
-      repo: this.repo,
-      outcome: "escalated",
-      sessionId: result.sessionId || undefined,
-      escalationReason: reason,
-    };
   }
 
   /**
@@ -4593,9 +4256,7 @@ export class RepoWorker {
   }
 
   private getPinnedOpencodeProfileName(task: AgentTask): string | null {
-    const raw = task["opencode-profile"];
-    const trimmed = typeof raw === "string" ? raw.trim() : "";
-    return trimmed ? trimmed : null;
+    return getPinnedOpencodeProfileNameCore(task);
   }
 
   private async resolveOpencodeXdgForTask(
@@ -4607,123 +4268,17 @@ export class RepoWorker {
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     error?: string;
   }> {
-    if (!isOpencodeProfilesEnabled()) return { profileName: null };
-
-    const home = process.env.HOME ?? homedir();
-    const ambientXdg = {
-      dataHome: join(home, ".local", "share"),
-      configHome: join(home, ".config"),
-      stateHome: join(home, ".local", "state"),
-      cacheHome: join(home, ".cache"),
-    };
-
-    const pinned = this.getPinnedOpencodeProfileName(task);
-
-    if (pinned) {
-      const resolved = resolveOpencodeProfile(pinned);
-      if (!resolved) {
-        return {
-          profileName: pinned,
-          error:
-            `Task is pinned to an unknown OpenCode profile ${JSON.stringify(pinned)} (task ${task.issue}). ` +
-            `Configure it under [opencode.profiles.${pinned}] in ~/.ralph/config.toml (paths must be absolute; no '~' expansion).`,
-        };
-      }
-
-      return {
-        profileName: resolved.name,
-        opencodeXdg: {
-          dataHome: resolved.xdgDataHome,
-          configHome: resolved.xdgConfigHome,
-          stateHome: resolved.xdgStateHome,
-          cacheHome: resolved.xdgCacheHome,
-        },
-      };
-    }
-
-    if (phase === "resume") {
-      if (!sessionId) {
-        return { profileName: null, opencodeXdg: ambientXdg };
-      }
-
-      const candidates = listOpencodeProfileNames();
-      for (const name of candidates) {
-        const resolved = resolveOpencodeProfile(name);
-        if (!resolved) continue;
-        const base = join(resolved.xdgDataHome, "opencode", "storage", "session");
-        if (!existsSync(base)) continue;
-        try {
-          const dirs = await readdir(base, { withFileTypes: true });
-          for (const dir of dirs) {
-            if (!dir.isDirectory()) continue;
-            const sessionPath = join(base, dir.name, `${sessionId}.json`);
-            if (existsSync(sessionPath)) {
-              return {
-                profileName: resolved.name,
-                opencodeXdg: {
-                  dataHome: resolved.xdgDataHome,
-                  configHome: resolved.xdgConfigHome,
-                  stateHome: resolved.xdgStateHome,
-                  cacheHome: resolved.xdgCacheHome,
-                },
-              };
-            }
-          }
-        } catch {
-          // best-effort
-        }
-      }
-
-      return { profileName: null, opencodeXdg: ambientXdg };
-    }
-
-    // Source of truth is config (opencode.defaultProfile). The control file no longer controls profile.
-    const requested = getRequestedOpencodeProfileName(null);
-
-    let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
-
-    if (requested === "auto") {
-      const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
-        getThrottleDecision: this.throttle.getThrottleDecision,
-      });
-      if (phase === "start") {
-        console.log(`[ralph:worker:${this.repo}] Auto-selected OpenCode profile=${JSON.stringify(chosen ?? "")}`);
-      }
-      resolved = chosen ? resolveOpencodeProfile(chosen) : resolveOpencodeProfile(null);
-    } else if (phase === "start") {
-      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requested || null, {
-        getThrottleDecision: this.throttle.getThrottleDecision,
-      });
-      const chosen = selection.profileName;
-
-      if (selection.source === "failover") {
-        console.log(
-          `[ralph:worker:${this.repo}] Hard throttle on profile=${selection.requestedProfile ?? "default"}; ` +
-            `failing over to profile=${chosen ?? "ambient"}`
-        );
-      }
-
-      resolved = chosen ? resolveOpencodeProfile(chosen) : null;
-    } else {
-      resolved = requested ? resolveOpencodeProfile(requested) : null;
-    }
-
-    if (!resolved) {
-      if (phase === "start" && requested) {
-        console.warn(`[ralph:worker:${this.repo}] Unable to resolve OpenCode profile for new task; running with ambient XDG dirs`);
-      }
-      return { profileName: null };
-    }
-
-    return {
-      profileName: resolved.name,
-      opencodeXdg: {
-        dataHome: resolved.xdgDataHome,
-        configHome: resolved.xdgConfigHome,
-        stateHome: resolved.xdgStateHome,
-        cacheHome: resolved.xdgCacheHome,
-      },
-    };
+    return resolveOpencodeXdgForTaskCore({
+      task,
+      phase,
+      sessionId,
+      repo: this.repo,
+      nowMs: Date.now(),
+      getThrottleDecision: this.throttle.getThrottleDecision,
+      log: (message: string) => console.log(message),
+      warn: (message: string) => console.warn(message),
+      envHome: process.env.HOME,
+    });
   }
 
   private getPauseControl() {
