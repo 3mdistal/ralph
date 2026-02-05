@@ -25,7 +25,7 @@ const RALPH_LEGACY_WORKFLOW_LABELS = [
 export type RalphLegacyWorkflowLabel = (typeof RALPH_LEGACY_WORKFLOW_LABELS)[number];
 
 export const RALPH_STATUS_LABEL_PREFIX = "ralph:status:";
-export const RALPH_CMD_LABEL_PREFIX = "ralph:cmd:";
+const RALPH_CMD_LABEL_PREFIX = "ralph:cmd:";
 
 export const RALPH_LABEL_STATUS_QUEUED = "ralph:status:queued";
 export const RALPH_LABEL_STATUS_IN_PROGRESS = "ralph:status:in-progress";
@@ -36,10 +36,10 @@ export const RALPH_LABEL_STATUS_IN_BOT = "ralph:status:in-bot";
 export const RALPH_LABEL_STATUS_DONE = "ralph:status:done";
 export const RALPH_LABEL_STATUS_STOPPED = "ralph:status:stopped";
 
-export const RALPH_LABEL_CMD_QUEUE = "ralph:cmd:queue";
-export const RALPH_LABEL_CMD_PAUSE = "ralph:cmd:pause";
-export const RALPH_LABEL_CMD_STOP = "ralph:cmd:stop";
-export const RALPH_LABEL_CMD_SATISFY = "ralph:cmd:satisfy";
+export const RALPH_LABEL_CMD_QUEUE = `${RALPH_CMD_LABEL_PREFIX}queue`;
+export const RALPH_LABEL_CMD_PAUSE = `${RALPH_CMD_LABEL_PREFIX}pause`;
+export const RALPH_LABEL_CMD_STOP = `${RALPH_CMD_LABEL_PREFIX}stop`;
+export const RALPH_LABEL_CMD_SATISFY = `${RALPH_CMD_LABEL_PREFIX}satisfy`;
 
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   // Status (Ralph-managed)

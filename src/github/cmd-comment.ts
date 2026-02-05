@@ -47,7 +47,7 @@ function buildMarkerId(key: string): string {
   return `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
 }
 
-export function buildCmdMarker(key: string): { markerId: string; marker: string } {
+function buildCmdMarker(key: string): { markerId: string; marker: string } {
   const markerId = buildMarkerId(key);
   return { markerId, marker: `<!-- ralph-cmd:id=${markerId} -->` };
 }
@@ -56,7 +56,7 @@ function serializeState(state: CmdCommentState): string {
   return JSON.stringify(state);
 }
 
-export function parseCmdCommentState(body: string): CmdCommentState | null {
+function parseCmdCommentState(body: string): CmdCommentState | null {
   const match = body.match(CMD_STATE_REGEX);
   if (!match?.[1]) return null;
   try {

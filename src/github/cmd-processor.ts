@@ -499,9 +499,3 @@ export function startGitHubCmdProcessor(params?: {
     },
   };
 }
-
-export const __testOnly = {
-  buildCmdEventKey,
-  buildSatisfactionKey,
-  fetchLatestCmdLabelEventId,
-};
