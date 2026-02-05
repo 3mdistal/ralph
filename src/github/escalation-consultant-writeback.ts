@@ -38,7 +38,7 @@ function buildApprovalInstructions(): string {
     "",
     "Fallback:",
     "- Comment with `RALPH RESOLVED: <guidance>`",
-    "- Or re-add `ralph:queued`",
+    "- Or re-add `ralph:status:queued`",
     "",
   ].join("\n");
 }
