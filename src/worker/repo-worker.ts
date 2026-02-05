@@ -137,6 +137,11 @@ import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-re
 import { redactHomePathForDisplay } from "../redaction";
 import { isSafeSessionId } from "../session-id";
 import {
+  createContextRecoveryAdapter as createContextRecoveryAdapterImpl,
+  withDashboardSessionOptions as withDashboardSessionOptionsImpl,
+  withRunContext as withRunContextImpl,
+} from "./run-context";
+import {
   buildWorkerDashboardContext,
   CheckpointEventDeduper,
   publishWorkerDashboardEvent,
@@ -711,110 +716,37 @@ export class RepoWorker {
     attemptKind: RalphRunAttemptKind,
     run: () => Promise<AgentRun>
   ): Promise<AgentRun> {
-    let runId: string | null = null;
-    const previousRunId = this.activeRunId;
-
-    try {
-      runId = createRalphRun({
+    return await withRunContextImpl({
+      task,
+      attemptKind,
+      run,
+      ports: {
         repo: this.repo,
-        issue: task.issue,
-        taskPath: task._path,
-        attemptKind,
-      });
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to create run record for ${task.name}: ${error?.message ?? String(error)}`
-      );
-    }
-
-    if (!runId) {
-      return await run();
-    }
-
-    this.activeRunId = runId;
-    try {
-      ensureRalphRunGateRows({ runId });
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to initialize gate rows for ${task.name}: ${error?.message ?? String(error)}`
-      );
-    }
-
-    const recordingBase = createRunRecordingSessionAdapter({
-      base: this.baseSession,
-      runId,
-      repo: this.repo,
-      issue: task.issue,
+        getActiveRunId: () => this.activeRunId,
+        setActiveRunId: (runId) => {
+          this.activeRunId = runId;
+        },
+        baseSession: this.baseSession,
+        createRunRecordingSessionAdapter: (params) => createRunRecordingSessionAdapter(params),
+        createContextRecoveryAdapter: (base) => this.createContextRecoveryAdapter(base),
+        withDashboardContext: (context, runner) => this.withDashboardContext(context, runner),
+        withSessionAdapters: (next, runner) => this.withSessionAdapters(next, runner),
+        buildDashboardContext: (contextTask, runId) => this.buildDashboardContext(contextTask, runId),
+        publishDashboardEvent: (event, overrides) => this.publishDashboardEvent(event, overrides),
+        createRunRecord: (params) => createRalphRun(params),
+        ensureRunGateRows: (runId) => ensureRalphRunGateRows({ runId }),
+        completeRun: (params) => completeRalphRun(params),
+        buildRunDetails: (result) => buildRunDetails(result),
+        getPinnedOpencodeProfileName: (contextTask) => this.getPinnedOpencodeProfileName(contextTask),
+        refreshRalphRunTokenTotals: (params) => refreshRalphRunTokenTotals(params),
+        getRalphRunTokenTotals: (runId) => getRalphRunTokenTotals(runId),
+        listRalphRunSessionTokenTotals: (runId) => listRalphRunSessionTokenTotals(runId),
+        appendFile,
+        existsSync,
+        computeAndStoreRunMetrics: (params) => computeAndStoreRunMetrics(params),
+        warn: (message) => console.warn(message),
+      },
     });
-    const recordingSession = this.createContextRecoveryAdapter(recordingBase);
-
-    let result: AgentRun | null = null;
-    const context = this.buildDashboardContext(task, runId);
-
-    try {
-      result = await this.withDashboardContext(context, async () => {
-        this.publishDashboardEvent({
-          type: "worker.became_busy",
-          level: "info",
-          data: { taskName: task.name, issue: task.issue },
-        });
-        return await this.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, run);
-      });
-      return result;
-    } finally {
-      this.publishDashboardEvent({
-        type: "worker.became_idle",
-        level: "info",
-        data: { reason: result?.outcome },
-      });
-
-      try {
-        completeRalphRun({
-          runId,
-          outcome: result?.outcome ?? "failed",
-          details: buildRunDetails(result),
-        });
-      } catch (error: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to complete run record for ${task.name}: ${error?.message ?? String(error)}`
-        );
-      }
-
-      // Best-effort: persist token totals + append to the latest run log.
-      try {
-        const opencodeProfile = this.getPinnedOpencodeProfileName(task);
-        await refreshRalphRunTokenTotals({ runId, opencodeProfile });
-        const totals = getRalphRunTokenTotals(runId);
-        const runLogPath = task["run-log-path"]?.trim() || "";
-        if (totals && runLogPath && existsSync(runLogPath)) {
-          const totalLabel = totals.tokensComplete && typeof totals.tokensTotal === "number" ? totals.tokensTotal : "?";
-          const perSession = listRalphRunSessionTokenTotals(runId);
-          const missingCount = perSession.filter((s) => s.quality !== "ok").length;
-          const suffix = missingCount > 0 ? ` missingSessions=${missingCount}` : "";
-
-          await appendFile(
-            runLogPath,
-            "\n" +
-              [
-                "-----",
-                `Token usage: total=${totalLabel} complete=${totals.tokensComplete ? "true" : "false"} sessions=${totals.sessionCount}${suffix}`,
-              ].join("\n") +
-              "\n",
-            "utf8"
-          );
-        }
-      } catch {
-        // best-effort token accounting
-      }
-
-      try {
-        await computeAndStoreRunMetrics({ runId });
-      } catch {
-        // best-effort metrics persistence
-      }
-
-      this.activeRunId = previousRunId;
-    }
   }
 
   private formatSetupFailureReason(failure: SetupFailure): string {
@@ -952,90 +884,23 @@ export class RepoWorker {
   }
 
   private createContextRecoveryAdapter(base: SessionAdapter): SessionAdapter {
-    return {
-      runAgent: async (repoPath, agent, message, options, testOverrides) => {
-        const dashboardOptions = this.withDashboardSessionOptions(options);
-        const result = await base.runAgent(repoPath, agent, message, dashboardOptions, testOverrides);
-        return this.maybeRecoverFromContextLengthExceeded({
-          repoPath,
-          sessionId: result.sessionId,
-          stepKey: options?.introspection?.stepTitle ?? `agent:${agent}`,
-          result,
-          options: dashboardOptions,
-        });
-      },
-      continueSession: async (repoPath, sessionId, message, options) => {
-        const dashboardOptions = this.withDashboardSessionOptions(options, { sessionId });
-        const result = await base.continueSession(repoPath, sessionId, message, dashboardOptions);
-        return this.maybeRecoverFromContextLengthExceeded({
-          repoPath,
-          sessionId,
-          stepKey: options?.introspection?.stepTitle ?? `session:${sessionId}`,
-          result,
-          options: dashboardOptions,
-        });
-      },
-      continueCommand: async (repoPath, sessionId, command, args, options) => {
-        const dashboardOptions = this.withDashboardSessionOptions(options, { sessionId });
-        const result = await base.continueCommand(repoPath, sessionId, command, args, dashboardOptions);
-        return this.maybeRecoverFromContextLengthExceeded({
-          repoPath,
-          sessionId,
-          stepKey: options?.introspection?.stepTitle ?? `command:${command}`,
-          result,
-          options: dashboardOptions,
-          command,
-        });
-      },
-      getRalphXdgCacheHome: base.getRalphXdgCacheHome,
-    };
+    return createContextRecoveryAdapterImpl({
+      base,
+      withDashboardSessionOptions: (options, overrides) => this.withDashboardSessionOptions(options, overrides),
+      maybeRecoverFromContextLengthExceeded: async (params) => await this.maybeRecoverFromContextLengthExceeded(params),
+    });
   }
 
   private withDashboardSessionOptions(
     options?: RunSessionOptionsBase,
     overrides?: Partial<DashboardEventContext>
   ): RunSessionOptionsBase | undefined {
-    const context = this.activeDashboardContext ? { ...this.activeDashboardContext, ...overrides } : overrides;
-    if (!context) return options;
-
-    const existingOnEvent = options?.onEvent;
-    const onEvent = (event: any) => {
-      if (!event) return;
-      const eventSessionId = event.sessionID ?? event.sessionId;
-      const sessionId = typeof eventSessionId === "string" ? eventSessionId : context.sessionId;
-
-      this.publishDashboardEvent(
-        {
-          type: "log.opencode.event",
-          level: "info",
-          repo: context.repo,
-          taskId: context.taskId,
-          workerId: context.workerId,
-          sessionId,
-          data: { event },
-        },
-        { ...context, sessionId }
-      );
-
-      if (event.type === "text" && event.part?.text) {
-        this.publishDashboardEvent(
-          {
-            type: "log.opencode.text",
-            level: "info",
-            repo: context.repo,
-            taskId: context.taskId,
-            workerId: context.workerId,
-            sessionId,
-            data: { text: String(event.part.text) },
-          },
-          { ...context, sessionId }
-        );
-      }
-
-      existingOnEvent?.(event);
-    };
-
-    return { ...(options ?? {}), onEvent };
+    return withDashboardSessionOptionsImpl({
+      options,
+      overrides,
+      activeDashboardContext: this.activeDashboardContext,
+      publishDashboardEvent: (event, eventOverrides) => this.publishDashboardEvent(event, eventOverrides),
+    });
   }
 
   private async maybeRecoverFromContextLengthExceeded(params: {
