@@ -924,20 +924,20 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#10",
-      labels: ["ralph:status:blocked", "ralph:status:queued"],
+      labels: ["ralph:status:escalated", "ralph:status:queued"],
       at: "2026-01-11T00:00:00.000Z",
     });
 
     recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#11",
-      labels: ["ralph:status:blocked"],
+      labels: ["ralph:status:escalated"],
       at: "2026-01-11T00:00:01.000Z",
     });
 
     const matches = listIssuesWithAllLabels({
       repo: "3mdistal/ralph",
-      labels: ["ralph:status:blocked", "ralph:status:queued"],
+      labels: ["ralph:status:escalated", "ralph:status:queued"],
     });
 
     expect(matches).toEqual([{ repo: "3mdistal/ralph", number: 10 }]);

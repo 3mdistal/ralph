@@ -56,9 +56,9 @@ const TRANSITION_LABELS = [
   "ralph:status:queued",
   "ralph:status:in-progress",
   "ralph:status:in-bot",
-  "ralph:status:blocked",
   "ralph:status:paused",
-  "ralph:status:throttled",
+  "ralph:status:escalated",
+  "ralph:status:stopped",
 ];
 
 function applyJitter(valueMs: number): number {

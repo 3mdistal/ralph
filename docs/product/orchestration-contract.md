@@ -35,7 +35,7 @@ This doc is intended to supersede label/queue semantics in older docs.
 
 | Label | Meaning |
 | --- | --- |
-| `ralph:status:queued` | Runnable/claimable work is queued. |
+| `ralph:status:queued` | Runnable/claimable work is queued (unless blocked by internal dependency metadata). |
 | `ralph:status:in-progress` | Ralph owns the task and is actively working or waiting on deterministic gates (e.g. CI). |
 | `ralph:status:paused` | Ralph will not progress this task beyond safe checkpoints. |
 | `ralph:status:escalated` | Needs human intervention; Ralph will not proceed until re-queued by an operator command. |
@@ -69,7 +69,7 @@ Command issuer policy:
 
 ## Queue semantics
 
-- Claimable state: `ralph:status:queued`.
+- Claimable state: `ralph:status:queued` (unless internal blocked metadata says dependencies are still open).
 - Claiming moves the issue to `ralph:status:in-progress` and records ownership/heartbeat in SQLite.
 - Human intervention:
   - Ralph escalates by setting `ralph:status:escalated` and writing a clear instruction comment.
@@ -145,6 +145,7 @@ Older docs and issues may reference these labels:
 - `ralph:in-bot` -> `ralph:status:in-bot`
 - `ralph:done` -> `ralph:status:done`
 - `ralph:escalated` -> `ralph:status:escalated`
+- `ralph:blocked` -> `ralph:status:escalated`
 
 Dependency-blocked state should not use a GitHub-visible `blocked` status going forward.
 

@@ -35,11 +35,11 @@ import {
 import type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "../queue/types";
 import { computeStaleInProgressRecovery, deriveTaskView, planClaim, statusToRalphLabelDelta, type LabelOp } from "./core";
 import {
-  RALPH_LABEL_STATUS_BLOCKED,
+  RALPH_LABEL_STATUS_ESCALATED,
   RALPH_LABEL_STATUS_IN_PROGRESS,
   RALPH_LABEL_STATUS_PAUSED,
-  RALPH_LABEL_STATUS_STOPPED,
   RALPH_LABEL_STATUS_QUEUED,
+  RALPH_LABEL_STATUS_STOPPED,
   RALPH_STATUS_LABEL_PREFIX,
 } from "../github-labels";
 
@@ -50,7 +50,6 @@ const DEFAULT_LIVE_LABELS_CACHE_TTL_MS = 60_000;
 const DEFAULT_LIVE_LABELS_ERROR_COOLDOWN_MS = 60_000;
 const LIVE_LABELS_TELEMETRY_SOURCE = "queue:claim:labels";
 
-const DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO = 25;
 const DEFAULT_MISSING_SESSION_GRACE_MS = 2 * 60_000;
 
 const DISABLE_SWEEPS_ENV = "RALPH_GITHUB_QUEUE_DISABLE_SWEEPS";
@@ -338,7 +337,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     deps?.relationshipsProviderFactory ?? ((repo: string) => new GitHubRelationshipProvider(repo));
   let lastSweepAt = 0;
   let lastClosedSweepAt = 0;
-  let lastBlockedSweepAt = 0;
   let stopRequested = false;
   let watchTimer: ReturnType<typeof setTimeout> | null = null;
   let watchInFlight = false;
@@ -355,86 +353,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     console.warn(`[ralph:queue:github] Repo unschedulable; skipping ${repo}${suffix}`);
   };
 
-  const maybeSweepBlockedLabels = async (): Promise<void> => {
-    const nowMs = getNowMs(deps);
-    if (nowMs - lastBlockedSweepAt < SWEEP_INTERVAL_MS) return;
-    lastBlockedSweepAt = nowMs;
-
-    const nowIso = getNowIso(deps);
-
-    for (const repo of getConfig().repos.map((entry) => entry.name)) {
-      if (stopRequested) return;
-
-      const skip = shouldSkipRepo(repo);
-      if (skip.skip) {
-        warnSkipRepo(repo, skip.details);
-        continue;
-      }
-      const autoQueueEnabled = getRepoAutoQueueConfig(repo)?.enabled ?? false;
-      if (!autoQueueEnabled) continue;
-
-      const maxIssues = clampPositiveInt(
-        readEnvInt("RALPH_GITHUB_QUEUE_BLOCKED_SWEEP_MAX_ISSUES", DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO),
-        DEFAULT_BLOCKED_SWEEP_MAX_ISSUES_PER_REPO
-      );
-
-      const provider = relationshipsProviderFactory(repo);
-      let processed = 0;
-
-      const issues = listIssueSnapshotsWithRalphLabels(repo);
-      for (const issue of issues) {
-        if (stopRequested) return;
-        if (processed >= maxIssues) break;
-        if ((issue.state ?? "").toUpperCase() === "CLOSED") continue;
-        const hasQueued = issue.labels.includes(RALPH_LABEL_STATUS_QUEUED);
-        const hasBlocked = issue.labels.includes(RALPH_LABEL_STATUS_BLOCKED);
-        if (!hasQueued && !hasBlocked) continue;
-
-        try {
-          const snapshot = await provider.getSnapshot({ repo, number: issue.number });
-          const resolved = resolveRelationshipSignals(snapshot);
-          logRelationshipDiagnostics({ repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
-          const decision = computeBlockedDecision(resolved.signals);
-
-          // IMPORTANT: unknown dependency coverage should NOT cause blocked label churn.
-          // Only write the blocked label when we are certain the issue is blocked.
-          if (decision.confidence === "unknown") {
-            continue;
-          }
-
-          const shouldBeBlocked = decision.blocked;
-          const add: string[] = [];
-          const remove: string[] = [];
-
-          if (shouldBeBlocked) {
-            if (!hasBlocked) add.push(RALPH_LABEL_STATUS_BLOCKED);
-            if (hasQueued) remove.push(RALPH_LABEL_STATUS_QUEUED);
-          } else {
-            if (hasBlocked) remove.push(RALPH_LABEL_STATUS_BLOCKED);
-            if (!hasQueued) add.push(RALPH_LABEL_STATUS_QUEUED);
-          }
-          if (add.length === 0 && remove.length === 0) continue;
-
-          const didMutate = await io.mutateIssueLabels({
-            repo,
-            issueNumber: issue.number,
-            issueNodeId: issue.githubNodeId,
-            add,
-            remove,
-          });
-          if (didMutate) {
-            applyLabelDelta({ repo, issueNumber: issue.number, add, remove, nowIso });
-          }
-        } catch (error: any) {
-          console.warn(
-            `[ralph:queue:github] Failed to reconcile blocked label for ${repo}#${issue.number}: ${error?.message ?? String(error)}`
-          );
-        } finally {
-          processed += 1;
-        }
-      }
-    }
-  };
 
   const maybeSweepClosedIssues = async (): Promise<void> => {
     const nowMs = getNowMs(deps);
@@ -683,7 +601,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     if (shouldRunSweeps()) {
       await maybeSweepClosedIssues();
       await maybeSweepStaleInProgress();
-      await maybeSweepBlockedLabels();
     }
 
     const tasks: AgentTask[] = [];
@@ -792,7 +709,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
         const snapshotLabels = issue.labels;
         let plan = planClaim(snapshotLabels);
-        const shouldCheckDependencies = snapshotLabels.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
+        const shouldCheckDependencies = autoQueueEnabled;
         const shouldCheckPause = snapshotLabels.includes(RALPH_LABEL_STATUS_PAUSED);
 
         // Avoid repeated core REST reads on every claim attempt. The IO layer applies a TTL cache.
@@ -803,7 +720,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             labelsForPlan = await io.listIssueLabels(issueRef.repo, issueRef.number);
           }
 
-          const shouldCheckDependenciesLive = labelsForPlan.includes(RALPH_LABEL_STATUS_BLOCKED) || autoQueueEnabled;
+          const shouldCheckDependenciesLive = autoQueueEnabled;
           if (shouldCheckDependenciesLive) {
             try {
               const relationships = relationshipsProviderFactory(issueRef.repo);
@@ -826,30 +743,6 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
                     ? `Issue blocked by dependencies (${decision.reasons.join(", ")})`
                   : "Issue blocked by dependencies";
 
-                // Best-effort: materialize blocked label for visibility.
-                if (autoQueueEnabled && !labelsForPlan.includes(RALPH_LABEL_STATUS_BLOCKED)) {
-                  try {
-                    const nowIso = new Date(opts.nowMs).toISOString();
-                    const didMutate = await io.mutateIssueLabels({
-                      repo: issueRef.repo,
-                      issueNumber: issueRef.number,
-                      issueNodeId: issue.githubNodeId,
-                      add: [RALPH_LABEL_STATUS_BLOCKED],
-                      remove: [],
-                    });
-                    if (didMutate) {
-                      applyLabelDelta({
-                        repo: issueRef.repo,
-                        issueNumber: issueRef.number,
-                        add: [RALPH_LABEL_STATUS_BLOCKED],
-                        remove: [],
-                        nowIso,
-                      });
-                    }
-                  } catch {
-                    // best-effort
-                  }
-                }
                 return { claimed: false, task: opts.task, reason };
               }
             } catch (error: any) {
@@ -1083,14 +976,14 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         return true;
       }
 
-      const preserveOperatorStopLabel =
-        Boolean(
-          issue?.labels?.includes(RALPH_LABEL_STATUS_PAUSED) || issue?.labels?.includes(RALPH_LABEL_STATUS_STOPPED)
-        ) &&
-        status !== "paused" &&
-        status !== "stopped" &&
-        status !== "done";
-      const delta = preserveOperatorStopLabel
+      const preservePausedLabel =
+        Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_PAUSED)) && status !== "paused" && status !== "done";
+      const preserveEscalatedLabel =
+        Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_ESCALATED)) && status !== "escalated" && status !== "done";
+      const preserveStoppedLabel =
+        Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_STOPPED)) && status !== "stopped" && status !== "done";
+      const shouldPreserveLabel = preservePausedLabel || preserveEscalatedLabel || preserveStoppedLabel;
+      const delta = shouldPreserveLabel
         ? { add: [], remove: [] }
         : (issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] });
       const steps: LabelOp[] = [

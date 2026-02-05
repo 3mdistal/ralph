@@ -97,19 +97,19 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
-  test("statusToRalphLabelDelta removes queued when blocked", () => {
+  test("statusToRalphLabelDelta preserves queued when blocked", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
-    expect(delta).toEqual({ add: ["ralph:status:blocked"], remove: ["ralph:status:queued"] });
+    expect(delta).toEqual({ add: [], remove: [] });
   });
 
-  test("statusToRalphLabelDelta transitions from in-progress to blocked", () => {
+  test("statusToRalphLabelDelta preserves in-progress when blocked", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:status:in-progress"]);
-    expect(delta).toEqual({ add: ["ralph:status:blocked"], remove: ["ralph:status:in-progress"] });
+    expect(delta).toEqual({ add: [], remove: [] });
   });
 
   test("statusToRalphLabelDelta removes other status labels when blocked", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued", "ralph:status:in-progress"]);
-    expect(delta).toEqual({ add: ["ralph:status:blocked"], remove: ["ralph:status:queued", "ralph:status:in-progress"] });
+    expect(delta).toEqual({ add: [], remove: ["ralph:status:queued"] });
   });
 
   test("statusToRalphLabelDelta preserves non-ralph labels when blocked", () => {
@@ -120,14 +120,14 @@ describe("github queue core", () => {
       "ralph:status:in-progress",
     ]);
     expect(delta).toEqual({
-      add: ["ralph:status:blocked"],
-      remove: ["ralph:status:queued", "ralph:status:in-progress"],
+      add: [],
+      remove: ["ralph:status:queued"],
     });
   });
 
-  test("statusToRalphLabelDelta maps escalated to blocked", () => {
+  test("statusToRalphLabelDelta maps escalated to escalated", () => {
     const delta = statusToRalphLabelDelta("escalated", ["ralph:status:queued"]);
-    expect(delta).toEqual({ add: ["ralph:status:blocked"], remove: ["ralph:status:queued"] });
+    expect(delta).toEqual({ add: ["ralph:status:escalated"], remove: ["ralph:status:queued"] });
   });
 
   test("planClaim requires queued label", () => {
@@ -144,8 +144,8 @@ describe("github queue core", () => {
     expect(plan.claimable).toBe(false);
   });
 
-  test("planClaim rejects blocked issues", () => {
-    const plan = planClaim(["ralph:status:queued", "ralph:status:blocked"]);
+  test("planClaim rejects escalated issues", () => {
+    const plan = planClaim(["ralph:status:queued", "ralph:status:escalated"]);
     expect(plan.claimable).toBe(false);
     expect(plan.steps).toEqual([]);
   });
@@ -155,7 +155,7 @@ describe("github queue core", () => {
     expect(plan.claimable).toBe(false);
   });
 
-  test("unblocked issues remain queued and claimable", () => {
+  test("legacy blocked labels are removed when queued", () => {
     const blockedLabels = ["ralph:status:queued", "ralph:status:blocked"];
     const delta = statusToRalphLabelDelta("queued", blockedLabels);
     const updated = applyDelta(blockedLabels, delta);
@@ -163,8 +163,8 @@ describe("github queue core", () => {
     expect(planClaim(updated).claimable).toBe(true);
   });
 
-  test("deriveRalphStatus treats blocked as blocked", () => {
-    const status = deriveRalphStatus(["ralph:status:queued", "ralph:status:blocked"], "OPEN");
+  test("deriveRalphStatus treats legacy blocked as blocked", () => {
+    const status = deriveRalphStatus(["ralph:status:blocked"], "OPEN");
     expect(status).toBe("blocked");
   });
 
@@ -327,7 +327,7 @@ describe("issue label io", () => {
       return { data: null, etag: null, status: 200 };
     };
 
-    const ops = planIssueLabelOps({ add: ["ralph:status:blocked"], remove: ["ralph:status:in-progress"] });
+    const ops = planIssueLabelOps({ add: ["ralph:status:escalated"], remove: ["ralph:status:in-progress"] });
     const result = await executeIssueLabelOps({
       github: { request },
       repo: "3mdistal/ralph",
@@ -338,7 +338,7 @@ describe("issue label io", () => {
     expect(result.ok).toBe(true);
     expect(labels.has("bug")).toBe(true);
     expect(labels.has("p1-high")).toBe(true);
-    expect(labels.has("ralph:status:blocked")).toBe(true);
+    expect(labels.has("ralph:status:escalated")).toBe(true);
     expect(labels.has("ralph:status:in-progress")).toBe(false);
     expect(calls.map((call) => call.method)).toEqual(["POST", "DELETE"]);
   });

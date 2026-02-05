@@ -172,8 +172,8 @@ describe("escalation resolution reconciliation", () => {
     const removed = requests.filter((req) => req.method === "DELETE").map((req) => req.path);
     expect(removed).toEqual(
       expect.arrayContaining([
-        "/repos/3mdistal/ralph/issues/10/labels/ralph%3Astatus%3Ablocked",
-        "/repos/3mdistal/ralph/issues/11/labels/ralph%3Astatus%3Ablocked",
+        "/repos/3mdistal/ralph/issues/10/labels/ralph%3Astatus%3Aescalated",
+        "/repos/3mdistal/ralph/issues/11/labels/ralph%3Astatus%3Aescalated",
       ])
     );
 
@@ -520,7 +520,7 @@ describe("escalation resolution reconciliation", () => {
     recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#77",
-      labels: ["ralph:status:blocked"],
+      labels: ["ralph:status:escalated"],
       at: "2026-01-11T00:00:00.000Z",
     });
     recordEscalationCommentCheckState({

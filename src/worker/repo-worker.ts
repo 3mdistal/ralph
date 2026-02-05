@@ -73,11 +73,7 @@ import { notifyEscalation, notifyError, notifyTaskComplete, type EscalationConte
 import { buildWorkerFailureAlert, type WorkerFailureKind } from "../alerts/worker-failure-core";
 import { buildNudgePreview, drainQueuedNudges, type NudgeDeliveryOutcome } from "../nudge";
 import { redactSensitiveText } from "../redaction";
-import {
-  RALPH_LABEL_STATUS_BLOCKED,
-  RALPH_LABEL_STATUS_IN_PROGRESS,
-  RALPH_LABEL_STATUS_QUEUED,
-} from "../github-labels";
+import { RALPH_LABEL_STATUS_IN_PROGRESS, RALPH_LABEL_STATUS_QUEUED } from "../github-labels";
 import { GitHubClient } from "../github/client";
 import { computeGitHubRateLimitPause } from "../github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "../github/dx-survey-writeback";
@@ -2770,17 +2766,6 @@ export class RepoWorker {
       );
     }
 
-    try {
-      await this.removeIssueLabel(issue, RALPH_LABEL_STATUS_BLOCKED);
-    } catch (error: any) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label for ${formatIssueRef(
-          issue
-        )}: ${
-          error?.message ?? String(error)
-        }`
-      );
-    }
   }
 
   private async clearMergeConflictLabels(issue: IssueRef): Promise<void> {

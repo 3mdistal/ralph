@@ -15,12 +15,15 @@ import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels
 import { GitHubRelationshipProvider } from "./issue-relationships";
 import { resolveRelationshipSignals } from "./relationship-signals";
 import { logRelationshipDiagnostics } from "./relationship-diagnostics";
+import { statusToRalphLabelDelta } from "../github-queue/core";
 
 const RALPH_LABEL_QUEUED = "ralph:status:queued";
-const RALPH_LABEL_BLOCKED = "ralph:status:blocked";
 const RALPH_LABEL_DONE = "ralph:status:done";
 const RALPH_LABEL_IN_BOT = "ralph:status:in-bot";
 const RALPH_LABEL_IN_PROGRESS = "ralph:status:in-progress";
+const RALPH_LABEL_PAUSED = "ralph:status:paused";
+const RALPH_LABEL_ESCALATED = "ralph:status:escalated";
+const RALPH_LABEL_STOPPED = "ralph:status:stopped";
 
 const AUTO_QUEUE_DEBOUNCE_MS = 500;
 
@@ -44,6 +47,9 @@ function shouldSkipIssue(issue: IssueSnapshot): { skip: boolean; reason?: string
     return { skip: true, reason: "done" };
   }
   if (labels.includes(RALPH_LABEL_IN_PROGRESS)) return { skip: true, reason: "in-progress" };
+  if (labels.includes(RALPH_LABEL_PAUSED)) return { skip: true, reason: "paused" };
+  if (labels.includes(RALPH_LABEL_ESCALATED)) return { skip: true, reason: "escalated" };
+  if (labels.includes(RALPH_LABEL_STOPPED)) return { skip: true, reason: "stopped" };
   return { skip: false };
 }
 
@@ -66,20 +72,14 @@ export function computeAutoQueueLabelPlan(params: {
     return { add: [], remove: [], blocked: params.blocked, runnable: false, skipped: true, reason: "unknown" };
   }
 
-  const add: string[] = [];
-  const remove: string[] = [];
-  const hasQueued = labels.includes(RALPH_LABEL_QUEUED);
-  const hasBlocked = labels.includes(RALPH_LABEL_BLOCKED);
-
-  if (params.blocked.blocked) {
-    if (!hasBlocked) add.push(RALPH_LABEL_BLOCKED);
-    if (hasQueued) remove.push(RALPH_LABEL_QUEUED);
-    return { add, remove, blocked: params.blocked, runnable: false, skipped: add.length === 0 };
-  }
-
-  if (hasBlocked) remove.push(RALPH_LABEL_BLOCKED);
-  if (!hasQueued) add.push(RALPH_LABEL_QUEUED);
-  return { add, remove, blocked: params.blocked, runnable: true, skipped: add.length === 0 && remove.length === 0 };
+  const delta = statusToRalphLabelDelta("queued", labels);
+  return {
+    add: delta.add,
+    remove: delta.remove,
+    blocked: params.blocked,
+    runnable: !params.blocked.blocked,
+    skipped: delta.add.length === 0 && delta.remove.length === 0,
+  };
 }
 
 function applyLabelDelta(params: {

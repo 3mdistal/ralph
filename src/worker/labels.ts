@@ -1,4 +1,4 @@
-import { RALPH_LABEL_STATUS_BLOCKED, RALPH_LABEL_STATUS_IN_PROGRESS } from "../github-labels";
+import { RALPH_LABEL_STATUS_IN_PROGRESS } from "../github-labels";
 import { executeIssueLabelOps, type LabelOp } from "../github/issue-label-io";
 import { formatIssueRef, type IssueRef } from "../github/issue-ref";
 import { getIssueLabels, recordIssueLabelsSnapshot } from "../state";
@@ -93,15 +93,6 @@ export async function applyCiDebugLabels(worker: any, issue: IssueRef): Promise<
     );
   }
 
-  try {
-    await worker.removeIssueLabel(issue, RALPH_LABEL_STATUS_BLOCKED);
-  } catch (error: any) {
-    console.warn(
-      `[ralph:worker:${worker.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label for ${formatIssueRef(issue)}: ${
-        error?.message ?? String(error)
-      }`
-    );
-  }
 }
 
 export async function clearCiDebugLabels(worker: any, issue: IssueRef): Promise<void> {

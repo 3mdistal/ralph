@@ -42,15 +42,16 @@ describe("auto-queue planning", () => {
     expect(plan.remove).toEqual(["ralph:status:blocked"]);
   });
 
-  test("adds blocked when blocked", () => {
+  test("adds queued when blocked", () => {
     const plan = computeAutoQueueLabelPlan({
       issue: { ...baseIssue, labels: [] },
       blocked: { blocked: true, confidence: "certain", reasons: ["blocked by #1"] },
       scope: "all-open",
     });
 
-    expect(plan.add).toEqual(["ralph:status:blocked"]);
+    expect(plan.add).toEqual(["ralph:status:queued"]);
     expect(plan.remove).toEqual([]);
+    expect(plan.runnable).toBe(false);
   });
 
   test("skips when dependency coverage is unknown", () => {

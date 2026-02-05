@@ -8,7 +8,7 @@ Ralph vNext uses namespaced labels:
 
 Legacy workflow labels (unqualified `ralph:<state>`) are not supported after cutover. If any OPEN issue/PR in a repo has a legacy label, Ralph treats the repo as **unschedulable** and will not claim work.
 
-Canonical spec: `docs/product/intent-artifact-orchestration.md`.
+Canonical spec: `docs/product/orchestration-contract.md`.
 
 ## Legacy Label Set (Migration Errors)
 
@@ -26,8 +26,8 @@ Relabel by removing the legacy label and adding the vNext label:
 
 - `ralph:queued` -> `ralph:status:queued`
 - `ralph:in-progress` -> `ralph:status:in-progress`
-- `ralph:blocked` -> `ralph:status:blocked`
-- `ralph:escalated` -> `ralph:status:blocked`
+- `ralph:blocked` -> `ralph:status:escalated`
+- `ralph:escalated` -> `ralph:status:escalated`
 - `ralph:stuck` -> `ralph:status:in-progress`
 - `ralph:in-bot` -> `ralph:status:in-bot`
 - `ralph:done` -> `ralph:status:done`
@@ -68,8 +68,8 @@ map_label() {
   case "$1" in
     "ralph:queued") echo "ralph:status:queued" ;;
     "ralph:in-progress") echo "ralph:status:in-progress" ;;
-    "ralph:blocked") echo "ralph:status:blocked" ;;
-    "ralph:escalated") echo "ralph:status:blocked" ;;
+  "ralph:blocked") echo "ralph:status:escalated" ;;
+  "ralph:escalated") echo "ralph:status:escalated" ;;
     "ralph:stuck") echo "ralph:status:in-progress" ;;
     "ralph:in-bot") echo "ralph:status:in-bot" ;;
     "ralph:done") echo "ralph:status:done" ;;
@@ -99,4 +99,4 @@ done
 Notes:
 
 - The mapping is intentionally manual/big-bang: there is no auto-translation in Ralph.
-- `ralph:status:queued` is the only claimable state.
+- `ralph:status:queued` is claimable when dependency metadata is clear (see `docs/product/orchestration-contract.md`).
