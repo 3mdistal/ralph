@@ -5,6 +5,7 @@ import {
   getRepoPath,
   getRepoBotBranch,
   getRepoRollupBatchSize,
+  getRepoPreflightCommands,
   getRepoRequiredChecksOverride,
   getRepoVerificationConfig,
 } from "./config";
@@ -627,6 +628,7 @@ export class RollupMonitor {
       const includedIssues = issueRefs;
       const closingIssues = issueRefs;
       const verificationConfig = getRepoVerificationConfig(repo);
+      const preflightConfig = getRepoPreflightCommands(repo);
       const requiredChecks = await this.resolveRollupRequiredChecks(repo, repoPath, baseBranch, logPrefix);
 
       const body = buildRollupBody({
@@ -638,7 +640,7 @@ export class RollupMonitor {
         verification: {
           baseBranch,
           requiredChecks,
-          preflight: verificationConfig?.preflight ?? [],
+          preflight: preflightConfig.commands,
           e2e: verificationConfig?.e2e ?? [],
           staging: verificationConfig?.staging ?? [],
           manualChecks,

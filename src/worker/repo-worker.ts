@@ -13,6 +13,7 @@ import {
   getRepoBotBranch,
   getRepoConcurrencySlots,
   getRepoLoopDetectionConfig,
+  getRepoPreflightCommands,
   getRepoRequiredChecksOverride,
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
@@ -37,7 +38,7 @@ import {
   type SessionResult,
 } from "../session";
 import { buildPlannerPrompt } from "../planner-prompt";
-import { buildParentVerificationPrompt } from "../parent-verification-prompt";
+import { maybeRunParentVerificationLane } from "./parent-verification-lane";
 import { appendChildDossierToIssueContext } from "../child-dossier/core";
 import { collectChildCompletionDossier } from "../child-dossier/io";
 import { getThrottleDecision } from "../throttle";
@@ -46,12 +47,13 @@ import { ensureWorktreeSetup, type SetupFailure } from "../worktree-setup";
 import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
+import { runPreflightGate } from "../gates/preflight";
+
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
 import { getPinnedOpencodeProfileName as getPinnedOpencodeProfileNameCore, resolveOpencodeXdgForTask as resolveOpencodeXdgForTaskCore } from "./opencode-profiles";
 import { readControlStateSnapshot } from "../drain";
-import { buildCheckpointState, type CheckpointState } from "../checkpoints/core";
-import { applyCheckpointReached } from "../checkpoints/runtime";
+import { createPauseControl, recordCheckpoint } from "./pause-control";
 import { hasProductGap, parseRoutingDecision, selectPrUrl, type RoutingDecision } from "../routing";
 import {
   cleanupIntrospectionLogs,
@@ -147,15 +149,7 @@ import {
   publishWorkerDashboardEvent,
   type WorkerDashboardEventInput,
 } from "./events";
-import {
-  buildCheckpointPatch,
-  CHECKPOINT_SEQ_FIELD,
-  PAUSED_AT_CHECKPOINT_FIELD,
-  PAUSE_REQUESTED_FIELD,
-  parseCheckpointSeq,
-  parseCheckpointValue,
-  parsePauseRequested,
-} from "./checkpoint-fields";
+import { PAUSED_AT_CHECKPOINT_FIELD, parseCheckpointValue } from "./checkpoint-fields";
 import { applyTaskPatch } from "./task-patch";
 import { resolveVaultPath } from "./vault-paths";
 import {
@@ -183,15 +177,6 @@ import {
   tryClaimParentVerification,
   upsertRalphRunGateResult,
 } from "../state";
-import {
-  getParentVerificationBackoffMs,
-  getParentVerificationMaxAttempts,
-  isParentVerificationDisabled,
-  parseParentVerificationMarker,
-  PARENT_VERIFY_MARKER_PREFIX,
-  PARENT_VERIFY_MARKER_VERSION,
-} from "../parent-verification";
-import { parseLastLineJsonMarker } from "../markers";
 import { refreshRalphRunTokenTotals } from "../run-token-accounting";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
 import {
@@ -1642,6 +1627,10 @@ export class RepoWorker {
 
   private buildPrCreationNudge(botBranch: string, issueNumber: string, issueRef: string): string {
     const fixes = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${issueRef}`;
+    const preflight = getRepoPreflightCommands(this.repo);
+    const preflightLines = preflight.commands.length > 0
+      ? ["# Preflight (must pass before PR)", ...preflight.commands]
+      : [];
 
     return [
       `No PR URL found. Create a PR targeting '${botBranch}' and paste the PR URL.`,
@@ -1650,6 +1639,7 @@ export class RepoWorker {
       "Commands (run in the task worktree):",
       "```bash",
       "git status",
+      ...preflightLines,
       "git push -u origin HEAD",
       issueNumber
         ? `gh pr list --state open --search "fixes #${issueNumber} OR closes #${issueNumber} OR resolves #${issueNumber}" --json url,baseRefName,headRefName --limit 10`
@@ -1861,6 +1851,38 @@ export class RepoWorker {
     } catch (e: any) {
       diagnostics.push(`- git status failed: ${e?.message ?? String(e)}`);
       return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    const preflightConfig = getRepoPreflightCommands(this.repo);
+    const runId = this.activeRunId;
+    if (runId) {
+      const skipReason =
+        preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
+          ? "preflight disabled (preflightCommand=[])"
+          : preflightConfig.configured
+            ? "preflight configured but empty"
+            : "no preflight configured";
+
+      const preflightResult = await runPreflightGate({
+        runId,
+        worktreePath: candidate.worktreePath,
+        commands: preflightConfig.commands,
+        skipReason,
+      });
+
+      if (preflightResult.status === "fail") {
+        diagnostics.push("- Preflight failed; refusing to create PR");
+        diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
+        return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      }
+
+      if (preflightResult.status === "skipped") {
+        diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
+      } else {
+        diagnostics.push("- Preflight passed");
+      }
+    } else if (preflightConfig.commands.length > 0) {
+      diagnostics.push("- WARNING: missing runId; skipping deterministic preflight gate recording");
     }
 
     try {
@@ -4130,25 +4152,6 @@ export class RepoWorker {
     };
   }
 
-  private async deferParentVerification(task: AgentTask, reason: string): Promise<AgentRun> {
-    const patch: Record<string, string> = {
-      "daemon-id": "",
-      "heartbeat-at": "",
-    };
-    const updated = await this.queue.updateTaskStatus(task, "queued", patch);
-    if (updated) {
-      applyTaskPatch(task, "queued", patch);
-    }
-
-    console.log(`[ralph:worker:${this.repo}] Parent verification deferred: ${reason}`);
-    return {
-      taskName: task.name,
-      repo: this.repo,
-      outcome: "failed",
-      escalationReason: reason,
-    };
-  }
-
   private async maybeRunParentVerification(params: {
     task: AgentTask;
     issueNumber: string;
@@ -4156,201 +4159,32 @@ export class RepoWorker {
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     opencodeSessionOptions?: RunSessionOptionsBase;
   }): Promise<AgentRun | null> {
-    if (isParentVerificationDisabled()) return null;
-    const parsedIssueNumber = Number(params.issueNumber);
-    if (!Number.isFinite(parsedIssueNumber)) return null;
-
-    const state = getParentVerificationState({ repo: this.repo, issueNumber: parsedIssueNumber });
-    if (!state || state.status !== "pending") return null;
-
-    const nowMs = Date.now();
-    if (state.nextAttemptAtMs && state.nextAttemptAtMs > nowMs) {
-      return await this.deferParentVerification(
-        params.task,
-        `backoff active until ${new Date(state.nextAttemptAtMs).toISOString()}`
-      );
-    }
-
-    const maxAttempts = getParentVerificationMaxAttempts();
-    if (state.attemptCount >= maxAttempts) {
-      completeParentVerification({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        outcome: "skipped",
-        details: `max attempts (${maxAttempts}) reached`,
-        nowMs,
-      });
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification skipped (attempts=${state.attemptCount} max=${maxAttempts})`
-      );
-      return null;
-    }
-
-    const claimed = tryClaimParentVerification({ repo: this.repo, issueNumber: parsedIssueNumber, nowMs });
-    if (!claimed) {
-      return await this.deferParentVerification(params.task, "pending claim not acquired");
-    }
-
-    const attemptCount = claimed.attemptCount;
-    await this.recordRunLogPath(params.task, params.issueNumber, "parent-verify", "queued");
-    const issueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber: params.issueNumber });
-    const prompt = buildParentVerificationPrompt({ repo: this.repo, issueNumber: params.issueNumber, issueContext });
-    let result: SessionResult;
-    try {
-      result = await this.session.runAgent(this.repoPath, "ralph-parent-verify", prompt, {
-        repo: this.repo,
-        cacheKey: `parent-verify-${params.issueNumber}`,
-        introspection: {
-          repo: this.repo,
-          issue: params.task.issue,
-          taskName: params.task.name,
-          step: 0,
-          stepTitle: "parent verification",
-        },
-        ...this.buildWatchdogOptions(params.task, "parent-verify"),
-        ...this.buildStallOptions(params.task, "parent-verify"),
-        ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
-        ...(params.opencodeSessionOptions ?? {}),
-      });
-    } catch (error: any) {
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: error?.message ?? String(error),
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification failed; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification error");
-    }
-
-    if (result.loopTrip) {
-      return await this.handleLoopTrip(params.task, `parent-verify-${params.issueNumber}`, "parent-verify", result);
-    }
-
-    if (!result.success) {
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: result.output,
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification failed; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification failed");
-    }
-
-    const markerResult = parseLastLineJsonMarker(result.output ?? "", PARENT_VERIFY_MARKER_PREFIX);
-    const parsedMarker = markerResult.ok ? parseParentVerificationMarker(markerResult.value) : null;
-    if (!markerResult.ok || !parsedMarker || parsedMarker.version !== PARENT_VERIFY_MARKER_VERSION) {
-      const detail = markerResult.ok ? "invalid marker payload" : markerResult.error;
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: detail,
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification marker invalid; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification marker invalid");
-    }
-
-    if (parsedMarker.work_remains) {
-      completeParentVerification({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        outcome: "work_remains",
-        details: parsedMarker.reason,
-        nowMs,
-      });
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification: work remains for ${params.task.issue} (${parsedMarker.reason})`
-      );
-      return null;
-    }
-
-    completeParentVerification({
+    void params.opencodeXdg;
+    return await maybeRunParentVerificationLane({
       repo: this.repo,
-      issueNumber: parsedIssueNumber,
-      outcome: "no_work",
-      details: parsedMarker.reason,
-      nowMs,
+      repoPath: this.repoPath,
+      task: params.task,
+      issueNumber: params.issueNumber,
+      issueMeta: params.issueMeta,
+      opencodeSessionOptions: params.opencodeSessionOptions,
+      nowMs: () => Date.now(),
+      getParentVerificationState,
+      tryClaimParentVerification,
+      recordParentVerificationAttemptFailure,
+      completeParentVerification,
+      recordRunLogPath: this.recordRunLogPath.bind(this),
+      buildIssueContextForAgent: this.buildIssueContextForAgent.bind(this),
+      runAgent: this.session.runAgent.bind(this.session),
+      buildWatchdogOptions: this.buildWatchdogOptions.bind(this),
+      buildStallOptions: this.buildStallOptions.bind(this),
+      buildLoopDetectionOptions: this.buildLoopDetectionOptions.bind(this),
+      handleLoopTrip: this.handleLoopTrip.bind(this),
+      updateTaskStatus: this.queue.updateTaskStatus.bind(this.queue),
+      applyTaskPatch,
+      writeEscalationWriteback: this.writeEscalationWriteback.bind(this),
+      notifyEscalation: this.notify.notifyEscalation.bind(this.notify),
+      recordEscalatedRunNote: this.recordEscalatedRunNote.bind(this),
     });
-
-    const reason = `Parent verification: no remaining work. ${parsedMarker.reason}`;
-    const wasEscalated = params.task.status === "escalated";
-    const escalated = await this.queue.updateTaskStatus(params.task, "escalated", {
-      "daemon-id": "",
-      "heartbeat-at": "",
-    });
-    if (escalated) {
-      applyTaskPatch(params.task, "escalated", {
-        "daemon-id": "",
-        "heartbeat-at": "",
-      });
-    }
-
-    await this.writeEscalationWriteback(params.task, { reason, details: parsedMarker.reason, escalationType: "other" });
-    await this.notify.notifyEscalation({
-      taskName: params.task.name,
-      taskFileName: params.task._name,
-      taskPath: params.task._path,
-      issue: params.task.issue,
-      repo: this.repo,
-      sessionId: result.sessionId || params.task["session-id"]?.trim() || undefined,
-      reason,
-      escalationType: "other",
-      planOutput: result.output,
-    });
-
-    if (escalated && !wasEscalated) {
-      await this.recordEscalatedRunNote(params.task, {
-        reason,
-        sessionId: result.sessionId,
-        details: result.output,
-      });
-    }
-
-    return {
-      taskName: params.task.name,
-      repo: this.repo,
-      outcome: "escalated",
-      sessionId: result.sessionId || undefined,
-      escalationReason: reason,
-    };
   }
 
   /**
@@ -4447,107 +4281,43 @@ export class RepoWorker {
     });
   }
 
+  private getPauseControl() {
+    return createPauseControl({
+      readControlStateSnapshot,
+      defaults: getConfig().control,
+      isRalphCheckpoint,
+      log: (message) => console.warn(message),
+    });
+  }
+
   private readPauseRequested(): boolean {
-    return this.readPauseControl().pauseRequested;
+    return this.getPauseControl().readPauseRequested();
   }
 
   private readPauseControl(): { pauseRequested: boolean; pauseAtCheckpoint: RalphCheckpoint | null } {
-    const defaults = getConfig().control;
-    const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults });
-
-    const pauseRequested = control.pauseRequested === true;
-    const pauseAtCheckpoint =
-      typeof control.pauseAtCheckpoint === "string" && isRalphCheckpoint(control.pauseAtCheckpoint)
-        ? (control.pauseAtCheckpoint as RalphCheckpoint)
-        : null;
-
-    return { pauseRequested, pauseAtCheckpoint };
+    return this.getPauseControl().readPauseControl();
   }
 
   private async waitForPauseCleared(opts?: { signal?: AbortSignal }): Promise<void> {
-    const minMs = 250;
-    const maxMs = 2000;
-    let delayMs = minMs;
-
-    while (this.readPauseRequested()) {
-      if (opts?.signal?.aborted) return;
-
-      await new Promise<void>((resolve) => {
-        const timeout = setTimeout(resolve, delayMs);
-        if (opts?.signal) {
-          const onAbort = () => {
-            clearTimeout(timeout);
-            resolve();
-          };
-          opts.signal.addEventListener("abort", onAbort, { once: true });
-        }
-      });
-
-      const jitter = Math.floor(Math.random() * 125);
-      delayMs = Math.min(maxMs, Math.floor(delayMs * 1.6) + jitter);
-    }
-  }
-
-  private getCheckpointState(task: AgentTask): CheckpointState {
-    return buildCheckpointState({
-      lastCheckpoint: parseCheckpointValue(task.checkpoint),
-      checkpointSeq: parseCheckpointSeq(task[CHECKPOINT_SEQ_FIELD]),
-      pausedAtCheckpoint: parseCheckpointValue(task[PAUSED_AT_CHECKPOINT_FIELD]),
-      pauseRequested: parsePauseRequested(task[PAUSE_REQUESTED_FIELD]),
-    });
+    await this.getPauseControl().waitForPauseCleared(opts);
   }
 
   private async recordCheckpoint(task: AgentTask, checkpoint: RalphCheckpoint, sessionId?: string): Promise<void> {
     const workerId = await this.formatWorkerId(task, task._path);
-    const state = this.getCheckpointState(task);
-
-    const store = {
-      persist: async (nextState: CheckpointState) => {
-        const patch = buildCheckpointPatch(nextState);
-        try {
-          const updated = await this.queue.updateTaskStatus(task, task.status, patch);
-          if (!updated) {
-            console.warn(
-              `[ralph:worker:${this.repo}] Failed to persist checkpoint state (checkpoint=${checkpoint}, task=${task.issue})`
-            );
-            return;
-          }
-          applyTaskPatch(task, task.status, patch);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to persist checkpoint state (checkpoint=${checkpoint}, task=${task.issue}): ${
-              error?.message ?? String(error)
-            }`
-          );
-        }
-      },
-    };
-
-    const pauseSource = {
-      isPauseRequested: () => this.readPauseRequested(),
-      waitUntilCleared: (opts?: { signal?: AbortSignal }) => this.waitForPauseCleared(opts),
-    };
-
-    const pauseAtCheckpoint = this.readPauseControl().pauseAtCheckpoint;
-
-    const emitter = {
-      emit: (event: RalphEvent, key: string) => this.checkpointEvents.emit(event, key),
-      hasEmitted: (key: string) => this.checkpointEvents.hasEmitted(key),
-    };
-
-    await applyCheckpointReached({
+    await recordCheckpoint({
+      task,
       checkpoint,
-      pauseAtCheckpoint,
-      state,
-      context: {
-        workerId,
-        repo: this.repo,
-        taskId: task._path,
-        sessionId: sessionId ?? (task["session-id"]?.trim() || undefined),
+      workerId,
+      repo: this.repo,
+      sessionId,
+      pauseControl: this.getPauseControl(),
+      updateTaskStatus: this.queue.updateTaskStatus,
+      applyTaskPatch,
+      emitter: {
+        emit: (event: RalphEvent, key: string) => this.checkpointEvents.emit(event, key),
+        hasEmitted: (key: string) => this.checkpointEvents.hasEmitted(key),
       },
-      store,
-      pauseSource,
-      emitter,
+      log: (message) => console.warn(message),
     });
   }
 
