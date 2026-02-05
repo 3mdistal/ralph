@@ -5,7 +5,7 @@ import { createPauseControl, recordCheckpoint } from "../worker/pause-control";
 
 describe("pause control", () => {
   test("reads pause control snapshot with checkpoint validation", () => {
-    let state = { pauseRequested: true, pauseAtCheckpoint: "planned" };
+    let state = { mode: "running" as const, pauseRequested: true, pauseAtCheckpoint: "planned" };
     const pause = createPauseControl({
       readControlStateSnapshot: () => state,
       defaults: {},
@@ -16,7 +16,7 @@ describe("pause control", () => {
     expect(snapshot.pauseRequested).toBe(true);
     expect(snapshot.pauseAtCheckpoint).toBe("planned");
 
-    state = { pauseRequested: true, pauseAtCheckpoint: "not-a-checkpoint" };
+    state = { mode: "running" as const, pauseRequested: true, pauseAtCheckpoint: "not-a-checkpoint" };
     const fallback = pause.readPauseControl();
     expect(fallback.pauseAtCheckpoint).toBe(null);
   });
@@ -25,7 +25,7 @@ describe("pause control", () => {
     let pauseRequested = true;
     const delays: number[] = [];
     const pause = createPauseControl({
-      readControlStateSnapshot: () => ({ pauseRequested }),
+      readControlStateSnapshot: () => ({ mode: "running", pauseRequested }),
       defaults: {},
       isRalphCheckpoint: () => false,
       jitter: () => 0,
@@ -55,7 +55,7 @@ describe("pause control", () => {
 
     let patched: { status: AgentTask["status"]; patch: Record<string, string> } | null = null;
     const pauseControl = createPauseControl({
-      readControlStateSnapshot: () => ({ pauseRequested: false }),
+      readControlStateSnapshot: () => ({ mode: "running", pauseRequested: false }),
       defaults: {},
       isRalphCheckpoint: () => false,
     });
@@ -78,8 +78,9 @@ describe("pause control", () => {
       },
     });
 
-    expect(patched?.status).toBe("in-progress");
-    expect(patched?.patch).toMatchObject({
+    expect(patched).not.toBeNull();
+    expect(patched!.status).toBe("in-progress");
+    expect(patched!.patch).toMatchObject({
       checkpoint: "planned",
       "checkpoint-seq": "1",
       "pause-requested": "false",
@@ -102,7 +103,7 @@ describe("pause control", () => {
 
     const emitted: string[] = [];
     const pauseControl = createPauseControl({
-      readControlStateSnapshot: () => ({ pauseRequested: false }),
+      readControlStateSnapshot: () => ({ mode: "running", pauseRequested: false }),
       defaults: {},
       isRalphCheckpoint: () => false,
     });
