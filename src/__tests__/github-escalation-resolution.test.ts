@@ -172,8 +172,8 @@ describe("escalation resolution reconciliation", () => {
     const removed = requests.filter((req) => req.method === "DELETE").map((req) => req.path);
     expect(removed).toEqual(
       expect.arrayContaining([
-        "/repos/3mdistal/ralph/issues/10/labels/ralph%3Astatus%3Ablocked",
-        "/repos/3mdistal/ralph/issues/11/labels/ralph%3Astatus%3Ablocked",
+        "/repos/3mdistal/ralph/issues/10/labels/ralph%3Astatus%3Aescalated",
+        "/repos/3mdistal/ralph/issues/11/labels/ralph%3Astatus%3Aescalated",
       ])
     );
 
