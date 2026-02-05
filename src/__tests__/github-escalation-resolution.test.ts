@@ -520,7 +520,7 @@ describe("escalation resolution reconciliation", () => {
     recordIssueLabelsSnapshot({
       repo: "3mdistal/ralph",
       issue: "3mdistal/ralph#77",
-      labels: ["ralph:status:blocked"],
+      labels: ["ralph:status:escalated"],
       at: "2026-01-11T00:00:00.000Z",
     });
     recordEscalationCommentCheckState({

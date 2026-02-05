@@ -28,21 +28,21 @@ export const RALPH_STATUS_LABEL_PREFIX = "ralph:status:";
 
 export const RALPH_LABEL_STATUS_QUEUED = "ralph:status:queued";
 export const RALPH_LABEL_STATUS_IN_PROGRESS = "ralph:status:in-progress";
-export const RALPH_LABEL_STATUS_BLOCKED = "ralph:status:blocked";
 export const RALPH_LABEL_STATUS_PAUSED = "ralph:status:paused";
-export const RALPH_LABEL_STATUS_THROTTLED = "ralph:status:throttled";
+export const RALPH_LABEL_STATUS_ESCALATED = "ralph:status:escalated";
 export const RALPH_LABEL_STATUS_IN_BOT = "ralph:status:in-bot";
 export const RALPH_LABEL_STATUS_DONE = "ralph:status:done";
+export const RALPH_LABEL_STATUS_STOPPED = "ralph:status:stopped";
 
 export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   // Status (Ralph-managed)
-  { name: RALPH_LABEL_STATUS_QUEUED, color: "0366D6", description: "In queue; claimable" },
+  { name: RALPH_LABEL_STATUS_QUEUED, color: "0366D6", description: "In queue; claimable when unblocked" },
   { name: RALPH_LABEL_STATUS_IN_PROGRESS, color: "FBCA04", description: "Ralph is actively working" },
-  { name: RALPH_LABEL_STATUS_BLOCKED, color: "D73A4A", description: "Waiting on dependencies or human input" },
   { name: RALPH_LABEL_STATUS_PAUSED, color: "6A737D", description: "Operator pause; do not claim or resume" },
-  { name: RALPH_LABEL_STATUS_THROTTLED, color: "F9A825", description: "Throttled; will resume later" },
+  { name: RALPH_LABEL_STATUS_ESCALATED, color: "D73A4A", description: "Needs human intervention; see escalation note" },
   { name: RALPH_LABEL_STATUS_IN_BOT, color: "0E8A16", description: "Task PR merged to bot/integration" },
   { name: RALPH_LABEL_STATUS_DONE, color: "1A7F37", description: "Task merged to default branch" },
+  { name: RALPH_LABEL_STATUS_STOPPED, color: "6A737D", description: "Operator stop; do not claim or resume" },
 
   // Intent (operator-owned)
   { name: "ralph:intent:implement", color: "0B5FFF", description: "Implementation pipeline" },

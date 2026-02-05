@@ -32,12 +32,12 @@ const MARKER_REGEX = /<!--\s*ralph-parent-verify:id=([^\s]+)\s*-->/i;
 const DEFAULT_COMMENT_SCAN_LIMIT = 100;
 const LABELS_TO_REMOVE = [
   "ralph:status:queued",
-  "ralph:status:blocked",
   "ralph:status:in-progress",
   "ralph:status:paused",
-  "ralph:status:throttled",
+  "ralph:status:escalated",
   "ralph:status:in-bot",
   "ralph:status:done",
+  "ralph:status:stopped",
 ];
 
 function hashFNV1a(input: string): string {

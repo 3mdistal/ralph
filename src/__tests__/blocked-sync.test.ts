@@ -5,7 +5,7 @@ import { join } from "path";
 
 import { RepoWorker } from "../worker";
 import type { IssueRelationshipProvider, IssueRelationshipSnapshot } from "../github/issue-relationships";
-import { closeStateDbForTests, getParentVerificationState, initStateDb, recordIssueLabelsSnapshot } from "../state";
+import { closeStateDbForTests, getParentVerificationState, initStateDb } from "../state";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 const updateTaskStatusMock = mock(async () => true);
@@ -83,56 +83,6 @@ describe("syncBlockedStateForTasks", () => {
     expect(typeof call?.[2]?.["blocked-at"]).toBe("string");
     expect(call?.[2]?.["blocked-at"]).not.toBe("");
     expect(typeof call?.[2]?.["blocked-details"]).toBe("string");
-  });
-
-  test("does not re-add blocked label when already present in state", async () => {
-    updateTaskStatusMock.mockClear();
-    const releaseLock = await acquireGlobalTestLock();
-    const priorStateDb = process.env.RALPH_STATE_DB_PATH;
-    const stateDir = await mkdtemp(join(tmpdir(), "ralph-state-"));
-    process.env.RALPH_STATE_DB_PATH = join(stateDir, "state.sqlite");
-    closeStateDbForTests();
-    initStateDb();
-
-    try {
-      recordIssueLabelsSnapshot({
-        repo: "3mdistal/ralph",
-        issue: "3mdistal/ralph#10",
-        labels: ["ralph:status:blocked"],
-      });
-
-      const provider: IssueRelationshipProvider = {
-        getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
-          issue,
-          signals: [
-            { source: "github", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 11 } },
-          ],
-          coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: false },
-        }),
-      };
-
-      const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
-        session: sessionAdapter,
-        queue: queueAdapter,
-        notify: notifyAdapter,
-        throttle: throttleAdapter,
-        relationships: provider,
-      });
-
-      const addIssueLabelMock = mock(async () => {});
-      (worker as any).addIssueLabel = addIssueLabelMock;
-
-      await worker.syncBlockedStateForTasks([createTask({})]);
-      await worker.syncBlockedStateForTasks([createTask({})]);
-
-      expect(addIssueLabelMock).not.toHaveBeenCalled();
-    } finally {
-      closeStateDbForTests();
-      if (priorStateDb === undefined) delete process.env.RALPH_STATE_DB_PATH;
-      else process.env.RALPH_STATE_DB_PATH = priorStateDb;
-      await rm(stateDir, { recursive: true, force: true });
-      releaseLock();
-    }
   });
 
   test("does not unblock tasks blocked for other reasons", async () => {

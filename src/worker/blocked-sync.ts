@@ -1,8 +1,8 @@
 import type { AgentTask } from "../queue-backend";
-import { setParentVerificationPending, getIssueLabels, isStateDbInitialized } from "../state";
+import { setParentVerificationPending, getIssueLabels } from "../state";
 import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef } from "../github/issue-ref";
-import { RALPH_LABEL_STATUS_BLOCKED, RALPH_LABEL_STATUS_QUEUED } from "../github-labels";
+import { RALPH_LABEL_STATUS_QUEUED } from "../github-labels";
 
 const BLOCKED_SYNC_INTERVAL_MS = 30_000;
 
@@ -27,7 +27,6 @@ export async function syncBlockedStateForTasks(worker: any, tasks: AgentTask[]):
   }
 
   for (const entry of byIssue.values()) {
-    const labelsKnown = isStateDbInitialized();
     const issueLabels = getIssueLabels(entry.issue.repo, entry.issue.number);
     const snapshot = await worker.getRelationshipSnapshot(entry.issue, allowRefresh);
     if (!snapshot) continue;
@@ -45,16 +44,6 @@ export async function syncBlockedStateForTasks(worker: any, tasks: AgentTask[]):
         await worker.markTaskBlocked(task, "deps", { reason, details: reason });
       }
 
-      const hasBlockedLabel = issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_BLOCKED);
-      if (!labelsKnown || !hasBlockedLabel) {
-        try {
-          await worker.addIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${worker.repo}] Failed to add ${RALPH_LABEL_STATUS_BLOCKED} label: ${error?.message ?? String(error)}`
-          );
-        }
-      }
       continue;
     }
 
@@ -62,17 +51,13 @@ export async function syncBlockedStateForTasks(worker: any, tasks: AgentTask[]):
       const labels = issueLabels;
       const shouldSetParentVerification =
         labels.length === 0 ? true : labels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_QUEUED);
-      let shouldRemoveBlockedLabel = true;
       for (const task of entry.tasks) {
         if (task.status !== "blocked") continue;
         if (task["blocked-source"] !== "deps") {
-          shouldRemoveBlockedLabel = false;
           continue;
         }
         const unblocked = await worker.markTaskUnblocked(task);
-        if (!unblocked) {
-          shouldRemoveBlockedLabel = false;
-        } else {
+        if (unblocked) {
           if (shouldSetParentVerification) {
             const didSet = setParentVerificationPending({
               repo: worker.repo,
@@ -84,19 +69,6 @@ export async function syncBlockedStateForTasks(worker: any, tasks: AgentTask[]):
                 `[ralph:worker:${worker.repo}] Parent verification pending for ${formatIssueRef(entry.issue)}`
               );
             }
-          }
-        }
-      }
-
-      if (shouldRemoveBlockedLabel) {
-        const hasBlockedLabel = issueLabels.some((label) => label.trim().toLowerCase() === RALPH_LABEL_STATUS_BLOCKED);
-        if (!labelsKnown || hasBlockedLabel) {
-          try {
-            await worker.removeIssueLabel(entry.issue, RALPH_LABEL_STATUS_BLOCKED);
-          } catch (error: any) {
-            console.warn(
-              `[ralph:worker:${worker.repo}] Failed to remove ${RALPH_LABEL_STATUS_BLOCKED} label: ${error?.message ?? String(error)}`
-            );
           }
         }
       }
