@@ -42,7 +42,7 @@ import {
   type SessionResult,
 } from "../session";
 import { buildPlannerPrompt } from "../planner-prompt";
-import { buildParentVerificationPrompt } from "../parent-verification-prompt";
+import { maybeRunParentVerificationLane } from "./parent-verification-lane";
 import { appendChildDossierToIssueContext } from "../child-dossier/core";
 import { collectChildCompletionDossier } from "../child-dossier/io";
 import { getThrottleDecision } from "../throttle";
@@ -183,15 +183,6 @@ import {
   tryClaimParentVerification,
   upsertRalphRunGateResult,
 } from "../state";
-import {
-  getParentVerificationBackoffMs,
-  getParentVerificationMaxAttempts,
-  isParentVerificationDisabled,
-  parseParentVerificationMarker,
-  PARENT_VERIFY_MARKER_PREFIX,
-  PARENT_VERIFY_MARKER_VERSION,
-} from "../parent-verification";
-import { parseLastLineJsonMarker } from "../markers";
 import { refreshRalphRunTokenTotals } from "../run-token-accounting";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
 import {
@@ -4270,25 +4261,6 @@ export class RepoWorker {
     };
   }
 
-  private async deferParentVerification(task: AgentTask, reason: string): Promise<AgentRun> {
-    const patch: Record<string, string> = {
-      "daemon-id": "",
-      "heartbeat-at": "",
-    };
-    const updated = await this.queue.updateTaskStatus(task, "queued", patch);
-    if (updated) {
-      applyTaskPatch(task, "queued", patch);
-    }
-
-    console.log(`[ralph:worker:${this.repo}] Parent verification deferred: ${reason}`);
-    return {
-      taskName: task.name,
-      repo: this.repo,
-      outcome: "failed",
-      escalationReason: reason,
-    };
-  }
-
   private async maybeRunParentVerification(params: {
     task: AgentTask;
     issueNumber: string;
@@ -4296,201 +4268,32 @@ export class RepoWorker {
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     opencodeSessionOptions?: RunSessionOptionsBase;
   }): Promise<AgentRun | null> {
-    if (isParentVerificationDisabled()) return null;
-    const parsedIssueNumber = Number(params.issueNumber);
-    if (!Number.isFinite(parsedIssueNumber)) return null;
-
-    const state = getParentVerificationState({ repo: this.repo, issueNumber: parsedIssueNumber });
-    if (!state || state.status !== "pending") return null;
-
-    const nowMs = Date.now();
-    if (state.nextAttemptAtMs && state.nextAttemptAtMs > nowMs) {
-      return await this.deferParentVerification(
-        params.task,
-        `backoff active until ${new Date(state.nextAttemptAtMs).toISOString()}`
-      );
-    }
-
-    const maxAttempts = getParentVerificationMaxAttempts();
-    if (state.attemptCount >= maxAttempts) {
-      completeParentVerification({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        outcome: "skipped",
-        details: `max attempts (${maxAttempts}) reached`,
-        nowMs,
-      });
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification skipped (attempts=${state.attemptCount} max=${maxAttempts})`
-      );
-      return null;
-    }
-
-    const claimed = tryClaimParentVerification({ repo: this.repo, issueNumber: parsedIssueNumber, nowMs });
-    if (!claimed) {
-      return await this.deferParentVerification(params.task, "pending claim not acquired");
-    }
-
-    const attemptCount = claimed.attemptCount;
-    await this.recordRunLogPath(params.task, params.issueNumber, "parent-verify", "queued");
-    const issueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber: params.issueNumber });
-    const prompt = buildParentVerificationPrompt({ repo: this.repo, issueNumber: params.issueNumber, issueContext });
-    let result: SessionResult;
-    try {
-      result = await this.session.runAgent(this.repoPath, "ralph-parent-verify", prompt, {
-        repo: this.repo,
-        cacheKey: `parent-verify-${params.issueNumber}`,
-        introspection: {
-          repo: this.repo,
-          issue: params.task.issue,
-          taskName: params.task.name,
-          step: 0,
-          stepTitle: "parent verification",
-        },
-        ...this.buildWatchdogOptions(params.task, "parent-verify"),
-        ...this.buildStallOptions(params.task, "parent-verify"),
-        ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
-        ...(params.opencodeSessionOptions ?? {}),
-      });
-    } catch (error: any) {
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: error?.message ?? String(error),
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification failed; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification error");
-    }
-
-    if (result.loopTrip) {
-      return await this.handleLoopTrip(params.task, `parent-verify-${params.issueNumber}`, "parent-verify", result);
-    }
-
-    if (!result.success) {
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: result.output,
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification failed; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification failed");
-    }
-
-    const markerResult = parseLastLineJsonMarker(result.output ?? "", PARENT_VERIFY_MARKER_PREFIX);
-    const parsedMarker = markerResult.ok ? parseParentVerificationMarker(markerResult.value) : null;
-    if (!markerResult.ok || !parsedMarker || parsedMarker.version !== PARENT_VERIFY_MARKER_VERSION) {
-      const detail = markerResult.ok ? "invalid marker payload" : markerResult.error;
-      const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
-      recordParentVerificationAttemptFailure({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        attemptCount,
-        nextAttemptAtMs,
-        nowMs,
-        details: detail,
-      });
-      if (attemptCount >= maxAttempts) {
-        completeParentVerification({
-          repo: this.repo,
-          issueNumber: parsedIssueNumber,
-          outcome: "skipped",
-          details: "parent verification marker invalid; proceeding to implementation",
-          nowMs,
-        });
-        return null;
-      }
-      return await this.deferParentVerification(params.task, "parent verification marker invalid");
-    }
-
-    if (parsedMarker.work_remains) {
-      completeParentVerification({
-        repo: this.repo,
-        issueNumber: parsedIssueNumber,
-        outcome: "work_remains",
-        details: parsedMarker.reason,
-        nowMs,
-      });
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification: work remains for ${params.task.issue} (${parsedMarker.reason})`
-      );
-      return null;
-    }
-
-    completeParentVerification({
+    void params.opencodeXdg;
+    return await maybeRunParentVerificationLane({
       repo: this.repo,
-      issueNumber: parsedIssueNumber,
-      outcome: "no_work",
-      details: parsedMarker.reason,
-      nowMs,
+      repoPath: this.repoPath,
+      task: params.task,
+      issueNumber: params.issueNumber,
+      issueMeta: params.issueMeta,
+      opencodeSessionOptions: params.opencodeSessionOptions,
+      nowMs: () => Date.now(),
+      getParentVerificationState,
+      tryClaimParentVerification,
+      recordParentVerificationAttemptFailure,
+      completeParentVerification,
+      recordRunLogPath: this.recordRunLogPath.bind(this),
+      buildIssueContextForAgent: this.buildIssueContextForAgent.bind(this),
+      runAgent: this.session.runAgent.bind(this.session),
+      buildWatchdogOptions: this.buildWatchdogOptions.bind(this),
+      buildStallOptions: this.buildStallOptions.bind(this),
+      buildLoopDetectionOptions: this.buildLoopDetectionOptions.bind(this),
+      handleLoopTrip: this.handleLoopTrip.bind(this),
+      updateTaskStatus: this.queue.updateTaskStatus.bind(this.queue),
+      applyTaskPatch,
+      writeEscalationWriteback: this.writeEscalationWriteback.bind(this),
+      notifyEscalation: this.notify.notifyEscalation.bind(this.notify),
+      recordEscalatedRunNote: this.recordEscalatedRunNote.bind(this),
     });
-
-    const reason = `Parent verification: no remaining work. ${parsedMarker.reason}`;
-    const wasEscalated = params.task.status === "escalated";
-    const escalated = await this.queue.updateTaskStatus(params.task, "escalated", {
-      "daemon-id": "",
-      "heartbeat-at": "",
-    });
-    if (escalated) {
-      applyTaskPatch(params.task, "escalated", {
-        "daemon-id": "",
-        "heartbeat-at": "",
-      });
-    }
-
-    await this.writeEscalationWriteback(params.task, { reason, details: parsedMarker.reason, escalationType: "other" });
-    await this.notify.notifyEscalation({
-      taskName: params.task.name,
-      taskFileName: params.task._name,
-      taskPath: params.task._path,
-      issue: params.task.issue,
-      repo: this.repo,
-      sessionId: result.sessionId || params.task["session-id"]?.trim() || undefined,
-      reason,
-      escalationType: "other",
-      planOutput: result.output,
-    });
-
-    if (escalated && !wasEscalated) {
-      await this.recordEscalatedRunNote(params.task, {
-        reason,
-        sessionId: result.sessionId,
-        details: result.output,
-      });
-    }
-
-    return {
-      taskName: params.task.name,
-      repo: this.repo,
-      outcome: "escalated",
-      sessionId: result.sessionId || undefined,
-      escalationReason: reason,
-    };
   }
 
   /**
