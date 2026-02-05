@@ -243,8 +243,9 @@ ralph sandbox tag --failed --apply
   - `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
   - `dryRun` (boolean): compute decisions without mutating labels (default: false)
 - `repos[].setup` (array): optional setup commands to run in the task worktree before any agent execution (operator-owned)
+- `repos[].preflightCommand` (string|string[]): optional deterministic preflight commands run in the task worktree before Ralph opens PRs (normalized to string[])
 - `repos[].verification` (object, optional): rollup PR verification guidance
-  - `preflight` (array): fast local sanity commands (string[])
+  - `preflight` (array): legacy alias for `repos[].preflightCommand` (string[])
   - `e2e` (array): human E2E scenarios (`[{ title?: string, steps: string[] }]`)
   - `staging` (array): staging/preview checks (`[{ url: string, expected?: string }]`)
 - Rollup batches persist across daemon restarts via `~/.ralph/state.sqlite`. Ralph stores the active batch, merged PR URLs, and rollup PR metadata to ensure exactly one rollup PR is created per batch.

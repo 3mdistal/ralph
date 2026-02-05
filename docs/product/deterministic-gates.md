@@ -99,6 +99,10 @@ Recommended default preflight (repo-specific):
 Determinism requirement:
 - The preflight command must come from a repo-level configuration surface (not ad-hoc per agent). The run record stores the exact command string that was executed.
 
+Config surface:
+- Preferred: `repos[].preflightCommand` (string or string[]; normalized to string[])
+- Legacy alias: `repos[].verification.preflight` (string[])
+
 ## Gate 2: Review Requests (Product + DevEx)
 
 Default: required for PRs produced by Ralph.

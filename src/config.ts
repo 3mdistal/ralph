@@ -41,6 +41,12 @@ export interface RepoConfig {
   path: string;      // "/Users/alicemoore/Developer/bwrb"
   botBranch: string; // "bot/integration"
   /**
+   * Optional deterministic preflight commands run in the task worktree before Ralph opens a PR.
+   *
+   * Config accepts either a string or string[]; Ralph normalizes to string[].
+   */
+  preflightCommand?: string[];
+  /**
    * Required status checks for merge gating (default: derive from branch protection).
    *
    * Values must match the check context name shown by GitHub.
@@ -476,6 +482,14 @@ function toNonEmptyStringOrNull(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+}
+
+function toStringOrStringArrayOrNull(value: unknown): string[] | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : null;
+  }
+  return toStringArrayOrNull(value);
 }
 
 function toStringArrayOrNull(value: unknown): string[] | null {
@@ -929,6 +943,19 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
         updates.verification = parsed;
       } else {
         updates.verification = undefined;
+      }
+    }
+
+    const rawPreflight = (repo as any).preflightCommand;
+    if (rawPreflight !== undefined) {
+      const parsed = toStringOrStringArrayOrNull(rawPreflight);
+      if (parsed === null) {
+        console.warn(
+          `[ralph] Invalid config preflightCommand for repo ${repo.name}: ${JSON.stringify(rawPreflight)}; expected string or string[].`
+        );
+        updates.preflightCommand = undefined;
+      } else {
+        updates.preflightCommand = parsed;
       }
     }
 
@@ -1956,6 +1983,47 @@ export function getRepoVerificationConfig(repoName: string): RepoVerificationCon
   const cfg = getConfig();
   const repo = cfg.repos.find((r) => r.name === repoName);
   return repo?.verification ?? null;
+}
+
+export type RepoPreflightCommands = {
+  commands: string[];
+  source: "preflightCommand" | "verification.preflight" | "none";
+  configured: boolean;
+};
+
+export function getRepoPreflightCommands(repoName: string): RepoPreflightCommands {
+  const cfg = getConfig();
+  const repo = cfg.repos.find((r) => r.name === repoName);
+  if (!repo) return { commands: [], source: "none", configured: false };
+
+  const rawPreflight = (repo as any).preflightCommand;
+  if (rawPreflight !== undefined) {
+    const parsed = Array.isArray(rawPreflight)
+      ? toStringArrayOrNull(rawPreflight)
+      : typeof rawPreflight === "string"
+        ? toStringOrStringArrayOrNull(rawPreflight)
+        : null;
+
+    if (parsed !== null) {
+      return { commands: parsed, source: "preflightCommand", configured: true };
+    }
+    console.warn(
+      `[ralph] Invalid config preflightCommand for repo ${repoName}: ${JSON.stringify(rawPreflight)}; expected string or string[].`
+    );
+  }
+
+  const legacy = (repo as any).verification?.preflight;
+  if (legacy !== undefined) {
+    const parsed = toStringArrayOrNull(legacy);
+    if (parsed !== null) {
+      return { commands: parsed, source: "verification.preflight", configured: true };
+    }
+    console.warn(
+      `[ralph] Invalid config repos[${repoName}].verification.preflight=${JSON.stringify(legacy)}; expected string[].`
+    );
+  }
+
+  return { commands: [], source: "none", configured: false };
 }
 
 export function getRepoLoopDetectionConfig(repoName: string): LoopDetectionConfig | null {
