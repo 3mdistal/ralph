@@ -1,9 +1,8 @@
 import { $ } from "bun";
-import { appendFile, mkdir, readFile, readdir, rm } from "fs/promises";
+import { appendFile, mkdir, readFile, rm } from "fs/promises";
 import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
-import { homedir } from "os";
 
 import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "../queue-backend";
 import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "../bwrb/artifacts";
@@ -11,17 +10,13 @@ import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
   getOpencodeDefaultProfileName,
-  getRequestedOpencodeProfileName,
   getRepoBotBranch,
   getRepoConcurrencySlots,
   getRepoLoopDetectionConfig,
   getRepoRequiredChecksOverride,
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
-  isOpencodeProfilesEnabled,
-  listOpencodeProfileNames,
   getConfig,
-  resolveOpencodeProfile,
 } from "../config";
 import { normalizeGitRef } from "../midpoint-labels";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "../midpoint-labeler";
@@ -53,7 +48,7 @@ import { buildWorktreePath } from "../worktree-paths";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
-import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "../opencode-auto-profile";
+import { getPinnedOpencodeProfileName as getPinnedOpencodeProfileNameCore, resolveOpencodeXdgForTask as resolveOpencodeXdgForTaskCore } from "./opencode-profiles";
 import { readControlStateSnapshot } from "../drain";
 import { buildCheckpointState, type CheckpointState } from "../checkpoints/core";
 import { applyCheckpointReached } from "../checkpoints/runtime";
@@ -4562,9 +4557,7 @@ export class RepoWorker {
   }
 
   private getPinnedOpencodeProfileName(task: AgentTask): string | null {
-    const raw = task["opencode-profile"];
-    const trimmed = typeof raw === "string" ? raw.trim() : "";
-    return trimmed ? trimmed : null;
+    return getPinnedOpencodeProfileNameCore(task);
   }
 
   private async resolveOpencodeXdgForTask(
@@ -4576,123 +4569,17 @@ export class RepoWorker {
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     error?: string;
   }> {
-    if (!isOpencodeProfilesEnabled()) return { profileName: null };
-
-    const home = process.env.HOME ?? homedir();
-    const ambientXdg = {
-      dataHome: join(home, ".local", "share"),
-      configHome: join(home, ".config"),
-      stateHome: join(home, ".local", "state"),
-      cacheHome: join(home, ".cache"),
-    };
-
-    const pinned = this.getPinnedOpencodeProfileName(task);
-
-    if (pinned) {
-      const resolved = resolveOpencodeProfile(pinned);
-      if (!resolved) {
-        return {
-          profileName: pinned,
-          error:
-            `Task is pinned to an unknown OpenCode profile ${JSON.stringify(pinned)} (task ${task.issue}). ` +
-            `Configure it under [opencode.profiles.${pinned}] in ~/.ralph/config.toml (paths must be absolute; no '~' expansion).`,
-        };
-      }
-
-      return {
-        profileName: resolved.name,
-        opencodeXdg: {
-          dataHome: resolved.xdgDataHome,
-          configHome: resolved.xdgConfigHome,
-          stateHome: resolved.xdgStateHome,
-          cacheHome: resolved.xdgCacheHome,
-        },
-      };
-    }
-
-    if (phase === "resume") {
-      if (!sessionId) {
-        return { profileName: null, opencodeXdg: ambientXdg };
-      }
-
-      const candidates = listOpencodeProfileNames();
-      for (const name of candidates) {
-        const resolved = resolveOpencodeProfile(name);
-        if (!resolved) continue;
-        const base = join(resolved.xdgDataHome, "opencode", "storage", "session");
-        if (!existsSync(base)) continue;
-        try {
-          const dirs = await readdir(base, { withFileTypes: true });
-          for (const dir of dirs) {
-            if (!dir.isDirectory()) continue;
-            const sessionPath = join(base, dir.name, `${sessionId}.json`);
-            if (existsSync(sessionPath)) {
-              return {
-                profileName: resolved.name,
-                opencodeXdg: {
-                  dataHome: resolved.xdgDataHome,
-                  configHome: resolved.xdgConfigHome,
-                  stateHome: resolved.xdgStateHome,
-                  cacheHome: resolved.xdgCacheHome,
-                },
-              };
-            }
-          }
-        } catch {
-          // best-effort
-        }
-      }
-
-      return { profileName: null, opencodeXdg: ambientXdg };
-    }
-
-    // Source of truth is config (opencode.defaultProfile). The control file no longer controls profile.
-    const requested = getRequestedOpencodeProfileName(null);
-
-    let resolved = null as ReturnType<typeof resolveOpencodeProfile>;
-
-    if (requested === "auto") {
-      const chosen = await resolveAutoOpencodeProfileName(Date.now(), {
-        getThrottleDecision: this.throttle.getThrottleDecision,
-      });
-      if (phase === "start") {
-        console.log(`[ralph:worker:${this.repo}] Auto-selected OpenCode profile=${JSON.stringify(chosen ?? "")}`);
-      }
-      resolved = chosen ? resolveOpencodeProfile(chosen) : resolveOpencodeProfile(null);
-    } else if (phase === "start") {
-      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requested || null, {
-        getThrottleDecision: this.throttle.getThrottleDecision,
-      });
-      const chosen = selection.profileName;
-
-      if (selection.source === "failover") {
-        console.log(
-          `[ralph:worker:${this.repo}] Hard throttle on profile=${selection.requestedProfile ?? "default"}; ` +
-            `failing over to profile=${chosen ?? "ambient"}`
-        );
-      }
-
-      resolved = chosen ? resolveOpencodeProfile(chosen) : null;
-    } else {
-      resolved = requested ? resolveOpencodeProfile(requested) : null;
-    }
-
-    if (!resolved) {
-      if (phase === "start" && requested) {
-        console.warn(`[ralph:worker:${this.repo}] Unable to resolve OpenCode profile for new task; running with ambient XDG dirs`);
-      }
-      return { profileName: null };
-    }
-
-    return {
-      profileName: resolved.name,
-      opencodeXdg: {
-        dataHome: resolved.xdgDataHome,
-        configHome: resolved.xdgConfigHome,
-        stateHome: resolved.xdgStateHome,
-        cacheHome: resolved.xdgCacheHome,
-      },
-    };
+    return resolveOpencodeXdgForTaskCore({
+      task,
+      phase,
+      sessionId,
+      repo: this.repo,
+      nowMs: Date.now(),
+      getThrottleDecision: this.throttle.getThrottleDecision,
+      log: (message: string) => console.log(message),
+      warn: (message: string) => console.warn(message),
+      envHome: process.env.HOME,
+    });
   }
 
   private readPauseRequested(): boolean {
