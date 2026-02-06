@@ -81,12 +81,7 @@ export function normalizeTaskPriority(value: unknown): TaskPriority {
   return PRIORITY_BY_INDEX[index] ?? DEFAULT_PRIORITY;
 }
 
-export function parseRalphPriorityLabel(label: string): TaskPriority | null {
-  const index = parseRalphPriorityIndex(label);
-  return index === null ? null : PRIORITY_BY_INDEX[index];
-}
-
-export function taskPriorityToRalphPriorityLabel(priority: TaskPriority): RalphPriorityLabel {
+function taskPriorityToRalphPriorityLabel(priority: TaskPriority): RalphPriorityLabel {
   const index = PRIORITY_BY_INDEX.indexOf(priority);
   return RALPH_PRIORITY_LABELS[index] ?? RALPH_PRIORITY_LABELS[PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY)];
 }
@@ -98,10 +93,6 @@ export function normalizePriorityInputToRalphPriorityLabel(value: unknown): Ralp
 
 export function taskPriorityToCanonicalLabel(priority: TaskPriority): RalphPriorityLabel {
   return taskPriorityToRalphPriorityLabel(priority);
-}
-
-export function normalizePriorityInputToCanonicalLabel(value: unknown): RalphPriorityLabel {
-  return normalizePriorityInputToRalphPriorityLabel(value);
 }
 
 export function planRalphPriorityLabelSet(target: RalphPriorityLabel): {
