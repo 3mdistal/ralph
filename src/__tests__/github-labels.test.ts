@@ -48,7 +48,7 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:status:escalated", color: "000000", description: "Needs human intervention; see escalation note" },
-      { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
+      { name: "ralph:status:done", color: "1A7F37", description: "Task reconciled or verified complete" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
     expect(toUpdate).toEqual([
@@ -65,7 +65,7 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
-      { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
+      { name: "ralph:status:done", color: "1A7F37", description: "Task reconciled or verified complete" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
     expect(toUpdate).toEqual([
@@ -93,7 +93,7 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
-      { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
+      { name: "ralph:status:done", color: "1A7F37", description: "Task reconciled or verified complete" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
     expect(toUpdate).toEqual([]);
@@ -105,7 +105,7 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
       { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
-      { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
+      { name: "ralph:status:done", color: "1A7F37", description: "Task reconciled or verified complete" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
     expect(toUpdate).toEqual([

@@ -31,14 +31,16 @@ export function buildParentVerificationPrompt(options: ParentVerificationPromptO
     "",
     "Decision guidance:",
     "- If the issue is clearly resolved or no actionable work remains, set work_remains=false and explain why.",
+    "- Only use work_remains=false when you can cite concrete evidence; otherwise set work_remains=true.",
     "- If there is any reasonable remaining work, set work_remains=true and summarize what remains.",
     "- Keep the reason short and deterministic (1-2 sentences).",
     "",
     "Output requirements:",
     "- Your final line MUST be the marker below, with valid JSON (no code fences).",
     "- Use version 1.",
+    "- When work_remains=false, include: confidence (low|medium|high), checked (list), why_satisfied, evidence (list of {url,note}).",
     "",
     "Format:",
-    "RALPH_PARENT_VERIFY: {\"version\":1,\"work_remains\":true|false,\"reason\":\"...\"}",
+    "RALPH_PARENT_VERIFY: {\"version\":1,\"work_remains\":true|false,\"reason\":\"...\",\"confidence\":\"low|medium|high\",\"checked\":[\"...\"],\"why_satisfied\":\"...\",\"evidence\":[{\"url\":\"...\",\"note\":\"...\"}]}",
   ].join("\n");
 }

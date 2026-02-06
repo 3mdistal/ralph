@@ -55,6 +55,8 @@ function createDeps(overrides: Partial<ParentVerificationLaneDeps> = {}) {
     recordParentVerificationAttemptFailure: [] as Array<{ details: string }>,
     completeParentVerification: [] as Array<{ outcome: string; details: string }>,
     writeEscalationWriteback: [] as Array<{ reason: string }>,
+    writeParentVerificationToGitHub: [] as Array<{ issueNumber: number }>,
+    finalizeVerifiedTask: [] as Array<{ sessionId: string; cacheKey: string }>,
     notifyEscalation: [] as Array<{ reason: string }>,
     recordEscalatedRunNote: [] as Array<{ reason: string }>,
     runAgent: [] as Array<{ prompt: string }>,
@@ -99,6 +101,14 @@ function createDeps(overrides: Partial<ParentVerificationLaneDeps> = {}) {
       calls.writeEscalationWriteback.push({ reason: params.reason });
       return null;
     },
+    writeParentVerificationToGitHub: async (params) => {
+      calls.writeParentVerificationToGitHub.push({ issueNumber: params.issueNumber });
+      return { ok: true, closed: true, labelOpsApplied: true };
+    },
+    finalizeVerifiedTask: async (params) => {
+      calls.finalizeVerifiedTask.push({ sessionId: params.sessionId, cacheKey: params.cacheKey });
+      return { taskName: baseTask.name, repo: baseTask.repo, outcome: "success" };
+    },
     notifyEscalation: async (params: EscalationContext) => {
       calls.notifyEscalation.push({ reason: params.reason });
       return true;
@@ -142,7 +152,7 @@ describe("parent verification lane", () => {
     expect(calls.completeParentVerification[0]?.outcome).toBe("work_remains");
   });
 
-  test("escalates when no work remains", async () => {
+  test("completes when no work remains with strong confidence", async () => {
     const { deps, calls } = createDeps({
       runAgent: async (_repoPath: string, _agentName: string, _prompt: string) => ({
         sessionId: "sid",
@@ -150,6 +160,30 @@ describe("parent verification lane", () => {
           version: 1,
           work_remains: false,
           reason: "already done",
+          confidence: "high",
+          checked: ["child issues reviewed"],
+          why_satisfied: "All child issues are closed and acceptance criteria is met.",
+          evidence: [{ url: "https://example.com", note: "child issue" }],
+        })}`,
+        success: true,
+      }),
+    });
+
+    const result = await maybeRunParentVerificationLane(deps);
+    expect(result?.outcome).toBe("success");
+    expect(calls.writeParentVerificationToGitHub.length).toBe(1);
+    expect(calls.finalizeVerifiedTask.length).toBe(1);
+  });
+
+  test("escalates when no work remains but confidence is low", async () => {
+    const { deps, calls } = createDeps({
+      runAgent: async (_repoPath: string, _agentName: string, _prompt: string) => ({
+        sessionId: "sid",
+        output: `${PARENT_VERIFY_MARKER_PREFIX}: ${JSON.stringify({
+          version: 1,
+          work_remains: false,
+          reason: "already done",
+          confidence: "low",
         })}`,
         success: true,
       }),

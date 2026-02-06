@@ -4141,6 +4141,7 @@ export class RepoWorker {
     task: AgentTask;
     issueNumber: string;
     issueMeta: IssueMetadata;
+    startTime: Date;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     opencodeSessionOptions?: RunSessionOptionsBase;
   }): Promise<AgentRun | null> {
@@ -4167,6 +4168,20 @@ export class RepoWorker {
       updateTaskStatus: this.queue.updateTaskStatus.bind(this.queue),
       applyTaskPatch,
       writeEscalationWriteback: this.writeEscalationWriteback.bind(this),
+      writeParentVerificationToGitHub: async (ctx) =>
+        await writeParentVerificationToGitHub(ctx, { github: this.github }),
+      finalizeVerifiedTask: async ({ sessionId, cacheKey }) =>
+        await this.finalizeTaskSuccess({
+          task: params.task,
+          prUrl: null,
+          completionKind: "verified",
+          sessionId,
+          startTime: params.startTime,
+          cacheKey,
+          opencodeXdg: params.opencodeXdg,
+          notify: true,
+          logMessage: `Task verified without changes: ${params.task.name}`,
+        }),
       notifyEscalation: this.notify.notifyEscalation.bind(this.notify),
       recordEscalatedRunNote: this.recordEscalatedRunNote.bind(this),
     });
@@ -5565,195 +5580,8 @@ export class RepoWorker {
     workerId?: string;
     allocatedSlot?: number | null;
   }): Promise<AgentRun | null> {
-    const issueRef = parseIssueRef(params.task.issue, params.task.repo);
-    if (!issueRef) return null;
-
-    const snapshot = await this.getRelationshipSnapshot(issueRef, true);
-    if (!snapshot) return null;
-
-    const signals = this.buildRelationshipSignals(snapshot);
-    const eligibility = evaluateParentVerificationEligibility({ snapshot, signals });
-    if (eligibility.decision !== "verify") {
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification skipped for ${params.task.issue}: ${eligibility.reason}`
-      );
-      return null;
-    }
-
-    const issueUrl =
-      params.issueMeta.url ?? `https://github.com/${issueRef.repo}/issues/${issueRef.number}`;
-    const evidence = await collectParentVerificationEvidence({ childIssues: eligibility.childIssues });
-    if (evidence.diagnostics.length > 0) {
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification evidence diagnostics for ${params.task.issue}:\n${evidence.diagnostics.join(
-          "\n"
-        )}`
-      );
-    }
-
-    const prompt = buildParentVerificationPromptLegacy({
-      repo: this.repo,
-      issueNumber: Number(params.issueNumber),
-      issueUrl,
-      childIssues: eligibility.childIssues,
-      evidence: evidence.evidence,
-    });
-
-    const verifyWorktreePath = this.buildParentVerificationWorktreePath(params.issueNumber);
-    const verifyCacheKey = `${params.cacheKey}-parent-verify`;
-    let dirtyWorktree = false;
-
-    try {
-      try {
-        await this.ensureGitWorktree(verifyWorktreePath);
-      } catch (error: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to prepare parent verification worktree: ${error?.message ?? String(error)}`
-        );
-        return null;
-      }
-
-      const preStatus = await this.getWorktreeStatusPorcelain(verifyWorktreePath);
-      if (preStatus) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Parent verification worktree not clean; skipping verification for ${params.task.issue}.`
-        );
-        dirtyWorktree = true;
-        return null;
-      }
-
-      const pausedVerify = await this.pauseIfHardThrottled(params.task, "parent verification");
-      if (pausedVerify) return pausedVerify;
-
-      const verifyRunLogPath = await this.recordRunLogPath(
-        params.task,
-        params.issueNumber,
-        "parent-verify",
-        "starting"
-      );
-
-      const verifyResult = await this.session.runAgent(verifyWorktreePath, "general", prompt, {
-        repo: this.repo,
-        cacheKey: verifyCacheKey,
-        runLogPath: verifyRunLogPath,
-        introspection: {
-          repo: this.repo,
-          issue: params.task.issue,
-          taskName: params.task.name,
-          step: 1,
-          stepTitle: "parent verification",
-        },
-        ...this.buildWatchdogOptions(params.task, "parent-verify"),
-        ...this.buildStallOptions(params.task, "parent-verify"),
-        ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
-        ...(params.opencodeSessionOptions ?? {}),
-      });
-
-      const pausedAfterVerify = await this.pauseIfHardThrottled(
-        params.task,
-        "parent verification (post)",
-        verifyResult.sessionId
-      );
-      if (pausedAfterVerify) return pausedAfterVerify;
-
-      if (verifyResult.loopTrip) {
-        return await this.handleLoopTrip(params.task, verifyCacheKey, "parent-verify", verifyResult);
-      }
-
-      if (!verifyResult.success && verifyResult.watchdogTimeout) {
-        return await this.handleWatchdogTimeout(params.task, verifyCacheKey, "parent-verify", verifyResult, params.opencodeXdg);
-      }
-
-      if (!verifyResult.success && verifyResult.stallTimeout) {
-        return await this.handleStallTimeout(params.task, verifyCacheKey, "parent-verify", verifyResult);
-      }
-
-      const postStatus = await this.getWorktreeStatusPorcelain(verifyWorktreePath);
-      if (postStatus) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Parent verification dirtied its worktree; skipping verification for ${params.task.issue}.`
-        );
-        dirtyWorktree = true;
-        return null;
-      }
-
-      if (!verifyResult.success) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Parent verification run failed; continuing with normal flow for ${params.task.issue}.`
-        );
-        return null;
-      }
-
-      if (verifyResult.sessionId) {
-        await this.queue.updateTaskStatus(params.task, "in-progress", {
-          "session-id": verifyResult.sessionId,
-          ...(params.workerId ? { "worker-id": params.workerId } : {}),
-          ...(typeof params.allocatedSlot === "number" ? { "repo-slot": String(params.allocatedSlot) } : {}),
-        });
-      }
-
-      const parsed = parseParentVerificationOutput(verifyResult.output);
-      if (!parsed.satisfied) {
-        console.log(
-          `[ralph:worker:${this.repo}] Parent verification not satisfied for ${params.task.issue}: ${parsed.reason ?? "unsatisfied"}`
-        );
-        return null;
-      }
-
-      const writeback = await writeParentVerificationToGitHub(
-        {
-          repo: this.repo,
-          issueNumber: Number(params.issueNumber),
-          childIssues: eligibility.childIssues,
-          evidence: evidence.evidence,
-        },
-        { github: this.github }
-      );
-
-      if (!writeback.ok) {
-        const reason = writeback.error ?? "Parent verification writeback failed";
-        return await this.escalateParentVerificationFailure(params.task, reason, verifyResult.sessionId);
-      }
-
-      recordIssueSnapshot({
-        repo: issueRef.repo,
-        issue: params.task.issue,
-        title: params.issueMeta.title,
-        state: "CLOSED",
-        url: issueUrl,
-      });
-
-      return await this.finalizeTaskSuccess({
-        task: params.task,
-        prUrl: null,
-        completionKind: "verified",
-        sessionId: verifyResult.sessionId || params.task["session-id"]?.trim() || "",
-        startTime: params.startTime,
-        cacheKey: verifyCacheKey,
-        opencodeXdg: params.opencodeXdg,
-        worktreePath: params.worktreePath,
-        workerId: params.workerId,
-        repoSlot: typeof params.allocatedSlot === "number" ? String(params.allocatedSlot) : undefined,
-        notify: true,
-        logMessage: `Task verified without changes: ${params.task.name}`,
-      });
-    } finally {
-      if (dirtyWorktree) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Parent verification worktree left for inspection: ${verifyWorktreePath}`
-        );
-      }
-
-      if (!dirtyWorktree) {
-        try {
-          await this.cleanupGitWorktree(verifyWorktreePath);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to cleanup parent verification worktree: ${error?.message ?? String(error)}`
-          );
-        }
-      }
-    }
+    void params;
+    return null;
   }
 
   async processTask(task: AgentTask, opts?: { repoSlot?: number | null }): Promise<AgentRun> {
@@ -5796,6 +5624,7 @@ export class RepoWorker {
         task,
         issueNumber,
         issueMeta,
+        startTime,
         opencodeXdg,
         opencodeSessionOptions,
       });

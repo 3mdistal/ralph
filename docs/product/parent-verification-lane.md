@@ -22,17 +22,27 @@ The verifier must emit a last-line marker:
 
 `RALPH_PARENT_VERIFY: {"version":1,"work_remains":true|false,"reason":"..."}`
 
-The JSON object may include additional keys for observability, for example:
+Optional keys (required when `work_remains=false`):
 
 - `confidence`: `high|medium|low`
-- `evidence`: array of URLs/issue references that support the determination
+- `checked`: array of short strings describing what was verified
+- `why_satisfied`: short rationale (1-2 sentences)
+- `evidence`: array of objects: `{ "url": "...", "note": "..." }`
 
 ## Outcomes
 
 - `work_remains=true`: record outcome and proceed to the normal implementation pipeline.
 - `work_remains=false`: record outcome and either:
-  - close the issue automatically when confidence and evidence are strong, or
-  - escalate with a "close or clarify" summary when the result is opinionated/inconclusive.
+  - post a structured verification comment and close the issue when confidence is medium/high and evidence is strong, or
+  - escalate with a "close or clarify" summary when confidence/evidence is weak.
+
+### Verification comment (v1)
+
+When `work_remains=false` with strong evidence:
+
+- include a hidden marker: `<!-- ralph-verify:v1 id=ISSUE_NUMBER -->`
+- include a JSON block like:
+  `RALPH_VERIFY: {"version":1,"work_remains":false,"confidence":"medium|high","checked":["..."],"why_satisfied":"...","evidence":[{"url":"...","note":"..."}]}`
 
 ## Failure handling
 

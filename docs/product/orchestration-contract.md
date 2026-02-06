@@ -101,15 +101,22 @@ GitHub label writes are best-effort. When throttled/blocked by GitHub rate limit
 ## Issue closure policy (target)
 
 - Ralph closes issues when `ralph:status:done` is reached.
-- Rollup PRs may also close issues via `Fixes #N`, but the operator-visible definition is "done == reconciled to default branch".
+- Rollup PRs may also close issues via `Fixes #N`.
+- Parent-verification-only completion (no PR) may close the issue when the verification comment contract is satisfied.
 
 ## Done semantics (deterministic)
 
-`ralph:status:done` is derived from merged PR evidence:
+`ralph:status:done` is derived from deterministic completion evidence:
 
-- Ralph uses GitHub issue timeline events to identify the closing PR.
-- Ralph then verifies the merge commit SHA (or equivalent head SHA) is reachable from the repo default branch head.
-- If verified, it sets `ralph:status:done` and closes the issue.
+1) **Merged PR evidence (default).**
+   - Ralph uses GitHub issue timeline events to identify the closing PR.
+   - Ralph verifies the merge commit SHA (or equivalent head SHA) is reachable from the repo default branch head.
+   - If verified, it sets `ralph:status:done` and closes the issue.
+
+2) **Parent verification (no PR).**
+   - Only when the parent verification lane concludes `work_remains=false` with `confidence=medium|high`.
+   - Ralph posts/updates a structured verification comment (`ralph-verify:v1`) and treats that comment as completion evidence.
+   - After the verification comment is written, it sets `ralph:status:done` and closes the issue.
 
 ## Label bootstrap
 

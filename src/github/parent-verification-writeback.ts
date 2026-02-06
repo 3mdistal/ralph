@@ -1,14 +1,20 @@
 import { GitHubClient, splitRepoFullName } from "./client";
 import { initStateDb, hasIdempotencyKey, recordIdempotencyKey, deleteIdempotencyKey } from "../state";
-import { buildParentVerificationComment, type ParentVerificationEvidence } from "../parent-verification/core";
 import { executeIssueLabelOps, planIssueLabelOps } from "./issue-label-io";
-import type { IssueRef } from "./issue-ref";
+import { RALPH_LABEL_STATUS_DONE } from "../github-labels";
+import type { ParentVerificationConfidence, ParentVerificationEvidence } from "../parent-verification";
+
+export type ParentVerificationCommentPayload = {
+  confidence: ParentVerificationConfidence;
+  checked: string[];
+  whySatisfied: string;
+  evidence: ParentVerificationEvidence[];
+};
 
 export type ParentVerificationContext = {
   repo: string;
   issueNumber: number;
-  childIssues: IssueRef[];
-  evidence: ParentVerificationEvidence[];
+  payload: ParentVerificationCommentPayload;
 };
 
 export type ParentVerificationWritebackResult = {
@@ -25,10 +31,15 @@ type WritebackDeps = {
   log?: (message: string) => void;
 };
 
-type IssueComment = { body?: string | null; databaseId?: number | null; url?: string | null };
+type IssueComment = {
+  body?: string | null;
+  databaseId?: number | null;
+  url?: string | null;
+  createdAt?: string | null;
+};
 
-const MARKER_PREFIX = "<!-- ralph-parent-verify:id=";
-const MARKER_REGEX = /<!--\s*ralph-parent-verify:id=([^\s]+)\s*-->/i;
+const MARKER_PREFIX = "<!-- ralph-verify:v1 id=";
+const MARKER_REGEX = /<!--\s*ralph-verify:v1\s+id=([^\s]+)\s*-->/i;
 const DEFAULT_COMMENT_SCAN_LIMIT = 100;
 const LABELS_TO_REMOVE = [
   "ralph:status:queued",
@@ -36,32 +47,73 @@ const LABELS_TO_REMOVE = [
   "ralph:status:paused",
   "ralph:status:escalated",
   "ralph:status:in-bot",
-  "ralph:status:done",
   "ralph:status:stopped",
 ];
 
-function hashFNV1a(input: string): string {
-  let hash = 2166136261;
-  for (let i = 0; i < input.length; i += 1) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 16777619) >>> 0;
-  }
-  return hash.toString(16).padStart(8, "0");
+const MAX_CHECKED_ITEMS = 20;
+const MAX_EVIDENCE_ITEMS = 20;
+const MAX_TEXT_LENGTH = 300;
+
+function trimText(value: unknown, maxLen = MAX_TEXT_LENGTH): string {
+  const text = String(value ?? "").trim();
+  if (!text) return "";
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen).trimEnd();
 }
 
-function buildMarkerId(params: { repo: string; issueNumber: number }): string {
-  const base = `parent-verify:v1|${params.repo}|${params.issueNumber}`;
-  return `${hashFNV1a(base)}${hashFNV1a(base.split("").reverse().join(""))}`.slice(0, 12);
-}
-
-function buildMarker(params: { repo: string; issueNumber: number }): string {
-  const markerId = buildMarkerId(params);
-  return `${MARKER_PREFIX}${markerId} -->`;
+export function buildMarker(params: { issueNumber: number }): string {
+  return `${MARKER_PREFIX}${params.issueNumber} -->`;
 }
 
 function extractExistingMarker(body: string): string | null {
   const match = body.match(MARKER_REGEX);
   return match?.[1] ?? null;
+}
+
+function sanitizePayload(payload: ParentVerificationCommentPayload): ParentVerificationCommentPayload {
+  const checked: string[] = [];
+  for (const entry of payload.checked) {
+    if (checked.length >= MAX_CHECKED_ITEMS) break;
+    const text = trimText(entry);
+    if (text) checked.push(text);
+  }
+
+  const evidence: ParentVerificationEvidence[] = [];
+  for (const entry of payload.evidence) {
+    if (evidence.length >= MAX_EVIDENCE_ITEMS) break;
+    const url = trimText(entry?.url);
+    if (!url) continue;
+    const note = trimText(entry?.note);
+    evidence.push(note ? { url, note } : { url });
+  }
+
+  return {
+    confidence: payload.confidence,
+    checked,
+    whySatisfied: trimText(payload.whySatisfied) || "Verified completion via parent verification.",
+    evidence,
+  };
+}
+
+export function buildParentVerificationComment(params: {
+  marker: string;
+  payload: ParentVerificationCommentPayload;
+}): string {
+  const payload = sanitizePayload(params.payload);
+  const markerJson = JSON.stringify({
+    version: 1,
+    work_remains: false,
+    confidence: payload.confidence,
+    checked: payload.checked,
+    why_satisfied: payload.whySatisfied,
+    evidence: payload.evidence,
+  });
+
+  return [
+    params.marker,
+    "Verification complete — no PR needed.",
+    `RALPH_VERIFY: ${markerJson}`,
+  ].join("\n");
 }
 
 async function listRecentIssueComments(params: {
@@ -79,6 +131,7 @@ async function listRecentIssueComments(params: {
           body
           databaseId
           url
+          createdAt
         }
         pageInfo {
           hasPreviousPage
@@ -93,7 +146,12 @@ async function listRecentIssueComments(params: {
       repository?: {
         issue?: {
           comments?: {
-            nodes?: Array<{ body?: string | null; databaseId?: number | null; url?: string | null }>;
+            nodes?: Array<{
+              body?: string | null;
+              databaseId?: number | null;
+              url?: string | null;
+              createdAt?: string | null;
+            }>;
             pageInfo?: { hasPreviousPage?: boolean };
           };
         };
@@ -112,10 +170,56 @@ async function listRecentIssueComments(params: {
     body: node?.body ?? "",
     databaseId: typeof node?.databaseId === "number" ? node.databaseId : null,
     url: node?.url ?? null,
+    createdAt: node?.createdAt ?? null,
   }));
   const reachedMax = Boolean(response.data?.data?.repository?.issue?.comments?.pageInfo?.hasPreviousPage);
 
   return { comments, reachedMax };
+}
+
+function toTimestamp(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function planVerificationCommentWrite(params: {
+  desiredBody: string;
+  markerId: string;
+  marker: string;
+  scannedComments: IssueComment[];
+}): {
+  action: "noop" | "patch" | "post";
+  markerFound: boolean;
+  targetCommentId?: number | null;
+  targetCommentUrl?: string | null;
+} {
+  const desired = params.desiredBody.trim();
+  const matches = params.scannedComments.filter((comment) => {
+    const body = comment.body ?? "";
+    const found = extractExistingMarker(body);
+    return found ? found.toLowerCase() === params.markerId.toLowerCase() : body.includes(params.marker);
+  });
+
+  if (!matches.length) {
+    return { action: "post", markerFound: false };
+  }
+
+  const selected = matches.reduce((latest, current) => {
+    const latestTs = toTimestamp(latest.createdAt);
+    const currentTs = toTimestamp(current.createdAt);
+    return currentTs >= latestTs ? current : latest;
+  }, matches[0]);
+
+  const existing = String(selected.body ?? "").trim();
+  const action = existing === desired ? "noop" : "patch";
+
+  return {
+    action,
+    markerFound: true,
+    targetCommentId: selected.databaseId ?? null,
+    targetCommentUrl: selected.url ?? null,
+  };
 }
 
 async function createIssueComment(params: {
@@ -167,10 +271,10 @@ export async function writeParentVerificationToGitHub(
   initStateDb();
   const log = deps.log ?? console.log;
   const commentLimit = Math.min(Math.max(1, deps.commentScanLimit ?? DEFAULT_COMMENT_SCAN_LIMIT), 100);
-  const marker = buildMarker({ repo: ctx.repo, issueNumber: ctx.issueNumber });
-  const markerId = buildMarkerId({ repo: ctx.repo, issueNumber: ctx.issueNumber });
-  const commentBody = buildParentVerificationComment({ marker, childIssues: ctx.childIssues, evidence: ctx.evidence });
-  const idempotencyKey = `gh-parent-verify:${ctx.repo}#${ctx.issueNumber}:${markerId}`;
+  const marker = buildMarker({ issueNumber: ctx.issueNumber });
+  const markerId = String(ctx.issueNumber);
+  const commentBody = buildParentVerificationComment({ marker, payload: ctx.payload });
+  const idempotencyKey = `gh-parent-verify:${ctx.repo}#${ctx.issueNumber}:verify-v1`;
   const prefix = `[ralph:gh-parent-verify:${ctx.repo}]`;
 
   let commentOk = false;
@@ -188,30 +292,46 @@ export async function writeParentVerificationToGitHub(
     log(`${prefix} Failed to list issue comments: ${error?.message ?? String(error)}`);
   }
 
-  const markerFoundComment = listResult?.comments.find((comment) => {
-    const body = comment.body ?? "";
-    const found = extractExistingMarker(body);
-    return found ? found.toLowerCase() === markerId.toLowerCase() : body.includes(marker);
-  });
+  const plan = listResult
+    ? planVerificationCommentWrite({
+        desiredBody: commentBody,
+        markerId,
+        marker,
+        scannedComments: listResult.comments,
+      })
+    : null;
 
-  if (markerFoundComment) {
+  if (plan?.action === "noop") {
     commentOk = true;
-    const commentId = markerFoundComment.databaseId ?? null;
-    commentUrl = markerFoundComment.url ?? null;
-    if (commentId) {
-      try {
-        const updated = await updateIssueComment({
-          github: deps.github,
-          repo: ctx.repo,
-          commentId,
-          body: commentBody,
-        });
-        commentUrl = updated?.html_url ?? commentUrl;
-      } catch (error: any) {
-        log(`${prefix} Failed to update existing verification comment: ${error?.message ?? String(error)}`);
-      }
-    }
+    commentUrl = plan.targetCommentUrl ?? null;
     recordIdempotencyKey({ key: idempotencyKey, scope: "gh-parent-verify" });
+  }
+
+  if (plan?.action === "patch") {
+    const commentId = plan.targetCommentId ?? null;
+    commentUrl = plan.targetCommentUrl ?? null;
+    if (!commentId) {
+      return { ok: false, closed: false, labelOpsApplied: false, commentUrl, error: "Verification comment missing id" };
+    }
+    try {
+      const updated = await updateIssueComment({
+        github: deps.github,
+        repo: ctx.repo,
+        commentId,
+        body: commentBody,
+      });
+      commentUrl = updated?.html_url ?? commentUrl;
+      commentOk = true;
+      recordIdempotencyKey({ key: idempotencyKey, scope: "gh-parent-verify" });
+    } catch (error: any) {
+      return {
+        ok: false,
+        closed: false,
+        labelOpsApplied: false,
+        commentUrl,
+        error: `Failed to update verification comment: ${error?.message ?? String(error)}`,
+      };
+    }
   }
 
   if (!commentOk) {
@@ -255,21 +375,9 @@ export async function writeParentVerificationToGitHub(
     return { ok: false, closed: false, labelOpsApplied: false, error: "Verification comment missing" };
   }
 
-  try {
-    await closeIssue({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber });
-  } catch (error: any) {
-    return {
-      ok: false,
-      closed: false,
-      labelOpsApplied: false,
-      commentUrl,
-      error: `Failed to close issue: ${error?.message ?? String(error)}`,
-    };
-  }
-
   let labelOpsApplied = false;
   try {
-    const ops = planIssueLabelOps({ add: [], remove: LABELS_TO_REMOVE });
+    const ops = planIssueLabelOps({ add: [RALPH_LABEL_STATUS_DONE], remove: LABELS_TO_REMOVE });
     const result = await executeIssueLabelOps({
       github: deps.github,
       repo: ctx.repo,
@@ -283,6 +391,18 @@ export async function writeParentVerificationToGitHub(
     labelOpsApplied = result.ok || result.kind === "transient";
   } catch (error: any) {
     log(`${prefix} Failed to remove verification labels: ${error?.message ?? String(error)}`);
+  }
+
+  try {
+    await closeIssue({ github: deps.github, repo: ctx.repo, issueNumber: ctx.issueNumber });
+  } catch (error: any) {
+    return {
+      ok: false,
+      closed: false,
+      labelOpsApplied,
+      commentUrl,
+      error: `Failed to close issue: ${error?.message ?? String(error)}`,
+    };
   }
 
   return { ok: true, commentUrl, closed: true, labelOpsApplied };

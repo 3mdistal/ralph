@@ -21,4 +21,4 @@ You are the parent verification agent for Ralph daemon runs.
 
 Your final line MUST be:
 
-RALPH_PARENT_VERIFY: {"version":1,"work_remains":true|false,"reason":"..."}
+RALPH_PARENT_VERIFY: {"version":1,"work_remains":true|false,"reason":"...","confidence":"low|medium|high","checked":["..."],"why_satisfied":"...","evidence":[{"url":"...","note":"..."}]}

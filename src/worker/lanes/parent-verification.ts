@@ -14,6 +14,10 @@ import type { RunSessionOptionsBase, SessionResult } from "../../session";
 import type { EscalationType } from "../../github/escalation-constants";
 import type { EscalationContext } from "../../notify";
 import type { AgentRun } from "../repo-worker";
+import type {
+  ParentVerificationCommentPayload,
+  ParentVerificationWritebackResult,
+} from "../../github/parent-verification-writeback";
 
 type UpdateTaskStatus = (
   task: AgentTask,
@@ -82,6 +86,12 @@ export type ParentVerificationLaneDeps = {
     details?: string;
     escalationType: EscalationType;
   }) => Promise<string | null>;
+  writeParentVerificationToGitHub: (params: {
+    repo: string;
+    issueNumber: number;
+    payload: ParentVerificationCommentPayload;
+  }) => Promise<ParentVerificationWritebackResult>;
+  finalizeVerifiedTask: (params: { sessionId: string; cacheKey: string }) => Promise<AgentRun>;
   notifyEscalation: (params: EscalationContext) => Promise<boolean>;
   recordEscalatedRunNote: (task: AgentTask, params: {
     reason: string;
@@ -161,6 +171,7 @@ export async function maybeRunParentVerificationLane(params: ParentVerificationL
   }
 
   const attemptCount = claimed.attemptCount;
+  const verifyCacheKey = `parent-verify-${params.issueNumber}`;
   await params.recordRunLogPath(params.task, params.issueNumber, "parent-verify", "queued");
   const issueContext = await params.buildIssueContextForAgent({ repo: params.repo, issueNumber: params.issueNumber });
   const prompt = buildParentVerificationPrompt({
@@ -173,7 +184,7 @@ export async function maybeRunParentVerificationLane(params: ParentVerificationL
   try {
     result = await params.runAgent(params.repoPath, "ralph-parent-verify", prompt, {
       repo: params.repo,
-      cacheKey: `parent-verify-${params.issueNumber}`,
+      cacheKey: verifyCacheKey,
       introspection: {
         repo: params.repo,
         issue: params.task.issue,
@@ -216,7 +227,7 @@ export async function maybeRunParentVerificationLane(params: ParentVerificationL
   }
 
   if (result.loopTrip) {
-    return await params.handleLoopTrip(params.task, `parent-verify-${params.issueNumber}`, "parent-verify", result);
+    return await params.handleLoopTrip(params.task, verifyCacheKey, "parent-verify", result);
   }
 
   if (!result.success) {
@@ -302,7 +313,80 @@ export async function maybeRunParentVerificationLane(params: ParentVerificationL
     nowMs,
   });
 
-  const reason = `Parent verification: no remaining work. ${parsedMarker.reason}`;
+  const confidence = parsedMarker.confidence ?? "low";
+  const checked = parsedMarker.checked ?? [];
+  const evidence = parsedMarker.evidence ?? [];
+  const whySatisfied = parsedMarker.why_satisfied ?? parsedMarker.reason;
+  const hasStrongConfidence = confidence === "medium" || confidence === "high";
+  const completionReady = hasStrongConfidence && checked.length > 0 && evidence.length > 0;
+
+  if (completionReady) {
+    const writeback = await params.writeParentVerificationToGitHub({
+      repo: params.repo,
+      issueNumber: parsedIssueNumber,
+      payload: {
+        confidence,
+        checked,
+        whySatisfied,
+        evidence,
+      },
+    });
+
+    if (!writeback.ok) {
+      const reason = writeback.error ?? "Parent verification writeback failed";
+      const wasEscalated = params.task.status === "escalated";
+      const escalated = await params.updateTaskStatus(params.task, "escalated", {
+        "daemon-id": "",
+        "heartbeat-at": "",
+      });
+      if (escalated) {
+        params.applyTaskPatch(params.task, "escalated", {
+          "daemon-id": "",
+          "heartbeat-at": "",
+        });
+      }
+
+      await params.writeEscalationWriteback(params.task, {
+        reason,
+        details: parsedMarker.reason,
+        escalationType: "other",
+      });
+      await params.notifyEscalation({
+        taskName: params.task.name,
+        taskFileName: params.task._name,
+        taskPath: params.task._path,
+        issue: params.task.issue,
+        repo: params.repo,
+        sessionId: result.sessionId || params.task["session-id"]?.trim() || undefined,
+        reason,
+        escalationType: "other",
+        planOutput: result.output,
+      });
+
+      if (escalated && !wasEscalated) {
+        await params.recordEscalatedRunNote(params.task, {
+          reason,
+          sessionId: result.sessionId,
+          details: result.output,
+        });
+      }
+
+      return {
+        taskName: params.task.name,
+        repo: params.repo,
+        outcome: "escalated",
+        sessionId: result.sessionId || undefined,
+        escalationReason: reason,
+      };
+    }
+
+    const sessionId = result.sessionId || params.task["session-id"]?.trim() || "";
+    return await params.finalizeVerifiedTask({ sessionId, cacheKey: verifyCacheKey });
+  }
+
+  const reason =
+    `Close or clarify: parent verification found no remaining work, but confidence/evidence are insufficient ` +
+    `(confidence=${confidence}, checked=${checked.length}, evidence=${evidence.length}).`;
   const wasEscalated = params.task.status === "escalated";
   const escalated = await params.updateTaskStatus(params.task, "escalated", {
     "daemon-id": "",
@@ -315,7 +399,11 @@ export async function maybeRunParentVerificationLane(params: ParentVerificationL
     });
   }
 
-  await params.writeEscalationWriteback(params.task, { reason, details: parsedMarker.reason, escalationType: "other" });
+  await params.writeEscalationWriteback(params.task, {
+    reason,
+    details: parsedMarker.reason,
+    escalationType: "low-confidence",
+  });
   await params.notifyEscalation({
     taskName: params.task.name,
     taskFileName: params.task._name,
@@ -324,7 +412,7 @@ export async function maybeRunParentVerificationLane(params: ParentVerificationL
     repo: params.repo,
     sessionId: result.sessionId || params.task["session-id"]?.trim() || undefined,
     reason,
-    escalationType: "other",
+    escalationType: "low-confidence",
     planOutput: result.output,
   });
 

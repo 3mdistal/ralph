@@ -168,7 +168,7 @@ export function parseParentVerificationOutput(output: string): ParentVerificatio
   };
 }
 
-export function buildParentVerificationComment(params: {
+function buildParentVerificationComment(params: {
   marker: string;
   childIssues: IssueRef[];
   evidence: ParentVerificationEvidence[];
