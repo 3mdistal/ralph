@@ -12,9 +12,9 @@ import {
   RALPH_LABEL_QUEUED,
   RALPH_LABEL_STUCK,
   RALPH_ESCALATION_MARKER_REGEX,
-  RALPH_RESOLVED_TEXT,
   type EscalationType,
 } from "./escalation-constants";
+import { RALPH_LABEL_CMD_QUEUE } from "../github-labels";
 import { GitHubApiError, GitHubClient, splitRepoFullName } from "./client";
 import { ensureRalphWorkflowLabelsOnce } from "./ensure-ralph-workflow-labels";
 import { executeIssueLabelOps, type LabelOp } from "./issue-label-io";
@@ -205,10 +205,8 @@ export function buildEscalationComment(params: {
     details || null,
     "",
     "To resolve:",
-    `1. Comment with \`${RALPH_RESOLVED_TEXT} <guidance>\` to resume with guidance.`,
-    `2. Or re-add the \`${RALPH_LABEL_QUEUED}\` label to resume without extra guidance. Ralph will remove \`${
-      RALPH_LABEL_ESCALATED
-    }\`.`,
+    "1. Reply with any guidance for the agent.",
+    `2. Apply the \`${RALPH_LABEL_CMD_QUEUE}\` label to resume. Ralph will remove \`${RALPH_LABEL_ESCALATED}\`.`,
   ].join("\n");
 }
 

@@ -1,9 +1,7 @@
 import { type RepoConfig } from "../config";
 import { isRepoAllowed } from "../github-app-auth";
-import { shouldLog } from "../logging";
 import type { SchedulerTimers } from "../scheduler";
 import { getRepoGithubIssueLastSyncAt } from "../state";
-import { reconcileEscalationResolutions } from "./escalation-resolution";
 import { syncRepoIssuesOnce } from "./issues-sync-service";
 import type { SyncResult } from "./issues-sync-types";
 
@@ -22,7 +20,6 @@ const DEFAULT_BACKOFF_MULTIPLIER = 1.5;
 const DEFAULT_ERROR_MULTIPLIER = 2;
 const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
-const ESCALATION_RECONCILE_MIN_INTERVAL_MS = 60_000;
 
 const DEFAULT_REPO_POLLER_DEPS: RepoPollerDeps = {
   nowMs: () => Date.now(),
@@ -155,24 +152,6 @@ function startRepoPoller(params: {
           `ralph=${result.ralphCount} cursor=${lastSyncAt ?? "none"}->${result.newLastSyncAt ?? "none"} ` +
           `delayMs=${delayMs}${limitInfo}${cursorInvalidInfo}`
       );
-
-      const nowMs = deps.nowMs();
-      const elapsedMs = nowMs - lastEscalationReconcileAt;
-      if (elapsedMs < ESCALATION_RECONCILE_MIN_INTERVAL_MS) {
-        if (shouldLog(`ralph:gh-sync:${repoLabel}:escalation-defer`, ESCALATION_RECONCILE_MIN_INTERVAL_MS)) {
-          const remaining = Math.max(0, ESCALATION_RECONCILE_MIN_INTERVAL_MS - elapsedMs);
-          params.log(`[ralph:gh-sync:${repoLabel}] escalation reconcile deferred for ${Math.round(remaining / 1000)}s`);
-        }
-      } else {
-        lastEscalationReconcileAt = nowMs;
-        try {
-          await reconcileEscalationResolutions({ repo: repoName, log: params.log });
-        } catch (error: any) {
-          params.log(
-            `[ralph:gh-sync:${repoLabel}] escalation resolution reconcile failed: ${error?.message ?? String(error)}`
-          );
-        }
-      }
 
       if (params.onSync) {
         params.onSync({ repo: repoName, result });
