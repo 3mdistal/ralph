@@ -7,8 +7,8 @@ const env = ((globalThis as any).process?.env ?? {}) as Record<string, string | 
 export const PARENT_VERIFY_MARKER_PREFIX = "RALPH_PARENT_VERIFY";
 export const PARENT_VERIFY_MARKER_VERSION = 1;
 
-export const PARENT_VERIFY_CONFIDENCE_LEVELS = ["low", "medium", "high"] as const;
-export type ParentVerificationConfidence = (typeof PARENT_VERIFY_CONFIDENCE_LEVELS)[number];
+const PARENT_VERIFY_CONFIDENCE_LEVELS = ["low", "medium", "high"] as const;
+export type ParentVerificationConfidence = "low" | "medium" | "high";
 
 export type ParentVerificationEvidenceItem = {
   url: string;
