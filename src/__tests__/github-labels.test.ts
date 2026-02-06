@@ -120,4 +120,12 @@ describe("computeRalphLabelSync", () => {
     const paused = RALPH_WORKFLOW_LABELS.find((label) => label.name === "ralph:status:paused");
     expect(paused?.description).toBe("Operator pause; do not claim or resume");
   });
+
+  test("includes canonical priority labels", () => {
+    const priorities = ["ralph:priority:p0", "ralph:priority:p1", "ralph:priority:p2", "ralph:priority:p3", "ralph:priority:p4"];
+    const names = new Set(RALPH_WORKFLOW_LABELS.map((label) => label.name));
+    for (const priority of priorities) {
+      expect(names.has(priority)).toBe(true);
+    }
+  });
 });

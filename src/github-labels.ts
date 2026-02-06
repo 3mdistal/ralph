@@ -1,3 +1,5 @@
+import { RALPH_PRIORITY_LABELS } from "./queue/priority";
+
 export interface LabelSpec {
   name: string;
   color: string; // 6-char hex, no leading '#'
@@ -55,6 +57,13 @@ export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   { name: RALPH_LABEL_CMD_PAUSE, color: "C5DEF5", description: "Command: pause" },
   { name: RALPH_LABEL_CMD_STOP, color: "C5DEF5", description: "Command: stop" },
   { name: RALPH_LABEL_CMD_SATISFY, color: "C5DEF5", description: "Command: mark satisfied" },
+
+  // Priority (operator-owned)
+  { name: RALPH_PRIORITY_LABELS[0], color: "B60205", description: "Priority 0 (critical / blocker)" },
+  { name: RALPH_PRIORITY_LABELS[1], color: "D93F0B", description: "Priority 1 (high)" },
+  { name: RALPH_PRIORITY_LABELS[2], color: "FBCA04", description: "Priority 2 (medium)" },
+  { name: RALPH_PRIORITY_LABELS[3], color: "0E8A16", description: "Priority 3 (low)" },
+  { name: RALPH_PRIORITY_LABELS[4], color: "C5DEF5", description: "Priority 4 (backlog)" },
 
   // Intent (operator-owned)
   { name: "ralph:intent:implement", color: "0B5FFF", description: "Implementation pipeline" },
