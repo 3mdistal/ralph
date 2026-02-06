@@ -116,6 +116,8 @@ Minimum payload:
 - any new tests added + why they matter
 - consistency/reuse notes (what existing patterns/modules this should match, or why new code is justified)
 
+Review inputs must reference a diff artifact (path or persisted artifact id) plus `git diff --stat` output. Do not paste full diff text into the prompt; use the artifact reference to avoid truncated-context drift.
+
 This gate is complete when the review agents return explicit `pass|fail` and (if `fail`) an actionable reason.
 
 Deterministic review output contract:
