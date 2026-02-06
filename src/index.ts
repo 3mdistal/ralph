@@ -49,7 +49,12 @@ import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 import { createPrioritySelectorState } from "./scheduler/priority-policy";
-import { issuePriorityWeight, normalizeTaskPriority, RALPH_PRIORITY_LABELS, toRalphPriorityLabel } from "./queue/priority";
+import {
+  issuePriorityWeight,
+  normalizePriorityInputToRalphPriorityLabel,
+  normalizeTaskPriority,
+  planRalphPriorityLabelSet,
+} from "./queue/priority";
 
 import { DrainMonitor, readControlStateSnapshot, resolveControlFilePath, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
@@ -78,6 +83,7 @@ import { resolveGitHubToken } from "./github-auth";
 import { GitHubClient } from "./github/client";
 import { parseIssueRef } from "./github/issue-ref";
 import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
+import { ensureRalphWorkflowLabelsOnce } from "./github/ensure-ralph-workflow-labels";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -1631,11 +1637,12 @@ async function main(): Promise<void> {
               if (!token) throw new Error("GitHub auth is not configured");
 
               const github = new GitHubClient(issueRef.repo, { getToken: resolveGitHubToken });
-              const targetLabel = toRalphPriorityLabel(normalized);
+              const canonicalLabel = normalizePriorityInputToRalphPriorityLabel(priority);
+              const labelPlan = planRalphPriorityLabelSet(canonicalLabel);
 
               const ops = planIssueLabelOps({
-                add: [targetLabel],
-                remove: RALPH_PRIORITY_LABELS.filter((label) => label !== targetLabel),
+                add: labelPlan.add,
+                remove: labelPlan.remove,
               });
 
               const result = await executeIssueLabelOps({
@@ -1643,6 +1650,9 @@ async function main(): Promise<void> {
                 repo: issueRef.repo,
                 issueNumber: issueRef.number,
                 ops,
+                ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: issueRef.repo, github }),
+                ensureBefore: true,
+                retryMissingLabelOnce: true,
               });
 
               if (!result.ok) {
@@ -1655,7 +1665,7 @@ async function main(): Promise<void> {
                 level: "info",
                 repo: issueRef.repo,
                 taskId,
-                data: { message: `Set priority ${targetLabel} on ${issueRef.repo}#${issueRef.number}` },
+                data: { message: `Set priority ${canonicalLabel} on ${issueRef.repo}#${issueRef.number}` },
               });
 
               return;

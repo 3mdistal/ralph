@@ -118,7 +118,7 @@ GitHub label writes are best-effort. When throttled/blocked by GitHub rate limit
 
 ## Label bootstrap
 
-Ralph ensures all required `ralph:status:*` and `ralph:cmd:*` labels exist in the repo, and enforces their label descriptions/colors to match the version shipped with Ralph.
+Ralph ensures all required `ralph:status:*`, `ralph:cmd:*`, and `ralph:priority:*` labels exist in the repo, and enforces their label descriptions/colors to match the version shipped with Ralph.
 
 Required set (vNext):
 
