@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtemp, rm } from "fs/promises";
+import { mkdtemp, readdir, rm } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
@@ -50,14 +50,23 @@ import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
 let priorStateDbPath: string | undefined;
+let priorMigrationBusyTimeoutMs: string | undefined;
+let priorBackupBeforeMigrate: string | undefined;
+let priorBackupDir: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 describe("State SQLite (~/.ralph/state.sqlite)", () => {
   beforeEach(async () => {
     priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
+    priorMigrationBusyTimeoutMs = process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
+    priorBackupBeforeMigrate = process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
+    priorBackupDir = process.env.RALPH_STATE_DB_BACKUP_DIR;
     releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
+    delete process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
+    delete process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
+    delete process.env.RALPH_STATE_DB_BACKUP_DIR;
     closeStateDbForTests();
   });
 
@@ -71,8 +80,118 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       } else {
         process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
       }
+      if (priorMigrationBusyTimeoutMs === undefined) {
+        delete process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
+      } else {
+        process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS = priorMigrationBusyTimeoutMs;
+      }
+      if (priorBackupBeforeMigrate === undefined) {
+        delete process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
+      } else {
+        process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE = priorBackupBeforeMigrate;
+      }
+      if (priorBackupDir === undefined) {
+        delete process.env.RALPH_STATE_DB_BACKUP_DIR;
+      } else {
+        process.env.RALPH_STATE_DB_BACKUP_DIR = priorBackupDir;
+      }
       releaseLock?.();
       releaseLock = null;
+    }
+  });
+
+  test("refuses newer schema versions with actionable guidance", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '999')");
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    expect(() => initStateDb()).toThrow(/supported range=1\.\.15/);
+    expect(() => initStateDb()).toThrow(/delete ~\/\.ralph\/state\.sqlite/);
+  });
+
+  test("backs up state.sqlite before migration when enabled", async () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '7')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT NOT NULL,
+          task_name TEXT,
+          status TEXT,
+          session_id TEXT,
+          worktree_path TEXT,
+          worker_id TEXT,
+          repo_slot TEXT,
+          daemon_id TEXT,
+          heartbeat_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, task_path)
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE = "1";
+    process.env.RALPH_STATE_DB_BACKUP_DIR = join(homeDir, "backups");
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const backupFiles = await readdir(process.env.RALPH_STATE_DB_BACKUP_DIR);
+    expect(backupFiles.some((name) => name.startsWith("state.schema-v7."))).toBe(true);
+  });
+
+  test("fails deterministically when migration lock times out", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '7')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT NOT NULL,
+          status TEXT,
+          session_id TEXT,
+          worktree_path TEXT,
+          worker_id TEXT,
+          repo_slot TEXT,
+          daemon_id TEXT,
+          heartbeat_at TEXT,
+          created_at TEXT,
+          updated_at TEXT,
+          UNIQUE(repo_id, task_path)
+        )
+      `);
+    } finally {
+      db.close();
+    }
+
+    const lockDb = new Database(dbPath);
+    lockDb.exec("BEGIN IMMEDIATE");
+    process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS = "1";
+
+    closeStateDbForTests();
+    try {
+      expect(() => initStateDb()).toThrow(/migration lock timeout/);
+    } finally {
+      lockDb.exec("ROLLBACK");
+      lockDb.close();
     }
   });
   test("migrates schema from v3", () => {
@@ -348,6 +467,64 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'alert_deliveries'")
         .get() as { name?: string } | undefined;
       expect(deliveriesTable?.name).toBe("alert_deliveries");
+    } finally {
+      migrated.close();
+    }
+  });
+
+  test("fills missing v10+ columns idempotently during migration", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '9')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS repos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          local_path TEXT,
+          bot_branch TEXT,
+          label_write_last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT NOT NULL,
+          status TEXT,
+          session_id TEXT,
+          worktree_path TEXT,
+          worker_id TEXT,
+          repo_slot TEXT,
+          daemon_id TEXT,
+          heartbeat_at TEXT,
+          released_reason TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, task_path)
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const migrated = new Database(dbPath);
+    try {
+      const repoColumns = migrated.query("PRAGMA table_info(repos)").all() as Array<{ name: string }>;
+      const repoColumnNames = repoColumns.map((column) => column.name);
+      expect(repoColumnNames).toContain("label_write_blocked_until_ms");
+      expect(repoColumnNames).toContain("label_write_last_error");
+
+      const taskColumns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
+      const taskColumnNames = taskColumns.map((column) => column.name);
+      expect(taskColumnNames).toContain("released_at_ms");
+      expect(taskColumnNames).toContain("released_reason");
     } finally {
       migrated.close();
     }
