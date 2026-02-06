@@ -52,7 +52,7 @@ function isRalphPriorityLabel(label: string): label is RalphPriorityLabel {
   return parseRalphPriorityIndex(label) !== null;
 }
 
-export function toRalphPriorityLabel(priority: TaskPriority): RalphPriorityLabel {
+function toRalphPriorityLabel(priority: TaskPriority): RalphPriorityLabel {
   const index = PRIORITY_BY_INDEX.indexOf(priority);
   const clamped = index >= 0 ? index : PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY);
   return RALPH_PRIORITY_LABELS[clamped] ?? "ralph:priority:p2";
