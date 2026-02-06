@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { parseLastLineJsonMarker } from "../markers";
 import {
+  evaluateParentVerificationNoPrEligibility,
   getParentVerificationBackoffMs,
   parseParentVerificationMarker,
   PARENT_VERIFY_MARKER_PREFIX,
@@ -28,6 +29,39 @@ describe("parent verification markers", () => {
       const marker = parseParentVerificationMarker(parsed.value);
       expect(marker).toBe(null);
     }
+  });
+
+  test("accepts extended marker payload and no-pr eligibility", () => {
+    const payload = {
+      version: 1,
+      work_remains: false,
+      reason: "No implementation work remains",
+      confidence: "high",
+      checked: ["Reviewed child issues", "Checked acceptance criteria"],
+      why_satisfied: "Child work fully satisfies this parent issue.",
+      evidence: [{ url: "https://github.com/3mdistal/ralph/issues/1", note: "Child completion" }],
+    };
+    const marker = parseParentVerificationMarker(payload);
+    expect(marker).not.toBe(null);
+    if (!marker) return;
+    const eligibility = evaluateParentVerificationNoPrEligibility(marker);
+    expect(eligibility.ok).toBe(true);
+  });
+
+  test("rejects no-pr completion eligibility when confidence is low", () => {
+    const marker = parseParentVerificationMarker({
+      version: 1,
+      work_remains: false,
+      reason: "Probably done",
+      confidence: "low",
+      checked: ["Checked child issues"],
+      why_satisfied: "Likely done",
+      evidence: [{ url: "https://github.com/3mdistal/ralph/issues/1" }],
+    });
+    expect(marker).not.toBe(null);
+    if (!marker) return;
+    const eligibility = evaluateParentVerificationNoPrEligibility(marker);
+    expect(eligibility.ok).toBe(false);
   });
 
   test("backoff increases with attempts", () => {
