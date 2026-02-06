@@ -28,12 +28,26 @@ describe("github queue core", () => {
         repo: "3mdistal/ralph",
         number: 285,
         title: "Priority labels",
-        labels: ["p0-critical", "ralph:status:queued"],
+        labels: ["ralph:priority:p0", "ralph:status:queued"],
       },
       nowIso: "2026-01-23T00:00:00.000Z",
     });
 
     expect(task.priority).toBe("p0-critical");
+  });
+
+  test("deriveTaskView prefers ralph:priority labels", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 285,
+        title: "Priority labels",
+        labels: ["p0-critical", "ralph:priority:p3"],
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.priority).toBe("p3-low");
   });
 
   test("deriveTaskView prefers highest priority label", () => {

@@ -56,6 +56,13 @@ export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   { name: RALPH_LABEL_CMD_STOP, color: "C5DEF5", description: "Command: stop" },
   { name: RALPH_LABEL_CMD_SATISFY, color: "C5DEF5", description: "Command: mark satisfied" },
 
+  // Priority (operator-owned)
+  { name: "ralph:priority:p0", color: "B60205", description: "Priority 0 (critical / blocker)" },
+  { name: "ralph:priority:p1", color: "D93F0B", description: "Priority 1 (high)" },
+  { name: "ralph:priority:p2", color: "FBCA04", description: "Priority 2 (medium)" },
+  { name: "ralph:priority:p3", color: "0E8A16", description: "Priority 3 (low)" },
+  { name: "ralph:priority:p4", color: "C5DEF5", description: "Priority 4 (backlog)" },
+
   // Intent (operator-owned)
   { name: "ralph:intent:implement", color: "0B5FFF", description: "Implementation pipeline" },
   { name: "ralph:intent:review-fix", color: "0B5FFF", description: "PR review-fix autopilot" },
