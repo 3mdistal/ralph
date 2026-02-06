@@ -1,4 +1,5 @@
 import { parseDurationMs, parseTimestampMs, resolveTimeRange } from "../time-range";
+import { describe, expect, test } from "bun:test";
 
 describe("time-range", () => {
   test("parseDurationMs supports days", () => {
