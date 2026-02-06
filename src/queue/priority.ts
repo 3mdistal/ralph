@@ -48,7 +48,7 @@ function parseRalphPriorityIndex(value: string): number | null {
   return PRIORITY_BY_INDEX[index] ? index : null;
 }
 
-export function isRalphPriorityLabel(label: string): label is RalphPriorityLabel {
+function isRalphPriorityLabel(label: string): label is RalphPriorityLabel {
   return parseRalphPriorityIndex(label) !== null;
 }
 
