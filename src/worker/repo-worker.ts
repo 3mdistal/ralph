@@ -39,6 +39,7 @@ import {
 } from "../session";
 import { buildPlannerPrompt } from "../planner-prompt";
 import { maybeRunParentVerificationLane } from "./parent-verification-lane";
+import type { ParentVerificationMarker } from "../parent-verification";
 import { appendChildDossierToIssueContext } from "../child-dossier/core";
 import { collectChildCompletionDossier } from "../child-dossier/io";
 import { getThrottleDecision } from "../throttle";
@@ -89,7 +90,7 @@ import {
   parseParentVerificationOutput,
 } from "../parent-verification/core";
 import { collectParentVerificationEvidence } from "../parent-verification/io";
-import { writeParentVerificationToGitHub } from "../github/parent-verification-writeback";
+import { writeParentVerificationNoPrCompletion, writeParentVerificationToGitHub } from "../github/parent-verification-writeback";
 import {
   buildCiDebugCommentBody,
   createCiDebugComment,
@@ -4141,6 +4142,10 @@ export class RepoWorker {
     task: AgentTask;
     issueNumber: string;
     issueMeta: IssueMetadata;
+    startTime: Date;
+    cacheKey: string;
+    workerId?: string;
+    allocatedSlot?: number | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     opencodeSessionOptions?: RunSessionOptionsBase;
   }): Promise<AgentRun | null> {
@@ -4169,6 +4174,69 @@ export class RepoWorker {
       writeEscalationWriteback: this.writeEscalationWriteback.bind(this),
       notifyEscalation: this.notify.notifyEscalation.bind(this.notify),
       recordEscalatedRunNote: this.recordEscalatedRunNote.bind(this),
+      finalizeVerifiedNoPrCompletion: async ({ task, issueNumber, marker, sessionId, output }) => {
+        return await this.finalizeVerifiedNoPrCompletion({
+          task,
+          issueNumber,
+          marker,
+          startTime: params.startTime,
+          cacheKey: params.cacheKey,
+          sessionId,
+          output,
+          opencodeXdg: params.opencodeXdg,
+          workerId: params.workerId,
+          repoSlot: params.allocatedSlot,
+        });
+      },
+    });
+  }
+
+  private async finalizeVerifiedNoPrCompletion(params: {
+    task: AgentTask;
+    issueNumber: number;
+    marker: ParentVerificationMarker;
+    startTime: Date;
+    cacheKey: string;
+    sessionId?: string;
+    output?: string;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    workerId?: string;
+    repoSlot?: number | null;
+  }): Promise<AgentRun> {
+    const writeback = await writeParentVerificationNoPrCompletion(
+      {
+        repo: this.repo,
+        issueNumber: params.issueNumber,
+        marker: params.marker,
+      },
+      { github: this.github }
+    );
+
+    if (!writeback.ok) {
+      throw new Error(writeback.error ?? "Parent verification writeback failed");
+    }
+
+    const issueUrl = `https://github.com/${this.repo}/issues/${params.issueNumber}`;
+    recordIssueSnapshot({
+      repo: this.repo,
+      issue: params.task.issue,
+      state: "CLOSED",
+      url: issueUrl,
+    });
+
+    return await this.finalizeTaskSuccess({
+      task: params.task,
+      prUrl: null,
+      completionKind: "verified",
+      sessionId: params.sessionId || params.task["session-id"]?.trim() || "parent-verify-no-pr",
+      startTime: params.startTime,
+      cacheKey: `parent-verify-${params.cacheKey}`,
+      opencodeXdg: params.opencodeXdg,
+      workerId: params.workerId,
+      repoSlot: typeof params.repoSlot === "number" ? String(params.repoSlot) : undefined,
+      notify: true,
+      logMessage: `Task verified via comment-only completion: ${params.task.name}`,
+      surveyResults: params.output,
     });
   }
 
@@ -5796,6 +5864,10 @@ export class RepoWorker {
         task,
         issueNumber,
         issueMeta,
+        startTime,
+        cacheKey,
+        workerId,
+        allocatedSlot,
         opencodeXdg,
         opencodeSessionOptions,
       });
