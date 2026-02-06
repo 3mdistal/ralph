@@ -76,7 +76,7 @@ describe("gates command output", () => {
     const json = buildGatesJsonOutput({ repo: "3mdistal/ralph", issueNumber: 240, state });
 
     expect(json).toEqual({
-      version: 1,
+      version: 2,
       repo: "3mdistal/ralph",
       issueNumber: 240,
       runId,
@@ -86,6 +86,7 @@ describe("gates command output", () => {
           status: "fail",
           command: null,
           skipReason: null,
+          reason: null,
           url: "https://github.com/3mdistal/ralph/actions/runs/1200",
           prNumber: 240,
           prUrl: "https://github.com/3mdistal/ralph/pull/240",
@@ -95,6 +96,7 @@ describe("gates command output", () => {
           status: "pending",
           command: null,
           skipReason: null,
+          reason: null,
           url: null,
           prNumber: null,
           prUrl: null,
@@ -104,6 +106,7 @@ describe("gates command output", () => {
           status: "pending",
           command: null,
           skipReason: null,
+          reason: null,
           url: null,
           prNumber: null,
           prUrl: null,
@@ -113,6 +116,7 @@ describe("gates command output", () => {
           status: "pending",
           command: null,
           skipReason: null,
+          reason: null,
           url: null,
           prNumber: null,
           prUrl: null,

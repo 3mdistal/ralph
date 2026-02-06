@@ -165,13 +165,17 @@ async function ensureCmdComment(params: {
   }
 }
 
-async function processOneCommand(params: {
+type ProcessOneCommandParams = {
   repo: string;
   issueNumber: number;
   cmdLabel: CmdLabel;
   currentLabels: string[];
   issueState: string | null;
-}): Promise<{ processed: boolean; removedCmdLabel: boolean }> {
+};
+
+export async function processOneCommand(
+  params: ProcessOneCommandParams
+): Promise<{ processed: boolean; removedCmdLabel: boolean }> {
   const github = new GitHubClient(params.repo);
   const at = nowIso();
   const issueRef = `${params.repo}#${params.issueNumber}`;
@@ -419,6 +423,12 @@ async function processOneCommand(params: {
   }
 
   return { processed: true, removedCmdLabel };
+}
+
+export async function __processOneCommandForTests(
+  params: ProcessOneCommandParams
+): Promise<{ processed: boolean; removedCmdLabel: boolean }> {
+  return await processOneCommand(params);
 }
 
 async function processRepoOnce(repo: string, maxIssues: number): Promise<number> {

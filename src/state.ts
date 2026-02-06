@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "paused" | "throttled" | "escalated" | "failed";
@@ -289,6 +289,13 @@ function ensureSchema(database: Database): void {
           } catch {}
         }
       }
+      if (existingVersion < 16) {
+        if (tableExists("ralph_run_gate_results")) {
+          try {
+            database.exec("ALTER TABLE ralph_run_gate_results ADD COLUMN reason TEXT");
+          } catch {}
+        }
+      }
       if (existingVersion < 9) {
         database.exec(
           "CREATE TABLE IF NOT EXISTS issue_escalation_comment_checks (" +
@@ -360,6 +367,7 @@ function ensureSchema(database: Database): void {
             status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
             command TEXT,
             skip_reason TEXT,
+            reason TEXT,
             url TEXT,
             pr_number INTEGER,
             pr_url TEXT,
@@ -828,6 +836,7 @@ function ensureSchema(database: Database): void {
       status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
       command TEXT,
       skip_reason TEXT,
+      reason TEXT,
       url TEXT,
       pr_number INTEGER,
       pr_url TEXT,
@@ -2033,6 +2042,7 @@ type GateResultRow = {
   status: GateStatus;
   command: string | null;
   skipReason: string | null;
+  reason: string | null;
   url: string | null;
   prNumber: number | null;
   prUrl: string | null;
@@ -2120,6 +2130,7 @@ export function upsertRalphRunGateResult(params: {
   status?: GateStatus;
   command?: string | null;
   skipReason?: string | null;
+  reason?: string | null;
   url?: string | null;
   prNumber?: number | null;
   prUrl?: string | null;
@@ -2140,11 +2151,13 @@ export function upsertRalphRunGateResult(params: {
 
   const commandPatch = sanitizeOptionalText(params.command, 1000);
   const skipReasonPatch = sanitizeOptionalText(params.skipReason, 400);
+  const reasonPatch = sanitizeOptionalText(params.reason, 400);
   const urlPatch = sanitizeOptionalText(params.url, 500);
   const prUrlPatch = sanitizeOptionalText(params.prUrl, 500);
 
   const commandPatchFlag = commandPatch !== undefined ? 1 : 0;
   const skipReasonPatchFlag = skipReasonPatch !== undefined ? 1 : 0;
+  const reasonPatchFlag = reasonPatch !== undefined ? 1 : 0;
   const urlPatchFlag = urlPatch !== undefined ? 1 : 0;
   const prUrlPatchFlag = prUrlPatch !== undefined ? 1 : 0;
 
@@ -2163,14 +2176,15 @@ export function upsertRalphRunGateResult(params: {
   database
     .query(
       `INSERT INTO ralph_run_gate_results(
-         run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+         run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
        ) VALUES (
-         $run_id, $gate, $status_insert, $command, $skip_reason, $url, $pr_number, $pr_url, $repo_id, $issue_number, $task_path, $created_at, $updated_at
+         $run_id, $gate, $status_insert, $command, $skip_reason, $reason, $url, $pr_number, $pr_url, $repo_id, $issue_number, $task_path, $created_at, $updated_at
        )
        ON CONFLICT(run_id, gate) DO UPDATE SET
          status = CASE WHEN $status_patch = 1 THEN $status_update ELSE ralph_run_gate_results.status END,
          command = CASE WHEN $command_patch = 1 THEN excluded.command ELSE ralph_run_gate_results.command END,
          skip_reason = CASE WHEN $skip_reason_patch = 1 THEN excluded.skip_reason ELSE ralph_run_gate_results.skip_reason END,
+         reason = CASE WHEN $reason_patch = 1 THEN excluded.reason ELSE ralph_run_gate_results.reason END,
          url = CASE WHEN $url_patch = 1 THEN excluded.url ELSE ralph_run_gate_results.url END,
          pr_number = CASE WHEN $pr_number_patch = 1 THEN excluded.pr_number ELSE ralph_run_gate_results.pr_number END,
          pr_url = CASE WHEN $pr_url_patch = 1 THEN excluded.pr_url ELSE ralph_run_gate_results.pr_url END,
@@ -2186,6 +2200,8 @@ export function upsertRalphRunGateResult(params: {
       $command_patch: commandPatchFlag,
       $skip_reason: skipReasonPatch ?? null,
       $skip_reason_patch: skipReasonPatchFlag,
+      $reason: reasonPatch ?? null,
+      $reason_patch: reasonPatchFlag,
       $url: urlPatch ?? null,
       $url_patch: urlPatchFlag,
       $pr_number: prNumberValue,
@@ -2258,7 +2274,7 @@ export function getRalphRunGateState(runId: string): RalphRunGateState {
 
   const results = database
     .query(
-      `SELECT run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+       `SELECT run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
        FROM ralph_run_gate_results
        WHERE run_id = $run_id
        ORDER BY gate ASC`
@@ -2269,6 +2285,7 @@ export function getRalphRunGateState(runId: string): RalphRunGateState {
     status: string;
     command?: string | null;
     skip_reason?: string | null;
+    reason?: string | null;
     url?: string | null;
     pr_number?: number | null;
     pr_url?: string | null;
@@ -2306,6 +2323,7 @@ export function getRalphRunGateState(runId: string): RalphRunGateState {
       status: assertGateStatus(row.status),
       command: row.command ?? null,
       skipReason: row.skip_reason ?? null,
+      reason: row.reason ?? null,
       url: row.url ?? null,
       prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
       prUrl: row.pr_url ?? null,
@@ -2850,110 +2868,6 @@ export function getIssueSnapshotByNumber(repo: string, issueNumber: number): Iss
     githubUpdatedAt: row.github_updated_at ?? null,
     labels: parseLabelList(row.labels),
   };
-}
-
-export type EscalationCommentCheckState = {
-  lastCheckedAt: string | null;
-  lastSeenUpdatedAt: string | null;
-  lastResolvedCommentId: number | null;
-  lastResolvedCommentAt: string | null;
-};
-
-export function getEscalationCommentCheckState(
-  repo: string,
-  issueNumber: number
-): EscalationCommentCheckState | null {
-  const database = requireDb();
-  const row = database
-    .query(
-      `SELECT ecc.last_checked_at as last_checked_at,
-              ecc.last_seen_updated_at as last_seen_updated_at,
-              ecc.last_resolved_comment_id as last_resolved_comment_id,
-              ecc.last_resolved_comment_at as last_resolved_comment_at
-       FROM issue_escalation_comment_checks ecc
-       JOIN issues i ON i.id = ecc.issue_id
-       JOIN repos r ON r.id = i.repo_id
-       WHERE r.name = $name AND i.number = $number`
-    )
-    .get({ $name: repo, $number: issueNumber }) as
-    | {
-        last_checked_at?: string | null;
-        last_seen_updated_at?: string | null;
-        last_resolved_comment_id?: number | null;
-        last_resolved_comment_at?: string | null;
-      }
-    | undefined;
-
-  if (!row) return null;
-  return {
-    lastCheckedAt: row.last_checked_at ?? null,
-    lastSeenUpdatedAt: row.last_seen_updated_at ?? null,
-    lastResolvedCommentId: row.last_resolved_comment_id ?? null,
-    lastResolvedCommentAt: row.last_resolved_comment_at ?? null,
-  };
-}
-
-export function recordEscalationCommentCheckState(params: {
-  repo: string;
-  issueNumber: number;
-  lastCheckedAt: string;
-  lastSeenUpdatedAt?: string | null;
-  lastResolvedCommentId?: number | null;
-  lastResolvedCommentAt?: string | null;
-}): void {
-  const database = requireDb();
-  const issueRow = database
-    .query(
-      `SELECT i.id as id
-       FROM issues i
-       JOIN repos r ON r.id = i.repo_id
-       WHERE r.name = $name AND i.number = $number`
-    )
-    .get({ $name: params.repo, $number: params.issueNumber }) as { id?: number } | undefined;
-
-  if (!issueRow?.id) return;
-
-  const existing = database
-    .query(
-      `SELECT last_resolved_comment_id as last_resolved_comment_id,
-              last_resolved_comment_at as last_resolved_comment_at
-       FROM issue_escalation_comment_checks
-       WHERE issue_id = $issue_id`
-    )
-    .get({ $issue_id: issueRow.id }) as
-    | { last_resolved_comment_id?: number | null; last_resolved_comment_at?: string | null }
-    | undefined;
-
-  const lastResolvedCommentId =
-    params.lastResolvedCommentId !== undefined
-      ? params.lastResolvedCommentId
-      : (existing?.last_resolved_comment_id ?? null);
-  const lastResolvedCommentAt =
-    params.lastResolvedCommentAt !== undefined ? params.lastResolvedCommentAt : (existing?.last_resolved_comment_at ?? null);
-
-  database
-    .query(
-      `INSERT INTO issue_escalation_comment_checks(
-         issue_id,
-         last_checked_at,
-         last_seen_updated_at,
-         last_resolved_comment_id,
-         last_resolved_comment_at
-       )
-       VALUES ($issue_id, $last_checked_at, $last_seen_updated_at, $last_resolved_comment_id, $last_resolved_comment_at)
-       ON CONFLICT(issue_id) DO UPDATE SET
-          last_checked_at = excluded.last_checked_at,
-          last_seen_updated_at = excluded.last_seen_updated_at,
-          last_resolved_comment_id = excluded.last_resolved_comment_id,
-          last_resolved_comment_at = excluded.last_resolved_comment_at`
-    )
-    .run({
-      $issue_id: issueRow.id,
-      $last_checked_at: params.lastCheckedAt,
-      $last_seen_updated_at: params.lastSeenUpdatedAt ?? null,
-      $last_resolved_comment_id: lastResolvedCommentId,
-      $last_resolved_comment_at: lastResolvedCommentAt,
-    });
 }
 
 export function getIssueLabels(repo: string, issueNumber: number): string[] {

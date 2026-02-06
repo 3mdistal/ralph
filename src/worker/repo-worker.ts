@@ -2993,7 +2993,7 @@ export class RepoWorker {
     lines.push(
       "",
       "Next action:",
-      "- Inspect the failing check runs linked above, fix or rerun as needed, then re-add `ralph:status:queued` (or comment `RALPH RESOLVED:`) to resume."
+      "- Inspect the failing check runs linked above, fix or rerun as needed, then apply `ralph:cmd:queue` to resume."
     );
 
     return lines.join("\n");
@@ -4044,6 +4044,7 @@ export class RepoWorker {
     notifyTitle: string;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
   }): Promise<{ ok: true; prUrl: string; sessionId: string } | { ok: false; run: AgentRun }> {
+    const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
     return await mergePrWithRequiredChecksImpl({
       repo: this.repo,
       task: params.task,
@@ -4053,6 +4054,7 @@ export class RepoWorker {
       prUrl: params.prUrl,
       sessionId: params.sessionId,
       issueMeta: params.issueMeta,
+      runId: this.activeRunId,
       watchdogStagePrefix: params.watchdogStagePrefix,
       notifyTitle: params.notifyTitle,
       opencodeXdg: params.opencodeXdg,
@@ -4067,6 +4069,26 @@ export class RepoWorker {
       markTaskBlocked: async (task, source, opts) => await this.markTaskBlocked(task, source as any, opts as any),
       getPullRequestChecks: async (url) => await this.getPullRequestChecks(url),
       recordCiGateSummary: (url, summary) => this.recordCiGateSummary(url, summary),
+      buildIssueContextForAgent: async (input) => await this.buildIssueContextForAgent(input),
+      runReviewAgent: async (input) => {
+        const runLogPath = await this.recordRunLogPath(params.task, issueNumber, input.stage, "in-progress");
+        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, {
+          repo: this.repo,
+          cacheKey: input.cacheKey,
+          runLogPath,
+          introspection: {
+            repo: this.repo,
+            issue: params.task.issue,
+            taskName: params.task.name,
+            step: 0,
+            stepTitle: input.stage,
+          },
+          ...this.buildWatchdogOptions(params.task, input.stage),
+          ...this.buildStallOptions(params.task, input.stage),
+          ...this.buildLoopDetectionOptions(params.task, input.stage),
+          ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
+        });
+      },
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),
       formatGhError: (err) => this.formatGhError(err),

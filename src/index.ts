@@ -49,7 +49,12 @@ import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 import { createPrioritySelectorState } from "./scheduler/priority-policy";
-import { issuePriorityWeight, normalizeTaskPriority, type TaskPriority } from "./queue/priority";
+import {
+  issuePriorityWeight,
+  normalizePriorityInputToRalphPriorityLabel,
+  normalizeTaskPriority,
+  planRalphPriorityLabelSet,
+} from "./queue/priority";
 
 import { DrainMonitor, readControlStateSnapshot, resolveControlFilePath, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
@@ -78,6 +83,7 @@ import { resolveGitHubToken } from "./github-auth";
 import { GitHubClient } from "./github/client";
 import { parseIssueRef } from "./github/issue-ref";
 import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
+import { ensureRalphWorkflowLabelsOnce } from "./github/ensure-ralph-workflow-labels";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -1016,7 +1022,7 @@ async function startTask(opts: {
           .resumeTask(claimedTask, {
             resumeMessage:
               "This task already has an OpenCode session. Resume from where you left off. " +
-              "If the issue has a recent `RALPH RESOLVED:` comment (or a `RALPH APPROVE`/`RALPH OVERRIDE:` flow), apply that human guidance.",
+              "If the issue has recent operator guidance in comments, apply it before continuing.",
             repoSlot: slot,
           })
           .then(async (run: AgentRun) => {
@@ -1631,18 +1637,12 @@ async function main(): Promise<void> {
               if (!token) throw new Error("GitHub auth is not configured");
 
               const github = new GitHubClient(issueRef.repo, { getToken: resolveGitHubToken });
-              const priorityLabels: TaskPriority[] = [
-                "p0-critical",
-                "p1-high",
-                "p2-medium",
-                "p3-low",
-                "p4-backlog",
-              ];
+              const canonicalLabel = normalizePriorityInputToRalphPriorityLabel(priority);
+              const labelPlan = planRalphPriorityLabelSet(canonicalLabel);
 
               const ops = planIssueLabelOps({
-                add: [normalized],
-                remove: priorityLabels.filter((label) => label !== normalized),
-                allowNonRalph: true,
+                add: labelPlan.add,
+                remove: labelPlan.remove,
               });
 
               const result = await executeIssueLabelOps({
@@ -1650,7 +1650,9 @@ async function main(): Promise<void> {
                 repo: issueRef.repo,
                 issueNumber: issueRef.number,
                 ops,
-                allowNonRalph: true,
+                ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: issueRef.repo, github }),
+                ensureBefore: true,
+                retryMissingLabelOnce: true,
               });
 
               if (!result.ok) {
@@ -1663,7 +1665,7 @@ async function main(): Promise<void> {
                 level: "info",
                 repo: issueRef.repo,
                 taskId,
-                data: { message: `Set priority ${normalized} on ${issueRef.repo}#${issueRef.number}` },
+                data: { message: `Set priority ${canonicalLabel} on ${issueRef.repo}#${issueRef.number}` },
               });
 
               return;

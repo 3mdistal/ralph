@@ -182,7 +182,7 @@ export function buildMergeConflictEscalationDetails(params: {
     "",
     "Notes:",
     "- Do not rebase or force-push this PR branch.",
-    "- After pushing, re-add `ralph:status:queued` or comment `RALPH RESOLVED:` to resume."
+    "- After pushing, apply `ralph:cmd:queue` to resume."
   );
 
   return lines.join("\n");
