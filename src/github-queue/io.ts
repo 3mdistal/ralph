@@ -33,15 +33,15 @@ import {
   type TaskOpState,
 } from "../state";
 import type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "../queue/types";
-import { computeStaleInProgressRecovery, deriveTaskView, planClaim, statusToRalphLabelDelta, type LabelOp } from "./core";
 import {
-  RALPH_LABEL_STATUS_ESCALATED,
-  RALPH_LABEL_STATUS_IN_PROGRESS,
-  RALPH_LABEL_STATUS_PAUSED,
-  RALPH_LABEL_STATUS_QUEUED,
-  RALPH_LABEL_STATUS_STOPPED,
-  RALPH_STATUS_LABEL_PREFIX,
-} from "../github-labels";
+  computeStaleInProgressRecovery,
+  deriveTaskView,
+  getRalphStatusLock,
+  planClaim,
+  statusToRalphLabelDelta,
+  type LabelOp,
+} from "./core";
+import { RALPH_LABEL_STATUS_IN_PROGRESS, RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_QUEUED, RALPH_STATUS_LABEL_PREFIX } from "../github-labels";
 
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 const WATCH_MIN_INTERVAL_MS = 1000;
@@ -976,16 +976,12 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         return true;
       }
 
-      const preservePausedLabel =
-        Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_PAUSED)) && status !== "paused" && status !== "done";
-      const preserveEscalatedLabel =
-        Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_ESCALATED)) && status !== "escalated" && status !== "done";
-      const preserveStoppedLabel =
-        Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_STOPPED)) && status !== "stopped" && status !== "done";
-      const shouldPreserveLabel = preservePausedLabel || preserveEscalatedLabel || preserveStoppedLabel;
+      const lockStatus = issue ? getRalphStatusLock(issue.labels) : null;
+      const shouldPreserveLabel = Boolean(lockStatus) && status !== "done" && status !== lockStatus;
+      const effectiveStatus = shouldPreserveLabel ? lockStatus! : status;
       const delta = shouldPreserveLabel
         ? { add: [], remove: [] }
-        : (issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] });
+        : (issue ? statusToRalphLabelDelta(effectiveStatus, issue.labels) : { add: [], remove: [] });
       const steps: LabelOp[] = [
         ...delta.add.map((label) => ({ action: "add" as const, label })),
         ...delta.remove.map((label) => ({ action: "remove" as const, label })),
@@ -1030,15 +1026,27 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         repo: issueRef.repo,
         issue: `${issueRef.repo}#${issueRef.number}`,
         taskPath: taskObj._path || `github:${issueRef.repo}#${issueRef.number}`,
-        status,
+        status: effectiveStatus,
         sessionId: normalizeTaskField(normalizedExtra["session-id"]),
         worktreePath: normalizeTaskField(normalizedExtra["worktree-path"]),
         workerId: normalizeTaskField(normalizedExtra["worker-id"]),
         repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
         daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
         heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
-        releasedAtMs: status === "in-progress" || status === "starting" || status === "paused" || status === "throttled" ? null : undefined,
-        releasedReason: status === "in-progress" || status === "starting" || status === "paused" || status === "throttled" ? null : undefined,
+        releasedAtMs:
+          effectiveStatus === "in-progress" ||
+          effectiveStatus === "starting" ||
+          effectiveStatus === "paused" ||
+          effectiveStatus === "throttled"
+            ? null
+            : undefined,
+        releasedReason:
+          effectiveStatus === "in-progress" ||
+          effectiveStatus === "starting" ||
+          effectiveStatus === "paused" ||
+          effectiveStatus === "throttled"
+            ? null
+            : undefined,
         at: nowIso,
       });
 

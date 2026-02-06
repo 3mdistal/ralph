@@ -36,11 +36,19 @@ const DEFAULT_MAX_RECENT_COMMENTS = 20;
 const DEFAULT_ESCALATION_RECHECK_INTERVAL_MS = 10 * 60_000;
 const ESCALATION_DEFER_LOG_INTERVAL_MS = 60_000;
 const AUTHORIZED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+const LEGACY_ESCALATION_RESOLUTION_ENV = "RALPH_ENABLE_LEGACY_ESCALATION_RESOLUTION";
 
 const RALPH_APPROVE_REGEX = /\bRALPH\s+APPROVE\b/i;
 const RALPH_OVERRIDE_REGEX = /\bRALPH\s+OVERRIDE\s*:\s*([\s\S]*)/i;
 const CONSULTANT_JSON_BLOCK_REGEX = /```json\s*([\s\S]*?)```/i;
 const CONSULTANT_MARKER_REGEX = /<!--\s*ralph-consultant:v\d+\s*-->/i;
+
+function isLegacyEscalationResolutionEnabled(): boolean {
+  const raw = process.env[LEGACY_ESCALATION_RESOLUTION_ENV];
+  if (!raw) return false;
+  const normalized = raw.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
 
 type IssueCommentNode = {
   body?: string | null;
@@ -318,6 +326,12 @@ export async function reconcileEscalationResolutions(params: {
   now?: () => Date;
 }): Promise<void> {
   const log = params.log ?? console.log;
+  if (!isLegacyEscalationResolutionEnabled()) {
+    if (shouldLog(`ralph:gh-escalation:${params.repo}:disabled`, 10 * 60_000)) {
+      log(`[ralph:gh-escalation:${params.repo}] legacy escalation resolution disabled (cmd-only)`);
+    }
+    return;
+  }
   const maxEscalations = params.maxEscalations ?? DEFAULT_MAX_ESCALATIONS;
   const maxRecentComments = params.maxRecentComments ?? DEFAULT_MAX_RECENT_COMMENTS;
   const minRecheckIntervalMs = params.minRecheckIntervalMs ?? DEFAULT_ESCALATION_RECHECK_INTERVAL_MS;

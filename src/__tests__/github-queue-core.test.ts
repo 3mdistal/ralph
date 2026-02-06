@@ -8,6 +8,7 @@ import {
   planClaim,
   computeStaleInProgressRecovery,
   statusToRalphLabelDelta,
+  resolveRalphStatusForLabels,
 } from "../github-queue/core";
 
 function applyDelta(labels: string[], delta: { add: string[]; remove: string[] }): string[] {
@@ -92,6 +93,26 @@ describe("github queue core", () => {
     expect(task.priority).toBe("p3-low");
   });
 
+  test("deriveTaskView preserves escalated label over op-state", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 290,
+        title: "Escalated",
+        labels: ["ralph:status:escalated"],
+      },
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 290,
+        taskPath: "github:3mdistal/ralph#290",
+        status: "queued",
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.status).toBe("escalated");
+  });
+
   test("statusToRalphLabelDelta only mutates ralph labels", () => {
     const delta = statusToRalphLabelDelta("in-progress", ["bug", "ralph:status:queued", "dx"]);
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
@@ -128,6 +149,17 @@ describe("github queue core", () => {
   test("statusToRalphLabelDelta maps escalated to escalated", () => {
     const delta = statusToRalphLabelDelta("escalated", ["ralph:status:queued"]);
     expect(delta).toEqual({ add: ["ralph:status:escalated"], remove: ["ralph:status:queued"] });
+  });
+
+  test("resolveRalphStatusForLabels keeps escalated lock", () => {
+    const status = resolveRalphStatusForLabels({
+      labels: ["ralph:status:escalated", "ralph:status:queued"],
+      opStatus: "in-progress",
+      released: false,
+      issueState: "OPEN",
+    });
+
+    expect(status).toBe("escalated");
   });
 
   test("planClaim requires queued label", () => {

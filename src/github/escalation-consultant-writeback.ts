@@ -30,15 +30,11 @@ function ensureTrailingNewline(text: string): string {
 function buildApprovalInstructions(): string {
   return [
     "## Approval",
-    "To approve the consultant recommendation (resume automatically):",
-    "- Comment with `RALPH APPROVE`",
+    "To resume work:",
+    "- Apply `ralph:cmd:queue`",
     "",
-    "To override with your own guidance (resume automatically):",
-    "- Comment with `RALPH OVERRIDE: <your guidance>` (can be multi-line)",
-    "",
-    "Fallback:",
-    "- Comment with `RALPH RESOLVED: <guidance>`",
-    "- Or re-add `ralph:status:queued`",
+    "Optional guidance:",
+    "- Comment with your decision or notes (plain text)",
     "",
   ].join("\n");
 }

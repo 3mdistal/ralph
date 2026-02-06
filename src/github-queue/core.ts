@@ -13,6 +13,8 @@ import {
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
+export type RalphStatusLock = "paused" | "stopped" | "escalated";
+
 const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   queued: RALPH_LABEL_STATUS_QUEUED,
   "in-progress": RALPH_LABEL_STATUS_IN_PROGRESS,
@@ -60,6 +62,35 @@ export function deriveRalphStatus(labels: string[], issueState?: string | null):
   if (labels.includes("ralph:status:blocked")) return "blocked";
   if (labels.includes("ralph:status:throttled")) return "throttled";
   return null;
+}
+
+export function getRalphStatusLock(labels: string[]): RalphStatusLock | null {
+  if (labels.includes(RALPH_LABEL_STATUS_STOPPED)) return "stopped";
+  if (labels.includes(RALPH_LABEL_STATUS_ESCALATED)) return "escalated";
+  if (labels.includes(RALPH_LABEL_STATUS_PAUSED)) return "paused";
+  return null;
+}
+
+function normalizeOpStatusForLabels(status: QueueTaskStatus | null | undefined): QueueTaskStatus | null {
+  if (!status) return null;
+  if (status === "starting") return "in-progress";
+  if (status === "throttled") return null;
+  if (status === "done") return null;
+  return status;
+}
+
+export function resolveRalphStatusForLabels(params: {
+  labels: string[];
+  opStatus?: QueueTaskStatus | null;
+  released?: boolean;
+  issueState?: string | null;
+}): QueueTaskStatus | null {
+  const labelStatus = deriveRalphStatus(params.labels, params.issueState);
+  if (labelStatus === "done") return "done";
+  const lock = getRalphStatusLock(params.labels);
+  if (lock) return lock;
+  const desired = params.released ? "queued" : normalizeOpStatusForLabels(params.opStatus ?? null);
+  return desired ?? labelStatus ?? null;
 }
 
 function resolveFallbackStatusLabel(labels: string[]): string | null {
@@ -180,11 +211,9 @@ export function deriveTaskView(params: {
   const labelStatus = deriveRalphStatus(params.issue.labels, params.issue.state);
   const released = typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs);
   const opStatus = released ? "queued" : ((params.opState?.status as QueueTaskStatus | null) ?? null);
-  // Pause/stopped labels are operator stop switches and must not be overridden by durable op-state.
-  const status =
-    labelStatus === "paused" || labelStatus === "stopped"
-      ? labelStatus
-      : (opStatus ?? labelStatus ?? "queued");
+  const lockStatus = getRalphStatusLock(params.issue.labels);
+  // Pause/stopped/escalated labels are operator stop switches and must not be overridden by durable op-state.
+  const status = labelStatus === "done" ? "done" : (lockStatus ?? opStatus ?? labelStatus ?? "queued");
   const creationDate = params.issue.githubUpdatedAt ?? params.nowIso;
   const name = params.issue.title?.trim() ? params.issue.title : `Issue ${params.issue.number}`;
   const priority = inferPriorityFromLabels(params.issue.labels);

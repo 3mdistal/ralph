@@ -1016,7 +1016,7 @@ async function startTask(opts: {
           .resumeTask(claimedTask, {
             resumeMessage:
               "This task already has an OpenCode session. Resume from where you left off. " +
-              "If the issue has a recent `RALPH RESOLVED:` comment (or a `RALPH APPROVE`/`RALPH OVERRIDE:` flow), apply that human guidance.",
+              "If the issue has a recent operator decision comment, apply that guidance.",
             repoSlot: slot,
           })
           .then(async (run: AgentRun) => {

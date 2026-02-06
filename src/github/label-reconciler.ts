@@ -11,9 +11,8 @@ import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels
 import { executeIssueLabelOps } from "./issue-label-io";
 import { mutateIssueLabels } from "./label-mutation";
 import { canAttemptLabelWrite } from "./label-write-backoff";
-import { statusToRalphLabelDelta, type LabelOp } from "../github-queue/core";
+import { resolveRalphStatusForLabels, statusToRalphLabelDelta, type LabelOp } from "../github-queue/core";
 import type { QueueTaskStatus } from "../queue/types";
-import { RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_STOPPED } from "../github-labels";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_MAX_ISSUES_PER_TICK = 10;
@@ -43,14 +42,6 @@ function applyLabelDeltaSnapshot(params: {
   });
 }
 
-function toDesiredStatus(raw: string | null | undefined): QueueTaskStatus | null {
-  if (!raw) return null;
-  if (raw === "starting") return "in-progress";
-  if (raw === "throttled") return null;
-  if (raw === "done") return null;
-  return raw as QueueTaskStatus;
-}
-
 async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number): Promise<number> {
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
@@ -77,13 +68,16 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
   for (const issue of issues) {
     if (processed >= maxIssues) break;
     if ((issue.state ?? "").toUpperCase() === "CLOSED") continue;
-    if (issue.labels.includes(RALPH_LABEL_STATUS_PAUSED)) continue;
-    if (issue.labels.includes(RALPH_LABEL_STATUS_STOPPED)) continue;
     const opState = opStateByIssue.get(issue.number);
     if (!opState) continue;
 
     const released = typeof opState.releasedAtMs === "number" && Number.isFinite(opState.releasedAtMs);
-    const desiredStatus = released ? "queued" : toDesiredStatus(opState.status ?? null);
+    const desiredStatus = resolveRalphStatusForLabels({
+      labels: issue.labels,
+      opStatus: (opState.status as QueueTaskStatus | null) ?? null,
+      released,
+      issueState: issue.state ?? null,
+    });
     if (!desiredStatus) continue;
 
     const cooldownKey = `${repo}#${issue.number}`;

@@ -18,10 +18,13 @@ import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
 let priorStateDbPath: string | undefined;
+let priorLegacyEnv: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 beforeEach(async () => {
   priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
+  priorLegacyEnv = process.env.RALPH_ENABLE_LEGACY_ESCALATION_RESOLUTION;
+  process.env.RALPH_ENABLE_LEGACY_ESCALATION_RESOLUTION = "1";
   releaseLock = await acquireGlobalTestLock();
   homeDir = await mkdtemp(join(tmpdir(), "ralph-escalation-"));
   process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
@@ -39,12 +42,37 @@ afterEach(async () => {
     } else {
       process.env.RALPH_STATE_DB_PATH = priorStateDbPath;
     }
+    if (priorLegacyEnv === undefined) {
+      delete process.env.RALPH_ENABLE_LEGACY_ESCALATION_RESOLUTION;
+    } else {
+      process.env.RALPH_ENABLE_LEGACY_ESCALATION_RESOLUTION = priorLegacyEnv;
+    }
     releaseLock?.();
     releaseLock = null;
   }
 });
 
 describe("escalation resolution reconciliation", () => {
+  test("no-ops when legacy escalation resolution disabled", async () => {
+    process.env.RALPH_ENABLE_LEGACY_ESCALATION_RESOLUTION = "0";
+
+    await reconcileEscalationResolutions({
+      repo: "3mdistal/ralph",
+      deps: {
+        github: { request: async () => ({ data: {} }) } as any,
+        listIssuesWithAllLabels: () => {
+          throw new Error("should not list issues when disabled");
+        },
+        resolveAgentTaskByIssue: async () => null,
+        updateTaskStatus: async () => true,
+        getIssueSnapshotByNumber: () => null,
+        getEscalationCommentCheckState: () => null,
+        recordEscalationCommentCheckState: () => {},
+      },
+      log: () => {},
+    });
+  });
+
   test("requeues on queued label and RALPH RESOLVED comment", async () => {
     const requests: Array<{ path: string; method: string }> = [];
 

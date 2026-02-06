@@ -23,6 +23,14 @@ const DEFAULT_ERROR_MULTIPLIER = 2;
 const DEFAULT_MAX_BACKOFF_MULTIPLIER = 10;
 const MIN_DELAY_MS = 1000;
 const ESCALATION_RECONCILE_MIN_INTERVAL_MS = 60_000;
+const LEGACY_ESCALATION_RESOLUTION_ENV = "RALPH_ENABLE_LEGACY_ESCALATION_RESOLUTION";
+
+function isLegacyEscalationResolutionEnabled(): boolean {
+  const raw = process.env[LEGACY_ESCALATION_RESOLUTION_ENV];
+  if (!raw) return false;
+  const normalized = raw.trim().toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
 
 const DEFAULT_REPO_POLLER_DEPS: RepoPollerDeps = {
   nowMs: () => Date.now(),
@@ -157,20 +165,26 @@ function startRepoPoller(params: {
       );
 
       const nowMs = deps.nowMs();
-      const elapsedMs = nowMs - lastEscalationReconcileAt;
-      if (elapsedMs < ESCALATION_RECONCILE_MIN_INTERVAL_MS) {
-        if (shouldLog(`ralph:gh-sync:${repoLabel}:escalation-defer`, ESCALATION_RECONCILE_MIN_INTERVAL_MS)) {
-          const remaining = Math.max(0, ESCALATION_RECONCILE_MIN_INTERVAL_MS - elapsedMs);
-          params.log(`[ralph:gh-sync:${repoLabel}] escalation reconcile deferred for ${Math.round(remaining / 1000)}s`);
+      if (!isLegacyEscalationResolutionEnabled()) {
+        if (shouldLog(`ralph:gh-sync:${repoLabel}:escalation-disabled`, 10 * 60_000)) {
+          params.log(`[ralph:gh-sync:${repoLabel}] escalation resolution reconcile disabled (cmd-only)`);
         }
       } else {
-        lastEscalationReconcileAt = nowMs;
-        try {
-          await reconcileEscalationResolutions({ repo: repoName, log: params.log });
-        } catch (error: any) {
-          params.log(
-            `[ralph:gh-sync:${repoLabel}] escalation resolution reconcile failed: ${error?.message ?? String(error)}`
-          );
+        const elapsedMs = nowMs - lastEscalationReconcileAt;
+        if (elapsedMs < ESCALATION_RECONCILE_MIN_INTERVAL_MS) {
+          if (shouldLog(`ralph:gh-sync:${repoLabel}:escalation-defer`, ESCALATION_RECONCILE_MIN_INTERVAL_MS)) {
+            const remaining = Math.max(0, ESCALATION_RECONCILE_MIN_INTERVAL_MS - elapsedMs);
+            params.log(`[ralph:gh-sync:${repoLabel}] escalation reconcile deferred for ${Math.round(remaining / 1000)}s`);
+          }
+        } else {
+          lastEscalationReconcileAt = nowMs;
+          try {
+            await reconcileEscalationResolutions({ repo: repoName, log: params.log });
+          } catch (error: any) {
+            params.log(
+              `[ralph:gh-sync:${repoLabel}] escalation resolution reconcile failed: ${error?.message ?? String(error)}`
+            );
+          }
         }
       }
 
