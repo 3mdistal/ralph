@@ -20,6 +20,14 @@ export function getRalphHomeDir(): string {
   return join(resolveHomeDir(), ".ralph");
 }
 
+function getRalphArtifactsDir(): string {
+  return join(getRalphHomeDir(), "artifacts");
+}
+
+export function getRalphRunArtifactsDir(runId: string): string {
+  return join(getRalphArtifactsDir(), runId);
+}
+
 function getRalphSandboxDir(): string {
   return join(getRalphHomeDir(), "sandbox");
 }

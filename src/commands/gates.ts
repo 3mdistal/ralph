@@ -18,6 +18,7 @@ type GateResultProjection = {
   status: GateStatus;
   command: string | null;
   skipReason: string | null;
+  reason: string | null;
   url: string | null;
   prNumber: number | null;
   prUrl: string | null;
@@ -31,7 +32,7 @@ type GateArtifactProjection = {
 };
 
 export type GatesJsonOutput = {
-  version: 1;
+  version: 2;
   repo: string;
   issueNumber: number;
   runId: string | null;
@@ -49,7 +50,7 @@ export function buildGatesJsonOutput(params: {
   const artifacts = params.state?.artifacts ?? [];
 
   return {
-    version: 1,
+    version: 2,
     repo: params.repo,
     issueNumber: params.issueNumber,
     runId,
@@ -58,6 +59,7 @@ export function buildGatesJsonOutput(params: {
       status: result.status,
       command: result.command,
       skipReason: result.skipReason,
+      reason: result.reason,
       url: result.url,
       prNumber: result.prNumber,
       prUrl: result.prUrl,
@@ -105,6 +107,7 @@ export async function runGatesCommand(opts: { args: string[] }): Promise<void> {
     console.log(`- ${result.gate}: ${result.status}`);
     if (result.command) console.log(`  command: ${result.command}`);
     if (result.skipReason) console.log(`  skip reason: ${result.skipReason}`);
+    if (result.reason) console.log(`  reason: ${result.reason}`);
     if (result.url) console.log(`  url: ${result.url}`);
     if (result.prNumber) console.log(`  pr: #${result.prNumber}`);
     if (result.prUrl) console.log(`  pr url: ${result.prUrl}`);

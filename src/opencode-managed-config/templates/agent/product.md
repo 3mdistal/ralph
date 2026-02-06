@@ -28,6 +28,10 @@ When consulted, you are usually reviewing either:
 1) A proposed implementation plan (plan-stage product review)
 2) A PR/diff (product review)
 
+# Review Inputs (deterministic)
+
+When reviewing a PR/diff, rely on the provided diff artifact path or ID plus `git diff --stat` output. Do NOT ask for pasted diff chunks; if the diff artifact is missing, fail closed with the required `RALPH_REVIEW` marker.
+
 You must enforce the claims ledger:
 
 - If the plan/change contradicts a canonical claim, FAIL and cite the claim `id`(s).
