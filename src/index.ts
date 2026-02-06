@@ -49,7 +49,7 @@ import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 import { createPrioritySelectorState } from "./scheduler/priority-policy";
-import { issuePriorityWeight, normalizeTaskPriority, type TaskPriority } from "./queue/priority";
+import { issuePriorityWeight, normalizeTaskPriority, RALPH_PRIORITY_LABELS, toRalphPriorityLabel } from "./queue/priority";
 
 import { DrainMonitor, readControlStateSnapshot, resolveControlFilePath, type DaemonMode } from "./drain";
 import { isRalphCheckpoint, type RalphCheckpoint } from "./dashboard/events";
@@ -1016,7 +1016,7 @@ async function startTask(opts: {
           .resumeTask(claimedTask, {
             resumeMessage:
               "This task already has an OpenCode session. Resume from where you left off. " +
-              "If the issue has a recent `RALPH RESOLVED:` comment (or a `RALPH APPROVE`/`RALPH OVERRIDE:` flow), apply that human guidance.",
+              "If the issue has recent operator guidance in comments, apply it before continuing.",
             repoSlot: slot,
           })
           .then(async (run: AgentRun) => {
@@ -1631,18 +1631,11 @@ async function main(): Promise<void> {
               if (!token) throw new Error("GitHub auth is not configured");
 
               const github = new GitHubClient(issueRef.repo, { getToken: resolveGitHubToken });
-              const priorityLabels: TaskPriority[] = [
-                "p0-critical",
-                "p1-high",
-                "p2-medium",
-                "p3-low",
-                "p4-backlog",
-              ];
+              const targetLabel = toRalphPriorityLabel(normalized);
 
               const ops = planIssueLabelOps({
-                add: [normalized],
-                remove: priorityLabels.filter((label) => label !== normalized),
-                allowNonRalph: true,
+                add: [targetLabel],
+                remove: RALPH_PRIORITY_LABELS.filter((label) => label !== targetLabel),
               });
 
               const result = await executeIssueLabelOps({
@@ -1650,7 +1643,6 @@ async function main(): Promise<void> {
                 repo: issueRef.repo,
                 issueNumber: issueRef.number,
                 ops,
-                allowNonRalph: true,
               });
 
               if (!result.ok) {
@@ -1663,7 +1655,7 @@ async function main(): Promise<void> {
                 level: "info",
                 repo: issueRef.repo,
                 taskId,
-                data: { message: `Set priority ${normalized} on ${issueRef.repo}#${issueRef.number}` },
+                data: { message: `Set priority ${targetLabel} on ${issueRef.repo}#${issueRef.number}` },
               });
 
               return;
