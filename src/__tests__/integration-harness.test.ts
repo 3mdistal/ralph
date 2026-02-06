@@ -73,11 +73,25 @@ const defaultPlanOutput = [
   "",
 ].join("\n");
 
-const defaultRunAgentImpl = async (..._args: unknown[]) => ({
-  sessionId: "ses_plan",
-  success: true,
-  output: defaultPlanOutput,
-});
+const defaultRunAgentImpl = async (...args: unknown[]) => {
+  const agent = typeof args[1] === "string" ? args[1] : "";
+  if (agent === "product" || agent === "devex") {
+    return {
+      sessionId: `ses_${agent}`,
+      success: true,
+      output: [
+        `${agent} review ok`,
+        'RALPH_REVIEW: {"status":"pass","reason":"Review passed"}',
+      ].join("\n"),
+    };
+  }
+
+  return {
+    sessionId: "ses_plan",
+    success: true,
+    output: defaultPlanOutput,
+  };
+};
 
 const runAgentMock = mock(defaultRunAgentImpl);
 

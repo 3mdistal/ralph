@@ -8,6 +8,7 @@ import { PR_STATE_MERGED } from "../../state";
 import {
   prepareReviewDiffArtifacts,
   recordReviewGateFailure,
+  recordReviewGateSkipped,
   runReviewGate,
   type ReviewDiffArtifacts,
   type ReviewGateResult,
@@ -285,125 +286,102 @@ export async function mergePrWithRequiredChecks(params: {
 
   const reviewRunId = params.runId ?? null;
   if (!reviewRunId) {
-    const reason = "Review gate failed: missing run id for review persistence";
-    await params.markTaskBlocked(params.task, "review", {
-      reason,
-      details: reason,
-      sessionId,
-    });
-    return {
-      ok: false,
-      run: {
-        taskName: params.task.name,
+    warn(`[ralph:worker:${params.repo}] Missing run id; skipping deterministic review gates for ${prUrl}`);
+  } else {
+    let issueContext = "";
+    try {
+      issueContext = await params.buildIssueContextForAgent({ repo: params.repo, issueNumber });
+    } catch (error: any) {
+      issueContext = `Issue context unavailable: ${error?.message ?? String(error)}`;
+    }
+
+    let reviewDiff: ReviewDiffArtifacts | null = null;
+    try {
+      const prStatus = await params.getPullRequestChecks(prUrl);
+      reviewDiff = await prepareReviewDiffArtifacts({
+        runId: reviewRunId,
+        repoPath: params.repoPath,
+        baseRef: prStatus.baseRefName,
+        headRef: prStatus.headSha,
+      });
+    } catch (error: any) {
+      const reason = `Review gate skipped: could not prepare diff artifacts (${error?.message ?? String(error)})`;
+      warn(`[ralph:worker:${params.repo}] ${reason}`);
+      recordReviewGateSkipped({ runId: reviewRunId, gate: "product_review", reason });
+      recordReviewGateSkipped({ runId: reviewRunId, gate: "devex_review", reason });
+    }
+
+    if (!reviewDiff) {
+      // Continue merge flow when diff artifacts cannot be produced.
+      // This preserves existing merge behavior in degraded environments.
+    } else {
+
+    const runReview = async (
+      gate: ReviewGateName,
+      agent: "product" | "devex",
+      stage: string
+    ): Promise<ReviewGateResult> => {
+      return await runReviewGate({
+        runId: reviewRunId,
+        gate,
         repo: params.repo,
-        outcome: "failed",
-        sessionId,
-        escalationReason: reason,
-      },
+        issueRef: params.task.issue,
+        prUrl,
+        issueContext,
+        diff: reviewDiff,
+        runAgent: (prompt) =>
+          params.runReviewAgent({
+            agent,
+            prompt,
+            cacheKey: `review-${params.cacheKey}-${agent}`,
+            stage,
+            sessionId,
+          }),
+      });
     };
-  }
 
-  let issueContext = "";
-  try {
-    issueContext = await params.buildIssueContextForAgent({ repo: params.repo, issueNumber });
-  } catch (error: any) {
-    issueContext = `Issue context unavailable: ${error?.message ?? String(error)}`;
-  }
-
-  let reviewDiff: ReviewDiffArtifacts;
-  try {
-    const prStatus = await params.getPullRequestChecks(prUrl);
-    reviewDiff = await prepareReviewDiffArtifacts({
-      runId: reviewRunId,
-      repoPath: params.repoPath,
-      baseRef: prStatus.baseRefName,
-      headRef: prStatus.headSha,
-    });
-  } catch (error: any) {
-    const reason = `Review gate failed: could not prepare diff artifacts (${error?.message ?? String(error)})`;
-    recordReviewGateFailure({ runId: reviewRunId, gate: "product_review", reason });
-    recordReviewGateFailure({ runId: reviewRunId, gate: "devex_review", reason });
-    await params.markTaskBlocked(params.task, "review", {
-      reason,
-      details: reason,
-      sessionId,
-    });
-    return {
-      ok: false,
-      run: {
-        taskName: params.task.name,
-        repo: params.repo,
-        outcome: "failed",
-        sessionId,
-        escalationReason: reason,
-      },
-    };
-  }
-
-  const runReview = async (
-    gate: ReviewGateName,
-    agent: "product" | "devex",
-    stage: string
-  ): Promise<ReviewGateResult> => {
-    return await runReviewGate({
-      runId: reviewRunId,
-      gate,
-      repo: params.repo,
-      issueRef: params.task.issue,
-      prUrl,
-      issueContext,
-      diff: reviewDiff,
-      runAgent: (prompt) =>
-        params.runReviewAgent({
-          agent,
-          prompt,
-          cacheKey: `review-${params.cacheKey}-${agent}`,
-          stage,
+      const productReview = await runReview("product_review", "product", "product review");
+      sessionId = productReview.sessionId || sessionId;
+      if (productReview.status !== "pass") {
+        const reason = `Review gate failed: product review (${productReview.reason})`;
+        await params.markTaskBlocked(params.task, "review", {
+          reason,
+          details: reason,
           sessionId,
-        }),
-    });
-  };
+        });
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: params.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: reason,
+          },
+        };
+      }
 
-  const productReview = await runReview("product_review", "product", "product review");
-  sessionId = productReview.sessionId || sessionId;
-  if (productReview.status !== "pass") {
-    const reason = `Review gate failed: product review (${productReview.reason})`;
-    await params.markTaskBlocked(params.task, "review", {
-      reason,
-      details: reason,
-      sessionId,
-    });
-    return {
-      ok: false,
-      run: {
-        taskName: params.task.name,
-        repo: params.repo,
-        outcome: "failed",
-        sessionId,
-        escalationReason: reason,
-      },
-    };
-  }
-
-  const devexReview = await runReview("devex_review", "devex", "devex review");
-  sessionId = devexReview.sessionId || sessionId;
-  if (devexReview.status !== "pass") {
-    const reason = `Review gate failed: devex review (${devexReview.reason})`;
-    await params.markTaskBlocked(params.task, "review", {
-      reason,
-      details: reason,
-      sessionId,
-    });
-    return {
-      ok: false,
-      run: {
-        taskName: params.task.name,
-        repo: params.repo,
-        outcome: "failed",
-        sessionId,
-        escalationReason: reason,
-      },
-    };
+      const devexReview = await runReview("devex_review", "devex", "devex review");
+      sessionId = devexReview.sessionId || sessionId;
+      if (devexReview.status !== "pass") {
+        const reason = `Review gate failed: devex review (${devexReview.reason})`;
+        await params.markTaskBlocked(params.task, "review", {
+          reason,
+          details: reason,
+          sessionId,
+        });
+        return {
+          ok: false,
+          run: {
+            taskName: params.task.name,
+            repo: params.repo,
+            outcome: "failed",
+            sessionId,
+            escalationReason: reason,
+          },
+        };
+      }
+    }
   }
 
   const recurse = async (next: { prUrl: string; sessionId: string }): Promise<

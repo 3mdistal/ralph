@@ -20,7 +20,7 @@ export function getRalphHomeDir(): string {
   return join(resolveHomeDir(), ".ralph");
 }
 
-export function getRalphArtifactsDir(): string {
+function getRalphArtifactsDir(): string {
   return join(getRalphHomeDir(), "artifacts");
 }
 

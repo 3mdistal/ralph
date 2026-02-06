@@ -135,7 +135,7 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
   return { ok: true, status, reason, markerLine };
 }
 
-export function buildReviewPrompt(params: {
+function buildReviewPrompt(params: {
   repo: string;
   issueRef: string;
   prUrl: string;
@@ -257,6 +257,15 @@ export function recordReviewGateFailure(params: { runId: string; gate: ReviewGat
     runId: params.runId,
     gate: params.gate,
     status: "fail",
+    reason: params.reason,
+  });
+}
+
+export function recordReviewGateSkipped(params: { runId: string; gate: ReviewGateName; reason: string }): void {
+  upsertRalphRunGateResult({
+    runId: params.runId,
+    gate: params.gate,
+    status: "skipped",
     reason: params.reason,
   });
 }
