@@ -51,6 +51,20 @@ describe("github escalation writeback", () => {
     expect(comment).toContain("@3mdistal");
   });
 
+  test("buildEscalationComment points to ralph:cmd:queue", () => {
+    const comment = buildEscalationComment({
+      marker: "<!-- ralph-escalation:id=abc123 -->",
+      taskName: "Escalation task",
+      issueUrl: "https://github.com/3mdistal/ralph/issues/66",
+      reason: "Need guidance",
+      ownerHandle: "@3mdistal",
+    });
+
+    expect(comment).toContain("ralph:cmd:queue");
+    expect(comment).not.toContain("RALPH RESOLVED");
+    expect(comment).not.toContain("ralph:status:queued");
+  });
+
   test("planEscalationWriteback includes details for merge-conflict", () => {
     const plan = planEscalationWriteback({
       repo: "3mdistal/ralph",
