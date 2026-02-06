@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "paused" | "throttled" | "escalated" | "failed";
@@ -63,7 +63,7 @@ export type IssueAlertSummary = {
 export const PR_STATE_OPEN: PrState = "open";
 export const PR_STATE_MERGED: PrState = "merged";
 
-export type GateName = "preflight" | "product_review" | "devex_review" | "ci";
+export type GateName = "preflight" | "product_review" | "devex_review" | "ci" | "pr_evidence";
 export type GateStatus = "pending" | "pass" | "fail" | "skipped";
 export type GateArtifactKind = "command_output" | "failure_excerpt" | "note";
 
@@ -83,7 +83,7 @@ export type ParentVerificationState = {
   updatedAtMs: number;
 };
 
-const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci"];
+const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci", "pr_evidence"];
 const GATE_STATUSES: GateStatus[] = ["pending", "pass", "fail", "skipped"];
 const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_excerpt", "note"];
 
@@ -356,7 +356,7 @@ function ensureSchema(database: Database): void {
         database.exec(`
           CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
             run_id TEXT NOT NULL,
-            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
             status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
             command TEXT,
             skip_reason TEXT,
@@ -375,7 +375,7 @@ function ensureSchema(database: Database): void {
           CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
-            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
             kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
             content TEXT NOT NULL,
             truncated INTEGER NOT NULL DEFAULT 0,
@@ -552,6 +552,73 @@ function ensureSchema(database: Database): void {
           database.exec(
             "CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_triage_score ON ralph_run_metrics(triage_score)"
           );
+        }
+      }
+
+      if (existingVersion < 16) {
+        if (
+          tableExists("ralph_run_gate_results") &&
+          tableExists("ralph_run_gate_artifacts") &&
+          tableExists("ralph_runs") &&
+          tableExists("repos")
+        ) {
+          database.exec(`
+            CREATE TABLE ralph_run_gate_results_new (
+              run_id TEXT NOT NULL,
+              gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+              status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
+              command TEXT,
+              skip_reason TEXT,
+              url TEXT,
+              pr_number INTEGER,
+              pr_url TEXT,
+              repo_id INTEGER NOT NULL,
+              issue_number INTEGER,
+              task_path TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(run_id, gate),
+              FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE,
+              FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+            );
+            INSERT INTO ralph_run_gate_results_new(
+              run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+            )
+            SELECT
+              run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+            FROM ralph_run_gate_results;
+            DROP TABLE ralph_run_gate_results;
+            ALTER TABLE ralph_run_gate_results_new RENAME TO ralph_run_gate_results;
+
+            CREATE TABLE ralph_run_gate_artifacts_new (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              run_id TEXT NOT NULL,
+              gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+              kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
+              content TEXT NOT NULL,
+              truncated INTEGER NOT NULL DEFAULT 0,
+              original_chars INTEGER,
+              original_lines INTEGER,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+            );
+            INSERT INTO ralph_run_gate_artifacts_new(
+              id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+            )
+            SELECT
+              id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+            FROM ralph_run_gate_artifacts;
+            DROP TABLE ralph_run_gate_artifacts;
+            ALTER TABLE ralph_run_gate_artifacts_new RENAME TO ralph_run_gate_artifacts;
+
+            CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
+              ON ralph_run_gate_results(repo_id, issue_number, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr
+              ON ralph_run_gate_results(repo_id, pr_number);
+            CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_artifacts_run
+              ON ralph_run_gate_artifacts(run_id);
+          `);
         }
       }
     })();
@@ -824,7 +891,7 @@ function ensureSchema(database: Database): void {
 
     CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
       run_id TEXT NOT NULL,
-      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
       status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
       command TEXT,
       skip_reason TEXT,
@@ -844,7 +911,7 @@ function ensureSchema(database: Database): void {
     CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_id TEXT NOT NULL,
-      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
       kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
       content TEXT NOT NULL,
       truncated INTEGER NOT NULL DEFAULT 0,
@@ -2129,6 +2196,19 @@ export function upsertRalphRunGateResult(params: {
   const at = params.at ?? nowIso();
   const meta = getRunMeta(params.runId);
   const gate = assertGateName(params.gate);
+
+  if (gate === "pr_evidence" && params.status === "fail") {
+    const existing = database
+      .query(
+        `SELECT status
+         FROM ralph_run_gate_results
+         WHERE run_id = $run_id AND gate = $gate`
+      )
+      .get({ $run_id: params.runId, $gate: gate }) as { status?: string } | undefined;
+    if (existing?.status === "pass") {
+      return;
+    }
+  }
 
   if (params.status === null) {
     throw new Error("Gate status cannot be null");

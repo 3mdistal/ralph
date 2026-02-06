@@ -717,6 +717,8 @@ export class RepoWorker {
         createRunRecord: (params) => createRalphRun(params),
         ensureRunGateRows: (runId) => ensureRalphRunGateRows({ runId }),
         completeRun: (params) => completeRalphRun(params),
+        upsertRunGateResult: (params) => upsertRalphRunGateResult(params),
+        recordRunGateArtifact: (params) => recordRalphRunGateArtifact(params),
         buildRunDetails: (result) => buildRunDetails(result),
         getPinnedOpencodeProfileName: (contextTask) => this.getPinnedOpencodeProfileName(contextTask),
         refreshRalphRunTokenTotals: (params) => refreshRalphRunTokenTotals(params),
@@ -2113,6 +2115,62 @@ export class RepoWorker {
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to persist CI triage artifact: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
+  private recordMissingPrEvidence(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    reason: string;
+    diagnostics?: string;
+  }): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    try {
+      upsertRalphRunGateResult({
+        runId,
+        gate: "pr_evidence",
+        status: "fail",
+        skipReason: "missing pr_url",
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist PR evidence gate failure: ${error?.message ?? String(error)}`
+      );
+    }
+
+    try {
+      const worktreePath = params.task["worktree-path"]?.trim() || "(unknown)";
+      const content = [
+        "PR evidence gate failed: missing PR URL.",
+        `Reason: ${params.reason}`,
+        `Issue: ${params.task.issue}`,
+        `Worktree: ${worktreePath}`,
+        "",
+        "Suggested recovery commands:",
+        `git -C \"${worktreePath}\" status`,
+        `git -C \"${worktreePath}\" branch --show-current`,
+        `git -C \"${worktreePath}\" push -u origin HEAD`,
+        `gh pr create --base ${params.botBranch} --fill --body \"Fixes #${params.issueNumber}\"`,
+        params.diagnostics ? "" : null,
+        params.diagnostics ? "Diagnostics:" : null,
+        params.diagnostics ?? null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "pr_evidence",
+        kind: "note",
+        content,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist PR evidence diagnostics: ${error?.message ?? String(error)}`
       );
     }
   }
@@ -5353,6 +5411,13 @@ export class RepoWorker {
       if (!prUrl) {
         const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+        this.recordMissingPrEvidence({
+          task,
+          issueNumber,
+          botBranch,
+          reason,
+          diagnostics: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+        });
 
         const wasEscalated = task.status === "escalated";
         const escalated = await this.queue.updateTaskStatus(task, "escalated");
@@ -6614,6 +6679,13 @@ export class RepoWorker {
         // Escalate if we still don't have a PR after retries
         const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
         console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+        this.recordMissingPrEvidence({
+          task,
+          issueNumber,
+          botBranch,
+          reason,
+          diagnostics: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+        });
 
         const wasEscalated = task.status === "escalated";
         const escalated = await this.queue.updateTaskStatus(task, "escalated");
