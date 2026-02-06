@@ -56,7 +56,7 @@ describe("github queue core", () => {
         repo: "3mdistal/ralph",
         number: 286,
         title: "Priority labels",
-        labels: ["p3-low", "p1-high"],
+        labels: ["ralph:priority:p3", "ralph:priority:p1"],
       },
       nowIso: "2026-01-23T00:00:00.000Z",
     });
@@ -84,12 +84,26 @@ describe("github queue core", () => {
         repo: "3mdistal/ralph",
         number: 288,
         title: "Priority labels",
-        labels: ["P2", "p4 backlog"],
+        labels: ["ralph:priority:P2", "p4 backlog"],
       },
       nowIso: "2026-01-23T00:00:00.000Z",
     });
 
     expect(task.priority).toBe("p2-medium");
+  });
+
+  test("deriveTaskView prefers canonical labels over legacy", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 288,
+        title: "Priority labels",
+        labels: ["p0-critical", "ralph:priority:p3"],
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.priority).toBe("p3-low");
   });
 
   test("deriveTaskView accepts priority prefixes with suffixes", () => {

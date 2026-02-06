@@ -2,9 +2,11 @@ import type { AgentTask } from "../../queue-backend";
 import type { IssueMetadata } from "../../escalation";
 import { buildParentVerificationPrompt } from "../../parent-verification-prompt";
 import {
+  evaluateParentVerificationNoPrEligibility,
   getParentVerificationBackoffMs,
   getParentVerificationMaxAttempts,
   isParentVerificationDisabled,
+  type ParentVerificationMarker,
   parseParentVerificationMarker,
   PARENT_VERIFY_MARKER_PREFIX,
   PARENT_VERIFY_MARKER_VERSION,
@@ -88,7 +90,73 @@ export type ParentVerificationLaneDeps = {
     sessionId?: string;
     details?: string;
   }) => Promise<void>;
+  finalizeVerifiedNoPrCompletion: (params: {
+    task: AgentTask;
+    issueNumber: number;
+    marker: ParentVerificationMarker;
+    sessionId?: string;
+    output?: string;
+  }) => Promise<AgentRun>;
 };
+
+async function escalateNoPrCompletion(params: {
+  task: AgentTask;
+  repo: string;
+  reason: string;
+  details: string;
+  sessionId?: string;
+  output?: string;
+  updateTaskStatus: UpdateTaskStatus;
+  applyTaskPatch: ApplyTaskPatch;
+  writeEscalationWriteback: ParentVerificationLaneDeps["writeEscalationWriteback"];
+  notifyEscalation: ParentVerificationLaneDeps["notifyEscalation"];
+  recordEscalatedRunNote: ParentVerificationLaneDeps["recordEscalatedRunNote"];
+}): Promise<AgentRun> {
+  const wasEscalated = params.task.status === "escalated";
+  const escalated = await params.updateTaskStatus(params.task, "escalated", {
+    "daemon-id": "",
+    "heartbeat-at": "",
+  });
+  if (escalated) {
+    params.applyTaskPatch(params.task, "escalated", {
+      "daemon-id": "",
+      "heartbeat-at": "",
+    });
+  }
+
+  await params.writeEscalationWriteback(params.task, {
+    reason: params.reason,
+    details: params.details,
+    escalationType: "other",
+  });
+  await params.notifyEscalation({
+    taskName: params.task.name,
+    taskFileName: params.task._name,
+    taskPath: params.task._path,
+    issue: params.task.issue,
+    repo: params.repo,
+    sessionId: params.sessionId || params.task["session-id"]?.trim() || undefined,
+    reason: params.reason,
+    escalationType: "other",
+    planOutput: params.output,
+  });
+
+  if (escalated && !wasEscalated) {
+    await params.recordEscalatedRunNote(params.task, {
+      reason: params.reason,
+      sessionId: params.sessionId,
+      details: params.details,
+    });
+  }
+
+  return {
+    taskName: params.task.name,
+    repo: params.repo,
+    outcome: "escalated",
+    sessionId: params.sessionId || undefined,
+    escalationReason: params.reason,
+  };
+}
 
 async function deferParentVerification(params: {
   repo: string;
@@ -294,53 +362,80 @@ export async function maybeRunParentVerificationLane(params: ParentVerificationL
     return null;
   }
 
-  params.completeParentVerification({
-    repo: params.repo,
-    issueNumber: parsedIssueNumber,
-    outcome: "no_work",
-    details: parsedMarker.reason,
-    nowMs,
-  });
-
-  const reason = `Parent verification: no remaining work. ${parsedMarker.reason}`;
-  const wasEscalated = params.task.status === "escalated";
-  const escalated = await params.updateTaskStatus(params.task, "escalated", {
-    "daemon-id": "",
-    "heartbeat-at": "",
-  });
-  if (escalated) {
-    params.applyTaskPatch(params.task, "escalated", {
-      "daemon-id": "",
-      "heartbeat-at": "",
+  const eligibility = evaluateParentVerificationNoPrEligibility(parsedMarker);
+  if (!eligibility.ok) {
+    params.completeParentVerification({
+      repo: params.repo,
+      issueNumber: parsedIssueNumber,
+      outcome: "skipped",
+      details: `close or clarify: ${eligibility.reason}`,
+      nowMs,
     });
-  }
-
-  await params.writeEscalationWriteback(params.task, { reason, details: parsedMarker.reason, escalationType: "other" });
-  await params.notifyEscalation({
-    taskName: params.task.name,
-    taskFileName: params.task._name,
-    taskPath: params.task._path,
-    issue: params.task.issue,
-    repo: params.repo,
-    sessionId: result.sessionId || params.task["session-id"]?.trim() || undefined,
-    reason,
-    escalationType: "other",
-    planOutput: result.output,
-  });
-
-  if (escalated && !wasEscalated) {
-    await params.recordEscalatedRunNote(params.task, {
+    const reason = `Parent verification returned no_work but cannot auto-complete (${eligibility.reason}); close or clarify.`;
+    return await escalateNoPrCompletion({
+      task: params.task,
+      repo: params.repo,
       reason,
-      sessionId: result.sessionId,
-      details: result.output,
+      details: parsedMarker.reason,
+      sessionId: result.sessionId || undefined,
+      output: result.output,
+      updateTaskStatus: params.updateTaskStatus,
+      applyTaskPatch: params.applyTaskPatch,
+      writeEscalationWriteback: params.writeEscalationWriteback,
+      notifyEscalation: params.notifyEscalation,
+      recordEscalatedRunNote: params.recordEscalatedRunNote,
     });
   }
 
-  return {
-    taskName: params.task.name,
-    repo: params.repo,
-    outcome: "escalated",
-    sessionId: result.sessionId || undefined,
-    escalationReason: reason,
-  };
+  try {
+    const completionRun = await params.finalizeVerifiedNoPrCompletion({
+      task: params.task,
+      issueNumber: parsedIssueNumber,
+      marker: parsedMarker,
+      sessionId: result.sessionId || undefined,
+      output: result.output,
+    });
+    params.completeParentVerification({
+      repo: params.repo,
+      issueNumber: parsedIssueNumber,
+      outcome: "no_work",
+      details: parsedMarker.why_satisfied ?? parsedMarker.reason,
+      nowMs,
+    });
+    return completionRun;
+  } catch (error: any) {
+    const detail = error?.message ?? String(error);
+    const nextAttemptAtMs = nowMs + getParentVerificationBackoffMs(attemptCount);
+    params.recordParentVerificationAttemptFailure({
+      repo: params.repo,
+      issueNumber: parsedIssueNumber,
+      attemptCount,
+      nextAttemptAtMs,
+      nowMs,
+      details: detail,
+    });
+    if (attemptCount >= maxAttempts) {
+      const reason = `Parent verification no-PR completion failed after ${attemptCount} attempts`;
+      return await escalateNoPrCompletion({
+        task: params.task,
+        repo: params.repo,
+        reason,
+        details: detail,
+        sessionId: result.sessionId || undefined,
+        output: result.output,
+        updateTaskStatus: params.updateTaskStatus,
+        applyTaskPatch: params.applyTaskPatch,
+        writeEscalationWriteback: params.writeEscalationWriteback,
+        notifyEscalation: params.notifyEscalation,
+        recordEscalatedRunNote: params.recordEscalatedRunNote,
+      });
+    }
+    return await deferParentVerification({
+      repo: params.repo,
+      task: params.task,
+      reason: "parent verification no-pr completion failed",
+      updateTaskStatus: params.updateTaskStatus,
+      applyTaskPatch: params.applyTaskPatch,
+    });
+  }
 }

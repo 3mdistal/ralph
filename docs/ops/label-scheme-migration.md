@@ -6,10 +6,16 @@ Ralph vNext uses namespaced labels:
 - `ralph:priority:*` (operator-owned)
 - `ralph:intent:*` (operator-owned)
 - `ralph:artifact:*` (operator-owned)
+- `ralph:priority:*` (operator-owned)
 
 Legacy workflow labels (unqualified `ralph:<state>`) are not supported after cutover. If any OPEN issue/PR in a repo has a legacy label, Ralph treats the repo as **unschedulable** and will not claim work.
 
 Canonical spec: `docs/product/orchestration-contract.md`.
+
+Priority note:
+
+- Canonical priority labels are `ralph:priority:p0`..`ralph:priority:p4`.
+- Legacy non-namespaced `p0`..`p4` labels are deprecated and treated as read-only fallback only when no `ralph:priority:*` labels exist.
 
 ## Legacy Label Set (Migration Errors)
 
