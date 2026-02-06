@@ -121,11 +121,14 @@ describe("computeRalphLabelSync", () => {
     expect(paused?.description).toBe("Operator pause; do not claim or resume");
   });
 
-  test("includes canonical priority labels", () => {
-    const priorities = ["ralph:priority:p0", "ralph:priority:p1", "ralph:priority:p2", "ralph:priority:p3", "ralph:priority:p4"];
-    const names = new Set(RALPH_WORKFLOW_LABELS.map((label) => label.name));
-    for (const priority of priorities) {
-      expect(names.has(priority)).toBe(true);
-    }
+  test("includes ralph priority labels", () => {
+    const priorities = RALPH_WORKFLOW_LABELS.filter((label) => label.name.startsWith("ralph:priority:"));
+    expect(priorities.map((label) => label.name)).toEqual([
+      "ralph:priority:p0",
+      "ralph:priority:p1",
+      "ralph:priority:p2",
+      "ralph:priority:p3",
+      "ralph:priority:p4",
+    ]);
   });
 });

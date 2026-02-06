@@ -1,5 +1,12 @@
 export type TaskPriority = "p0-critical" | "p1-high" | "p2-medium" | "p3-low" | "p4-backlog";
 
+export type RalphPriorityLabel =
+  | "ralph:priority:p0"
+  | "ralph:priority:p1"
+  | "ralph:priority:p2"
+  | "ralph:priority:p3"
+  | "ralph:priority:p4";
+
 const DEFAULT_PRIORITY: TaskPriority = "p2-medium";
 
 const PRIORITY_BY_INDEX: TaskPriority[] = [
@@ -10,15 +17,13 @@ const PRIORITY_BY_INDEX: TaskPriority[] = [
   "p4-backlog",
 ];
 
-export const RALPH_PRIORITY_LABELS = [
+export const RALPH_PRIORITY_LABELS: RalphPriorityLabel[] = [
   "ralph:priority:p0",
   "ralph:priority:p1",
   "ralph:priority:p2",
   "ralph:priority:p3",
   "ralph:priority:p4",
-] as const;
-
-export type RalphPriorityLabel = (typeof RALPH_PRIORITY_LABELS)[number];
+];
 
 const RALPH_PRIORITY_LABEL_RE = /^ralph:priority:p([0-4])$/i;
 const LEGACY_PRIORITY_LABEL_RE = /^p([0-4])(?:$|[^0-9])/i;
@@ -43,26 +48,45 @@ function parseLegacyPriorityIndex(value: string): number | null {
   return PRIORITY_BY_INDEX[index] ? index : null;
 }
 
+function isRalphPriorityLabel(label: string): label is RalphPriorityLabel {
+  return parseRalphPriorityIndex(label) !== null;
+}
+
+export function toRalphPriorityLabel(priority: TaskPriority): RalphPriorityLabel {
+  const index = PRIORITY_BY_INDEX.indexOf(priority);
+  const clamped = index >= 0 ? index : PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY);
+  return RALPH_PRIORITY_LABELS[clamped] ?? "ralph:priority:p2";
+}
+
+export function planRalphPriorityLabelDelta(
+  desired: TaskPriority,
+  currentLabels: readonly string[]
+): { add: string[]; remove: string[] } {
+  const target = toRalphPriorityLabel(desired);
+  const labelSet = new Set(currentLabels);
+  const add = labelSet.has(target) ? [] : [target];
+  const remove = currentLabels.filter((label) => isRalphPriorityLabel(label) && label !== target);
+  return { add, remove };
+}
+
 export function inferPriorityFromLabels(labels?: readonly string[] | null): TaskPriority {
-  let bestIndex: number | null = null;
+  let bestRalph: number | null = null;
+  let bestLegacy: number | null = null;
   const entries = labels ?? [];
   for (const label of entries) {
-    const index = parseRalphPriorityIndex(label);
-    if (index === null) continue;
-    if (bestIndex === null || index < bestIndex) bestIndex = index;
+    const ralphIndex = parseRalphPriorityIndex(label);
+    if (ralphIndex !== null) {
+      if (bestRalph === null || ralphIndex < bestRalph) bestRalph = ralphIndex;
+      continue;
+    }
+
+    const legacyIndex = parseLegacyPriorityIndex(label);
+    if (legacyIndex === null) continue;
+    if (bestLegacy === null || legacyIndex < bestLegacy) bestLegacy = legacyIndex;
   }
 
-  if (bestIndex !== null) {
-    return PRIORITY_BY_INDEX[bestIndex];
-  }
-
-  for (const label of entries) {
-    const index = parseLegacyPriorityIndex(label);
-    if (index === null) continue;
-    if (bestIndex === null || index < bestIndex) bestIndex = index;
-  }
-
-  return PRIORITY_BY_INDEX[bestIndex ?? PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY)];
+  const index = bestRalph ?? bestLegacy ?? PRIORITY_BY_INDEX.indexOf(DEFAULT_PRIORITY);
+  return PRIORITY_BY_INDEX[index];
 }
 
 export function normalizeTaskPriority(value: unknown): TaskPriority {
@@ -73,8 +97,8 @@ export function normalizeTaskPriority(value: unknown): TaskPriority {
     return normalized as TaskPriority;
   }
 
-  const canonicalIndex = parseRalphPriorityIndex(value);
-  if (canonicalIndex !== null) return PRIORITY_BY_INDEX[canonicalIndex];
+  const ralphIndex = parseRalphPriorityIndex(value);
+  if (ralphIndex !== null) return PRIORITY_BY_INDEX[ralphIndex] ?? DEFAULT_PRIORITY;
 
   const index = parseLegacyPriorityIndex(value);
   if (index === null) return DEFAULT_PRIORITY;

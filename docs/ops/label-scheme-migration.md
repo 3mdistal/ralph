@@ -3,6 +3,7 @@
 Ralph vNext uses namespaced labels:
 
 - `ralph:status:*` (Ralph-managed)
+- `ralph:priority:*` (operator-owned)
 - `ralph:intent:*` (operator-owned)
 - `ralph:artifact:*` (operator-owned)
 - `ralph:priority:*` (operator-owned)
@@ -37,6 +38,13 @@ Relabel by removing the legacy label and adding the vNext label:
 - `ralph:stuck` -> `ralph:status:in-progress`
 - `ralph:in-bot` -> `ralph:status:in-bot`
 - `ralph:done` -> `ralph:status:done`
+
+## Priority labels
+
+Priority is now expressed via `ralph:priority:p0`..`ralph:priority:p4`.
+
+- Ralph only mutates `ralph:*` labels; it does not add/remove legacy `p0-critical`/`p2-medium` labels.
+- If you still have legacy priority labels, add the corresponding `ralph:priority:*` label to migrate.
 
 ## Checklist
 

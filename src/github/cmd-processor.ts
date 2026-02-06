@@ -173,7 +173,9 @@ type ProcessOneCommandParams = {
   issueState: string | null;
 };
 
-async function processOneCommand(params: ProcessOneCommandParams): Promise<{ processed: boolean; removedCmdLabel: boolean }> {
+export async function processOneCommand(
+  params: ProcessOneCommandParams
+): Promise<{ processed: boolean; removedCmdLabel: boolean }> {
   const github = new GitHubClient(params.repo);
   const at = nowIso();
   const issueRef = `${params.repo}#${params.issueNumber}`;

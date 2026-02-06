@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { inferPriorityFromLabels, normalizePriorityInputToRalphPriorityLabel, normalizeTaskPriority } from "../queue/priority";
+import {
+  inferPriorityFromLabels,
+  normalizePriorityInputToRalphPriorityLabel,
+  normalizeTaskPriority,
+  planRalphPriorityLabelDelta,
+} from "../queue/priority";
 
 describe("priority parsing", () => {
   test("inferPriorityFromLabels defaults to p2-medium", () => {
@@ -68,5 +73,12 @@ describe("normalizePriorityInputToRalphPriorityLabel", () => {
 
   test("maps canonical labels to themselves", () => {
     expect(normalizePriorityInputToRalphPriorityLabel("ralph:priority:p0")).toBe("ralph:priority:p0");
+  });
+});
+
+describe("planRalphPriorityLabelDelta", () => {
+  test("returns add/remove for ralph:priority labels only", () => {
+    const delta = planRalphPriorityLabelDelta("p1-high", ["bug", "ralph:priority:p3"]);
+    expect(delta).toEqual({ add: ["ralph:priority:p1"], remove: ["ralph:priority:p3"] });
   });
 });

@@ -3,7 +3,7 @@
   "agent": {
     "build": {
       "description": "Implementation agent for Ralph daemon runs",
-      "model": "openai/gpt-5.2-codex",
+      "model": "openai/gpt-5.3-codex",
       "prompt": "agent/build.md"
     },
     "ralph-plan": {
@@ -22,7 +22,7 @@
     },
     "devex": {
       "description": "Developer experience advisor",
-      "model": "openai/gpt-5.2",
+      "model": "openai/gpt-5.3-codex",
       "prompt": "agent/devex.md",
       "mode": "subagent"
     }
