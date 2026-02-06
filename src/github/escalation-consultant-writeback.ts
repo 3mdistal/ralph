@@ -27,18 +27,10 @@ function ensureTrailingNewline(text: string): string {
   return text.endsWith("\n") ? text : `${text}\n`;
 }
 
-function buildApprovalInstructions(): string {
+function buildResumeInstructions(): string {
   return [
-    "## Approval",
-    "To approve the consultant recommendation (resume automatically):",
-    "- Comment with `RALPH APPROVE`",
-    "",
-    "To override with your own guidance (resume automatically):",
-    "- Comment with `RALPH OVERRIDE: <your guidance>` (can be multi-line)",
-    "",
-    "Fallback:",
-    "- Comment with `RALPH RESOLVED: <guidance>`",
-    "- Or re-add `ralph:status:queued`",
+    "## Resume",
+    "Reply with any guidance for the agent, then apply `ralph:cmd:queue` to resume.",
     "",
   ].join("\n");
 }
@@ -85,7 +77,7 @@ export async function ensureEscalationCommentHasConsultantPacket(params: {
     "",
     consultant.trimEnd(),
     "",
-    buildApprovalInstructions().trimEnd(),
+    buildResumeInstructions().trimEnd(),
     "",
   ].join("\n");
 
