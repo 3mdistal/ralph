@@ -6,10 +6,31 @@ import {
   recordIdempotencyKey,
   upsertIdempotencyKey,
 } from "../state";
+import {
+  normalizeTaskPriority,
+  RALPH_PRIORITY_LABELS,
+  taskPriorityToCanonicalLabel,
+  type TaskPriority,
+} from "../queue/priority";
 
 export type DxSurveyOwnershipOwner = "target_repo" | "ralph";
 export type DxSurveyOwnershipConfidence = "high" | "medium" | "low";
-export type DxSurveySeverity = "p0" | "p1" | "p2" | "p3" | "p4" | "p0-critical" | "p1-high" | "p2-medium" | "p3-low" | "p4-backlog";
+export type DxSurveySeverity =
+  | "p0"
+  | "p1"
+  | "p2"
+  | "p3"
+  | "p4"
+  | "p0-critical"
+  | "p1-high"
+  | "p2-medium"
+  | "p3-low"
+  | "p4-backlog"
+  | "ralph:priority:p0"
+  | "ralph:priority:p1"
+  | "ralph:priority:p2"
+  | "ralph:priority:p3"
+  | "ralph:priority:p4";
 
 export type DxSurveyV1 = {
   schema: "ralph.dx_survey.v1";
@@ -91,15 +112,24 @@ export type DxSurveyWritebackResult = {
 
 type LabelSpec = { name: string; color: string; description: string };
 
+const PRIORITY_LABEL_COLORS = ["B60205", "D93F0B", "FBCA04", "0E8A16", "C5DEF5"] as const;
+const PRIORITY_LABEL_DESCRIPTIONS = [
+  "Priority 0 (critical / blocker)",
+  "Priority 1 (high)",
+  "Priority 2 (medium)",
+  "Priority 3 (low)",
+  "Priority 4 (backlog)",
+] as const;
+
 const DX_LABEL_SPECS: readonly LabelSpec[] = [
   { name: "dx", color: "1D76DB", description: "Developer experience" },
   { name: "ralph-feedback", color: "0E8A16", description: "Ralph DX survey feedback (job record)" },
   { name: "ralph-work", color: "5319E7", description: "Work item created from Ralph feedback" },
-  { name: "p0-critical", color: "B60205", description: "Priority 0 (critical / blocker)" },
-  { name: "p1-high", color: "D93F0B", description: "Priority 1 (high)" },
-  { name: "p2-medium", color: "FBCA04", description: "Priority 2 (medium)" },
-  { name: "p3-low", color: "0E8A16", description: "Priority 3 (low)" },
-  { name: "p4-backlog", color: "C5DEF5", description: "Priority 4 (backlog)" },
+  ...RALPH_PRIORITY_LABELS.map((label, index) => ({
+    name: label,
+    color: PRIORITY_LABEL_COLORS[index] ?? "C5DEF5",
+    description: PRIORITY_LABEL_DESCRIPTIONS[index] ?? "Priority",
+  })),
 ] as const;
 
 type EnsureOutcome =
@@ -195,14 +225,8 @@ async function ensureDxFeedbackLabelsOnce(params: { repo: string; github: GitHub
   return { ok: true, created, updated };
 }
 
-function mapSeverityToPriorityLabel(severity: DxSurveySeverity | undefined): string {
-  const s = (severity ?? "p2").toString().trim().toLowerCase();
-  if (s === "p0" || s === "p0-critical") return "p0-critical";
-  if (s === "p1" || s === "p1-high") return "p1-high";
-  if (s === "p2" || s === "p2-medium") return "p2-medium";
-  if (s === "p3" || s === "p3-low") return "p3-low";
-  if (s === "p4" || s === "p4-backlog") return "p4-backlog";
-  return "p2-medium";
+function mapSeverityToPriority(severity: DxSurveySeverity | undefined): TaskPriority {
+  return normalizeTaskPriority(severity ?? "p2");
 }
 
 function hash32(value: string): string {
@@ -405,7 +429,8 @@ export async function writeDxSurveyToGitHubIssues(params: {
 
     const owner = item.ownership?.owner === "ralph" ? "ralph" : "target_repo";
     const childRepo = owner === "ralph" ? params.ralphRepo : params.targetRepo;
-    const priority = mapSeverityToPriorityLabel(item.severity);
+    const priority = mapSeverityToPriority(item.severity);
+    const priorityLabel = taskPriorityToCanonicalLabel(priority);
 
     const childKey = `gh-dx-survey-child:${childRepo}:${params.cacheKey}:${hash32(`${owner}:${priority}:${title}`)}`;
     if (hasIdempotencyKey(childKey)) {
@@ -459,7 +484,7 @@ export async function writeDxSurveyToGitHubIssues(params: {
       // best-effort
     }
 
-    const labels = owner === "ralph" ? ["dx", "ralph-work", priority] : ["dx", priority];
+    const labels = owner === "ralph" ? ["dx", "ralph-work", priorityLabel] : ["dx", priorityLabel];
     await addIssueLabelsBestEffort({
       github: owner === "ralph" ? ralphClient : params.github,
       repo: childRepo,
