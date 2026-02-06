@@ -165,7 +165,7 @@ async function ensureCmdComment(params: {
   }
 }
 
-async function processOneCommand(params: {
+export async function processOneCommand(params: {
   repo: string;
   issueNumber: number;
   cmdLabel: CmdLabel;
