@@ -120,4 +120,15 @@ describe("computeRalphLabelSync", () => {
     const paused = RALPH_WORKFLOW_LABELS.find((label) => label.name === "ralph:status:paused");
     expect(paused?.description).toBe("Operator pause; do not claim or resume");
   });
+
+  test("includes ralph priority labels", () => {
+    const priorities = RALPH_WORKFLOW_LABELS.filter((label) => label.name.startsWith("ralph:priority:"));
+    expect(priorities.map((label) => label.name)).toEqual([
+      "ralph:priority:p0",
+      "ralph:priority:p1",
+      "ralph:priority:p2",
+      "ralph:priority:p3",
+      "ralph:priority:p4",
+    ]);
+  });
 });
