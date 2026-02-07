@@ -227,14 +227,13 @@ function buildReviewPrompt(params: {
 
   const lines = [
     "Review request (deterministic gate)",
+    "IMPORTANT: respond with exactly one line; do not call tools.",
+    "If uncertain, return fail with a concise actionable reason.",
     `Repo: ${params.repo}`,
     `Issue: ${params.issueRef}`,
     `PR: ${params.prUrl}`,
     `Base: ${params.baseRef}`,
     `Head: ${params.headRef}`,
-    "",
-    "Diff artifact path (reference only):",
-    params.diffPath,
     "",
     "git diff --stat:",
     stat,
@@ -249,11 +248,11 @@ function buildReviewPrompt(params: {
 
   lines.push(
     "",
-    "Do not call tools. Do not request additional files.",
+    "Do not call tools. Do not request additional files. Do not add explanation text.",
     "Return the required RALPH_REVIEW marker on the final line.",
     "Final line format:",
     'RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}',
-    "Do not add any text after the marker line."
+    "Do not add any text before or after the marker line."
   );
 
   return lines.join("\n");
