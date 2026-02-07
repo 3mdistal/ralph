@@ -1876,6 +1876,9 @@ async function main(): Promise<void> {
       return gate.allowModelSend;
     },
     repoPath: () => ".",
+    editEscalation,
+    getTaskByPath,
+    updateTaskStatus,
     log: (message) => console.log(message),
   });
   void escalationConsultantScheduler.tick();
