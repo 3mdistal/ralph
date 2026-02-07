@@ -5,6 +5,7 @@ export const BLOCKED_SOURCES = [
   "dirty-repo",
   "merge-target",
   "ci-only",
+  "review",
   "merge-conflict",
   "stall",
   "guardrail",

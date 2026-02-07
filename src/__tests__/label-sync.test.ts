@@ -3,8 +3,16 @@ import { describe, expect, mock, test } from "bun:test";
 import { GitHubApiError } from "../github/client";
 import { ensureRalphWorkflowLabelsOnce, createRalphWorkflowLabelsEnsurer } from "../github/ensure-ralph-workflow-labels";
 import { RALPH_WORKFLOW_LABELS } from "../github-labels";
+import { RALPH_PRIORITY_LABELS } from "../queue/priority";
 
 describe("ensureRalphWorkflowLabelsOnce", () => {
+  test("includes priority labels in the workflow set", () => {
+    const labelNames = new Set(RALPH_WORKFLOW_LABELS.map((label) => label.name));
+    for (const label of RALPH_PRIORITY_LABELS) {
+      expect(labelNames.has(label)).toBe(true);
+    }
+  });
+
   test("no-ops when labels already match", async () => {
     const listLabelSpecs = mock(async () => RALPH_WORKFLOW_LABELS);
     const createLabel = mock(async () => {});

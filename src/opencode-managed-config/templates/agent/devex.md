@@ -38,6 +38,8 @@ You will receive one of:
   - What the change is intended to do
   - Any test/build output (if relevant)
 
+If a diff artifact path or ID is provided, use that file for review instead of asking for pasted diff chunks. Always rely on the referenced diff artifact plus `git diff --stat` when available.
+
 # Investigation Process (Survey/Feedback)
 
 When you receive survey/feedback:
@@ -99,6 +101,17 @@ Testing guidance:
 # Output Format
 
 Return your recommendations as a structured list.
+
+# Deterministic Output Marker
+
+You MUST include exactly one marker on the FINAL LINE:
+
+`RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}`
+
+Marker rules:
+- Final line only.
+- Exactly one marker.
+- Keep `reason` concise (1-2 sentences) and actionable.
 
 If you received a diff, use:
 
