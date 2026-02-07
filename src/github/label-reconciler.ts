@@ -84,6 +84,8 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
   });
 
   let processed = 0;
+  let blockedQueuedDriftDetected = 0;
+  let blockedQueuedDriftReconciled = 0;
 
   for (const issue of issues) {
     if (processed >= maxIssues) break;
@@ -96,6 +98,8 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
     const released = typeof opState.releasedAtMs === "number" && Number.isFinite(opState.releasedAtMs);
     const desiredStatus = released ? "queued" : toDesiredStatus(opState.status ?? null);
     if (!desiredStatus) continue;
+    const hasBlockedQueuedDrift = desiredStatus === "blocked" && issue.labels.includes("ralph:status:queued");
+    if (hasBlockedQueuedDrift) blockedQueuedDriftDetected += 1;
 
     const cooldownKey = `${repo}#${issue.number}`;
     const cooldown = lastAppliedByIssue.get(cooldownKey);
@@ -184,9 +188,17 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
         updatedAtMs: nowMs,
       });
       lastAppliedByIssue.set(cooldownKey, { desiredStatus, appliedAtMs: nowMs });
+      if (hasBlockedQueuedDrift) blockedQueuedDriftReconciled += 1;
     }
 
     processed += 1;
+  }
+
+  if (blockedQueuedDriftDetected > 0 && shouldLog(`labels:blocked-queued-drift:${repo}`, 60_000)) {
+    const remaining = Math.max(0, blockedQueuedDriftDetected - blockedQueuedDriftReconciled);
+    console.warn(
+      `[ralph:labels:reconcile:${repo}] queued/local-blocked drift detected=${blockedQueuedDriftDetected} reconciled=${blockedQueuedDriftReconciled} remaining=${remaining}`
+    );
   }
 
   return processed;

@@ -282,4 +282,117 @@ describe("GitHub queue updateTaskStatus", () => {
     expect(updated).toBe(true);
     expect(mutationCount).toBe(0);
   });
+
+  test("blocked status reconciles queued label to in-progress", async () => {
+    const now = new Date("2026-02-03T05:00:00.000Z");
+    const queueMod = await import("../github-queue/io");
+    const stateMod = await import("../state");
+    const calls: Array<{ add: string[]; remove: string[] }> = [];
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => now,
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => ["ralph:status:queued"],
+        fetchIssue: async () => ({
+          title: "Blocked",
+          state: "OPEN",
+          url: "https://github.com/3mdistal/ralph/issues/406",
+          githubNodeId: "node-406",
+          githubUpdatedAt: now.toISOString(),
+          labels: ["ralph:status:queued"],
+        }),
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async ({ add, remove }) => {
+          calls.push({ add, remove });
+          return true;
+        },
+      },
+    });
+
+    const task = buildTask("3mdistal/ralph", 406);
+    stateMod.recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#406",
+      title: "Blocked",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/406",
+      githubUpdatedAt: now.toISOString(),
+      at: now.toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#406",
+      labels: ["ralph:status:queued"],
+      at: now.toISOString(),
+    });
+
+    const updated = await driver.updateTaskStatus(task, "blocked");
+    expect(updated).toBe(true);
+    expect(calls).toEqual([{ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] }]);
+    const labels = stateMod.getIssueLabels("3mdistal/ralph", 406);
+    expect(labels).toEqual(["ralph:status:in-progress"]);
+  });
+
+  test("blocked to queued clears in-progress label", async () => {
+    const now = new Date("2026-02-03T05:30:00.000Z");
+    const queueMod = await import("../github-queue/io");
+    const stateMod = await import("../state");
+    const calls: Array<{ add: string[]; remove: string[] }> = [];
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => now,
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => ["ralph:status:in-progress"],
+        fetchIssue: async () => ({
+          title: "Unblocked",
+          state: "OPEN",
+          url: "https://github.com/3mdistal/ralph/issues/407",
+          githubNodeId: "node-407",
+          githubUpdatedAt: now.toISOString(),
+          labels: ["ralph:status:in-progress"],
+        }),
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async ({ add, remove }) => {
+          calls.push({ add, remove });
+          return true;
+        },
+      },
+    });
+
+    const task = buildTask("3mdistal/ralph", 407);
+    stateMod.recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#407",
+      title: "Unblocked",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/407",
+      githubUpdatedAt: now.toISOString(),
+      at: now.toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#407",
+      labels: ["ralph:status:in-progress"],
+      at: now.toISOString(),
+    });
+    stateMod.recordTaskSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#407",
+      taskPath: task._path,
+      status: "blocked",
+      at: now.toISOString(),
+    });
+
+    const updated = await driver.updateTaskStatus(task, "queued");
+    expect(updated).toBe(true);
+    expect(calls).toEqual([{ add: ["ralph:status:queued"], remove: ["ralph:status:in-progress"] }]);
+    const labels = stateMod.getIssueLabels("3mdistal/ralph", 407);
+    expect(labels).toEqual(["ralph:status:queued"]);
+  });
 });
