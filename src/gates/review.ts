@@ -138,7 +138,7 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
 function buildReviewPrompt(params: {
   repo: string;
   issueRef: string;
-  prUrl: string;
+  prUrl?: string;
   baseRef: string;
   headRef: string;
   diffPath: string;
@@ -152,7 +152,7 @@ function buildReviewPrompt(params: {
     "Review request (deterministic gate)",
     `Repo: ${params.repo}`,
     `Issue: ${params.issueRef}`,
-    `PR: ${params.prUrl}`,
+    `PR: ${params.prUrl?.trim() || "(pending creation by Ralph)"}`,
     `Base: ${params.baseRef}`,
     `Head: ${params.headRef}`,
     "",
@@ -230,7 +230,7 @@ export async function prepareReviewDiffArtifacts(params: {
   if (baseRef) {
     await execGit(["fetch", "origin", baseRef]);
   }
-  if (headRef) {
+  if (headRef && headRef !== "HEAD") {
     await execGit(["fetch", "origin", headRef]);
   }
 
@@ -240,8 +240,8 @@ export async function prepareReviewDiffArtifacts(params: {
     throw new Error("Missing base/head refs for review diff");
   }
 
-  const diffStat = (await execGit(["diff", "--stat", range])).trim();
-  const diffText = await execGit(["diff", range]);
+  const diffStat = (await execGit(["diff", "--no-color", "--stat", range])).trim();
+  const diffText = await execGit(["diff", "--no-color", range]);
   await writeFile(diffPath, diffText, "utf8");
 
   return {
@@ -275,7 +275,7 @@ export async function runReviewGate(params: {
   gate: ReviewGateName;
   repo: string;
   issueRef: string;
-  prUrl: string;
+  prUrl?: string;
   issueContext?: string;
   diff: ReviewDiffArtifacts;
   runAgent: (prompt: string) => Promise<SessionResult>;

@@ -49,6 +49,13 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import {
+  prepareReviewDiffArtifacts,
+  recordReviewGateFailure,
+  runReviewGate,
+  type ReviewDiffArtifacts,
+  type ReviewGateName,
+} from "../gates/review";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
@@ -1684,6 +1691,107 @@ export class RepoWorker {
     ].join("\n");
   }
 
+  private async runPrSubmissionReadinessChecks(params: {
+    task: AgentTask;
+    issueNumber: string;
+    taskRepoPath: string;
+    baseRef: string;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+  }): Promise<{ ok: true; diagnostics: string[] } | { ok: false; diagnostics: string[] }> {
+    const diagnostics: string[] = [];
+    const runId = this.activeRunId;
+
+    if (!runId) {
+      diagnostics.push("- PR readiness failed: missing run id for deterministic gate recording");
+      return { ok: false, diagnostics };
+    }
+
+    let issueContext = "";
+    try {
+      issueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber: params.issueNumber });
+    } catch (error: any) {
+      issueContext = `Issue context unavailable: ${error?.message ?? String(error)}`;
+    }
+
+    let reviewDiff: ReviewDiffArtifacts;
+    try {
+      reviewDiff = await prepareReviewDiffArtifacts({
+        runId,
+        repoPath: params.taskRepoPath,
+        baseRef: params.baseRef,
+        headRef: "HEAD",
+      });
+      diagnostics.push("- Review diff artifact prepared");
+    } catch (error: any) {
+      const reason = `PR readiness failed: could not prepare review diff artifacts (${error?.message ?? String(error)})`;
+      diagnostics.push(`- ${reason}`);
+      recordReviewGateFailure({ runId, gate: "product_review", reason });
+      recordReviewGateFailure({ runId, gate: "devex_review", reason });
+      return { ok: false, diagnostics };
+    }
+
+    const runSingleReview = async (
+      gate: ReviewGateName,
+      agent: "product" | "devex",
+      stage: string
+    ): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      const result = await runReviewGate({
+        runId,
+        gate,
+        repo: this.repo,
+        issueRef: params.task.issue,
+        prUrl: "(pending creation by Ralph)",
+        issueContext,
+        diff: reviewDiff,
+        runAgent: async (prompt) => {
+          const runLogPath = await this.recordRunLogPath(params.task, params.issueNumber, stage, "in-progress");
+          return await this.session.runAgent(params.taskRepoPath, agent, prompt, {
+            repo: this.repo,
+            cacheKey: `${params.issueNumber}-${gate}-pr-readiness`,
+            runLogPath,
+            introspection: {
+              repo: this.repo,
+              issue: params.task.issue,
+              taskName: params.task.name,
+              step: 0,
+              stepTitle: stage,
+            },
+            ...this.buildWatchdogOptions(params.task, stage),
+            ...this.buildStallOptions(params.task, stage),
+            ...this.buildLoopDetectionOptions(params.task, stage),
+            ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
+          });
+        },
+      });
+
+      if (result.status !== "pass") {
+        return { ok: false, reason: result.reason };
+      }
+
+      return { ok: true };
+    };
+
+    const productReview = await runSingleReview(
+      "product_review",
+      "product",
+      "pr-readiness-product-review"
+    );
+    if (!productReview.ok) {
+      diagnostics.push(`- PR readiness failed: product review (${productReview.reason})`);
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Product review gate passed");
+
+    const devexReview = await runSingleReview("devex_review", "devex", "pr-readiness-devex-review");
+    if (!devexReview.ok) {
+      diagnostics.push(`- PR readiness failed: devex review (${devexReview.reason})`);
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- DevEx review gate passed");
+
+    return { ok: true, diagnostics };
+  }
+
   private async getGitWorktrees(): Promise<GitWorktreeEntry[]> {
     return (await getGitWorktreesImpl(this as any)) as any;
   }
@@ -1815,6 +1923,7 @@ export class RepoWorker {
     issueNumber: string;
     issueTitle: string;
     botBranch: string;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
   }): Promise<{ prUrl: string | null; diagnostics: string }> {
     const { task, issueNumber, issueTitle, botBranch } = params;
 
@@ -1911,8 +2020,23 @@ export class RepoWorker {
       } else {
         diagnostics.push("- Preflight passed");
       }
-    } else if (preflightConfig.commands.length > 0) {
+
+      const readiness = await this.runPrSubmissionReadinessChecks({
+        task,
+        issueNumber,
+        taskRepoPath: candidate.worktreePath,
+        baseRef: botBranch,
+        opencodeXdg: params.opencodeXdg,
+      });
+      diagnostics.push(...readiness.diagnostics);
+      if (!readiness.ok) {
+        diagnostics.push("- PR creation refused: deterministic PR readiness gates not satisfied");
+        return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      }
+    } else {
       diagnostics.push("- WARNING: missing runId; skipping deterministic preflight gate recording");
+      diagnostics.push("- PR creation refused: missing run id for deterministic PR readiness gates");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
     try {
@@ -5191,6 +5315,7 @@ export class RepoWorker {
           issueNumber,
           issueTitle: issueMeta.title || task.name,
           botBranch,
+          opencodeXdg,
         });
         prRecoveryDiagnostics = recovered.diagnostics;
         prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
@@ -5449,6 +5574,7 @@ export class RepoWorker {
             issueNumber,
             issueTitle: issueMeta.title || task.name,
             botBranch,
+            opencodeXdg,
           });
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
@@ -5475,6 +5601,7 @@ export class RepoWorker {
           issueNumber,
           issueTitle: issueMeta.title || task.name,
           botBranch,
+          opencodeXdg,
         });
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
         prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
@@ -6477,6 +6604,7 @@ export class RepoWorker {
           issueNumber,
           issueTitle: issueMeta.title || task.name,
           botBranch,
+          opencodeXdg,
         });
         prRecoveryDiagnostics = recovered.diagnostics;
         prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
@@ -6730,6 +6858,7 @@ export class RepoWorker {
             issueNumber,
             issueTitle: issueMeta.title || task.name,
             botBranch,
+            opencodeXdg,
           });
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
@@ -6756,6 +6885,7 @@ export class RepoWorker {
           issueNumber,
           issueTitle: issueMeta.title || task.name,
           botBranch,
+          opencodeXdg,
         });
         prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
         prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);

@@ -8,7 +8,6 @@ import { PR_STATE_MERGED } from "../../state";
 import {
   prepareReviewDiffArtifacts,
   recordReviewGateFailure,
-  recordReviewGateSkipped,
   runReviewGate,
   type ReviewDiffArtifacts,
   type ReviewGateResult,
@@ -296,7 +295,7 @@ export async function mergePrWithRequiredChecks(params: {
       issueContext = `Issue context unavailable: ${error?.message ?? String(error)}`;
     }
 
-    let reviewDiff: ReviewDiffArtifacts | null = null;
+    let reviewDiff: ReviewDiffArtifacts;
     try {
       const prStatus = await params.getPullRequestChecks(prUrl);
       reviewDiff = await prepareReviewDiffArtifacts({
@@ -306,16 +305,26 @@ export async function mergePrWithRequiredChecks(params: {
         headRef: prStatus.headSha,
       });
     } catch (error: any) {
-      const reason = `Review gate skipped: could not prepare diff artifacts (${error?.message ?? String(error)})`;
+      const reason = `Review gate failed: could not prepare diff artifacts (${error?.message ?? String(error)})`;
       warn(`[ralph:worker:${params.repo}] ${reason}`);
-      recordReviewGateSkipped({ runId: reviewRunId, gate: "product_review", reason });
-      recordReviewGateSkipped({ runId: reviewRunId, gate: "devex_review", reason });
+      recordReviewGateFailure({ runId: reviewRunId, gate: "product_review", reason });
+      recordReviewGateFailure({ runId: reviewRunId, gate: "devex_review", reason });
+      await params.markTaskBlocked(params.task, "review", {
+        reason,
+        details: reason,
+        sessionId,
+      });
+      return {
+        ok: false,
+        run: {
+          taskName: params.task.name,
+          repo: params.repo,
+          outcome: "failed",
+          sessionId,
+          escalationReason: reason,
+        },
+      };
     }
-
-    if (!reviewDiff) {
-      // Continue merge flow when diff artifacts cannot be produced.
-      // This preserves existing merge behavior in degraded environments.
-    } else {
 
     const runReview = async (
       gate: ReviewGateName,
@@ -382,7 +391,6 @@ export async function mergePrWithRequiredChecks(params: {
           },
         };
       }
-    }
   }
 
   const recurse = async (next: { prUrl: string; sessionId: string }): Promise<

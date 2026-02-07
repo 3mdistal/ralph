@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "fs/promises";
+import { join } from "path";
+import { tmpdir } from "os";
 
 import { mergePrWithRequiredChecks } from "../worker/merge/merge-runner";
+import { createRalphRun, ensureRalphRunGateRows, initStateDb } from "../state";
 
 function buildSuccessSummary() {
   return {
@@ -179,5 +183,42 @@ describe("mergePrWithRequiredChecks 405 handling", () => {
     expect(markTaskBlockedCalls[0]?.source).toBe("auto-update");
     expect(markTaskBlockedCalls[0]?.reason).toContain("base branch changed");
     expect(markTaskBlockedCalls[0]?.reason).not.toContain("required checks not green");
+  });
+});
+
+describe("mergePrWithRequiredChecks deterministic review readiness", () => {
+  test("fails closed when review diff artifacts cannot be prepared", async () => {
+    const previousHome = process.env.HOME;
+    const homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
+    process.env.HOME = homeDir;
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#611",
+      taskPath: "tasks/611",
+      attemptKind: "process",
+    });
+    ensureRalphRunGateRows({ runId });
+
+    const { params, markTaskBlockedCalls, mergeCalls } = buildParams({
+      runId,
+      getPullRequestChecks: async () => {
+        throw new Error("missing diff base");
+      },
+    });
+
+    try {
+      const result = await mergePrWithRequiredChecks(params);
+
+      expect(result.ok).toBe(false);
+      expect(markTaskBlockedCalls).toHaveLength(1);
+      expect(markTaskBlockedCalls[0]?.source).toBe("review");
+      expect(markTaskBlockedCalls[0]?.reason).toContain("could not prepare diff artifacts");
+      expect(mergeCalls).toHaveLength(0);
+    } finally {
+      process.env.HOME = previousHome;
+      await rm(homeDir, { recursive: true, force: true });
+    }
   });
 });
