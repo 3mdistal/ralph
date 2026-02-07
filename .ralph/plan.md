@@ -1,42 +1,54 @@
-# Plan: Fix queue/in-progress label flapping on long-lived open PRs (#599)
+# Plan: Refactor RepoWorker orchestration into start/resume lanes (#564)
 
 ## Goal
 
-- Stop `ralph:status:queued` <-> `ralph:status:in-progress` oscillation for issues that already have a long-lived open PR and no new operator input.
-- Preserve contract invariant: exactly one `ralph:status:*` label converges, and `queued` remains claimable while “open PR waiting” is not claimable.
-- Reduce GitHub label writes/timeline noise; avoid burning API quota.
+- Shrink `src/worker/repo-worker.ts` by moving the high-level start/resume flow orchestration into lane modules.
+- Keep `RepoWorker.processTask` (start-like) and `RepoWorker.resumeTask` as stable entrypoints / monkeypatch seams.
+- Preserve behavior (queue/label semantics, pause/throttle behavior, escalation logic, PR reuse/merge flow).
 
 ## Product Constraints (canonical)
 
-- Status labels are fixed to the `ralph:status:*` set; internal “why” states should be internal metadata (`docs/product/orchestration-contract.md`).
-- `ralph:status:in-progress` includes “waiting on deterministic gates (e.g. CI)”; “open PR waiting” should therefore be stable `in-progress` on GitHub.
-- GitHub label writes are best-effort; convergence matters more than chattiness.
+- Preserve GitHub operator contract surfaces (labels, queue semantics) per `docs/product/orchestration-contract.md`.
+- Keep deterministic gates green: `bun test`, `bun run typecheck`, `bun run knip`.
 
 ## Assumptions
 
-- Introduce explicit durable status `waiting-on-pr` in task op-state (`tasks.status`) for “open PR exists, waiting”.
-- Map `waiting-on-pr` to GitHub label `ralph:status:in-progress` (no new GitHub-visible status labels).
-- Use SQLite PR snapshots (`prs` table) as the primary “does an open PR exist for this issue?” signal, with a freshness window to avoid indefinite parking on stale data.
+- Repo reality: “startTask” in this epic corresponds to `RepoWorker.processTask` (tests and call sites use `processTask`).
+- Lane modules follow existing patterns in `src/worker/lanes/pause.ts` and `src/worker/lanes/parent-verification.ts`: explicit `*LaneDeps` type + deps passed from `RepoWorker` (so tests can keep monkeypatching via `(worker as any)` and prototype overrides).
 
 ## Checklist
 
-- [x] Unblock gate persistence drift (`ralph_run_gate_results.reason`)
-- [x] Add durable op-state for open-PR wait (`waiting-on-pr`)
-- [x] Park queued tasks on open PR (don’t keep them claimable)
-- [x] Gate stale in-progress sweep by open-PR wait state
-- [x] Make label reconciler respect open-PR wait mapping
-- [x] Remove passive open-PR in-progress writes for passive path
-- [x] Add anti-flap guardrail (single choke point debounce)
-- [x] Tests: no-flap regression + operator override + closed-PR recovery + no-duplicate writes
-- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
+- [x] Add lane module for start flow: `src/worker/lanes/start.ts`.
+- [x] Add lane module for resume flow: `src/worker/lanes/resume.ts`.
+- [x] Refactor `src/worker/repo-worker.ts` so `processTask` delegates to the start lane.
+- [x] Refactor `src/worker/repo-worker.ts` so `resumeTask` delegates to the resume lane.
+- [x] Preserve monkeypatch seams by routing all side effects through injected deps (RepoWorker methods/ports), not direct imports that bypass seams.
+- [ ] Add parity tests for lane delegation (start + resume) and a seam-override regression test.
+- [ ] Enforce lane boundary: lanes perform I/O only via injected deps (no direct side-effect imports).
+- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run knip`.
 
 ## Steps
 
-- [x] Keep startup gate-schema repair covered and aligned with schema updates (`src/__tests__/state-sqlite.test.ts`).
-- [x] Add `waiting-on-pr` to queue status model and map it to `ralph:status:in-progress` label convergence.
-- [x] Park queued tasks with existing open PRs in `RepoWorker.processTask` before planner/build, clearing active ownership/session fields.
-- [x] Gate stale in-progress sweep: skip recovery when op-state is `waiting-on-pr` and open PR snapshot is fresh; allow recovery when snapshot is stale/closed.
-- [x] Add transition debounce guard (in-memory + durable SQLite record) for opposite queued/in-progress transitions; log suppressed transitions.
-- [x] Wire label reconciler to respect `waiting-on-pr` and transition debounce state.
-- [x] Add tests for no-flap regression, operator re-queue behavior, closed-PR recovery, waiting-on-pr label idempotence, and transition debounce core logic.
-- [x] Run gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
+- [x] Map the current `processTask` flow into major groups (preflight/allowlist/issue-open check; opencode profile + throttles; parent verification; label/protection bootstrap; worktree setup; planner + dossier; routing + devex consult + escalation; build; PR extraction + retries/anomaly loop; required-checks/merge lanes; finalize).
+- [ ] Define lane boundary rule up-front:
+  - [ ] `src/worker/lanes/start.ts` and `src/worker/lanes/resume.ts` may only call `deps` + local pure helpers; all side effects go through injected functions (preserves `(worker as any)` monkeypatch seams).
+  - [ ] Prefer grouping deps into sub-ports (`session`, `taskState`, `github`, `merge`, `notify`, `telemetry`) to avoid a single mega-interface.
+- [x] Implement `src/worker/lanes/start.ts`:
+  - [x] Define `StartLaneDeps` containing all values/functions currently accessed via `this` inside `processTask`.
+  - [x] Export `runStartLane(deps, task, opts)` (or equivalent) that contains the orchestrator logic.
+  - [x] Keep internal helpers inside the lane file for readability (no behavior change).
+- [ ] Extract shared "PR extraction / anomaly loop / PR recovery" logic into a helper used by both start and resume lanes (avoid duplicating the riskiest control-flow).
+- [x] Update `RepoWorker.processTask` to be a thin wrapper that constructs deps from `this` (bound methods + required fields) and returns `runStartLane(...)`.
+- [x] Implement `src/worker/lanes/resume.ts`:
+  - [x] Define `ResumeLaneDeps` for everything currently accessed via `this` inside `resumeTask`.
+  - [x] Export `runResumeLane(deps, task, opts)`.
+- [x] Update `RepoWorker.resumeTask` to be a thin wrapper that constructs deps and returns `runResumeLane(...)`.
+- [x] Ensure stage strings, checkpoint writes, and logging remain stable (avoid changing event names / run-log stage labels unless unavoidable).
+- [ ] Add targeted tests before relying on repo gates:
+  - [ ] Start lane delegation: a representative `processTask` test asserts key transitions still occur and that a monkeypatched method is invoked via deps (seam regression guard).
+  - [ ] Resume lane parity: add a mocked orchestration test that covers a "resume happy path" and one key recovery path (e.g. missing session-id -> failed, or merge-conflict preflight sentinel).
+  - [ ] Lane boundary guard: add a small test or lint check ensuring the new lane modules do not import known side-effect modules directly (deps-only I/O).
+- [x] Run and fix gates:
+  - [x] `bun test`
+  - [x] `bun run typecheck`
+  - [x] `bun run knip`
