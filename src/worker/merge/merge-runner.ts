@@ -105,7 +105,7 @@ export async function mergePrWithRequiredChecks(params: {
   recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary) => void;
   buildIssueContextForAgent: (params: { repo: string; issueNumber: string }) => Promise<string>;
   runReviewAgent: (params: {
-    agent: "product" | "devex" | "general";
+    agent: "product" | "devex" | "general" | "ralph-plan";
     prompt: string;
     cacheKey: string;
     stage: string;
@@ -341,7 +341,7 @@ export async function mergePrWithRequiredChecks(params: {
           }),
         runRepairAgent: (prompt, continueSessionId) =>
           params.runReviewAgent({
-            agent: "general",
+            agent: "ralph-plan",
             prompt,
             cacheKey: `review-${params.cacheKey}-${agent}-repair`,
             stage: `${stage} marker repair`,
