@@ -172,4 +172,104 @@ describe("GitHub queue updateTaskStatus", () => {
     const opState = stateMod.getTaskOpStateByPath("3mdistal/ralph", task._path);
     expect(opState?.status).toBe("queued");
   });
+
+  test("operator queue override transitions waiting-on-pr back to queued", async () => {
+    const now = new Date("2026-02-03T03:00:00.000Z");
+    const calls: Array<{ repo: string; issueNumber: number; add: string[]; remove: string[] }> = [];
+    const queueMod = await import("../github-queue/io");
+    const stateMod = await import("../state");
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => now,
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => [],
+        fetchIssue: async () => null,
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async ({ repo, issueNumber, add, remove }) => {
+          calls.push({ repo, issueNumber, add, remove });
+          return true;
+        },
+      },
+    });
+
+    const task = buildTask("3mdistal/ralph", 404);
+    stateMod.recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#404",
+      title: "Waiting",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/404",
+      githubUpdatedAt: now.toISOString(),
+      at: now.toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#404",
+      labels: ["ralph:status:in-progress"],
+      at: now.toISOString(),
+    });
+    stateMod.recordTaskSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#404",
+      taskPath: task._path,
+      status: "waiting-on-pr",
+      at: now.toISOString(),
+    });
+
+    const updated = await driver.updateTaskStatus(task, "queued");
+    expect(updated).toBe(true);
+
+    const opState = stateMod.getTaskOpStateByPath("3mdistal/ralph", task._path);
+    expect(opState?.status).toBe("queued");
+    expect(calls).toEqual([
+      { repo: "3mdistal/ralph", issueNumber: 404, add: ["ralph:status:queued"], remove: ["ralph:status:in-progress"] },
+    ]);
+  });
+
+  test("does not write duplicate labels when desired status is unchanged", async () => {
+    const now = new Date("2026-02-03T04:00:00.000Z");
+    const calls: Array<{ repo: string; issueNumber: number; add: string[]; remove: string[] }> = [];
+    const queueMod = await import("../github-queue/io");
+    const stateMod = await import("../state");
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => now,
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => [],
+        fetchIssue: async () => null,
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async ({ repo, issueNumber, add, remove }) => {
+          calls.push({ repo, issueNumber, add, remove });
+          return true;
+        },
+      },
+    });
+
+    const task = buildTask("3mdistal/ralph", 505);
+    stateMod.recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#505",
+      title: "Already queued",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/505",
+      githubUpdatedAt: now.toISOString(),
+      at: now.toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#505",
+      labels: ["ralph:status:queued"],
+      at: now.toISOString(),
+    });
+
+    const updated = await driver.updateTaskStatus(task, "queued");
+    expect(updated).toBe(true);
+    expect(calls).toEqual([]);
+  });
 });

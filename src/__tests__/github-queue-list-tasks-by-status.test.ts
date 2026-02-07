@@ -136,4 +136,169 @@ describe("GitHub queue listTasksByStatus", () => {
 
     expect(calls).toEqual([]);
   });
+
+  test("does not requeue stale in-progress when open PR wait is intentional", async () => {
+    let nowMs = Date.parse("2026-02-03T04:00:00.000Z");
+    await writeJson(getRalphConfigJsonPath(), {
+      queueBackend: "github",
+      repos: [{ name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" }],
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+
+    const stateMod = await import("../state");
+    stateMod.closeStateDbForTests();
+    stateMod.initStateDb();
+
+    stateMod.recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#10",
+      title: "Waiting on open PR",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/10",
+      githubUpdatedAt: new Date(nowMs).toISOString(),
+      at: new Date(nowMs).toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#10",
+      labels: ["ralph:status:in-progress"],
+      at: new Date(nowMs).toISOString(),
+    });
+    stateMod.recordTaskSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#10",
+      taskPath: "github:3mdistal/ralph#10",
+      status: "waiting-on-pr",
+      sessionId: "",
+      heartbeatAt: "2026-02-03T00:00:00.000Z",
+      at: new Date(nowMs).toISOString(),
+    });
+    stateMod.recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#10",
+      prUrl: "https://github.com/3mdistal/ralph/pull/10",
+      state: "open",
+      at: new Date(nowMs).toISOString(),
+    });
+
+    const calls: Array<{ repo: string; issueNumber: number; add: string[]; remove: string[] }> = [];
+    const queueMod = await import("../github-queue/io");
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => new Date(nowMs),
+      relationshipsProviderFactory: () => ({
+        getSnapshot: async (issue) => ({
+          issue,
+          signals: [],
+          coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: false },
+        }),
+      }),
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => [],
+        fetchIssue: async () => null,
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async ({ repo, issueNumber, add, remove }) => {
+          calls.push({ repo, issueNumber, add, remove });
+          return true;
+        },
+      },
+    });
+
+    for (let i = 0; i < 6; i++) {
+      const queued = await driver.getTasksByStatus("queued");
+      expect(queued).toEqual([]);
+      nowMs += 5 * 60_000;
+    }
+
+    const opState = stateMod.getTaskOpStateByPath("3mdistal/ralph", "github:3mdistal/ralph#10");
+    expect(opState?.status).toBe("waiting-on-pr");
+    expect(calls).toEqual([]);
+  });
+
+  test("closed PR allows stale recovery from waiting-on-pr", async () => {
+    const now = new Date("2026-02-03T05:00:00.000Z");
+    await writeJson(getRalphConfigJsonPath(), {
+      queueBackend: "github",
+      repos: [{ name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" }],
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+
+    const stateMod = await import("../state");
+    stateMod.closeStateDbForTests();
+    stateMod.initStateDb();
+
+    stateMod.recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#11",
+      title: "PR closed",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/11",
+      githubUpdatedAt: now.toISOString(),
+      at: now.toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#11",
+      labels: ["ralph:status:in-progress"],
+      at: now.toISOString(),
+    });
+    stateMod.recordTaskSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#11",
+      taskPath: "github:3mdistal/ralph#11",
+      status: "waiting-on-pr",
+      sessionId: "",
+      heartbeatAt: "2026-02-03T00:00:00.000Z",
+      at: now.toISOString(),
+    });
+    stateMod.recordPrSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#11",
+      prUrl: "https://github.com/3mdistal/ralph/pull/11",
+      state: "merged",
+      at: now.toISOString(),
+    });
+
+    const calls: Array<{ repo: string; issueNumber: number; add: string[]; remove: string[] }> = [];
+    const queueMod = await import("../github-queue/io");
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => now,
+      relationshipsProviderFactory: () => ({
+        getSnapshot: async (issue) => ({
+          issue,
+          signals: [],
+          coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: false },
+        }),
+      }),
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => [],
+        fetchIssue: async () => null,
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async ({ repo, issueNumber, add, remove }) => {
+          calls.push({ repo, issueNumber, add, remove });
+          return true;
+        },
+      },
+    });
+
+    const queued = await driver.getTasksByStatus("queued");
+    expect(queued.map((task) => task.issue)).toEqual(["3mdistal/ralph#11"]);
+    expect(calls).toEqual([
+      { repo: "3mdistal/ralph", issueNumber: 11, add: ["ralph:status:queued"], remove: ["ralph:status:in-progress"] },
+    ]);
+
+    const opState = stateMod.getTaskOpStateByPath("3mdistal/ralph", "github:3mdistal/ralph#11");
+    expect(opState?.status).toBe("queued");
+  });
 });

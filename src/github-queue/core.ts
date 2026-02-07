@@ -16,6 +16,7 @@ export type LabelOp = { action: "add" | "remove"; label: string };
 const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   queued: RALPH_LABEL_STATUS_QUEUED,
   "in-progress": RALPH_LABEL_STATUS_IN_PROGRESS,
+  "waiting-on-pr": RALPH_LABEL_STATUS_IN_PROGRESS,
   paused: RALPH_LABEL_STATUS_PAUSED,
   blocked: null,
   escalated: RALPH_LABEL_STATUS_ESCALATED,

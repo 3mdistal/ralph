@@ -1,10 +1,12 @@
 import { getConfig } from "../config";
 import { shouldLog } from "../logging";
 import {
+  getIdempotencyPayload,
   getIssueLabels,
   listIssueSnapshotsWithRalphLabels,
   listTaskOpStatesByRepo,
   recordIssueLabelsSnapshot,
+  upsertIdempotencyKey,
 } from "../state";
 import { GitHubClient } from "./client";
 import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels";
@@ -18,10 +20,17 @@ import { RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_STOPPED } from "../github
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_MAX_ISSUES_PER_TICK = 10;
 const DEFAULT_COOLDOWN_MS = 10 * 60_000;
+const DEFAULT_TRANSITION_THROTTLE_MS = 3 * 60_000;
 const TELEMETRY_SOURCE = "label-reconciler";
 
-type ReconcileCooldownState = { desiredStatus: QueueTaskStatus; appliedAtMs: number };
+type ReconcileCooldownState = { desiredStatus: QueueTaskStatus; appliedAtMs: number; reason: string };
 const lastAppliedByIssue = new Map<string, ReconcileCooldownState>();
+
+type TransitionGuardPayload = {
+  desiredStatus: QueueTaskStatus;
+  reason: string;
+  appliedAtMs: number;
+};
 
 function applyLabelDeltaSnapshot(params: {
   repo: string;
@@ -46,12 +55,42 @@ function applyLabelDeltaSnapshot(params: {
 function toDesiredStatus(raw: string | null | undefined): QueueTaskStatus | null {
   if (!raw) return null;
   if (raw === "starting") return "in-progress";
+  if (raw === "waiting-on-pr") return "in-progress";
   if (raw === "throttled") return null;
   if (raw === "done") return null;
   return raw as QueueTaskStatus;
 }
 
-async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number): Promise<number> {
+function transitionGuardKey(repo: string, issueNumber: number): string {
+  return `ralph:label-transition:v1:${repo}#${issueNumber}`;
+}
+
+function parseTransitionGuardPayload(raw: string | null): TransitionGuardPayload | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<TransitionGuardPayload>;
+    if (typeof parsed.desiredStatus !== "string") return null;
+    if (typeof parsed.reason !== "string") return null;
+    if (typeof parsed.appliedAtMs !== "number" || !Number.isFinite(parsed.appliedAtMs)) return null;
+    return {
+      desiredStatus: parsed.desiredStatus as QueueTaskStatus,
+      reason: parsed.reason,
+      appliedAtMs: parsed.appliedAtMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildDesiredReason(params: { opStatus: string | null | undefined; released: boolean }): string {
+  if (params.released) return "released";
+  const status = (params.opStatus ?? "").trim();
+  if (!status) return "unknown";
+  if (status === "waiting-on-pr") return "open-pr-wait";
+  return `op-state:${status}`;
+}
+
+async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number, transitionThrottleMs: number): Promise<number> {
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
   const opStates = listTaskOpStatesByRepo(repo);
@@ -85,10 +124,36 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
     const released = typeof opState.releasedAtMs === "number" && Number.isFinite(opState.releasedAtMs);
     const desiredStatus = released ? "queued" : toDesiredStatus(opState.status ?? null);
     if (!desiredStatus) continue;
+    const desiredReason = buildDesiredReason({ opStatus: opState.status, released });
 
     const cooldownKey = `${repo}#${issue.number}`;
     const cooldown = lastAppliedByIssue.get(cooldownKey);
     if (cooldown && cooldown.desiredStatus === desiredStatus && nowMs - cooldown.appliedAtMs < cooldownMs) {
+      continue;
+    }
+    const shouldThrottleTransition = (guard: ReconcileCooldownState | TransitionGuardPayload | null): boolean => {
+      if (!guard) return false;
+      if (guard.desiredStatus === desiredStatus) return false;
+      if (guard.reason !== desiredReason) return false;
+      return nowMs - guard.appliedAtMs < transitionThrottleMs;
+    };
+
+    if (shouldThrottleTransition(cooldown ?? null)) {
+      if (shouldLog(`labels:reconcile:transition-throttle:${cooldownKey}`, 60_000)) {
+        console.warn(
+          `[ralph:labels] Suppressed transition for ${cooldownKey}: ${cooldown?.desiredStatus} -> ${desiredStatus} (reason=${desiredReason})`
+        );
+      }
+      continue;
+    }
+
+    const durableGuard = parseTransitionGuardPayload(getIdempotencyPayload(transitionGuardKey(repo, issue.number)));
+    if (shouldThrottleTransition(durableGuard)) {
+      if (shouldLog(`labels:reconcile:transition-throttle:durable:${cooldownKey}`, 60_000)) {
+        console.warn(
+          `[ralph:labels] Suppressed transition for ${cooldownKey} from durable guard: ${durableGuard?.desiredStatus} -> ${desiredStatus} (reason=${desiredReason})`
+        );
+      }
       continue;
     }
 
@@ -140,7 +205,14 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
     }
 
     if (didApply) {
-      lastAppliedByIssue.set(cooldownKey, { desiredStatus, appliedAtMs: nowMs });
+      const payload: TransitionGuardPayload = { desiredStatus, reason: desiredReason, appliedAtMs: nowMs };
+      upsertIdempotencyKey({
+        key: transitionGuardKey(repo, issue.number),
+        scope: "label-transition-guard",
+        payloadJson: JSON.stringify(payload),
+        createdAt: nowIso,
+      });
+      lastAppliedByIssue.set(cooldownKey, { desiredStatus, appliedAtMs: nowMs, reason: desiredReason });
     }
 
     processed += 1;
@@ -153,11 +225,16 @@ export function startGitHubLabelReconciler(params?: {
   intervalMs?: number;
   maxIssuesPerTick?: number;
   cooldownMs?: number;
+  transitionThrottleMs?: number;
   log?: (message: string) => void;
 }): { stop: () => void } {
   const intervalMs = Math.max(1_000, params?.intervalMs ?? DEFAULT_INTERVAL_MS);
   const maxIssuesPerTick = Math.max(1, Math.floor(params?.maxIssuesPerTick ?? DEFAULT_MAX_ISSUES_PER_TICK));
   const cooldownMs = Math.max(0, Math.floor(params?.cooldownMs ?? DEFAULT_COOLDOWN_MS));
+  const transitionThrottleMs = Math.max(
+    0,
+    Math.floor(params?.transitionThrottleMs ?? DEFAULT_TRANSITION_THROTTLE_MS)
+  );
   const log = params?.log ?? ((message: string) => console.log(message));
   let timer: ReturnType<typeof setTimeout> | null = null;
   let running = false;
@@ -175,7 +252,7 @@ export function startGitHubLabelReconciler(params?: {
       let remaining = maxIssuesPerTick;
       for (const repo of repos) {
         if (remaining <= 0) break;
-        const processed = await reconcileRepo(repo, remaining, cooldownMs);
+        const processed = await reconcileRepo(repo, remaining, cooldownMs, transitionThrottleMs);
         remaining -= processed;
       }
       if (shouldLog("labels:reconcile", 5 * 60_000)) {

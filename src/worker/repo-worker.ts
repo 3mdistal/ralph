@@ -1377,14 +1377,15 @@ export class RepoWorker {
     };
   }
 
-  private async markIssueInProgressForOpenPrBestEffort(task: AgentTask, prUrl: string): Promise<void> {
+  private async markIssueWaitingOnPrBestEffort(task: AgentTask, prUrl: string): Promise<void> {
     const issueRef = parseIssueRef(task.issue, this.repo);
     if (!issueRef) return;
     try {
-      await this.addIssueLabel(issueRef, RALPH_LABEL_STATUS_IN_PROGRESS);
+      const updated = await this.queue.updateTaskStatus(task, "waiting-on-pr");
+      if (updated) applyTaskPatch(task, "waiting-on-pr", {});
     } catch (error: any) {
       console.warn(
-        `[ralph:worker:${this.repo}] Failed to apply ${RALPH_LABEL_STATUS_IN_PROGRESS} for open PR ${prUrl}: ${
+        `[ralph:worker:${this.repo}] Failed to park issue in waiting-on-pr for open PR ${prUrl}: ${
           error?.message ?? String(error)
         }`
       );
@@ -5046,7 +5047,6 @@ export class RepoWorker {
             existingPr.source ?? "unknown"
           })`
         );
-        await this.markIssueInProgressForOpenPrBestEffort(task, existingPr.selectedUrl);
         if (existingPr.duplicates.length > 0) {
           console.log(
             `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
@@ -5294,7 +5294,7 @@ export class RepoWorker {
               canonical.source ?? "unknown"
             })`
           );
-          await this.markIssueInProgressForOpenPrBestEffort(task, canonical.selectedUrl);
+          await this.markIssueWaitingOnPrBestEffort(task, canonical.selectedUrl);
           if (canonical.duplicates.length > 0) {
             console.log(
               `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
@@ -5325,7 +5325,7 @@ export class RepoWorker {
             });
 
             if (waited?.selectedUrl) {
-              await this.markIssueInProgressForOpenPrBestEffort(task, waited.selectedUrl);
+              await this.markIssueWaitingOnPrBestEffort(task, waited.selectedUrl);
               prRecoveryDiagnostics = [prRecoveryDiagnostics, waited.diagnostics.join("\n")].filter(Boolean).join("\n\n");
               prUrl = this.updateOpenPrSnapshot(task, prUrl, waited.selectedUrl);
               break;
@@ -6350,7 +6350,6 @@ export class RepoWorker {
             existingPr.source ?? "unknown"
           })`
         );
-        await this.markIssueInProgressForOpenPrBestEffort(task, existingPr.selectedUrl);
         if (existingPr.duplicates.length > 0) {
           console.log(
             `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
@@ -6567,7 +6566,7 @@ export class RepoWorker {
               canonical.source ?? "unknown"
             })`
           );
-          await this.markIssueInProgressForOpenPrBestEffort(task, canonical.selectedUrl);
+          await this.markIssueWaitingOnPrBestEffort(task, canonical.selectedUrl);
           if (canonical.duplicates.length > 0) {
             console.log(
               `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
@@ -6598,7 +6597,7 @@ export class RepoWorker {
             });
 
             if (waited?.selectedUrl) {
-              await this.markIssueInProgressForOpenPrBestEffort(task, waited.selectedUrl);
+              await this.markIssueWaitingOnPrBestEffort(task, waited.selectedUrl);
               prRecoveryDiagnostics = [prRecoveryDiagnostics, waited.diagnostics.join("\n")].filter(Boolean).join("\n\n");
               prUrl = this.updateOpenPrSnapshot(task, prUrl, waited.selectedUrl);
               break;

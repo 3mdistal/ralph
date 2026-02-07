@@ -331,6 +331,10 @@ function resolveIssueSnapshot(repo: string, issueNumber: number): IssueSnapshot 
   return getIssueSnapshotByNumber(repo, issueNumber);
 }
 
+function isOpenPrWaitingState(opState: TaskOpState | null | undefined): boolean {
+  return (opState?.status ?? "").trim().toLowerCase() === "waiting-on-pr";
+}
+
 export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   const io = deps?.io ?? createGitHubQueueIo();
   const relationshipsProviderFactory =
@@ -528,6 +532,16 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           graceMs: missingSessionGraceMs,
         });
         if (!recovery.shouldRecover) continue;
+
+        const hasOpenPr = listOpenPrCandidatesForIssue(repo, issue.number).length > 0;
+        if (hasOpenPr && isOpenPrWaitingState(opState)) {
+          if (shouldLog(`ralph:queue:github:stale-sweep:suppress:${repo}#${issue.number}`, 60_000)) {
+            console.warn(
+              `[ralph:queue:github] Suppressed stale in-progress recovery for ${repo}#${issue.number}; open PR wait state is intentional`
+            );
+          }
+          continue;
+        }
 
         try {
           releaseTaskSlot({
@@ -1037,8 +1051,22 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
         daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
         heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
-        releasedAtMs: status === "in-progress" || status === "starting" || status === "paused" || status === "throttled" ? null : undefined,
-        releasedReason: status === "in-progress" || status === "starting" || status === "paused" || status === "throttled" ? null : undefined,
+        releasedAtMs:
+          status === "in-progress" ||
+          status === "starting" ||
+          status === "waiting-on-pr" ||
+          status === "paused" ||
+          status === "throttled"
+            ? null
+            : undefined,
+        releasedReason:
+          status === "in-progress" ||
+          status === "starting" ||
+          status === "waiting-on-pr" ||
+          status === "paused" ||
+          status === "throttled"
+            ? null
+            : undefined,
         at: nowIso,
       });
 
