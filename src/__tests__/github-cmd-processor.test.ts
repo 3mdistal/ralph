@@ -10,7 +10,7 @@ import {
   RALPH_LABEL_STATUS_ESCALATED,
   RALPH_LABEL_STATUS_PAUSED,
 } from "../github-labels";
-import { closeStateDbForTests, initStateDb } from "../state";
+import { closeStateDbForTests, getIdempotencyPayload, initStateDb, upsertIdempotencyKey } from "../state";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 describe("github cmd-processor", () => {
@@ -161,5 +161,83 @@ describe("github cmd-processor", () => {
       (req) => req.method === "DELETE" && req.path.endsWith(`/issues/43/labels/${encodeURIComponent(RALPH_LABEL_STATUS_PAUSED)}`)
     );
     expect(pausedDeletes.length).toBeGreaterThan(0);
+  });
+
+  test("queue command pagination uses latest event id", async () => {
+    const requests: Array<{ path: string; method: string; body?: any }> = [];
+    originalRequest = GitHubClient.prototype.request;
+    const requestStub: GitHubClient["request"] = async (path: string, opts: { method?: string; body?: any } = {}) => {
+      const method = (opts.method ?? "GET").toUpperCase();
+      requests.push({ path, method, body: opts.body });
+
+      if (path.includes("/issues/44/events")) {
+        const match = path.match(/[?&]page=(\d+)/);
+        const page = Number(match?.[1] ?? "1");
+        if (page === 1) {
+          return {
+            data: [{ id: 555, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } }],
+            status: 200,
+            etag: null,
+          } as any;
+        }
+        if (page === 2) {
+          return {
+            data: [{ id: 999, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } }],
+            status: 200,
+            etag: null,
+          } as any;
+        }
+        return { data: [], status: 200, etag: null } as any;
+      }
+
+      if (path.includes("/issues/44/comments") && method === "GET") {
+        return { data: [], status: 200, etag: null } as any;
+      }
+
+      if (path.includes("/issues/44/comments") && method === "POST") {
+        return { data: { id: 1003 }, status: 201, etag: null } as any;
+      }
+
+      if (path.includes("/labels?")) {
+        return { data: [], status: 200, etag: null } as any;
+      }
+
+      return { data: {}, status: 200, etag: null } as any;
+    };
+    GitHubClient.prototype.request = requestStub;
+
+    upsertIdempotencyKey({
+      key: "ralph:cmd:v1:3mdistal/ralph#44:ralph:cmd:queue:555",
+      scope: "cmd",
+      payloadJson: JSON.stringify({
+        version: 1,
+        phase: "completed",
+        repo: "3mdistal/ralph",
+        issueNumber: 44,
+        cmdLabel: RALPH_LABEL_CMD_QUEUE,
+        eventId: "555",
+        startedAt: "2026-02-07T00:00:00.000Z",
+        completedAt: "2026-02-07T00:00:01.000Z",
+        decision: "applied",
+      }),
+      createdAt: "2026-02-07T00:00:01.000Z",
+    });
+
+    const result = await __processOneCommandForTests({
+      repo: "3mdistal/ralph",
+      issueNumber: 44,
+      cmdLabel: RALPH_LABEL_CMD_QUEUE as any,
+      currentLabels: [RALPH_LABEL_CMD_QUEUE, RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_ESCALATED],
+      issueState: "OPEN",
+    });
+
+    expect(result.processed).toBe(true);
+    expect(result.removedCmdLabel).toBe(true);
+
+    const eventsPage2Calls = requests.filter((req) => req.path.includes("/issues/44/events") && req.path.includes("page=2"));
+    expect(eventsPage2Calls.length).toBeGreaterThan(0);
+
+    const newPayload = getIdempotencyPayload("ralph:cmd:v1:3mdistal/ralph#44:ralph:cmd:queue:999");
+    expect(newPayload).toBeTruthy();
   });
 });
