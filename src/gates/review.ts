@@ -28,6 +28,7 @@ export type ReviewDiffArtifacts = {
   headRef: string;
   diffPath: string;
   diffStat: string;
+  diffExcerpt: string;
 };
 
 export type ReviewGateResult = {
@@ -217,9 +218,11 @@ function buildReviewPrompt(params: {
   headRef: string;
   diffPath: string;
   diffStat: string;
+  diffExcerpt: string;
   issueContext?: string;
 }): string {
   const stat = params.diffStat.trim() || "(no changes)";
+  const excerpt = params.diffExcerpt.trim() || "(diff excerpt unavailable)";
   const issueContext = params.issueContext?.trim();
 
   const lines = [
@@ -230,11 +233,14 @@ function buildReviewPrompt(params: {
     `Base: ${params.baseRef}`,
     `Head: ${params.headRef}`,
     "",
-    "Diff artifact (read this file; do not request pasted diff chunks):",
+    "Diff artifact path (reference only):",
     params.diffPath,
     "",
     "git diff --stat:",
     stat,
+    "",
+    "Diff excerpt (truncated):",
+    excerpt,
   ];
 
   if (issueContext) {
@@ -243,6 +249,7 @@ function buildReviewPrompt(params: {
 
   lines.push(
     "",
+    "Do not call tools. Do not request additional files.",
     "Return the required RALPH_REVIEW marker on the final line.",
     "Final line format:",
     'RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}',
@@ -256,6 +263,7 @@ function buildReviewRepairPrompt(reason: string): string {
   return [
     "Your prior review response failed deterministic marker parsing.",
     `Parser error: ${reason}`,
+    "Do not call tools.",
     "Re-emit your decision as exactly one final line with valid JSON:",
     'RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}',
     "No code fences.",
@@ -264,6 +272,14 @@ function buildReviewRepairPrompt(reason: string): string {
 }
 
 const MAX_REPAIR_ATTEMPTS = 2;
+const REVIEW_DIFF_EXCERPT_MAX_CHARS = 20_000;
+
+function buildDiffExcerpt(diffText: string): string {
+  const normalized = String(diffText ?? "").trim();
+  if (!normalized) return "";
+  if (normalized.length <= REVIEW_DIFF_EXCERPT_MAX_CHARS) return normalized;
+  return `${normalized.slice(0, REVIEW_DIFF_EXCERPT_MAX_CHARS)}\n... (truncated)`;
+}
 
 function buildDiffArtifactNote(params: ReviewDiffArtifacts): string {
   const stat = params.diffStat.trim() || "(no changes)";
@@ -342,6 +358,7 @@ export async function prepareReviewDiffArtifacts(params: {
     headRef,
     diffPath,
     diffStat,
+    diffExcerpt: buildDiffExcerpt(diffText),
   };
 }
 
@@ -385,6 +402,7 @@ export async function runReviewGate(params: {
     headRef: diff.headRef,
     diffPath: diff.diffPath,
     diffStat: diff.diffStat,
+    diffExcerpt: diff.diffExcerpt,
     issueContext: params.issueContext,
   });
 
