@@ -388,6 +388,7 @@ export async function runReviewGate(params: {
   issueContext?: string;
   diff: ReviewDiffArtifacts;
   runAgent: (prompt: string) => Promise<SessionResult>;
+  runRepairAgent?: (prompt: string) => Promise<SessionResult>;
 }): Promise<ReviewGateResult> {
   const { runId, gate, diff } = params;
   upsertRalphRunGateResult({ runId, gate, status: "pending" });
@@ -448,7 +449,7 @@ export async function runReviewGate(params: {
     });
 
     try {
-      const repair = await params.runAgent(repairPrompt);
+      const repair = await (params.runRepairAgent ?? params.runAgent)(repairPrompt);
       finalSessionId = repair.sessionId ?? finalSessionId;
       const repairedOutput = repair.output ?? "";
       recordRalphRunGateArtifact({
