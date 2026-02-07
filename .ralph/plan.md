@@ -1,80 +1,42 @@
-# Plan: Refactor RepoWorker pause control + checkpoint glue (#562)
+# Plan: Fix queue/in-progress label flapping on long-lived open PRs (#599)
 
 ## Goal
 
-- Consolidate pause-control reads and checkpoint patch/persist glue into `src/worker/pause-control.ts`.
-- Keep RepoWorker as an imperative shell with thin delegations; preserve seams `pauseIfHardThrottled` / `pauseIfGitHubRateLimited`.
-- Preserve checkpoint/task-field semantics and any operator-visible contract surfaces.
+- Stop `ralph:status:queued` <-> `ralph:status:in-progress` oscillation for issues that already have a long-lived open PR and no new operator input.
+- Preserve contract invariant: exactly one `ralph:status:*` label converges, and `queued` remains claimable while “open PR waiting” is not claimable.
+- Reduce GitHub label writes/timeline noise; avoid burning API quota.
+
+## Product Constraints (canonical)
+
+- Status labels are fixed to the `ralph:status:*` set; internal “why” states should be internal metadata (`docs/product/orchestration-contract.md`).
+- `ralph:status:in-progress` includes “waiting on deterministic gates (e.g. CI)”; “open PR waiting” should therefore be stable `in-progress` on GitHub.
+- GitHub label writes are best-effort; convergence matters more than chattiness.
 
 ## Assumptions
 
-- This is an internal refactor; behavior/semantics must remain unchanged.
-- PRs should target `bot/integration`.
+- Introduce explicit durable status `waiting-on-pr` in task op-state (`tasks.status`) for “open PR exists, waiting”.
+- Map `waiting-on-pr` to GitHub label `ralph:status:in-progress` (no new GitHub-visible status labels).
+- Use SQLite PR snapshots (`prs` table) as the primary “does an open PR exist for this issue?” signal, with a freshness window to avoid indefinite parking on stale data.
 
 ## Checklist
 
-- [x] Confirm current state (avoid redoing work)
-- [x] Lock invariants (no behavior change)
-- [x] Pause-control consolidation
-- [x] Checkpoint glue consolidation
-- [x] Tighten RepoWorker seams + call sites
-- [x] Tests + verification gates
-- [ ] Publish PR artifact
+- [x] Unblock gate persistence drift (`ralph_run_gate_results.reason`)
+- [x] Add durable op-state for open-PR wait (`waiting-on-pr`)
+- [x] Park queued tasks on open PR (don’t keep them claimable)
+- [x] Gate stale in-progress sweep by open-PR wait state
+- [x] Make label reconciler respect open-PR wait mapping
+- [x] Remove passive open-PR in-progress writes for passive path
+- [x] Add anti-flap guardrail (single choke point debounce)
+- [x] Tests: no-flap regression + operator override + closed-PR recovery + no-duplicate writes
+- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
 
 ## Steps
 
-- [x] Confirm current state (avoid redoing work)
-  - [ ] Inspect whether `src/worker/pause-control.ts` already exists and owns: control snapshot reading + pause wait + checkpoint persistence glue.
-  - [ ] Inspect whether `src/worker/repo-worker.ts` delegates pause-control reads + checkpoint recording to that module.
-  - [ ] Compare against `bot/integration` (not just local cleanliness): confirm `git diff bot/integration...HEAD` is empty or contains only intended refactor.
-  - [ ] If everything is already on the base branch and tests pass, treat this task as “already satisfied” and move to the PR/closure path (no new refactor).
-
-- [x] Lock invariants (no behavior change)
-  - [ ] Write down the invariants to preserve (and keep them stable through the refactor):
-    - [ ] Task-field contract: `checkpoint`, `checkpoint-seq`, `pause-requested`, `paused-at-checkpoint` names + meanings.
-    - [ ] Checkpoint sequencing: each `recordCheckpoint` advances `checkpoint-seq` monotonically (+1 per applied checkpoint runtime).
-    - [ ] Persistence ordering: successful `updateTaskStatus` -> `applyTaskPatch` mirrors the same patch; failures never mutate in-memory task fields.
-    - [ ] Emission guarantee: checkpoint reached event emits even if persistence fails (including `updateTaskStatus=false` or throw).
-    - [ ] Pause-wait semantics: `waitForPauseCleared` returns when pause clears, and respects abort (returns early on abort).
-  - [ ] Add seam-level characterization tests so cross-lane consumers stay stable:
-    - [ ] Minimal tests for RepoWorker wrapper return contracts (e.g. `pauseIfHardThrottled` / `pauseIfGitHubRateLimited` still return `AgentRun | null`).
-    - [ ] Ensure merge/CI remediation callers still compile against the same seam surface.
-
-- [x] Pause-control consolidation (`src/worker/pause-control.ts`)
-  - [ ] Provide `createPauseControl(...)` that reads the control state snapshot and normalizes `pauseRequested` + `pauseAtCheckpoint`.
-  - [ ] Provide `waitForPauseCleared(...)` with bounded backoff and abort support.
-  - [ ] Ensure dependency injection keeps this module testable (sleep/jitter/log overrides).
-  - [ ] Keep internal boundaries explicit to avoid a long-lived god module:
-    - [ ] Snapshot adapter (control-state -> normalized pause snapshot)
-    - [ ] Waiter (backoff/jitter/abort loop)
-
-- [x] Checkpoint glue consolidation (`src/worker/pause-control.ts`)
-  - [ ] Provide `recordCheckpoint(...)` that:
-    - [ ] Builds checkpoint state from task fields.
-    - [ ] Persists checkpoint patches via `updateTaskStatus(...)` and mirrors them into memory via `applyTaskPatch(...)`.
-    - [ ] Calls the checkpoint runtime (`applyCheckpointReached`) with pause source + emitter.
-  - [ ] Keep task-field names and semantics unchanged (`checkpoint`, `checkpoint-seq`, `pause-requested`, `paused-at-checkpoint`).
-  - [ ] Keep internal boundaries explicit:
-    - [ ] State mapping (task fields -> `CheckpointState`)
-    - [ ] Persistence adapter (build patch + persist + mirror)
-    - [ ] Runtime bridge (apply + pauseSource + emitter)
-
-- [x] Tighten RepoWorker seams + call sites (`src/worker/repo-worker.ts`)
-  - [ ] Keep `pauseIfHardThrottled` / `pauseIfGitHubRateLimited` as RepoWorker wrapper/seam methods.
-  - [ ] Replace any remaining direct control/checkpoint glue in RepoWorker with delegations (where it improves clarity without changing behavior).
-  - [ ] Ensure any cross-lane consumers (e.g. merge/CI remediation) still receive the same seam surface.
-
-- [x] Tests + verification gates
-  - [ ] Ensure unit tests cover:
-    - [ ] pause snapshot validation (checkpoint validation)
-    - [ ] pause-clear waiting/backoff
-    - [ ] pause-clear abort matrix (already-aborted, aborted during backoff, clears naturally)
-    - [ ] checkpoint patch persistence preserves task status
-    - [ ] checkpoint event emission even when persistence fails
-    - [ ] checkpoint persistence failure modes: `updateTaskStatus=false` and `updateTaskStatus` throws
-  - [ ] Run gates: `bun test`, `bun run typecheck`, `bun run knip`.
-
-- [ ] Publish PR artifact
-  - [ ] If there are code changes: create branch + commit(s).
-  - [ ] Push branch and open PR targeting `bot/integration`.
-  - [ ] PR body includes: rationale, risk notes (contract-surface preserved), test commands run, and `Fixes #562`.
+- [x] Keep startup gate-schema repair covered and aligned with schema updates (`src/__tests__/state-sqlite.test.ts`).
+- [x] Add `waiting-on-pr` to queue status model and map it to `ralph:status:in-progress` label convergence.
+- [x] Park queued tasks with existing open PRs in `RepoWorker.processTask` before planner/build, clearing active ownership/session fields.
+- [x] Gate stale in-progress sweep: skip recovery when op-state is `waiting-on-pr` and open PR snapshot is fresh; allow recovery when snapshot is stale/closed.
+- [x] Add transition debounce guard (in-memory + durable SQLite record) for opposite queued/in-progress transitions; log suppressed transitions.
+- [x] Wire label reconciler to respect `waiting-on-pr` and transition debounce state.
+- [x] Add tests for no-flap regression, operator re-queue behavior, closed-PR recovery, waiting-on-pr label idempotence, and transition debounce core logic.
+- [x] Run gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
