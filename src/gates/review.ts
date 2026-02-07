@@ -189,6 +189,8 @@ function buildReviewRepairPrompt(reason: string): string {
   ].join("\n");
 }
 
+const MAX_REPAIR_ATTEMPTS = 2;
+
 function buildDiffArtifactNote(params: ReviewDiffArtifacts): string {
   const stat = params.diffStat.trim() || "(no changes)";
   return [
@@ -343,30 +345,39 @@ export async function runReviewGate(params: {
 
   let parsed = parseRalphReviewMarker(output);
   let finalSessionId = result.sessionId;
-  if (!parsed.ok) {
-    const repairPrompt = buildReviewRepairPrompt(parsed.reason);
+  let lastParseReason = parsed.ok ? "" : parsed.reason;
+
+  for (let attempt = 1; !parsed.ok && attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
+    const repairPrompt = buildReviewRepairPrompt(lastParseReason);
     recordRalphRunGateArtifact({
       runId,
       gate,
       kind: "note",
-      content: ["Review marker parse failed; requesting repair:", parsed.reason].join("\n"),
+      content: [`Review marker parse failed (attempt ${attempt}); requesting repair:`, lastParseReason].join("\n"),
     });
 
     try {
       const repair = await params.runAgent(repairPrompt);
       finalSessionId = repair.sessionId ?? finalSessionId;
-      if (repair.success) {
-        const repairedOutput = repair.output ?? "";
-        recordRalphRunGateArtifact({
-          runId,
-          gate,
-          kind: "note",
-          content: ["Review repair output:", repairedOutput].join("\n").trim(),
-        });
-        parsed = parseRalphReviewMarker(repairedOutput);
+      const repairedOutput = repair.output ?? "";
+      recordRalphRunGateArtifact({
+        runId,
+        gate,
+        kind: "note",
+        content: [`Review repair output (attempt ${attempt}):`, repairedOutput].join("\n").trim(),
+      });
+
+      if (!repair.success) {
+        lastParseReason = "Review repair attempt did not complete successfully";
+        continue;
+      }
+
+      parsed = parseRalphReviewMarker(repairedOutput);
+      if (!parsed.ok) {
+        lastParseReason = parsed.reason;
       }
     } catch {
-      // Fall through to original parse failure handling.
+      lastParseReason = "Review repair attempt failed to execute";
     }
   }
 
