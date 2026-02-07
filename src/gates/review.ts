@@ -37,6 +37,37 @@ export type ReviewGateResult = {
 };
 
 const REVIEW_MARKER_PREFIX = "RALPH_REVIEW:";
+const REVIEW_MARKER_REGEX = /^\s*RALPH_REVIEW:\s*/i;
+
+function tryParseReviewPayload(jsonText: string):
+  | { ok: true; status: "pass" | "fail"; reason: string }
+  | { ok: false; reason: string } {
+  if (!jsonText.trim()) {
+    return { ok: false, reason: "Review marker invalid: missing JSON payload" };
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error: any) {
+    return {
+      ok: false,
+      reason: `Review marker invalid: malformed JSON (${error?.message ?? String(error)})`,
+    };
+  }
+
+  const status = parsed?.status;
+  if (status !== "pass" && status !== "fail") {
+    return { ok: false, reason: "Review marker invalid: status must be pass|fail" };
+  }
+
+  const reason = typeof parsed?.reason === "string" ? parsed.reason.trim() : "";
+  if (!reason) {
+    return { ok: false, reason: "Review marker invalid: reason is required" };
+  }
+
+  return { ok: true, status, reason };
+}
 
 export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult {
   const text = String(output ?? "");
@@ -48,7 +79,7 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
     const line = lines[i];
     const trimmed = line.trim();
     if (trimmed) lastNonEmptyIndex = i;
-    if (line.trimStart().startsWith(REVIEW_MARKER_PREFIX)) {
+    if (REVIEW_MARKER_REGEX.test(line)) {
       markerIndices.push(i);
     }
   }
@@ -62,6 +93,15 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
   }
 
   if (markerIndices.length === 0) {
+    const fallbackPayload = tryParseReviewPayload(lines[lastNonEmptyIndex].trim());
+    if (fallbackPayload.ok) {
+      return {
+        ok: true,
+        status: fallbackPayload.status,
+        reason: fallbackPayload.reason,
+        markerLine: `${REVIEW_MARKER_PREFIX} ${lines[lastNonEmptyIndex].trim()}`,
+      };
+    }
     return {
       ok: false,
       failure: "missing_marker",
@@ -86,7 +126,7 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
   }
 
   const markerLine = lines[lastNonEmptyIndex].trim();
-  if (!markerLine.startsWith(REVIEW_MARKER_PREFIX)) {
+  if (!REVIEW_MARKER_REGEX.test(markerLine)) {
     return {
       ok: false,
       failure: "missing_marker",
@@ -94,45 +134,23 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
     };
   }
 
-  const jsonText = markerLine.slice(REVIEW_MARKER_PREFIX.length).trim();
-  if (!jsonText) {
-    return {
-      ok: false,
-      failure: "missing_json",
-      reason: "Review marker invalid: missing JSON payload",
-    };
+  const jsonText = markerLine.replace(REVIEW_MARKER_REGEX, "").trim();
+  const payload = tryParseReviewPayload(jsonText);
+  if (!payload.ok) {
+    const reason = payload.reason;
+    if (reason.includes("missing JSON payload")) {
+      return { ok: false, failure: "missing_json", reason };
+    }
+    if (reason.includes("malformed JSON")) {
+      return { ok: false, failure: "invalid_json", reason };
+    }
+    if (reason.includes("status must be")) {
+      return { ok: false, failure: "invalid_status", reason };
+    }
+    return { ok: false, failure: "missing_reason", reason };
   }
 
-  let parsed: any;
-  try {
-    parsed = JSON.parse(jsonText);
-  } catch (error: any) {
-    return {
-      ok: false,
-      failure: "invalid_json",
-      reason: `Review marker invalid: malformed JSON (${error?.message ?? String(error)})`,
-    };
-  }
-
-  const status = parsed?.status;
-  if (status !== "pass" && status !== "fail") {
-    return {
-      ok: false,
-      failure: "invalid_status",
-      reason: "Review marker invalid: status must be pass|fail",
-    };
-  }
-
-  const reason = typeof parsed?.reason === "string" ? parsed.reason.trim() : "";
-  if (!reason) {
-    return {
-      ok: false,
-      failure: "missing_reason",
-      reason: "Review marker invalid: reason is required",
-    };
-  }
-
-  return { ok: true, status, reason, markerLine };
+  return { ok: true, status: payload.status, reason: payload.reason, markerLine };
 }
 
 function buildReviewPrompt(params: {

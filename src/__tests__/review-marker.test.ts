@@ -26,6 +26,31 @@ describe("parseRalphReviewMarker", () => {
     }
   });
 
+  test("accepts raw JSON payload on final line when marker is missing", () => {
+    const output = [
+      "Review notes",
+      '{"status":"pass","reason":"Looks good"}',
+    ].join("\n");
+
+    const result = parseRalphReviewMarker(output);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.status).toBe("pass");
+      expect(result.reason).toBe("Looks good");
+    }
+  });
+
+  test("accepts case-insensitive marker prefix", () => {
+    const output = 'ralph_review: {"status":"fail","reason":"Needs changes"}';
+
+    const result = parseRalphReviewMarker(output);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.status).toBe("fail");
+      expect(result.reason).toBe("Needs changes");
+    }
+  });
+
   test("fails when marker is not final line", () => {
     const output = [
       "RALPH_REVIEW: {\"status\":\"pass\",\"reason\":\"ok\"}",
