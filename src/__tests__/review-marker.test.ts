@@ -51,6 +51,34 @@ describe("parseRalphReviewMarker", () => {
     }
   });
 
+  test("accepts marker prefix without colon", () => {
+    const output = 'RALPH_REVIEW {"status":"pass","reason":"Looks good"}';
+
+    const result = parseRalphReviewMarker(output);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.status).toBe("pass");
+      expect(result.reason).toBe("Looks good");
+    }
+  });
+
+  test("accepts multiline trailing JSON payload when marker is missing", () => {
+    const output = [
+      "Review notes",
+      "{",
+      '  "status": "fail",',
+      '  "reason": "Needs follow-up"',
+      "}",
+    ].join("\n");
+
+    const result = parseRalphReviewMarker(output);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.status).toBe("fail");
+      expect(result.reason).toBe("Needs follow-up");
+    }
+  });
+
   test("fails when marker is not final line", () => {
     const output = [
       "RALPH_REVIEW: {\"status\":\"pass\",\"reason\":\"ok\"}",
