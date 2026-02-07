@@ -1,4 +1,4 @@
-import type { AgentTask } from "./queue";
+import type { AgentTask } from "./queue/types";
 import type { AgentEscalationNote, EditEscalationResult } from "./escalation-notes";
 import type { Semaphore } from "./semaphore";
 import type { AgentRun } from "./worker";
@@ -65,14 +65,14 @@ async function safeEditEscalation(
 
   deps.resumeAttemptedThisRun.add(escalationPath);
 
-  if (result.kind === "vault-missing") {
+  if (result.kind === "storage-unavailable") {
     const now = Date.now();
     if (now >= deps.getResumeDisabledUntil()) {
       deps.setResumeDisabledUntil(now + deps.resumeDisableMs);
       const vault = deps.getVaultPathForLogs();
       console.error(
-        `[ralph:escalations] Cannot edit escalation notes; pausing auto-resume for ${Math.round(deps.resumeDisableMs / 1000)}s. ` +
-          `Check bwrbVault in ~/.ralph/config.toml or ~/.ralph/config.json (current: ${JSON.stringify(vault)}). ` +
+          `[ralph:escalations] Cannot edit escalation notes; pausing auto-resume for ${Math.round(deps.resumeDisableMs / 1000)}s. ` +
+          `Escalation note storage is disabled (current path hint: ${JSON.stringify(vault)}). ` +
           `Last error: ${result.error}`
       );
     }

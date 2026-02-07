@@ -88,7 +88,7 @@ function truncateText(input: string, maxChars: number): string {
   return `${trimmed.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
 }
 
-export function sanitizeEscalationText(
+function sanitizeEscalationText(
   input: string | null | undefined,
   maxChars: number,
   opts?: { homeDir?: string }
