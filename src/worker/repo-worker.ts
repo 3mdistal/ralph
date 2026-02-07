@@ -2294,6 +2294,12 @@ export class RepoWorker {
     return /not up to date with the base branch/i.test(message);
   }
 
+  private isBaseBranchModifiedMergeError(error: any): boolean {
+    const message = this.getGhErrorSearchText(error);
+    if (!message) return false;
+    return /base branch was modified/i.test(message);
+  }
+
   private isRequiredChecksExpectedMergeError(error: any): boolean {
     const message = this.getGhErrorSearchText(error);
     if (!message) return false;
@@ -4100,6 +4106,7 @@ export class RepoWorker {
       deleteMergedPrHeadBranchBestEffort: async (input) => await this.deleteMergedPrHeadBranchBestEffort(input as any),
       normalizeGitRef: (ref) => this.normalizeGitRef(ref),
       isOutOfDateMergeError: (err) => this.isOutOfDateMergeError(err as any),
+      isBaseBranchModifiedMergeError: (err) => this.isBaseBranchModifiedMergeError(err as any),
       isRequiredChecksExpectedMergeError: (err) => this.isRequiredChecksExpectedMergeError(err as any),
       waitForRequiredChecks: async (url, checks, opts) => await this.waitForRequiredChecks(url, checks, opts),
       runCiFailureTriage: async (input) => await this.runCiFailureTriage(input as any),

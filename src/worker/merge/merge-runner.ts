@@ -137,6 +137,7 @@ export async function mergePrWithRequiredChecks(params: {
   normalizeGitRef: (ref: string) => string;
 
   isOutOfDateMergeError: (error: unknown) => boolean;
+  isBaseBranchModifiedMergeError: (error: unknown) => boolean;
   isRequiredChecksExpectedMergeError: (error: unknown) => boolean;
   waitForRequiredChecks: (prUrl: string, requiredChecks: string[], opts: { timeoutMs: number; pollIntervalMs: number }) => Promise<WaitForRequiredChecksResult>;
   runCiFailureTriage: (input: {
@@ -511,10 +512,17 @@ export async function mergePrWithRequiredChecks(params: {
       return { ok: true, prUrl, sessionId };
     } catch (error: any) {
       const shouldUpdateBeforeRetry =
-        !didUpdateBranch && (params.isOutOfDateMergeError(error) || params.isRequiredChecksExpectedMergeError(error));
+        !didUpdateBranch &&
+        (params.isOutOfDateMergeError(error) ||
+          params.isBaseBranchModifiedMergeError(error) ||
+          params.isRequiredChecksExpectedMergeError(error));
 
       if (shouldUpdateBeforeRetry) {
-        const why = params.isRequiredChecksExpectedMergeError(error) ? "required checks expected" : "out of date with base";
+        const why = params.isRequiredChecksExpectedMergeError(error)
+          ? "required checks expected"
+          : params.isBaseBranchModifiedMergeError(error)
+            ? "base branch changed"
+            : "out of date with base";
         log(`[ralph:worker:${params.repo}] PR ${why}; updating branch ${prUrl}`);
         didUpdateBranch = true;
         try {
@@ -603,6 +611,9 @@ export async function mergePrWithRequiredChecks(params: {
           source = "ci-failure";
           reason = `Merge blocked: required checks not green for ${prUrl}`;
           details = [diagnostic, "", formatRequiredChecksForHumans(summary)].join("\n").trim();
+        } else if (params.isBaseBranchModifiedMergeError(error)) {
+          source = "auto-update";
+          reason = `Merge blocked: base branch changed for ${prUrl}`;
         } else if (params.isRequiredChecksExpectedMergeError(error)) {
           source = "ci-failure";
           reason = `Merge blocked: required checks expected for ${prUrl}`;
