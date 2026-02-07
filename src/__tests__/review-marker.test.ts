@@ -62,6 +62,21 @@ describe("parseRalphReviewMarker", () => {
     }
   });
 
+  test("accepts marker line wrapped in markdown fence", () => {
+    const output = [
+      "```",
+      'RALPH_REVIEW: {"status":"pass","reason":"Looks good"}',
+      "```",
+    ].join("\n");
+
+    const result = parseRalphReviewMarker(output);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.status).toBe("pass");
+      expect(result.reason).toBe("Looks good");
+    }
+  });
+
   test("accepts multiline trailing JSON payload when marker is missing", () => {
     const output = [
       "Review notes",
@@ -76,6 +91,24 @@ describe("parseRalphReviewMarker", () => {
     if (result.ok) {
       expect(result.status).toBe("fail");
       expect(result.reason).toBe("Needs follow-up");
+    }
+  });
+
+  test("accepts fenced multiline JSON payload when marker is missing", () => {
+    const output = [
+      "```json",
+      "{",
+      '  "status": "pass",',
+      '  "reason": "Fenced fallback"',
+      "}",
+      "```",
+    ].join("\n");
+
+    const result = parseRalphReviewMarker(output);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.status).toBe("pass");
+      expect(result.reason).toBe("Fenced fallback");
     }
   });
 

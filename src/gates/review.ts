@@ -38,6 +38,7 @@ export type ReviewGateResult = {
 
 const REVIEW_MARKER_PREFIX = "RALPH_REVIEW:";
 const REVIEW_MARKER_REGEX = /^\s*RALPH_REVIEW\b\s*[:\-]?\s*/i;
+const MARKDOWN_FENCE_LINE_REGEX = /^```(?:[a-z0-9_-]+)?$/i;
 
 function tryParseReviewPayload(jsonText: string):
   | { ok: true; status: "pass" | "fail"; reason: string }
@@ -109,16 +110,34 @@ function tryParseFallbackPayload(lines: string[], lastNonEmptyIndex: number):
 export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult {
   const text = String(output ?? "");
   const lines = text.split(/\r?\n/);
-  let lastNonEmptyIndex = -1;
+  let rawLastNonEmptyIndex = -1;
   const markerIndices: number[] = [];
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     const trimmed = line.trim();
-    if (trimmed) lastNonEmptyIndex = i;
+    if (trimmed) rawLastNonEmptyIndex = i;
     if (REVIEW_MARKER_REGEX.test(line)) {
       markerIndices.push(i);
     }
+  }
+
+  if (rawLastNonEmptyIndex < 0) {
+    return {
+      ok: false,
+      failure: "empty_output",
+      reason: "Review marker invalid: output was empty",
+    };
+  }
+
+  let lastNonEmptyIndex = rawLastNonEmptyIndex;
+  while (lastNonEmptyIndex >= 0) {
+    const line = lines[lastNonEmptyIndex].trim();
+    if (!line || MARKDOWN_FENCE_LINE_REGEX.test(line)) {
+      lastNonEmptyIndex -= 1;
+      continue;
+    }
+    break;
   }
 
   if (lastNonEmptyIndex < 0) {
