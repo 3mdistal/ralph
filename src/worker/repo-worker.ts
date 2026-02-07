@@ -4109,7 +4109,7 @@ export class RepoWorker {
       buildIssueContextForAgent: async (input) => await this.buildIssueContextForAgent(input),
       runReviewAgent: async (input) => {
         const runLogPath = await this.recordRunLogPath(params.task, issueNumber, input.stage, "in-progress");
-        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, {
+        const baseOptions = {
           repo: this.repo,
           cacheKey: input.cacheKey,
           runLogPath,
@@ -4124,7 +4124,15 @@ export class RepoWorker {
           ...this.buildStallOptions(params.task, input.stage),
           ...this.buildLoopDetectionOptions(params.task, input.stage),
           ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
-        });
+        };
+        const continueSessionId = input.continueSessionId?.trim();
+        if (continueSessionId) {
+          return await this.session.continueSession(params.repoPath, continueSessionId, input.prompt, {
+            ...baseOptions,
+            agent: input.agent,
+          });
+        }
+        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, baseOptions);
       },
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),

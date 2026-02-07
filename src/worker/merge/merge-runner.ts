@@ -110,6 +110,7 @@ export async function mergePrWithRequiredChecks(params: {
     cacheKey: string;
     stage: string;
     sessionId: string;
+    continueSessionId?: string;
   }) => Promise<SessionResult>;
   runMergeConflictRecovery: (input: {
     task: AgentTask;
@@ -338,13 +339,14 @@ export async function mergePrWithRequiredChecks(params: {
             stage,
             sessionId,
           }),
-        runRepairAgent: (prompt) =>
+        runRepairAgent: (prompt, continueSessionId) =>
           params.runReviewAgent({
             agent: "general",
             prompt,
             cacheKey: `review-${params.cacheKey}-${agent}-repair`,
             stage: `${stage} marker repair`,
             sessionId,
+            continueSessionId,
           }),
       });
     };
