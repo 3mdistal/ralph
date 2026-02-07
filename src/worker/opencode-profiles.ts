@@ -63,7 +63,6 @@ export async function resolveOpencodeXdgForTask(
   const home = envHome ?? homedir();
   const ambientXdg = {
     dataHome: join(home, ".local", "share"),
-    configHome: join(home, ".config"),
     stateHome: join(home, ".local", "state"),
     cacheHome: join(home, ".cache"),
   };
@@ -85,7 +84,6 @@ export async function resolveOpencodeXdgForTask(
       profileName: resolved.name,
       opencodeXdg: {
         dataHome: resolved.xdgDataHome,
-        configHome: resolved.xdgConfigHome,
         stateHome: resolved.xdgStateHome,
         cacheHome: resolved.xdgCacheHome,
       },
@@ -113,7 +111,6 @@ export async function resolveOpencodeXdgForTask(
               profileName: resolved.name,
               opencodeXdg: {
                 dataHome: resolved.xdgDataHome,
-                configHome: resolved.xdgConfigHome,
                 stateHome: resolved.xdgStateHome,
                 cacheHome: resolved.xdgCacheHome,
               },
@@ -170,7 +167,6 @@ export async function resolveOpencodeXdgForTask(
     profileName: resolved.name,
     opencodeXdg: {
       dataHome: resolved.xdgDataHome,
-      configHome: resolved.xdgConfigHome,
       stateHome: resolved.xdgStateHome,
       cacheHome: resolved.xdgCacheHome,
     },
