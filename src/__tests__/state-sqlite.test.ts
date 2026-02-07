@@ -534,6 +534,77 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     }
   });
 
+  test("repairs same-version gate schema drift idempotently at startup", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '16')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
+          run_id TEXT NOT NULL,
+          gate TEXT NOT NULL,
+          status TEXT NOT NULL,
+          command TEXT,
+          skip_reason TEXT,
+          url TEXT,
+          pr_number INTEGER,
+          pr_url TEXT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(run_id, gate)
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    initStateDb();
+    closeStateDbForTests();
+    initStateDb();
+
+    const migrated = new Database(dbPath);
+    try {
+      const gateColumns = migrated.query("PRAGMA table_info(ralph_run_gate_results)").all() as Array<{ name: string }>;
+      const gateColumnNames = gateColumns.map((column) => column.name);
+      expect(gateColumnNames).toContain("reason");
+
+      const issueIndex = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_ralph_run_gate_results_repo_issue_updated'")
+        .get() as { name?: string } | undefined;
+      expect(issueIndex?.name).toBe("idx_ralph_run_gate_results_repo_issue_updated");
+
+      const prIndex = migrated
+        .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_ralph_run_gate_results_repo_pr'")
+        .get() as { name?: string } | undefined;
+      expect(prIndex?.name).toBe("idx_ralph_run_gate_results_repo_pr");
+    } finally {
+      migrated.close();
+    }
+  });
+
+  test("fails closed with explicit diagnostics when invariant object type is incompatible", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '16')");
+      db.exec("CREATE VIEW ralph_run_gate_results AS SELECT 'run-1' AS run_id");
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    expect(() => initStateDb()).toThrow(/schema invariant failed/);
+    expect(() => initStateDb()).toThrow(/table=ralph_run_gate_results has incompatible object type=view/);
+  });
+
   test("records ralph runs and session usage", () => {
     initStateDb();
 

@@ -236,6 +236,20 @@ function tableExists(database: Database, name: string): boolean {
   return row?.name === name;
 }
 
+function schemaObjectType(database: Database, name: string): string | null {
+  const row = database
+    .query("SELECT type FROM sqlite_master WHERE name = $name")
+    .get({ $name: name }) as { type?: string } | undefined;
+  return row?.type ?? null;
+}
+
+function indexExists(database: Database, name: string): boolean {
+  const row = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = $name")
+    .get({ $name: name }) as { name?: string } | undefined;
+  return row?.name === name;
+}
+
 function columnExists(database: Database, tableName: string, columnName: string): boolean {
   if (!tableExists(database, tableName)) return false;
   const rows = database
@@ -248,6 +262,105 @@ function addColumnIfMissing(database: Database, tableName: string, columnName: s
   if (!tableExists(database, tableName)) return;
   if (columnExists(database, tableName, columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+type SchemaInvariant =
+  | {
+      kind: "column";
+      tableName: string;
+      columnName: string;
+      definition: string;
+    }
+  | {
+      kind: "index";
+      tableName: string;
+      indexName: string;
+      createSql: string;
+    };
+
+const SCHEMA_INVARIANTS: SchemaInvariant[] = [
+  {
+    kind: "column",
+    tableName: "ralph_run_gate_results",
+    columnName: "reason",
+    definition: "TEXT",
+  },
+  {
+    kind: "index",
+    tableName: "ralph_run_gate_results",
+    indexName: "idx_ralph_run_gate_results_repo_issue_updated",
+    createSql:
+      "CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated ON ralph_run_gate_results(repo_id, issue_number, updated_at)",
+  },
+  {
+    kind: "index",
+    tableName: "ralph_run_gate_results",
+    indexName: "idx_ralph_run_gate_results_repo_pr",
+    createSql: "CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr ON ralph_run_gate_results(repo_id, pr_number)",
+  },
+];
+
+function formatSchemaInvariantError(message: string): Error {
+  return new Error(
+    `state.sqlite schema invariant failed: ${message}. ` +
+      `Expected durable-state shape for schema_version=${SCHEMA_VERSION}. ` +
+      "If this persists after restarting the latest Ralph binary, restore from backup or reset ~/.ralph/state.sqlite."
+  );
+}
+
+function ensureSchemaInvariantObjectTypes(database: Database): void {
+  const tableNames = new Set(SCHEMA_INVARIANTS.map((invariant) => invariant.tableName));
+  for (const tableName of tableNames) {
+    const objectType = schemaObjectType(database, tableName);
+    if (objectType && objectType !== "table") {
+      throw formatSchemaInvariantError(
+        `table=${tableName} has incompatible object type=${objectType}; expected table`
+      );
+    }
+  }
+}
+
+function applySchemaInvariants(database: Database): void {
+  for (const invariant of SCHEMA_INVARIANTS) {
+    if (!tableExists(database, invariant.tableName)) {
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} is missing and cannot be repaired additively`
+      );
+    }
+
+    if (invariant.kind === "column") {
+      if (columnExists(database, invariant.tableName, invariant.columnName)) continue;
+      try {
+        addColumnIfMissing(database, invariant.tableName, invariant.columnName, invariant.definition);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw formatSchemaInvariantError(
+          `table=${invariant.tableName} missing column=${invariant.columnName}; additive repair failed: ${detail}`
+        );
+      }
+      if (!columnExists(database, invariant.tableName, invariant.columnName)) {
+        throw formatSchemaInvariantError(
+          `table=${invariant.tableName} missing column=${invariant.columnName}; additive repair did not apply`
+        );
+      }
+      continue;
+    }
+
+    if (indexExists(database, invariant.indexName)) continue;
+    try {
+      database.exec(invariant.createSql);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} missing index=${invariant.indexName}; additive repair failed: ${detail}`
+      );
+    }
+    if (!indexExists(database, invariant.indexName)) {
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} missing index=${invariant.indexName}; additive repair did not apply`
+      );
+    }
+  }
 }
 
 function readSchemaVersion(database: Database): number | null {
@@ -682,6 +795,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
      ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
   );
 
+  ensureSchemaInvariantObjectTypes(database);
+
   database.exec(`
     CREATE TABLE IF NOT EXISTS repos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1037,6 +1152,12 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_alert_channel ON alert_deliveries(alert_id, channel);
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
   `);
+
+    runMigrationsWithLock(database, () => {
+      database.transaction(() => {
+        applySchemaInvariants(database);
+      })();
+    });
   } catch (error) {
     throw toMigrationLockError(error, busyTimeoutMs);
   }
