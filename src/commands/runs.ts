@@ -1,13 +1,16 @@
 import { redactSensitiveText } from "../redaction";
-import { parseTimestampMs, resolveTimeRange } from "../time-range";
+import { parseDurationMs, parseTimestampMs, resolveTimeRange } from "../time-range";
 import {
   getRalphRunDetails,
   initStateDb,
+  listRalphRunStepMetrics,
+  listRalphRunStepMetricsByRunIds,
   listRalphRunSessionIds,
   listRalphRunSessionIdsByRunIds,
   listRalphRunTracePointers,
   listRalphRunTracePointersByRunIds,
   listRalphRunsTop,
+  type RalphRunStepMetric,
   type RalphRunSummary,
   type RalphRunTopSort,
 } from "../state";
@@ -42,6 +45,7 @@ type RunsTopJsonOutput = {
     tokensComplete: boolean;
     triageScore: number | null;
     triageFlags: string[];
+    dominantStep: DominantStepSummary | null;
     tracePointers: RunTracePointers;
   }>;
 };
@@ -50,6 +54,25 @@ type RunsShowJsonOutput = {
   schemaVersion: 1;
   computedAt: string;
   run: RunsTopJsonOutput["runs"][number];
+};
+
+type DominantStepBasis = "tokens_total" | "wall_time_ms";
+
+type DominantStepSummary = {
+  stepTitle: string;
+  basis: DominantStepBasis;
+  tokensTotal: number | null;
+  wallTimeMs: number | null;
+  toolCallCount: number;
+  toolTimeMs: number | null;
+};
+
+type NormalizedRunsTopArgs = {
+  sort: RalphRunTopSort;
+  includeMissing: boolean;
+  limit: number;
+  sinceIso: string | null;
+  untilIso: string;
 };
 
 function getFlagValue(args: string[], flag: string): string | null {
@@ -94,6 +117,90 @@ function formatTriageValue(value: number | null): string {
   return typeof value === "number" ? String(value) : "unknown";
 }
 
+function formatDurationMs(value: number | null): string {
+  return typeof value === "number" ? `${value}ms` : "unknown";
+}
+
+function selectDominantStep(steps: RalphRunStepMetric[]): DominantStepSummary | null {
+  if (steps.length === 0) return null;
+
+  const sorted = [...steps].sort((a, b) => {
+    const aTokens = a.tokensTotal ?? -1;
+    const bTokens = b.tokensTotal ?? -1;
+    if (aTokens !== bTokens) return bTokens - aTokens;
+
+    const aWall = a.wallTimeMs ?? -1;
+    const bWall = b.wallTimeMs ?? -1;
+    if (aWall !== bWall) return bWall - aWall;
+
+    if (a.toolCallCount !== b.toolCallCount) return b.toolCallCount - a.toolCallCount;
+    return a.stepTitle.localeCompare(b.stepTitle);
+  });
+
+  const best = sorted[0];
+  if (!best) return null;
+
+  const basis: DominantStepBasis = best.tokensTotal != null ? "tokens_total" : "wall_time_ms";
+  return {
+    stepTitle: best.stepTitle,
+    basis,
+    tokensTotal: best.tokensTotal,
+    wallTimeMs: best.wallTimeMs,
+    toolCallCount: best.toolCallCount,
+    toolTimeMs: best.toolTimeMs,
+  };
+}
+
+function normalizeRunsTopArgs(args: string[], nowMs: number): NormalizedRunsTopArgs | null {
+  const sort = parseSort(args);
+  if (!sort) return null;
+
+  const includeMissing = hasFlag(args, "--include-missing");
+  const limit = parseLimit(args);
+  const sinceRaw = getFlagValue(args, "--since");
+  const untilRaw = getFlagValue(args, "--until");
+  const hasSinceFlag = hasFlag(args, "--since");
+  const hasUntilFlag = hasFlag(args, "--until");
+  const all = hasFlag(args, "--all");
+
+  if ((hasSinceFlag && !sinceRaw) || (hasUntilFlag && !untilRaw)) return null;
+
+  if (sinceRaw) {
+    const sinceIsAbsolute = parseTimestampMs(sinceRaw, nowMs) != null;
+    const sinceIsDuration = parseDurationMs(sinceRaw) != null;
+    if (!sinceIsAbsolute && !sinceIsDuration) return null;
+  }
+
+  if (untilRaw && parseTimestampMs(untilRaw, nowMs) == null) return null;
+
+  let sinceMs: number | null;
+  let untilMs: number;
+
+  if (all && !sinceRaw) {
+    untilMs = parseTimestampMs(untilRaw, nowMs) ?? nowMs;
+    sinceMs = null;
+  } else {
+    const resolved = resolveTimeRange({
+      sinceRaw,
+      untilRaw,
+      defaultSinceMs: DEFAULT_SINCE_MS,
+      nowMs,
+    });
+    sinceMs = resolved.sinceMs;
+    untilMs = resolved.untilMs;
+  }
+
+  if (sinceMs != null && (!Number.isFinite(sinceMs) || !Number.isFinite(untilMs) || sinceMs > untilMs)) return null;
+
+  return {
+    sort,
+    includeMissing,
+    limit,
+    sinceIso: sinceMs == null ? null : new Date(sinceMs).toISOString(),
+    untilIso: new Date(untilMs).toISOString(),
+  };
+}
+
 function normalizeTracePointers(params: {
   runId: string;
   tracePointersByRun: Map<string, ReturnType<typeof listRalphRunTracePointers>>;
@@ -129,25 +236,26 @@ function formatRunTraceLines(trace: RunTracePointers): string[] {
   return lines;
 }
 
-function formatRunsTopHuman(rows: Array<{ run: RalphRunSummary; trace: RunTracePointers }>): string {
+function formatRunsTopHuman(rows: Array<{ run: RalphRunSummary; trace: RunTracePointers; dominantStep: DominantStepSummary | null }>): string {
   if (rows.length === 0) return "No runs matched the query.";
 
-  const header = ["RUN", "ISSUE", "OUTCOME", "ENDED", "TOKENS", "TRIAGE"];
-  const widths = [8, 24, 10, 20, 10, 10];
+  const header = ["RUN", "ISSUE", "OUTCOME", "ENDED", "TOKENS", "TRIAGE", "DOM-STEP"];
+  const widths = [8, 20, 10, 20, 10, 10, 20];
   const fmt = (value: string, width: number) => (value.length >= width ? value.slice(0, width) : value.padEnd(width));
   const lines: string[] = [];
 
   lines.push(header.map((h, i) => fmt(h, widths[i]!)).join(" "));
   lines.push(widths.map((w) => "-".repeat(w)).join(" "));
 
-  for (const { run, trace } of rows) {
+  for (const { run, trace, dominantStep } of rows) {
     const runShort = run.runId.slice(0, 8);
     const issueLabel = formatIssueLabel(run.repo, run.issueNumber);
     const outcome = run.outcome ?? "unknown";
     const endedAt = run.completedAt ?? "-";
     const tokens = formatTokenValue(run.tokensTotal);
     const triage = formatTriageValue(run.triageScore);
-    const row = [runShort, issueLabel, outcome, endedAt, tokens, triage];
+    const domStep = dominantStep ? dominantStep.stepTitle : "unknown";
+    const row = [runShort, issueLabel, outcome, endedAt, tokens, triage, domStep];
     lines.push(row.map((value, i) => fmt(value, widths[i]!)).join(" "));
     lines.push(...formatRunTraceLines(trace));
   }
@@ -155,7 +263,7 @@ function formatRunsTopHuman(rows: Array<{ run: RalphRunSummary; trace: RunTraceP
   return lines.join("\n");
 }
 
-function formatRunShowHuman(run: RalphRunSummary, trace: RunTracePointers): string {
+function formatRunShowHuman(run: RalphRunSummary, trace: RunTracePointers, dominantStep: DominantStepSummary | null): string {
   const lines: string[] = [];
   lines.push(`Run: ${run.runId}`);
   lines.push(`Issue: ${formatIssueLabel(run.repo, run.issueNumber)}`);
@@ -165,12 +273,23 @@ function formatRunShowHuman(run: RalphRunSummary, trace: RunTracePointers): stri
   lines.push(`Tokens total: ${formatTokenValue(run.tokensTotal)}`);
   lines.push(`Triage score: ${formatTriageValue(run.triageScore)}`);
   if (run.triageFlags.length > 0) lines.push(`Triage flags: ${run.triageFlags.join(", ")}`);
+  if (dominantStep) {
+    lines.push(
+      `Dominant step: ${dominantStep.stepTitle} (${dominantStep.basis}, tokens=${formatTokenValue(dominantStep.tokensTotal)}, wall=${formatDurationMs(dominantStep.wallTimeMs)}, tool_calls=${dominantStep.toolCallCount}, tool_time=${formatDurationMs(dominantStep.toolTimeMs)})`
+    );
+  } else {
+    lines.push("Dominant step: unknown");
+  }
   lines.push("Trace pointers:");
   lines.push(...formatRunTraceLines(trace));
   return lines.join("\n");
 }
 
-function buildJsonRun(run: RalphRunSummary, trace: RunTracePointers): RunsTopJsonOutput["runs"][number] {
+function buildJsonRun(
+  run: RalphRunSummary,
+  trace: RunTracePointers,
+  dominantStep: DominantStepSummary | null
+): RunsTopJsonOutput["runs"][number] {
   return {
     runId: run.runId,
     repo: run.repo,
@@ -182,6 +301,7 @@ function buildJsonRun(run: RalphRunSummary, trace: RunTracePointers): RunsTopJso
     tokensComplete: run.tokensComplete,
     triageScore: run.triageScore,
     triageFlags: run.triageFlags,
+    dominantStep,
     tracePointers: trace,
   };
 }
@@ -214,69 +334,44 @@ export async function runRunsCommand(opts: { args: string[] }): Promise<void> {
   const nowMs = Date.now();
 
   if (subcommand === "top") {
-    const sort = parseSort(args);
-    if (!sort) {
+    const normalized = normalizeRunsTopArgs(args, nowMs);
+    if (!normalized) {
       console.error(buildRunsUsage());
       process.exit(1);
       return;
     }
-
-    const includeMissing = hasFlag(args, "--include-missing");
-    const limit = parseLimit(args);
-    const sinceRaw = getFlagValue(args, "--since");
-    const untilRaw = getFlagValue(args, "--until");
-    const all = hasFlag(args, "--all");
-
-    let sinceMs: number | null;
-    let untilMs: number;
-
-    if (all && !sinceRaw) {
-      untilMs = parseTimestampMs(untilRaw, nowMs) ?? nowMs;
-      sinceMs = null;
-    } else {
-      const resolved = resolveTimeRange({
-        sinceRaw,
-        untilRaw,
-        defaultSinceMs: DEFAULT_SINCE_MS,
-        nowMs,
-      });
-      sinceMs = resolved.sinceMs;
-      untilMs = resolved.untilMs;
-    }
-
-    if (sinceMs != null && (!Number.isFinite(sinceMs) || !Number.isFinite(untilMs) || sinceMs > untilMs)) {
-      console.error(buildRunsUsage());
-      process.exit(1);
-      return;
-    }
-
-    const sinceIso = sinceMs == null ? null : new Date(sinceMs).toISOString();
-    const untilIso = new Date(untilMs).toISOString();
 
     const runs = listRalphRunsTop({
-      limit,
-      sort,
-      includeMissing,
-      sinceIso,
-      untilIso,
+      limit: normalized.limit,
+      sort: normalized.sort,
+      includeMissing: normalized.includeMissing,
+      sinceIso: normalized.sinceIso,
+      untilIso: normalized.untilIso,
     });
 
     const runIds = runs.map((run) => run.runId);
     const tracePointersByRun = listRalphRunTracePointersByRunIds(runIds);
     const sessionIdsByRun = listRalphRunSessionIdsByRunIds(runIds);
+    const stepMetricsByRun = listRalphRunStepMetricsByRunIds(runIds);
 
     if (json) {
       const output: RunsTopJsonOutput = {
         schemaVersion: 1,
         computedAt: new Date(nowMs).toISOString(),
         range: {
-          since: sinceIso,
-          until: untilIso,
+          since: normalized.sinceIso,
+          until: normalized.untilIso,
         },
-        sort,
-        includeMissing,
-        limit,
-        runs: runs.map((run) => buildJsonRun(run, normalizeTracePointers({ runId: run.runId, tracePointersByRun, sessionIdsByRun }))),
+        sort: normalized.sort,
+        includeMissing: normalized.includeMissing,
+        limit: normalized.limit,
+        runs: runs.map((run) =>
+          buildJsonRun(
+            run,
+            normalizeTracePointers({ runId: run.runId, tracePointersByRun, sessionIdsByRun }),
+            selectDominantStep(stepMetricsByRun.get(run.runId) ?? [])
+          )
+        ),
       };
       console.log(JSON.stringify(output, null, 2));
       process.exit(0);
@@ -286,6 +381,7 @@ export async function runRunsCommand(opts: { args: string[] }): Promise<void> {
     const rows = runs.map((run) => ({
       run,
       trace: normalizeTracePointers({ runId: run.runId, tracePointersByRun, sessionIdsByRun }),
+      dominantStep: selectDominantStep(stepMetricsByRun.get(run.runId) ?? []),
     }));
     console.log(formatRunsTopHuman(rows));
     process.exit(0);
@@ -309,6 +405,8 @@ export async function runRunsCommand(opts: { args: string[] }): Promise<void> {
 
     const tracePointers = listRalphRunTracePointers(runId);
     const sessionIds = listRalphRunSessionIds(runId);
+    const stepMetrics = listRalphRunStepMetrics(runId);
+    const dominantStep = selectDominantStep(stepMetrics);
     const trace: RunTracePointers = {
       runLogPaths: tracePointers.filter((p) => p.kind === "run_log_path").map((p) => redactSensitiveText(p.path)),
       sessionEventPaths: tracePointers.filter((p) => p.kind === "session_events_path").map((p) => redactSensitiveText(p.path)),
@@ -319,14 +417,14 @@ export async function runRunsCommand(opts: { args: string[] }): Promise<void> {
       const output: RunsShowJsonOutput = {
         schemaVersion: 1,
         computedAt: new Date(nowMs).toISOString(),
-        run: buildJsonRun(run, trace),
+        run: buildJsonRun(run, trace, dominantStep),
       };
       console.log(JSON.stringify(output, null, 2));
       process.exit(0);
       return;
     }
 
-    console.log(formatRunShowHuman(run, trace));
+    console.log(formatRunShowHuman(run, trace, dominantStep));
     process.exit(0);
     return;
   }
