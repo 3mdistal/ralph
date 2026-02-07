@@ -159,6 +159,18 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: [] });
   });
 
+  test("statusToRalphLabelDelta supports blocked to queued round-trip", () => {
+    const blockedDelta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
+    const blockedLabels = applyDelta(["ralph:status:queued"], blockedDelta);
+    expect(blockedLabels).toContain("ralph:status:in-progress");
+    expect(blockedLabels).not.toContain("ralph:status:queued");
+
+    const queuedDelta = statusToRalphLabelDelta("queued", blockedLabels);
+    const queuedLabels = applyDelta(blockedLabels, queuedDelta);
+    expect(queuedLabels).toContain("ralph:status:queued");
+    expect(queuedLabels).not.toContain("ralph:status:in-progress");
+  });
+
   test("statusToRalphLabelDelta maps escalated to escalated", () => {
     const delta = statusToRalphLabelDelta("escalated", ["ralph:status:queued"]);
     expect(delta).toEqual({ add: ["ralph:status:escalated"], remove: ["ralph:status:queued"] });
