@@ -11,6 +11,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph runs top|show ...             List expensive runs + trace pointers",
       "  ralph gates <repo> <issue> [--json] Show deterministic gate state",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph github-usage [--since 24h]   Summarize GitHub API request telemetry",
@@ -60,6 +61,18 @@ function printCommandHelp(command: string): void {
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "runs":
+      console.log(
+        [
+          "Usage:",
+          "  ralph runs top [--since 7d] [--until <iso|ms|now>] [--limit N] [--sort tokens_total|triage_score] [--include-missing] [--all] [--json]",
+          "  ralph runs show <runId> [--json]",
+          "",
+          "Lists top runs by tokens or triage score and links to trace artifacts.",
         ].join("\n")
       );
       return;
@@ -252,6 +265,7 @@ if (!cmd || cmd.startsWith("-")) {
 if (
   (cmd === "resume" ||
     cmd === "status" ||
+    cmd === "runs" ||
     cmd === "gates" ||
     cmd === "usage" ||
     cmd === "github-usage" ||

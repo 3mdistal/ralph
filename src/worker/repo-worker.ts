@@ -165,6 +165,7 @@ import {
   deleteIdempotencyKey,
   recordParentVerificationAttemptFailure,
   recordRalphRunGateArtifact,
+  recordRalphRunTracePointer,
   upsertIdempotencyKey,
   recordIssueSnapshot,
   PR_STATE_MERGED,
@@ -631,6 +632,13 @@ export class RepoWorker {
     const updated = await this.queue.updateTaskStatus(task, status, { "run-log-path": runLogPath });
     if (!updated) {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
+    }
+    if (this.activeRunId) {
+      recordRalphRunTracePointer({
+        runId: this.activeRunId,
+        kind: "run_log_path",
+        path: runLogPath,
+      });
     }
     return runLogPath;
   }

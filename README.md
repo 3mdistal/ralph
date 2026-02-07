@@ -392,6 +392,24 @@ ralph github-usage --date 2026-02-03
 ralph github-usage --since 6h --json
 ```
 
+### Runs (top + trace pointers)
+
+List the most expensive runs (default window is last 7 days):
+
+```bash
+ralph runs top
+ralph runs top --sort triage_score --include-missing
+ralph runs top --since 14d --limit 50
+ralph runs top --all --json
+```
+
+Show a specific run (includes session IDs, trace paths, and run logs when known):
+
+```bash
+ralph runs show <runId>
+ralph runs show <runId> --json
+```
+
 ### Sandbox provisioning
 
 ```bash
