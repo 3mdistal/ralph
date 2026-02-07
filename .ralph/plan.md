@@ -1,80 +1,80 @@
-# Plan: Refactor RepoWorker pause control + checkpoint glue (#562)
+# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
 
 ## Goal
 
-- Consolidate pause-control reads and checkpoint patch/persist glue into `src/worker/pause-control.ts`.
-- Keep RepoWorker as an imperative shell with thin delegations; preserve seams `pauseIfHardThrottled` / `pauseIfGitHubRateLimited`.
-- Preserve checkpoint/task-field semantics and any operator-visible contract surfaces.
+- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
+- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
+- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
 
 ## Assumptions
 
-- This is an internal refactor; behavior/semantics must remain unchanged.
-- PRs should target `bot/integration`.
+- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
+- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
+- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
 
 ## Checklist
 
-- [x] Confirm current state (avoid redoing work)
-- [x] Lock invariants (no behavior change)
-- [x] Pause-control consolidation
-- [x] Checkpoint glue consolidation
-- [x] Tighten RepoWorker seams + call sites
-- [x] Tests + verification gates
-- [ ] Publish PR artifact
+- [x] Confirm current behavior + repro path
+- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
+- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
+- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
+- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
+- [x] Add regression test (continueSession retries with hard failure output)
+- [x] Add focused unit tests for reason derivation helper
+- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
 
 ## Steps
 
-- [x] Confirm current state (avoid redoing work)
-  - [ ] Inspect whether `src/worker/pause-control.ts` already exists and owns: control snapshot reading + pause wait + checkpoint persistence glue.
-  - [ ] Inspect whether `src/worker/repo-worker.ts` delegates pause-control reads + checkpoint recording to that module.
-  - [ ] Compare against `bot/integration` (not just local cleanliness): confirm `git diff bot/integration...HEAD` is empty or contains only intended refactor.
-  - [ ] If everything is already on the base branch and tests pass, treat this task as “already satisfied” and move to the PR/closure path (no new refactor).
+- [x] Confirm current behavior + repro path
+  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
+  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
 
-- [x] Lock invariants (no behavior change)
-  - [ ] Write down the invariants to preserve (and keep them stable through the refactor):
-    - [ ] Task-field contract: `checkpoint`, `checkpoint-seq`, `pause-requested`, `paused-at-checkpoint` names + meanings.
-    - [ ] Checkpoint sequencing: each `recordCheckpoint` advances `checkpoint-seq` monotonically (+1 per applied checkpoint runtime).
-    - [ ] Persistence ordering: successful `updateTaskStatus` -> `applyTaskPatch` mirrors the same patch; failures never mutate in-memory task fields.
-    - [ ] Emission guarantee: checkpoint reached event emits even if persistence fails (including `updateTaskStatus=false` or throw).
-    - [ ] Pause-wait semantics: `waitForPauseCleared` returns when pause clears, and respects abort (returns early on abort).
-  - [ ] Add seam-level characterization tests so cross-lane consumers stay stable:
-    - [ ] Minimal tests for RepoWorker wrapper return contracts (e.g. `pauseIfHardThrottled` / `pauseIfGitHubRateLimited` still return `AgentRun | null`).
-    - [ ] Ensure merge/CI remediation callers still compile against the same seam surface.
+- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
+  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
+    - [x] accepts accumulated evidence strings + attempt count
+    - [x] returns `{ reason, details?, classification? }`
+    - [x] uses `classifyOpencodeFailure(...)` deterministically
+    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
+  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
 
-- [x] Pause-control consolidation (`src/worker/pause-control.ts`)
-  - [ ] Provide `createPauseControl(...)` that reads the control state snapshot and normalizes `pauseRequested` + `pauseAtCheckpoint`.
-  - [ ] Provide `waitForPauseCleared(...)` with bounded backoff and abort support.
-  - [ ] Ensure dependency injection keeps this module testable (sleep/jitter/log overrides).
-  - [ ] Keep internal boundaries explicit to avoid a long-lived god module:
-    - [ ] Snapshot adapter (control-state -> normalized pause snapshot)
-    - [ ] Waiter (backoff/jitter/abort loop)
+- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
+  - [x] Extract a single RepoWorker method/helper for the common escalation block:
+    - [x] update task status to escalated
+    - [x] write escalation writeback
+    - [x] notify escalation
+    - [x] record escalated run note
+    - [x] return the `AgentRun` shape
+  - [x] Call the shared helper from both build and resume PR-create escalation sites.
 
-- [x] Checkpoint glue consolidation (`src/worker/pause-control.ts`)
-  - [ ] Provide `recordCheckpoint(...)` that:
-    - [ ] Builds checkpoint state from task fields.
-    - [ ] Persists checkpoint patches via `updateTaskStatus(...)` and mirrors them into memory via `applyTaskPatch(...)`.
-    - [ ] Calls the checkpoint runtime (`applyCheckpointReached`) with pause source + emitter.
-  - [ ] Keep task-field names and semantics unchanged (`checkpoint`, `checkpoint-seq`, `pause-requested`, `paused-at-checkpoint`).
-  - [ ] Keep internal boundaries explicit:
-    - [ ] State mapping (task fields -> `CheckpointState`)
-    - [ ] Persistence adapter (build patch + persist + mirror)
-    - [ ] Runtime bridge (apply + pauseSource + emitter)
+- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
+  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
+  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
+  - [x] Compute a single `reason`:
+    - [x] If classification exists: use `classification.reason` as the headline reason.
+    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
+  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
+  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
+  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
 
-- [x] Tighten RepoWorker seams + call sites (`src/worker/repo-worker.ts`)
-  - [ ] Keep `pauseIfHardThrottled` / `pauseIfGitHubRateLimited` as RepoWorker wrapper/seam methods.
-  - [ ] Replace any remaining direct control/checkpoint glue in RepoWorker with delegations (where it improves clarity without changing behavior).
-  - [ ] Ensure any cross-lane consumers (e.g. merge/CI remediation) still receive the same seam surface.
+- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
+  - [x] Ensure the computed `reason` is passed consistently to:
+    - [x] `writeEscalationWriteback(task, { reason, ... })`
+    - [x] `notify.notifyEscalation({ reason, ... })`
+    - [x] `recordEscalatedRunNote({ reason, ... })`
+    - [x] the returned `{ escalationReason: reason }`.
 
-- [x] Tests + verification gates
-  - [ ] Ensure unit tests cover:
-    - [ ] pause snapshot validation (checkpoint validation)
-    - [ ] pause-clear waiting/backoff
-    - [ ] pause-clear abort matrix (already-aborted, aborted during backoff, clears naturally)
-    - [ ] checkpoint patch persistence preserves task status
-    - [ ] checkpoint event emission even when persistence fails
-    - [ ] checkpoint persistence failure modes: `updateTaskStatus=false` and `updateTaskStatus` throws
-  - [ ] Run gates: `bun test`, `bun run typecheck`, `bun run knip`.
+- [x] Add regression test (continueSession retries with hard failure output)
+  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
+    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
+  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
+  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
 
-- [ ] Publish PR artifact
-  - [ ] If there are code changes: create branch + commit(s).
-  - [ ] Push branch and open PR targeting `bot/integration`.
-  - [ ] PR body includes: rationale, risk notes (contract-surface preserved), test commands run, and `Fixes #562`.
+- [x] Add focused unit tests for reason derivation helper
+  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
+    - [x] classification wins over no-PR fallback
+    - [x] fallback used only when classifier returns null
+    - [x] accumulated evidence (classification present only in a later continue output still wins)
+
+- [x] Run verification gates
+  - [x] `bun test`
+  - [x] `bun run typecheck`
