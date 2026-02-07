@@ -109,31 +109,38 @@ async function fetchLatestCmdLabelEventId(params: {
 }): Promise<string | null> {
   const { owner, name } = splitRepoFullName(params.repo);
   try {
-    const response = await params.github.request<
-      Array<{
-        id?: number | null;
-        event?: string | null;
-        created_at?: string | null;
-        label?: { name?: string | null } | null;
-      }>
-    >(`/repos/${owner}/${name}/issues/${params.issueNumber}/events?per_page=100`);
-    const events = response.data ?? [];
+    const perPage = 100;
+    const maxPages = 10;
     const target = params.label.toLowerCase();
 
     let lastLabeled: number | null = null;
     let lastUnlabeled: number | null = null;
 
-    for (const ev of events) {
-      const name = (ev?.label?.name ?? "").toLowerCase();
-      if (!name || name !== target) continue;
-      const id = typeof ev?.id === "number" ? ev.id : Number(ev?.id ?? 0);
-      if (!id) continue;
-      const kind = (ev?.event ?? "").toLowerCase();
-      if (kind === "labeled") {
-        if (!lastLabeled || id > lastLabeled) lastLabeled = id;
-      } else if (kind === "unlabeled") {
-        if (!lastUnlabeled || id > lastUnlabeled) lastUnlabeled = id;
+    for (let page = 1; page <= maxPages; page += 1) {
+      const response = await params.github.request<
+        Array<{
+          id?: number | null;
+          event?: string | null;
+          created_at?: string | null;
+          label?: { name?: string | null } | null;
+        }>
+      >(`/repos/${owner}/${name}/issues/${params.issueNumber}/events?per_page=${perPage}&page=${page}`);
+      const events = response.data ?? [];
+      if (events.length === 0) break;
+
+      for (const ev of events) {
+        const name = (ev?.label?.name ?? "").toLowerCase();
+        if (!name || name !== target) continue;
+        const id = typeof ev?.id === "number" ? ev.id : Number(ev?.id ?? 0);
+        if (!id) continue;
+        const kind = (ev?.event ?? "").toLowerCase();
+        if (kind === "labeled") {
+          if (!lastLabeled || id > lastLabeled) lastLabeled = id;
+        } else if (kind === "unlabeled") {
+          if (!lastUnlabeled || id > lastUnlabeled) lastUnlabeled = id;
+        }
       }
+
     }
 
     if (lastLabeled && (!lastUnlabeled || lastLabeled > lastUnlabeled)) return String(lastLabeled);
