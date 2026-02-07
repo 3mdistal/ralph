@@ -1,5 +1,5 @@
 import { mkdirSync } from "fs";
-import { dirname } from "path";
+import { dirname, join } from "path";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 
@@ -8,7 +8,29 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
+const MIN_SUPPORTED_SCHEMA_VERSION = 1;
+const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
+
+function parsePositiveIntEnv(name: string): number | null {
+  const raw = process.env[name]?.trim();
+  if (!raw) return null;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  const normalized = Math.floor(value);
+  if (normalized <= 0) return null;
+  return normalized;
+}
+
+function isTruthyEnv(name: string): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return false;
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function quoteSqlLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
 
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "paused" | "throttled" | "escalated" | "failed";
@@ -216,8 +238,240 @@ function requireDb(): Database {
   return db;
 }
 
-function ensureSchema(database: Database): void {
-  database.exec("PRAGMA journal_mode = WAL;");
+function tableExists(database: Database, name: string): boolean {
+  const row = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = $name")
+    .get({ $name: name }) as { name?: string } | undefined;
+  return row?.name === name;
+}
+
+function schemaObjectType(database: Database, name: string): string | null {
+  const row = database
+    .query("SELECT type FROM sqlite_master WHERE name = $name")
+    .get({ $name: name }) as { type?: string } | undefined;
+  return row?.type ?? null;
+}
+
+function indexExists(database: Database, name: string): boolean {
+  const row = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = $name")
+    .get({ $name: name }) as { name?: string } | undefined;
+  return row?.name === name;
+}
+
+function columnExists(database: Database, tableName: string, columnName: string): boolean {
+  if (!tableExists(database, tableName)) return false;
+  const rows = database
+    .query(`PRAGMA table_info(${tableName})`)
+    .all() as Array<{ name?: string }>;
+  return rows.some((row) => row.name === columnName);
+}
+
+function addColumnIfMissing(database: Database, tableName: string, columnName: string, definition: string): void {
+  if (!tableExists(database, tableName)) return;
+  if (columnExists(database, tableName, columnName)) return;
+  database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+type SchemaInvariant =
+  | {
+      kind: "column";
+      tableName: string;
+      columnName: string;
+      definition: string;
+    }
+  | {
+      kind: "index";
+      tableName: string;
+      indexName: string;
+      createSql: string;
+    };
+
+const SCHEMA_INVARIANTS: SchemaInvariant[] = [
+  {
+    kind: "column",
+    tableName: "ralph_run_gate_results",
+    columnName: "reason",
+    definition: "TEXT",
+  },
+  {
+    kind: "index",
+    tableName: "ralph_run_gate_results",
+    indexName: "idx_ralph_run_gate_results_repo_issue_updated",
+    createSql:
+      "CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated ON ralph_run_gate_results(repo_id, issue_number, updated_at)",
+  },
+  {
+    kind: "index",
+    tableName: "ralph_run_gate_results",
+    indexName: "idx_ralph_run_gate_results_repo_pr",
+    createSql: "CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr ON ralph_run_gate_results(repo_id, pr_number)",
+  },
+];
+
+function formatSchemaInvariantError(message: string): Error {
+  return new Error(
+    `state.sqlite schema invariant failed: ${message}. ` +
+      `Expected durable-state shape for schema_version=${SCHEMA_VERSION}. ` +
+      "If this persists after restarting the latest Ralph binary, restore from backup or reset ~/.ralph/state.sqlite."
+  );
+}
+
+function ensureSchemaInvariantObjectTypes(database: Database): void {
+  const tableNames = new Set(SCHEMA_INVARIANTS.map((invariant) => invariant.tableName));
+  for (const tableName of tableNames) {
+    const objectType = schemaObjectType(database, tableName);
+    if (objectType && objectType !== "table") {
+      throw formatSchemaInvariantError(
+        `table=${tableName} has incompatible object type=${objectType}; expected table`
+      );
+    }
+  }
+}
+
+function applySchemaInvariants(database: Database): void {
+  for (const invariant of SCHEMA_INVARIANTS) {
+    if (!tableExists(database, invariant.tableName)) {
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} is missing and cannot be repaired additively`
+      );
+    }
+
+    if (invariant.kind === "column") {
+      if (columnExists(database, invariant.tableName, invariant.columnName)) continue;
+      try {
+        addColumnIfMissing(database, invariant.tableName, invariant.columnName, invariant.definition);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw formatSchemaInvariantError(
+          `table=${invariant.tableName} missing column=${invariant.columnName}; additive repair failed: ${detail}`
+        );
+      }
+      if (!columnExists(database, invariant.tableName, invariant.columnName)) {
+        throw formatSchemaInvariantError(
+          `table=${invariant.tableName} missing column=${invariant.columnName}; additive repair did not apply`
+        );
+      }
+      continue;
+    }
+
+    if (indexExists(database, invariant.indexName)) continue;
+    try {
+      database.exec(invariant.createSql);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} missing index=${invariant.indexName}; additive repair failed: ${detail}`
+      );
+    }
+    if (!indexExists(database, invariant.indexName)) {
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} missing index=${invariant.indexName}; additive repair did not apply`
+      );
+    }
+  }
+}
+
+function readSchemaVersion(database: Database): number | null {
+  const existing = database
+    .query("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value?: string } | undefined;
+  const raw = existing?.value?.trim();
+  if (!raw) return null;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`Invalid state.sqlite schema_version value: ${raw}`);
+  }
+  const normalized = Math.floor(parsed);
+  if (normalized <= 0) {
+    throw new Error(`Invalid state.sqlite schema_version value: ${raw}`);
+  }
+  return normalized;
+}
+
+function formatSchemaCompatibilityError(version: number): string {
+  return (
+    `Unsupported state.sqlite schema_version=${version}; ` +
+    `supported range=${MIN_SUPPORTED_SCHEMA_VERSION}..${SCHEMA_VERSION}. ` +
+    "Upgrade Ralph to a compatible/newer binary before restarting. " +
+    "If recovery is required and local durable state can be discarded, delete ~/.ralph/state.sqlite to rebuild from scratch."
+  );
+}
+
+function runIntegrityCheck(database: Database): void {
+  const rows = database
+    .query("PRAGMA integrity_check")
+    .all() as Array<{ integrity_check?: string }>;
+  if (rows.length !== 1 || rows[0]?.integrity_check !== "ok") {
+    const details = rows.map((row) => row.integrity_check ?? "unknown").join("; ");
+    throw new Error(
+      `state.sqlite integrity_check failed before migration: ${details || "unknown"}. ` +
+        "Restore from backup or reset ~/.ralph/state.sqlite if local state can be recreated."
+    );
+  }
+}
+
+function maybeBackupBeforeMigration(database: Database, stateDbPath: string, fromVersion: number): void {
+  if (!isTruthyEnv("RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE")) return;
+  const configuredDir = process.env.RALPH_STATE_DB_BACKUP_DIR?.trim();
+  const backupDir = configuredDir || dirname(stateDbPath);
+  mkdirSync(backupDir, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupPath = join(backupDir, `state.schema-v${fromVersion}.${timestamp}.backup.sqlite`);
+  database.exec(`VACUUM INTO ${quoteSqlLiteral(backupPath)}`);
+}
+
+function runMigrationsWithLock(database: Database, migrate: () => void): void {
+  const busyTimeoutMs =
+    parsePositiveIntEnv("RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS") ?? DEFAULT_MIGRATION_BUSY_TIMEOUT_MS;
+  database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+
+  try {
+    database.exec("BEGIN IMMEDIATE");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.toLowerCase().includes("database is locked")) {
+      throw new Error(
+        `state.sqlite migration lock timeout after ${busyTimeoutMs}ms. ` +
+          "Another process is using the state DB; stop/drain the other daemon and retry."
+      );
+    }
+    throw error;
+  }
+
+  let committed = false;
+  try {
+    migrate();
+    database.exec("COMMIT");
+    committed = true;
+  } finally {
+    if (!committed) {
+      try {
+        database.exec("ROLLBACK");
+      } catch {
+        // Best effort rollback after failed migration.
+      }
+    }
+  }
+}
+
+function toMigrationLockError(error: unknown, busyTimeoutMs: number): Error {
+  const message = error instanceof Error ? error.message : String(error);
+  if (message.toLowerCase().includes("database is locked")) {
+    return new Error(
+      `state.sqlite migration lock timeout after ${busyTimeoutMs}ms. ` +
+        "Another process is using the state DB; stop/drain the other daemon and retry."
+    );
+  }
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function ensureSchema(database: Database, stateDbPath: string): void {
+  const busyTimeoutMs =
+    parsePositiveIntEnv("RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS") ?? DEFAULT_MIGRATION_BUSY_TIMEOUT_MS;
+  database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  try {
+    database.exec("PRAGMA journal_mode = WAL;");
   database.exec("PRAGMA synchronous = NORMAL;");
   database.exec("PRAGMA foreign_keys = ON;");
 
@@ -225,91 +479,74 @@ function ensureSchema(database: Database): void {
     "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
   );
 
-  const existing = database
-    .query("SELECT value FROM meta WHERE key = 'schema_version'")
-    .get() as { value?: string } | undefined;
-
-  const existingVersion = existing?.value ? Number(existing.value) : null;
+  const existingVersion = readSchemaVersion(database);
   if (existingVersion && existingVersion > SCHEMA_VERSION) {
-    const schemaLabel = existing?.value ?? "unknown";
-    throw new Error(
-      `Unsupported state.sqlite schema_version=${schemaLabel}; expected ${SCHEMA_VERSION}`
-    );
+    throw new Error(formatSchemaCompatibilityError(existingVersion));
   }
 
-  const tableExists = (name: string): boolean => {
-    const row = database
-      .query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = $name")
-      .get({ $name: name }) as { name?: string } | undefined;
-    return row?.name === name;
-  };
-
   if (existingVersion && existingVersion < SCHEMA_VERSION) {
-    database.transaction(() => {
-      if (existingVersion < 3) {
-        database.exec("ALTER TABLE tasks ADD COLUMN worker_id TEXT");
-        database.exec("ALTER TABLE tasks ADD COLUMN repo_slot TEXT");
+    maybeBackupBeforeMigration(database, stateDbPath, existingVersion);
+    runMigrationsWithLock(database, () => {
+      const lockedVersion = readSchemaVersion(database);
+      if (!lockedVersion || lockedVersion >= SCHEMA_VERSION) return;
+      if (lockedVersion > SCHEMA_VERSION) {
+        throw new Error(formatSchemaCompatibilityError(lockedVersion));
       }
-      if (existingVersion < 4) {
-        database.exec("ALTER TABLE issues ADD COLUMN github_node_id TEXT");
-        database.exec("ALTER TABLE issues ADD COLUMN github_updated_at TEXT");
-      }
-      if (existingVersion < 5) {
-        database.exec(
-          "CREATE TABLE IF NOT EXISTS repo_github_issue_sync (repo_id INTEGER PRIMARY KEY, last_sync_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
-        );
-      }
-      if (existingVersion < 6) {
-        database.exec("ALTER TABLE tasks ADD COLUMN daemon_id TEXT");
-        database.exec("ALTER TABLE tasks ADD COLUMN heartbeat_at TEXT");
-        database.exec(
-          "UPDATE tasks SET task_path = 'github:' || (SELECT name FROM repos r WHERE r.id = tasks.repo_id) || '#' || tasks.issue_number " +
-            "WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL"
-        );
-        database.exec(
-          "DELETE FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL AND rowid NOT IN (" +
-            "SELECT MAX(rowid) FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL GROUP BY repo_id, issue_number" +
-            ")"
-        );
-      }
-      if (existingVersion < 7) {
-        database.exec(
-          "CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (repo_id INTEGER PRIMARY KEY, last_merged_at TEXT NOT NULL, last_pr_number INTEGER NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
-        );
-      }
-      if (existingVersion < 8) {
-        database.exec("ALTER TABLE tasks ADD COLUMN session_events_path TEXT");
-      }
-      if (existingVersion < 14) {
-        database.exec(
-          "CREATE TABLE IF NOT EXISTS repo_github_issue_sync_bootstrap_cursor (repo_id INTEGER PRIMARY KEY, next_url TEXT NOT NULL, high_watermark_updated_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
-        );
-      }
-      if (existingVersion < 15) {
-        if (tableExists("repos")) {
-          try {
-            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_error_code TEXT");
-          } catch {}
-          try {
-            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_error_details TEXT");
-          } catch {}
-          try {
-            database.exec("ALTER TABLE repos ADD COLUMN label_scheme_checked_at TEXT");
-          } catch {}
+
+      runIntegrityCheck(database);
+
+      const fromVersion = lockedVersion;
+      database.transaction(() => {
+        const existingVersion = fromVersion;
+        if (existingVersion < 3) {
+          addColumnIfMissing(database, "tasks", "worker_id", "TEXT");
+          addColumnIfMissing(database, "tasks", "repo_slot", "TEXT");
         }
-      }
-      if (existingVersion < 9) {
-        database.exec(
-          "CREATE TABLE IF NOT EXISTS issue_escalation_comment_checks (" +
-            "issue_id INTEGER PRIMARY KEY, " +
-            "last_checked_at TEXT NOT NULL, " +
-            "last_seen_updated_at TEXT, " +
-            "last_resolved_comment_id INTEGER, " +
-            "last_resolved_comment_at TEXT, " +
-            "FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE" +
-            ")"
-        );
-        database.exec(`
+        if (existingVersion < 4) {
+          addColumnIfMissing(database, "issues", "github_node_id", "TEXT");
+          addColumnIfMissing(database, "issues", "github_updated_at", "TEXT");
+        }
+        if (existingVersion < 5) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS repo_github_issue_sync (repo_id INTEGER PRIMARY KEY, last_sync_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
+          );
+        }
+        if (existingVersion < 6) {
+          addColumnIfMissing(database, "tasks", "daemon_id", "TEXT");
+          addColumnIfMissing(database, "tasks", "heartbeat_at", "TEXT");
+          database.exec(
+            "UPDATE tasks SET task_path = 'github:' || (SELECT name FROM repos r WHERE r.id = tasks.repo_id) || '#' || tasks.issue_number " +
+              "WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL"
+          );
+          database.exec(
+            "DELETE FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL AND rowid NOT IN (" +
+              "SELECT MAX(rowid) FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL GROUP BY repo_id, issue_number" +
+              ")"
+          );
+        }
+        if (existingVersion < 7) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (repo_id INTEGER PRIMARY KEY, last_merged_at TEXT NOT NULL, last_pr_number INTEGER NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
+          );
+        }
+        if (existingVersion < 8) {
+          addColumnIfMissing(database, "tasks", "session_events_path", "TEXT");
+        }
+        if (existingVersion < 16) {
+          addColumnIfMissing(database, "ralph_run_gate_results", "reason", "TEXT");
+        }
+        if (existingVersion < 9) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS issue_escalation_comment_checks (" +
+              "issue_id INTEGER PRIMARY KEY, " +
+              "last_checked_at TEXT NOT NULL, " +
+              "last_seen_updated_at TEXT, " +
+              "last_resolved_comment_id INTEGER, " +
+              "last_resolved_comment_at TEXT, " +
+              "FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE" +
+              ")"
+          );
+          database.exec(`
           CREATE TABLE IF NOT EXISTS ralph_runs (
             run_id TEXT PRIMARY KEY,
             repo_id INTEGER NOT NULL,
@@ -342,25 +579,13 @@ function ensureSchema(database: Database): void {
             ON ralph_run_sessions(session_id);
           CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started
             ON ralph_runs(repo_id, issue_number, started_at);
-        `);
-      }
-      if (existingVersion < 10) {
-        if (tableExists("repos")) {
-          try {
-            database.exec("ALTER TABLE repos ADD COLUMN label_write_blocked_until_ms INTEGER");
-          } catch {}
-          try {
-            database.exec("ALTER TABLE repos ADD COLUMN label_write_last_error TEXT");
-          } catch {}
+          `);
         }
-        if (tableExists("tasks")) {
-          try {
-            database.exec("ALTER TABLE tasks ADD COLUMN released_at_ms INTEGER");
-          } catch {}
-          try {
-            database.exec("ALTER TABLE tasks ADD COLUMN released_reason TEXT");
-          } catch {}
-        }
+        if (existingVersion < 10) {
+          addColumnIfMissing(database, "repos", "label_write_blocked_until_ms", "INTEGER");
+          addColumnIfMissing(database, "repos", "label_write_last_error", "TEXT");
+          addColumnIfMissing(database, "tasks", "released_at_ms", "INTEGER");
+          addColumnIfMissing(database, "tasks", "released_reason", "TEXT");
 
         database.exec(`
           CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
@@ -369,6 +594,7 @@ function ensureSchema(database: Database): void {
             status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
             command TEXT,
             skip_reason TEXT,
+            reason TEXT,
             url TEXT,
             pr_number INTEGER,
             pr_url TEXT,
@@ -437,22 +663,16 @@ function ensureSchema(database: Database): void {
           CREATE INDEX IF NOT EXISTS idx_alerts_repo_target ON alerts(repo_id, target_type, target_number, last_seen_at);
           CREATE INDEX IF NOT EXISTS idx_alert_deliveries_alert_channel ON alert_deliveries(alert_id, channel);
           CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
-        `);
-        try {
-          database.exec("ALTER TABLE issue_escalation_comment_checks ADD COLUMN last_resolved_comment_id INTEGER");
-        } catch {}
-        try {
-          database.exec("ALTER TABLE issue_escalation_comment_checks ADD COLUMN last_resolved_comment_at TEXT");
-        } catch {}
-      }
-      if (existingVersion < 11) {
-        try {
-          database.exec("ALTER TABLE alert_deliveries ADD COLUMN comment_id INTEGER");
-        } catch {}
-      }
+          `);
+          addColumnIfMissing(database, "issue_escalation_comment_checks", "last_resolved_comment_id", "INTEGER");
+          addColumnIfMissing(database, "issue_escalation_comment_checks", "last_resolved_comment_at", "TEXT");
+        }
+        if (existingVersion < 11) {
+          addColumnIfMissing(database, "alert_deliveries", "comment_id", "INTEGER");
+        }
 
-      if (existingVersion < 12) {
-        database.exec(`
+        if (existingVersion < 12) {
+          database.exec(`
           CREATE TABLE IF NOT EXISTS ralph_run_session_token_totals (
             run_id TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -478,10 +698,10 @@ function ensureSchema(database: Database): void {
             updated_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
           );
-        `);
-      }
-      if (existingVersion < 13) {
-        database.exec(`
+          `);
+        }
+        if (existingVersion < 13) {
+          database.exec(`
           CREATE TABLE IF NOT EXISTS parent_verification_state (
             repo_id INTEGER NOT NULL,
             issue_number INTEGER NOT NULL,
@@ -543,55 +763,67 @@ function ensureSchema(database: Database): void {
             ON ralph_run_metrics(quality);
           CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_triage_score
             ON ralph_run_metrics(triage_score);
-        `);
-      }
+          `);
+        }
 
-      if (existingVersion < 16) {
-        database.exec(
-          "CREATE TABLE IF NOT EXISTS ralph_run_trace_pointers (" +
-            "run_id TEXT NOT NULL, " +
-            "kind TEXT NOT NULL CHECK (kind IN ('run_log_path', 'session_events_path')), " +
-            "session_id TEXT, " +
-            "path TEXT NOT NULL, " +
-            "created_at TEXT NOT NULL, " +
-            "updated_at TEXT NOT NULL, " +
-            "PRIMARY KEY(run_id, kind, session_id, path), " +
-            "FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE" +
-            ")"
-        );
-        database.exec(
-          "CREATE INDEX IF NOT EXISTS idx_ralph_run_trace_pointers_run ON ralph_run_trace_pointers(run_id)"
-        );
-        database.exec("CREATE INDEX IF NOT EXISTS idx_ralph_runs_started_at ON ralph_runs(started_at)");
-        database.exec(
-          "CREATE INDEX IF NOT EXISTS idx_ralph_run_token_totals_tokens_total ON ralph_run_token_totals(tokens_total)"
-        );
-      }
 
-      if (existingVersion < 15) {
-        if (tableExists("ralph_run_metrics")) {
-          try {
-            database.exec("ALTER TABLE ralph_run_metrics ADD COLUMN triage_score REAL");
-          } catch {}
-          try {
-            database.exec("ALTER TABLE ralph_run_metrics ADD COLUMN triage_reasons_json TEXT NOT NULL DEFAULT '[]'");
-          } catch {}
-          try {
-            database.exec("ALTER TABLE ralph_run_metrics ADD COLUMN triage_computed_at TEXT");
-          } catch {}
-
+        if (existingVersion < 14) {
           database.exec(
-            "CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_triage_score ON ralph_run_metrics(triage_score)"
+            "CREATE TABLE IF NOT EXISTS repo_github_issue_sync_bootstrap_cursor (repo_id INTEGER PRIMARY KEY, next_url TEXT NOT NULL, high_watermark_updated_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
           );
         }
-      }
-    })();
+
+        if (existingVersion < 15) {
+          addColumnIfMissing(database, "repos", "label_scheme_error_code", "TEXT");
+          addColumnIfMissing(database, "repos", "label_scheme_error_details", "TEXT");
+          addColumnIfMissing(database, "repos", "label_scheme_checked_at", "TEXT");
+          addColumnIfMissing(database, "ralph_run_metrics", "triage_score", "REAL");
+          addColumnIfMissing(
+            database,
+            "ralph_run_metrics",
+            "triage_reasons_json",
+            "TEXT NOT NULL DEFAULT '[]'"
+          );
+          addColumnIfMissing(database, "ralph_run_metrics", "triage_computed_at", "TEXT");
+          if (tableExists(database, "ralph_run_metrics")) {
+            database.exec(
+              "CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_triage_score ON ralph_run_metrics(triage_score)"
+            );
+          }
+        }
+
+        if (existingVersion < 17) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS issue_status_transition_guard (" +
+              "repo_id INTEGER NOT NULL, " +
+              "issue_number INTEGER NOT NULL, " +
+              "from_status TEXT, " +
+              "to_status TEXT NOT NULL, " +
+              "reason TEXT, " +
+              "updated_at_ms INTEGER NOT NULL, " +
+              "PRIMARY KEY(repo_id, issue_number), " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE" +
+              ")"
+          );
+          database.exec(
+            "CREATE INDEX IF NOT EXISTS idx_issue_status_transition_guard_repo_updated ON issue_status_transition_guard(repo_id, updated_at_ms)"
+          );
+        }
+
+        database.exec(
+          `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
+        );
+      })();
+    });
   }
 
   database.exec(
     `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
      ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
   );
+
+  ensureSchemaInvariantObjectTypes(database);
 
   database.exec(`
     CREATE TABLE IF NOT EXISTS repos (
@@ -870,6 +1102,7 @@ function ensureSchema(database: Database): void {
       status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
       command TEXT,
       skip_reason TEXT,
+      reason TEXT,
       url TEXT,
       pr_number INTEGER,
       pr_url TEXT,
@@ -935,6 +1168,17 @@ function ensureSchema(database: Database): void {
       UNIQUE(alert_id, channel, marker_id)
     );
 
+    CREATE TABLE IF NOT EXISTS issue_status_transition_guard (
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER NOT NULL,
+      from_status TEXT,
+      to_status TEXT NOT NULL,
+      reason TEXT,
+      updated_at_ms INTEGER NOT NULL,
+      PRIMARY KEY(repo_id, issue_number),
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -960,7 +1204,18 @@ function ensureSchema(database: Database): void {
     CREATE INDEX IF NOT EXISTS idx_alerts_repo_target ON alerts(repo_id, target_type, target_number, last_seen_at);
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_alert_channel ON alert_deliveries(alert_id, channel);
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
+    CREATE INDEX IF NOT EXISTS idx_issue_status_transition_guard_repo_updated
+      ON issue_status_transition_guard(repo_id, updated_at_ms);
   `);
+
+    runMigrationsWithLock(database, () => {
+      database.transaction(() => {
+        applySchemaInvariants(database);
+      })();
+    });
+  } catch (error) {
+    throw toMigrationLockError(error, busyTimeoutMs);
+  }
 }
 
 export function initStateDb(): void {
@@ -976,7 +1231,7 @@ export function initStateDb(): void {
   mkdirSync(dirname(stateDbPath), { recursive: true });
 
   const database = new Database(stateDbPath);
-  ensureSchema(database);
+  ensureSchema(database, stateDbPath);
 
   db = database;
   dbPath = stateDbPath;
@@ -2217,6 +2472,7 @@ type GateResultRow = {
   status: GateStatus;
   command: string | null;
   skipReason: string | null;
+  reason: string | null;
   url: string | null;
   prNumber: number | null;
   prUrl: string | null;
@@ -2304,6 +2560,7 @@ export function upsertRalphRunGateResult(params: {
   status?: GateStatus;
   command?: string | null;
   skipReason?: string | null;
+  reason?: string | null;
   url?: string | null;
   prNumber?: number | null;
   prUrl?: string | null;
@@ -2324,11 +2581,13 @@ export function upsertRalphRunGateResult(params: {
 
   const commandPatch = sanitizeOptionalText(params.command, 1000);
   const skipReasonPatch = sanitizeOptionalText(params.skipReason, 400);
+  const reasonPatch = sanitizeOptionalText(params.reason, 400);
   const urlPatch = sanitizeOptionalText(params.url, 500);
   const prUrlPatch = sanitizeOptionalText(params.prUrl, 500);
 
   const commandPatchFlag = commandPatch !== undefined ? 1 : 0;
   const skipReasonPatchFlag = skipReasonPatch !== undefined ? 1 : 0;
+  const reasonPatchFlag = reasonPatch !== undefined ? 1 : 0;
   const urlPatchFlag = urlPatch !== undefined ? 1 : 0;
   const prUrlPatchFlag = prUrlPatch !== undefined ? 1 : 0;
 
@@ -2347,14 +2606,15 @@ export function upsertRalphRunGateResult(params: {
   database
     .query(
       `INSERT INTO ralph_run_gate_results(
-         run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+         run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
        ) VALUES (
-         $run_id, $gate, $status_insert, $command, $skip_reason, $url, $pr_number, $pr_url, $repo_id, $issue_number, $task_path, $created_at, $updated_at
+         $run_id, $gate, $status_insert, $command, $skip_reason, $reason, $url, $pr_number, $pr_url, $repo_id, $issue_number, $task_path, $created_at, $updated_at
        )
        ON CONFLICT(run_id, gate) DO UPDATE SET
          status = CASE WHEN $status_patch = 1 THEN $status_update ELSE ralph_run_gate_results.status END,
          command = CASE WHEN $command_patch = 1 THEN excluded.command ELSE ralph_run_gate_results.command END,
          skip_reason = CASE WHEN $skip_reason_patch = 1 THEN excluded.skip_reason ELSE ralph_run_gate_results.skip_reason END,
+         reason = CASE WHEN $reason_patch = 1 THEN excluded.reason ELSE ralph_run_gate_results.reason END,
          url = CASE WHEN $url_patch = 1 THEN excluded.url ELSE ralph_run_gate_results.url END,
          pr_number = CASE WHEN $pr_number_patch = 1 THEN excluded.pr_number ELSE ralph_run_gate_results.pr_number END,
          pr_url = CASE WHEN $pr_url_patch = 1 THEN excluded.pr_url ELSE ralph_run_gate_results.pr_url END,
@@ -2370,6 +2630,8 @@ export function upsertRalphRunGateResult(params: {
       $command_patch: commandPatchFlag,
       $skip_reason: skipReasonPatch ?? null,
       $skip_reason_patch: skipReasonPatchFlag,
+      $reason: reasonPatch ?? null,
+      $reason_patch: reasonPatchFlag,
       $url: urlPatch ?? null,
       $url_patch: urlPatchFlag,
       $pr_number: prNumberValue,
@@ -2442,7 +2704,7 @@ export function getRalphRunGateState(runId: string): RalphRunGateState {
 
   const results = database
     .query(
-      `SELECT run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+       `SELECT run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
        FROM ralph_run_gate_results
        WHERE run_id = $run_id
        ORDER BY gate ASC`
@@ -2453,6 +2715,7 @@ export function getRalphRunGateState(runId: string): RalphRunGateState {
     status: string;
     command?: string | null;
     skip_reason?: string | null;
+    reason?: string | null;
     url?: string | null;
     pr_number?: number | null;
     pr_url?: string | null;
@@ -2490,6 +2753,7 @@ export function getRalphRunGateState(runId: string): RalphRunGateState {
       status: assertGateStatus(row.status),
       command: row.command ?? null,
       skipReason: row.skip_reason ?? null,
+      reason: row.reason ?? null,
       url: row.url ?? null,
       prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
       prUrl: row.pr_url ?? null,
@@ -3119,6 +3383,15 @@ export type TaskOpState = {
   releasedReason?: string | null;
 };
 
+export type IssueStatusTransitionRecord = {
+  repo: string;
+  issueNumber: number;
+  fromStatus: string | null;
+  toStatus: string;
+  reason: string;
+  updatedAtMs: number;
+};
+
 type IssueSnapshotQueryParams = {
   repo: string;
   includeClosed?: boolean;
@@ -3541,6 +3814,68 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
   };
+}
+
+export function getIssueStatusTransitionRecord(repo: string, issueNumber: number): IssueStatusTransitionRecord | null {
+  const database = requireDb();
+  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: repo,
+  }) as { id?: number } | undefined;
+  if (!repoRow?.id) return null;
+
+  const row = database
+    .query(
+      `SELECT from_status, to_status, reason, updated_at_ms
+       FROM issue_status_transition_guard
+       WHERE repo_id = $repo_id AND issue_number = $issue_number`
+    )
+    .get({
+      $repo_id: repoRow.id,
+      $issue_number: issueNumber,
+    }) as { from_status?: string | null; to_status?: string | null; reason?: string | null; updated_at_ms?: number } | undefined;
+
+  if (!row?.to_status || typeof row.updated_at_ms !== "number") return null;
+  return {
+    repo,
+    issueNumber,
+    fromStatus: row.from_status ?? null,
+    toStatus: row.to_status,
+    reason: row.reason ?? "",
+    updatedAtMs: row.updated_at_ms,
+  };
+}
+
+export function recordIssueStatusTransition(input: {
+  repo: string;
+  issueNumber: number;
+  fromStatus: string | null;
+  toStatus: string;
+  reason?: string | null;
+  updatedAtMs: number;
+}): void {
+  const database = requireDb();
+  const atIso = nowIso();
+  const repoId = upsertRepo({ repo: input.repo, at: atIso });
+  const reason = sanitizeOptionalText(input.reason ?? null, 300) ?? "";
+
+  database
+    .query(
+      `INSERT INTO issue_status_transition_guard(repo_id, issue_number, from_status, to_status, reason, updated_at_ms)
+       VALUES ($repo_id, $issue_number, $from_status, $to_status, $reason, $updated_at_ms)
+       ON CONFLICT(repo_id, issue_number) DO UPDATE SET
+         from_status = excluded.from_status,
+         to_status = excluded.to_status,
+         reason = excluded.reason,
+         updated_at_ms = excluded.updated_at_ms`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: input.issueNumber,
+      $from_status: input.fromStatus,
+      $to_status: input.toStatus,
+      $reason: reason,
+      $updated_at_ms: Math.floor(input.updatedAtMs),
+    });
 }
 
 function parsePrNumber(prUrl: string): number | null {

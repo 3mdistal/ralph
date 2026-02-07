@@ -33,12 +33,13 @@ export function buildParentVerificationPrompt(options: ParentVerificationPromptO
     "- If the issue is clearly resolved or no actionable work remains, set work_remains=false and explain why.",
     "- If there is any reasonable remaining work, set work_remains=true and summarize what remains.",
     "- Keep the reason short and deterministic (1-2 sentences).",
+    "- When work_remains=false, include confidence, checked, why_satisfied, and evidence so Ralph can decide whether to auto-complete safely.",
     "",
     "Output requirements:",
     "- Your final line MUST be the marker below, with valid JSON (no code fences).",
     "- Use version 1.",
     "",
     "Format:",
-    "RALPH_PARENT_VERIFY: {\"version\":1,\"work_remains\":true|false,\"reason\":\"...\"}",
+    "RALPH_PARENT_VERIFY: {\"version\":1,\"work_remains\":true|false,\"reason\":\"...\",\"confidence\":\"low|medium|high\",\"checked\":[\"...\"],\"why_satisfied\":\"...\",\"evidence\":[{\"url\":\"https://...\",\"note\":\"...\"}]}",
   ].join("\n");
 }

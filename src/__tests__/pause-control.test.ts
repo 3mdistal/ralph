@@ -40,6 +40,44 @@ describe("pause control", () => {
     expect(delays).toEqual([250, 400, 640]);
   });
 
+  test("waitForPauseCleared returns immediately when already aborted", async () => {
+    let slept = false;
+    const pause = createPauseControl({
+      readControlStateSnapshot: () => ({ mode: "running", pauseRequested: true }),
+      defaults: {},
+      isRalphCheckpoint: () => false,
+      sleep: async () => {
+        slept = true;
+      },
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    await pause.waitForPauseCleared({ signal: controller.signal });
+
+    expect(slept).toBe(false);
+  });
+
+  test("waitForPauseCleared stops after abort during backoff", async () => {
+    const delays: number[] = [];
+    const controller = new AbortController();
+
+    const pause = createPauseControl({
+      readControlStateSnapshot: () => ({ mode: "running", pauseRequested: true }),
+      defaults: {},
+      isRalphCheckpoint: () => false,
+      sleep: async (ms) => {
+        delays.push(ms);
+        controller.abort();
+      },
+    });
+
+    await pause.waitForPauseCleared({ signal: controller.signal });
+
+    expect(delays).toEqual([250]);
+  });
+
   test("recordCheckpoint persists patch with status preserved", async () => {
     const task = {
       _path: "task/path",
@@ -122,6 +160,88 @@ describe("pause control", () => {
       log: () => undefined,
     });
 
+    expect(emitted).toContain("worker.checkpoint.reached");
+  });
+
+  test("recordCheckpoint does not patch in-memory task when persistence fails", async () => {
+    const task = {
+      _path: "task/path",
+      _name: "task-name",
+      type: "agent-task",
+      "creation-date": "2026-02-04",
+      scope: "scope",
+      issue: "3mdistal/ralph#562",
+      repo: "3mdistal/ralph",
+      status: "in-progress",
+      name: "task",
+    } satisfies AgentTask;
+
+    let patched = false;
+    const pauseControl = createPauseControl({
+      readControlStateSnapshot: () => ({ mode: "running", pauseRequested: false }),
+      defaults: {},
+      isRalphCheckpoint: () => false,
+    });
+
+    await recordCheckpoint({
+      task,
+      checkpoint: "planned",
+      workerId: "worker#task",
+      repo: "3mdistal/ralph",
+      pauseControl,
+      updateTaskStatus: async () => false,
+      applyTaskPatch: () => {
+        patched = true;
+      },
+      emitter: {
+        emit: () => undefined,
+      },
+      log: () => undefined,
+    });
+
+    expect(patched).toBe(false);
+  });
+
+  test("recordCheckpoint emits when persistence throws", async () => {
+    const task = {
+      _path: "task/path",
+      _name: "task-name",
+      type: "agent-task",
+      "creation-date": "2026-02-04",
+      scope: "scope",
+      issue: "3mdistal/ralph#562",
+      repo: "3mdistal/ralph",
+      status: "in-progress",
+      name: "task",
+    } satisfies AgentTask;
+
+    let patched = false;
+    const emitted: string[] = [];
+    const pauseControl = createPauseControl({
+      readControlStateSnapshot: () => ({ mode: "running", pauseRequested: false }),
+      defaults: {},
+      isRalphCheckpoint: () => false,
+    });
+
+    await recordCheckpoint({
+      task,
+      checkpoint: "planned",
+      workerId: "worker#task",
+      repo: "3mdistal/ralph",
+      pauseControl,
+      updateTaskStatus: async () => {
+        throw new Error("db unavailable");
+      },
+      applyTaskPatch: () => {
+        patched = true;
+      },
+      emitter: {
+        emit: (event) => emitted.push(event.type),
+      },
+      log: () => undefined,
+    });
+
+    expect(patched).toBe(false);
     expect(emitted).toContain("worker.checkpoint.reached");
   });
 });

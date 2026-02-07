@@ -33,7 +33,11 @@ Ralph overwrites managed files on startup to keep them in sync with the version 
 
 Daemon runs isolate `XDG_CONFIG_HOME` by default so changes in user-global config do not leak into Ralph.
 
+When OpenCode profiles are enabled, Ralph still keeps `XDG_CONFIG_HOME` isolated for daemon worker sessions. Profiles may provide `XDG_DATA_HOME`/`XDG_STATE_HOME`/`XDG_CACHE_HOME`, but profile `xdgConfigHome` is intentionally not applied to worker runs.
+
 Ralph does not override `XDG_DATA_HOME` by default (to preserve OpenAI OAuth tokens under `XDG_DATA_HOME/opencode/auth.json`).
+
+If OpenCode rejects a tool schema (`invalid_function_parameters` / "Invalid schema for function ..."), Ralph classifies the task as `blocked-source=opencode-config-invalid` so operators get an explicit, non-retryable configuration failure instead of generic retries.
 
 ## Claims
 
