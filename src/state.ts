@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
 
@@ -35,6 +35,15 @@ function quoteSqlLiteral(value: string): string {
 export type PrState = "open" | "merged";
 export type RalphRunOutcome = "success" | "paused" | "throttled" | "escalated" | "failed";
 export type RalphRunAttemptKind = "process" | "resume";
+export type RalphRunTracePointerKind = "run_log_path" | "session_events_path";
+export type RalphRunTracePointer = {
+  runId: string;
+  kind: RalphRunTracePointerKind;
+  sessionId: string | null;
+  path: string;
+  createdAt: string;
+  updatedAt: string;
+};
 export type RalphRunDetails = {
   reasonCode?: string;
   errorCode?: string;
@@ -236,6 +245,20 @@ function tableExists(database: Database, name: string): boolean {
   return row?.name === name;
 }
 
+function schemaObjectType(database: Database, name: string): string | null {
+  const row = database
+    .query("SELECT type FROM sqlite_master WHERE name = $name")
+    .get({ $name: name }) as { type?: string } | undefined;
+  return row?.type ?? null;
+}
+
+function indexExists(database: Database, name: string): boolean {
+  const row = database
+    .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = $name")
+    .get({ $name: name }) as { name?: string } | undefined;
+  return row?.name === name;
+}
+
 function columnExists(database: Database, tableName: string, columnName: string): boolean {
   if (!tableExists(database, tableName)) return false;
   const rows = database
@@ -248,6 +271,105 @@ function addColumnIfMissing(database: Database, tableName: string, columnName: s
   if (!tableExists(database, tableName)) return;
   if (columnExists(database, tableName, columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+type SchemaInvariant =
+  | {
+      kind: "column";
+      tableName: string;
+      columnName: string;
+      definition: string;
+    }
+  | {
+      kind: "index";
+      tableName: string;
+      indexName: string;
+      createSql: string;
+    };
+
+const SCHEMA_INVARIANTS: SchemaInvariant[] = [
+  {
+    kind: "column",
+    tableName: "ralph_run_gate_results",
+    columnName: "reason",
+    definition: "TEXT",
+  },
+  {
+    kind: "index",
+    tableName: "ralph_run_gate_results",
+    indexName: "idx_ralph_run_gate_results_repo_issue_updated",
+    createSql:
+      "CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated ON ralph_run_gate_results(repo_id, issue_number, updated_at)",
+  },
+  {
+    kind: "index",
+    tableName: "ralph_run_gate_results",
+    indexName: "idx_ralph_run_gate_results_repo_pr",
+    createSql: "CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr ON ralph_run_gate_results(repo_id, pr_number)",
+  },
+];
+
+function formatSchemaInvariantError(message: string): Error {
+  return new Error(
+    `state.sqlite schema invariant failed: ${message}. ` +
+      `Expected durable-state shape for schema_version=${SCHEMA_VERSION}. ` +
+      "If this persists after restarting the latest Ralph binary, restore from backup or reset ~/.ralph/state.sqlite."
+  );
+}
+
+function ensureSchemaInvariantObjectTypes(database: Database): void {
+  const tableNames = new Set(SCHEMA_INVARIANTS.map((invariant) => invariant.tableName));
+  for (const tableName of tableNames) {
+    const objectType = schemaObjectType(database, tableName);
+    if (objectType && objectType !== "table") {
+      throw formatSchemaInvariantError(
+        `table=${tableName} has incompatible object type=${objectType}; expected table`
+      );
+    }
+  }
+}
+
+function applySchemaInvariants(database: Database): void {
+  for (const invariant of SCHEMA_INVARIANTS) {
+    if (!tableExists(database, invariant.tableName)) {
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} is missing and cannot be repaired additively`
+      );
+    }
+
+    if (invariant.kind === "column") {
+      if (columnExists(database, invariant.tableName, invariant.columnName)) continue;
+      try {
+        addColumnIfMissing(database, invariant.tableName, invariant.columnName, invariant.definition);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw formatSchemaInvariantError(
+          `table=${invariant.tableName} missing column=${invariant.columnName}; additive repair failed: ${detail}`
+        );
+      }
+      if (!columnExists(database, invariant.tableName, invariant.columnName)) {
+        throw formatSchemaInvariantError(
+          `table=${invariant.tableName} missing column=${invariant.columnName}; additive repair did not apply`
+        );
+      }
+      continue;
+    }
+
+    if (indexExists(database, invariant.indexName)) continue;
+    try {
+      database.exec(invariant.createSql);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} missing index=${invariant.indexName}; additive repair failed: ${detail}`
+      );
+    }
+    if (!indexExists(database, invariant.indexName)) {
+      throw formatSchemaInvariantError(
+        `table=${invariant.tableName} missing index=${invariant.indexName}; additive repair did not apply`
+      );
+    }
+  }
 }
 
 function readSchemaVersion(database: Database): number | null {
@@ -644,6 +766,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           `);
         }
 
+
         if (existingVersion < 14) {
           database.exec(
             "CREATE TABLE IF NOT EXISTS repo_github_issue_sync_bootstrap_cursor (repo_id INTEGER PRIMARY KEY, next_url TEXT NOT NULL, high_watermark_updated_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
@@ -669,6 +792,24 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           }
         }
 
+        if (existingVersion < 17) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS issue_status_transition_guard (" +
+              "repo_id INTEGER NOT NULL, " +
+              "issue_number INTEGER NOT NULL, " +
+              "from_status TEXT, " +
+              "to_status TEXT NOT NULL, " +
+              "reason TEXT, " +
+              "updated_at_ms INTEGER NOT NULL, " +
+              "PRIMARY KEY(repo_id, issue_number), " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE" +
+              ")"
+          );
+          database.exec(
+            "CREATE INDEX IF NOT EXISTS idx_issue_status_transition_guard_repo_updated ON issue_status_transition_guard(repo_id, updated_at_ms)"
+          );
+        }
+
         database.exec(
           `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
            ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
@@ -681,6 +822,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
      ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
   );
+
+  ensureSchemaInvariantObjectTypes(database);
 
   database.exec(`
     CREATE TABLE IF NOT EXISTS repos (
@@ -897,6 +1040,17 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS ralph_run_trace_pointers (
+      run_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK (kind IN ('run_log_path', 'session_events_path')),
+      session_id TEXT,
+      path TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, kind, session_id, path),
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS ralph_run_metrics (
       run_id TEXT PRIMARY KEY,
       wall_time_ms INTEGER,
@@ -1014,6 +1168,17 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       UNIQUE(alert_id, channel, marker_id)
     );
 
+    CREATE TABLE IF NOT EXISTS issue_status_transition_guard (
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER NOT NULL,
+      from_status TEXT,
+      to_status TEXT NOT NULL,
+      reason TEXT,
+      updated_at_ms INTEGER NOT NULL,
+      PRIMARY KEY(repo_id, issue_number),
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -1027,6 +1192,9 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE INDEX IF NOT EXISTS idx_ralph_run_session_token_totals_session
       ON ralph_run_session_token_totals(session_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_runs_repo_issue_started ON ralph_runs(repo_id, issue_number, started_at);
+    CREATE INDEX IF NOT EXISTS idx_ralph_runs_started_at ON ralph_runs(started_at);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_token_totals_tokens_total ON ralph_run_token_totals(tokens_total);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_trace_pointers_run ON ralph_run_trace_pointers(run_id);
     CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
       ON ralph_run_gate_results(repo_id, issue_number, updated_at);
     CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr
@@ -1036,7 +1204,15 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE INDEX IF NOT EXISTS idx_alerts_repo_target ON alerts(repo_id, target_type, target_number, last_seen_at);
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_alert_channel ON alert_deliveries(alert_id, channel);
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
+    CREATE INDEX IF NOT EXISTS idx_issue_status_transition_guard_repo_updated
+      ON issue_status_transition_guard(repo_id, updated_at_ms);
   `);
+
+    runMigrationsWithLock(database, () => {
+      database.transaction(() => {
+        applySchemaInvariants(database);
+      })();
+    });
   } catch (error) {
     throw toMigrationLockError(error, busyTimeoutMs);
   }
@@ -2102,6 +2278,145 @@ export function recordRalphRunSessionUse(params: {
       $created_at: at,
       $updated_at: at,
     });
+
+  recordRalphRunTracePointer({
+    runId: params.runId,
+    kind: "session_events_path",
+    sessionId: params.sessionId,
+    path: getSessionEventsPath(params.sessionId),
+    at,
+  });
+}
+
+export function recordRalphRunTracePointer(params: {
+  runId: string;
+  kind: RalphRunTracePointerKind;
+  sessionId?: string | null;
+  path: string;
+  at?: string;
+}): void {
+  const runId = params.runId?.trim();
+  if (!runId) return;
+  const rawPath = String(params.path ?? "").trim();
+  if (!rawPath) return;
+
+  const sessionId = params.sessionId?.trim() ?? null;
+  if (params.kind === "session_events_path" && (!sessionId || !isSafeSessionId(sessionId))) return;
+
+  const safeSessionId = sessionId && isSafeSessionId(sessionId) ? sessionId : null;
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+
+  database
+    .query(
+      `INSERT INTO ralph_run_trace_pointers(
+         run_id, kind, session_id, path, created_at, updated_at
+       ) VALUES (
+         $run_id, $kind, $session_id, $path, $created_at, $updated_at
+       )
+       ON CONFLICT(run_id, kind, session_id, path) DO UPDATE SET
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $run_id: runId,
+      $kind: params.kind,
+      $session_id: safeSessionId,
+      $path: rawPath,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function listRalphRunTracePointers(runId: string): RalphRunTracePointer[] {
+  const trimmed = runId?.trim();
+  if (!trimmed) return [];
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT run_id as run_id, kind as kind, session_id as session_id, path as path, created_at as created_at, updated_at as updated_at
+       FROM ralph_run_trace_pointers
+       WHERE run_id = $run_id
+       ORDER BY kind, session_id, path`
+    )
+    .all({ $run_id: trimmed }) as Array<{
+    run_id?: string;
+    kind?: string;
+    session_id?: string | null;
+    path?: string;
+    created_at?: string;
+    updated_at?: string;
+  }>;
+
+  return rows
+    .map((row) => {
+      const runId = row.run_id ?? "";
+      const kind = row.kind === "run_log_path" || row.kind === "session_events_path" ? row.kind : null;
+      const path = row.path ?? "";
+      const createdAt = row.created_at ?? "";
+      const updatedAt = row.updated_at ?? "";
+      if (!runId || !kind || !path || !createdAt || !updatedAt) return null;
+      return {
+        runId,
+        kind,
+        sessionId: row.session_id ?? null,
+        path,
+        createdAt,
+        updatedAt,
+      } satisfies RalphRunTracePointer;
+    })
+    .filter((row): row is RalphRunTracePointer => Boolean(row));
+}
+
+export function listRalphRunTracePointersByRunIds(runIds: string[]): Map<string, RalphRunTracePointer[]> {
+  const deduped = Array.from(new Set(runIds.map((id) => id.trim()).filter(Boolean)));
+  if (deduped.length === 0) return new Map();
+  const database = requireDb();
+
+  const params: Record<string, string> = {};
+  const placeholders = deduped.map((runId, idx) => {
+    const key = `$run_id_${idx}`;
+    params[key] = runId;
+    return key;
+  });
+
+  const rows = database
+    .query(
+      `SELECT run_id as run_id, kind as kind, session_id as session_id, path as path, created_at as created_at, updated_at as updated_at
+       FROM ralph_run_trace_pointers
+       WHERE run_id IN (${placeholders.join(", ")})
+       ORDER BY run_id, kind, session_id, path`
+    )
+    .all(params) as Array<{
+    run_id?: string;
+    kind?: string;
+    session_id?: string | null;
+    path?: string;
+    created_at?: string;
+    updated_at?: string;
+  }>;
+
+  const byRun = new Map<string, RalphRunTracePointer[]>();
+  for (const row of rows) {
+    const runId = row.run_id ?? "";
+    const kind = row.kind === "run_log_path" || row.kind === "session_events_path" ? row.kind : null;
+    const path = row.path ?? "";
+    const createdAt = row.created_at ?? "";
+    const updatedAt = row.updated_at ?? "";
+    if (!runId || !kind || !path || !createdAt || !updatedAt) continue;
+    const entry: RalphRunTracePointer = {
+      runId,
+      kind,
+      sessionId: row.session_id ?? null,
+      path,
+      createdAt,
+      updatedAt,
+    };
+    const list = byRun.get(runId);
+    if (list) list.push(entry);
+    else byRun.set(runId, [entry]);
+  }
+
+  return byRun;
 }
 
 export function getLatestRunIdForSession(sessionId: string): string | null {
@@ -2554,6 +2869,40 @@ export function listRalphRunSessionIds(runId: string): string[] {
   return rows.map((row) => row?.session_id ?? "").filter((id) => Boolean(id));
 }
 
+export function listRalphRunSessionIdsByRunIds(runIds: string[]): Map<string, string[]> {
+  const deduped = Array.from(new Set(runIds.map((id) => id.trim()).filter(Boolean)));
+  if (deduped.length === 0) return new Map();
+  const database = requireDb();
+
+  const params: Record<string, string> = {};
+  const placeholders = deduped.map((runId, idx) => {
+    const key = `$run_id_${idx}`;
+    params[key] = runId;
+    return key;
+  });
+
+  const rows = database
+    .query(
+      `SELECT run_id as run_id, session_id as session_id
+       FROM ralph_run_sessions
+       WHERE run_id IN (${placeholders.join(", ")})
+       ORDER BY run_id, session_id`
+    )
+    .all(params) as Array<{ run_id?: string; session_id?: string } | undefined>;
+
+  const byRun = new Map<string, string[]>();
+  for (const row of rows) {
+    const runId = row?.run_id ?? "";
+    const sessionId = row?.session_id ?? "";
+    if (!runId || !sessionId) continue;
+    const list = byRun.get(runId);
+    if (list) list.push(sessionId);
+    else byRun.set(runId, [sessionId]);
+  }
+
+  return byRun;
+}
+
 export type RalphRunSessionTokenTotalsQuality = "ok" | "missing" | "unreadable" | "timeout" | "error";
 
 export type RalphRunSessionTokenTotals = {
@@ -2745,6 +3094,153 @@ export function getRalphRunTokenTotals(runId: string): RalphRunTokenTotals | nul
   };
 }
 
+export type RalphRunTopSort = "tokens_total" | "triage_score";
+
+export type RalphRunSummary = {
+  runId: string;
+  repo: string;
+  issueNumber: number | null;
+  startedAt: string;
+  completedAt: string | null;
+  outcome: RalphRunOutcome | null;
+  tokensTotal: number | null;
+  tokensComplete: boolean;
+  triageScore: number | null;
+  triageFlags: string[];
+};
+
+export function listRalphRunsTop(params?: {
+  limit?: number;
+  sinceIso?: string | null;
+  untilIso?: string | null;
+  sort?: RalphRunTopSort;
+  includeMissing?: boolean;
+}): RalphRunSummary[] {
+  const database = requireDb();
+  const limit =
+    typeof params?.limit === "number" && Number.isFinite(params.limit) ? Math.max(1, Math.floor(params.limit)) : 20;
+  const sort: RalphRunTopSort = params?.sort === "triage_score" ? "triage_score" : "tokens_total";
+  const includeMissing = params?.includeMissing === true;
+  const sinceIso = params?.sinceIso ?? null;
+  const untilIso = params?.untilIso ?? null;
+
+  const sortColumn = sort === "triage_score" ? "m.triage_score" : "t.tokens_total";
+  const conditions: string[] = [];
+  if (sinceIso) conditions.push("r.started_at >= $since");
+  if (untilIso) conditions.push("r.started_at <= $until");
+  if (!includeMissing) conditions.push(`${sortColumn} IS NOT NULL`);
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const rows = database
+    .query(
+      `SELECT
+         r.run_id as run_id,
+         repo.name as repo,
+         r.issue_number as issue_number,
+         r.started_at as started_at,
+         r.completed_at as completed_at,
+         r.outcome as outcome,
+         t.tokens_total as tokens_total,
+         t.tokens_complete as tokens_complete,
+         m.triage_score as triage_score,
+         m.triage_reasons_json as triage_reasons_json
+       FROM ralph_runs r
+       JOIN repos repo ON repo.id = r.repo_id
+       LEFT JOIN ralph_run_token_totals t ON t.run_id = r.run_id
+       LEFT JOIN ralph_run_metrics m ON m.run_id = r.run_id
+       ${where}
+       ORDER BY ${sortColumn} IS NULL ASC, ${sortColumn} DESC, r.started_at DESC, r.run_id DESC
+       LIMIT $limit`
+    )
+    .all({ $limit: limit, $since: sinceIso, $until: untilIso }) as Array<{
+    run_id?: string;
+    repo?: string;
+    issue_number?: number | null;
+    started_at?: string;
+    completed_at?: string | null;
+    outcome?: RalphRunOutcome | null;
+    tokens_total?: number | null;
+    tokens_complete?: number | null;
+    triage_score?: number | null;
+    triage_reasons_json?: string | null;
+  }>;
+
+  return rows
+    .map((row) => {
+      const runId = row.run_id ?? "";
+      const repo = row.repo ?? "";
+      const startedAt = row.started_at ?? "";
+      if (!runId || !repo || !startedAt) return null;
+      return {
+        runId,
+        repo,
+        issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
+        startedAt,
+        completedAt: row.completed_at ?? null,
+        outcome: row.outcome ?? null,
+        tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+        tokensComplete: fromSqliteBool(row.tokens_complete),
+        triageScore: typeof row.triage_score === "number" ? row.triage_score : null,
+        triageFlags: safeParseJsonStringList(row.triage_reasons_json),
+      } satisfies RalphRunSummary;
+    })
+    .filter((row): row is RalphRunSummary => Boolean(row));
+}
+
+export function getRalphRunDetails(runId: string): RalphRunSummary | null {
+  const trimmed = runId?.trim();
+  if (!trimmed) return null;
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT
+         r.run_id as run_id,
+         repo.name as repo,
+         r.issue_number as issue_number,
+         r.started_at as started_at,
+         r.completed_at as completed_at,
+         r.outcome as outcome,
+         t.tokens_total as tokens_total,
+         t.tokens_complete as tokens_complete,
+         m.triage_score as triage_score,
+         m.triage_reasons_json as triage_reasons_json
+       FROM ralph_runs r
+       JOIN repos repo ON repo.id = r.repo_id
+       LEFT JOIN ralph_run_token_totals t ON t.run_id = r.run_id
+       LEFT JOIN ralph_run_metrics m ON m.run_id = r.run_id
+       WHERE r.run_id = $run_id
+       LIMIT 1`
+    )
+    .get({ $run_id: trimmed }) as
+    | {
+        run_id?: string;
+        repo?: string;
+        issue_number?: number | null;
+        started_at?: string;
+        completed_at?: string | null;
+        outcome?: RalphRunOutcome | null;
+        tokens_total?: number | null;
+        tokens_complete?: number | null;
+        triage_score?: number | null;
+        triage_reasons_json?: string | null;
+      }
+    | undefined;
+
+  if (!row?.run_id || !row.repo || !row.started_at) return null;
+  return {
+    runId: row.run_id,
+    repo: row.repo,
+    issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
+    startedAt: row.started_at,
+    completedAt: row.completed_at ?? null,
+    outcome: row.outcome ?? null,
+    tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+    tokensComplete: fromSqliteBool(row.tokens_complete),
+    triageScore: typeof row.triage_score === "number" ? row.triage_score : null,
+    triageFlags: safeParseJsonStringList(row.triage_reasons_json),
+  } satisfies RalphRunSummary;
+}
+
 export type RalphRunTriageSummary = {
   runId: string;
   repo: string;
@@ -2885,6 +3381,15 @@ export type TaskOpState = {
   heartbeatAt?: string | null;
   releasedAtMs?: number | null;
   releasedReason?: string | null;
+};
+
+export type IssueStatusTransitionRecord = {
+  repo: string;
+  issueNumber: number;
+  fromStatus: string | null;
+  toStatus: string;
+  reason: string;
+  updatedAtMs: number;
 };
 
 type IssueSnapshotQueryParams = {
@@ -3309,6 +3814,68 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
   };
+}
+
+export function getIssueStatusTransitionRecord(repo: string, issueNumber: number): IssueStatusTransitionRecord | null {
+  const database = requireDb();
+  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: repo,
+  }) as { id?: number } | undefined;
+  if (!repoRow?.id) return null;
+
+  const row = database
+    .query(
+      `SELECT from_status, to_status, reason, updated_at_ms
+       FROM issue_status_transition_guard
+       WHERE repo_id = $repo_id AND issue_number = $issue_number`
+    )
+    .get({
+      $repo_id: repoRow.id,
+      $issue_number: issueNumber,
+    }) as { from_status?: string | null; to_status?: string | null; reason?: string | null; updated_at_ms?: number } | undefined;
+
+  if (!row?.to_status || typeof row.updated_at_ms !== "number") return null;
+  return {
+    repo,
+    issueNumber,
+    fromStatus: row.from_status ?? null,
+    toStatus: row.to_status,
+    reason: row.reason ?? "",
+    updatedAtMs: row.updated_at_ms,
+  };
+}
+
+export function recordIssueStatusTransition(input: {
+  repo: string;
+  issueNumber: number;
+  fromStatus: string | null;
+  toStatus: string;
+  reason?: string | null;
+  updatedAtMs: number;
+}): void {
+  const database = requireDb();
+  const atIso = nowIso();
+  const repoId = upsertRepo({ repo: input.repo, at: atIso });
+  const reason = sanitizeOptionalText(input.reason ?? null, 300) ?? "";
+
+  database
+    .query(
+      `INSERT INTO issue_status_transition_guard(repo_id, issue_number, from_status, to_status, reason, updated_at_ms)
+       VALUES ($repo_id, $issue_number, $from_status, $to_status, $reason, $updated_at_ms)
+       ON CONFLICT(repo_id, issue_number) DO UPDATE SET
+         from_status = excluded.from_status,
+         to_status = excluded.to_status,
+         reason = excluded.reason,
+         updated_at_ms = excluded.updated_at_ms`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: input.issueNumber,
+      $from_status: input.fromStatus,
+      $to_status: input.toStatus,
+      $reason: reason,
+      $updated_at_ms: Math.floor(input.updatedAtMs),
+    });
 }
 
 function parsePrNumber(prUrl: string): number | null {

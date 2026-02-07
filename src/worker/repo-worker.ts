@@ -166,6 +166,7 @@ import {
   deleteIdempotencyKey,
   recordParentVerificationAttemptFailure,
   recordRalphRunGateArtifact,
+  recordRalphRunTracePointer,
   upsertIdempotencyKey,
   recordIssueSnapshot,
   PR_STATE_MERGED,
@@ -632,6 +633,13 @@ export class RepoWorker {
     const updated = await this.queue.updateTaskStatus(task, status, { "run-log-path": runLogPath });
     if (!updated) {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
+    }
+    if (this.activeRunId) {
+      recordRalphRunTracePointer({
+        runId: this.activeRunId,
+        kind: "run_log_path",
+        path: runLogPath,
+      });
     }
     return runLogPath;
   }
@@ -1390,6 +1398,30 @@ export class RepoWorker {
         }`
       );
     }
+  }
+
+  private async parkTaskWaitingOnOpenPr(task: AgentTask, issueNumber: string, prUrl: string): Promise<AgentRun> {
+    const patch: Record<string, string> = {
+      "session-id": "",
+      "worktree-path": "",
+      "worker-id": "",
+      "repo-slot": "",
+      "daemon-id": "",
+      "heartbeat-at": "",
+    };
+    const updated = await this.queue.updateTaskStatus(task, "waiting-on-pr", patch);
+    if (updated) {
+      applyTaskPatch(task, "waiting-on-pr", patch);
+    }
+    this.updateOpenPrSnapshot(task, null, prUrl);
+    console.log(
+      `[ralph:worker:${this.repo}] Parking ${task.issue} in waiting-on-pr for open PR ${prUrl} (issue ${issueNumber})`
+    );
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+    };
   }
 
   /**
@@ -2342,6 +2374,12 @@ export class RepoWorker {
     const message = this.getGhErrorSearchText(error);
     if (!message) return false;
     return /not up to date with the base branch/i.test(message);
+  }
+
+  private isBaseBranchModifiedMergeError(error: any): boolean {
+    const message = this.getGhErrorSearchText(error);
+    if (!message) return false;
+    return /base branch was modified/i.test(message);
   }
 
   private isRequiredChecksExpectedMergeError(error: any): boolean {
@@ -4150,6 +4188,7 @@ export class RepoWorker {
       deleteMergedPrHeadBranchBestEffort: async (input) => await this.deleteMergedPrHeadBranchBestEffort(input as any),
       normalizeGitRef: (ref) => this.normalizeGitRef(ref),
       isOutOfDateMergeError: (err) => this.isOutOfDateMergeError(err as any),
+      isBaseBranchModifiedMergeError: (err) => this.isBaseBranchModifiedMergeError(err as any),
       isRequiredChecksExpectedMergeError: (err) => this.isRequiredChecksExpectedMergeError(err as any),
       waitForRequiredChecks: async (url, checks, opts) => await this.waitForRequiredChecks(url, checks, opts),
       runCiFailureTriage: async (input) => await this.runCiFailureTriage(input as any),
@@ -6030,6 +6069,18 @@ export class RepoWorker {
         opencodeSessionOptions,
       });
       if (ciFailureRun) return ciFailureRun;
+
+      const existingPrForQueue = await this.getIssuePrResolution(issueNumber);
+      if (existingPrForQueue.selectedUrl) {
+        if (existingPrForQueue.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPrForQueue.duplicates.join(
+              ", "
+            )}`
+          );
+        }
+        return await this.parkTaskWaitingOnOpenPr(task, issueNumber, existingPrForQueue.selectedUrl);
+      }
 
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);

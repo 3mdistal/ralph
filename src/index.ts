@@ -99,6 +99,7 @@ import {
 import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 import { computeDaemonGate } from "./daemon-gate";
 import { runGatesCommand } from "./commands/gates";
+import { runRunsCommand } from "./commands/runs";
 import { collectStatusSnapshot, runStatusCommand, type StatusDrainState } from "./commands/status";
 import { runGithubUsageCommand } from "./commands/github-usage";
 import { runWorktreesCommand } from "./commands/worktrees";
@@ -2053,6 +2054,7 @@ function printGlobalHelp(): void {
       "  ralph                              Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
+      "  ralph runs top|show ...             List expensive runs + trace pointers",
       "  ralph gates <repo> <issue> [--json] Show deterministic gate state",
       "  ralph usage [--json] [--profile]   Show OpenAI usage meters (by profile)",
       "  ralph github-usage [--since 24h]   Summarize GitHub API request telemetry",
@@ -2104,6 +2106,18 @@ function printCommandHelp(command: string): void {
           "",
           "Options:",
           "  --json    Emit machine-readable JSON output.",
+        ].join("\n")
+      );
+      return;
+
+    case "runs":
+      console.log(
+        [
+          "Usage:",
+          "  ralph runs top [--since 7d] [--until <iso|ms|now>] [--limit N] [--sort tokens_total|triage_score] [--include-missing] [--all] [--json]",
+          "  ralph runs show <runId> [--json]",
+          "",
+          "Lists top runs by tokens or triage score and links to trace artifacts.",
         ].join("\n")
       );
       return;
@@ -2377,6 +2391,16 @@ if (args[0] === "status") {
       pauseAtCheckpoint: pauseAtCheckpoint ?? statusControl.pauseAtCheckpoint ?? null,
     },
   });
+  process.exit(0);
+}
+
+if (args[0] === "runs") {
+  if (hasHelpFlag) {
+    printCommandHelp("runs");
+    process.exit(0);
+  }
+
+  await runRunsCommand({ args });
   process.exit(0);
 }
 
