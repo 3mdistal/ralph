@@ -4709,7 +4709,7 @@ export class RepoWorker {
     const githubCommentUrl = await this.writeEscalationWriteback(task, {
       reason: escalationReason,
       details: diagnostics ?? undefined,
-      escalationType: "other",
+      escalationType: "watchdog",
     });
     await this.notify.notifyEscalation({
       taskName: task.name,
@@ -4721,7 +4721,7 @@ export class RepoWorker {
       priority: task.priority,
       sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
       reason: escalationReason,
-      escalationType: "other",
+      escalationType: "watchdog",
       githubCommentUrl: githubCommentUrl ?? undefined,
       planOutput: result.output,
     });
@@ -5224,7 +5224,7 @@ export class RepoWorker {
             if (escalated) {
               applyTaskPatch(task, "escalated", {});
             }
-            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+            await this.writeEscalationWriteback(task, { reason, escalationType: "watchdog" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -5233,7 +5233,7 @@ export class RepoWorker {
               repo: this.repo,
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
-              escalationType: "other",
+              escalationType: "watchdog",
               planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
@@ -6512,7 +6512,7 @@ export class RepoWorker {
             if (escalated) {
               applyTaskPatch(task, "escalated", {});
             }
-            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+            await this.writeEscalationWriteback(task, { reason, escalationType: "watchdog" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -6521,7 +6521,7 @@ export class RepoWorker {
               repo: this.repo,
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
-              escalationType: "other",
+              escalationType: "watchdog",
               planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 

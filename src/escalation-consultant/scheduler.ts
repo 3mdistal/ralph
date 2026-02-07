@@ -1,9 +1,21 @@
-import { readFile } from "fs/promises";
+import { createHash } from "crypto";
+import { readFile, writeFile } from "fs/promises";
 import { isAbsolute, join } from "path";
 import type { AgentEscalationNote } from "../escalation-notes";
 import { normalizeEscalationType } from "../github/escalation-constants";
 import type { EscalationConsultantInput } from "./core";
 import { appendConsultantPacket } from "./io";
+import {
+  applyAutopilotResolutionPatch,
+  AUTO_RESOLVE_MAX_ATTEMPTS,
+  computeEscalationSignature,
+  computeLoopBudget,
+  evaluateAutopilotEligibility,
+  parseConsultantDecisionFromEscalationNote,
+} from "../escalation-autopilot/core";
+import { hasIdempotencyKey, initStateDb, recordIdempotencyKey } from "../state";
+import type { AgentTask } from "../queue/types";
+import type { EditEscalationResult } from "../escalation-notes";
 
 export type EscalationConsultantSchedulerDeps = {
   getEscalationsByStatus: (status: string) => Promise<AgentEscalationNote[]>;
@@ -11,6 +23,9 @@ export type EscalationConsultantSchedulerDeps = {
   isShuttingDown: () => boolean;
   allowModelSend: () => Promise<boolean>;
   repoPath: () => string;
+  editEscalation: (path: string, fields: Record<string, string>) => Promise<EditEscalationResult>;
+  getTaskByPath: (taskPath: string) => Promise<AgentTask | null>;
+  updateTaskStatus: (task: AgentTask, status: AgentTask["status"], fields?: Record<string, string | number>) => Promise<boolean>;
   log?: (message: string) => void;
 };
 
@@ -41,16 +56,31 @@ function toTimestamp(value: string | undefined): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function makeAutopilotIdempotencyKey(notePath: string, signature: string): string {
+  const hash = createHash("sha1").update(`${notePath}|${signature}`).digest("hex").slice(0, 16);
+  return `escalation-autopilot:v1:${hash}`;
+}
+
+function hasSuppressionMarker(noteContent: string, signature: string): boolean {
+  return noteContent.includes(`ralph-autopilot:suppressed signature=${signature} `);
+}
+
+function appendSuppressionMarker(noteContent: string, signature: string, reason: string): string {
+  if (hasSuppressionMarker(noteContent, signature)) return noteContent;
+  const marker = `<!-- ralph-autopilot:suppressed signature=${signature} reason=${reason} at=${new Date().toISOString()} -->`;
+  const base = noteContent.endsWith("\n") ? noteContent : `${noteContent}\n`;
+  return `${base}\n${marker}\n`;
+}
+
 function buildInputFromEscalation(params: {
   escalation: AgentEscalationNote;
   noteContent: string;
 }): EscalationConsultantInput {
-  const meta = params.escalation as unknown as Record<string, unknown>;
   const noteContent = params.noteContent;
-  const creationDate = typeof meta["creation-date"] === "string" ? (meta["creation-date"] as string) : null;
+  const creationDate = params.escalation["creation-date"] ?? null;
   const escalationType =
-    typeof meta["escalation-type"] === "string"
-      ? normalizeEscalationType(meta["escalation-type"] as string)
+    typeof params.escalation["escalation-type"] === "string"
+      ? normalizeEscalationType(params.escalation["escalation-type"])
       : parseEscalationType(noteContent);
 
   return {
@@ -76,19 +106,17 @@ export function createEscalationConsultantScheduler(deps: EscalationConsultantSc
     const vault = deps.getVaultPath();
     if (!vault) return;
 
-    const allow = await deps.allowModelSend();
-    if (!allow) return;
-
     state.inFlight = true;
     try {
+      initStateDb();
       const escalations = await deps.getEscalationsByStatus("pending");
       if (escalations.length === 0) return;
 
       const sorted = escalations
         .slice()
         .sort((a, b) => {
-          const aDate = toTimestamp(((a as unknown) as Record<string, unknown>)["creation-date"] as string | undefined);
-          const bDate = toTimestamp(((b as unknown) as Record<string, unknown>)["creation-date"] as string | undefined);
+          const aDate = toTimestamp(a["creation-date"]);
+          const bDate = toTimestamp(b["creation-date"]);
           return aDate - bDate;
         });
 
@@ -96,14 +124,108 @@ export function createEscalationConsultantScheduler(deps: EscalationConsultantSc
         if (deps.isShuttingDown()) return;
         const notePath = resolveNotePath(vault, escalation._path);
         try {
-          const noteContent = await readFile(notePath, "utf8");
+          let noteContent = await readFile(notePath, "utf8");
           const input = buildInputFromEscalation({ escalation, noteContent });
 
-          const result = await appendConsultantPacket(notePath, input, {
-            repoPath: deps.repoPath(),
-            log: deps.log,
+          let decision = parseConsultantDecisionFromEscalationNote(noteContent);
+          if (!decision) {
+            const allow = await deps.allowModelSend();
+            if (!allow) continue;
+
+            const result = await appendConsultantPacket(notePath, input, {
+              repoPath: deps.repoPath(),
+              log: deps.log,
+            });
+            if (result.status === "appended") {
+              noteContent = await readFile(notePath, "utf8");
+              decision = parseConsultantDecisionFromEscalationNote(noteContent);
+            }
+          }
+
+          if (!decision) continue;
+
+          const signature = computeEscalationSignature({
+            escalationType: input.escalationType,
+            reason: input.reason,
+            decision,
           });
-          if (result.status === "appended") return;
+
+          const eligibility = evaluateAutopilotEligibility({
+            escalationType: input.escalationType,
+            reason: input.reason,
+            decision,
+            noteContent,
+          });
+          if (!eligibility.eligible) {
+            const suppressed = appendSuppressionMarker(noteContent, signature, eligibility.reason);
+            if (suppressed !== noteContent) {
+              await writeFile(notePath, suppressed, "utf8");
+            }
+            deps.log?.(
+              `[ralph:consultant] auto-resolve suppressed for ${escalation._path} reason=${eligibility.reason} signature=${signature}`
+            );
+            continue;
+          }
+
+          const taskPath = escalation["task-path"]?.trim() ?? "";
+          if (!taskPath) continue;
+          const task = await deps.getTaskByPath(taskPath);
+          if (!task) continue;
+
+          const budget = computeLoopBudget({
+            ledgerRaw: task["auto-resolve-ledger"],
+            signature,
+            nowIso: new Date().toISOString(),
+            maxAttempts: AUTO_RESOLVE_MAX_ATTEMPTS,
+          });
+          if (!budget.allowed) {
+            const suppressed = appendSuppressionMarker(noteContent, signature, budget.reason);
+            if (suppressed !== noteContent) {
+              await writeFile(notePath, suppressed, "utf8");
+            }
+            deps.log?.(
+              `[ralph:consultant] auto-resolve suppressed for ${escalation._path} reason=${budget.reason} attempts=${budget.attempts} signature=${signature}`
+            );
+            continue;
+          }
+
+          const idempotencyKey = makeAutopilotIdempotencyKey(escalation._path, signature);
+          if (hasIdempotencyKey(idempotencyKey)) {
+            deps.log?.(`[ralph:consultant] auto-resolve already applied for ${escalation._path} signature=${signature}`);
+            continue;
+          }
+
+          const patch = applyAutopilotResolutionPatch(noteContent, decision.proposed_resolution_text);
+          if (!patch.changed) {
+            const suppressed = appendSuppressionMarker(noteContent, signature, patch.reason);
+            if (suppressed !== noteContent) {
+              await writeFile(notePath, suppressed, "utf8");
+            }
+            continue;
+          }
+
+          await writeFile(notePath, patch.noteContent, "utf8");
+          const resolved = await deps.editEscalation(escalation._path, { status: "resolved" });
+          if (!resolved.ok) {
+            deps.log?.(
+              `[ralph:consultant] auto-resolve writeback failed for ${escalation._path}: ${resolved.error}`
+            );
+            continue;
+          }
+
+          await deps.updateTaskStatus(task, task.status, {
+            "auto-resolve-ledger": budget.ledgerJson,
+            "auto-resolve-last-at": new Date().toISOString(),
+          });
+          recordIdempotencyKey({
+            key: idempotencyKey,
+            scope: "escalation-autopilot",
+            payloadJson: JSON.stringify({ escalationPath: escalation._path, signature, attempts: budget.attempts }),
+          });
+          deps.log?.(
+            `[ralph:consultant] auto-resolve applied for ${escalation._path} type=${input.escalationType} attempts=${budget.attempts}/${AUTO_RESOLVE_MAX_ATTEMPTS} signature=${signature}`
+          );
+          return;
         } catch (error: any) {
           deps.log?.(`[ralph:consultant] Failed to read escalation note ${notePath}: ${error?.message ?? String(error)}`);
         }

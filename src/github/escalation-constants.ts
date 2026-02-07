@@ -11,6 +11,7 @@ const ESCALATION_TYPES = [
   "low-confidence",
   "ambiguous-requirements",
   "blocked",
+  "watchdog",
   "merge-conflict",
   "other",
 ] as const;

@@ -54,6 +54,10 @@ export interface QueueTask {
   "stall-retries"?: string;
   /** Long-run guardrail recovery attempts (string in frontmatter) */
   "guardrail-retries"?: string;
+  /** Escalation autopilot loop ledger JSON (signature -> attempts metadata). */
+  "auto-resolve-ledger"?: string;
+  /** Last escalation autopilot attempt timestamp (ISO). */
+  "auto-resolve-last-at"?: string;
   /** Blocked reason category */
   "blocked-source"?: BlockedSource;
   /** Short explanation of block reason */

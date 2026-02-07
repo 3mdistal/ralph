@@ -1,42 +1,56 @@
-# Plan: Fix queue/in-progress label flapping on long-lived open PRs (#599)
+# Plan: Escalation Autopilot (Auto-Resolve Allowlisted Types With Loop Limits) (#210)
 
 ## Goal
 
-- Stop `ralph:status:queued` <-> `ralph:status:in-progress` oscillation for issues that already have a long-lived open PR and no new operator input.
-- Preserve contract invariant: exactly one `ralph:status:*` label converges, and `queued` remains claimable while “open PR waiting” is not claimable.
-- Reduce GitHub label writes/timeline noise; avoid burning API quota.
+- Automatically resolve routine/low-risk escalations without human intervention.
+- When the escalation consultant decision is eligible, fill `## Resolution` with `proposed_resolution_text` and mark the escalation note `status=resolved` so Ralph resumes the same OpenCode session.
+- Add durable loop protection to prevent infinite resolve/resume/escalate cycles.
 
 ## Product Constraints (canonical)
 
-- Status labels are fixed to the `ralph:status:*` set; internal “why” states should be internal metadata (`docs/product/orchestration-contract.md`).
-- `ralph:status:in-progress` includes “waiting on deterministic gates (e.g. CI)”; “open PR waiting” should therefore be stable `in-progress` on GitHub.
-- GitHub label writes are best-effort; convergence matters more than chattiness.
+- Never auto-resolve product gaps (`docs/escalation-policy.md`).
+- Never auto-resolve contract-surface questions (`docs/escalation-policy.md`).
+- Keep work bounded and deterministic; loop limits must survive daemon restarts (`docs/product/vision.md`).
 
 ## Assumptions
 
-- Introduce explicit durable status `waiting-on-pr` in task op-state (`tasks.status`) for “open PR exists, waiting”.
-- Map `waiting-on-pr` to GitHub label `ralph:status:in-progress` (no new GitHub-visible status labels).
-- Use SQLite PR snapshots (`prs` table) as the primary “does an open PR exist for this issue?” signal, with a freshness window to avoid indefinite parking on stale data.
+- Autopilot gates on the escalation consultant packet (not routing JSON).
+- Default loop budget is 2 auto-resolve attempts per `(task, escalation signature)`.
+- Loop budget state is stored durably on the task note as a small JSON map keyed by signature (to survive multiple distinct signatures across a task).
+- Initial allowlist targets only conservative subtypes:
+  - `blocked` only when a dependency reference can be parsed deterministically (e.g. "blocked by <owner>/<repo>#<n>")
+  - `watchdog` for watchdog/anomaly-loop remediation
+  - `low-confidence` (if/when emitted) remains eligible
 
 ## Checklist
 
-- [x] Unblock gate persistence drift (`ralph_run_gate_results.reason`)
-- [x] Add durable op-state for open-PR wait (`waiting-on-pr`)
-- [x] Park queued tasks on open PR (don’t keep them claimable)
-- [x] Gate stale in-progress sweep by open-PR wait state
-- [x] Make label reconciler respect open-PR wait mapping
-- [x] Remove passive open-PR in-progress writes for passive path
-- [x] Add anti-flap guardrail (single choke point debounce)
-- [x] Tests: no-flap regression + operator override + closed-PR recovery + no-duplicate writes
-- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
+- [x] Add a small, testable “escalation autopilot” functional core (parse consultant decision from note, eligibility rules, signature, resolution patch planner).
+- [x] Add durable loop budget ledger on the task note (JSON map keyed by signature + timestamps).
+- [x] Introduce/emit an explicit escalation type for watchdog/anomaly loops (`watchdog`).
+- [x] Wire autopilot into the escalation consultant scheduler:
+  - [x] If consultant packet missing and model-send allowed: append packet.
+  - [x] If packet present: attempt auto-resolve for eligible allowlisted escalations.
+  - [x] If auto-resolve suppressed: record a short suppression note (for audit) and exit.
+- [x] Ensure autopilot apply is idempotent per escalation note + signature (avoid double increments / double resolves).
+- [x] Ensure auto-resolve does not run for product-gap or contract-surface cases.
+- [x] Tests: eligibility matrix + loop ledger semantics + resolution patching + idempotence + minimal integration (tick -> resolved -> resume reads text).
+- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
 
-## Steps
+## Implementation Steps
 
-- [x] Keep startup gate-schema repair covered and aligned with schema updates (`src/__tests__/state-sqlite.test.ts`).
-- [x] Add `waiting-on-pr` to queue status model and map it to `ralph:status:in-progress` label convergence.
-- [x] Park queued tasks with existing open PRs in `RepoWorker.processTask` before planner/build, clearing active ownership/session fields.
-- [x] Gate stale in-progress sweep: skip recovery when op-state is `waiting-on-pr` and open PR snapshot is fresh; allow recovery when snapshot is stale/closed.
-- [x] Add transition debounce guard (in-memory + durable SQLite record) for opposite queued/in-progress transitions; log suppressed transitions.
-- [x] Wire label reconciler to respect `waiting-on-pr` and transition debounce state.
-- [x] Add tests for no-flap regression, operator re-queue behavior, closed-PR recovery, waiting-on-pr label idempotence, and transition debounce core logic.
-- [x] Run gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
+- [x] Add `src/escalation-autopilot/core.ts` (pure):
+  - [x] parse consultant decision JSON from the escalation note markdown (rendered packet format)
+  - [x] compute an escalation signature (type + normalized reason + decision)
+  - [x] evaluate eligibility (allowlist + guardrails)
+  - [x] plan loop-ledger updates and suppression decisions
+  - [x] plan a safe `## Resolution` patch (do not overwrite human text)
+- [x] Extend `src/escalation-notes.ts` with a tested `patchResolutionSection()` helper (keep parse/write rules co-located with `extractResolutionSection`).
+- [x] Implement autopilot IO in `src/escalation-consultant/scheduler.ts`:
+  - [x] Read pending escalation note; if missing packet and model-send allowed, append packet.
+  - [x] If decision eligible and loop budget allows: patch note first, then set escalation note status to `resolved` (write order avoids resume race).
+  - [x] Update task loop ledger (single atomic update step if possible), then log applied.
+  - [x] If suppressed: write an audit hint (e.g. `<!-- ralph-autopilot:suppressed ... -->`) and log.
+- [x] Add strict blocked-subtype detection helper (dependency ref parser) used by eligibility.
+- [x] Update `src/github/escalation-constants.ts` to include `watchdog` escalation type and update all watchdog/anomaly escalation emitters to use it (not `other`).
+- [x] Add idempotency for autopilot apply keyed by `(escalation note path, signature)` (SQLite idempotency or bwrb metadata field).
+- [x] Add structured logs for applied/suppressed; keep GitHub writes out of scope.
