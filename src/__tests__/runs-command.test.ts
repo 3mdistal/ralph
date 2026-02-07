@@ -1,11 +1,13 @@
 import { mkdtemp, rm } from "fs/promises";
 import { homedir, tmpdir } from "os";
 import { join } from "path";
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 import {
   closeStateDbForTests,
+  completeRalphRun,
   createRalphRun,
   initStateDb,
   recordRalphRunSessionUse,
@@ -13,6 +15,53 @@ import {
   recordRalphRunTracePointer,
 } from "../state";
 import { runRunsCommand } from "../commands/runs";
+import { getRalphStateDbPath } from "../paths";
+
+function insertStepMetric(params: {
+  runId: string;
+  stepTitle: string;
+  tokensTotal?: number | null;
+  wallTimeMs?: number | null;
+  toolCallCount?: number;
+  toolTimeMs?: number | null;
+  quality?: string;
+  at?: string;
+}) {
+  const now = params.at ?? "2026-02-05T12:30:00.000Z";
+  const db = new Database(getRalphStateDbPath());
+  try {
+    db.query(
+      `INSERT INTO ralph_run_step_metrics(
+         run_id, step_title, wall_time_ms, tool_call_count, tool_time_ms, anomaly_count, anomaly_recent_burst,
+         tokens_total, event_count, parse_error_count, quality, computed_at, created_at, updated_at
+       ) VALUES (
+         $run_id, $step_title, $wall_time_ms, $tool_call_count, $tool_time_ms, 0, 0,
+         $tokens_total, 0, 0, $quality, $computed_at, $created_at, $updated_at
+       )
+       ON CONFLICT(run_id, step_title) DO UPDATE SET
+         wall_time_ms = excluded.wall_time_ms,
+         tool_call_count = excluded.tool_call_count,
+         tool_time_ms = excluded.tool_time_ms,
+         tokens_total = excluded.tokens_total,
+         quality = excluded.quality,
+         computed_at = excluded.computed_at,
+         updated_at = excluded.updated_at`
+    ).run({
+      $run_id: params.runId,
+      $step_title: params.stepTitle,
+      $wall_time_ms: typeof params.wallTimeMs === "number" ? params.wallTimeMs : null,
+      $tool_call_count: typeof params.toolCallCount === "number" ? params.toolCallCount : 0,
+      $tool_time_ms: typeof params.toolTimeMs === "number" ? params.toolTimeMs : null,
+      $tokens_total: typeof params.tokensTotal === "number" ? params.tokensTotal : null,
+      $quality: params.quality ?? "ok",
+      $computed_at: now,
+      $created_at: now,
+      $updated_at: now,
+    });
+  } finally {
+    db.close();
+  }
+}
 
 async function invokeRuns(args: string[], opts?: { nowMs?: number }) {
   const stdout: string[] = [];
@@ -98,9 +147,12 @@ describe("runs command", () => {
       startedAt: "2026-02-05T12:00:00.000Z",
     });
 
+    completeRalphRun({ runId, outcome: "success", completedAt: "2026-02-05T12:40:00.000Z" });
     recordRalphRunTokenTotals({ runId, tokensTotal: 1234, tokensComplete: true, sessionCount: 1 });
     recordRalphRunSessionUse({ runId, sessionId: "ses_test_001" });
     recordRalphRunTracePointer({ runId, kind: "run_log_path", path: "/tmp/ralph/run.log" });
+    insertStepMetric({ runId, stepTitle: "build", tokensTotal: 900, wallTimeMs: 120000, toolCallCount: 4, toolTimeMs: 90000 });
+    insertStepMetric({ runId, stepTitle: "plan", tokensTotal: 200, wallTimeMs: 30000, toolCallCount: 1, toolTimeMs: 1000 });
 
     const result = await invokeRuns([
       "top",
@@ -125,6 +177,10 @@ describe("runs command", () => {
     expect(runEntry).toBeTruthy();
     expect(runEntry).toMatchObject({
       runId,
+      dominantStep: {
+        stepTitle: "build",
+        basis: "tokens_total",
+      },
       tracePointers: {
         runLogPaths: expect.any(Array),
         sessionEventPaths: expect.any(Array),
@@ -260,5 +316,22 @@ describe("runs command", () => {
     const result = await invokeRuns(["show", "run_missing_123"]);
     expect(result.exitCode).toBe(1);
     expect(result.stderr[0]).toContain("Run not found");
+  });
+
+  test("shows dominant step details for run", async () => {
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#308",
+      taskPath: "github:3mdistal/ralph#308",
+      attemptKind: "process",
+      startedAt: "2026-02-05T13:00:00.000Z",
+    });
+    insertStepMetric({ runId, stepTitle: "survey", wallTimeMs: 90000, toolCallCount: 7, toolTimeMs: 70000 });
+    insertStepMetric({ runId, stepTitle: "plan", wallTimeMs: 20000, toolCallCount: 1, toolTimeMs: 1000 });
+
+    const result = await invokeRuns(["show", runId]);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.join("\n")).toContain("Dominant step: survey");
+    expect(result.stdout.join("\n")).toContain("wall_time_ms");
   });
 });
