@@ -14,6 +14,7 @@ import {
   RALPH_LABEL_CMD_QUEUE,
   RALPH_LABEL_CMD_SATISFY,
   RALPH_LABEL_CMD_STOP,
+  RALPH_LABEL_STATUS_ESCALATED,
   RALPH_LABEL_STATUS_PAUSED,
   RALPH_LABEL_STATUS_QUEUED,
   RALPH_LABEL_STATUS_STOPPED,
@@ -68,6 +69,17 @@ function buildCmdEventKey(params: { repo: string; issueNumber: number; cmdLabel:
 
 function buildSatisfactionKey(repo: string, issueNumber: number): string {
   return `ralph:satisfy:v1:${repo}#${issueNumber}`;
+}
+
+function buildQueueLabelDelta(currentLabels: string[]): { add: string[]; remove: string[] } {
+  // Queue command must reliably clear stop-switch labels even if local snapshot labels are stale.
+  const withForcedRemovals = [
+    ...currentLabels,
+    RALPH_LABEL_STATUS_PAUSED,
+    RALPH_LABEL_STATUS_ESCALATED,
+    RALPH_LABEL_STATUS_STOPPED,
+  ];
+  return statusToRalphLabelDelta("queued", withForcedRemovals);
 }
 
 function applyLabelDeltaSnapshot(params: {
@@ -338,7 +350,10 @@ export async function processOneCommand(
         releasedReason: `cmd:${params.cmdLabel}`,
       });
 
-      const delta = statusToRalphLabelDelta(desiredStatus as any, params.currentLabels);
+      const delta =
+        desiredStatus === "queued"
+          ? buildQueueLabelDelta(params.currentLabels)
+          : statusToRalphLabelDelta(desiredStatus as any, params.currentLabels);
       addLabels = delta.add;
       removeLabels = [...delta.remove, params.cmdLabel];
       reason =
