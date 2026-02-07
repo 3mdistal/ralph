@@ -49,6 +49,17 @@ describe("OpenCode config env", () => {
     expect(env.XDG_CONFIG_HOME).toContain("ralph-opencode");
   });
 
+  test("keeps XDG_CONFIG_HOME isolated even when profile configHome is set", () => {
+    const profileConfigHome = join(homeDir, ".opencode-profiles", "apple", "config");
+    const env = __buildOpencodeEnvForTests({
+      repo: "demo",
+      cacheKey: "abc-profile",
+      opencodeXdg: { configHome: profileConfigHome },
+    });
+    expect(env.XDG_CONFIG_HOME).toContain("ralph-opencode");
+    expect(env.XDG_CONFIG_HOME).not.toBe(profileConfigHome);
+  });
+
   test("respects RALPH_OPENCODE_CONFIG_DIR override", () => {
     const override = join(homeDir, "custom-opencode");
     process.env.RALPH_OPENCODE_CONFIG_DIR = override;

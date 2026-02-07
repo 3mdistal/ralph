@@ -78,6 +78,7 @@ test("resume detects the configured profile that contains the OpenCode session",
   const resolved = await (worker as any).resolveOpencodeXdgForTask(task, "resume", sessionId);
   expect(resolved.profileName).toBe("apple");
   expect(resolved.opencodeXdg?.dataHome).toBe(appleData);
+  expect(resolved.opencodeXdg?.configHome).toBeUndefined();
 });
 
 test("resume does not auto-switch profiles when session cannot be found", async () => {
@@ -109,6 +110,7 @@ test("resume does not auto-switch profiles when session cannot be found", async 
   expect(resolved.profileName).toBe(null);
   expect(resolved.opencodeXdg?.dataHome).toBe(join(homeDir, ".local", "share"));
   expect(resolved.opencodeXdg?.stateHome).toBe(join(homeDir, ".local", "state"));
+  expect(resolved.opencodeXdg?.configHome).toBeUndefined();
 });
 
 test("writes config to the expected path", async () => {

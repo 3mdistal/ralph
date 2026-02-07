@@ -121,6 +121,7 @@ import {
 import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "../github/watchdog-writeback";
 import { buildLoopTripDetails } from "../loop-detection/format";
 import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
+import { classifyOpencodeFailure } from "../opencode-error-classifier";
 import { computeBlockedDecision, type RelationshipSignal } from "../github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "../github/issue-ref";
 import {
@@ -5539,7 +5540,11 @@ export class RepoWorker {
 
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
-        await this.markTaskBlocked(task, "runtime-error", { reason, details });
+        const classification = classifyOpencodeFailure(`${reason}\n${details}`);
+        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
+          reason: classification?.reason ?? reason,
+          details,
+        });
       }
 
       return {
@@ -5992,10 +5997,11 @@ export class RepoWorker {
           return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
         }
 
-        const reason = `planner failed: ${planResult.output}`;
+        const classification = classifyOpencodeFailure(planResult.output);
+        const reason = classification?.reason ?? `planner failed: ${planResult.output}`;
         const details = planResult.output;
 
-        await this.markTaskBlocked(task, "runtime-error", {
+        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
           reason,
           details,
           sessionId: planResult.sessionId,
@@ -6795,7 +6801,11 @@ export class RepoWorker {
 
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
-        await this.markTaskBlocked(task, "runtime-error", { reason, details });
+        const classification = classifyOpencodeFailure(`${reason}\n${details}`);
+        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
+          reason: classification?.reason ?? reason,
+          details,
+        });
       }
 
       return {
