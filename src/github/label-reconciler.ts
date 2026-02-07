@@ -1,9 +1,11 @@
 import { getConfig } from "../config";
 import { shouldLog } from "../logging";
 import {
+  getIssueStatusTransitionRecord,
   getIssueLabels,
   listIssueSnapshotsWithRalphLabels,
   listTaskOpStatesByRepo,
+  recordIssueStatusTransition,
   recordIssueLabelsSnapshot,
 } from "../state";
 import { GitHubClient } from "./client";
@@ -11,13 +13,19 @@ import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels
 import { executeIssueLabelOps } from "./issue-label-io";
 import { mutateIssueLabels } from "./label-mutation";
 import { canAttemptLabelWrite } from "./label-write-backoff";
-import { statusToRalphLabelDelta, type LabelOp } from "../github-queue/core";
+import {
+  deriveRalphStatus,
+  shouldDebounceOppositeStatusTransition,
+  statusToRalphLabelDelta,
+  type LabelOp,
+} from "../github-queue/core";
 import type { QueueTaskStatus } from "../queue/types";
 import { RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_STOPPED } from "../github-labels";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_MAX_ISSUES_PER_TICK = 10;
 const DEFAULT_COOLDOWN_MS = 10 * 60_000;
+const DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS = 5 * 60_000;
 const TELEMETRY_SOURCE = "label-reconciler";
 
 type ReconcileCooldownState = { desiredStatus: QueueTaskStatus; appliedAtMs: number };
@@ -46,6 +54,7 @@ function applyLabelDeltaSnapshot(params: {
 function toDesiredStatus(raw: string | null | undefined): QueueTaskStatus | null {
   if (!raw) return null;
   if (raw === "starting") return "in-progress";
+  if (raw === "waiting-on-pr") return "in-progress";
   if (raw === "throttled") return null;
   if (raw === "done") return null;
   return raw as QueueTaskStatus;
@@ -54,6 +63,8 @@ function toDesiredStatus(raw: string | null | undefined): QueueTaskStatus | null
 async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number): Promise<number> {
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
+  const debounceMsRaw = Number(process.env.RALPH_GITHUB_QUEUE_STATUS_DEBOUNCE_MS ?? DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS);
+  const debounceMs = Number.isFinite(debounceMsRaw) ? Math.max(0, Math.floor(debounceMsRaw)) : DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS;
   const opStates = listTaskOpStatesByRepo(repo);
   const opStateByIssue = new Map<number, (typeof opStates)[number]>();
   for (const op of opStates) {
@@ -94,6 +105,30 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
 
     const delta = statusToRalphLabelDelta(desiredStatus, issue.labels);
     if (delta.add.length === 0 && delta.remove.length === 0) continue;
+
+    const fromStatus = deriveRalphStatus(issue.labels, issue.state);
+    const previous = getIssueStatusTransitionRecord(repo, issue.number);
+    const suppress = shouldDebounceOppositeStatusTransition({
+      fromStatus,
+      toStatus: desiredStatus,
+      reason: `label-reconciler:${desiredStatus}`,
+      nowMs,
+      windowMs: debounceMs,
+      previous: previous
+        ? {
+            fromStatus: previous.fromStatus as QueueTaskStatus | null,
+            toStatus: previous.toStatus as QueueTaskStatus,
+            reason: previous.reason,
+            atMs: previous.updatedAtMs,
+          }
+        : null,
+    });
+    if (suppress.suppress) {
+      console.warn(
+        `[ralph:labels:reconcile:${repo}] Suppressed transition for ${repo}#${issue.number}: ${suppress.reason ?? "debounced"}`
+      );
+      continue;
+    }
 
     const ops: LabelOp[] = [
       ...delta.add.map((label) => ({ action: "add" as const, label })),
@@ -140,6 +175,14 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
     }
 
     if (didApply) {
+      recordIssueStatusTransition({
+        repo,
+        issueNumber: issue.number,
+        fromStatus,
+        toStatus: desiredStatus,
+        reason: `label-reconciler:${desiredStatus}`,
+        updatedAtMs: nowMs,
+      });
       lastAppliedByIssue.set(cooldownKey, { desiredStatus, appliedAtMs: nowMs });
     }
 

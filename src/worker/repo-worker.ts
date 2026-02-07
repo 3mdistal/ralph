@@ -1391,6 +1391,30 @@ export class RepoWorker {
     }
   }
 
+  private async parkTaskWaitingOnOpenPr(task: AgentTask, issueNumber: string, prUrl: string): Promise<AgentRun> {
+    const patch: Record<string, string> = {
+      "session-id": "",
+      "worktree-path": "",
+      "worker-id": "",
+      "repo-slot": "",
+      "daemon-id": "",
+      "heartbeat-at": "",
+    };
+    const updated = await this.queue.updateTaskStatus(task, "waiting-on-pr", patch);
+    if (updated) {
+      applyTaskPatch(task, "waiting-on-pr", patch);
+    }
+    this.updateOpenPrSnapshot(task, null, prUrl);
+    console.log(
+      `[ralph:worker:${this.repo}] Parking ${task.issue} in waiting-on-pr for open PR ${prUrl} (issue ${issueNumber})`
+    );
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+    };
+  }
+
   /**
    * Reconciliation lane: if a queued issue already has a Ralph-authored PR that is mergeable,
    * merge it and apply midpoint labels. This avoids "orphan" PRs when the daemon restarts
@@ -6003,6 +6027,18 @@ export class RepoWorker {
         opencodeSessionOptions,
       });
       if (ciFailureRun) return ciFailureRun;
+
+      const existingPrForQueue = await this.getIssuePrResolution(issueNumber);
+      if (existingPrForQueue.selectedUrl) {
+        if (existingPrForQueue.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPrForQueue.duplicates.join(
+              ", "
+            )}`
+          );
+        }
+        return await this.parkTaskWaitingOnOpenPr(task, issueNumber, existingPrForQueue.selectedUrl);
+      }
 
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);

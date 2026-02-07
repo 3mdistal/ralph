@@ -7,6 +7,7 @@ import {
   deriveTaskView,
   planClaim,
   computeStaleInProgressRecovery,
+  shouldDebounceOppositeStatusTransition,
   statusToRalphLabelDelta,
 } from "../github-queue/core";
 
@@ -156,6 +157,45 @@ describe("github queue core", () => {
   test("statusToRalphLabelDelta maps escalated to escalated", () => {
     const delta = statusToRalphLabelDelta("escalated", ["ralph:status:queued"]);
     expect(delta).toEqual({ add: ["ralph:status:escalated"], remove: ["ralph:status:queued"] });
+  });
+
+  test("statusToRalphLabelDelta maps waiting-on-pr to in-progress label", () => {
+    const delta = statusToRalphLabelDelta("waiting-on-pr", ["ralph:status:queued"]);
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
+  });
+
+  test("debounces opposite queued/in-progress transition with unchanged reason", () => {
+    const result = shouldDebounceOppositeStatusTransition({
+      fromStatus: "in-progress",
+      toStatus: "queued",
+      reason: "stale-heartbeat",
+      nowMs: 1_000,
+      windowMs: 5_000,
+      previous: {
+        fromStatus: "queued",
+        toStatus: "in-progress",
+        reason: "stale-heartbeat",
+        atMs: 500,
+      },
+    });
+    expect(result.suppress).toBe(true);
+  });
+
+  test("allows opposite transition when reason changes", () => {
+    const result = shouldDebounceOppositeStatusTransition({
+      fromStatus: "in-progress",
+      toStatus: "queued",
+      reason: "operator-queue",
+      nowMs: 1_000,
+      windowMs: 5_000,
+      previous: {
+        fromStatus: "queued",
+        toStatus: "in-progress",
+        reason: "stale-heartbeat",
+        atMs: 500,
+      },
+    });
+    expect(result.suppress).toBe(false);
   });
 
   test("planClaim requires queued label", () => {

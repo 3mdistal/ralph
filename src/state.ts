@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
 
@@ -782,6 +782,24 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           }
         }
 
+        if (existingVersion < 17) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS issue_status_transition_guard (" +
+              "repo_id INTEGER NOT NULL, " +
+              "issue_number INTEGER NOT NULL, " +
+              "from_status TEXT, " +
+              "to_status TEXT NOT NULL, " +
+              "reason TEXT, " +
+              "updated_at_ms INTEGER NOT NULL, " +
+              "PRIMARY KEY(repo_id, issue_number), " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE" +
+              ")"
+          );
+          database.exec(
+            "CREATE INDEX IF NOT EXISTS idx_issue_status_transition_guard_repo_updated ON issue_status_transition_guard(repo_id, updated_at_ms)"
+          );
+        }
+
         database.exec(
           `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
            ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
@@ -1129,6 +1147,17 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       UNIQUE(alert_id, channel, marker_id)
     );
 
+    CREATE TABLE IF NOT EXISTS issue_status_transition_guard (
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER NOT NULL,
+      from_status TEXT,
+      to_status TEXT NOT NULL,
+      reason TEXT,
+      updated_at_ms INTEGER NOT NULL,
+      PRIMARY KEY(repo_id, issue_number),
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -1151,6 +1180,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE INDEX IF NOT EXISTS idx_alerts_repo_target ON alerts(repo_id, target_type, target_number, last_seen_at);
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_alert_channel ON alert_deliveries(alert_id, channel);
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
+    CREATE INDEX IF NOT EXISTS idx_issue_status_transition_guard_repo_updated
+      ON issue_status_transition_guard(repo_id, updated_at_ms);
   `);
 
     runMigrationsWithLock(database, () => {
@@ -3008,6 +3039,15 @@ export type TaskOpState = {
   releasedReason?: string | null;
 };
 
+export type IssueStatusTransitionRecord = {
+  repo: string;
+  issueNumber: number;
+  fromStatus: string | null;
+  toStatus: string;
+  reason: string;
+  updatedAtMs: number;
+};
+
 type IssueSnapshotQueryParams = {
   repo: string;
   includeClosed?: boolean;
@@ -3430,6 +3470,68 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
   };
+}
+
+export function getIssueStatusTransitionRecord(repo: string, issueNumber: number): IssueStatusTransitionRecord | null {
+  const database = requireDb();
+  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: repo,
+  }) as { id?: number } | undefined;
+  if (!repoRow?.id) return null;
+
+  const row = database
+    .query(
+      `SELECT from_status, to_status, reason, updated_at_ms
+       FROM issue_status_transition_guard
+       WHERE repo_id = $repo_id AND issue_number = $issue_number`
+    )
+    .get({
+      $repo_id: repoRow.id,
+      $issue_number: issueNumber,
+    }) as { from_status?: string | null; to_status?: string | null; reason?: string | null; updated_at_ms?: number } | undefined;
+
+  if (!row?.to_status || typeof row.updated_at_ms !== "number") return null;
+  return {
+    repo,
+    issueNumber,
+    fromStatus: row.from_status ?? null,
+    toStatus: row.to_status,
+    reason: row.reason ?? "",
+    updatedAtMs: row.updated_at_ms,
+  };
+}
+
+export function recordIssueStatusTransition(input: {
+  repo: string;
+  issueNumber: number;
+  fromStatus: string | null;
+  toStatus: string;
+  reason?: string | null;
+  updatedAtMs: number;
+}): void {
+  const database = requireDb();
+  const atIso = nowIso();
+  const repoId = upsertRepo({ repo: input.repo, at: atIso });
+  const reason = sanitizeOptionalText(input.reason ?? null, 300) ?? "";
+
+  database
+    .query(
+      `INSERT INTO issue_status_transition_guard(repo_id, issue_number, from_status, to_status, reason, updated_at_ms)
+       VALUES ($repo_id, $issue_number, $from_status, $to_status, $reason, $updated_at_ms)
+       ON CONFLICT(repo_id, issue_number) DO UPDATE SET
+         from_status = excluded.from_status,
+         to_status = excluded.to_status,
+         reason = excluded.reason,
+         updated_at_ms = excluded.updated_at_ms`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: input.issueNumber,
+      $from_status: input.fromStatus,
+      $to_status: input.toStatus,
+      $reason: reason,
+      $updated_at_ms: Math.floor(input.updatedAtMs),
+    });
 }
 
 function parsePrNumber(prUrl: string): number | null {
