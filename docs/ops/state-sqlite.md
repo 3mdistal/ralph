@@ -2,7 +2,7 @@
 
 Status: canonical
 Owner: @3mdistal
-Last updated: 2026-02-01
+Last updated: 2026-02-07
 
 `~/.ralph/state.sqlite` is Ralph's internal durable store for operational metadata (sessions, worktrees, cursors, run records).
 
@@ -23,6 +23,13 @@ It also stores deterministic gate state for each run (`ralph_run_gate_results`) 
   - upgrade Ralph to a compatible/newer binary, or
   - perform safe reset by deleting `~/.ralph/state.sqlite` (local durable state loss).
 
+## Startup schema invariants
+
+- Startup verifies required schema shape for critical tables in addition to `meta.schema_version`.
+- Current invariants include `ralph_run_gate_results.reason` and required gate indexes used by latest-run lookups.
+- Additive drift is repaired automatically under migration lock/transaction boundaries (idempotent `ALTER TABLE ... ADD COLUMN`, `CREATE INDEX IF NOT EXISTS`).
+- Non-additive or incompatible drift fails closed with explicit diagnostics (table/index name, incompatibility, and operator recovery guidance).
+
 ## Preflight and backup knobs
 
 - Before running migrations, Ralph runs `PRAGMA integrity_check`.
@@ -38,6 +45,13 @@ It also stores deterministic gate state for each run (`ralph_run_gate_results`) 
 2. Upgrade Ralph binary.
 3. Restart Ralph and allow startup preflight + migration to complete.
 4. Resume normal processing.
+
+Schema drift recovery:
+
+1. If startup reports a schema invariant failure, stop all Ralph processes touching the DB.
+2. Restart with the latest binary once to allow additive repair.
+3. If failure persists, inspect for incompatible objects (for example, a view where a table is expected).
+4. Restore from backup or perform safe reset (`~/.ralph/state.sqlite`) when local durable state can be recreated.
 
 Rollback caveat:
 
