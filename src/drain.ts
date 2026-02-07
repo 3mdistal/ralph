@@ -1,7 +1,10 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { homedir } from "os";
-import { dirname, join } from "path";
+import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { dirname } from "path";
 import { readDaemonRecord } from "./daemon-record";
+import {
+  resolveCanonicalControlFilePath,
+  resolveLegacyControlFilePathCandidates,
+} from "./control-root";
 
 export type DaemonMode = "running" | "draining" | "paused";
 
@@ -24,26 +27,11 @@ const DEFAULT_CONTROL_DEFAULTS: ControlDefaults = {
   suppressMissingWarnings: true,
 };
 
-function resolveTmpControlDir(): string {
-  const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
-  return join("/tmp", "ralph", String(uid));
-}
-
 function getControlDefaults(opts?: { defaults?: Partial<ControlDefaults> }): ControlDefaults {
   return {
     autoCreate: opts?.defaults?.autoCreate ?? DEFAULT_CONTROL_DEFAULTS.autoCreate,
     suppressMissingWarnings: opts?.defaults?.suppressMissingWarnings ?? DEFAULT_CONTROL_DEFAULTS.suppressMissingWarnings,
   };
-}
-
-function resolveHomeDirFallback(): string | undefined {
-  const homeEnv = process.env.HOME?.trim();
-  if (homeEnv) return homeEnv;
-  try {
-    return homedir();
-  } catch {
-    return undefined;
-  }
 }
 
 function isPidAlive(pid: number): boolean {
@@ -67,13 +55,27 @@ export function resolveControlFilePath(
   homeDir?: string,
   xdgStateHome: string | undefined = process.env.XDG_STATE_HOME
 ): string {
-  const trimmedStateHome = xdgStateHome?.trim();
-  if (trimmedStateHome) return join(trimmedStateHome, "ralph", "control.json");
+  return resolveCanonicalControlFilePath({ homeDir });
+}
 
-  const resolvedHome = homeDir?.trim() ?? resolveHomeDirFallback();
-  if (resolvedHome) return join(resolvedHome, ".local", "state", "ralph", "control.json");
+export function resolveControlFilePathCandidates(
+  homeDir?: string,
+  xdgStateHome: string | undefined = process.env.XDG_STATE_HOME
+): string[] {
+  const canonical = resolveControlFilePath(homeDir, xdgStateHome);
+  const legacy = resolveLegacyControlFilePathCandidates({ homeDir, xdgStateHome });
+  return Array.from(new Set([canonical, ...legacy]));
+}
 
-  return join(resolveTmpControlDir(), "control.json");
+function resolveReadableControlFilePath(opts?: {
+  homeDir?: string;
+  xdgStateHome?: string;
+}): { path: string; hasExisting: boolean } {
+  const candidates = resolveControlFilePathCandidates(opts?.homeDir, opts?.xdgStateHome);
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return { path: candidate, hasExisting: true };
+  }
+  return { path: candidates[0] ?? resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome), hasExisting: false };
 }
 
 function parseControlStateJson(raw: string): ControlState {
@@ -239,9 +241,11 @@ export function readControlStateSnapshot(opts?: {
   log?: (message: string) => void;
   defaults?: Partial<ControlDefaults>;
 }): ControlState {
-  const path = resolveEffectiveControlFilePath(opts);
+  const effectivePath = resolveEffectiveControlFilePath(opts);
+  const readable = resolveReadableControlFilePath({ homeDir: opts?.homeDir, xdgStateHome: opts?.xdgStateHome });
+  const path = existsSync(effectivePath) ? effectivePath : readable.path;
   const defaults = getControlDefaults({ defaults: opts?.defaults });
-  if (defaults.autoCreate) {
+  if (defaults.autoCreate && !readable.hasExisting && path === resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome)) {
     writeDefaultControlFile(path, opts?.log);
   }
 
@@ -376,10 +380,21 @@ export class DrainMonitor {
   }
 
   private reloadNow(reason: string, opts?: { force?: boolean }): void {
-    const path = resolveControlFilePath(this.options.homeDir, this.options.xdgStateHome);
+    const canonicalPath = resolveControlFilePath(this.options.homeDir, this.options.xdgStateHome);
+    const effectivePath = resolveEffectiveControlFilePath({
+      homeDir: this.options.homeDir,
+      xdgStateHome: this.options.xdgStateHome,
+      log: this.options.warn ?? this.options.log,
+    });
+    const readable = resolveReadableControlFilePath({
+      homeDir: this.options.homeDir,
+      xdgStateHome: this.options.xdgStateHome,
+    });
+    let path = existsSync(effectivePath) ? effectivePath : readable.path;
     const defaults = getControlDefaults({ defaults: this.options.defaults });
-    if (reason === "startup" && defaults.autoCreate) {
-      writeDefaultControlFile(path, this.options.warn ?? this.options.log);
+    if (reason === "startup" && defaults.autoCreate && !readable.hasExisting) {
+      writeDefaultControlFile(canonicalPath, this.options.warn ?? this.options.log);
+      path = canonicalPath;
     }
 
     let mtimeMs: number | null = null;
@@ -391,8 +406,8 @@ export class DrainMonitor {
       this.lastMissing = false;
     } catch (e: any) {
       if (e?.code === "ENOENT") {
-        if (reason === "startup" && defaults.autoCreate) {
-          writeDefaultControlFile(path, this.options.warn ?? this.options.log);
+        if (reason === "startup" && defaults.autoCreate && path === canonicalPath) {
+          writeDefaultControlFile(canonicalPath, this.options.warn ?? this.options.log);
         }
 
         this.warnOnceForMissing(path, defaults);

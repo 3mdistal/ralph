@@ -1,42 +1,40 @@
-# Plan: Fix queue/in-progress label flapping on long-lived open PRs (#599)
+# Plan: Canonical Daemon Registry + Control Root (#604)
 
-## Goal
-
-- Stop `ralph:status:queued` <-> `ralph:status:in-progress` oscillation for issues that already have a long-lived open PR and no new operator input.
-- Preserve contract invariant: exactly one `ralph:status:*` label converges, and `queued` remains claimable while “open PR waiting” is not claimable.
-- Reduce GitHub label writes/timeline noise; avoid burning API quota.
-
-## Product Constraints (canonical)
-
-- Status labels are fixed to the `ralph:status:*` set; internal “why” states should be internal metadata (`docs/product/orchestration-contract.md`).
-- `ralph:status:in-progress` includes “waiting on deterministic gates (e.g. CI)”; “open PR waiting” should therefore be stable `in-progress` on GitHub.
-- GitHub label writes are best-effort; convergence matters more than chattiness.
-
-## Assumptions
-
-- Introduce explicit durable status `waiting-on-pr` in task op-state (`tasks.status`) for “open PR exists, waiting”.
-- Map `waiting-on-pr` to GitHub label `ralph:status:in-progress` (no new GitHub-visible status labels).
-- Use SQLite PR snapshots (`prs` table) as the primary “does an open PR exist for this issue?” signal, with a freshness window to avoid indefinite parking on stale data.
+Assumptions:
+- Canonical control artifacts must be profile-agnostic (must not depend on ambient `XDG_*` / OpenCode profile selection).
+- Maintain backwards compatibility by continuing to *read* legacy locations and (for a transition period) *write* legacy daemon discovery records.
+- Prefer safety over cleverness for stale lock recovery: never steal a lock from a live PID by default.
 
 ## Checklist
 
-- [x] Unblock gate persistence drift (`ralph_run_gate_results.reason`)
-- [x] Add durable op-state for open-PR wait (`waiting-on-pr`)
-- [x] Park queued tasks on open PR (don’t keep them claimable)
-- [x] Gate stale in-progress sweep by open-PR wait state
-- [x] Make label reconciler respect open-PR wait mapping
-- [x] Remove passive open-PR in-progress writes for passive path
-- [x] Add anti-flap guardrail (single choke point debounce)
-- [x] Tests: no-flap regression + operator override + closed-PR recovery + no-duplicate writes
-- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
-
-## Steps
-
-- [x] Keep startup gate-schema repair covered and aligned with schema updates (`src/__tests__/state-sqlite.test.ts`).
-- [x] Add `waiting-on-pr` to queue status model and map it to `ralph:status:in-progress` label convergence.
-- [x] Park queued tasks with existing open PRs in `RepoWorker.processTask` before planner/build, clearing active ownership/session fields.
-- [x] Gate stale in-progress sweep: skip recovery when op-state is `waiting-on-pr` and open PR snapshot is fresh; allow recovery when snapshot is stale/closed.
-- [x] Add transition debounce guard (in-memory + durable SQLite record) for opposite queued/in-progress transitions; log suppressed transitions.
-- [x] Wire label reconciler to respect `waiting-on-pr` and transition debounce state.
-- [x] Add tests for no-flap regression, operator re-queue behavior, closed-PR recovery, waiting-on-pr label idempotence, and transition debounce core logic.
-- [x] Run gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
+- [x] Inventory current discovery/control paths and map *all* call sites (`src/index.ts`, `src/ralphctl.ts`, `src/drain.ts`, `src/control-file.ts`, `src/commands/status.ts`).
+- [x] Introduce a single canonical resolver API and route all call sites through it:
+      - `src/control-root.ts` (pure): canonical root + legacy candidate generation
+      - `src/daemon-record.ts`: schema parse/validate + lock-protected IO + singleton lock
+      - `src/drain.ts`: resolve effective `control.json` path (daemon-advertised first, then canonical, then legacy)
+- [x] Define canonical control root (default: `~/.ralph/control`) and canonical file names:
+      - daemon registry: `daemon-registry.json`
+      - control file: `control.json`
+      - locks: `daemon.lock` (singleton, held for lifetime) and `daemon-registry.lock` (short-lived write lock)
+- [x] Implement daemon registry schema v1 with strict parsing + validation:
+      - required: daemonId, pid, startedAt, heartbeatAt, controlRoot, ralphVersion
+      - optional/additive: command, cwd, controlFilePath
+- [x] Implement lock semantics with ownership tokens (nonce) to avoid unsafe cleanup:
+      - lock file payload includes daemonId, pid, startedAt, acquiredAt, token
+      - only the owning process (matching token) may release/cleanup in normal shutdown
+      - stale lock recovery requires pid-not-alive (never steal from a live pid by default)
+- [x] Implement crash-safe, lock-protected registry writes as a read-modify-write transaction under lock (write temp + rename).
+- [x] Fix monitor/read consistency: ensure `DrainMonitor.reloadNow` and `readControlStateSnapshot` use the same effective control-path resolver (no direct `resolveControlFilePath(...)` bypass).
+- [x] Update daemon startup/shutdown (`src/index.ts`) to:
+      - create canonical control root (0700)
+      - acquire singleton lock (`daemon.lock`) or fail-fast with actionable error
+      - write initial registry record + start heartbeat ticker
+      - dual-write legacy daemon record during transition (so older tooling can still discover)
+      - release only when token matches; best-effort cleanup on shutdown
+- [x] Update `ralphctl` to read canonical registry first (then legacy fallbacks), and emit deterministic diagnostics listing candidate paths + why they were rejected (missing/invalid/stale/pid-dead).
+- [x] Update docs/help text to state canonical path + fallback behavior (`README.md`, `src/cli.ts`, `src/index.ts`, and any referenced docs that mention `$XDG_STATE_HOME/ralph/*`).
+- [x] Tests:
+      - Core/selection: candidate ordering and canonical-precedence coverage in daemon-record tests
+      - IO/fs: canonical control path behavior + fallback behavior in drain/control-file tests
+      - Avoid wall-clock sleeps: inject clock/tickers where possible
+- [x] Run `bun test` and fix regressions.
