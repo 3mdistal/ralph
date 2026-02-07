@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { RalphEventBus } from "../dashboard/event-bus";
 import { buildRalphEvent } from "../dashboard/events";
 import { startControlPlaneServer } from "../dashboard/control-plane-server";
+import { ControlPlaneRequestError } from "../dashboard/task-command";
 import type { StatusSnapshot } from "../status-snapshot";
 
 function createSnapshot(): StatusSnapshot {
@@ -377,6 +378,78 @@ describe("control plane server", () => {
       expect(res.status).toBe(200);
       expect(seen?.taskId).toBe("github:owner/repo#123");
       expect(seen?.priority).toBe("p1");
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("task command calls handler", async () => {
+    const bus = new RalphEventBus();
+    let seen: any = null;
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async () => {},
+        resume: async () => {},
+        enqueueMessage: async () => ({ id: "n5" }),
+        setTaskPriority: async () => {},
+        applyTaskCommand: async (params) => {
+          seen = params;
+        },
+      },
+    });
+
+    try {
+      const res = await fetch(`${server.url}/v1/commands/task/command`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({
+          taskId: "github:owner/repo#123",
+          command: "pause",
+          comment: "checkpoint please",
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(seen?.taskId).toBe("github:owner/repo#123");
+      expect(seen?.command).toBe("pause");
+      expect(seen?.comment).toBe("checkpoint please");
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("task command maps request errors to http", async () => {
+    const bus = new RalphEventBus();
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async () => {},
+        resume: async () => {},
+        enqueueMessage: async () => ({ id: "n6" }),
+        setTaskPriority: async () => {},
+        applyTaskCommand: async () => {
+          throw new ControlPlaneRequestError(403, "forbidden", "repo is not configured");
+        },
+      },
+    });
+
+    try {
+      const res = await fetch(`${server.url}/v1/commands/task/command`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: "github:owner/repo#123", command: "pause" }),
+      });
+      expect(res.status).toBe(403);
+      const body = await res.json();
+      expect(body?.error?.code).toBe("forbidden");
     } finally {
       server.stop();
     }

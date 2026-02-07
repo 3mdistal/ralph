@@ -80,10 +80,11 @@ import { startGitHubDoneReconciler } from "./github/done-reconciler";
 import { startGitHubLabelReconciler } from "./github/label-reconciler";
 import { startGitHubCmdProcessor } from "./github/cmd-processor";
 import { resolveGitHubToken } from "./github-auth";
-import { GitHubClient } from "./github/client";
+import { GitHubClient, splitRepoFullName } from "./github/client";
 import { parseIssueRef } from "./github/issue-ref";
 import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
 import { ensureRalphWorkflowLabelsOnce } from "./github/ensure-ralph-workflow-labels";
+import { buildGitHubTaskCommandPlan } from "./dashboard/task-command";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -1627,6 +1628,52 @@ async function main(): Promise<void> {
             );
 
             return { id };
+          },
+          applyTaskCommand: async ({ taskId, command, comment }) => {
+            const token = await resolveGitHubToken();
+            if (!token) throw new Error("GitHub auth is not configured");
+
+            const plan = buildGitHubTaskCommandPlan({
+              taskId,
+              command,
+              comment,
+              allowedRepos: new Set(config.repos.map((entry) => entry.name)),
+            });
+
+            const github = new GitHubClient(plan.repo, { getToken: resolveGitHubToken });
+            const ops = planIssueLabelOps({ add: [plan.cmdLabel], remove: [] });
+
+            const labelResult = await executeIssueLabelOps({
+              github,
+              repo: plan.repo,
+              issueNumber: plan.issueNumber,
+              ops,
+              ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: plan.repo, github }),
+              ensureBefore: true,
+              retryMissingLabelOnce: true,
+            });
+            if (!labelResult.ok) {
+              const message = labelResult.error instanceof Error ? labelResult.error.message : String(labelResult.error);
+              throw new Error(`Failed to apply command label: ${message}`);
+            }
+
+            if (plan.comment) {
+              const { owner, name } = splitRepoFullName(plan.repo);
+              await github.request(`/repos/${owner}/${name}/issues/${plan.issueNumber}/comments`, {
+                method: "POST",
+                body: { body: plan.comment },
+              });
+            }
+
+            publishDashboardEvent({
+              type: "log.ralph",
+              level: "info",
+              repo: plan.repo,
+              taskId,
+              data: {
+                message: `Applied command ${command} (${plan.cmdLabel}) on ${plan.repo}#${plan.issueNumber}; commentPosted=${Boolean(plan.comment)}`,
+              },
+            });
           },
           setTaskPriority: async ({ taskId, priority }) => {
             const normalized = normalizeTaskPriority(priority);

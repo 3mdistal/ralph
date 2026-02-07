@@ -26,6 +26,8 @@ export type ConnectOptions = {
   handlers: EventStreamHandlers;
 };
 
+export type DashboardTaskCommand = "queue" | "pause" | "stop" | "satisfy";
+
 export async function fetchControlPlaneState(baseUrl: string, token: string): Promise<ControlPlaneStateV1> {
   const url = new URL("/v1/state", baseUrl);
   let response: Response;
@@ -53,6 +55,45 @@ export async function fetchControlPlaneState(baseUrl: string, token: string): Pr
     return (await response.json()) as ControlPlaneStateV1;
   } catch (error: any) {
     throw new DashboardApiError("invalid_response", error?.message ?? "Invalid JSON response");
+  }
+}
+
+export async function sendControlPlaneTaskCommand(params: {
+  baseUrl: string;
+  token: string;
+  taskId: string;
+  command: DashboardTaskCommand;
+  comment?: string;
+}): Promise<void> {
+  const url = new URL("/v1/commands/task/command", params.baseUrl);
+  let response: Response;
+
+  try {
+    response = await fetch(url.toString(), {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${params.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        taskId: params.taskId,
+        command: params.command,
+        ...(params.comment !== undefined ? { comment: params.comment } : {}),
+      }),
+    });
+  } catch (error: any) {
+    throw new DashboardApiError("network", error?.message ?? "Failed to send task command");
+  }
+
+  if (response.status === 401) {
+    throw new DashboardApiError("unauthorized", "Missing or invalid token");
+  }
+
+  if (!response.ok) {
+    throw new DashboardApiError(
+      "invalid_response",
+      `Unexpected response (${response.status} ${response.statusText})`
+    );
   }
 }
 

@@ -1,42 +1,29 @@
-# Plan: Fix queue/in-progress label flapping on long-lived open PRs (#599)
+# Plan: #37 Dashboard edit endpoints (priority/status)
 
-## Goal
-
-- Stop `ralph:status:queued` <-> `ralph:status:in-progress` oscillation for issues that already have a long-lived open PR and no new operator input.
-- Preserve contract invariant: exactly one `ralph:status:*` label converges, and `queued` remains claimable while “open PR waiting” is not claimable.
-- Reduce GitHub label writes/timeline noise; avoid burning API quota.
-
-## Product Constraints (canonical)
-
-- Status labels are fixed to the `ralph:status:*` set; internal “why” states should be internal metadata (`docs/product/orchestration-contract.md`).
-- `ralph:status:in-progress` includes “waiting on deterministic gates (e.g. CI)”; “open PR waiting” should therefore be stable `in-progress` on GitHub.
-- GitHub label writes are best-effort; convergence matters more than chattiness.
-
-## Assumptions
-
-- Introduce explicit durable status `waiting-on-pr` in task op-state (`tasks.status`) for “open PR exists, waiting”.
-- Map `waiting-on-pr` to GitHub label `ralph:status:in-progress` (no new GitHub-visible status labels).
-- Use SQLite PR snapshots (`prs` table) as the primary “does an open PR exist for this issue?” signal, with a freshness window to avoid indefinite parking on stale data.
+Assumptions (non-interactive defaults):
+- “Status editing” in the dashboard means expressing operator intent via semantic commands that map to GitHub `ralph:cmd:*` labels (per `docs/product/orchestration-contract.md`), not directly setting `ralph:status:*` labels.
+- bwrb is legacy output-only; do not add any new bwrb-dependent write paths for these endpoints.
+- Control-plane “taskId” for GitHub-backed tasks is `github:OWNER/REPO#NUMBER` (existing convention in `src/index.ts`).
 
 ## Checklist
 
-- [x] Unblock gate persistence drift (`ralph_run_gate_results.reason`)
-- [x] Add durable op-state for open-PR wait (`waiting-on-pr`)
-- [x] Park queued tasks on open PR (don’t keep them claimable)
-- [x] Gate stale in-progress sweep by open-PR wait state
-- [x] Make label reconciler respect open-PR wait mapping
-- [x] Remove passive open-PR in-progress writes for passive path
-- [x] Add anti-flap guardrail (single choke point debounce)
-- [x] Tests: no-flap regression + operator override + closed-PR recovery + no-duplicate writes
-- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
-
-## Steps
-
-- [x] Keep startup gate-schema repair covered and aligned with schema updates (`src/__tests__/state-sqlite.test.ts`).
-- [x] Add `waiting-on-pr` to queue status model and map it to `ralph:status:in-progress` label convergence.
-- [x] Park queued tasks with existing open PRs in `RepoWorker.processTask` before planner/build, clearing active ownership/session fields.
-- [x] Gate stale in-progress sweep: skip recovery when op-state is `waiting-on-pr` and open PR snapshot is fresh; allow recovery when snapshot is stale/closed.
-- [x] Add transition debounce guard (in-memory + durable SQLite record) for opposite queued/in-progress transitions; log suppressed transitions.
-- [x] Wire label reconciler to respect `waiting-on-pr` and transition debounce state.
-- [x] Add tests for no-flap regression, operator re-queue behavior, closed-PR recovery, waiting-on-pr label idempotence, and transition debounce core logic.
-- [x] Run gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
+- [x] Review current control-plane API + existing `setTaskPriority` handler; confirm it already uses `ralph:priority:*` labels for GitHub tasks.
+- [x] Add a GitHub-first “status intent” command to the control plane:
+- [x] Extend `src/dashboard/control-plane-server.ts` with `POST /v1/commands/task/command`.
+- [x] Request body: `{ "taskId": string, "command": "queue"|"pause"|"stop"|"satisfy", "comment"?: string }`.
+- [x] Validate JSON + required fields; return `400` on missing/invalid `command`.
+- [x] Add explicit error-to-HTTP mapping so handler validation failures return actionable `4xx` (not generic `500`).
+- [x] Wire through a new handler on `ControlPlaneCommandHandlers` (e.g. `applyTaskCommand`).
+- [x] Implement the daemon handler with good boundaries (avoid growing `src/index.ts`):
+- [x] Extract a focused module (e.g. `src/dashboard/task-command.ts`) that:
+- [x] Parses and validates `taskId` (must be `github:OWNER/REPO#NUMBER`).
+- [x] Validates the command enum and maps it to a `ralph:cmd:*` label internally.
+- [x] Enforces a repo allowlist (must be in configured `config.repos`).
+- [x] Produces an “effect plan” for GitHub writes (labels + optional comment) that the imperative shell executes.
+- [x] Execute the plan using `ensureRalphWorkflowLabelsOnce` + `executeIssueLabelOps` + GitHub REST comment write.
+- [x] Emit a `log.ralph` dashboard event describing the applied command (do not log raw comment text).
+- [x] Add dashboard client API convenience (optional but low-cost): add a function in `src/dashboard/client/api.ts` to call `/v1/commands/task/command`.
+- [x] Tests:
+- [x] Update `src/__tests__/control-plane-server.test.ts` to cover the new route (auth + validation + handler called with parsed fields).
+- [x] Add unit tests for the new parser/validator module (`taskId` parsing, command mapping, repo allowlist, error mapping).
+- [x] Run the dashboard/control-plane test suite (`bun test`) and ensure no new bwrb-write behavior was introduced.

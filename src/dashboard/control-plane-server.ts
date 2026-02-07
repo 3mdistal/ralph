@@ -12,6 +12,7 @@ import {
   serializeStateSnapshot,
   tokensMatch,
 } from "./control-plane-core";
+import { ControlPlaneRequestError, parseTaskCommandRequest } from "./task-command";
 
 export type ControlPlaneStateProvider<TSnapshot> = () => Promise<TSnapshot>;
 
@@ -27,6 +28,7 @@ export type ControlPlaneCommandHandlers = {
     | { id?: string }
     | void;
   setTaskPriority: (params: { taskId: string; priority: string }) => Promise<void> | void;
+  applyTaskCommand?: (params: { taskId: string; command: "queue" | "pause" | "stop" | "satisfy"; comment?: string | null }) => Promise<void> | void;
 };
 
 export type ControlPlaneServerOptions<TSnapshot> = {
@@ -264,11 +266,26 @@ export function startControlPlaneServer<TSnapshot>(
             return jsonResponse(200, { ok: true });
           }
 
+          if (path === "/v1/commands/task/command") {
+            if (!commands.applyTaskCommand) {
+              return jsonError(501, "not_implemented", "Task command control is not enabled");
+            }
+
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const req = parseTaskCommandRequest(parsed.value);
+            await commands.applyTaskCommand({ taskId: req.taskId, command: req.command, comment: req.comment });
+            return jsonResponse(200, { ok: true });
+          }
+
           return jsonError(404, "not_found", "Not found");
         }
 
         return jsonError(404, "not_found", "Not found");
       } catch (error: any) {
+        if (error instanceof ControlPlaneRequestError) {
+          return jsonError(error.status, error.code, error.message);
+        }
         const message = error?.message ?? String(error);
         console.warn(`${LOG_PREFIX} Request failed: ${message}`);
         publishInternalError(options.bus, `Control plane request failed: ${message}`);
