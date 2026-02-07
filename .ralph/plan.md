@@ -1,42 +1,35 @@
-# Plan: Fix queue/in-progress label flapping on long-lived open PRs (#599)
+# Plan: Fix queued/blocked GitHub label parity drift (#598)
 
 ## Goal
 
-- Stop `ralph:status:queued` <-> `ralph:status:in-progress` oscillation for issues that already have a long-lived open PR and no new operator input.
-- Preserve contract invariant: exactly one `ralph:status:*` label converges, and `queued` remains claimable while “open PR waiting” is not claimable.
-- Reduce GitHub label writes/timeline noise; avoid burning API quota.
+- Enforce deterministic convergence: no issue is labeled `ralph:status:queued` on GitHub while local state classifies it as `blocked`.
+- Preserve the single-status invariant: on a successful reconciliation pass, exactly one `ralph:status:*` label is present.
+- Add a regression test (and minimal diagnostics) so parity drift is visible and prevented in CI.
 
-## Product Constraints (canonical)
+## Product Guidance (authoritative for this task)
 
-- Status labels are fixed to the `ralph:status:*` set; internal “why” states should be internal metadata (`docs/product/orchestration-contract.md`).
-- `ralph:status:in-progress` includes “waiting on deterministic gates (e.g. CI)”; “open PR waiting” should therefore be stable `in-progress` on GitHub.
-- GitHub label writes are best-effort; convergence matters more than chattiness.
+- Per issue comment from @3mdistal: run a bounded fresh retry targeting a concrete fix; if no PR is produced, stop retrying and mark blocked with reason `no-pr-after-retry`; reconcile labels to match local state before exit; post a final summary comment with counts before/after parity check.
 
-## Assumptions
+## Key Assumption (chosen to avoid sticky states)
 
-- Introduce explicit durable status `waiting-on-pr` in task op-state (`tasks.status`) for “open PR exists, waiting”.
-- Map `waiting-on-pr` to GitHub label `ralph:status:in-progress` (no new GitHub-visible status labels).
-- Use SQLite PR snapshots (`prs` table) as the primary “does an open PR exist for this issue?” signal, with a freshness window to avoid indefinite parking on stale data.
+- Map local `blocked` (dependency-blocked / non-runnable) to GitHub `ralph:status:in-progress`.
+  - Rationale: `in-progress` explicitly includes “waiting on deterministic gates”; dependency-blocked is “waiting”, and this avoids `paused`/`escalated` semantics that can require explicit operator action.
+  - This satisfies “no `ralph:status:queued` while locally blocked” without introducing a new GitHub-visible `blocked` status.
 
 ## Checklist
 
-- [x] Unblock gate persistence drift (`ralph_run_gate_results.reason`)
-- [x] Add durable op-state for open-PR wait (`waiting-on-pr`)
-- [x] Park queued tasks on open PR (don’t keep them claimable)
-- [x] Gate stale in-progress sweep by open-PR wait state
-- [x] Make label reconciler respect open-PR wait mapping
-- [x] Remove passive open-PR in-progress writes for passive path
-- [x] Add anti-flap guardrail (single choke point debounce)
-- [x] Tests: no-flap regression + operator override + closed-PR recovery + no-duplicate writes
-- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
+- [x] Identify current drift path and update label convergence mapping for `blocked`.
+- [x] Update/extend label reconciler to enforce the new mapping (and remain idempotent under backoff).
+- [x] Add regression tests covering `blocked` label delta and reconcile behavior.
+- [x] Add minimal operator-visible diagnostics (log or status output) for queued-label/local-blocked drift.
+- [x] Update docs only if the chosen mapping needs clarification (no doc change required).
+- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
 
 ## Steps
 
-- [x] Keep startup gate-schema repair covered and aligned with schema updates (`src/__tests__/state-sqlite.test.ts`).
-- [x] Add `waiting-on-pr` to queue status model and map it to `ralph:status:in-progress` label convergence.
-- [x] Park queued tasks with existing open PRs in `RepoWorker.processTask` before planner/build, clearing active ownership/session fields.
-- [x] Gate stale in-progress sweep: skip recovery when op-state is `waiting-on-pr` and open PR snapshot is fresh; allow recovery when snapshot is stale/closed.
-- [x] Add transition debounce guard (in-memory + durable SQLite record) for opposite queued/in-progress transitions; log suppressed transitions.
-- [x] Wire label reconciler to respect `waiting-on-pr` and transition debounce state.
-- [x] Add tests for no-flap regression, operator re-queue behavior, closed-PR recovery, waiting-on-pr label idempotence, and transition debounce core logic.
-- [x] Run gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
+- [x] Change `statusToRalphLabelDelta("blocked", ...)` in `src/github-queue/core.ts` to converge to `ralph:status:in-progress` (remove `queued`/`paused`/`escalated`/etc; add `in-progress` if absent).
+- [x] Ensure the async reconciler tick in `src/github/label-reconciler.ts` uses this mapping so drift self-heals after restart.
+- [x] Update unit tests in `src/__tests__/github-queue-core.test.ts` that currently assert “blocked preserves queued label”.
+- [x] Add a focused test to validate the invariant: when local is `blocked`, the desired label set is not `ralph:status:queued` (and is `ralph:status:in-progress`).
+- [x] Add a small diagnostic counter/log line (e.g. in label reconciler) reporting how many locally-blocked tasks were observed with `ralph:status:queued` before reconciliation.
+- [x] (Optional) fast reconcile trigger after `markTaskBlocked(...)` / `markTaskUnblocked(...)` was not needed after this fix.

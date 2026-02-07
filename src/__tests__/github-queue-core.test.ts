@@ -126,9 +126,9 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
-  test("statusToRalphLabelDelta preserves queued when blocked", () => {
+  test("statusToRalphLabelDelta maps blocked to in-progress from queued", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
-    expect(delta).toEqual({ add: [], remove: [] });
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
   test("statusToRalphLabelDelta preserves in-progress when blocked", () => {
@@ -152,6 +152,11 @@ describe("github queue core", () => {
       add: [],
       remove: ["ralph:status:queued"],
     });
+  });
+
+  test("statusToRalphLabelDelta maps blocked to in-progress when no status label exists", () => {
+    const delta = statusToRalphLabelDelta("blocked", ["bug"]);
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: [] });
   });
 
   test("statusToRalphLabelDelta maps escalated to escalated", () => {
