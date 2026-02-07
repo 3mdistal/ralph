@@ -1,5 +1,5 @@
 import { redactSensitiveText } from "../redaction";
-import { parseTimestampMs, resolveTimeRange } from "../time-range";
+import { parseDurationMs, parseTimestampMs, resolveTimeRange } from "../time-range";
 import {
   getRalphRunDetails,
   initStateDb,
@@ -225,7 +225,31 @@ export async function runRunsCommand(opts: { args: string[] }): Promise<void> {
     const limit = parseLimit(args);
     const sinceRaw = getFlagValue(args, "--since");
     const untilRaw = getFlagValue(args, "--until");
+    const hasSinceFlag = hasFlag(args, "--since");
+    const hasUntilFlag = hasFlag(args, "--until");
     const all = hasFlag(args, "--all");
+
+    if ((hasSinceFlag && !sinceRaw) || (hasUntilFlag && !untilRaw)) {
+      console.error(buildRunsUsage());
+      process.exit(1);
+      return;
+    }
+
+    if (sinceRaw) {
+      const sinceIsAbsolute = parseTimestampMs(sinceRaw, nowMs) != null;
+      const sinceIsDuration = parseDurationMs(sinceRaw) != null;
+      if (!sinceIsAbsolute && !sinceIsDuration) {
+        console.error(buildRunsUsage());
+        process.exit(1);
+        return;
+      }
+    }
+
+    if (untilRaw && parseTimestampMs(untilRaw, nowMs) == null) {
+      console.error(buildRunsUsage());
+      process.exit(1);
+      return;
+    }
 
     let sinceMs: number | null;
     let untilMs: number;
