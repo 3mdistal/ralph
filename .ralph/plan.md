@@ -1,42 +1,82 @@
-# Plan: Fix queue/in-progress label flapping on long-lived open PRs (#599)
+# Plan: Make relationship coverage explicit (complete/partial/unavailable) (#271)
+
+Issue: `https://github.com/3mdistal/ralph/issues/271`
 
 ## Goal
 
-- Stop `ralph:status:queued` <-> `ralph:status:in-progress` oscillation for issues that already have a long-lived open PR and no new operator input.
-- Preserve contract invariant: exactly one `ralph:status:*` label converges, and `queued` remains claimable while “open PR waiting” is not claimable.
-- Reduce GitHub label writes/timeline noise; avoid burning API quota.
+- Replace boolean relationship coverage flags that conflate partial vs unavailable with an explicit enum state.
+- Remove brittle inference of partial coverage from the presence of GitHub signals.
+- Keep dependency/blocking decisions conservative and deterministic.
 
-## Product Constraints (canonical)
+## Product Guidance (from @product)
 
-- Status labels are fixed to the `ralph:status:*` set; internal “why” states should be internal metadata (`docs/product/orchestration-contract.md`).
-- `ralph:status:in-progress` includes “waiting on deterministic gates (e.g. CI)”; “open PR waiting” should therefore be stable `in-progress` on GitHub.
-- GitHub label writes are best-effort; convergence matters more than chattiness.
+- Coverage should be explicit per relationship kind as `complete|partial|unavailable` and documented in the type.
+- Downstream logic must use coverage state directly (no inference from “signals exist”).
+- Be conservative: `partial`/`unavailable` must not accidentally imply “certainly unblocked”.
+- Tests should cover all 3 states, including “partial even when first page is empty”.
 
 ## Assumptions
 
-- Introduce explicit durable status `waiting-on-pr` in task op-state (`tasks.status`) for “open PR exists, waiting”.
-- Map `waiting-on-pr` to GitHub label `ralph:status:in-progress` (no new GitHub-visible status labels).
-- Use SQLite PR snapshots (`prs` table) as the primary “does an open PR exist for this issue?” signal, with a freshness window to avoid indefinite parking on stale data.
+- This enum is not persisted; it remains an in-memory snapshot field.
+- `partial` means: GitHub relationship fetch succeeded but may not represent the full set (pagination or missing pageInfo).
+- `unavailable` means: GitHub relationship fetch could not be obtained (unsupported endpoint/capability or fetch failure).
+- Body-parsed dependency blockers remain a fallback only when GitHub deps coverage is `unavailable` (not when `partial`).
 
 ## Checklist
 
-- [x] Unblock gate persistence drift (`ralph_run_gate_results.reason`)
-- [x] Add durable op-state for open-PR wait (`waiting-on-pr`)
-- [x] Park queued tasks on open PR (don’t keep them claimable)
-- [x] Gate stale in-progress sweep by open-PR wait state
-- [x] Make label reconciler respect open-PR wait mapping
-- [x] Remove passive open-PR in-progress writes for passive path
-- [x] Add anti-flap guardrail (single choke point debounce)
-- [x] Tests: no-flap regression + operator override + closed-PR recovery + no-duplicate writes
-- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
+- [x] Define `RelationshipCoverage` enum/union and update `IssueRelationshipSnapshot.coverage` to use explicit state.
+- [x] Update `GitHubRelationshipProvider` to set `githubDeps`/`githubSubIssues` coverage to `complete|partial|unavailable`.
+- [x] Update relationship signal resolution to:
+  - [x] stop inferring `partial` from signal presence
+  - [x] drive body-fallback + unknown-signal injection from explicit coverage
+- [x] Update parent-verification + child-dossier eligibility to use explicit coverage state.
+- [x] Update/extend tests to cover explicit states (complete/partial/unavailable), including “partial with empty first page”.
+- [x] Ensure sub-issue coverage states are tested end-to-end (provider -> resolver -> eligibility) to avoid drift.
+- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
 
-## Steps
+## Implementation Steps
 
-- [x] Keep startup gate-schema repair covered and aligned with schema updates (`src/__tests__/state-sqlite.test.ts`).
-- [x] Add `waiting-on-pr` to queue status model and map it to `ralph:status:in-progress` label convergence.
-- [x] Park queued tasks with existing open PRs in `RepoWorker.processTask` before planner/build, clearing active ownership/session fields.
-- [x] Gate stale in-progress sweep: skip recovery when op-state is `waiting-on-pr` and open PR snapshot is fresh; allow recovery when snapshot is stale/closed.
-- [x] Add transition debounce guard (in-memory + durable SQLite record) for opposite queued/in-progress transitions; log suppressed transitions.
-- [x] Wire label reconciler to respect `waiting-on-pr` and transition debounce state.
-- [x] Add tests for no-flap regression, operator re-queue behavior, closed-PR recovery, waiting-on-pr label idempotence, and transition debounce core logic.
-- [x] Run gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
+- [x] Update `src/github/issue-relationships.ts`:
+  - add `export type RelationshipCoverage = "complete" | "partial" | "unavailable"`.
+  - change `coverage` to `{ githubDeps: RelationshipCoverage; githubSubIssues: RelationshipCoverage; bodyDeps: boolean }`.
+  - document semantics inline (what each state means and how callers should interpret it).
+
+- [x] Update `src/github/issue-relationships.ts` (`GitHubRelationshipProvider.getSnapshot()`):
+  - initialize `coverage.githubDeps`/`coverage.githubSubIssues` as `"unavailable"`.
+  - when a fetch returns a result, set state via a shared helper (used for deps + sub-issues):
+    - `"complete"` iff `hasNextPage === false`
+    - otherwise `"partial"` (covers `hasNextPage===true` and missing/unknown pageInfo)
+  - keep `coverage.bodyDeps` behavior unchanged.
+
+- [x] Update `src/github/relationship-signals.ts`:
+  - [x] derive `shouldIgnoreBodyDeps` from `coverage.githubDeps !== "unavailable"` (complete or partial).
+  - [x] inject `unknown` for deps when `coverage.githubDeps !== "complete"` and body deps coverage is absent.
+  - [x] inject `unknown` for sub-issues when `coverage.githubSubIssues !== "complete"`.
+  - [x] keep diagnostics (`ignoredBodyBlockers.reason`) aligned with `complete` vs `partial`.
+  - [x] prefer an exhaustive `switch`/branch on `RelationshipCoverage` to avoid future drift.
+
+- [x] Update downstream consumers:
+  - [x] `src/parent-verification/core.ts` — treat non-`complete` sub-issue coverage as ineligible.
+  - [x] `src/child-dossier/core.ts` — treat non-`complete` sub-issue coverage as ineligible.
+
+- [x] Tests:
+  - [x] `src/__tests__/issue-relationships.test.ts` — update assertions to new coverage fields.
+  - [x] `src/__tests__/issue-relationships.test.ts` — provider test matrix for BOTH deps + sub-issues:
+    - `complete` (no next page)
+    - `partial` (next page true, including an empty first-page response)
+    - `unavailable` (REST+GraphQL not supported / 404)
+  - [x] `src/__tests__/relationship-signals.test.ts` — update fixtures and add coverage-state tests:
+    - deps: `githubDeps="partial"` with only body blockers present => body ignored + unknown injected.
+    - sub-issues: `githubSubIssues="partial"` and `"unavailable"` => unknown injected.
+  - [x] `src/__tests__/blocked-sync.test.ts` — add one assertion that `githubSubIssues !== "complete"` keeps outcomes conservative (no accidental unblock/verification triggers) even when no open blockers are present.
+  - [x] Update snapshot coverage literals in `src/__tests__/blocked-sync.test.ts`.
+  - [x] Update snapshot coverage literals in `src/__tests__/parent-verification-core.test.ts`.
+  - [x] Update snapshot coverage literals in `src/__tests__/child-dossier-core.test.ts`.
+  - [x] Update snapshot coverage literals in `src/__tests__/github-queue-list-tasks-by-status.test.ts`.
+  - [ ] Optional: add a small shared snapshot builder in tests to reduce repetitive `coverage` literals.
+
+- [x] Run gates locally:
+  - [x] `bun test`
+  - [x] `bun run typecheck`
+  - [x] `bun run build`
+  - [x] `bun run knip`
