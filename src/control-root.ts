@@ -39,7 +39,7 @@ export function resolveCanonicalDaemonRegistryPath(opts?: { homeDir?: string }):
   return join(resolveCanonicalControlRoot(opts), "daemon-registry.json");
 }
 
-export function resolveLegacyStateDirCandidates(opts?: { homeDir?: string; xdgStateHome?: string }): string[] {
+function resolveLegacyStateDirCandidates(opts?: { homeDir?: string; xdgStateHome?: string }): string[] {
   const xdg = opts?.xdgStateHome?.trim() ?? process.env.XDG_STATE_HOME?.trim() ?? "";
   const explicitHome =
     opts && Object.prototype.hasOwnProperty.call(opts, "homeDir") && opts.homeDir !== undefined

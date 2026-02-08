@@ -58,7 +58,7 @@ export function resolveControlFilePath(
   return resolveCanonicalControlFilePath({ homeDir });
 }
 
-export function resolveControlFilePathCandidates(
+function resolveControlFilePathCandidates(
   homeDir?: string,
   xdgStateHome: string | undefined = process.env.XDG_STATE_HOME
 ): string[] {
