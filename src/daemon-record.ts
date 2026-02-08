@@ -30,7 +30,7 @@ function resolveTmpStateDir(): string {
   return join("/tmp", "ralph", String(uid));
 }
 
-function resolveStateDir(opts?: { homeDir?: string; xdgStateHome?: string }): string {
+function resolveLegacyStateDir(opts?: { homeDir?: string; xdgStateHome?: string }): string {
   const trimmedStateHome = opts?.xdgStateHome?.trim() ?? process.env.XDG_STATE_HOME?.trim();
   if (trimmedStateHome) return join(trimmedStateHome, "ralph");
 
@@ -40,18 +40,29 @@ function resolveStateDir(opts?: { homeDir?: string; xdgStateHome?: string }): st
   return resolveTmpStateDir();
 }
 
+function resolveCanonicalControlRoot(opts?: { homeDir?: string }): string {
+  const home = opts?.homeDir?.trim() || resolveHomeDirFallback();
+  if (home) return join(home, ".ralph", "control");
+  return join(resolveTmpStateDir(), "control");
+}
+
 export function resolveDaemonRecordPath(opts?: { homeDir?: string; xdgStateHome?: string }): string {
-  return join(resolveStateDir(opts), "daemon.json");
+  return join(resolveCanonicalControlRoot({ homeDir: opts?.homeDir }), "daemon.json");
 }
 
-function resolveDaemonRecordPathCandidates(opts?: { homeDir?: string; xdgStateHome?: string }): string[] {
-  const primary = resolveDaemonRecordPath(opts);
-  const homeFallback = resolveDaemonRecordPath({ homeDir: opts?.homeDir, xdgStateHome: "" });
+function resolveLegacyDaemonRecordPath(opts?: { homeDir?: string; xdgStateHome?: string }): string {
+  return join(resolveLegacyStateDir(opts), "daemon.json");
+}
+
+export function resolveDaemonRecordPathCandidates(opts?: { homeDir?: string; xdgStateHome?: string }): string[] {
+  const canonical = resolveDaemonRecordPath(opts);
+  const legacyPrimary = resolveLegacyDaemonRecordPath(opts);
+  const homeFallback = resolveLegacyDaemonRecordPath({ homeDir: opts?.homeDir, xdgStateHome: "" });
   const tmpFallback = join(resolveTmpStateDir(), "daemon.json");
-  return Array.from(new Set([primary, homeFallback, tmpFallback]));
+  return Array.from(new Set([canonical, legacyPrimary, homeFallback, tmpFallback]));
 }
 
-function isPidAlive(pid: number): boolean {
+export function isPidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -85,7 +96,7 @@ function assertSafeRecordFile(path: string): void {
   }
 }
 
-function parseRecord(raw: string): DaemonRecord | null {
+function parseDaemonRecord(raw: string): DaemonRecord | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -124,19 +135,20 @@ export function readDaemonRecord(opts?: {
   xdgStateHome?: string;
   log?: (message: string) => void;
 }): DaemonRecord | null {
-  const primaryPath = resolveDaemonRecordPath(opts);
-  if (existsSync(primaryPath)) {
+  const candidates = resolveDaemonRecordPathCandidates(opts);
+  const canonicalPath = resolveDaemonRecordPath(opts);
+  if (existsSync(canonicalPath)) {
     try {
-      assertSafeRecordFile(primaryPath);
-      const raw = readFileSync(primaryPath, "utf8");
-      const record = parseRecord(raw);
+      assertSafeRecordFile(canonicalPath);
+      const raw = readFileSync(canonicalPath, "utf8");
+      const record = parseDaemonRecord(raw);
       if (record) return record;
     } catch (e: any) {
-      opts?.log?.(`[ralph] Failed to read daemon record ${primaryPath}: ${e?.message ?? String(e)}`);
+      opts?.log?.(`[ralph] Failed to read daemon record ${canonicalPath}: ${e?.message ?? String(e)}`);
     }
   }
 
-  const fallbacks = resolveDaemonRecordPathCandidates(opts).filter((p) => p !== primaryPath);
+  const fallbacks = candidates.filter((p) => p !== canonicalPath);
   const parsed: DaemonRecord[] = [];
 
   for (const path of fallbacks) {
@@ -144,7 +156,7 @@ export function readDaemonRecord(opts?: {
     try {
       assertSafeRecordFile(path);
       const raw = readFileSync(path, "utf8");
-      const record = parseRecord(raw);
+      const record = parseDaemonRecord(raw);
       if (record) parsed.push(record);
     } catch (e: any) {
       opts?.log?.(`[ralph] Failed to read daemon record ${path}: ${e?.message ?? String(e)}`);
@@ -166,6 +178,17 @@ export function readDaemonRecord(opts?: {
   });
 
   return pool[0] ?? null;
+}
+
+export function readDaemonRecordAtPath(path: string): DaemonRecord | null {
+  if (!existsSync(path)) return null;
+  try {
+    assertSafeRecordFile(path);
+    const raw = readFileSync(path, "utf8");
+    return parseDaemonRecord(raw);
+  } catch {
+    return null;
+  }
 }
 
 export function writeDaemonRecord(record: DaemonRecord, opts?: { homeDir?: string; xdgStateHome?: string }): void {

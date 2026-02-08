@@ -73,6 +73,12 @@ export type StatusDaemonSnapshot = {
   command: string[] | null;
 };
 
+export type StatusDaemonDiscoverySnapshot = {
+  state: "live" | "missing" | "stale" | "conflict";
+  canonicalPath: string;
+  recordPaths: string[];
+};
+
 export type StatusTriageRun = {
   runId: string;
   repo: string;
@@ -101,6 +107,7 @@ export type StatusSnapshot = {
   queue: StatusQueueSnapshot;
   parity?: StatusQueueParitySnapshot;
   daemon: StatusDaemonSnapshot | null;
+  daemonDiscovery?: StatusDaemonDiscoverySnapshot;
   controlProfile: string | null;
   activeProfile: string | null;
   throttle: unknown;

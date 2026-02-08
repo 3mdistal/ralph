@@ -1,0 +1,101 @@
+import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
+import { tmpdir } from "os";
+
+import { classifyDaemonCandidates, discoverDaemon } from "../daemon-discovery";
+import { resolveDaemonRecordPath } from "../daemon-record";
+
+function writeRecord(path: string, opts: { daemonId: string; pid: number; startedAt?: string }): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify(
+      {
+        version: 1,
+        daemonId: opts.daemonId,
+        pid: opts.pid,
+        startedAt: opts.startedAt ?? new Date().toISOString(),
+        ralphVersion: "test",
+        command: ["bun", "src/index.ts"],
+        cwd: process.cwd(),
+        controlFilePath: "/tmp/control.json",
+      },
+      null,
+      2
+    )
+  );
+}
+
+describe("daemon discovery", () => {
+  let priorHome: string | undefined;
+  let priorXdg: string | undefined;
+  const tempDirs: string[] = [];
+
+  beforeEach(() => {
+    priorHome = process.env.HOME;
+    priorXdg = process.env.XDG_STATE_HOME;
+  });
+
+  afterEach(() => {
+    if (priorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = priorHome;
+
+    if (priorXdg === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = priorXdg;
+
+    for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+    tempDirs.length = 0;
+  });
+
+  test("multiple live records fail closed as conflict", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-discovery-home-"));
+    const xdg = mkdtempSync(join(tmpdir(), "ralph-discovery-xdg-"));
+    tempDirs.push(home, xdg);
+    process.env.HOME = home;
+    process.env.XDG_STATE_HOME = xdg;
+
+    writeRecord(resolveDaemonRecordPath(), { daemonId: "d_canonical", pid: process.pid });
+    writeRecord(join(xdg, "ralph", "daemon.json"), { daemonId: "d_legacy", pid: process.pid });
+
+    const result = discoverDaemon({ healStale: false });
+    expect(result.state).toBe("conflict");
+    expect(result.candidates[0]?.isCanonical).toBe(true);
+  });
+
+  test("stale record is detected and heal renames file", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-discovery-home-"));
+    tempDirs.push(home);
+    process.env.HOME = home;
+
+    const canonical = resolveDaemonRecordPath();
+    writeRecord(canonical, { daemonId: "d_stale", pid: 999_999_991 });
+
+    const before = discoverDaemon({ healStale: false });
+    expect(before.state).toBe("stale");
+
+    const after = discoverDaemon({ healStale: true });
+    expect(after.state).toBe("stale");
+    expect(after.healedPaths.length).toBeGreaterThan(0);
+  });
+
+  test("live legacy record is discovered when canonical missing", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-discovery-home-"));
+    const xdg = mkdtempSync(join(tmpdir(), "ralph-discovery-xdg-"));
+    tempDirs.push(home, xdg);
+    process.env.HOME = home;
+    process.env.XDG_STATE_HOME = xdg;
+
+    writeRecord(join(xdg, "ralph", "daemon.json"), { daemonId: "d_legacy_live", pid: process.pid });
+
+    const result = discoverDaemon({ healStale: false });
+    expect(result.state).toBe("live");
+    expect(result.live?.record.daemonId).toBe("d_legacy_live");
+  });
+
+  test("classifier returns missing for empty candidate set", () => {
+    const classified = classifyDaemonCandidates({ canonicalPath: "/tmp/daemon.json", candidates: [] });
+    expect(classified.state).toBe("missing");
+    expect(classified.live).toBeNull();
+  });
+});

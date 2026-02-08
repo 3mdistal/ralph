@@ -1,6 +1,6 @@
 import { getConfig, getRequestedOpencodeProfileName, isOpencodeProfilesEnabled, listOpencodeProfileNames } from "../config";
 import { readControlStateSnapshot, type DaemonMode } from "../drain";
-import { readDaemonRecord } from "../daemon-record";
+import { discoverDaemon } from "../daemon-discovery";
 import { getEscalationsByStatus } from "../escalation-notes";
 import { getSessionNowDoing } from "../live-status";
 import { resolveOpencodeProfileForNewWork } from "../opencode-auto-profile";
@@ -91,7 +91,8 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
   const queueState = getQueueBackendStateWithLabelHealth();
   const parity = buildQueueParitySnapshot(config.repos.map((repo) => repo.name));
 
-  const daemonRecord = readDaemonRecord();
+  const daemonDiscovery = discoverDaemon({ healStale: false });
+  const daemonRecord = daemonDiscovery.state === "live" ? daemonDiscovery.live?.record ?? null : null;
   const daemon = daemonRecord
     ? {
         daemonId: daemonRecord.daemonId ?? null,
@@ -211,6 +212,11 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
     },
     parity,
     daemon,
+    daemonDiscovery: {
+      state: daemonDiscovery.state,
+      canonicalPath: daemonDiscovery.canonicalPath,
+      recordPaths: daemonDiscovery.candidates.map((entry) => entry.path),
+    },
     controlProfile: controlProfile || null,
     activeProfile: resolvedProfile ?? null,
     throttle: throttle.snapshot,
@@ -302,7 +308,8 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   const queueState = getQueueBackendStateWithLabelHealth();
   const parity = buildQueueParitySnapshot(config.repos.map((repo) => repo.name));
 
-  const daemonRecord = readDaemonRecord();
+  const daemonDiscovery = discoverDaemon({ healStale: false });
+  const daemonRecord = daemonDiscovery.state === "live" ? daemonDiscovery.live?.record ?? null : null;
   const daemon = daemonRecord
     ? {
         daemonId: daemonRecord.daemonId ?? null,
@@ -439,6 +446,11 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       },
       parity,
       daemon,
+      daemonDiscovery: {
+        state: daemonDiscovery.state,
+        canonicalPath: daemonDiscovery.canonicalPath,
+        recordPaths: daemonDiscovery.candidates.map((entry) => entry.path),
+      },
       controlProfile: controlProfile || null,
       activeProfile: resolvedProfile ?? null,
       throttle: throttle.snapshot,
@@ -537,6 +549,14 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   if (daemon) {
     const version = daemon.version ?? "unknown";
     console.log(`Daemon: id=${daemon.daemonId ?? "unknown"} pid=${daemon.pid ?? "unknown"} version=${version}`);
+  } else {
+    if (daemonDiscovery.state === "stale") {
+      console.log("Daemon: stale registry record(s) detected (no live PID)");
+    } else if (daemonDiscovery.state === "conflict") {
+      console.log("Daemon: conflicting live daemon records detected");
+    } else {
+      console.log("Daemon: not running");
+    }
   }
 
   if (opts.drain.pauseRequested) {
