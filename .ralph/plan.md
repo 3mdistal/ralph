@@ -1,6 +1,6 @@
 # Plan: Trace bundle exporter for sandbox runs (#254)
 
-This file is a lightweight scratch plan used during agent work.
+Assumption (based on prefetched dossier + GitHub state): sub-issues #561-#565 are already implemented and closed; remaining work is admin closeout with deterministic evidence.
 
 - Persist a run-scoped trace directory keyed by `runId` with worker/tool timeline and GitHub request ids.
 - Add `sandbox:collect` to package logs + manifest + key links into one folder.
