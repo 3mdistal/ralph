@@ -38,7 +38,7 @@ describe("GitHub queue label bootstrap", () => {
   test("ensures workflow labels during initial poll", async () => {
     await writeJson(getRalphConfigJsonPath(), {
       queueBackend: "github",
-      repos: [{ name: "3mdistal/bwrb", path: "/tmp/bwrb" }],
+      repos: [{ name: "3mdistal/ralph", path: "/tmp/ralph" }],
     });
 
     const cfgMod = await import("../config");
@@ -66,6 +66,6 @@ describe("GitHub queue label bootstrap", () => {
     });
 
     await driver.initialPoll();
-    expect(ensureCalls).toEqual(["3mdistal/bwrb"]);
+    expect(ensureCalls).toEqual(["3mdistal/ralph"]);
   });
 });
