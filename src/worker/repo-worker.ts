@@ -120,12 +120,6 @@ import {
   formatMergeConflictPaths,
 } from "../merge-conflict-recovery";
 import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "../github/watchdog-writeback";
-import { buildLoopTripDetails } from "../loop-detection/format";
-import {
-  computeLoopTriageSignature,
-  decideLoopTripAction,
-  parseLoopTriageMarker,
-} from "../loop-triage/core";
 import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
 import { classifyOpencodeFailure } from "../opencode-error-classifier";
 import { derivePrCreateEscalationReason } from "./pr-create-escalation-reason";
@@ -142,7 +136,6 @@ import type { DashboardEventContext } from "../dashboard/publisher";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-recording-session-adapter";
 import { redactHomePathForDisplay } from "../redaction";
 import { buildGhErrorSearchText, formatGhError as formatGhErrorShared } from "./gh-error-format";
-import { isSafeSessionId } from "../session-id";
 import {
   createContextRecoveryAdapter as createContextRecoveryAdapterImpl,
   withDashboardSessionOptions as withDashboardSessionOptionsImpl,
@@ -296,6 +289,12 @@ import {
 } from "./worktree-cleanup";
 import { writeEscalationWriteback as writeEscalationWritebackImpl } from "./escalation";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
+import {
+  buildLoopTriagePrompt as buildLoopTriagePromptImpl,
+  readLoopTriageEvents as readLoopTriageEventsImpl,
+  readLoopTriageLogTail as readLoopTriageLogTailImpl,
+  runLoopTripLane,
+} from "./lanes/loop-triage";
 import type { ThrottleAdapter } from "./ports";
 
 function prBodyClosesIssue(body: string, issueNumber: string): boolean {
@@ -420,10 +419,6 @@ const MERGE_CONFLICT_COMMENT_SCAN_LIMIT = 50;
 const MERGE_CONFLICT_COMMENT_MIN_EDIT_MS = 60_000;
 const MERGE_CONFLICT_WAIT_TIMEOUT_MS = 10 * 60_000;
 const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
-const LOOP_TRIAGE_EVENTS_LIMIT = 30;
-const LOOP_TRIAGE_LOG_LINES_LIMIT = 40;
-const LOOP_TRIAGE_NUDGE_MAX_CHARS = 600;
-
 const CI_REMEDIATION_BACKOFF_BASE_MS = 30_000;
 const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 
@@ -5119,54 +5114,11 @@ export class RepoWorker {
   }
 
   private async readLoopTriageEvents(sessionId: string, limit: number): Promise<string[]> {
-    if (!sessionId || !isSafeSessionId(sessionId)) return [];
-    try {
-      const raw = await readFile(getSessionEventsPath(sessionId), "utf8");
-      const rows = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-      const selected: string[] = [];
-
-      for (const line of rows) {
-        try {
-          const event = JSON.parse(line) as any;
-          const type = String(event?.type ?? "");
-          if (!["tool-start", "step-start", "run-start", "tool-end", "loop-trip"].includes(type)) continue;
-          selected.push(
-            sanitizeEscalationReason(
-              redactSensitiveText(
-                JSON.stringify({
-                  type,
-                  ts: event?.ts,
-                  step: event?.step,
-                  title: event?.title,
-                  toolName: event?.toolName,
-                  argsPreview: event?.argsPreview,
-                  callId: event?.callId,
-                })
-              )
-            )
-          );
-        } catch {
-          // ignore malformed lines
-        }
-      }
-
-      return selected.slice(Math.max(0, selected.length - limit));
-    } catch {
-      return [];
-    }
+    return await readLoopTriageEventsImpl({ sessionId, limit });
   }
 
   private async readLoopTriageLogTail(path: string | undefined, maxLines: number): Promise<string[]> {
-    const filePath = path?.trim();
-    if (!filePath || !existsSync(filePath)) return [];
-    try {
-      const raw = await readFile(filePath, "utf8");
-      const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-      const tail = lines.slice(Math.max(0, lines.length - maxLines));
-      return tail.map((line) => sanitizeEscalationReason(redactSensitiveText(line))).filter(Boolean);
-    } catch {
-      return [];
-    }
+    return await readLoopTriageLogTailImpl({ path, maxLines });
   }
 
   private buildLoopTriagePrompt(params: {
@@ -5174,281 +5126,44 @@ export class RepoWorker {
     bundle: string;
     recommendedGateCommand: string;
   }): string {
-    const gate = params.recommendedGateCommand.trim() || "bun test";
-    return [
-      "Loop triage prompt v1",
-      "Decide the safest next action after loop detection tripped.",
-      "Prefer progress: restart/resume if plausible, escalate only when needed.",
-      "",
-      `Stage: ${params.stage}`,
-      `Recommended deterministic gate: ${gate}`,
-      "",
-      "Compact context bundle:",
-      params.bundle,
-      "",
-      "Output instructions:",
-      "- Return concise reasoning.",
-      "- Final line must be exactly one marker:",
-      'RALPH_LOOP_TRIAGE: {"version":1,"decision":"resume-existing|restart-new-agent|restart-ci-debug|escalate","rationale":"...","nudge":"..."}',
-    ].join("\n");
+    return buildLoopTriagePromptImpl(params);
   }
 
   private async handleLoopTrip(task: AgentTask, cacheKey: string, stage: string, result: SessionResult): Promise<AgentRun> {
-    const trip = result.loopTrip;
-    const sessionId = result.sessionId || task["session-id"]?.trim() || "";
-    const worktreePath = task["worktree-path"]?.trim() || "";
-    const issueMatch = task.issue.match(/#(\d+)$/);
-    const issueNumber = issueMatch?.[1] ?? "";
-
-    const reason = trip ? `Loop detection tripped: ${trip.reason} (${stage})` : `Loop detection tripped (${stage})`;
-
-    let fallbackTouchedFiles: string[] | null = null;
-    if (trip && trip.metrics.topFiles.length === 0 && worktreePath) {
-      try {
-        const names = (await $`git diff --name-only`.cwd(worktreePath).quiet()).stdout
-          .toString()
-          .split("\n")
-          .map((v: string) => v.trim())
-          .filter(Boolean);
-        fallbackTouchedFiles = names.slice(0, 10);
-      } catch {
-        // ignore
-      }
-    }
-
-    const loopCfg = getRepoLoopDetectionConfig(this.repo);
-    const recommendedGateCommand = loopCfg?.recommendedGateCommand ?? "bun test";
-    const loopDetails =
-      trip != null
-        ? buildLoopTripDetails({
-            trip,
-            recommendedGateCommand,
-            lastDiagnosticSnippet: result.output,
-            fallbackTouchedFiles,
-          })
-        : "";
-
-    const eventTail = await this.readLoopTriageEvents(sessionId, LOOP_TRIAGE_EVENTS_LIMIT);
-    const runLogTail = await this.readLoopTriageLogTail(task["run-log-path"], LOOP_TRIAGE_LOG_LINES_LIMIT);
-    const fallbackOutputTail = result.output
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .slice(-LOOP_TRIAGE_LOG_LINES_LIMIT)
-      .map((line) => sanitizeEscalationReason(redactSensitiveText(line)));
-
-    let prSnapshot = "PR status: (no open PR detected)";
-    let deterministicCiDebug = false;
-    try {
-      if (issueNumber) {
-        const existingPr = await this.getIssuePrResolution(issueNumber);
-        if (existingPr.selectedUrl) {
-          const { checks: requiredChecks } = await this.resolveRequiredChecksForMerge();
-          const prStatus = await this.getPullRequestChecks(existingPr.selectedUrl);
-          const summary = summarizeRequiredChecks(prStatus.checks, requiredChecks);
-          deterministicCiDebug = summary.status === "failure";
-          const lines = summary.required.slice(0, 8).map((check) => {
-            const detailsUrl = check.detailsUrl ? ` (${check.detailsUrl})` : "";
-            return `- ${check.name}: ${check.rawState}${detailsUrl}`;
-          });
-          prSnapshot = [
-            `PR: ${existingPr.selectedUrl}`,
-            `Required checks: ${summary.status}`,
-            ...(lines.length > 0 ? lines : ["- (no required checks configured)"]),
-          ].join("\n");
-        }
-      }
-    } catch (error: any) {
-      prSnapshot = `PR status lookup failed: ${this.formatGhError(error)}`;
-    }
-
-    const signature = computeLoopTriageSignature({ stage, trip });
-    const maxAttempts = this.resolveLoopTriageAttempts();
-    const issueNumberValue = Number.parseInt(issueNumber, 10);
-    const priorAttempt =
-      issueNumber && Number.isFinite(issueNumberValue)
-        ? getLoopTriageAttempt({ repo: this.repo, issueNumber: issueNumberValue, signature })
-        : null;
-    const priorAttempts = priorAttempt?.attemptCount ?? 0;
-
-    const bundle = sanitizeEscalationReason(
-      [
-        loopDetails || "Loop details unavailable.",
-        "",
-        "Recent events (bounded):",
-        ...(eventTail.length > 0 ? eventTail.map((line) => `- ${line}`) : ["- (none captured)"]),
-        "",
-        "Recent stderr/output tail (bounded):",
-        ...((runLogTail.length > 0 ? runLogTail : fallbackOutputTail).map((line) => `- ${line}`)),
-        "",
-        prSnapshot,
-      ].join("\n")
-    );
-
-    let parseResult = parseLoopTriageMarker("RALPH_LOOP_TRIAGE: {\"version\":1,\"decision\":\"escalate\",\"rationale\":\"deterministic default\",\"nudge\":\"escalate\"}");
-    if (!deterministicCiDebug) {
-      const prompt = this.buildLoopTriagePrompt({ stage, bundle, recommendedGateCommand });
-      const triageRepoPath = existsSync(worktreePath) ? worktreePath : this.repoPath;
-      const triageResult = await this.session.runAgent(triageRepoPath, "loop-triage", prompt, {
-        repo: this.repo,
-        cacheKey,
-        introspection: {
-          repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 0,
-          stepTitle: "loop-triage",
-        },
-      });
-      parseResult = parseLoopTriageMarker(triageResult.output);
-      if (!triageResult.success && !parseResult.ok) {
-        parseResult = { ok: false, error: `Loop triage run failed: ${sanitizeEscalationReason(triageResult.output)}` };
-      }
-    }
-
-    const decision = decideLoopTripAction({
-      deterministicCiDebug,
-      parse: parseResult,
-      priorAttempts,
-      maxAttempts,
-      canResumeExisting: Boolean(sessionId),
-    });
-
-    if (decision.action !== "escalate") {
-      const nowIso = new Date().toISOString();
-      if (issueNumber && Number.isFinite(issueNumberValue)) {
-        const nextAttempt = bumpLoopTriageAttempt({
-          repo: this.repo,
-          issueNumber: issueNumberValue,
-          signature,
-          decision: decision.action,
-          rationale: decision.rationale,
-        });
-        if (!shouldAllowLoopTriageAttempt(nextAttempt.attemptCount, maxAttempts)) {
-          decision.action = "escalate";
-          decision.reasonCode = "budget_exhausted";
-          decision.rationale = `Loop-triage budget exhausted (${nextAttempt.attemptCount}/${maxAttempts})`;
-        }
-      }
-
-      if (decision.action === "resume-existing") {
-        const nudge = decision.nudge.slice(0, LOOP_TRIAGE_NUDGE_MAX_CHARS);
-        const details = sanitizeEscalationReason(bundle.slice(0, 1200));
-        await this.queue.updateTaskStatus(task, "queued", {
-          "session-id": sessionId,
-          "blocked-source": "loop-triage",
-          "blocked-reason": decision.rationale,
-          "blocked-details": `${nudge}\n\n${details}`,
-          "blocked-at": nowIso,
-          "blocked-checked-at": nowIso,
-        });
-        try {
-          await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
-        } catch {
-          // ignore
-        }
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "failed",
-          sessionId: sessionId || undefined,
-          escalationReason: `Loop triage: ${decision.action} (${decision.reasonCode})`,
-        };
-      }
-
-      const queueFields: Record<string, string> = {
-        "session-id": "",
-        "blocked-source": "",
-        "blocked-reason": "",
-        "blocked-details": "",
-        "blocked-at": "",
-        "blocked-checked-at": "",
-      };
-      await this.queue.updateTaskStatus(task, "queued", queueFields);
-      try {
-        await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
-      } catch {
-        // ignore
-      }
-      return {
-        taskName: task.name,
-        repo: this.repo,
-        outcome: "failed",
-        sessionId: sessionId || undefined,
-        escalationReason: `Loop triage: ${decision.action} (${decision.reasonCode})`,
-      };
-    }
-
-    const escalateReason = `${reason}; triage=${decision.action} code=${decision.reasonCode}`;
-    const details = sanitizeEscalationReason(
-      [
-        loopDetails,
-        "",
-        `Triage decision: ${decision.action}`,
-        `Triage rationale: ${decision.rationale}`,
-        `Triage source: ${decision.source}`,
-        `Signature: ${signature}`,
-        `Attempts: ${priorAttempts}/${maxAttempts}`,
-        decision.parseError ? `Parse error: ${decision.parseError}` : "",
-        "",
-        "Context bundle (bounded):",
-        bundle,
-      ]
-        .filter(Boolean)
-        .join("\n")
-    );
-
-    const escalationFields: Record<string, string> = {};
-    if (sessionId) escalationFields["session-id"] = sessionId;
-
-    const wasEscalated = task.status === "escalated";
-    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
-    if (escalated) {
-      applyTaskPatch(task, "escalated", escalationFields);
-    }
-
-    const githubCommentUrl = await this.writeEscalationWriteback(task, {
-      reason: escalateReason,
-      details,
-      escalationType: "other",
-    });
-
-    await this.notify.notifyEscalation({
-      taskName: task.name,
-      taskFileName: task._name,
-      taskPath: task._path,
-      issue: task.issue,
+    return await runLoopTripLane({
       repo: this.repo,
-      scope: task.scope,
-      priority: task.priority,
-      sessionId: sessionId || undefined,
-      reason: escalateReason,
-      escalationType: "other",
-      githubCommentUrl: githubCommentUrl ?? undefined,
-      planOutput: result.output,
+      repoPath: this.repoPath,
+      task,
+      cacheKey,
+      stage,
+      result,
+      readLoopTriageEvents: async (sessionId, limit) => await this.readLoopTriageEvents(sessionId, limit),
+      readLoopTriageLogTail: async (path, maxLines) => await this.readLoopTriageLogTail(path, maxLines),
+      buildLoopTriagePrompt: (args) => this.buildLoopTriagePrompt(args),
+      getIssuePrResolution: async (issueNumber) => await this.getIssuePrResolution(issueNumber),
+      resolveRequiredChecksForMerge: async () => await this.resolveRequiredChecksForMerge(),
+      getPullRequestChecks: async (prUrl) => await this.getPullRequestChecks(prUrl),
+      resolveLoopTriageAttempts: () => this.resolveLoopTriageAttempts(),
+      updateTaskStatus: async (laneTask, status, fields) => await this.queue.updateTaskStatus(laneTask, status, fields),
+      applyTaskPatch: (laneTask, status, fields) => applyTaskPatch(laneTask, status, fields),
+      runLoopTriageAgent: async (repoPath, prompt, args) =>
+        await this.session.runAgent(repoPath, "loop-triage", prompt, {
+          repo: args.repo,
+          cacheKey: args.cacheKey,
+          introspection: {
+            repo: args.repo,
+            issue: args.issue,
+            taskName: args.taskName,
+            step: 0,
+            stepTitle: "loop-triage",
+          },
+        }),
+      getRalphXdgCacheHome: (repo, key) => this.session.getRalphXdgCacheHome(repo, key),
+      formatGhError: (error) => this.formatGhError(error),
+      writeEscalationWriteback: async (laneTask, args) => await this.writeEscalationWriteback(laneTask, args),
+      notifyEscalation: async (args) => await this.notify.notifyEscalation(args),
+      recordEscalatedRunNote: async (laneTask, args) => await this.recordEscalatedRunNote(laneTask, args),
     });
-
-    if (escalated && !wasEscalated) {
-      await this.recordEscalatedRunNote(task, {
-        reason: escalateReason,
-        sessionId: sessionId || undefined,
-        details,
-      });
-    }
-
-    try {
-      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-
-    return {
-      taskName: task.name,
-      repo: this.repo,
-      outcome: "escalated",
-      sessionId: sessionId || undefined,
-      escalationReason: escalateReason,
-    };
   }
 
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string; repoSlot?: number | null }): Promise<AgentRun> {
