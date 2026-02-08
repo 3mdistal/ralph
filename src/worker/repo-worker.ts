@@ -140,6 +140,7 @@ import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "../das
 import type { DashboardEventContext } from "../dashboard/publisher";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-recording-session-adapter";
 import { redactHomePathForDisplay } from "../redaction";
+import { buildGhErrorSearchText, formatGhError as formatGhErrorShared } from "./gh-error-format";
 import { isSafeSessionId } from "../session-id";
 import {
   createContextRecoveryAdapter as createContextRecoveryAdapterImpl,
@@ -2474,56 +2475,11 @@ export class RepoWorker {
   }
 
   private getGhErrorSearchText(error: any): string {
-    const parts: string[] = [];
-    const message = String(error?.message ?? "").trim();
-    const stderr = this.stringifyGhOutput(error?.stderr);
-    const stdout = this.stringifyGhOutput(error?.stdout);
-
-    if (message) parts.push(message);
-    if (stderr) parts.push(stderr);
-    if (stdout) parts.push(stdout);
-
-    return parts.join("\n").trim();
-  }
-
-  private stringifyGhOutput(value: unknown): string {
-    if (value === null || value === undefined) return "";
-    if (typeof value === "string") return value.trim();
-    if (typeof (value as any)?.toString === "function") {
-      try {
-        return String((value as any).toString()).trim();
-      } catch {
-        return "";
-      }
-    }
-    try {
-      return String(value).trim();
-    } catch {
-      return "";
-    }
+    return buildGhErrorSearchText(error);
   }
 
   private formatGhError(error: any): string {
-    const lines: string[] = [];
-
-    const command = String(error?.ghCommand ?? error?.command ?? "").trim();
-    const redactedCommand = command ? redactSensitiveText(command).trim() : "";
-    if (redactedCommand) lines.push(`Command: ${redactedCommand}`);
-
-    const exitCodeRaw = error?.exitCode ?? error?.code ?? null;
-    const exitCode = exitCodeRaw === null || exitCodeRaw === undefined ? "" : String(exitCodeRaw).trim();
-    if (exitCode) lines.push(`Exit code: ${exitCode}`);
-
-    const message = String(error?.message ?? "").trim();
-    if (message) lines.push(message);
-
-    const stderr = this.stringifyGhOutput(error?.stderr);
-    const stdout = this.stringifyGhOutput(error?.stdout);
-
-    if (stderr) lines.push("", "stderr:", summarizeForNote(stderr, 1600));
-    if (stdout) lines.push("", "stdout:", summarizeForNote(stdout, 1600));
-
-    return lines.join("\n").trim();
+    return formatGhErrorShared(error);
   }
 
   private buildMergeConflictPrompt(prUrl: string, baseRefName: string | null, botBranch: string): string {
