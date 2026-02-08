@@ -7,7 +7,6 @@ import { join } from "path";
 import { __resetConfigForTests } from "../config";
 import { writeDaemonRecord } from "../daemon-record";
 import { __resetQueueBackendStateForTests } from "../queue-backend";
-import { __resetBwrbRunnerForTests, __setBwrbRunnerForTests } from "../queue";
 import { closeStateDbForTests, initStateDb } from "../state";
 import { runStatusCommand } from "../commands/status";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
@@ -17,16 +16,6 @@ let priorHome: string | undefined;
 let priorStateDb: string | undefined;
 let priorXdgStateHome: string | undefined;
 let releaseLock: (() => void) | null = null;
-
-function createMockBwrbRunner() {
-  return (_strings: TemplateStringsArray, ..._values: unknown[]) => {
-    const runner = {
-      cwd: () => runner,
-      quiet: async () => ({ stdout: Buffer.from("[]") }),
-    };
-    return runner;
-  };
-}
 
 async function setupEnv(): Promise<void> {
   priorHome = process.env.HOME;
@@ -38,22 +27,17 @@ async function setupEnv(): Promise<void> {
   process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
   process.env.XDG_STATE_HOME = join(homeDir, "xdg-state");
 
-  const vaultDir = join(homeDir, "vault");
-  await mkdir(join(vaultDir, ".bwrb"), { recursive: true });
-  await writeFile(join(vaultDir, ".bwrb", "schema.json"), "{}", "utf8");
 
   await mkdir(join(homeDir, ".ralph"), { recursive: true });
-  await writeFile(join(homeDir, ".ralph", "config.json"), JSON.stringify({ queueBackend: "bwrb", bwrbVault: vaultDir }), "utf8");
+  await writeFile(join(homeDir, ".ralph", "config.json"), JSON.stringify({ queueBackend: "none" }), "utf8");
 
   __resetConfigForTests();
   __resetQueueBackendStateForTests();
-  __resetBwrbRunnerForTests();
   closeStateDbForTests();
   initStateDb();
 }
 
 async function teardownEnv(): Promise<void> {
-  __resetBwrbRunnerForTests();
   __resetQueueBackendStateForTests();
   __resetConfigForTests();
   closeStateDbForTests();
@@ -102,7 +86,6 @@ async function runStatusJson(): Promise<any> {
 beforeEach(async () => {
   releaseLock = await acquireGlobalTestLock();
   await setupEnv();
-  __setBwrbRunnerForTests(createMockBwrbRunner());
 });
 
 afterEach(async () => {
