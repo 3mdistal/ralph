@@ -16,10 +16,12 @@ import {
   type MergeConflictCommentState,
 } from "../../github/merge-conflict-comment";
 import {
+  buildMergeConflictPostRecoveryFailureReason,
   buildMergeConflictCommentLines,
   buildMergeConflictSignature,
   computeMergeConflictDecision,
   formatMergeConflictPaths,
+  getMergeConflictPermissionReason,
 } from "../../merge-conflict-recovery";
 
 // Keep these values aligned with src/worker/repo-worker.ts
@@ -337,6 +339,41 @@ export async function runMergeConflictRecovery(
     return { status: "failed", run };
   }
 
+  const permissionReason = getMergeConflictPermissionReason(sessionResult.output);
+  if (permissionReason) {
+    const completedAt = new Date().toISOString();
+    attempt.status = "failed";
+    attempt.completedAt = completedAt;
+    const failedState: MergeConflictCommentState = {
+      version: 1,
+      attempts: [...attempts, attempt],
+      lastSignature: signature,
+    };
+    const failedLines = buildMergeConflictCommentLines({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      conflictPaths,
+      attemptCount: attemptNumber,
+      maxAttempts,
+      action: "Merge-conflict recovery blocked by sandbox permission; escalating.",
+      reason: permissionReason,
+    });
+    await worker.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+    await worker.clearMergeConflictLabels(issueRef);
+    await worker.cleanupGitWorktree(worktreePath);
+    return await worker.finalizeMergeConflictEscalation({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      prUrl: params.prUrl,
+      reason: permissionReason,
+      attempts: [...attempts, attempt],
+      baseRefName,
+      headRefName,
+      sessionId: sessionResult.sessionId || params.task["session-id"]?.trim(),
+    });
+  }
+
   const completedAt = new Date().toISOString();
   if (sessionResult.sessionId) {
     await worker.queue.updateTaskStatus(params.task, "in-progress", { "session-id": sessionResult.sessionId });
@@ -374,7 +411,8 @@ export async function runMergeConflictRecovery(
       pollIntervalMs: MERGE_CONFLICT_WAIT_POLL_MS,
     });
   } catch (error: any) {
-    const reason = `Merge-conflict recovery failed while waiting for updated PR state: ${worker.formatGhError(error)}`;
+    const reason =
+      permissionReason ?? `Merge-conflict recovery failed while waiting for updated PR state: ${worker.formatGhError(error)}`;
     console.warn(`[ralph:worker:${worker.repo}] ${reason}`);
     attempt.status = "failed";
     attempt.completedAt = completedAt;
@@ -399,9 +437,12 @@ export async function runMergeConflictRecovery(
   }
 
   if (postRecovery.mergeStateStatus === "DIRTY" || postRecovery.timedOut) {
-    const reason = postRecovery.timedOut
-      ? `Merge-conflict recovery timed out waiting for updated PR state for ${params.prUrl}`
-      : `Merge conflicts remain after recovery attempt for ${params.prUrl}`;
+    const reason = buildMergeConflictPostRecoveryFailureReason({
+      prUrl: params.prUrl,
+      mergeStateStatus: postRecovery.mergeStateStatus,
+      timedOut: postRecovery.timedOut,
+      sessionOutput: sessionResult.output,
+    });
     attempt.status = "failed";
     attempt.completedAt = completedAt;
     const failedState: MergeConflictCommentState = {
