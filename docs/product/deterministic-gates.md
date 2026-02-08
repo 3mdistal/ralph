@@ -232,6 +232,7 @@ Behavior:
 - Run: spawn a dedicated merge-conflict recovery run with a fresh worktree and fresh OpenCode session (no planning phase). Merge base into head (no rebase / no force-push), resolve conflicts, run tests/typecheck/build/knip, then push updates.
 - Wait: after pushing, wait for `mergeStateStatus != DIRTY` and for required checks to appear for the new head SHA before resuming merge-gate logic.
 - Retries: bounded attempts; configurable via `RALPH_MERGE_CONFLICT_MAX_ATTEMPTS` (default: 2). If the same conflict signature repeats across attempts, stop early and escalate.
+- Exception: allow one bounded grace retry when the prior repeated-signature failure class is non-merge-progress (`permission|tooling|runtime`); if the signature repeats again after that grace retry, stop early and escalate with a clear "grace exhausted" reason.
 
 - GitHub status: keep `ralph:status:in-progress` while recovery attempts continue. Set `ralph:status:escalated` only after bounded attempts fail.
 - Escalation: post a final comment summarizing the conflict files and the exact next human action needed.
