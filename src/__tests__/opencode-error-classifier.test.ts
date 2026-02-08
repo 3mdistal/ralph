@@ -19,4 +19,16 @@ describe("classifyOpencodeFailure", () => {
     const classification = classifyOpencodeFailure("Build failed: test suite had 2 failures");
     expect(classification).toBeNull();
   });
+
+  test("classifies sandbox external_directory permission denials", () => {
+    const output = [
+      "tool call failed",
+      "permission requested: external_directory (/tmp/merge-123)",
+      "auto-rejecting",
+    ].join("\n");
+
+    const classification = classifyOpencodeFailure(output);
+    expect(classification?.blockedSource).toBe("permission");
+    expect(classification?.reason).toBe("OpenCode sandbox permission denied: external_directory access blocked.");
+  });
 });

@@ -1,7 +1,23 @@
 import type { MergeConflictAttempt } from "./github/merge-conflict-comment";
+import type { BlockedSource } from "./blocked-sources";
+import { sanitizeEscalationReason } from "./github/escalation-writeback";
+import { classifyOpencodeFailure } from "./opencode-error-classifier";
 
 const FNV_OFFSET = 2166136261;
 const FNV_PRIME = 16777619;
+const RECOVERY_DETAILS_MAX_CHARS = 2000;
+
+export const MERGE_CONFLICT_PERMISSION_DENIED_REASON =
+  "OpenCode sandbox permission denied: external_directory access blocked.";
+
+export type MergeConflictRecoveryFailureCause = "permission-denied" | "other";
+
+export type MergeConflictRecoveryFailure = {
+  cause: MergeConflictRecoveryFailureCause;
+  blockedSource?: BlockedSource;
+  reason?: string;
+  details?: string;
+};
 
 function hashFNV1a(input: string): string {
   let hash = FNV_OFFSET;
@@ -120,6 +136,7 @@ export function buildMergeConflictEscalationDetails(params: {
   headRefName: string | null;
   attempts: MergeConflictAttempt[];
   reason: string;
+  details?: string;
   botBranch?: string | null;
 }): string {
   const baseName = params.baseRefName || params.botBranch || "(unknown)";
@@ -133,6 +150,9 @@ export function buildMergeConflictEscalationDetails(params: {
   const lines: string[] = [];
   lines.push("Merge-conflict escalation summary", "", `PR: ${params.prUrl}`, `Base: ${baseName}`, `Head: ${headName}`);
   lines.push("", "Reason:", params.reason);
+  if (params.details?.trim()) {
+    lines.push("", "Diagnostics:", params.details.trim());
+  }
 
   const latestWithPaths = [...params.attempts].reverse().find((attempt) => attempt.conflictPaths?.length);
   const conflictSample = formatMergeConflictPaths(latestWithPaths?.conflictPaths ?? []);
@@ -186,4 +206,34 @@ export function buildMergeConflictEscalationDetails(params: {
   );
 
   return lines.join("\n");
+}
+
+function sanitizeRecoveryDetails(output: string): string {
+  const sanitized = sanitizeEscalationReason(output ?? "").trim();
+  if (!sanitized) return "";
+  if (sanitized.length <= RECOVERY_DETAILS_MAX_CHARS) return sanitized;
+  return `...${sanitized.slice(-(RECOVERY_DETAILS_MAX_CHARS - 3))}`;
+}
+
+export function classifyMergeConflictRecoveryFailure(output: string | null | undefined): MergeConflictRecoveryFailure | null {
+  const classification = classifyOpencodeFailure(output);
+  if (!classification) return null;
+  if (classification.blockedSource === "permission") {
+    return {
+      cause: "permission-denied",
+      blockedSource: "permission",
+      reason: MERGE_CONFLICT_PERMISSION_DENIED_REASON,
+      details: sanitizeRecoveryDetails(output ?? ""),
+    };
+  }
+  return {
+    cause: "other",
+    blockedSource: classification.blockedSource,
+    reason: classification.reason,
+    details: sanitizeRecoveryDetails(output ?? ""),
+  };
+}
+
+export function shouldWaitForMergeConflictRecoverySignals(cause: MergeConflictRecoveryFailureCause): boolean {
+  return cause !== "permission-denied";
 }

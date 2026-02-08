@@ -72,4 +72,12 @@ describe("OpenCode config env", () => {
     const env = __buildOpencodeEnvForTests({ repo: "demo", cacheKey: "789" });
     expect(env.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
   });
+
+  test("sets TMPDIR/TEMP/TMP to worktree-local temp dir when provided", () => {
+    const tempDir = join(homeDir, "repo", ".ralph", "tmp");
+    const env = __buildOpencodeEnvForTests({ repo: "demo", cacheKey: "tmp", tempDirPath: tempDir });
+    expect(env.TMPDIR).toBe(tempDir);
+    expect(env.TEMP).toBe(tempDir);
+    expect(env.TMP).toBe(tempDir);
+  });
 });

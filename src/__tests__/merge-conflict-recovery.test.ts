@@ -4,7 +4,9 @@ import {
   buildMergeConflictCommentLines,
   buildMergeConflictEscalationDetails,
   buildMergeConflictSignature,
+  classifyMergeConflictRecoveryFailure,
   computeMergeConflictDecision,
+  shouldWaitForMergeConflictRecoverySignals,
 } from "../merge-conflict-recovery";
 
 describe("merge-conflict recovery helpers", () => {
@@ -80,5 +82,33 @@ describe("merge-conflict recovery helpers", () => {
     expect(details).toContain("- a.txt");
     expect(details).toContain("- h.txt");
     expect(details).not.toContain("- i.txt");
+  });
+
+  test("classifyMergeConflictRecoveryFailure maps external_directory denials", () => {
+    const failure = classifyMergeConflictRecoveryFailure(
+      "permission requested: external_directory (/tmp/scratch)\nauto-rejecting"
+    );
+    expect(failure?.cause).toBe("permission-denied");
+    expect(failure?.blockedSource).toBe("permission");
+    expect(failure?.reason).toBe("OpenCode sandbox permission denied: external_directory access blocked.");
+    expect(failure?.details).not.toContain("/home/");
+  });
+
+  test("shouldWaitForMergeConflictRecoverySignals skips wait for permission denials", () => {
+    expect(shouldWaitForMergeConflictRecoverySignals("permission-denied")).toBe(false);
+    expect(shouldWaitForMergeConflictRecoverySignals("other")).toBe(true);
+  });
+
+  test("buildMergeConflictEscalationDetails includes diagnostics", () => {
+    const details = buildMergeConflictEscalationDetails({
+      prUrl: "https://github.com/3mdistal/ralph/pull/1",
+      baseRefName: "bot/integration",
+      headRefName: "feature",
+      attempts: [],
+      reason: "OpenCode sandbox permission denied: external_directory access blocked.",
+      details: "permission requested: external_directory (/tmp/a)",
+      botBranch: "bot/integration",
+    });
+    expect(details).toContain("Diagnostics:");
   });
 });

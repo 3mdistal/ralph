@@ -14,6 +14,18 @@ const baseTask = {
 } as any;
 
 describe("existing PR recovery", () => {
+  test("merge-conflict prompt forbids /tmp paths", () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const prompt = (worker as any).buildMergeConflictPrompt(
+      "https://github.com/3mdistal/ralph/pull/123",
+      "bot/integration",
+      "bot/integration"
+    );
+
+    expect(prompt).toContain("Do not write files under /tmp");
+    expect(prompt).toContain("Use worktree-local temp files");
+  });
+
   test("routes merge-conflict recovery when PR is DIRTY", async () => {
     const worker = new RepoWorker("3mdistal/ralph", "/tmp");
     const task = { ...baseTask };

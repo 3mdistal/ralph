@@ -2505,6 +2505,8 @@ export class RepoWorker {
       `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
       `Resolve merge conflicts by merging '${baseName}' into the PR branch (no rebase or force-push).`,
       "The base branch has already been merged into the PR branch in this worktree; finish the merge and resolve conflicts if present.",
+      "Do not write files under /tmp or any external-directory path.",
+      "Use worktree-local temp files only (for example: .ralph/tmp).",
       "Do NOT create a new PR.",
       "After resolving conflicts, run tests/typecheck/build/knip and push updates on the PR branch.",
       "",
@@ -3016,6 +3018,7 @@ export class RepoWorker {
     issueNumber: string;
     prUrl: string;
     reason: string;
+    details?: string;
     attempts: MergeConflictAttempt[];
     baseRefName: string | null;
     headRefName: string | null;
@@ -3034,6 +3037,7 @@ export class RepoWorker {
       headRefName: params.headRefName,
       attempts: params.attempts,
       reason: params.reason,
+      details: params.details,
       botBranch: getRepoBotBranch(this.repo),
     });
 

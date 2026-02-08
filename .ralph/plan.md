@@ -1,80 +1,82 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: Merge-Conflict Recovery Permission Denial + Misclassification (#626)
 
 ## Goal
 
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
+- Merge-conflict recovery never writes to `/tmp` (or other external-directory paths) and instead uses repo/worktree-local paths.
+- If OpenCode sandbox denies a path permission (e.g. `external_directory (/tmp/*)`), classify the failure explicitly and surface it in merge-conflict lane comments and escalation details.
+- Prevent permission-denial from being misreported as a generic timeout waiting for updated PR state.
+- Add regression tests for the permission-denied path in the merge-conflict recovery lane.
 
 ## Assumptions
 
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+- Default: treat `blocked:permission` as an internal cause code (not a stable public contract); keep reason strings short/bounded and sanitize paths.
+- Since OpenCode can still emit explicit `/tmp/...` redirections, we will harden the merge-conflict prompt and also set `TMPDIR/TEMP/TMP` to a worktree-local directory for OpenCode runs.
+- Canonical permission-denied formatter defaults:
+  - `reason`: `OpenCode sandbox permission denied: external_directory access blocked.`
+  - `details`: sanitized, bounded tail of raw output (same redaction/length policy used by escalation helpers).
 
 ## Checklist
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+- [x] Gather context (issue + canonical docs)
+- [x] Locate merge-conflict recovery lane code paths
+- [x] Avoid external temp paths for merge-conflict recovery (prompt + env)
+- [x] Add permission-denial classification (`blocked:permission`) in OpenCode failure classifier
+- [x] Add a functional-core outcome boundary + canonical reason formatter
+- [x] Short-circuit merge-conflict recovery on permission denial via policy (no PR-state wait/timeout)
+- [x] Surface permission denial reason via canonical formatter (comment + escalation)
+- [x] Add regression tests for permission-denied merge-conflict recovery
+- [x] Run verification gates (`bun test`, plus `bun run typecheck` if types changed)
 
 ## Steps
 
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
+- [x] Gather context (issue + canonical docs)
+- [x] Locate merge-conflict recovery lane code paths
+  - [x] `src/worker/merge/conflict-recovery.ts`
+  - [x] `src/worker/repo-worker.ts` (prompt construction)
+  - [x] `src/merge-conflict-recovery.ts` (comment/details helpers)
+  - [x] `src/opencode-error-classifier.ts` + blocked source plumbing
 
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
+- [x] Avoid external temp paths for merge-conflict recovery (prompt + env)
+  - [x] Update merge-conflict prompt in `src/worker/repo-worker.ts` to explicitly forbid `/tmp` and instruct using a worktree-local temp dir (e.g. `.ralph/tmp`).
+  - [x] Set `TMPDIR`, `TEMP`, and `TMP` for OpenCode runs to a worktree-local path (e.g. `<repoPath>/.ralph/tmp`) in `src/session.ts` (create dir best-effort).
 
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
+- [x] Add permission-denial classification (`blocked:permission`) in OpenCode failure classifier
+  - [x] Add a new blocked source `permission` to `src/blocked-sources.ts`.
+  - [x] Extend `classifyOpencodeFailure(...)` in `src/opencode-error-classifier.ts` to detect OpenCode sandbox denial output (case-insensitive):
+    - [x] `permission requested: external_directory`
+    - [x] `auto-rejecting`
+    - [x] optionally `/tmp/` in the same sample for confidence.
+  - [x] Add unit tests in `src/__tests__/opencode-error-classifier.test.ts`.
 
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
+- [x] Add a functional-core outcome boundary + canonical reason formatter
+  - [x] Introduce a small typed boundary for recovery attempt outcomes (e.g. `RecoveryAttemptResult`) that carries:
+    - [x] `cause` (e.g. `permission-denied`, `opencode-config-invalid`, `unknown`, `timeout`)
+    - [x] `blockedSource?` (internal, e.g. `permission`)
+    - [x] `userReason` (bounded, sanitized; safe for comments/escalations)
+    - [x] `details?` (bounded, sanitized; safe for escalation details)
+  - [x] Add a pure policy helper `shouldWaitForMergeConflictSignals(cause)` and unit test it.
+  - [x] Centralize reason rendering in one formatter used by both merge-conflict lane comments and escalation payloads.
+  - [x] Use the exact permission-denied reason default: `OpenCode sandbox permission denied: external_directory access blocked.`
+  - [x] Ensure raw OpenCode output is never interpolated directly; sanitize/map first.
 
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
+- [x] Short-circuit merge-conflict recovery on permission denial via policy (no PR-state wait/timeout)
+  - [x] In `src/worker/merge/conflict-recovery.ts`, after the OpenCode session returns, build a `RecoveryAttemptResult` from `sessionResult`.
+  - [x] Use `shouldWaitForMergeConflictSignals(result.cause)` to decide whether to call `waitForMergeConflictRecoverySignals(...)`.
+  - [x] For permission denial causes, return early with `blocked:permission` and the canonical reason (no PR-state waiting).
 
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
+- [x] Surface permission denial reason via canonical formatter (comment + escalation)
+  - [x] Ensure merge-conflict status comment uses the canonical formatter and includes a stable reason token/category for permission denial.
+  - [x] Ensure merge-conflict escalation uses the same canonical formatter and includes bounded sanitized details.
+  - [x] Ensure the permission denial path cannot be overwritten by the generic PR-state timeout reason.
 
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
+- [x] Add regression tests for permission-denied merge-conflict recovery
+  - [x] Add a focused test that stubs a merge-conflict recovery run where the OpenCode output includes `external_directory (/tmp/*)` denial and asserts:
+    - [x] the returned failure is classified as `blocked:permission`
+    - [x] the lane uses the canonical formatter (stable reason token/category) rather than raw sandbox log text
+    - [x] `shouldWaitForMergeConflictSignals("permission-denied")` is false (unit test; avoid brittle call-order assertions)
+  - [x] Add a small “prompt policy” test ensuring merge-conflict prompt contains the “no `/tmp`” clause and a worktree-local temp dir directive.
+  - [x] Add a redaction/bounding test ensuring denial output that includes `/tmp/...` is sanitized and length-bounded before being used in escalation details.
 
 - [x] Run verification gates
-  - [x] `bun test`
+  - [x] `bun test` (targeted suites)
   - [x] `bun run typecheck`

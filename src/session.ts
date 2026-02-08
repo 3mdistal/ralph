@@ -234,6 +234,7 @@ function getIsolatedXdgCacheHome(opts?: {
 type OpencodeSpawnOptions = {
   repo?: string;
   cacheKey?: string;
+  tempDirPath?: string;
   opencodeXdg?: {
     dataHome?: string;
     configHome?: string;
@@ -264,6 +265,18 @@ function buildOpencodeSpawnEnvironment(opts?: OpencodeSpawnOptions): { env: Reco
     ...(opencodeXdg?.stateHome ? { XDG_STATE_HOME: opencodeXdg.stateHome } : {}),
     XDG_CACHE_HOME: xdgCacheHome,
   };
+
+  const tempDirPath = opts?.tempDirPath?.trim();
+  if (tempDirPath) {
+    try {
+      mkdirSync(tempDirPath, { recursive: true });
+      env.TMPDIR = tempDirPath;
+      env.TEMP = tempDirPath;
+      env.TMP = tempDirPath;
+    } catch {
+      // ignore
+    }
+  }
 
   // Daemon runs may have a sanitized PATH. Ensure user-installed binaries are discoverable.
   ensurePathIncludes(env, join(homedir(), ".local", "bin"));
@@ -922,6 +935,7 @@ async function runSession(
   const { env: baseEnv, xdgCacheHome } = buildOpencodeSpawnEnvironment({
     repo: options?.repo,
     cacheKey: options?.cacheKey,
+    tempDirPath: join(repoPath, ".ralph", "tmp"),
     opencodeXdg,
   });
 
@@ -2123,6 +2137,7 @@ async function* streamSession(
   const { env: baseEnv, xdgCacheHome } = buildOpencodeSpawnEnvironment({
     repo: options?.repo,
     cacheKey: options?.cacheKey,
+    tempDirPath: join(repoPath, ".ralph", "tmp"),
     opencodeXdg: options?.opencodeXdg,
   });
 

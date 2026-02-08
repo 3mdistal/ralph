@@ -17,9 +17,11 @@ import {
 } from "../../github/merge-conflict-comment";
 import {
   buildMergeConflictCommentLines,
+  classifyMergeConflictRecoveryFailure,
   buildMergeConflictSignature,
   computeMergeConflictDecision,
   formatMergeConflictPaths,
+  shouldWaitForMergeConflictRecoverySignals,
 } from "../../merge-conflict-recovery";
 
 // Keep these values aligned with src/worker/repo-worker.ts
@@ -343,6 +345,40 @@ export async function runMergeConflictRecovery(
   }
 
   if (!sessionResult.success) {
+    const classifiedFailure = classifyMergeConflictRecoveryFailure(sessionResult.output);
+    if (classifiedFailure?.blockedSource === "permission") {
+      attempt.status = "failed";
+      attempt.completedAt = completedAt;
+      const failedState: MergeConflictCommentState = {
+        version: 1,
+        attempts: [...attempts, attempt],
+        lastSignature: signature,
+      };
+      const failedLines = buildMergeConflictCommentLines({
+        prUrl: params.prUrl,
+        baseRefName,
+        headRefName,
+        conflictPaths,
+        attemptCount: attemptNumber,
+        maxAttempts,
+        action: "Ralph is escalating merge-conflict recovery.",
+        reason: classifiedFailure.reason,
+      });
+      await worker.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+      await worker.cleanupGitWorktree(worktreePath);
+      return await worker.finalizeMergeConflictEscalation({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        prUrl: params.prUrl,
+        reason: classifiedFailure.reason || "Merge-conflict recovery failed due to sandbox permission denial.",
+        details: classifiedFailure.details,
+        attempts: [...attempts, attempt],
+        baseRefName,
+        headRefName,
+        sessionId: sessionResult.sessionId || params.task["session-id"]?.trim(),
+      });
+    }
+
     attempt.status = "failed";
     attempt.completedAt = completedAt;
     const failedState: MergeConflictCommentState = {
@@ -362,6 +398,40 @@ export async function runMergeConflictRecovery(
     await worker.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
     await worker.cleanupGitWorktree(worktreePath);
     return await runMergeConflictRecovery(worker, { ...params, opencodeSessionOptions: params.opencodeSessionOptions });
+  }
+
+  const postRunFailure = classifyMergeConflictRecoveryFailure(sessionResult.output);
+  if (postRunFailure && !shouldWaitForMergeConflictRecoverySignals(postRunFailure.cause)) {
+    attempt.status = "failed";
+    attempt.completedAt = completedAt;
+    const failedState: MergeConflictCommentState = {
+      version: 1,
+      attempts: [...attempts, attempt],
+      lastSignature: signature,
+    };
+    const failedLines = buildMergeConflictCommentLines({
+      prUrl: params.prUrl,
+      baseRefName,
+      headRefName,
+      conflictPaths,
+      attemptCount: attemptNumber,
+      maxAttempts,
+      action: "Ralph is escalating merge-conflict recovery.",
+      reason: postRunFailure.reason,
+    });
+    await worker.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+    await worker.cleanupGitWorktree(worktreePath);
+    return await worker.finalizeMergeConflictEscalation({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      prUrl: params.prUrl,
+      reason: postRunFailure.reason || "Merge-conflict recovery failed due to sandbox permission denial.",
+      details: postRunFailure.details,
+      attempts: [...attempts, attempt],
+      baseRefName,
+      headRefName,
+      sessionId: sessionResult.sessionId || params.task["session-id"]?.trim(),
+    });
   }
 
   let postRecovery;
