@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
 
@@ -112,6 +112,16 @@ export type ParentVerificationState = {
   outcome: ParentVerificationOutcome | null;
   outcomeDetails: string | null;
   updatedAtMs: number;
+};
+
+export type LoopTriageAttemptState = {
+  repo: string;
+  issueNumber: number;
+  signature: string;
+  attemptCount: number;
+  lastDecision: string | null;
+  lastRationale: string | null;
+  lastUpdatedAtMs: number;
 };
 
 const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci", "pr_evidence"];
@@ -877,6 +887,26 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           );
         }
 
+        if (existingVersion < 18) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS loop_triage_attempts (" +
+              "repo_id INTEGER NOT NULL, " +
+              "issue_number INTEGER NOT NULL, " +
+              "signature TEXT NOT NULL, " +
+              "attempt_count INTEGER NOT NULL DEFAULT 0, " +
+              "last_decision TEXT, " +
+              "last_rationale TEXT, " +
+              "last_updated_at_ms INTEGER NOT NULL, " +
+              "PRIMARY KEY(repo_id, issue_number, signature), " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE" +
+              ")"
+          );
+          database.exec(
+            "CREATE INDEX IF NOT EXISTS idx_loop_triage_attempts_repo_issue_updated " +
+              "ON loop_triage_attempts(repo_id, issue_number, last_updated_at_ms)"
+          );
+        }
+
         database.exec(
           `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
            ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
@@ -1246,6 +1276,18 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS loop_triage_attempts (
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER NOT NULL,
+      signature TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_decision TEXT,
+      last_rationale TEXT,
+      last_updated_at_ms INTEGER NOT NULL,
+      PRIMARY KEY(repo_id, issue_number, signature),
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -1273,6 +1315,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE INDEX IF NOT EXISTS idx_alert_deliveries_target ON alert_deliveries(target_type, target_number, status);
     CREATE INDEX IF NOT EXISTS idx_issue_status_transition_guard_repo_updated
       ON issue_status_transition_guard(repo_id, updated_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_loop_triage_attempts_repo_issue_updated
+      ON loop_triage_attempts(repo_id, issue_number, last_updated_at_ms);
   `);
 
     runMigrationsWithLock(database, () => {
@@ -3773,6 +3817,123 @@ export function getParentVerificationState(params: {
     | undefined;
 
   return mapParentVerificationRow(row, params.repo);
+}
+
+export function shouldAllowLoopTriageAttempt(attemptCount: number, maxAttempts: number): boolean {
+  const normalizedAttempts = Number.isFinite(attemptCount) ? Math.max(0, Math.floor(attemptCount)) : 0;
+  const normalizedMax = Number.isFinite(maxAttempts) ? Math.max(1, Math.floor(maxAttempts)) : 1;
+  return normalizedAttempts < normalizedMax;
+}
+
+export function getLoopTriageAttempt(params: {
+  repo: string;
+  issueNumber: number;
+  signature: string;
+}): LoopTriageAttemptState | null {
+  if (!db) return null;
+  const signature = params.signature.trim();
+  if (!signature) return null;
+
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT lta.issue_number as issue_number,
+              lta.signature as signature,
+              lta.attempt_count as attempt_count,
+              lta.last_decision as last_decision,
+              lta.last_rationale as last_rationale,
+              lta.last_updated_at_ms as last_updated_at_ms
+       FROM loop_triage_attempts lta
+       JOIN repos r ON r.id = lta.repo_id
+       WHERE r.name = $repo AND lta.issue_number = $issue_number AND lta.signature = $signature`
+    )
+    .get({
+      $repo: params.repo,
+      $issue_number: params.issueNumber,
+      $signature: signature,
+    }) as
+    | {
+        issue_number?: number | null;
+        signature?: string | null;
+        attempt_count?: number | null;
+        last_decision?: string | null;
+        last_rationale?: string | null;
+        last_updated_at_ms?: number | null;
+      }
+    | undefined;
+
+  if (!row) return null;
+
+  const issueNumber = Number.isFinite(row.issue_number) ? Number(row.issue_number) : params.issueNumber;
+  const attemptCount = Number.isFinite(row.attempt_count) ? Math.max(0, Math.floor(Number(row.attempt_count))) : 0;
+  const lastUpdatedAtMs = Number.isFinite(row.last_updated_at_ms)
+    ? Math.max(0, Math.floor(Number(row.last_updated_at_ms)))
+    : 0;
+
+  return {
+    repo: params.repo,
+    issueNumber,
+    signature: String(row.signature ?? signature),
+    attemptCount,
+    lastDecision: row.last_decision ?? null,
+    lastRationale: row.last_rationale ?? null,
+    lastUpdatedAtMs,
+  };
+}
+
+export function bumpLoopTriageAttempt(params: {
+  repo: string;
+  issueNumber: number;
+  signature: string;
+  decision?: string | null;
+  rationale?: string | null;
+  nowMs?: number;
+}): LoopTriageAttemptState {
+  const database = requireDb();
+  const signature = params.signature.trim();
+  if (!signature) {
+    throw new Error("Loop triage signature is required");
+  }
+
+  const nowMs = Number.isFinite(params.nowMs) ? Number(params.nowMs) : Date.now();
+  const atIso = new Date(nowMs).toISOString();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const decision = sanitizeOptionalText(params.decision ?? null, 120);
+  const rationale = sanitizeOptionalText(params.rationale ?? null, 400);
+
+  database
+    .query(
+      `INSERT INTO loop_triage_attempts(
+         repo_id, issue_number, signature, attempt_count, last_decision, last_rationale, last_updated_at_ms
+       ) VALUES (
+         $repo_id, $issue_number, $signature, 1, $last_decision, $last_rationale, $last_updated_at_ms
+       )
+       ON CONFLICT(repo_id, issue_number, signature) DO UPDATE SET
+         attempt_count = loop_triage_attempts.attempt_count + 1,
+         last_decision = excluded.last_decision,
+         last_rationale = excluded.last_rationale,
+         last_updated_at_ms = excluded.last_updated_at_ms`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $signature: signature,
+      $last_decision: decision ?? null,
+      $last_rationale: rationale ?? null,
+      $last_updated_at_ms: Math.max(0, Math.floor(nowMs)),
+    });
+
+  return (
+    getLoopTriageAttempt({ repo: params.repo, issueNumber: params.issueNumber, signature }) ?? {
+      repo: params.repo,
+      issueNumber: params.issueNumber,
+      signature,
+      attemptCount: 1,
+      lastDecision: decision ?? null,
+      lastRationale: rationale ?? null,
+      lastUpdatedAtMs: Math.max(0, Math.floor(nowMs)),
+    }
+  );
 }
 
 export function setParentVerificationPending(params: {

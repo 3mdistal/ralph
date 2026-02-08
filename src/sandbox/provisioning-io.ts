@@ -607,8 +607,7 @@ export async function findLatestManifestPath(manifestsDir: string): Promise<stri
   }
 
   const entries = await readdir(manifestsDir, { withFileTypes: true });
-  let latestByCreatedAt: { path: string; ts: number } | null = null;
-  let latestByMtime: { path: string; ts: number } | null = null;
+  const candidates: Array<{ path: string; runId: string; createdAtTs: number | null; mtimeMs: number }> = [];
 
   for (const entry of entries) {
     if (!entry.isFile()) continue;
@@ -616,35 +615,43 @@ export async function findLatestManifestPath(manifestsDir: string): Promise<stri
     const fullPath = join(manifestsDir, entry.name);
     try {
       const info = await stat(fullPath);
-      const mtime = info.mtimeMs;
-      if (!latestByMtime || mtime >= latestByMtime.ts) {
-        latestByMtime = { path: fullPath, ts: mtime };
-      }
-      const createdAt = await readManifestCreatedAt(fullPath);
-      if (typeof createdAt === "number" && Number.isFinite(createdAt)) {
-        if (!latestByCreatedAt || createdAt >= latestByCreatedAt.ts) {
-          latestByCreatedAt = { path: fullPath, ts: createdAt };
-        }
-      }
+      const parsed = await readManifestSortData(fullPath);
+      if (!parsed) continue;
+      candidates.push({
+        path: fullPath,
+        runId: parsed.runId,
+        createdAtTs: parsed.createdAtTs,
+        mtimeMs: info.mtimeMs,
+      });
     } catch {
       // ignore
     }
   }
 
-  return latestByCreatedAt?.path ?? latestByMtime?.path ?? null;
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => {
+    const aCreated = a.createdAtTs ?? Number.NEGATIVE_INFINITY;
+    const bCreated = b.createdAtTs ?? Number.NEGATIVE_INFINITY;
+    if (aCreated !== bCreated) return bCreated - aCreated;
+    if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
+    return b.runId.localeCompare(a.runId);
+  });
+
+  return candidates[0]?.path ?? null;
 }
 
-async function readManifestCreatedAt(path: string): Promise<number | null> {
+async function readManifestSortData(path: string): Promise<{ createdAtTs: number | null; runId: string } | null> {
   try {
     const raw = await readFile(path, "utf8");
     const parsed = JSON.parse(raw) as any;
     if (!parsed || typeof parsed !== "object") return null;
     if (parsed.schemaVersion !== 1) return null;
+    const runId = typeof parsed.runId === "string" ? parsed.runId.trim() : "";
+    if (!runId) return null;
     const createdAt = typeof parsed.createdAt === "string" ? parsed.createdAt.trim() : "";
-    if (!createdAt) return null;
-    const ts = Date.parse(createdAt);
-    if (!Number.isFinite(ts)) return null;
-    return ts;
+    const ts = createdAt ? Date.parse(createdAt) : Number.NaN;
+    return { createdAtTs: Number.isFinite(ts) ? ts : null, runId };
   } catch {
     return null;
   }

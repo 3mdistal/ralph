@@ -92,6 +92,7 @@ function classifyGhCommand(command: string): "read" | "write" | "unknown" {
   if (/\bgh\s+pr\s+(create|merge|edit|ready|review|update-branch|close|reopen)\b/i.test(normalized)) return "write";
   if (/\bgh\s+issue\s+(comment|close|reopen|edit|lock|unlock)\b/i.test(normalized)) return "write";
   if (/\bgh\s+repo\s+(create|delete|fork)\b/i.test(normalized)) return "write";
+  if (/\bgh\s+repo\s+clone\b/i.test(normalized)) return "read";
 
   if (/\bgh\s+pr\s+(list|view|status)\b/i.test(normalized)) return "read";
   if (/\bgh\s+issue\s+view\b/i.test(normalized)) return "read";
