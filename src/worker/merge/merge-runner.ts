@@ -196,7 +196,54 @@ export async function mergePrWithRequiredChecks(params: {
   const isCiIssue = isCiRelatedIssue(params.issueMeta.labels ?? []);
   const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
 
-  const baseBranch = await params.getPullRequestBaseBranch(prUrl);
+  let baseBranch: string | null = null;
+  try {
+    baseBranch = await params.getPullRequestBaseBranch(prUrl);
+  } catch (error: any) {
+    const completed = new Date();
+    const completedAt = completed.toISOString().split("T")[0];
+    const details = params.formatGhError(error);
+    const reason = "Blocked: Ralph could not verify the PR base branch before merge.";
+
+    await params.createAgentRun(params.task, {
+      outcome: "failed",
+      started: completed,
+      completed,
+      sessionId,
+      bodyPrefix: [
+        reason,
+        "",
+        `Issue: ${params.task.issue}`,
+        `PR: ${prUrl}`,
+        details ? `Details: ${details}` : "Details: unknown",
+      ].join("\n"),
+    });
+
+    await params.markTaskBlocked(params.task, "merge-target", {
+      reason,
+      details,
+      skipRunNote: true,
+      extraFields: {
+        "completed-at": completedAt,
+        "session-id": "",
+        "watchdog-retries": "",
+        "stall-retries": "",
+        ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+      },
+    });
+
+    return {
+      ok: false,
+      run: {
+        taskName: params.task.name,
+        repo: params.repo,
+        outcome: "failed",
+        pr: prUrl ?? undefined,
+        sessionId,
+        escalationReason: reason,
+      },
+    };
+  }
   if (!params.isMainMergeAllowed(baseBranch, params.botBranch, params.issueMeta.labels ?? [])) {
     const completed = new Date();
     const completedAt = completed.toISOString().split("T")[0];

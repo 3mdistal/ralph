@@ -181,3 +181,22 @@ describe("mergePrWithRequiredChecks 405 handling", () => {
     expect(markTaskBlockedCalls[0]?.reason).not.toContain("required checks not green");
   });
 });
+
+describe("mergePrWithRequiredChecks base branch lookup failures", () => {
+  test("blocks with merge-target reason when base branch lookup errors", async () => {
+    const { params, markTaskBlockedCalls } = buildParams({
+      getPullRequestBaseBranch: async () => {
+        throw new Error("gh api graphql failed");
+      },
+      formatGhError: (error: any) => String(error?.message ?? error),
+    });
+
+    const result = await mergePrWithRequiredChecks(params);
+
+    expect(result.ok).toBe(false);
+    expect(markTaskBlockedCalls).toHaveLength(1);
+    expect(markTaskBlockedCalls[0]?.source).toBe("merge-target");
+    expect(markTaskBlockedCalls[0]?.reason).toContain("could not verify the PR base branch");
+    expect(markTaskBlockedCalls[0]?.details).toContain("gh api graphql failed");
+  });
+});
