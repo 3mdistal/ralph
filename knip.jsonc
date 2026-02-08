@@ -5,7 +5,7 @@
   // and explicitly ignore environment-provided tooling.
 
   // These binaries are expected to exist in the operator environment.
-  "ignoreBinaries": ["which", "terminal-notifier", "bwrb", "gh", "tsc", "knip"],
+  "ignoreBinaries": ["which", "terminal-notifier"],
 
   // Bun's recommended TS config uses the virtual `bun-types` package name.
   // Knip reports it as unresolved because it's not a real dependency.

@@ -3,7 +3,7 @@ import { createHash } from "crypto";
 import type { LoopTripInfo } from "../loop-detection/core";
 import { parseStrictFinalLineJsonMarker } from "../markers";
 
-export const LOOP_TRIAGE_MARKER_PREFIX = "RALPH_LOOP_TRIAGE";
+const LOOP_TRIAGE_MARKER_PREFIX = "RALPH_LOOP_TRIAGE";
 
 export type LoopTriageAction = "resume-existing" | "restart-new-agent" | "restart-ci-debug" | "escalate";
 
