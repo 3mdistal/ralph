@@ -221,8 +221,8 @@ function buildReviewPrompt(params: {
   diffExcerpt: string;
   issueContext?: string;
 }): string {
-  const stat = params.diffStat.trim() || "(no changes)";
-  const excerpt = params.diffExcerpt.trim() || "(diff excerpt unavailable)";
+  const stat = (typeof params.diffStat === "string" ? params.diffStat : "").trim() || "(no changes)";
+  const excerpt = (typeof params.diffExcerpt === "string" ? params.diffExcerpt : "").trim() || "(diff excerpt unavailable)";
   const issueContext = params.issueContext?.trim();
 
   const lines = [
@@ -297,7 +297,7 @@ function buildDiffExcerpt(diffText: string): string {
 }
 
 function buildDiffArtifactNote(params: ReviewDiffArtifacts): string {
-  const stat = params.diffStat.trim() || "(no changes)";
+  const stat = (typeof params.diffStat === "string" ? params.diffStat : "").trim() || "(no changes)";
   const base = params.baseRef.trim();
   const head = params.headRef.trim();
   const range = base && head ? `origin/${base}...${head}` : "(unresolved)";
