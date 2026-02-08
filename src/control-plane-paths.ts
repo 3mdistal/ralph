@@ -36,11 +36,11 @@ function resolveLegacyXdgControlRoot(opts?: { xdgStateHome?: string }): string |
   return join(raw, "ralph");
 }
 
-export function resolveControlFilePath(opts?: { homeDir?: string }): string {
+function resolveControlFilePath(opts?: { homeDir?: string }): string {
   return join(resolveCanonicalControlRoot(opts), "control.json");
 }
 
-export function resolveDaemonRecordPath(opts?: { homeDir?: string }): string {
+function resolveDaemonRecordPath(opts?: { homeDir?: string }): string {
   return join(resolveCanonicalControlRoot(opts), "daemon.json");
 }
 
@@ -64,7 +64,7 @@ function dedupe(paths: Array<string | null | undefined>): string[] {
   return out;
 }
 
-export function resolveDaemonRecordPathCandidates(opts?: { homeDir?: string; xdgStateHome?: string }): string[] {
+function resolveDaemonRecordPathCandidates(opts?: { homeDir?: string; xdgStateHome?: string }): string[] {
   const canonical = resolveDaemonRecordPath({ homeDir: opts?.homeDir });
   const legacyXdgRoot = resolveLegacyXdgControlRoot({ xdgStateHome: opts?.xdgStateHome });
   const legacyXdg = legacyXdgRoot ? join(legacyXdgRoot, "daemon.json") : null;
