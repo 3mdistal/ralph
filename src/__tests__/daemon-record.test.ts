@@ -3,7 +3,12 @@ import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 
-import { readDaemonRecord, resolveDaemonRecordPath, writeDaemonRecord } from "../daemon-record";
+import {
+  readDaemonRecord,
+  resolveDaemonRecordPath,
+  resolveDaemonRecordPathCandidates,
+  writeDaemonRecord,
+} from "../daemon-record";
 
 describe("daemon record", () => {
   let priorXdgStateHome: string | undefined;
@@ -36,6 +41,8 @@ describe("daemon record", () => {
       daemonId: "d_test",
       pid: 1234,
       startedAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      controlRoot: join(base, ".ralph", "control"),
       ralphVersion: "0.1.0",
       command: ["bun", "src/index.ts"],
       cwd: "/tmp",
@@ -61,7 +68,7 @@ describe("daemon record", () => {
     expect(record).toBeNull();
   });
 
-  test("falls back to ~/.local/state when XDG_STATE_HOME missing record", () => {
+  test("prefers canonical path under ~/.ralph/control", () => {
     const xdg = mkdtempSync(join(tmpdir(), "ralph-daemon-xdg-"));
     const home = mkdtempSync(join(tmpdir(), "ralph-daemon-home-"));
     tempDirs.push(xdg, home);
@@ -75,6 +82,8 @@ describe("daemon record", () => {
         daemonId: "d_home",
         pid: 1234,
         startedAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+        controlRoot: join(home, ".ralph", "control"),
         ralphVersion: "0.1.0",
         command: ["bun", "src/index.ts"],
         cwd: "/tmp",
@@ -85,5 +94,8 @@ describe("daemon record", () => {
 
     const record = readDaemonRecord();
     expect(record?.daemonId).toBe("d_home");
+    const recordPath = resolveDaemonRecordPath();
+    expect(recordPath).toBe(join(home, ".ralph", "control", "daemon-registry.json"));
+    expect(resolveDaemonRecordPathCandidates()[0]).toBe(recordPath);
   });
 });
