@@ -138,4 +138,31 @@ describe("existing PR recovery", () => {
     expect(ciTriageCalled).toBe(false);
     expect(result).toBe(null);
   });
+
+  test("refreshes issue-level PR resolution during PR-create lease conflicts", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+
+    const freshFlags: boolean[] = [];
+    (worker as any).getIssuePrResolution = async (_issueNumber: string, opts?: { fresh?: boolean }) => {
+      freshFlags.push(Boolean(opts?.fresh));
+      if (freshFlags.length === 1) {
+        return { selectedUrl: null, duplicates: [], source: null, diagnostics: [] };
+      }
+      return {
+        selectedUrl: "https://github.com/3mdistal/ralph/pull/624",
+        duplicates: [],
+        source: "db",
+        diagnostics: [],
+      };
+    };
+    (worker as any).sleepMs = async () => {};
+
+    const resolved = await (worker as any).waitForExistingPrDuringPrCreateConflict({
+      issueNumber: "598",
+      maxWaitMs: 500,
+    });
+
+    expect(resolved?.selectedUrl).toBe("https://github.com/3mdistal/ralph/pull/624");
+    expect(freshFlags).toEqual([true, true]);
+  });
 });
