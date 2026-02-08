@@ -48,6 +48,7 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import { prepareReviewDiffArtifacts, recordReviewGateFailure, recordReviewGateSkipped, runReviewGate } from "../gates/review";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
@@ -1909,6 +1910,101 @@ export class RepoWorker {
     return this.normalizeRepoSlot(preferred, limit);
   }
 
+  private async runPrReadinessChecks(params: {
+    task: AgentTask;
+    issueNumber: string;
+    worktreePath: string;
+    botBranch: string;
+    runId: string;
+  }): Promise<{ ok: true; diagnostics: string[] } | { ok: false; diagnostics: string[] }> {
+    const diagnostics: string[] = [];
+    const issueContextParts: string[] = [];
+
+    try {
+      const issueContext = await this.buildIssueContextForAgent({
+        repo: this.repo,
+        issueNumber: params.issueNumber,
+      });
+      if (issueContext.trim()) issueContextParts.push(issueContext.trim());
+    } catch (error: any) {
+      issueContextParts.push(`Issue context unavailable: ${error?.message ?? String(error)}`);
+    }
+
+    const reviewIssueContext = issueContextParts.join("\n\n");
+
+    let reviewDiff: { baseRef: string; headRef: string; diffPath: string; diffStat: string };
+    try {
+      reviewDiff = await prepareReviewDiffArtifacts({
+        runId: params.runId,
+        repoPath: params.worktreePath,
+        baseRef: params.botBranch,
+        headRef: "HEAD",
+      });
+      diagnostics.push(`- Review diff artifact prepared: ${reviewDiff.diffPath}`);
+    } catch (error: any) {
+      const reason = `Review readiness failed: could not prepare diff artifacts (${error?.message ?? String(error)})`;
+      diagnostics.push(`- ${reason}`);
+      recordReviewGateFailure({ runId: params.runId, gate: "product_review", reason });
+      recordReviewGateFailure({ runId: params.runId, gate: "devex_review", reason });
+      return { ok: false, diagnostics };
+    }
+
+    const runReviewAgent = async (
+      gate: "product_review" | "devex_review",
+      agent: "product" | "devex",
+      stage: string
+    ) => {
+      return await runReviewGate({
+        runId: params.runId,
+        gate,
+        repo: this.repo,
+        issueRef: params.task.issue,
+        prUrl: "(not created yet)",
+        issueContext: reviewIssueContext,
+        diff: reviewDiff,
+        runAgent: async (prompt: string) => {
+          const runLogPath = await this.recordRunLogPath(params.task, params.issueNumber, stage, "in-progress");
+          return await this.session.runAgent(params.worktreePath, agent, prompt, {
+            repo: this.repo,
+            cacheKey: `pr-readiness-${params.issueNumber}-${agent}`,
+            runLogPath,
+            introspection: {
+              repo: this.repo,
+              issue: params.task.issue,
+              taskName: params.task.name,
+              step: 4,
+              stepTitle: stage,
+            },
+            ...this.buildWatchdogOptions(params.task, stage),
+            ...this.buildStallOptions(params.task, stage),
+            ...this.buildLoopDetectionOptions(params.task, stage),
+          });
+        },
+      });
+    };
+
+    const productReview = await runReviewAgent("product_review", "product", "pr readiness product review");
+    if (productReview.status !== "pass") {
+      diagnostics.push(`- Review failed: product (${productReview.reason})`);
+      recordReviewGateSkipped({
+        runId: params.runId,
+        gate: "devex_review",
+        reason: "Skipped because product review did not pass",
+      });
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Review passed: product");
+
+    const devexReview = await runReviewAgent("devex_review", "devex", "pr readiness devex review");
+    if (devexReview.status !== "pass") {
+      diagnostics.push(`- Review failed: devex (${devexReview.reason})`);
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Review passed: devex");
+
+    return { ok: true, diagnostics };
+  }
+
   private async tryEnsurePrFromWorktree(params: {
     task: AgentTask;
     issueNumber: string;
@@ -1982,36 +2078,50 @@ export class RepoWorker {
       return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
-    const preflightConfig = getRepoPreflightCommands(this.repo);
     const runId = this.activeRunId;
-    if (runId) {
-      const skipReason =
-        preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
-          ? "preflight disabled (preflightCommand=[])"
-          : preflightConfig.configured
-            ? "preflight configured but empty"
-            : "no preflight configured";
+    if (!runId) {
+      diagnostics.push("- Missing runId; refusing PR creation because deterministic gates cannot be persisted");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
 
-      const preflightResult = await runPreflightGate({
-        runId,
-        worktreePath: candidate.worktreePath,
-        commands: preflightConfig.commands,
-        skipReason,
-      });
+    const preflightConfig = getRepoPreflightCommands(this.repo);
+    const skipReason =
+      preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
+        ? "preflight disabled (preflightCommand=[])"
+        : preflightConfig.configured
+          ? "preflight configured but empty"
+          : "no preflight configured";
 
-      if (preflightResult.status === "fail") {
-        diagnostics.push("- Preflight failed; refusing to create PR");
-        diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
-        return { prUrl: null, diagnostics: diagnostics.join("\n") };
-      }
+    const preflightResult = await runPreflightGate({
+      runId,
+      worktreePath: candidate.worktreePath,
+      commands: preflightConfig.commands,
+      skipReason,
+    });
 
-      if (preflightResult.status === "skipped") {
-        diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
-      } else {
-        diagnostics.push("- Preflight passed");
-      }
-    } else if (preflightConfig.commands.length > 0) {
-      diagnostics.push("- WARNING: missing runId; skipping deterministic preflight gate recording");
+    if (preflightResult.status === "fail") {
+      diagnostics.push("- Preflight failed; refusing to create PR");
+      diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    if (preflightResult.status === "skipped") {
+      diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
+    } else {
+      diagnostics.push("- Preflight passed");
+    }
+
+    const readiness = await this.runPrReadinessChecks({
+      task,
+      issueNumber,
+      worktreePath: candidate.worktreePath,
+      botBranch,
+      runId,
+    });
+    diagnostics.push(...readiness.diagnostics);
+    if (!readiness.ok) {
+      diagnostics.push("- PR readiness failed; refusing to create PR");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
     try {
@@ -2531,6 +2641,7 @@ export class RepoWorker {
       `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
       `Resolve merge conflicts by merging '${baseName}' into the PR branch (no rebase or force-push).`,
       "The base branch has already been merged into the PR branch in this worktree; finish the merge and resolve conflicts if present.",
+      "Do not use /tmp or any external-directory path; keep temporary files inside this worktree (for example ./.ralph-tmp/).",
       "Do NOT create a new PR.",
       "After resolving conflicts, run tests/typecheck/build/knip and push updates on the PR branch.",
       "",
