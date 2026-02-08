@@ -73,6 +73,14 @@ export type StatusDaemonSnapshot = {
   command: string[] | null;
 };
 
+export type StatusDaemonLivenessSnapshot = {
+  state: "alive" | "missing" | "dead" | "unknown";
+  mismatch: boolean;
+  hint: string | null;
+  pid: number | null;
+  daemonId: string | null;
+};
+
 export type StatusTriageRun = {
   runId: string;
   repo: string;
@@ -98,9 +106,11 @@ import type { StatusUsageSnapshot } from "./status-usage";
 
 export type StatusSnapshot = {
   mode: string;
+  desiredMode?: string;
   queue: StatusQueueSnapshot;
   parity?: StatusQueueParitySnapshot;
   daemon: StatusDaemonSnapshot | null;
+  daemonLiveness?: StatusDaemonLivenessSnapshot;
   controlProfile: string | null;
   activeProfile: string | null;
   throttle: unknown;
@@ -120,6 +130,19 @@ const normalizeOptionalString = (value?: string | null): string | null => {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+};
+
+const normalizeDaemonLiveness = (
+  liveness?: StatusDaemonLivenessSnapshot
+): StatusDaemonLivenessSnapshot | undefined => {
+  if (!liveness) return undefined;
+  return {
+    state: liveness.state,
+    mismatch: liveness.mismatch === true,
+    hint: normalizeOptionalString(liveness.hint),
+    pid: typeof liveness.pid === "number" ? liveness.pid : null,
+    daemonId: normalizeOptionalString(liveness.daemonId),
+  };
 };
 
 const normalizeAlerts = (alerts?: StatusTaskAlerts | null): StatusTaskAlerts | null => {
@@ -159,8 +182,11 @@ const normalizeInProgressTask = (task: StatusInProgressTask): StatusInProgressTa
 });
 
 export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
+  const desiredMode = normalizeOptionalString(input.desiredMode);
   return {
     ...input,
+    desiredMode: desiredMode ?? undefined,
+    daemonLiveness: normalizeDaemonLiveness(input.daemonLiveness),
     blocked: input.blocked.map(normalizeBlockedTask),
     inProgress: input.inProgress.map(normalizeInProgressTask),
     starting: input.starting.map(normalizeTaskBase),
