@@ -8,7 +8,7 @@
  */
 
 import { existsSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import crypto from "crypto";
 
 import {
@@ -60,7 +60,12 @@ import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessionLockPath } from "./paths";
-import { removeDaemonRecord, writeDaemonRecord } from "./daemon-record";
+import {
+  acquireDaemonSingletonLock,
+  removeDaemonRecord,
+  touchDaemonRecordHeartbeat,
+  writeDaemonRecord,
+} from "./daemon-record";
 import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { getRepoLabelSchemeState, initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
@@ -149,6 +154,7 @@ const daemonVersion = getRalphVersion();
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
+const DAEMON_REGISTRY_HEARTBEAT_MS = 5000;
 
 const idleState = new Map<
   string,
@@ -1412,12 +1418,21 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  let daemonSingletonLock: { release: () => void } | null = null;
+  try {
+    daemonSingletonLock = acquireDaemonSingletonLock({ daemonId, startedAt: daemonStartedAt });
+  } catch (e: any) {
+    console.error(`[ralph] ${e?.message ?? String(e)}`);
+    process.exit(1);
+  }
   try {
     writeDaemonRecord({
       version: 1,
       daemonId,
       pid: process.pid,
       startedAt: daemonStartedAt,
+      heartbeatAt: daemonStartedAt,
+      controlRoot: dirname(resolveControlFilePath()),
       ralphVersion: daemonVersion,
       command: daemonCommand,
       cwd: process.cwd(),
@@ -1429,6 +1444,15 @@ async function main(): Promise<void> {
   if (queueState.backend !== "none") {
     await seedRepoSlotReservations();
   }
+
+  const daemonRegistryHeartbeatTimer = setInterval(() => {
+    if (isShuttingDown) return;
+    try {
+      touchDaemonRecordHeartbeat();
+    } catch {
+      // ignore
+    }
+  }, DAEMON_REGISTRY_HEARTBEAT_MS);
 
   const retentionDays = getDashboardEventsRetentionDays();
   await cleanupDashboardEventLogs({ retentionDays });
@@ -1886,6 +1910,7 @@ async function main(): Promise<void> {
     schedulerController.clearTimers();
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
+    clearInterval(daemonRegistryHeartbeatTimer);
     clearInterval(idleRollupTimer);
     clearInterval(throttleResumeTimer);
     controlPlaneServer?.stop();
@@ -1946,6 +1971,12 @@ async function main(): Promise<void> {
       // ignore
     }
 
+    try {
+      daemonSingletonLock?.release();
+    } catch {
+      // ignore
+    }
+
     console.log("[ralph] Goodbye!");
     process.exit(0);
   };
@@ -1987,7 +2018,7 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Control file: set version=1 and mode=running|draining|paused in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
+      "  Control file: set version=1 and mode=running|draining|paused in ~/.ralph/control/control.json (fallback reads: $XDG_STATE_HOME/ralph/control.json, ~/.local/state/ralph/control.json, /tmp/ralph/<uid>/control.json).",
       "  OpenCode profile: set [opencode].defaultProfile in ~/.ralph/config.toml (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
