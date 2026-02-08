@@ -341,7 +341,7 @@ export async function mergePrWithRequiredChecks(params: {
           }),
         runRepairAgent: (prompt, continueSessionId) =>
           params.runReviewAgent({
-            agent: "ralph-plan",
+            agent,
             prompt,
             cacheKey: `review-${params.cacheKey}-${agent}-repair`,
             stage: `${stage} marker repair`,
