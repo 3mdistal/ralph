@@ -1,7 +1,6 @@
 import { getConfig, getRequestedOpencodeProfileName, isOpencodeProfilesEnabled, listOpencodeProfileNames } from "../config";
 import { readControlStateSnapshot, type DaemonMode } from "../drain";
 import { readDaemonRecord } from "../daemon-record";
-import { getEscalationsByStatus } from "../escalation-notes";
 import { getSessionNowDoing } from "../live-status";
 import { resolveOpencodeProfileForNewWork } from "../opencode-auto-profile";
 import { getQueueBackendStateWithLabelHealth, getQueuedTasks, getTasksByStatus } from "../queue-backend";
@@ -56,6 +55,39 @@ function buildQueueParitySnapshot(repos: string[]) {
   };
 }
 
+type StatusTaskSets = {
+  starting: Awaited<ReturnType<typeof getTasksByStatus>>;
+  inProgress: Awaited<ReturnType<typeof getTasksByStatus>>;
+  queued: Awaited<ReturnType<typeof getQueuedTasks>>;
+  throttled: Awaited<ReturnType<typeof getTasksByStatus>>;
+  blocked: Awaited<ReturnType<typeof getTasksByStatus>>;
+  pendingEscalationsCount: number;
+};
+
+async function getStatusTaskSets(opts: { disableSweeps: boolean }): Promise<StatusTaskSets> {
+  const run = async () => {
+    const [starting, inProgress, queued, throttled, blocked, escalated] = await Promise.all([
+      getTasksByStatus("starting"),
+      getTasksByStatus("in-progress"),
+      getQueuedTasks(),
+      getTasksByStatus("throttled"),
+      getTasksByStatus("blocked"),
+      getTasksByStatus("escalated"),
+    ]);
+    return {
+      starting,
+      inProgress,
+      queued,
+      throttled,
+      blocked,
+      pendingEscalationsCount: escalated.length,
+    };
+  };
+
+  if (!opts.disableSweeps) return run();
+  return withEnv(DISABLE_GITHUB_QUEUE_SWEEPS_ENV, "1", run);
+}
+
 function computeDesiredMode(params: { gateReason: string; throttleState: string }): string {
   return params.gateReason === "hard-throttled"
     ? "hard-throttled"
@@ -87,7 +119,7 @@ type StatusBaseData = {
   queued: Awaited<ReturnType<typeof getQueuedTasks>>;
   throttled: Awaited<ReturnType<typeof getTasksByStatus>>;
   blockedSorted: Awaited<ReturnType<typeof getTasksByStatus>>;
-  pendingEscalations: Awaited<ReturnType<typeof getEscalationsByStatus>>;
+  pendingEscalationsCount: number;
   triageRuns: ReturnType<typeof listTopRalphRunTriages>;
   getAlertSummary: (task: { repo: string; issue: string }) =>
     | {
@@ -137,19 +169,10 @@ async function collectBaseStatusData(opts?: { disableGitHubQueueSweeps?: boolean
   const desiredMode = computeDesiredMode({ gateReason: gate.reason, throttleState: throttle.state });
   const liveness = deriveDaemonLiveness({ desiredMode, daemonRecord });
 
-  const fetchTasks = async () =>
-    await Promise.all([
-      getTasksByStatus("starting"),
-      getTasksByStatus("in-progress"),
-      getQueuedTasks(),
-      getTasksByStatus("throttled"),
-      getTasksByStatus("blocked"),
-      getEscalationsByStatus("pending"),
-    ]);
+  const { starting, inProgress, queued, throttled, blocked, pendingEscalationsCount } = await getStatusTaskSets({
+    disableSweeps: opts?.disableGitHubQueueSweeps === true,
+  });
 
-  const [starting, inProgress, queued, throttled, blocked, pendingEscalations] = opts?.disableGitHubQueueSweeps
-    ? await withEnv(DISABLE_GITHUB_QUEUE_SWEEPS_ENV, "1", fetchTasks)
-    : await fetchTasks();
 
   const blockedSorted = [...blocked].sort((a, b) => {
     const priorityDelta = priorityRank(a.priority) - priorityRank(b.priority);
@@ -216,7 +239,7 @@ async function collectBaseStatusData(opts?: { disableGitHubQueueSweeps?: boolean
     queued,
     throttled,
     blockedSorted,
-    pendingEscalations,
+    pendingEscalationsCount,
     triageRuns,
     getAlertSummary,
     control,
@@ -296,7 +319,7 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
       computedAt: r.computedAt,
     })),
     escalations: {
-      pending: base.pendingEscalations.length,
+      pending: base.pendingEscalationsCount,
     },
     inProgress: inProgressWithStatus,
     starting: base.starting.map((t) => ({
@@ -429,7 +452,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
         computedAt: r.computedAt,
       })),
       escalations: {
-        pending: base.pendingEscalations.length,
+        pending: base.pendingEscalationsCount,
       },
       inProgress: inProgressWithStatus,
       starting: base.starting.map((t) => ({
@@ -531,7 +554,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   const usageLines = formatStatusUsageSection(usageRows);
   for (const line of usageLines) console.log(line);
 
-  console.log(`Escalations: ${base.pendingEscalations.length} pending`);
+  console.log(`Escalations: ${base.pendingEscalationsCount} pending`);
 
   console.log(`Dependency satisfaction overrides: ${base.depSatisfaction.length}`);
   for (const row of base.depSatisfaction.slice(0, 10)) {
