@@ -145,6 +145,8 @@ export function sanitizeEscalationReason(input: string): string {
     { re: /(Authorization:\s*Bearer\s+)[A-Za-z0-9._-]+/gi, replacement: "$1[REDACTED]" },
     { re: /\/home\/[A-Za-z0-9._-]+\//g, replacement: "~/" },
     { re: /\/Users\/[A-Za-z0-9._-]+\//g, replacement: "~/" },
+    { re: /\/private\/tmp\/[A-Za-z0-9._-][^\s)]*/g, replacement: "/private/tmp/[REDACTED]" },
+    { re: /\/tmp\/[A-Za-z0-9._-][^\s)]*/g, replacement: "/tmp/[REDACTED]" },
   ];
 
   for (const { re, replacement } of patterns) {
