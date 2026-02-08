@@ -99,8 +99,18 @@ import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
-import { isLoopbackHost, startControlPlaneServer, type ControlPlaneServer } from "./dashboard/control-plane-server";
+import {
+  ControlPlaneCommandError,
+  isLoopbackHost,
+  startControlPlaneServer,
+  type ControlPlaneServer,
+} from "./dashboard/control-plane-server";
 import { toControlPlaneStateV1 } from "./dashboard/control-plane-state";
+import {
+  buildTaskStatusCmdLabelMutation,
+  mapTaskStatusInputToCmdLabel,
+  parseGitHubTaskId,
+} from "./dashboard/task-command-core";
 import { buildProvisionPlan } from "./sandbox/provisioning-core";
 import {
   applySeedFromSpec,
@@ -1624,6 +1634,49 @@ async function main(): Promise<void> {
               taskId,
               sessionId: task["session-id"],
               data: { message: `Set priority ${normalized} for ${taskId}` },
+            });
+          },
+          setTaskStatus: async ({ taskId, status }) => {
+            const parsedTask = parseGitHubTaskId(taskId);
+            if (!parsedTask.ok) {
+              throw new ControlPlaneCommandError(400, parsedTask.error.code, parsedTask.error.message);
+            }
+
+            const mappedStatus = mapTaskStatusInputToCmdLabel(status);
+            if (!mappedStatus.ok) {
+              throw new ControlPlaneCommandError(400, mappedStatus.error.code, mappedStatus.error.message);
+            }
+
+            const token = await resolveGitHubToken();
+            if (!token) {
+              throw new ControlPlaneCommandError(503, "github_auth_unavailable", "GitHub auth is not configured");
+            }
+
+            const github = new GitHubClient(parsedTask.repo, { getToken: resolveGitHubToken });
+            const mutation = buildTaskStatusCmdLabelMutation(mappedStatus.cmdLabel);
+            const ops = planIssueLabelOps({ add: mutation.add, remove: mutation.remove });
+
+            const result = await executeIssueLabelOps({
+              github,
+              repo: parsedTask.repo,
+              issueNumber: parsedTask.issueNumber,
+              ops,
+              ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: parsedTask.repo, github }),
+              ensureBefore: true,
+              retryMissingLabelOnce: true,
+            });
+
+            if (!result.ok) {
+              const message = result.error instanceof Error ? result.error.message : String(result.error);
+              throw new ControlPlaneCommandError(502, "upstream_unavailable", `Failed to update task status: ${message}`);
+            }
+
+            publishDashboardEvent({
+              type: "log.ralph",
+              level: "info",
+              repo: parsedTask.repo,
+              taskId,
+              data: { message: `Applied ${mappedStatus.cmdLabel} on ${parsedTask.issueRef}` },
             });
           },
         },
