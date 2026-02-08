@@ -60,7 +60,7 @@ describe("syncBlockedStateForTasks", () => {
         signals: [
           { source: "github", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 11 } },
         ],
-        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: false },
+        coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: false },
       }),
     };
 
@@ -91,7 +91,7 @@ describe("syncBlockedStateForTasks", () => {
       getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
         issue,
         signals: [],
-        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
+        coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: true },
       }),
     };
 
@@ -117,7 +117,7 @@ describe("syncBlockedStateForTasks", () => {
       getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
         issue,
         signals: [],
-        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
+        coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: true },
       }),
     };
 
@@ -148,7 +148,7 @@ describe("syncBlockedStateForTasks", () => {
       getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
         issue,
         signals: [],
-        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
+        coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: true },
       }),
     };
 
@@ -175,7 +175,7 @@ describe("syncBlockedStateForTasks", () => {
       getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
         issue,
         signals: [],
-        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
+        coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: true },
       }),
     };
 
@@ -209,7 +209,7 @@ describe("syncBlockedStateForTasks", () => {
         getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
           issue,
           signals: [],
-          coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
+          coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: true },
         }),
       };
 
@@ -244,7 +244,7 @@ describe("syncBlockedStateForTasks", () => {
         signals: [
           { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 12 } },
         ],
-        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: true },
+        coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: true },
       }),
     };
 
@@ -274,7 +274,7 @@ describe("syncBlockedStateForTasks", () => {
         signals: [
           { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 12 } },
         ],
-        coverage: { githubDepsComplete: false, githubSubIssuesComplete: true, bodyDeps: true },
+        coverage: { githubDeps: "unavailable", githubSubIssues: "complete", bodyDeps: true },
       }),
     };
 
@@ -301,7 +301,7 @@ describe("syncBlockedStateForTasks", () => {
       getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
         issue,
         signals: [{ source: "github", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 11 } }],
-        coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: false },
+        coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: false },
       }),
     };
 
@@ -336,7 +336,7 @@ describe("syncBlockedStateForTasks", () => {
           { source: "github", kind: "blocked_by", state: "closed", ref: { repo: issue.repo, number: 12 } },
           { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 13 } },
         ],
-        coverage: { githubDepsComplete: false, githubSubIssuesComplete: true, bodyDeps: true },
+        coverage: { githubDeps: "partial", githubSubIssues: "complete", bodyDeps: true },
       }),
     };
 
@@ -363,7 +363,7 @@ describe("syncBlockedStateForTasks", () => {
           { source: "github", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 12 } },
           { source: "body", kind: "blocked_by", state: "open", ref: { repo: issue.repo, number: 13 } },
         ],
-        coverage: { githubDepsComplete: false, githubSubIssuesComplete: true, bodyDeps: true },
+        coverage: { githubDeps: "partial", githubSubIssues: "complete", bodyDeps: true },
       }),
     };
 
@@ -384,13 +384,36 @@ describe("syncBlockedStateForTasks", () => {
     expect(call?.[2]?.["blocked-source"]).toBe("deps");
   });
 
+  test("keeps outcome conservative when sub-issue coverage is not complete", async () => {
+    updateTaskStatusMock.mockClear();
+    const provider: IssueRelationshipProvider = {
+      getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
+        issue,
+        signals: [],
+        coverage: { githubDeps: "complete", githubSubIssues: "partial", bodyDeps: false },
+      }),
+    };
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+      relationships: provider,
+    });
+
+    await worker.syncBlockedStateForTasks([createTask({})]);
+
+    expect(updateTaskStatusMock).not.toHaveBeenCalled();
+  });
+
   test("skips changes when relationship coverage is unknown", async () => {
     updateTaskStatusMock.mockClear();
     const provider: IssueRelationshipProvider = {
       getSnapshot: async (issue): Promise<IssueRelationshipSnapshot> => ({
         issue,
         signals: [],
-        coverage: { githubDepsComplete: false, githubSubIssuesComplete: false, bodyDeps: false },
+        coverage: { githubDeps: "unavailable", githubSubIssues: "unavailable", bodyDeps: false },
       }),
     };
 
