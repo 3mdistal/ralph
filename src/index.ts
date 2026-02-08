@@ -105,6 +105,7 @@ import { runGithubUsageCommand } from "./commands/github-usage";
 import { runWorktreesCommand } from "./commands/worktrees";
 import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
+import { runSandboxCollectCommand } from "./commands/sandbox-collect";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { createEscalationConsultantScheduler } from "./escalation-consultant/scheduler";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
@@ -2068,9 +2069,11 @@ function printGlobalHelp(): void {
       "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
+      "  ralph sandbox:collect --run-id <id> Export a run trace bundle",
       "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
+      "  ralph sandbox:collect --run-id <id> Export a run trace bundle",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "  ralph sandbox seed                 Seed sandbox edge-case issues",
@@ -2230,6 +2233,17 @@ function printCommandHelp(command: string): void {
           "  ralph sandbox:seed [--run-id <id>]",
           "",
           "Seeds a sandbox repo based on the manifest (defaults to newest manifest if omitted).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:collect":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:collect --run-id <id> [--out <path>] [--json]",
+          "",
+          "Exports a run-scoped trace bundle (timeline + GitHub request ids + artifacts).",
         ].join("\n")
       );
       return;
@@ -2703,6 +2717,16 @@ if (args[0] === "sandbox:seed") {
 
   console.log(`[ralph:sandbox] Seeded ${manifest.repo.fullName}`);
   console.log(`[ralph:sandbox] Manifest: ${manifestPath}`);
+  process.exit(0);
+}
+
+if (args[0] === "sandbox:collect") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox:collect");
+    process.exit(0);
+  }
+
+  await runSandboxCollectCommand(args.slice(1));
   process.exit(0);
 }
 
