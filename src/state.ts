@@ -94,7 +94,7 @@ export type IssueAlertSummary = {
 export const PR_STATE_OPEN: PrState = "open";
 export const PR_STATE_MERGED: PrState = "merged";
 
-export type GateName = "preflight" | "product_review" | "devex_review" | "ci";
+export type GateName = "preflight" | "product_review" | "devex_review" | "ci" | "pr_evidence";
 export type GateStatus = "pending" | "pass" | "fail" | "skipped";
 export type GateArtifactKind = "command_output" | "failure_excerpt" | "note";
 
@@ -114,7 +114,7 @@ export type ParentVerificationState = {
   updatedAtMs: number;
 };
 
-const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci"];
+const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci", "pr_evidence"];
 const GATE_STATUSES: GateStatus[] = ["pending", "pass", "fail", "skipped"];
 const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_excerpt", "note"];
 
@@ -590,7 +590,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
         database.exec(`
           CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
             run_id TEXT NOT NULL,
-            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
             status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
             command TEXT,
             skip_reason TEXT,
@@ -610,7 +610,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
-            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
             kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
             content TEXT NOT NULL,
             truncated INTEGER NOT NULL DEFAULT 0,
@@ -789,6 +789,73 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             database.exec(
               "CREATE INDEX IF NOT EXISTS idx_ralph_run_metrics_triage_score ON ralph_run_metrics(triage_score)"
             );
+          }
+        }
+
+        if (existingVersion < 16) {
+          if (
+            tableExists(database, "ralph_run_gate_results") &&
+            tableExists(database, "ralph_run_gate_artifacts") &&
+            tableExists(database, "ralph_runs") &&
+            tableExists(database, "repos")
+          ) {
+            database.exec(`
+              CREATE TABLE ralph_run_gate_results_new (
+                run_id TEXT NOT NULL,
+                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
+                command TEXT,
+                skip_reason TEXT,
+                url TEXT,
+                pr_number INTEGER,
+                pr_url TEXT,
+                repo_id INTEGER NOT NULL,
+                issue_number INTEGER,
+                task_path TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(run_id, gate),
+                FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE,
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+              );
+              INSERT INTO ralph_run_gate_results_new(
+                run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+              )
+              SELECT
+                run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+              FROM ralph_run_gate_results;
+              DROP TABLE ralph_run_gate_results;
+              ALTER TABLE ralph_run_gate_results_new RENAME TO ralph_run_gate_results;
+
+              CREATE TABLE ralph_run_gate_artifacts_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
+                content TEXT NOT NULL,
+                truncated INTEGER NOT NULL DEFAULT 0,
+                original_chars INTEGER,
+                original_lines INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+              );
+              INSERT INTO ralph_run_gate_artifacts_new(
+                id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+              )
+              SELECT
+                id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+              FROM ralph_run_gate_artifacts;
+              DROP TABLE ralph_run_gate_artifacts;
+              ALTER TABLE ralph_run_gate_artifacts_new RENAME TO ralph_run_gate_artifacts;
+
+              CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
+                ON ralph_run_gate_results(repo_id, issue_number, updated_at);
+              CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr
+                ON ralph_run_gate_results(repo_id, pr_number);
+              CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_artifacts_run
+                ON ralph_run_gate_artifacts(run_id);
+            `);
           }
         }
 
@@ -1098,7 +1165,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
 
     CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
       run_id TEXT NOT NULL,
-      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
       status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
       command TEXT,
       skip_reason TEXT,
@@ -1119,7 +1186,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_id TEXT NOT NULL,
-      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
       kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
       content TEXT NOT NULL,
       truncated INTEGER NOT NULL DEFAULT 0,
@@ -2571,6 +2638,19 @@ export function upsertRalphRunGateResult(params: {
   const meta = getRunMeta(params.runId);
   const gate = assertGateName(params.gate);
 
+  if (gate === "pr_evidence" && params.status === "fail") {
+    const existing = database
+      .query(
+        `SELECT status
+         FROM ralph_run_gate_results
+         WHERE run_id = $run_id AND gate = $gate`
+      )
+      .get({ $run_id: params.runId, $gate: gate }) as { status?: string } | undefined;
+    if (existing?.status === "pass") {
+      return;
+    }
+  }
+
   if (params.status === null) {
     throw new Error("Gate status cannot be null");
   }
@@ -3108,6 +3188,130 @@ export type RalphRunSummary = {
   triageScore: number | null;
   triageFlags: string[];
 };
+
+export type RalphRunStepMetric = {
+  runId: string;
+  stepTitle: string;
+  wallTimeMs: number | null;
+  toolCallCount: number;
+  toolTimeMs: number | null;
+  anomalyCount: number;
+  tokensTotal: number | null;
+  quality: string;
+};
+
+export function listRalphRunStepMetrics(runId: string): RalphRunStepMetric[] {
+  const trimmed = runId?.trim();
+  if (!trimmed) return [];
+
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT
+         run_id as run_id,
+         step_title as step_title,
+         wall_time_ms as wall_time_ms,
+         tool_call_count as tool_call_count,
+         tool_time_ms as tool_time_ms,
+         anomaly_count as anomaly_count,
+         tokens_total as tokens_total,
+         quality as quality
+       FROM ralph_run_step_metrics
+       WHERE run_id = $run_id
+       ORDER BY step_title ASC`
+    )
+    .all({ $run_id: trimmed }) as Array<{
+    run_id?: string;
+    step_title?: string;
+    wall_time_ms?: number | null;
+    tool_call_count?: number | null;
+    tool_time_ms?: number | null;
+    anomaly_count?: number | null;
+    tokens_total?: number | null;
+    quality?: string | null;
+  }>;
+
+  return rows
+    .map((row) => {
+      const runId = row.run_id ?? "";
+      const stepTitle = row.step_title ?? "";
+      if (!runId || !stepTitle) return null;
+      return {
+        runId,
+        stepTitle,
+        wallTimeMs: typeof row.wall_time_ms === "number" ? row.wall_time_ms : null,
+        toolCallCount: typeof row.tool_call_count === "number" ? row.tool_call_count : 0,
+        toolTimeMs: typeof row.tool_time_ms === "number" ? row.tool_time_ms : null,
+        anomalyCount: typeof row.anomaly_count === "number" ? row.anomaly_count : 0,
+        tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+        quality: typeof row.quality === "string" && row.quality ? row.quality : "missing",
+      } satisfies RalphRunStepMetric;
+    })
+    .filter((row): row is RalphRunStepMetric => Boolean(row));
+}
+
+export function listRalphRunStepMetricsByRunIds(runIds: string[]): Map<string, RalphRunStepMetric[]> {
+  const deduped = Array.from(new Set(runIds.map((id) => id.trim()).filter(Boolean)));
+  if (deduped.length === 0) return new Map();
+
+  const database = requireDb();
+  const params: Record<string, string> = {};
+  const placeholders = deduped.map((runId, idx) => {
+    const key = `$run_id_${idx}`;
+    params[key] = runId;
+    return key;
+  });
+
+  const rows = database
+    .query(
+      `SELECT
+         run_id as run_id,
+         step_title as step_title,
+         wall_time_ms as wall_time_ms,
+         tool_call_count as tool_call_count,
+         tool_time_ms as tool_time_ms,
+         anomaly_count as anomaly_count,
+         tokens_total as tokens_total,
+         quality as quality
+       FROM ralph_run_step_metrics
+       WHERE run_id IN (${placeholders.join(", ")})
+       ORDER BY run_id ASC, step_title ASC`
+    )
+    .all(params) as Array<{
+    run_id?: string;
+    step_title?: string;
+    wall_time_ms?: number | null;
+    tool_call_count?: number | null;
+    tool_time_ms?: number | null;
+    anomaly_count?: number | null;
+    tokens_total?: number | null;
+    quality?: string | null;
+  }>;
+
+  const byRun = new Map<string, RalphRunStepMetric[]>();
+  for (const row of rows) {
+    const runId = row.run_id ?? "";
+    const stepTitle = row.step_title ?? "";
+    if (!runId || !stepTitle) continue;
+
+    const entry: RalphRunStepMetric = {
+      runId,
+      stepTitle,
+      wallTimeMs: typeof row.wall_time_ms === "number" ? row.wall_time_ms : null,
+      toolCallCount: typeof row.tool_call_count === "number" ? row.tool_call_count : 0,
+      toolTimeMs: typeof row.tool_time_ms === "number" ? row.tool_time_ms : null,
+      anomalyCount: typeof row.anomaly_count === "number" ? row.anomaly_count : 0,
+      tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+      quality: typeof row.quality === "string" && row.quality ? row.quality : "missing",
+    };
+
+    const list = byRun.get(runId);
+    if (list) list.push(entry);
+    else byRun.set(runId, [entry]);
+  }
+
+  return byRun;
+}
 
 export function listRalphRunsTop(params?: {
   limit?: number;
