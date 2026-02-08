@@ -47,7 +47,6 @@ async function writeTestConfig(): Promise<void> {
     maxWorkers: 1,
     batchSize: 10,
     pollInterval: 30_000,
-    bwrbVault: "/tmp",
     owner: "3mdistal",
     allowedOwners: ["3mdistal"],
     devDir: "/tmp",
@@ -1357,6 +1356,141 @@ describe("integration-ish harness: full task lifecycle", () => {
       message.includes("Timed out waiting for required checks") || message.includes("Fix the CI failure")
     );
     expect(askedForCiFix).toBe(false);
+  }, lifecycleTimeoutMs);
+
+  test("classifies hard continue failures before no-PR fallback escalation", async () => {
+    continueSessionMock.mockImplementation(async (_repoPath: string, _sessionId: string, message: string) => {
+      if (message.includes("Proceed with implementation")) {
+        return {
+          sessionId: "ses_build",
+          success: true,
+          output: "Implementation complete but PR URL not available yet.",
+        };
+      }
+
+      return {
+        sessionId: "ses_build",
+        success: true,
+        output: [
+          "{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"Invalid schema for function 'ahrefs_batch-analysis-batch-analysis': In context=('properties', 'select'), array schema missing items.\"}}}",
+          "code: invalid_function_parameters",
+        ].join("\n"),
+      };
+    });
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+    });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ kind: "ok", repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).tryEnsurePrFromWorktree = async () => ({ prUrl: null, diagnostics: "" });
+    (worker as any).createAgentRun = async () => {};
+
+    let writebackReason = "";
+    (worker as any).writeEscalationWriteback = async (_task: any, params: { reason: string }) => {
+      writebackReason = params.reason;
+      return null;
+    };
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("escalated");
+    const reason = String(result.escalationReason ?? "");
+    expect(reason).toContain("OpenCode config invalid");
+    expect(reason).not.toContain("did not create a PR");
+    expect(writebackReason).toBe(reason);
+
+    expect(notifyEscalationMock).toHaveBeenCalled();
+    const notifyCalls = notifyEscalationMock.mock.calls as any[];
+    const notifyReason = String(notifyCalls[notifyCalls.length - 1]?.[0]?.reason ?? "");
+    expect(notifyReason).toBe(reason);
+  }, lifecycleTimeoutMs);
+
+  test("resume path keeps classified reason aligned across run/writeback/notify", async () => {
+    continueSessionMock.mockImplementation(async (_repoPath: string, _sessionId: string, message: string) => {
+      if (message.includes("Ralph restarted while this task was in progress")) {
+        return {
+          sessionId: "ses_resume",
+          success: true,
+          output: "Resumed implementation. PR URL not available yet.",
+        };
+      }
+
+      return {
+        sessionId: "ses_resume",
+        success: true,
+        output: [
+          "{\"type\":\"error\",\"error\":{\"data\":{\"message\":\"Invalid schema for function 'ahrefs_batch-analysis-batch-analysis': array schema missing items.\"}}}",
+          "code: invalid_function_parameters",
+        ].join("\n"),
+      };
+    });
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+    });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ kind: "ok", repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).tryEnsurePrFromWorktree = async () => ({ prUrl: null, diagnostics: "" });
+    (worker as any).createAgentRun = async () => {};
+
+    let writebackReason = "";
+    (worker as any).writeEscalationWriteback = async (_task: any, params: { reason: string }) => {
+      writebackReason = params.reason;
+      return null;
+    };
+
+    const result = await worker.processTask(
+      createMockTask({
+        issue: "3mdistal/ralph#202",
+        "session-id": "ses_existing_resume",
+      })
+    );
+
+    expect(result.outcome).toBe("escalated");
+    const reason = String(result.escalationReason ?? "");
+    expect(reason).toContain("OpenCode config invalid");
+    expect(reason).not.toContain("did not create a PR");
+    expect(writebackReason).toBe(reason);
+
+    expect(notifyEscalationMock).toHaveBeenCalled();
+    const notifyCalls = notifyEscalationMock.mock.calls as any[];
+    const notifyReason = String(notifyCalls[notifyCalls.length - 1]?.[0]?.reason ?? "");
+    expect(notifyReason).toBe(reason);
   }, lifecycleTimeoutMs);
 
   test("hard throttle pauses before any model send", async () => {

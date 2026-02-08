@@ -1,15 +1,21 @@
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
 
-  // Mirror the intent of bwrb's Knip setup: keep CI signal stable
-  // and explicitly ignore environment-provided tooling.
+  // Keep CI signal stable and explicitly ignore environment-provided tooling.
 
   // These binaries are expected to exist in the operator environment.
-  "ignoreBinaries": ["which", "terminal-notifier", "bwrb", "gh", "tsc", "knip"],
+  "ignoreBinaries": ["which", "terminal-notifier", "tsc", "knip"],
 
   // Bun's recommended TS config uses the virtual `bun-types` package name.
   // Knip reports it as unresolved because it's not a real dependency.
   "ignoreUnresolved": ["bun-types"],
+
+  // Explicitly declare entrypoints.
+  //
+  // Knip's Bun plugin can infer test entrypoints from `package.json` scripts when
+  // they are simple (e.g. `bun test`). Our `test` script is chained, so we keep
+  // CI stable by listing test entrypoints directly.
+  "entry": ["src/__tests__/**/*.test.ts"],
 
   // Project files to analyze.
   "project": ["src/**/*.ts"],

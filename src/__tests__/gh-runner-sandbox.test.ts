@@ -33,7 +33,6 @@ describe("gh runner sandbox guard", () => {
       maxWorkers: 1,
       batchSize: 10,
       pollInterval: 30_000,
-      bwrbVault: "/tmp",
       owner: "3mdistal",
       allowedOwners: ["3mdistal"],
       devDir: "/tmp",
@@ -65,6 +64,11 @@ describe("gh runner sandbox guard", () => {
   test("ghRead rejects unknown commands in sandbox", () => {
     const ghRead = createGhRunner({ repo: "3mdistal/ralph-sandbox-demo", mode: "read" });
     expect(() => ghRead`gh magic unknown`).toThrow(/SANDBOX TRIPWIRE/i);
+  });
+
+  test("ghRead allows repo clone in sandbox", () => {
+    const ghRead = createGhRunner({ repo: "3mdistal/ralph-sandbox-demo", mode: "read" });
+    expect(() => ghRead`gh repo clone 3mdistal/ralph-sandbox-demo /tmp/ralph-sandbox-demo`).not.toThrow();
   });
 
   test("ghWrite blocks writes outside sandbox boundary", () => {

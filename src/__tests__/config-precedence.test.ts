@@ -38,8 +38,7 @@ describe("Config precedence (~/.ralph)", () => {
     await writeFile(
       configTomlPath,
       [
-        'bwrbVault = "toml-vault"',
-        'queueBackend = "bwrb"',
+        'queueBackend = "none"',
         "maxWorkers = 3",
         "batchSize = 11",
         "pollInterval = 12345",
@@ -53,8 +52,7 @@ describe("Config precedence (~/.ralph)", () => {
     );
 
     await writeJson(configJsonPath, {
-      bwrbVault: "json-vault",
-      queueBackend: "none",
+      queueBackend: "github",
       maxWorkers: 2,
       batchSize: 99,
       ownershipTtlMs: 33000,
@@ -65,8 +63,7 @@ describe("Config precedence (~/.ralph)", () => {
     cfgMod.__resetConfigForTests();
     const cfg = cfgMod.loadConfig().config;
 
-    expect(cfg.bwrbVault).toBe("toml-vault");
-    expect(cfg.queueBackend).toBe("bwrb");
+    expect(cfg.queueBackend).toBe("none");
     expect(cfg.maxWorkers).toBe(3);
     expect(cfg.batchSize).toBe(11);
     expect(cfg.owner).toBe("toml-owner");
@@ -78,7 +75,7 @@ describe("Config precedence (~/.ralph)", () => {
     const configJsonPath = getRalphConfigJsonPath();
 
     await writeJson(configJsonPath, {
-      bwrbVault: "json-vault",
+      queueBackend: "github",
       maxWorkers: 4,
       ownershipTtlMs: 33000,
       repos: [],
@@ -88,7 +85,7 @@ describe("Config precedence (~/.ralph)", () => {
     cfgMod.__resetConfigForTests();
     const cfg = cfgMod.loadConfig().config;
 
-    expect(cfg.bwrbVault).toBe("json-vault");
+    expect(cfg.queueBackend).toBe("github");
     expect(cfg.maxWorkers).toBe(4);
     expect(cfg.ownershipTtlMs).toBe(33000);
   });
@@ -96,7 +93,7 @@ describe("Config precedence (~/.ralph)", () => {
   test("falls back to legacy ~/.config/opencode/ralph/ralph.json with warning", async () => {
     const legacyPath = getRalphLegacyConfigPath();
     await writeJson(legacyPath, {
-      bwrbVault: "legacy-vault",
+      queueBackend: "none",
       maxWorkers: 5,
       ownershipTtlMs: 120000,
       repos: [],
@@ -111,7 +108,7 @@ describe("Config precedence (~/.ralph)", () => {
       cfgMod.__resetConfigForTests();
       const cfg = cfgMod.loadConfig().config;
 
-      expect(cfg.bwrbVault).toBe("legacy-vault");
+      expect(cfg.queueBackend).toBe("none");
       expect(cfg.maxWorkers).toBe(5);
       expect(cfg.ownershipTtlMs).toBe(120000);
       expect(warn).toHaveBeenCalled();

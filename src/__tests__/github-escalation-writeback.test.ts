@@ -82,16 +82,19 @@ describe("github escalation writeback", () => {
 
   test("sanitizeEscalationReason redacts tokens and paths", () => {
     const input =
-      "ghp_abcdefghijklmnopqrstuv Authorization: Bearer secret-token /home/alice/project /Users/bob/app \x1b[31mred\x1b[0m";
+      "ghp_abcdefghijklmnopqrstuv Authorization: Bearer secret-token /home/alice/project /Users/bob/app /tmp/ralph/secret.log /private/tmp/opencode-123/run.log \x1b[31mred\x1b[0m";
     const output = sanitizeEscalationReason(input);
 
     expect(output).toContain("ghp_[REDACTED]");
     expect(output).toContain("Bearer [REDACTED]");
     expect(output).toContain("~/project");
     expect(output).toContain("~/app");
+    expect(output).toContain("/tmp/[REDACTED]");
+    expect(output).toContain("/private/tmp/[REDACTED]");
     expect(output).not.toContain("~//");
     expect(output).not.toContain("ghp_abcdefghijklmnopqrstuv");
     expect(output).not.toContain("secret-token");
+    expect(output).not.toContain("/tmp/ralph/secret.log");
   });
 
   test("extractExistingMarker parses marker id", () => {

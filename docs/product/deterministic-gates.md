@@ -68,9 +68,33 @@ Note: gate persistence should be stored in `~/.ralph/state.sqlite`. Treat this l
 - `devex_review.status`: `pending|pass|fail|skipped`
 - `ci.status`: `pending|pass|fail|skipped`
 - `ci.url`: string (run URL, when available)
+- `pr_evidence.status`: `pending|pass|fail|skipped`
+- `pr_evidence.pr_url`: string (required for issue-linked implementation success)
+- `pr_evidence.pr_number`: number (required for issue-linked implementation success)
+- `pr_evidence.skip_reason`: string (required when PR evidence is absent and gate fails/skips)
 - `ready_for_pr`: boolean (derived; true only when required gates are satisfied)
 
 Rule of thumb: gates should be derived from observable artifacts (command output, CI checks, explicit review agent output), not "agent says it ran tests".
+
+## Completion gate: PR evidence for issue-linked runs
+
+Default: required for issue-linked implementation success.
+
+Before Ralph records a run as `outcome=success`, it must persist PR evidence for issue-linked implementation runs:
+
+- `pr_evidence.status=pass`
+- `pr_evidence.pr_url` (canonical PR URL)
+- `pr_evidence.pr_number`
+
+Exception:
+
+- `completionKind=verified` (parent verification / no-work-remains paths) may complete successfully without a PR URL.
+
+If PR evidence is missing:
+
+- Ralph must not record success for that run.
+- Ralph routes to deterministic PR recovery first (bounded retries).
+- If retries are exhausted, Ralph records `pr_evidence.status=fail` with a `skip_reason` and actionable diagnostics (worktree/branch + push/create-PR steps), then escalates.
 
 ## Gate State Query Surface
 
@@ -193,9 +217,7 @@ Behavior:
 - Detect: if required checks are failing or timed out, do not escalate until bounded remediation attempts complete.
 - Comment: post a single canonical GitHub **issue** comment listing failing required check names + links, base/head refs, and the action statement: “Ralph is spawning a dedicated CI-debug run to make required checks green.” Edit this comment as CI state changes (no duplicates).
 - Run: spawn a dedicated CI-debug run immediately with a fresh worktree and fresh OpenCode session (no planning phase). Seed the prompt with failing check names/URLs/refs and a brief failure summary.
-- Retries: bounded attempts; if the same failure signature repeats across attempts, stop early and escalate.
-
-Retries are per-lane configurable; do not assume a default count.
+- Retries: bounded attempts; configurable via `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` (default: 5). If the same failure signature repeats across attempts, stop early and escalate.
 
 - GitHub status: keep `ralph:status:in-progress` while remediation attempts continue. Set `ralph:status:escalated` only after bounded CI-debug attempts fail.
 - Escalation: post a final comment summarizing what failed, what was tried (links to attempts), and the exact next human action.
@@ -209,9 +231,8 @@ Behavior:
 - Comment: post a single canonical GitHub **issue** comment with PR/base/head refs, conflict file count/sample, and the action statement. Edit the same comment as state changes (no duplicates).
 - Run: spawn a dedicated merge-conflict recovery run with a fresh worktree and fresh OpenCode session (no planning phase). Merge base into head (no rebase / no force-push), resolve conflicts, run tests/typecheck/build/knip, then push updates.
 - Wait: after pushing, wait for `mergeStateStatus != DIRTY` and for required checks to appear for the new head SHA before resuming merge-gate logic.
-- Retries: bounded attempts (2–3). If the same conflict signature repeats across attempts, stop early and escalate. Exception: allow one bounded grace retry when the prior repeated-signature failure class is non-merge-progress (`permission|tooling|runtime`); if the signature repeats again after that grace retry, stop early and escalate with a clear "grace exhausted" reason.
-
-Retries are per-lane configurable; do not assume a default count.
+- Retries: bounded attempts; configurable via `RALPH_MERGE_CONFLICT_MAX_ATTEMPTS` (default: 2). If the same conflict signature repeats across attempts, stop early and escalate.
+- Exception: allow one bounded grace retry when the prior repeated-signature failure class is non-merge-progress (`permission|tooling|runtime`); if the signature repeats again after that grace retry, stop early and escalate with a clear "grace exhausted" reason.
 
 - GitHub status: keep `ralph:status:in-progress` while recovery attempts continue. Set `ralph:status:escalated` only after bounded attempts fail.
 - Escalation: post a final comment summarizing the conflict files and the exact next human action needed.

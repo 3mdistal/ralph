@@ -4,8 +4,7 @@ import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
 
-import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "../queue-backend";
-import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "../bwrb/artifacts";
+import { type AgentTask, updateTaskStatus } from "../queue-backend";
 import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
@@ -49,6 +48,7 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import { prepareReviewDiffArtifacts, recordReviewGateFailure, recordReviewGateSkipped, runReviewGate } from "../gates/review";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
@@ -120,9 +120,9 @@ import {
   formatMergeConflictPaths,
 } from "../merge-conflict-recovery";
 import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "../github/watchdog-writeback";
-import { buildLoopTripDetails } from "../loop-detection/format";
 import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
 import { classifyOpencodeFailure } from "../opencode-error-classifier";
+import { derivePrCreateEscalationReason } from "./pr-create-escalation-reason";
 import { computeBlockedDecision, type RelationshipSignal } from "../github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "../github/issue-ref";
 import {
@@ -135,7 +135,7 @@ import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "../das
 import type { DashboardEventContext } from "../dashboard/publisher";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-recording-session-adapter";
 import { redactHomePathForDisplay } from "../redaction";
-import { isSafeSessionId } from "../session-id";
+import { buildGhErrorSearchText, formatGhError as formatGhErrorShared } from "./gh-error-format";
 import {
   createContextRecoveryAdapter as createContextRecoveryAdapterImpl,
   withDashboardSessionOptions as withDashboardSessionOptionsImpl,
@@ -149,31 +149,35 @@ import {
 } from "./events";
 import { PAUSED_AT_CHECKPOINT_FIELD, parseCheckpointValue } from "./checkpoint-fields";
 import { applyTaskPatch } from "./task-patch";
-import { resolveVaultPath } from "./vault-paths";
+import { runStartLane } from "./lanes/start";
+import { runResumeLane } from "./lanes/resume";
 import {
+  bumpLoopTriageAttempt,
   completeParentVerification,
   completeRalphRun,
   createRalphRun,
   ensureRalphRunGateRows,
-  getParentVerificationState,
-  getLatestRunIdForSession,
-  getRalphRunTokenTotals,
   getIdempotencyRecord,
   getIdempotencyPayload,
+  getLatestRunIdForSession,
+  getLoopTriageAttempt,
+  getParentVerificationState,
+  getRalphRunTokenTotals,
   listRalphRunSessionTokenTotals,
-  recordIdempotencyKey,
   deleteIdempotencyKey,
+  recordIdempotencyKey,
   recordParentVerificationAttemptFailure,
+  recordIssueSnapshot,
   recordRalphRunGateArtifact,
   recordRalphRunTracePointer,
-  upsertIdempotencyKey,
-  recordIssueSnapshot,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
+  shouldAllowLoopTriageAttempt,
   type PrState,
   type RalphRunAttemptKind,
   type RalphRunDetails,
   tryClaimParentVerification,
+  upsertIdempotencyKey,
   upsertRalphRunGateResult,
 } from "../state";
 import { refreshRalphRunTokenTotals } from "../run-token-accounting";
@@ -285,6 +289,12 @@ import {
 } from "./worktree-cleanup";
 import { writeEscalationWriteback as writeEscalationWritebackImpl } from "./escalation";
 import { pauseIfGitHubRateLimited, pauseIfHardThrottled } from "./lanes/pause";
+import {
+  buildLoopTriagePrompt as buildLoopTriagePromptImpl,
+  readLoopTriageEvents as readLoopTriageEventsImpl,
+  readLoopTriageLogTail as readLoopTriageLogTailImpl,
+  runLoopTripLane,
+} from "./lanes/loop-triage";
 import type { ThrottleAdapter } from "./ports";
 
 function prBodyClosesIssue(body: string, issueNumber: string): boolean {
@@ -409,7 +419,6 @@ const MERGE_CONFLICT_COMMENT_SCAN_LIMIT = 50;
 const MERGE_CONFLICT_COMMENT_MIN_EDIT_MS = 60_000;
 const MERGE_CONFLICT_WAIT_TIMEOUT_MS = 10 * 60_000;
 const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
-
 const CI_REMEDIATION_BACKOFF_BASE_MS = 30_000;
 const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
 
@@ -449,7 +458,6 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 }
 
 // (applyTaskPatch extracted to src/worker/task-patch.ts)
-// (resolveVaultPath extracted to src/worker/vault-paths.ts)
 export class RepoWorker {
   private session: SessionAdapter;
   private baseSession: SessionAdapter;
@@ -627,7 +635,7 @@ export class RepoWorker {
     issueNumber: string,
     stepTitle: string,
     status: AgentTask["status"]
-  ): Promise<string | undefined> {
+  ): Promise<string> {
     const runLogPath = getRalphRunLogPath({ repo: this.repo, issueNumber, stepTitle, ts: Date.now() });
     const updated = await this.queue.updateTaskStatus(task, status, { "run-log-path": runLogPath });
     if (!updated) {
@@ -727,6 +735,8 @@ export class RepoWorker {
         createRunRecord: (params) => createRalphRun(params),
         ensureRunGateRows: (runId) => ensureRalphRunGateRows({ runId }),
         completeRun: (params) => completeRalphRun(params),
+        upsertRunGateResult: (params) => upsertRalphRunGateResult(params),
+        recordRunGateArtifact: (params) => recordRalphRunGateArtifact(params),
         buildRunDetails: (result) => buildRunDetails(result),
         getPinnedOpencodeProfileName: (contextTask) => this.getPinnedOpencodeProfileName(contextTask),
         refreshRalphRunTokenTotals: (params) => refreshRalphRunTokenTotals(params),
@@ -1170,8 +1180,12 @@ export class RepoWorker {
     return updateOpenPrSnapshotImpl({ repo: this.repo }, task, currentPrUrl, nextPrUrl);
   }
 
-  private getIssuePrResolution(issueNumber: string): Promise<ResolvedIssuePr> {
-    return this.prResolver.getIssuePrResolution(issueNumber);
+  private getIssuePrResolution(issueNumber: string, opts: { fresh?: boolean } = {}): Promise<ResolvedIssuePr> {
+    return this.prResolver.getIssuePrResolution(issueNumber, opts);
+  }
+
+  private invalidateIssuePrResolution(issueNumber: string): void {
+    this.prResolver.invalidateIssuePrResolution(issueNumber);
   }
 
   private buildPrCreateLeaseKey(issueNumber: string, botBranch: string): string {
@@ -1228,7 +1242,7 @@ export class RepoWorker {
   }): Promise<ResolvedIssuePr | null> {
     const deadline = Date.now() + Math.max(0, Math.floor(params.maxWaitMs));
     while (Date.now() < deadline) {
-      const resolved = await this.getIssuePrResolution(params.issueNumber);
+      const resolved = await this.getIssuePrResolution(params.issueNumber, { fresh: true });
       if (resolved.selectedUrl) return resolved;
       await this.sleepMs(PR_CREATE_CONFLICT_POLL_MS);
     }
@@ -1563,6 +1577,89 @@ export class RepoWorker {
     return await writeEscalationWritebackImpl(this as any, task, params);
   }
 
+  private async escalateNoPrAfterRetries(params: {
+    task: AgentTask;
+    reason: string;
+    details?: string;
+    planOutput: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    console.log(`[ralph:worker:${this.repo}] Escalating: ${params.reason}`);
+
+    const wasEscalated = params.task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
+    if (escalated) {
+      applyTaskPatch(params.task, "escalated", {});
+    }
+
+    await this.writeEscalationWriteback(params.task, {
+      reason: params.reason,
+      details: params.details,
+      escalationType: "other",
+    });
+    await this.notify.notifyEscalation({
+      taskName: params.task.name,
+      taskFileName: params.task._name,
+      taskPath: params.task._path,
+      issue: params.task.issue,
+      repo: this.repo,
+      sessionId: params.sessionId || params.task["session-id"]?.trim() || undefined,
+      reason: params.reason,
+      escalationType: "other",
+      planOutput: params.planOutput,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(params.task, {
+        reason: params.reason,
+        sessionId: params.sessionId || params.task["session-id"]?.trim() || undefined,
+        details: [params.details, params.planOutput].filter(Boolean).join("\n\n"),
+      });
+    }
+
+    return {
+      taskName: params.task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: params.sessionId,
+      escalationReason: params.reason,
+    };
+  }
+
+  private async escalateMissingPrWithDerivedReason(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    continueAttempts: number;
+    evidence: string[];
+    latestOutput: string;
+    prRecoveryDiagnostics: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    const derived = derivePrCreateEscalationReason({
+      continueAttempts: params.continueAttempts,
+      evidence: params.evidence,
+    });
+    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+
+    this.recordMissingPrEvidence({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      botBranch: params.botBranch,
+      reason: derived.reason,
+      blockedSource: derived.classification?.blockedSource,
+      diagnostics: planOutput,
+    });
+
+    return await this.escalateNoPrAfterRetries({
+      task: params.task,
+      reason: derived.reason,
+      details: derived.details,
+      planOutput,
+      sessionId: params.sessionId,
+    });
+  }
+
   private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
     return await this.branchProtection.fetchAvailableCheckContexts(branch);
   }
@@ -1810,6 +1907,101 @@ export class RepoWorker {
     return this.normalizeRepoSlot(preferred, limit);
   }
 
+  private async runPrReadinessChecks(params: {
+    task: AgentTask;
+    issueNumber: string;
+    worktreePath: string;
+    botBranch: string;
+    runId: string;
+  }): Promise<{ ok: true; diagnostics: string[] } | { ok: false; diagnostics: string[] }> {
+    const diagnostics: string[] = [];
+    const issueContextParts: string[] = [];
+
+    try {
+      const issueContext = await this.buildIssueContextForAgent({
+        repo: this.repo,
+        issueNumber: params.issueNumber,
+      });
+      if (issueContext.trim()) issueContextParts.push(issueContext.trim());
+    } catch (error: any) {
+      issueContextParts.push(`Issue context unavailable: ${error?.message ?? String(error)}`);
+    }
+
+    const reviewIssueContext = issueContextParts.join("\n\n");
+
+    let reviewDiff: { baseRef: string; headRef: string; diffPath: string; diffStat: string };
+    try {
+      reviewDiff = await prepareReviewDiffArtifacts({
+        runId: params.runId,
+        repoPath: params.worktreePath,
+        baseRef: params.botBranch,
+        headRef: "HEAD",
+      });
+      diagnostics.push(`- Review diff artifact prepared: ${reviewDiff.diffPath}`);
+    } catch (error: any) {
+      const reason = `Review readiness failed: could not prepare diff artifacts (${error?.message ?? String(error)})`;
+      diagnostics.push(`- ${reason}`);
+      recordReviewGateFailure({ runId: params.runId, gate: "product_review", reason });
+      recordReviewGateFailure({ runId: params.runId, gate: "devex_review", reason });
+      return { ok: false, diagnostics };
+    }
+
+    const runReviewAgent = async (
+      gate: "product_review" | "devex_review",
+      agent: "product" | "devex",
+      stage: string
+    ) => {
+      return await runReviewGate({
+        runId: params.runId,
+        gate,
+        repo: this.repo,
+        issueRef: params.task.issue,
+        prUrl: "(not created yet)",
+        issueContext: reviewIssueContext,
+        diff: reviewDiff,
+        runAgent: async (prompt: string) => {
+          const runLogPath = await this.recordRunLogPath(params.task, params.issueNumber, stage, "in-progress");
+          return await this.session.runAgent(params.worktreePath, agent, prompt, {
+            repo: this.repo,
+            cacheKey: `pr-readiness-${params.issueNumber}-${agent}`,
+            runLogPath,
+            introspection: {
+              repo: this.repo,
+              issue: params.task.issue,
+              taskName: params.task.name,
+              step: 4,
+              stepTitle: stage,
+            },
+            ...this.buildWatchdogOptions(params.task, stage),
+            ...this.buildStallOptions(params.task, stage),
+            ...this.buildLoopDetectionOptions(params.task, stage),
+          });
+        },
+      });
+    };
+
+    const productReview = await runReviewAgent("product_review", "product", "pr readiness product review");
+    if (productReview.status !== "pass") {
+      diagnostics.push(`- Review failed: product (${productReview.reason})`);
+      recordReviewGateSkipped({
+        runId: params.runId,
+        gate: "devex_review",
+        reason: "Skipped because product review did not pass",
+      });
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Review passed: product");
+
+    const devexReview = await runReviewAgent("devex_review", "devex", "pr readiness devex review");
+    if (devexReview.status !== "pass") {
+      diagnostics.push(`- Review failed: devex (${devexReview.reason})`);
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Review passed: devex");
+
+    return { ok: true, diagnostics };
+  }
+
   private async tryEnsurePrFromWorktree(params: {
     task: AgentTask;
     issueNumber: string;
@@ -1883,36 +2075,50 @@ export class RepoWorker {
       return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
-    const preflightConfig = getRepoPreflightCommands(this.repo);
     const runId = this.activeRunId;
-    if (runId) {
-      const skipReason =
-        preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
-          ? "preflight disabled (preflightCommand=[])"
-          : preflightConfig.configured
-            ? "preflight configured but empty"
-            : "no preflight configured";
+    if (!runId) {
+      diagnostics.push("- Missing runId; refusing PR creation because deterministic gates cannot be persisted");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
 
-      const preflightResult = await runPreflightGate({
-        runId,
-        worktreePath: candidate.worktreePath,
-        commands: preflightConfig.commands,
-        skipReason,
-      });
+    const preflightConfig = getRepoPreflightCommands(this.repo);
+    const skipReason =
+      preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
+        ? "preflight disabled (preflightCommand=[])"
+        : preflightConfig.configured
+          ? "preflight configured but empty"
+          : "no preflight configured";
 
-      if (preflightResult.status === "fail") {
-        diagnostics.push("- Preflight failed; refusing to create PR");
-        diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
-        return { prUrl: null, diagnostics: diagnostics.join("\n") };
-      }
+    const preflightResult = await runPreflightGate({
+      runId,
+      worktreePath: candidate.worktreePath,
+      commands: preflightConfig.commands,
+      skipReason,
+    });
 
-      if (preflightResult.status === "skipped") {
-        diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
-      } else {
-        diagnostics.push("- Preflight passed");
-      }
-    } else if (preflightConfig.commands.length > 0) {
-      diagnostics.push("- WARNING: missing runId; skipping deterministic preflight gate recording");
+    if (preflightResult.status === "fail") {
+      diagnostics.push("- Preflight failed; refusing to create PR");
+      diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    if (preflightResult.status === "skipped") {
+      diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
+    } else {
+      diagnostics.push("- Preflight passed");
+    }
+
+    const readiness = await this.runPrReadinessChecks({
+      task,
+      issueNumber,
+      worktreePath: candidate.worktreePath,
+      botBranch,
+      runId,
+    });
+    diagnostics.push(...readiness.diagnostics);
+    if (!readiness.ok) {
+      diagnostics.push("- PR readiness failed; refusing to create PR");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
     try {
@@ -1935,6 +2141,15 @@ export class RepoWorker {
       "- (Please fill in)",
       "",
     ].join("\n");
+
+    const canonicalBeforeCreate = await this.getIssuePrResolution(issueNumber, { fresh: true });
+    if (canonicalBeforeCreate.diagnostics.length > 0) {
+      diagnostics.push(...canonicalBeforeCreate.diagnostics);
+    }
+    if (canonicalBeforeCreate.selectedUrl) {
+      diagnostics.push(`- Reusing canonical PR before create: ${canonicalBeforeCreate.selectedUrl}`);
+      return { prUrl: canonicalBeforeCreate.selectedUrl, diagnostics: diagnostics.join("\n") };
+    }
 
     const lease = this.tryClaimPrCreateLease({
       task,
@@ -1973,6 +2188,7 @@ export class RepoWorker {
         } catch {
           // ignore
         }
+        this.invalidateIssuePrResolution(issueNumber);
         return { prUrl, diagnostics: diagnostics.join("\n") };
       }
     } catch (e: any) {
@@ -1985,6 +2201,7 @@ export class RepoWorker {
       const url = data?.[0]?.url as string | undefined;
       if (url) {
         diagnostics.push(`- Found PR after create attempt: ${url}`);
+        this.invalidateIssuePrResolution(issueNumber);
         return { prUrl: url, diagnostics: diagnostics.join("\n") };
       }
     } catch (e: any) {
@@ -2067,6 +2284,10 @@ export class RepoWorker {
     return parseCiFixAttempts(process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS) ?? 5;
   }
 
+  private resolveLoopTriageAttempts(): number {
+    return parseCiFixAttempts(process.env.RALPH_LOOP_TRIAGE_MAX_ATTEMPTS) ?? 2;
+  }
+
   private resolveMergeConflictAttempts(): number {
     return parseCiFixAttempts(process.env.RALPH_MERGE_CONFLICT_MAX_ATTEMPTS) ?? 2;
   }
@@ -2147,6 +2368,64 @@ export class RepoWorker {
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to persist CI triage artifact: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
+  private recordMissingPrEvidence(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    reason: string;
+    blockedSource?: string;
+    diagnostics?: string;
+  }): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    try {
+      upsertRalphRunGateResult({
+        runId,
+        gate: "pr_evidence",
+        status: "fail",
+        skipReason: "missing pr_url",
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist PR evidence gate failure: ${error?.message ?? String(error)}`
+      );
+    }
+
+    try {
+      const worktreePath = params.task["worktree-path"]?.trim() || "(unknown)";
+      const content = [
+        "PR evidence gate failed: missing PR URL.",
+        `Reason: ${params.reason}`,
+        params.blockedSource ? `Blocked source: ${params.blockedSource}` : null,
+        `Issue: ${params.task.issue}`,
+        `Worktree: ${worktreePath}`,
+        "",
+        "Suggested recovery commands:",
+        `git -C \"${worktreePath}\" status`,
+        `git -C \"${worktreePath}\" branch --show-current`,
+        `git -C \"${worktreePath}\" push -u origin HEAD`,
+        `gh pr create --base ${params.botBranch} --fill --body \"Fixes #${params.issueNumber}\"`,
+        params.diagnostics ? "" : null,
+        params.diagnostics ? "Diagnostics:" : null,
+        params.diagnostics ?? null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "pr_evidence",
+        kind: "note",
+        content,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist PR evidence diagnostics: ${error?.message ?? String(error)}`
       );
     }
   }
@@ -2338,57 +2617,19 @@ export class RepoWorker {
     return /required status checks are expected/i.test(message);
   }
 
-  private getGhErrorSearchText(error: any): string {
-    const parts: string[] = [];
-    const message = String(error?.message ?? "").trim();
-    const stderr = this.stringifyGhOutput(error?.stderr);
-    const stdout = this.stringifyGhOutput(error?.stdout);
-
-    if (message) parts.push(message);
-    if (stderr) parts.push(stderr);
-    if (stdout) parts.push(stdout);
-
-    return parts.join("\n").trim();
+  private isGhAuthError(error: any): boolean {
+    if (error?.ralphAuthError) return true;
+    const message = this.getGhErrorSearchText(error);
+    if (!message) return false;
+    return /HTTP\s+401|HTTP\s+403|Missing\s+GH_TOKEN|authentication required|unauthorized|forbidden|bad credentials/i.test(message);
   }
 
-  private stringifyGhOutput(value: unknown): string {
-    if (value === null || value === undefined) return "";
-    if (typeof value === "string") return value.trim();
-    if (typeof (value as any)?.toString === "function") {
-      try {
-        return String((value as any).toString()).trim();
-      } catch {
-        return "";
-      }
-    }
-    try {
-      return String(value).trim();
-    } catch {
-      return "";
-    }
+  private getGhErrorSearchText(error: any): string {
+    return buildGhErrorSearchText(error);
   }
 
   private formatGhError(error: any): string {
-    const lines: string[] = [];
-
-    const command = String(error?.ghCommand ?? error?.command ?? "").trim();
-    const redactedCommand = command ? redactSensitiveText(command).trim() : "";
-    if (redactedCommand) lines.push(`Command: ${redactedCommand}`);
-
-    const exitCodeRaw = error?.exitCode ?? error?.code ?? null;
-    const exitCode = exitCodeRaw === null || exitCodeRaw === undefined ? "" : String(exitCodeRaw).trim();
-    if (exitCode) lines.push(`Exit code: ${exitCode}`);
-
-    const message = String(error?.message ?? "").trim();
-    if (message) lines.push(message);
-
-    const stderr = this.stringifyGhOutput(error?.stderr);
-    const stdout = this.stringifyGhOutput(error?.stdout);
-
-    if (stderr) lines.push("", "stderr:", summarizeForNote(stderr, 1600));
-    if (stdout) lines.push("", "stdout:", summarizeForNote(stdout, 1600));
-
-    return lines.join("\n").trim();
+    return formatGhErrorShared(error);
   }
 
   private buildMergeConflictPrompt(prUrl: string, baseRefName: string | null, botBranch: string): string {
@@ -2397,6 +2638,7 @@ export class RepoWorker {
       `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
       `Resolve merge conflicts by merging '${baseName}' into the PR branch (no rebase or force-push).`,
       "The base branch has already been merged into the PR branch in this worktree; finish the merge and resolve conflicts if present.",
+      "Do not use /tmp or any external-directory path; keep temporary files inside this worktree (for example ./.ralph-tmp/).",
       "Do NOT create a new PR.",
       "After resolving conflicts, run tests/typecheck/build/knip and push updates on the PR branch.",
       "",
@@ -4112,7 +4354,7 @@ export class RepoWorker {
       buildIssueContextForAgent: async (input) => await this.buildIssueContextForAgent(input),
       runReviewAgent: async (input) => {
         const runLogPath = await this.recordRunLogPath(params.task, issueNumber, input.stage, "in-progress");
-        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, {
+        const baseOptions = {
           repo: this.repo,
           cacheKey: input.cacheKey,
           runLogPath,
@@ -4127,11 +4369,20 @@ export class RepoWorker {
           ...this.buildStallOptions(params.task, input.stage),
           ...this.buildLoopDetectionOptions(params.task, input.stage),
           ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
-        });
+        };
+        const continueSessionId = input.continueSessionId?.trim();
+        if (continueSessionId) {
+          return await this.session.continueSession(params.repoPath, continueSessionId, input.prompt, {
+            ...baseOptions,
+            agent: input.agent,
+          });
+        }
+        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, baseOptions);
       },
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),
       formatGhError: (err) => this.formatGhError(err),
+      isAuthError: (err) => this.isGhAuthError(err as any),
       mergePullRequest: async (url, sha, cwd) => await this.mergePullRequest(url, sha, cwd),
       recordPrSnapshotBestEffort: (input) => this.recordPrSnapshotBestEffort(input as any),
       applyMidpointLabelsBestEffort: async (input) => await this.applyMidpointLabelsBestEffort(input as any),
@@ -4709,7 +4960,7 @@ export class RepoWorker {
     const githubCommentUrl = await this.writeEscalationWriteback(task, {
       reason: escalationReason,
       details: diagnostics ?? undefined,
-      escalationType: "other",
+      escalationType: "watchdog",
     });
     await this.notify.notifyEscalation({
       taskName: task.name,
@@ -4721,7 +4972,7 @@ export class RepoWorker {
       priority: task.priority,
       sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
       reason: escalationReason,
-      escalationType: "other",
+      escalationType: "watchdog",
       githubCommentUrl: githubCommentUrl ?? undefined,
       planOutput: result.output,
     });
@@ -4863,2107 +5114,67 @@ export class RepoWorker {
     };
   }
 
+  private async readLoopTriageEvents(sessionId: string, limit: number): Promise<string[]> {
+    return await readLoopTriageEventsImpl({ sessionId, limit });
+  }
+
+  private async readLoopTriageLogTail(path: string | undefined, maxLines: number): Promise<string[]> {
+    return await readLoopTriageLogTailImpl({ path, maxLines });
+  }
+
+  private buildLoopTriagePrompt(params: {
+    stage: string;
+    bundle: string;
+    recommendedGateCommand: string;
+  }): string {
+    return buildLoopTriagePromptImpl(params);
+  }
+
   private async handleLoopTrip(task: AgentTask, cacheKey: string, stage: string, result: SessionResult): Promise<AgentRun> {
-    const trip = result.loopTrip;
-    const sessionId = result.sessionId || task["session-id"]?.trim() || "";
-    const worktreePath = task["worktree-path"]?.trim() || "";
-
-    const reason = trip ? `Loop detection tripped: ${trip.reason} (${stage})` : `Loop detection tripped (${stage})`;
-
-    let fallbackTouchedFiles: string[] | null = null;
-    if (trip && trip.metrics.topFiles.length === 0 && worktreePath) {
-      try {
-        const names = (await $`git diff --name-only`.cwd(worktreePath).quiet()).stdout
-          .toString()
-          .split("\n")
-          .map((v: string) => v.trim())
-          .filter(Boolean);
-        fallbackTouchedFiles = names.slice(0, 10);
-      } catch {
-        // ignore
-      }
-    }
-
-    const loopCfg = getRepoLoopDetectionConfig(this.repo);
-    const recommendedGateCommand = loopCfg?.recommendedGateCommand ?? "bun test";
-
-    const details =
-      trip != null
-        ? buildLoopTripDetails({
-            trip,
-            recommendedGateCommand,
-            lastDiagnosticSnippet: result.output,
-            fallbackTouchedFiles,
-          })
-        : undefined;
-
-    const escalationFields: Record<string, string> = {};
-    if (sessionId) escalationFields["session-id"] = sessionId;
-
-    const wasEscalated = task.status === "escalated";
-    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
-    if (escalated) {
-      applyTaskPatch(task, "escalated", escalationFields);
-    }
-
-    const githubCommentUrl = await this.writeEscalationWriteback(task, {
-      reason,
-      details,
-      escalationType: "other",
-    });
-
-    await this.notify.notifyEscalation({
-      taskName: task.name,
-      taskFileName: task._name,
-      taskPath: task._path,
-      issue: task.issue,
+    return await runLoopTripLane({
       repo: this.repo,
-      scope: task.scope,
-      priority: task.priority,
-      sessionId: sessionId || undefined,
-      reason,
-      escalationType: "other",
-      githubCommentUrl: githubCommentUrl ?? undefined,
-      planOutput: result.output,
+      repoPath: this.repoPath,
+      task,
+      cacheKey,
+      stage,
+      result,
+      readLoopTriageEvents: async (sessionId, limit) => await this.readLoopTriageEvents(sessionId, limit),
+      readLoopTriageLogTail: async (path, maxLines) => await this.readLoopTriageLogTail(path, maxLines),
+      buildLoopTriagePrompt: (args) => this.buildLoopTriagePrompt(args),
+      getIssuePrResolution: async (issueNumber) => await this.getIssuePrResolution(issueNumber),
+      resolveRequiredChecksForMerge: async () => await this.resolveRequiredChecksForMerge(),
+      getPullRequestChecks: async (prUrl) => await this.getPullRequestChecks(prUrl),
+      resolveLoopTriageAttempts: () => this.resolveLoopTriageAttempts(),
+      updateTaskStatus: async (laneTask, status, fields) => await this.queue.updateTaskStatus(laneTask, status, fields),
+      applyTaskPatch: (laneTask, status, fields) => applyTaskPatch(laneTask, status, fields),
+      runLoopTriageAgent: async (repoPath, prompt, args) =>
+        await this.session.runAgent(repoPath, "loop-triage", prompt, {
+          repo: args.repo,
+          cacheKey: args.cacheKey,
+          introspection: {
+            repo: args.repo,
+            issue: args.issue,
+            taskName: args.taskName,
+            step: 0,
+            stepTitle: "loop-triage",
+          },
+        }),
+      getRalphXdgCacheHome: (repo, key) => this.session.getRalphXdgCacheHome(repo, key),
+      formatGhError: (error) => this.formatGhError(error),
+      writeEscalationWriteback: async (laneTask, args) => await this.writeEscalationWriteback(laneTask, args),
+      notifyEscalation: async (args) => await this.notify.notifyEscalation(args),
+      recordEscalatedRunNote: async (laneTask, args) => await this.recordEscalatedRunNote(laneTask, args),
     });
-
-    if (escalated && !wasEscalated) {
-      await this.recordEscalatedRunNote(task, {
-        reason,
-        sessionId: sessionId || undefined,
-        details: result.output,
-      });
-    }
-
-    // Best-effort: clear per-task cache after a loop-trip, since we killed the session.
-    try {
-      await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
-
-    return {
-      taskName: task.name,
-      repo: this.repo,
-      outcome: "escalated",
-      sessionId: sessionId || undefined,
-      escalationReason: reason,
-    };
   }
 
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string; repoSlot?: number | null }): Promise<AgentRun> {
-    const startTime = new Date();
-
-    if (!isRepoAllowed(task.repo)) {
-      return await this.blockDisallowedRepo(task, startTime, "resume");
-    }
-
-    const issueMeta = await this.getIssueMetadata(task.issue);
-    if (issueMeta.state === "CLOSED") {
-      return await this.skipClosedIssue(task, issueMeta, startTime);
-    }
-
-    await this.ensureRalphWorkflowLabelsOnce();
-    await this.ensureBranchProtectionOnce();
-
-    const issueMatch = task.issue.match(/#(\d+)$/);
-    const issueNumber = issueMatch?.[1] ?? "";
-    const cacheKey = issueNumber || task._name;
-
-    const existingSessionId = task["session-id"]?.trim();
-    if (!existingSessionId) {
-      const reason = "In-progress task has no session-id; cannot resume";
-      console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
-      await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
-      return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
-    }
-
-    const workerId = await this.formatWorkerId(task, task._path);
-    const allocatedSlot = this.resolveAssignedRepoSlot(task, opts?.repoSlot);
-
-    try {
-      await this.assertRepoRootClean(task, "resume");
-
-      const resolvedRepoPath = await this.resolveTaskRepoPath(
-        task,
-        issueNumber || cacheKey,
-        "resume",
-        allocatedSlot
-      );
-
-      if (resolvedRepoPath.kind === "reset") {
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "failed",
-          sessionId: existingSessionId,
-          escalationReason: resolvedRepoPath.reason,
-        };
-      }
-
-      const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
-      if (worktreePath) task["worktree-path"] = worktreePath;
-
-      await this.prepareContextRecovery(task, taskRepoPath);
-
-      const workerIdChanged = task["worker-id"]?.trim() !== workerId;
-      const repoSlotChanged = task["repo-slot"]?.trim() !== String(allocatedSlot);
-
-      if (workerIdChanged || repoSlotChanged) {
-        await this.queue.updateTaskStatus(task, "in-progress", {
-          ...(workerIdChanged ? { "worker-id": workerId } : {}),
-          ...(repoSlotChanged ? { "repo-slot": String(allocatedSlot) } : {}),
-        });
-        task["worker-id"] = workerId;
-        task["repo-slot"] = String(allocatedSlot);
-      }
-
-      const eventWorkerId = task["worker-id"]?.trim();
-
-      const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume", existingSessionId);
-
-      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
-
-      const opencodeProfileName = resolvedOpencode.profileName;
-      const opencodeXdg = resolvedOpencode.opencodeXdg;
-      const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
-
-      if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
-        await this.queue.updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
-      }
-
-      const pausedSetup = await this.pauseIfHardThrottled(task, "setup (resume)", existingSessionId);
-      if (pausedSetup) return pausedSetup;
-
-      const setupRun = await this.ensureSetupForTask({
-        task,
-        issueNumber: issueNumber || cacheKey,
-        taskRepoPath,
-        status: "in-progress",
-        sessionId: existingSessionId,
-      });
-      if (setupRun) return setupRun;
-
-      const botBranch = getRepoBotBranch(this.repo);
-      const mergeConflictRun = await this.maybeHandleQueuedMergeConflict({
-        task,
-        issueNumber: issueNumber || cacheKey,
-        taskRepoPath,
-        cacheKey,
-        botBranch,
-        issueMeta,
-        startTime,
-        opencodeXdg,
-        opencodeSessionOptions,
-      });
-      if (mergeConflictRun) return mergeConflictRun;
-
-      const defaultResumeMessage =
-        "Ralph restarted while this task was in progress. " +
-        "Resume from where you left off. " +
-        "If you already created a PR, paste the PR URL. " +
-        `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
-
-      const resumeMessage = opts?.resumeMessage?.trim();
-      const baseResumeMessage = resumeMessage || defaultResumeMessage;
-      const existingPr = await this.getIssuePrResolution(issueNumber);
-      const finalResumeMessage = existingPr.selectedUrl
-        ? [
-            `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
-            "Do NOT create a new PR.",
-            "Continue work on the existing PR branch and push updates as needed.",
-            resumeMessage ?? "",
-            "Only paste a PR URL if it changes.",
-          ]
-            .filter(Boolean)
-            .join(" ")
-        : baseResumeMessage;
-
-      if (existingPr.selectedUrl) {
-        console.log(
-          `[ralph:worker:${this.repo}] Reusing existing PR for resume: ${existingPr.selectedUrl} (source=${
-            existingPr.source ?? "unknown"
-          })`
-        );
-        await this.markIssueInProgressForOpenPrBestEffort(task, existingPr.selectedUrl);
-        if (existingPr.duplicates.length > 0) {
-          console.log(
-            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
-          );
-        }
-      }
-
-      const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
-      if (pausedBefore) return pausedBefore;
-
-      return await this.withRunContext(task, "resume", async () => {
-      this.publishDashboardEvent(
-        {
-          type: "worker.created",
-          level: "info",
-          ...(eventWorkerId ? { workerId: eventWorkerId } : {}),
-          repo: this.repo,
-          taskId: task._path,
-          sessionId: existingSessionId,
-          data: {
-            ...(worktreePath ? { worktreePath } : {}),
-            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
-          },
-        },
-        { sessionId: existingSessionId, workerId: eventWorkerId }
-      );
-
-      this.logWorker(`Resuming task: ${task.name}`, { sessionId: existingSessionId, workerId: eventWorkerId });
-
-      const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
-
-      let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: resumeRunLogPath,
-        introspection: {
-          repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 4,
-          stepTitle: "resume",
-        },
-        ...this.buildWatchdogOptions(task, "resume"),
-        ...this.buildStallOptions(task, "resume"),
-        ...this.buildLoopDetectionOptions(task, "resume"),
-        ...opencodeSessionOptions,
-      });
-
-      await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
-
-      const pausedAfter = await this.pauseIfHardThrottled(task, "resume (post)", buildResult.sessionId || existingSessionId);
-      if (pausedAfter) return pausedAfter;
-
-      if (!buildResult.success) {
-        if (buildResult.loopTrip) {
-          return await this.handleLoopTrip(task, cacheKey, "resume", buildResult);
-        }
-        if (buildResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "resume", buildResult, opencodeXdg);
-        }
-
-        if (buildResult.stallTimeout) {
-          return await this.handleStallTimeout(task, cacheKey, "resume", buildResult);
-        }
-
-        const reason = `Failed to resume OpenCode session ${existingSessionId}: ${buildResult.output}`;
-        console.warn(`[ralph:worker:${this.repo}] Resume failed; falling back to fresh run: ${reason}`);
-
-        // Fall back to a fresh run by clearing session-id and re-queueing.
-        await this.queue.updateTaskStatus(task, "queued", { "session-id": "" });
-
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "failed",
-          sessionId: existingSessionId,
-          escalationReason: reason,
-        };
-      }
-
-      this.publishCheckpoint("implementation_step_complete", {
-        sessionId: buildResult.sessionId || existingSessionId || undefined,
-      });
-
-      if (buildResult.sessionId) {
-        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
-      }
-
-      await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
-
-      // Extract PR URL (with retry loop if agent stopped without creating PR)
-      const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = this.updateOpenPrSnapshot(
-        task,
-        null,
-        selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
-      );
-      let prRecoveryDiagnostics = "";
-
-      if (!prUrl) {
-        const recovered = await this.tryEnsurePrFromWorktree({
-          task,
-          issueNumber,
-          issueTitle: issueMeta.title || task.name,
-          botBranch,
-        });
-        prRecoveryDiagnostics = recovered.diagnostics;
-        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
-      }
-
-      let continueAttempts = 0;
-      let anomalyAborts = 0;
-      let lastAnomalyCount = 0;
-      let prCreateLeaseKey: string | null = null;
-
-      while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
-        await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
-
-        const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
-        const newAnomalies = anomalyStatus.total - lastAnomalyCount;
-        lastAnomalyCount = anomalyStatus.total;
-
-        if (anomalyStatus.total >= ANOMALY_BURST_THRESHOLD || anomalyStatus.recentBurst) {
-          anomalyAborts++;
-          console.warn(
-            `[ralph:worker:${this.repo}] Anomaly burst detected (${anomalyStatus.total} total, ${newAnomalies} new). ` +
-              `Abort #${anomalyAborts}/${MAX_ANOMALY_ABORTS}`
-          );
-
-          if (anomalyAborts >= MAX_ANOMALY_ABORTS) {
-            const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
-            console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
-
-            const wasEscalated = task.status === "escalated";
-            const escalated = await this.queue.updateTaskStatus(task, "escalated");
-            if (escalated) {
-              applyTaskPatch(task, "escalated", {});
-            }
-            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
-            await this.notify.notifyEscalation({
-              taskName: task.name,
-              taskFileName: task._name,
-              taskPath: task._path,
-              issue: task.issue,
-              repo: this.repo,
-              sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-              reason,
-              escalationType: "other",
-              planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-            });
-
-            if (escalated && !wasEscalated) {
-              await this.recordEscalatedRunNote(task, {
-                reason,
-                sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-                details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-              });
-            }
-
-            return {
-              taskName: task.name,
-              repo: this.repo,
-              outcome: "escalated",
-              sessionId: buildResult.sessionId,
-              escalationReason: reason,
-            };
-          }
-
-          console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
-
-          const pausedLoopBreak = await this.pauseIfHardThrottled(task, "resume loop-break", buildResult.sessionId || existingSessionId);
-          if (pausedLoopBreak) return pausedLoopBreak;
-
-          const loopBreakRunLogPath = await this.recordRunLogPath(
-            task,
-            issueNumber || cacheKey,
-            "resume loop-break",
-            "in-progress"
-          );
-
-          buildResult = await this.session.continueSession(
-            taskRepoPath,
-            buildResult.sessionId,
-            "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
-            {
-              repo: this.repo,
-              cacheKey,
-              runLogPath: loopBreakRunLogPath,
-              introspection: {
-                repo: this.repo,
-                issue: task.issue,
-                taskName: task.name,
-                step: 4,
-                stepTitle: "resume loop-break",
-              },
-              ...this.buildWatchdogOptions(task, "resume-loop-break"),
-              ...this.buildStallOptions(task, "resume-loop-break"),
-              ...this.buildLoopDetectionOptions(task, "resume-loop-break"),
-              ...opencodeSessionOptions,
-            }
-          );
-
-          await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
-
-          const pausedLoopBreakAfter = await this.pauseIfHardThrottled(
-            task,
-            "resume loop-break (post)",
-            buildResult.sessionId || existingSessionId
-          );
-          if (pausedLoopBreakAfter) return pausedLoopBreakAfter;
-
-            if (!buildResult.success) {
-              if (buildResult.loopTrip) {
-                return await this.handleLoopTrip(task, cacheKey, "resume-loop-break", buildResult);
-              }
-              if (buildResult.watchdogTimeout) {
-                return await this.handleWatchdogTimeout(task, cacheKey, "resume-loop-break", buildResult, opencodeXdg);
-              }
-
-            if (buildResult.stallTimeout) {
-              return await this.handleStallTimeout(task, cacheKey, "resume-loop-break", buildResult);
-            }
-            console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
-            break;
-          }
-
-          this.publishCheckpoint("implementation_step_complete", {
-            sessionId: buildResult.sessionId || existingSessionId || undefined,
-          });
-
-          lastAnomalyCount = anomalyStatus.total;
-          prUrl = this.updateOpenPrSnapshot(
-            task,
-            prUrl,
-            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
-          );
-
-          continue;
-        }
-
-        const canonical = await this.getIssuePrResolution(issueNumber);
-        if (canonical.selectedUrl) {
-          console.log(
-            `[ralph:worker:${this.repo}] Reusing existing PR during resume: ${canonical.selectedUrl} (source=${
-              canonical.source ?? "unknown"
-            })`
-          );
-          await this.markIssueInProgressForOpenPrBestEffort(task, canonical.selectedUrl);
-          if (canonical.duplicates.length > 0) {
-            console.log(
-              `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
-            );
-          }
-          prRecoveryDiagnostics = [prRecoveryDiagnostics, canonical.diagnostics.join("\n")].filter(Boolean).join("\n\n");
-          prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
-          break;
-        }
-
-        if (!prCreateLeaseKey) {
-          const lease = this.tryClaimPrCreateLease({
-            task,
-            issueNumber,
-            botBranch,
-            sessionId: buildResult.sessionId,
-            stage: "resume",
-          });
-
-          if (!lease.claimed) {
-            console.warn(
-              `[ralph:worker:${this.repo}] PR-create lease already held; waiting instead of creating duplicate (lease=${lease.key})`
-            );
-
-            const waited = await this.waitForExistingPrDuringPrCreateConflict({
-              issueNumber,
-              maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
-            });
-
-            if (waited?.selectedUrl) {
-              await this.markIssueInProgressForOpenPrBestEffort(task, waited.selectedUrl);
-              prRecoveryDiagnostics = [prRecoveryDiagnostics, waited.diagnostics.join("\n")].filter(Boolean).join("\n\n");
-              prUrl = this.updateOpenPrSnapshot(task, prUrl, waited.selectedUrl);
-              break;
-            }
-
-            const throttled = await this.throttleForPrCreateConflict({
-              task,
-              issueNumber,
-              sessionId: buildResult.sessionId,
-              leaseKey: lease.key,
-              existingCreatedAt: lease.existingCreatedAt,
-              stage: "resume",
-            });
-            if (throttled) return throttled;
-
-            prRecoveryDiagnostics = [
-              prRecoveryDiagnostics,
-              `PR-create conflict: lease=${lease.key} (createdAt=${lease.existingCreatedAt ?? "unknown"})`,
-            ]
-              .filter(Boolean)
-              .join("\n\n");
-            break;
-          }
-
-          prCreateLeaseKey = lease.key;
-          console.log(`[ralph:worker:${this.repo}] pr_mode=create lease=${lease.key}`);
-        }
-
-        continueAttempts++;
-        console.log(
-          `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
-        );
-
-        const pausedContinue = await this.pauseIfHardThrottled(task, "resume continue", buildResult.sessionId || existingSessionId);
-        if (pausedContinue) return pausedContinue;
-
-        const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
-        const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue", "in-progress");
-
-        buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
-          repo: this.repo,
-          cacheKey,
-          runLogPath: resumeContinueRunLogPath,
-          timeoutMs: 10 * 60_000,
-          introspection: {
-            repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 4,
-            stepTitle: "continue",
-          },
-          ...this.buildWatchdogOptions(task, "resume-continue"),
-          ...this.buildStallOptions(task, "resume-continue"),
-          ...this.buildLoopDetectionOptions(task, "resume-continue"),
-          ...opencodeSessionOptions,
-        });
-
-        await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
-
-        const pausedContinueAfter = await this.pauseIfHardThrottled(
-          task,
-          "resume continue (post)",
-          buildResult.sessionId || existingSessionId
-        );
-        if (pausedContinueAfter) return pausedContinueAfter;
-
-        if (!buildResult.success) {
-          if (buildResult.loopTrip) {
-            return await this.handleLoopTrip(task, cacheKey, "resume-continue", buildResult);
-          }
-          if (buildResult.watchdogTimeout) {
-            return await this.handleWatchdogTimeout(task, cacheKey, "resume-continue", buildResult, opencodeXdg);
-          }
-
-          if (buildResult.stallTimeout) {
-            return await this.handleStallTimeout(task, cacheKey, "resume-continue", buildResult);
-          }
-
-          // If the session ended without printing a URL, try to recover PR from git state.
-          const recovered = await this.tryEnsurePrFromWorktree({
-            task,
-            issueNumber,
-            issueTitle: issueMeta.title || task.name,
-            botBranch,
-          });
-          prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-          prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
-
-          if (!prUrl) {
-            console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
-            break;
-          }
-        } else {
-          this.publishCheckpoint("implementation_step_complete", {
-            sessionId: buildResult.sessionId || existingSessionId || undefined,
-          });
-          prUrl = this.updateOpenPrSnapshot(
-            task,
-            prUrl,
-            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
-          );
-        }
-      }
-
-      if (!prUrl) {
-        const recovered = await this.tryEnsurePrFromWorktree({
-          task,
-          issueNumber,
-          issueTitle: issueMeta.title || task.name,
-          botBranch,
-        });
-        prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
-      }
-
-      if (!prUrl) {
-        const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
-        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
-
-        const wasEscalated = task.status === "escalated";
-        const escalated = await this.queue.updateTaskStatus(task, "escalated");
-        if (escalated) {
-          applyTaskPatch(task, "escalated", {});
-        }
-        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
-        await this.notify.notifyEscalation({
-          taskName: task.name,
-          taskFileName: task._name,
-          taskPath: task._path,
-          issue: task.issue,
-          repo: this.repo,
-          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-          reason,
-          escalationType: "other",
-          planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-        });
-
-        if (escalated && !wasEscalated) {
-          await this.recordEscalatedRunNote(task, {
-            reason,
-            sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-          });
-        }
-
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "escalated",
-          sessionId: buildResult.sessionId,
-          escalationReason: reason,
-        };
-      }
-
-      if (prUrl && prCreateLeaseKey) {
-        try {
-          deleteIdempotencyKey(prCreateLeaseKey);
-        } catch {
-          // ignore
-        }
-        prCreateLeaseKey = null;
-      }
-
-      const canonical = await this.getIssuePrResolution(issueNumber);
-      if (canonical.selectedUrl && !this.isSamePrUrl(prUrl, canonical.selectedUrl)) {
-        console.log(
-          `[ralph:worker:${this.repo}] Detected duplicate PR; using existing ${canonical.selectedUrl} instead of ${prUrl}`
-        );
-        if (canonical.duplicates.length > 0) {
-          console.log(
-            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
-          );
-        }
-        prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
-      }
-
-      this.publishCheckpoint("pr_ready", { sessionId: buildResult.sessionId || existingSessionId || undefined });
-
-      const pausedMerge = await this.pauseIfHardThrottled(task, "resume merge", buildResult.sessionId || existingSessionId);
-      if (pausedMerge) return pausedMerge;
-
-      const mergeGate = await this.mergePrWithRequiredChecks({
-        task,
-        repoPath: taskRepoPath,
-        cacheKey,
-        botBranch,
-        prUrl,
-        sessionId: buildResult.sessionId,
-        issueMeta,
-        watchdogStagePrefix: "merge",
-        notifyTitle: `Merging ${task.name}`,
-        opencodeXdg,
-      });
-
-
-      if (!mergeGate.ok) return mergeGate.run;
-
-      const pausedMergeAfter = await this.pauseIfHardThrottled(
-        task,
-        "resume merge (post)",
-        mergeGate.sessionId || buildResult.sessionId || existingSessionId
-      );
-      if (pausedMergeAfter) return pausedMergeAfter;
-
-      this.publishCheckpoint("merge_step_complete", {
-        sessionId: mergeGate.sessionId || buildResult.sessionId || existingSessionId || undefined,
-      });
-
-      prUrl = mergeGate.prUrl;
-      buildResult.sessionId = mergeGate.sessionId;
-
-      console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const pausedSurvey = await this.pauseIfHardThrottled(task, "resume survey", buildResult.sessionId || existingSessionId);
-      if (pausedSurvey) return pausedSurvey;
-
-      const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
-      const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey", "in-progress");
-
-      const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: resumeSurveyRunLogPath,
-        ...this.buildWatchdogOptions(task, "resume-survey"),
-        ...this.buildStallOptions(task, "resume-survey"),
-        ...this.buildLoopDetectionOptions(task, "resume-survey"),
-        ...opencodeSessionOptions,
-      });
-
-      await this.recordImplementationCheckpoint(task, surveyResult.sessionId || buildResult.sessionId || existingSessionId);
-
-
-      const pausedSurveyAfter = await this.pauseIfHardThrottled(
-        task,
-        "resume survey (post)",
-        surveyResult.sessionId || buildResult.sessionId || existingSessionId
-      );
-      if (pausedSurveyAfter) return pausedSurveyAfter;
-
-      if (!surveyResult.success) {
-        if (surveyResult.loopTrip) {
-          return await this.handleLoopTrip(task, cacheKey, "resume-survey", surveyResult);
-        }
-        if (surveyResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "resume-survey", surveyResult, opencodeXdg);
-        }
-
-        if (surveyResult.stallTimeout) {
-          return await this.handleStallTimeout(task, cacheKey, "resume-survey", surveyResult);
-        }
-        console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
-      }
-
-      try {
-        await writeDxSurveyToGitHubIssues({
-          github: this.github,
-          targetRepo: this.repo,
-          ralphRepo: "3mdistal/ralph",
-          issueNumber,
-          taskName: task.name,
-          cacheKey,
-          prUrl: prUrl ?? null,
-          sessionId: surveyResult.sessionId || buildResult.sessionId || existingSessionId || null,
-          surveyOutput: surveyResult.output,
-        });
-      } catch (error: any) {
-        console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
-      }
-
-      await this.recordCheckpoint(
-        task,
-        "survey_complete",
-        surveyResult.sessionId || buildResult.sessionId || existingSessionId
-      );
-      this.publishCheckpoint("survey_complete", {
-        sessionId: surveyResult.sessionId || buildResult.sessionId || existingSessionId || undefined,
-      });
-
-      return await this.finalizeTaskSuccess({
-        task,
-        prUrl,
-        sessionId: buildResult.sessionId,
-        startTime,
-        surveyResults: surveyResult.output,
-        cacheKey,
-        opencodeXdg,
-        worktreePath,
-        workerId,
-        repoSlot: typeof allocatedSlot === "number" ? String(allocatedSlot) : undefined,
-        notify: false,
-        logMessage: `Task resumed to completion: ${task.name}`,
-      });
-      });
-    } catch (error: any) {
-      console.error(`[ralph:worker:${this.repo}] Resume failed:`, error);
-
-      if (!error?.ralphRootDirty) {
-        const paused = await this.pauseIfGitHubRateLimited(task, "resume", error, {
-          sessionId: task["session-id"]?.trim() || undefined,
-          runLogPath: task["run-log-path"]?.trim() || undefined,
-        });
-        if (paused) return paused;
-
-        const reason = error?.message ?? String(error);
-        const details = error?.stack ?? reason;
-        const classification = classifyOpencodeFailure(`${reason}\n${details}`);
-        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
-          reason: classification?.reason ?? reason,
-          details,
-        });
-      }
-
-      return {
-        taskName: task.name,
-        repo: this.repo,
-        outcome: "failed",
-        escalationReason: error?.message ?? String(error),
-      };
-    } finally {
-      // slot release handled by scheduler-level reservation
-    }
+    return await runResumeLane(this, task, opts);
   }
 
-  private async maybeHandleParentVerification(params: {
-    task: AgentTask;
-    issueNumber: string;
-    issueMeta: IssueMetadata;
-    cacheKey: string;
-    startTime: Date;
-    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
-    opencodeSessionOptions?: RunSessionOptionsBase;
-    worktreePath?: string;
-    workerId?: string;
-    allocatedSlot?: number | null;
-  }): Promise<AgentRun | null> {
-    const issueRef = parseIssueRef(params.task.issue, params.task.repo);
-    if (!issueRef) return null;
-
-    const snapshot = await this.getRelationshipSnapshot(issueRef, true);
-    if (!snapshot) return null;
-
-    const signals = this.buildRelationshipSignals(snapshot);
-    const eligibility = evaluateParentVerificationEligibility({ snapshot, signals });
-    if (eligibility.decision !== "verify") {
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification skipped for ${params.task.issue}: ${eligibility.reason}`
-      );
-      return null;
-    }
-
-    const issueUrl =
-      params.issueMeta.url ?? `https://github.com/${issueRef.repo}/issues/${issueRef.number}`;
-    const evidence = await collectParentVerificationEvidence({ childIssues: eligibility.childIssues });
-    if (evidence.diagnostics.length > 0) {
-      console.log(
-        `[ralph:worker:${this.repo}] Parent verification evidence diagnostics for ${params.task.issue}:\n${evidence.diagnostics.join(
-          "\n"
-        )}`
-      );
-    }
-
-    const prompt = buildParentVerificationPromptLegacy({
-      repo: this.repo,
-      issueNumber: Number(params.issueNumber),
-      issueUrl,
-      childIssues: eligibility.childIssues,
-      evidence: evidence.evidence,
-    });
-
-    const verifyWorktreePath = this.buildParentVerificationWorktreePath(params.issueNumber);
-    const verifyCacheKey = `${params.cacheKey}-parent-verify`;
-    let dirtyWorktree = false;
-
-    try {
-      try {
-        await this.ensureGitWorktree(verifyWorktreePath);
-      } catch (error: any) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Failed to prepare parent verification worktree: ${error?.message ?? String(error)}`
-        );
-        return null;
-      }
-
-      const preStatus = await this.getWorktreeStatusPorcelain(verifyWorktreePath);
-      if (preStatus) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Parent verification worktree not clean; skipping verification for ${params.task.issue}.`
-        );
-        dirtyWorktree = true;
-        return null;
-      }
-
-      const pausedVerify = await this.pauseIfHardThrottled(params.task, "parent verification");
-      if (pausedVerify) return pausedVerify;
-
-      const verifyRunLogPath = await this.recordRunLogPath(
-        params.task,
-        params.issueNumber,
-        "parent-verify",
-        "starting"
-      );
-
-      const verifyResult = await this.session.runAgent(verifyWorktreePath, "general", prompt, {
-        repo: this.repo,
-        cacheKey: verifyCacheKey,
-        runLogPath: verifyRunLogPath,
-        introspection: {
-          repo: this.repo,
-          issue: params.task.issue,
-          taskName: params.task.name,
-          step: 1,
-          stepTitle: "parent verification",
-        },
-        ...this.buildWatchdogOptions(params.task, "parent-verify"),
-        ...this.buildStallOptions(params.task, "parent-verify"),
-        ...this.buildLoopDetectionOptions(params.task, "parent-verify"),
-        ...(params.opencodeSessionOptions ?? {}),
-      });
-
-      const pausedAfterVerify = await this.pauseIfHardThrottled(
-        params.task,
-        "parent verification (post)",
-        verifyResult.sessionId
-      );
-      if (pausedAfterVerify) return pausedAfterVerify;
-
-      if (verifyResult.loopTrip) {
-        return await this.handleLoopTrip(params.task, verifyCacheKey, "parent-verify", verifyResult);
-      }
-
-      if (!verifyResult.success && verifyResult.watchdogTimeout) {
-        return await this.handleWatchdogTimeout(params.task, verifyCacheKey, "parent-verify", verifyResult, params.opencodeXdg);
-      }
-
-      if (!verifyResult.success && verifyResult.stallTimeout) {
-        return await this.handleStallTimeout(params.task, verifyCacheKey, "parent-verify", verifyResult);
-      }
-
-      const postStatus = await this.getWorktreeStatusPorcelain(verifyWorktreePath);
-      if (postStatus) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Parent verification dirtied its worktree; skipping verification for ${params.task.issue}.`
-        );
-        dirtyWorktree = true;
-        return null;
-      }
-
-      if (!verifyResult.success) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Parent verification run failed; continuing with normal flow for ${params.task.issue}.`
-        );
-        return null;
-      }
-
-      if (verifyResult.sessionId) {
-        await this.queue.updateTaskStatus(params.task, "in-progress", {
-          "session-id": verifyResult.sessionId,
-          ...(params.workerId ? { "worker-id": params.workerId } : {}),
-          ...(typeof params.allocatedSlot === "number" ? { "repo-slot": String(params.allocatedSlot) } : {}),
-        });
-      }
-
-      const parsed = parseParentVerificationOutput(verifyResult.output);
-      if (!parsed.satisfied) {
-        console.log(
-          `[ralph:worker:${this.repo}] Parent verification not satisfied for ${params.task.issue}: ${parsed.reason ?? "unsatisfied"}`
-        );
-        return null;
-      }
-
-      const writeback = await writeParentVerificationToGitHub(
-        {
-          repo: this.repo,
-          issueNumber: Number(params.issueNumber),
-          childIssues: eligibility.childIssues,
-          evidence: evidence.evidence,
-        },
-        { github: this.github }
-      );
-
-      if (!writeback.ok) {
-        const reason = writeback.error ?? "Parent verification writeback failed";
-        return await this.escalateParentVerificationFailure(params.task, reason, verifyResult.sessionId);
-      }
-
-      recordIssueSnapshot({
-        repo: issueRef.repo,
-        issue: params.task.issue,
-        title: params.issueMeta.title,
-        state: "CLOSED",
-        url: issueUrl,
-      });
-
-      return await this.finalizeTaskSuccess({
-        task: params.task,
-        prUrl: null,
-        completionKind: "verified",
-        sessionId: verifyResult.sessionId || params.task["session-id"]?.trim() || "",
-        startTime: params.startTime,
-        cacheKey: verifyCacheKey,
-        opencodeXdg: params.opencodeXdg,
-        worktreePath: params.worktreePath,
-        workerId: params.workerId,
-        repoSlot: typeof params.allocatedSlot === "number" ? String(params.allocatedSlot) : undefined,
-        notify: true,
-        logMessage: `Task verified without changes: ${params.task.name}`,
-      });
-    } finally {
-      if (dirtyWorktree) {
-        console.warn(
-          `[ralph:worker:${this.repo}] Parent verification worktree left for inspection: ${verifyWorktreePath}`
-        );
-      }
-
-      if (!dirtyWorktree) {
-        try {
-          await this.cleanupGitWorktree(verifyWorktreePath);
-        } catch (error: any) {
-          console.warn(
-            `[ralph:worker:${this.repo}] Failed to cleanup parent verification worktree: ${error?.message ?? String(error)}`
-          );
-        }
-      }
-    }
-  }
 
   async processTask(task: AgentTask, opts?: { repoSlot?: number | null }): Promise<AgentRun> {
-    const startTime = new Date();
-
-    let workerId: string | undefined;
-    let allocatedSlot: number | null = null;
-
-    try {
-      // 1. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
-      const issueMatch = task.issue.match(/#(\d+)$/);
-      if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
-      const issueNumber = issueMatch[1];
-      const cacheKey = issueNumber;
-
-      if (!isRepoAllowed(task.repo)) {
-        return await this.blockDisallowedRepo(task, startTime, "start");
-      }
-
-      // 2. Preflight: skip work if the upstream issue is already CLOSED
-      const issueMeta = await this.getIssueMetadata(task.issue);
-      if (issueMeta.state === "CLOSED") {
-        return await this.skipClosedIssue(task, issueMeta, startTime);
-      }
-
-      workerId = await this.formatWorkerId(task, task._path);
-      allocatedSlot = this.resolveAssignedRepoSlot(task, opts?.repoSlot);
-
-      const pausedPreStart = await this.pauseIfHardThrottled(task, "pre-start");
-      if (pausedPreStart) return pausedPreStart;
-
-      const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "start");
-      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
-
-      const opencodeProfileName = resolvedOpencode.profileName;
-      const opencodeXdg = resolvedOpencode.opencodeXdg;
-      const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
-
-      const parentVerifyRun = await this.maybeRunParentVerification({
-        task,
-        issueNumber,
-        issueMeta,
-        startTime,
-        cacheKey,
-        workerId,
-        allocatedSlot,
-        opencodeXdg,
-        opencodeSessionOptions,
-      });
-      if (parentVerifyRun) return parentVerifyRun;
-
-      await this.ensureRalphWorkflowLabelsOnce();
-
-      // 3. Mark task starting (restart-safe pre-session state)
-      const shouldClearBlocked = Boolean(
-        task["blocked-source"]?.trim() || task["blocked-reason"]?.trim() || task["blocked-details"]?.trim()
-      );
-      const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
-        "assigned-at": startTime.toISOString().split("T")[0],
-        ...(!task["opencode-profile"]?.trim() && opencodeProfileName ? { "opencode-profile": opencodeProfileName } : {}),
-        ...(workerId ? { "worker-id": workerId } : {}),
-        ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
-        ...(shouldClearBlocked
-          ? {
-              "blocked-source": "",
-              "blocked-reason": "",
-              "blocked-details": "",
-              "blocked-at": "",
-              "blocked-checked-at": "",
-            }
-          : {}),
-      });
-      if (workerId) task["worker-id"] = workerId;
-      if (typeof allocatedSlot === "number") task["repo-slot"] = String(allocatedSlot);
-      if (!markedStarting) {
-        throw new Error("Failed to mark task starting (bwrb edit failed)");
-      }
-
-      await this.ensureBranchProtectionOnce();
-
-      const resolvedRepoPath = await this.resolveTaskRepoPath(task, issueNumber, "start", allocatedSlot);
-      if (resolvedRepoPath.kind !== "ok") {
-        throw new Error(resolvedRepoPath.reason);
-      }
-      const { repoPath: taskRepoPath, worktreePath } = resolvedRepoPath;
-      if (worktreePath) task["worktree-path"] = worktreePath;
-
-      await this.prepareContextRecovery(task, taskRepoPath);
-
-      await this.assertRepoRootClean(task, "start");
-
-      return await this.withRunContext(task, "process", async () => {
-      this.publishDashboardEvent(
-        {
-          type: "worker.created",
-          level: "info",
-          ...(workerId ? { workerId } : {}),
-          repo: this.repo,
-          taskId: task._path,
-          sessionId: task["session-id"]?.trim() || undefined,
-          data: {
-            ...(worktreePath ? { worktreePath } : {}),
-            ...(typeof allocatedSlot === "number" ? { repoSlot: allocatedSlot } : {}),
-          },
-        },
-        { sessionId: task["session-id"]?.trim() || undefined, workerId }
-      );
-
-      this.logWorker(`Starting task: ${task.name}`, { workerId });
-
-      const pausedSetup = await this.pauseIfHardThrottled(task, "setup");
-      if (pausedSetup) return pausedSetup;
-
-      const setupRun = await this.ensureSetupForTask({
-        task,
-        issueNumber,
-        taskRepoPath,
-        status: "starting",
-      });
-      if (setupRun) return setupRun;
-
-      const botBranch = getRepoBotBranch(this.repo);
-      const mergeConflictRun = await this.maybeHandleQueuedMergeConflict({
-        task,
-        issueNumber,
-        taskRepoPath,
-        cacheKey,
-        botBranch,
-        issueMeta,
-        startTime,
-        opencodeXdg,
-        opencodeSessionOptions,
-      });
-      if (mergeConflictRun) return mergeConflictRun;
-
-      const ciFailureRun = await this.maybeHandleQueuedCiFailure({
-        task,
-        issueNumber,
-        taskRepoPath,
-        cacheKey,
-        botBranch,
-        issueMeta,
-        startTime,
-        opencodeXdg,
-        opencodeSessionOptions,
-      });
-      if (ciFailureRun) return ciFailureRun;
-
-      const existingPrForQueue = await this.getIssuePrResolution(issueNumber);
-      if (existingPrForQueue.selectedUrl) {
-        if (existingPrForQueue.duplicates.length > 0) {
-          console.log(
-            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPrForQueue.duplicates.join(
-              ", "
-            )}`
-          );
-        }
-        return await this.parkTaskWaitingOnOpenPr(task, issueNumber, existingPrForQueue.selectedUrl);
-      }
-
-      // 4. Determine whether this is an implementation-ish task
-      const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
-
-      // 4. Run planner prompt with ralph-plan agent
-      console.log(`[ralph:worker:${this.repo}] Running planner prompt for issue ${issueNumber}`);
-
-      // Transient OpenCode cache races can cause ENOENT during module imports (e.g. zod locales).
-      // With per-run cache isolation this should be rare, but we still retry once for robustness.
-      const isTransientCacheENOENT = (output: string) =>
-        /ENOENT\s+reading\s+"[^"]*\/opencode\/node_modules\//.test(output) ||
-        /ENOENT\s+reading\s+"[^"]*zod\/v4\/locales\//.test(output);
-
-      const pausedPlan = await this.pauseIfHardThrottled(task, "plan");
-      if (pausedPlan) return pausedPlan;
-
-      const baseIssueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber });
-      let issueContext = baseIssueContext;
-      const issueRef = parseIssueRef(task.issue, this.repo);
-      if (issueRef) {
-        const dossierText = await this.buildChildCompletionDossierText({ issueRef });
-        if (dossierText) {
-          issueContext = appendChildDossierToIssueContext(baseIssueContext, dossierText);
-        }
-      }
-      const plannerPrompt = buildPlannerPrompt({ repo: this.repo, issueNumber, issueContext });
-      const planRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan", "starting");
-
-      let planResult = await this.session.runAgent(taskRepoPath, "ralph-plan", plannerPrompt, {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: planRunLogPath,
-        introspection: {
-          repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 1,
-          stepTitle: "plan",
-        },
-        ...this.buildWatchdogOptions(task, "plan"),
-        ...this.buildStallOptions(task, "plan"),
-        ...this.buildLoopDetectionOptions(task, "plan"),
-        ...opencodeSessionOptions,
-      });
-
-      const pausedAfterPlan = await this.pauseIfHardThrottled(task, "plan (post)", planResult.sessionId);
-      if (pausedAfterPlan) return pausedAfterPlan;
-
-      if (!planResult.success && planResult.watchdogTimeout) {
-        return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
-      }
-
-      if (!planResult.success && planResult.stallTimeout) {
-        return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
-      }
-
-      if (!planResult.success && planResult.loopTrip) {
-        return await this.handleLoopTrip(task, cacheKey, "plan", planResult);
-      }
-
-      if (!planResult.success && isTransientCacheENOENT(planResult.output)) {
-        console.warn(`[ralph:worker:${this.repo}] planner hit transient cache ENOENT; retrying once...`);
-        await new Promise((r) => setTimeout(r, 750));
-        const planRetryRunLogPath = await this.recordRunLogPath(task, issueNumber, "plan-retry", "starting");
-
-        planResult = await this.session.runAgent(taskRepoPath, "ralph-plan", plannerPrompt, {
-          repo: this.repo,
-          cacheKey,
-          runLogPath: planRetryRunLogPath,
-          introspection: {
-            repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 1,
-            stepTitle: "plan (retry)",
-          },
-          ...this.buildWatchdogOptions(task, "plan-retry"),
-          ...this.buildStallOptions(task, "plan-retry"),
-          ...this.buildLoopDetectionOptions(task, "plan-retry"),
-          ...opencodeSessionOptions,
-        });
-      }
-
-      const pausedAfterPlanRetry = await this.pauseIfHardThrottled(task, "plan (post retry)", planResult.sessionId);
-      if (pausedAfterPlanRetry) return pausedAfterPlanRetry;
-
-      if (!planResult.success) {
-        if (planResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
-        }
-
-        if (planResult.stallTimeout) {
-          return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
-        }
-
-        const classification = classifyOpencodeFailure(planResult.output);
-        const reason = classification?.reason ?? `planner failed: ${planResult.output}`;
-        const details = planResult.output;
-
-        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
-          reason,
-          details,
-          sessionId: planResult.sessionId,
-          runLogPath: planRunLogPath,
-        });
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "failed",
-          sessionId: planResult.sessionId,
-          escalationReason: reason,
-        };
-      }
-
-      // Persist OpenCode session ID for crash recovery
-      if (planResult.sessionId) {
-        await this.queue.updateTaskStatus(task, "in-progress", {
-          "session-id": planResult.sessionId,
-          ...(workerId ? { "worker-id": workerId } : {}),
-          ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
-        });
-      }
-
-      await this.recordCheckpoint(task, "planned", planResult.sessionId);
-      this.publishCheckpoint("planned", { sessionId: planResult.sessionId || undefined });
-
-      // 5. Parse routing decision
-      let routing = parseRoutingDecision(planResult.output);
-      let hasGap = hasProductGap(planResult.output);
-
-      await this.recordCheckpoint(task, "routed", planResult.sessionId);
-
-      // 6. Consult devex once before escalating implementation tasks
-      let devexContext: EscalationContext["devex"] | undefined;
-      if (shouldConsultDevex({ routing, hasGap, isImplementationTask })) {
-        const baseSessionId = planResult.sessionId;
-        console.log(
-          `[ralph:worker:${this.repo}] Consulting @devex before escalation (task: ${task.name}, session: ${baseSessionId})`
-        );
-
-        const devexPrompt = [
-          "You are @devex.",
-          "Resolve low-level implementation ambiguity (style, error message patterns, validation scope that does not change public behavior).",
-          "IMPORTANT: This runs in a non-interactive daemon. Do NOT ask questions; make reasonable default choices and proceed.",
-          "Return a short, actionable summary.",
-        ].join("\n");
-
-        const pausedDevexConsult = await this.pauseIfHardThrottled(task, "consult devex", baseSessionId);
-        if (pausedDevexConsult) return pausedDevexConsult;
-
-        const devexRunLogPath = await this.recordRunLogPath(task, issueNumber, "consult devex", "in-progress");
-
-        const devexResult = await this.session.continueSession(taskRepoPath, baseSessionId, devexPrompt, {
-          agent: "devex",
-          repo: this.repo,
-          cacheKey,
-          runLogPath: devexRunLogPath,
-          introspection: {
-            repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 2,
-            stepTitle: "consult devex",
-          },
-          ...this.buildStallOptions(task, "consult devex"),
-          ...this.buildLoopDetectionOptions(task, "consult devex"),
-          ...opencodeSessionOptions,
-        });
-
-        await this.recordImplementationCheckpoint(task, devexResult.sessionId || baseSessionId);
-
-        const pausedAfterDevexConsult = await this.pauseIfHardThrottled(
-          task,
-          "consult devex (post)",
-          devexResult.sessionId || baseSessionId
-        );
-        if (pausedAfterDevexConsult) return pausedAfterDevexConsult;
-
-        if (!devexResult.success) {
-          if (devexResult.loopTrip) {
-            return await this.handleLoopTrip(task, cacheKey, "consult devex", devexResult);
-          }
-          if (devexResult.stallTimeout) {
-            return await this.handleStallTimeout(task, cacheKey, "consult devex", devexResult);
-          }
-          console.warn(`[ralph:worker:${this.repo}] Devex consult failed: ${devexResult.output}`);
-          devexContext = {
-            consulted: true,
-            sessionId: devexResult.sessionId || baseSessionId,
-            summary: `Devex consult failed: ${summarizeForNote(devexResult.output, 400)}`,
-          };
-        } else {
-          const devexSummary = summarizeForNote(devexResult.output);
-          devexContext = {
-            consulted: true,
-            sessionId: devexResult.sessionId || baseSessionId,
-            summary: devexSummary,
-          };
-
-          console.log(
-            `[ralph:worker:${this.repo}] Devex consulted (task: ${task.name}, session: ${devexContext.sessionId})`
-          );
-
-          const reroutePrompt = [
-            "Incorporate the devex guidance below into your plan.",
-            "Then output ONLY the routing decision JSON code block.",
-            "Do not ask questions.",
-            "If an open question touches a user-facing contract surface (e.g. CLI flags/args, exit codes, stdout/stderr formats, config schema, machine-readable outputs), set decision=escalate (policy: docs/escalation-policy.md).",
-            "",
-            "Devex guidance:",
-            devexSummary || devexResult.output,
-          ].join("\n");
-
-          const pausedReroute = await this.pauseIfHardThrottled(task, "reroute after devex", baseSessionId);
-          if (pausedReroute) return pausedReroute;
-
-          const rerouteRunLogPath = await this.recordRunLogPath(task, issueNumber, "reroute after devex", "in-progress");
-
-          const rerouteResult = await this.session.continueSession(taskRepoPath, baseSessionId, reroutePrompt, {
-            repo: this.repo,
-            cacheKey,
-            runLogPath: rerouteRunLogPath,
-            introspection: {
-              repo: this.repo,
-              issue: task.issue,
-              taskName: task.name,
-              step: 3,
-              stepTitle: "reroute after devex",
-            },
-            ...this.buildStallOptions(task, "reroute after devex"),
-            ...this.buildLoopDetectionOptions(task, "reroute after devex"),
-            ...opencodeSessionOptions,
-          });
-
-          await this.recordImplementationCheckpoint(task, rerouteResult.sessionId || baseSessionId);
-
-          const pausedAfterReroute = await this.pauseIfHardThrottled(
-            task,
-            "reroute after devex (post)",
-            rerouteResult.sessionId || baseSessionId
-          );
-          if (pausedAfterReroute) return pausedAfterReroute;
-
-          if (!rerouteResult.success) {
-            if (rerouteResult.loopTrip) {
-              return await this.handleLoopTrip(task, cacheKey, "reroute after devex", rerouteResult);
-            }
-            if (rerouteResult.stallTimeout) {
-              return await this.handleStallTimeout(task, cacheKey, "reroute after devex", rerouteResult);
-            }
-            console.warn(`[ralph:worker:${this.repo}] Reroute after devex consult failed: ${rerouteResult.output}`);
-          } else {
-            if (rerouteResult.sessionId) {
-              await this.queue.updateTaskStatus(task, "in-progress", { "session-id": rerouteResult.sessionId });
-            }
-
-            const updatedRouting = parseRoutingDecision(rerouteResult.output);
-            if (updatedRouting) routing = updatedRouting;
-
-            // Allow product-gap detection to trigger if the reroute output explicitly flags it.
-            hasGap = hasGap || hasProductGap(rerouteResult.output);
-          }
-        }
-
-      }
-
-      // 7. Decide whether to escalate
-      this.publishCheckpoint("routed", { sessionId: planResult.sessionId || undefined });
-      const shouldEscalate = this.shouldEscalate(routing, hasGap, isImplementationTask);
-      
-      if (shouldEscalate) {
-        const reason =
-          routing?.escalation_reason ||
-          (hasGap
-            ? "Product documentation gap identified"
-            : routing?.decision === "escalate" && routing?.confidence === "high"
-              ? "High-confidence escalation requested"
-              : "Escalation requested");
-
-        // Determine escalation type
-        let escalationType: EscalationContext["escalationType"] = "other";
-        if (hasGap) {
-          escalationType = "product-gap";
-        } else if (isExplicitBlockerReason(routing?.escalation_reason)) {
-          escalationType = "blocked";
-        } else if (routing?.escalation_reason?.toLowerCase().includes("ambiguous")) {
-          escalationType = "ambiguous-requirements";
-        }
-
-
-        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
-
-        const wasEscalated = task.status === "escalated";
-        const escalated = await this.queue.updateTaskStatus(task, "escalated");
-        if (escalated) {
-          applyTaskPatch(task, "escalated", {});
-        }
-        await this.writeEscalationWriteback(task, { reason, escalationType });
-        await this.notify.notifyEscalation({
-          taskName: task.name,
-          taskFileName: task._name,
-          taskPath: task._path,
-          issue: task.issue,
-          repo: this.repo,
-          sessionId: planResult.sessionId,
-          reason,
-          escalationType,
-          planOutput: planResult.output,
-          routing: routing
-            ? {
-                decision: routing.decision,
-                confidence: routing.confidence,
-                escalation_reason: routing.escalation_reason ?? undefined,
-                plan_summary: routing.plan_summary ?? undefined,
-              }
-            : undefined,
-          devex: devexContext,
-        });
-
-        if (escalated && !wasEscalated) {
-          await this.recordEscalatedRunNote(task, {
-            reason,
-            sessionId: planResult.sessionId,
-            details: planResult.output,
-          });
-        }
-
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "escalated",
-          sessionId: planResult.sessionId,
-          escalationReason: reason,
-        };
-      }
-
-      // 6. Proceed with build
-      console.log(`[ralph:worker:${this.repo}] Proceeding with build...`);
-      const existingPr = await this.getIssuePrResolution(issueNumber);
-      const proceedMessage = existingPr.selectedUrl
-        ? [
-            `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
-            "Do NOT create a new PR.",
-            "Fix any failing checks and push updates to the existing PR branch.",
-            "Only paste a PR URL if it changes.",
-          ].join(" ")
-        : `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
-
-      if (existingPr.selectedUrl) {
-        console.log(
-          `[ralph:worker:${this.repo}] Reusing existing PR for build: ${existingPr.selectedUrl} (source=${
-            existingPr.source ?? "unknown"
-          })`
-        );
-        await this.markIssueInProgressForOpenPrBestEffort(task, existingPr.selectedUrl);
-        if (existingPr.duplicates.length > 0) {
-          console.log(
-            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPr.duplicates.join(", ")}`
-          );
-        }
-      }
-
-      const pausedBuild = await this.pauseIfHardThrottled(task, "build", planResult.sessionId);
-      if (pausedBuild) return pausedBuild;
-
-      const buildRunLogPath = await this.recordRunLogPath(task, issueNumber, "build", "in-progress");
-
-      let buildResult = await this.session.continueSession(taskRepoPath, planResult.sessionId, proceedMessage, {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: buildRunLogPath,
-        introspection: {
-          repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 4,
-          stepTitle: "build",
-        },
-        ...this.buildWatchdogOptions(task, "build"),
-        ...this.buildStallOptions(task, "build"),
-        ...this.buildLoopDetectionOptions(task, "build"),
-        ...opencodeSessionOptions,
-      });
-
-      await this.recordImplementationCheckpoint(task, buildResult.sessionId || planResult.sessionId);
-
-      const pausedAfterBuild = await this.pauseIfHardThrottled(task, "build (post)", buildResult.sessionId || planResult.sessionId);
-      if (pausedAfterBuild) return pausedAfterBuild;
-
-      if (!buildResult.success) {
-        if (buildResult.loopTrip) {
-          return await this.handleLoopTrip(task, cacheKey, "build", buildResult);
-        }
-        if (buildResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "build", buildResult, opencodeXdg);
-        }
-
-        if (buildResult.stallTimeout) {
-          return await this.handleStallTimeout(task, cacheKey, "build", buildResult);
-        }
-        throw new Error(`Build failed: ${buildResult.output}`);
-      }
-
-      this.publishCheckpoint("implementation_step_complete", {
-        sessionId: buildResult.sessionId || planResult.sessionId || undefined,
-      });
-
-      // Keep the latest session ID persisted
-      if (buildResult.sessionId) {
-        await this.queue.updateTaskStatus(task, "in-progress", { "session-id": buildResult.sessionId });
-      }
-
-      await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build", opencodeXdg);
-
-      // 7. Extract PR URL (with retry loop if agent stopped without creating PR)
-      // Also monitors for anomaly bursts (GPT tool-result-as-text loop)
-      const MAX_CONTINUE_RETRIES = 5;
-      let prUrl = this.updateOpenPrSnapshot(
-        task,
-        null,
-        selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
-      );
-      let prRecoveryDiagnostics = "";
-
-      if (!prUrl) {
-        const recovered = await this.tryEnsurePrFromWorktree({
-          task,
-          issueNumber,
-          issueTitle: issueMeta.title || task.name,
-          botBranch,
-        });
-        prRecoveryDiagnostics = recovered.diagnostics;
-        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
-      }
-
-      let continueAttempts = 0;
-      let anomalyAborts = 0;
-      let lastAnomalyCount = 0;
-      let prCreateLeaseKey: string | null = null;
-
-      while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
-        await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build", opencodeXdg);
-
-        // Check for anomaly burst before continuing
-        const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
-        const newAnomalies = anomalyStatus.total - lastAnomalyCount;
-        lastAnomalyCount = anomalyStatus.total;
-
-        if (anomalyStatus.total >= ANOMALY_BURST_THRESHOLD || anomalyStatus.recentBurst) {
-          anomalyAborts++;
-          console.warn(
-            `[ralph:worker:${this.repo}] Anomaly burst detected (${anomalyStatus.total} total, ${newAnomalies} new). ` +
-            `Abort #${anomalyAborts}/${MAX_ANOMALY_ABORTS}`
-          );
-
-          if (anomalyAborts >= MAX_ANOMALY_ABORTS) {
-            // Too many anomaly aborts - escalate
-            const reason = `Agent stuck in tool-result-as-text loop (${anomalyStatus.total} anomalies detected, aborted ${anomalyAborts} times)`;
-            console.log(`[ralph:worker:${this.repo}] Escalating due to repeated anomaly loops`);
-
-            const wasEscalated = task.status === "escalated";
-            const escalated = await this.queue.updateTaskStatus(task, "escalated");
-            if (escalated) {
-              applyTaskPatch(task, "escalated", {});
-            }
-            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
-            await this.notify.notifyEscalation({
-              taskName: task.name,
-              taskFileName: task._name,
-              taskPath: task._path,
-              issue: task.issue,
-              repo: this.repo,
-              sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-              reason,
-              escalationType: "other",
-              planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-            });
-
-            if (escalated && !wasEscalated) {
-              await this.recordEscalatedRunNote(task, {
-                reason,
-                sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-                details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-              });
-            }
-
-            return {
-              taskName: task.name,
-              repo: this.repo,
-              outcome: "escalated",
-              sessionId: buildResult.sessionId,
-              escalationReason: reason,
-            };
-          }
-
-          // Send a specific nudge to break the loop
-          console.log(`[ralph:worker:${this.repo}] Sending loop-break nudge...`);
-
-          const pausedBuildLoopBreak = await this.pauseIfHardThrottled(task, "build loop-break", buildResult.sessionId);
-          if (pausedBuildLoopBreak) return pausedBuildLoopBreak;
-
-          const buildLoopBreakRunLogPath = await this.recordRunLogPath(
-            task,
-            issueNumber,
-            "build loop-break",
-            "in-progress"
-          );
-
-          buildResult = await this.session.continueSession(
-            taskRepoPath,
-            buildResult.sessionId,
-            "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
-            {
-              repo: this.repo,
-              cacheKey,
-              runLogPath: buildLoopBreakRunLogPath,
-              introspection: {
-                repo: this.repo,
-                issue: task.issue,
-                taskName: task.name,
-                step: 4,
-                stepTitle: "build loop-break",
-              },
-              ...this.buildWatchdogOptions(task, "build-loop-break"),
-              ...this.buildStallOptions(task, "build-loop-break"),
-              ...this.buildLoopDetectionOptions(task, "build-loop-break"),
-              ...opencodeSessionOptions,
-            }
-          );
-
-          await this.recordImplementationCheckpoint(task, buildResult.sessionId);
-
-          const pausedBuildLoopBreakAfter = await this.pauseIfHardThrottled(task, "build loop-break (post)", buildResult.sessionId);
-          if (pausedBuildLoopBreakAfter) return pausedBuildLoopBreakAfter;
-
-            if (!buildResult.success) {
-              if (buildResult.loopTrip) {
-                return await this.handleLoopTrip(task, cacheKey, "build-loop-break", buildResult);
-              }
-              if (buildResult.watchdogTimeout) {
-                return await this.handleWatchdogTimeout(task, cacheKey, "build-loop-break", buildResult, opencodeXdg);
-              }
-
-            if (buildResult.stallTimeout) {
-              return await this.handleStallTimeout(task, cacheKey, "build-loop-break", buildResult);
-            }
-            console.warn(`[ralph:worker:${this.repo}] Loop-break nudge failed: ${buildResult.output}`);
-            break;
-          }
-
-          this.publishCheckpoint("implementation_step_complete", {
-            sessionId: buildResult.sessionId || planResult.sessionId || undefined,
-          });
-
-          // Reset anomaly tracking for fresh window
-          lastAnomalyCount = anomalyStatus.total;
-          prUrl = this.updateOpenPrSnapshot(
-            task,
-            prUrl,
-            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
-          );
-          continue;
-        }
-
-        const canonical = await this.getIssuePrResolution(issueNumber);
-        if (canonical.selectedUrl) {
-          console.log(
-            `[ralph:worker:${this.repo}] Reusing existing PR during build: ${canonical.selectedUrl} (source=${
-              canonical.source ?? "unknown"
-            })`
-          );
-          await this.markIssueInProgressForOpenPrBestEffort(task, canonical.selectedUrl);
-          if (canonical.duplicates.length > 0) {
-            console.log(
-              `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
-            );
-          }
-          prRecoveryDiagnostics = [prRecoveryDiagnostics, canonical.diagnostics.join("\n")].filter(Boolean).join("\n\n");
-          prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
-          break;
-        }
-
-        if (!prCreateLeaseKey) {
-          const lease = this.tryClaimPrCreateLease({
-            task,
-            issueNumber,
-            botBranch,
-            sessionId: buildResult.sessionId,
-            stage: "build",
-          });
-
-          if (!lease.claimed) {
-            console.warn(
-              `[ralph:worker:${this.repo}] PR-create lease already held; waiting instead of creating duplicate (lease=${lease.key})`
-            );
-
-            const waited = await this.waitForExistingPrDuringPrCreateConflict({
-              issueNumber,
-              maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
-            });
-
-            if (waited?.selectedUrl) {
-              await this.markIssueInProgressForOpenPrBestEffort(task, waited.selectedUrl);
-              prRecoveryDiagnostics = [prRecoveryDiagnostics, waited.diagnostics.join("\n")].filter(Boolean).join("\n\n");
-              prUrl = this.updateOpenPrSnapshot(task, prUrl, waited.selectedUrl);
-              break;
-            }
-
-            const throttled = await this.throttleForPrCreateConflict({
-              task,
-              issueNumber,
-              sessionId: buildResult.sessionId,
-              leaseKey: lease.key,
-              existingCreatedAt: lease.existingCreatedAt,
-              stage: "build",
-            });
-            if (throttled) return throttled;
-
-            prRecoveryDiagnostics = [
-              prRecoveryDiagnostics,
-              `PR-create conflict: lease=${lease.key} (createdAt=${lease.existingCreatedAt ?? "unknown"})`,
-            ]
-              .filter(Boolean)
-              .join("\n\n");
-            break;
-          }
-
-          prCreateLeaseKey = lease.key;
-          console.log(`[ralph:worker:${this.repo}] pr_mode=create lease=${lease.key}`);
-        }
-
-        continueAttempts++;
-        console.log(
-          `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
-        );
-
-        const pausedBuildContinue = await this.pauseIfHardThrottled(task, "build continue", buildResult.sessionId);
-        if (pausedBuildContinue) return pausedBuildContinue;
-
-        const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
-        const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue", "in-progress");
-
-        buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
-          repo: this.repo,
-          cacheKey,
-          runLogPath: buildContinueRunLogPath,
-          timeoutMs: 10 * 60_000,
-          introspection: {
-            repo: this.repo,
-            issue: task.issue,
-            taskName: task.name,
-            step: 4,
-            stepTitle: "build continue",
-          },
-          ...this.buildWatchdogOptions(task, "build-continue"),
-          ...this.buildStallOptions(task, "build-continue"),
-          ...this.buildLoopDetectionOptions(task, "build-continue"),
-          ...opencodeSessionOptions,
-        });
-
-        await this.recordImplementationCheckpoint(task, buildResult.sessionId);
-
-        const pausedBuildContinueAfter = await this.pauseIfHardThrottled(task, "build continue (post)", buildResult.sessionId);
-        if (pausedBuildContinueAfter) return pausedBuildContinueAfter;
-
-        if (!buildResult.success) {
-          if (buildResult.loopTrip) {
-            return await this.handleLoopTrip(task, cacheKey, "build-continue", buildResult);
-          }
-          if (buildResult.watchdogTimeout) {
-            return await this.handleWatchdogTimeout(task, cacheKey, "build-continue", buildResult, opencodeXdg);
-          }
-
-          if (buildResult.stallTimeout) {
-            return await this.handleStallTimeout(task, cacheKey, "build-continue", buildResult);
-          }
-
-          // If the session ended without printing a URL, try to recover PR from git state.
-          const recovered = await this.tryEnsurePrFromWorktree({
-            task,
-            issueNumber,
-            issueTitle: issueMeta.title || task.name,
-            botBranch,
-          });
-          prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-          prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
-
-          if (!prUrl) {
-            console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
-            break;
-          }
-        } else {
-          this.publishCheckpoint("implementation_step_complete", {
-            sessionId: buildResult.sessionId || planResult.sessionId || undefined,
-          });
-          prUrl = this.updateOpenPrSnapshot(
-            task,
-            prUrl,
-            selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
-          );
-        }
-      }
-
-      if (!prUrl) {
-        const recovered = await this.tryEnsurePrFromWorktree({
-          task,
-          issueNumber,
-          issueTitle: issueMeta.title || task.name,
-          botBranch,
-        });
-        prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
-        prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
-      }
-
-      if (!prUrl) {
-        // Escalate if we still don't have a PR after retries
-        const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
-        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
-
-        const wasEscalated = task.status === "escalated";
-        const escalated = await this.queue.updateTaskStatus(task, "escalated");
-        if (escalated) {
-          applyTaskPatch(task, "escalated", {});
-        }
-        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
-        await this.notify.notifyEscalation({
-          taskName: task.name,
-          taskFileName: task._name,
-          taskPath: task._path,
-          issue: task.issue,
-          repo: this.repo,
-          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-          reason,
-          escalationType: "other",
-          planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-        });
-
-        if (escalated && !wasEscalated) {
-          await this.recordEscalatedRunNote(task, {
-            reason,
-            sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-          });
-        }
-
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "escalated",
-          sessionId: buildResult.sessionId,
-          escalationReason: reason,
-        };
-      }
-
-      if (prUrl && prCreateLeaseKey) {
-        try {
-          deleteIdempotencyKey(prCreateLeaseKey);
-        } catch {
-          // ignore
-        }
-        prCreateLeaseKey = null;
-      }
-
-      const canonical = await this.getIssuePrResolution(issueNumber);
-      if (canonical.selectedUrl && !this.isSamePrUrl(prUrl, canonical.selectedUrl)) {
-        console.log(
-          `[ralph:worker:${this.repo}] Detected duplicate PR; using existing ${canonical.selectedUrl} instead of ${prUrl}`
-        );
-        if (canonical.duplicates.length > 0) {
-          console.log(
-            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${canonical.duplicates.join(", ")}`
-          );
-        }
-        prUrl = this.updateOpenPrSnapshot(task, prUrl, canonical.selectedUrl);
-      }
-
-      this.publishCheckpoint("pr_ready", { sessionId: buildResult.sessionId || planResult.sessionId || undefined });
-
-      const pausedMerge = await this.pauseIfHardThrottled(task, "merge", buildResult.sessionId);
-      if (pausedMerge) return pausedMerge;
-
-      const mergeGate = await this.mergePrWithRequiredChecks({
-        task,
-        repoPath: taskRepoPath,
-        cacheKey,
-        botBranch,
-        prUrl,
-        sessionId: buildResult.sessionId,
-        issueMeta,
-        watchdogStagePrefix: "merge",
-        notifyTitle: `Merging ${task.name}`,
-        opencodeXdg,
-      });
-
-      if (!mergeGate.ok) return mergeGate.run;
-
-      const pausedMergeAfter = await this.pauseIfHardThrottled(task, "merge (post)", mergeGate.sessionId || buildResult.sessionId);
-      if (pausedMergeAfter) return pausedMergeAfter;
-
-      this.publishCheckpoint("merge_step_complete", {
-        sessionId: mergeGate.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
-      });
-
-      prUrl = mergeGate.prUrl;
-      buildResult.sessionId = mergeGate.sessionId;
-
-      // 9. Run survey (configured command)
-      console.log(`[ralph:worker:${this.repo}] Running survey...`);
-      const pausedSurvey = await this.pauseIfHardThrottled(task, "survey", buildResult.sessionId);
-      if (pausedSurvey) return pausedSurvey;
-
-      const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
-      const surveyRunLogPath = await this.recordRunLogPath(task, issueNumber, "survey", "in-progress");
-
-      const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
-        repo: this.repo,
-        cacheKey,
-        runLogPath: surveyRunLogPath,
-        introspection: {
-          repo: this.repo,
-          issue: task.issue,
-          taskName: task.name,
-          step: 6,
-          stepTitle: "survey",
-        },
-        ...this.buildWatchdogOptions(task, "survey"),
-        ...this.buildStallOptions(task, "survey"),
-        ...this.buildLoopDetectionOptions(task, "survey"),
-        ...opencodeSessionOptions,
-      });
-
-      await this.recordImplementationCheckpoint(task, surveyResult.sessionId || buildResult.sessionId);
-
-      const pausedSurveyAfter = await this.pauseIfHardThrottled(task, "survey (post)", surveyResult.sessionId || buildResult.sessionId);
-      if (pausedSurveyAfter) return pausedSurveyAfter;
-
-      if (!surveyResult.success) {
-        if (surveyResult.loopTrip) {
-          return await this.handleLoopTrip(task, cacheKey, "survey", surveyResult);
-        }
-        if (surveyResult.watchdogTimeout) {
-          return await this.handleWatchdogTimeout(task, cacheKey, "survey", surveyResult, opencodeXdg);
-        }
-
-        if (surveyResult.stallTimeout) {
-          return await this.handleStallTimeout(task, cacheKey, "survey", surveyResult);
-        }
-        console.warn(`[ralph:worker:${this.repo}] Survey may have failed: ${surveyResult.output}`);
-      }
-
-      try {
-        await writeDxSurveyToGitHubIssues({
-          github: this.github,
-          targetRepo: this.repo,
-          ralphRepo: "3mdistal/ralph",
-          issueNumber,
-          taskName: task.name,
-          cacheKey,
-          prUrl: prUrl ?? null,
-          sessionId: surveyResult.sessionId || buildResult.sessionId || null,
-          surveyOutput: surveyResult.output,
-        });
-      } catch (error: any) {
-        console.warn(`[ralph:worker:${this.repo}] Failed to file DX survey issues: ${error?.message ?? String(error)}`);
-      }
-
-      await this.recordCheckpoint(task, "survey_complete", surveyResult.sessionId || buildResult.sessionId);
-      this.publishCheckpoint("survey_complete", {
-        sessionId: surveyResult.sessionId || buildResult.sessionId || planResult.sessionId || undefined,
-      });
-
-      return await this.finalizeTaskSuccess({
-        task,
-        prUrl,
-        sessionId: buildResult.sessionId,
-        startTime,
-        surveyResults: surveyResult.output,
-        cacheKey,
-        opencodeXdg,
-        worktreePath,
-        workerId,
-        repoSlot: typeof allocatedSlot === "number" ? String(allocatedSlot) : undefined,
-        devex: devexContext,
-        notify: true,
-        logMessage: `Task completed: ${task.name}`,
-      });
-      });
-    } catch (error: any) {
-      console.error(`[ralph:worker:${this.repo}] Task failed:`, error);
-
-      if (!error?.ralphRootDirty) {
-        const paused = await this.pauseIfGitHubRateLimited(task, "process", error, {
-          sessionId: task["session-id"]?.trim() || undefined,
-          runLogPath: task["run-log-path"]?.trim() || undefined,
-        });
-        if (paused) return paused;
-
-        const reason = error?.message ?? String(error);
-        const details = error?.stack ?? reason;
-        const classification = classifyOpencodeFailure(`${reason}\n${details}`);
-        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
-          reason: classification?.reason ?? reason,
-          details,
-        });
-      }
-
-      return {
-        taskName: task.name,
-        repo: this.repo,
-        outcome: "failed",
-        escalationReason: error?.message ?? String(error),
-      };
-    } finally {
-      // slot release handled by scheduler-level reservation
-    }
+    return await runStartLane(this, task, opts);
   }
-
 
   private async createAgentRun(
     task: AgentTask,
@@ -6978,149 +5189,9 @@ export class RepoWorker {
       bodyPrefix?: string;
     }
   ): Promise<void> {
-    if (this.isGitHubQueueTask(task)) {
-      return;
-    }
-    const vault = getBwrbVaultForStorage("create agent-run note");
-    if (!vault) {
-      return;
-    }
-    const taskPath = typeof task._path === "string" ? task._path : "";
-    const resolvedTaskPath = taskPath.endsWith(".md") ? resolveVaultPath(taskPath) : "";
-    if (!resolvedTaskPath || !existsSync(resolvedTaskPath)) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Skipping agent-run note; task note missing at ${taskPath || "(unknown)"}`
-      );
-      return;
-    }
-    const today = data.completed.toISOString().split("T")[0];
-    const shortIssue = task.issue.split("/").pop() || task.issue;
-
-    const runName = safeNoteName(`Run for ${shortIssue} - ${task.name.slice(0, 40)}`);
-
-    const payload = buildAgentRunPayload({
-      name: runName,
-      task: `[[${task._name}]]`,  // Use _name (filename) not name (display) for wikilinks
-      started: data.started.toISOString().split("T")[0],
-      completed: today,
-      outcome: data.outcome,
-      pr: data.pr || "",
-      creationDate: today,
-      scope: "builder",
-    });
-
-    try {
-      const output = await createBwrbNote({
-        type: "agent-run",
-        action: "create agent-run note",
-        payload,
-      });
-
-      if (!output.ok || !output.path) {
-        const error = output.ok ? "bwrb did not return a note path" : output.error;
-        const log = !output.ok && output.skipped ? console.warn : console.error;
-        log(`[ralph:worker:${this.repo}] Failed to create agent-run: ${error}`);
-        return;
-      }
-
-      const bodySections: string[] = [];
-
-      if (data.bodyPrefix?.trim()) {
-        bodySections.push(data.bodyPrefix.trim(), "");
-      }
-
-      // Add introspection summary if available
-      if (data.sessionId) {
-        const introspection = await readIntrospectionSummary(data.sessionId);
-        if (introspection) {
-          bodySections.push(
-            "## Session Summary",
-            "",
-            `- **Steps:** ${introspection.stepCount}`,
-            `- **Tool calls:** ${introspection.totalToolCalls}`,
-            `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
-            `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
-            ""
-          );
-        }
-      }
-
-      // Add token totals (best-effort). GitHub queue tasks skip agent-run notes.
-      const tokenRunId = this.activeRunId ?? (data.sessionId ? getLatestRunIdForSession(data.sessionId) : null);
-      if (tokenRunId) {
-        try {
-          const opencodeProfile = this.getPinnedOpencodeProfileName(task);
-          let tokenTotals = getRalphRunTokenTotals(tokenRunId);
-          let sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
-          if (!tokenTotals || !tokenTotals.tokensComplete) {
-            await refreshRalphRunTokenTotals({ runId: tokenRunId, opencodeProfile });
-            tokenTotals = getRalphRunTokenTotals(tokenRunId);
-            sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
-          }
-
-          if (tokenTotals) {
-            const totalLabel = tokenTotals.tokensComplete && typeof tokenTotals.tokensTotal === "number" ? tokenTotals.tokensTotal : "?";
-            const showSessions = sessionTotals.length > 1;
-            bodySections.push(
-              "## Token Usage",
-              "",
-              `- **Total:** ${totalLabel}`,
-              `- **Complete:** ${tokenTotals.tokensComplete ? "Yes" : "No"}`,
-              `- **Sessions:** ${tokenTotals.sessionCount}`,
-              ""
-            );
-
-            if (showSessions) {
-              const lines = sessionTotals.slice(0, 10).map((s) => {
-                const label = typeof s.tokensTotal === "number" ? s.tokensTotal : "?";
-                return `- ${s.sessionId}: ${label} (${s.quality})`;
-              });
-              if (lines.length > 0) {
-                bodySections.push("### Sessions", "", ...lines, "");
-              }
-            }
-          }
-        } catch {
-          // best-effort token accounting
-        }
-      }
-
-
-      // Add devex consult summary (if we used devex-before-escalate)
-      if (data.devex?.consulted) {
-        bodySections.push(
-          "## Devex Consult",
-          "",
-          data.devex.sessionId ? `- **Session:** ${data.devex.sessionId}` : "",
-          data.devex.summary ?? "",
-          ""
-        );
-      }
-
-      // Add survey results
-      if (data.surveyResults) {
-        bodySections.push("## Survey Results", "", data.surveyResults, "");
-      }
-
-      if (bodySections.length > 0) {
-        const bodyResult = await appendBwrbNoteBody({
-          notePath: output.path,
-          body: "\n" + bodySections.join("\n"),
-        });
-        if (!bodyResult.ok) {
-          const log = bodyResult.skipped ? console.warn : console.error;
-          log(`[ralph:worker:${this.repo}] Failed to write agent-run body: ${bodyResult.error}`);
-        }
-      }
-
-      // Clean up introspection logs
-      if (data.sessionId) {
-        await cleanupIntrospectionLogs(data.sessionId);
-      }
-
-      console.log(`[ralph:worker:${this.repo}] Created agent-run note`);
-    } catch (e) {
-      console.error(`[ralph:worker:${this.repo}] Failed to create agent-run:`, e);
+    // Agent-run artifacts are persisted via SQLite run records.
+    if (data.sessionId) {
+      await cleanupIntrospectionLogs(data.sessionId);
     }
   }
 }

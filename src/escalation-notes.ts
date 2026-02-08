@@ -1,119 +1,4 @@
-import { $ } from "bun";
-import { existsSync } from "fs";
-import { readFile } from "fs/promises";
-import { join } from "path";
-import { getBwrbVaultForStorage } from "./queue-backend";
-
-type BwrbCommandResult = { stdout: Uint8Array | string | { toString(): string } };
-
-type BwrbProcess = {
-  cwd: (path: string) => BwrbProcess;
-  quiet: () => Promise<BwrbCommandResult>;
-};
-
-type BwrbRunner = (strings: TemplateStringsArray, ...values: unknown[]) => BwrbProcess;
-
-const DEFAULT_BWRB_RUNNER: BwrbRunner = $ as unknown as BwrbRunner;
-
-const bwrb: BwrbRunner = DEFAULT_BWRB_RUNNER;
-
-export interface AgentEscalationNote {
-  _path: string;
-  _name: string;
-  type: "agent-escalation";
-  "creation-date"?: string;
-  status: string;
-  repo?: string;
-  issue?: string;
-  "task-path"?: string;
-  "session-id"?: string;
-  "resume-status"?: string;
-  "resume-attempted-at"?: string;
-  "resume-deferred-at"?: string;
-  "resume-error"?: string;
-}
-
-export type EditEscalationResult =
-  | { ok: true }
-  | {
-      ok: false;
-      kind: "vault-missing" | "bwrb-error";
-      error: string;
-    };
-
-let warnedMissingVault = false;
-
-function resolveBwrbVault(action: string): string | null {
-  const vault = getBwrbVaultForStorage(action);
-  if (vault && existsSync(vault)) return vault;
-
-  if (!warnedMissingVault) {
-    warnedMissingVault = true;
-    console.error(
-      `[ralph:escalations] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
-        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`
-    );
-  }
-
-  return null;
-}
-
-function formatBwrbShellError(e: unknown): string {
-  const err = e as any;
-  const parts: string[] = [];
-
-  if (err?.message) parts.push(String(err.message));
-
-  const stdout = err?.stdout?.toString?.() ?? err?.stdout;
-  const stderr = err?.stderr?.toString?.() ?? err?.stderr;
-
-  if (typeof stdout === "string" && stdout.trim()) parts.push(`stdout: ${stdout.trim()}`);
-  if (typeof stderr === "string" && stderr.trim()) parts.push(`stderr: ${stderr.trim()}`);
-
-  return parts.join("\n").trim() || String(e);
-}
-
-export async function getEscalationsByStatus(status: string): Promise<AgentEscalationNote[]> {
-  const vault = resolveBwrbVault("list escalations");
-  if (!vault) return [];
-
-  try {
-    const result = await bwrb`bwrb list agent-escalation --where "status == '${status}'" --output json`
-      .cwd(vault)
-      .quiet();
-    return JSON.parse(result.stdout.toString());
-  } catch (e) {
-    console.error(`[ralph:escalations] Failed to list agent-escalation notes (status=${status}):`, e);
-    return [];
-  }
-}
-
-export async function editEscalation(
-  escalationPath: string,
-  fields: Record<string, string>
-): Promise<EditEscalationResult> {
-  const vault = resolveBwrbVault("edit escalation");
-  if (!vault) {
-    return {
-      ok: false,
-      kind: "vault-missing",
-      error: `bwrbVault is missing or invalid`,
-    };
-  }
-
-  const json = JSON.stringify(fields);
-
-  try {
-    await bwrb`bwrb edit --path ${escalationPath} --json ${json}`.cwd(vault).quiet();
-    return { ok: true };
-  } catch (e) {
-    const error = formatBwrbShellError(e);
-    const kind = /no notes found in vault/i.test(error) ? "vault-missing" : "bwrb-error";
-    return { ok: false, kind, error };
-  }
-}
-
-export function extractResolutionSection(markdown: string): string | null {
+function extractResolutionSection(markdown: string): string | null {
   const lines = markdown.split(/\r?\n/);
 
   const headerRe = /^##\s+resolution\s*$/i;
@@ -151,16 +36,70 @@ export function extractResolutionSection(markdown: string): string | null {
   return cleaned ? cleaned : null;
 }
 
-export async function readResolutionMessage(notePath: string): Promise<string | null> {
-  const vault = resolveBwrbVault("read escalation");
-  if (!vault) return null;
-  const abs = join(vault, notePath);
+export type PatchResolutionSectionResult = {
+  changed: boolean;
+  markdown: string;
+  reason: "updated" | "already-filled";
+};
 
-  try {
-    const md = await readFile(abs, "utf8");
-    return extractResolutionSection(md);
-  } catch (e: any) {
-    console.warn(`[ralph:escalations] Failed to read escalation note ${notePath}: ${e?.message ?? String(e)}`);
-    return null;
+function splitNonEmptyLines(input: string): string[] {
+  return input
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+}
+
+export function patchResolutionSection(markdown: string, resolutionText: string): PatchResolutionSectionResult {
+  const nextResolution = splitNonEmptyLines(resolutionText).join("\n").trim();
+  if (!nextResolution) {
+    return { changed: false, markdown, reason: "already-filled" };
   }
+
+  const existing = extractResolutionSection(markdown);
+  if (existing) {
+    return { changed: false, markdown, reason: "already-filled" };
+  }
+
+  const lines = markdown.split(/\r?\n/);
+  const headerRe = /^##\s+resolution\s*$/i;
+  const nextHeaderRe = /^##\s+\S/;
+
+  let headerIdx = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (headerRe.test(lines[i] ?? "")) {
+      headerIdx = i;
+      break;
+    }
+  }
+
+  if (headerIdx === -1) {
+    const insert = ["## Resolution", "", ...nextResolution.split("\n"), ""];
+    let insertAt = lines.length;
+    for (let i = 0; i < lines.length; i += 1) {
+      if (/^##\s+next\s+steps\s*$/i.test(lines[i] ?? "")) {
+        insertAt = i;
+        break;
+      }
+    }
+    const updated = [...lines.slice(0, insertAt), ...insert, ...lines.slice(insertAt)].join("\n");
+    return { changed: true, markdown: updated, reason: "updated" };
+  }
+
+  let sectionEnd = lines.length;
+  for (let i = headerIdx + 1; i < lines.length; i += 1) {
+    if (nextHeaderRe.test(lines[i] ?? "")) {
+      sectionEnd = i;
+      break;
+    }
+  }
+
+  const updatedLines = [
+    ...lines.slice(0, headerIdx + 1),
+    "",
+    ...nextResolution.split("\n"),
+    "",
+    ...lines.slice(sectionEnd),
+  ];
+
+  return { changed: true, markdown: updatedLines.join("\n"), reason: "updated" };
 }

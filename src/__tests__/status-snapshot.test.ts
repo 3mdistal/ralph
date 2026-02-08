@@ -6,7 +6,7 @@ describe("buildStatusSnapshot", () => {
   test("normalizes optional blocked/throttled fields", () => {
     const snapshot = buildStatusSnapshot({
       mode: "running",
-      queue: { backend: "bwrb", health: "ok", fallback: false, diagnostics: null },
+      queue: { backend: "github", health: "ok", fallback: false, diagnostics: null },
       daemon: null,
       controlProfile: null,
       activeProfile: null,
@@ -55,8 +55,16 @@ describe("buildStatusSnapshot", () => {
   test("preserves in-progress token fields", () => {
     const snapshot = buildStatusSnapshot({
       mode: "running",
-      queue: { backend: "bwrb", health: "ok", fallback: false, diagnostics: null },
+      desiredMode: " running ",
+      queue: { backend: "github", health: "ok", fallback: false, diagnostics: null },
       daemon: null,
+      daemonLiveness: {
+        state: "missing",
+        mismatch: true,
+        hint: "  mismatch  ",
+        pid: null,
+        daemonId: "  ",
+      },
       controlProfile: null,
       activeProfile: null,
       throttle: { state: "ok" },
@@ -84,5 +92,8 @@ describe("buildStatusSnapshot", () => {
 
     expect(snapshot.inProgress[0]?.tokensTotal).toBe(42);
     expect(snapshot.inProgress[0]?.tokensComplete).toBe(true);
+    expect(snapshot.desiredMode).toBe("running");
+    expect(snapshot.daemonLiveness?.hint).toBe("mismatch");
+    expect(snapshot.daemonLiveness?.daemonId).toBeNull();
   });
 });

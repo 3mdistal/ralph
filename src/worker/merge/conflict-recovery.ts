@@ -16,6 +16,7 @@ import {
   type MergeConflictCommentState,
 } from "../../github/merge-conflict-comment";
 import {
+  buildMergeConflictPostRecoveryFailureReason,
   buildMergeConflictCommentLines,
   buildMergeConflictSignature,
   classifyMergeConflictFailure,
@@ -424,10 +425,13 @@ export async function runMergeConflictRecovery(
   }
 
   if (postRecovery.mergeStateStatus === "DIRTY" || postRecovery.timedOut) {
-    const reason = postRecovery.timedOut
-      ? `Merge-conflict recovery timed out waiting for updated PR state for ${params.prUrl}`
-      : `Merge conflicts remain after recovery attempt for ${params.prUrl}`;
-    const failureClass = postRecovery.timedOut ? "runtime" : "merge-content";
+    const reason = buildMergeConflictPostRecoveryFailureReason({
+      prUrl: params.prUrl,
+      mergeStateStatus: postRecovery.mergeStateStatus,
+      timedOut: postRecovery.timedOut,
+      sessionOutput: sessionResult.output,
+    });
+    const failureClass = classifyMergeConflictFailure({ reason, waitTimedOut: postRecovery.timedOut });
     const retryResult = await finalizeFailedAttempt({ failureClass, reason, retry: true });
     return retryResult;
   }

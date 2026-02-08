@@ -1,4 +1,6 @@
 import type { MergeConflictAttempt } from "./github/merge-conflict-comment";
+import { sanitizeEscalationReason } from "./github/escalation-writeback";
+import { classifyOpencodeFailure } from "./opencode-error-classifier";
 
 export type MergeConflictFailureClass = "merge-content" | "permission" | "tooling" | "runtime";
 export type MergeConflictStopKind = "loop-protection" | "grace-exhausted" | "attempts-exhausted";
@@ -176,6 +178,29 @@ export function formatMergeConflictPaths(paths: string[], maxCount = 8): { total
   };
 }
 
+export function getMergeConflictPermissionReason(sessionOutput: string | null | undefined): string | null {
+  const classification = classifyOpencodeFailure(sessionOutput);
+  if (!classification || classification.blockedSource !== "permission") return null;
+  return classification.reason;
+}
+
+export function buildMergeConflictPostRecoveryFailureReason(params: {
+  prUrl: string;
+  mergeStateStatus: string | null;
+  timedOut: boolean;
+  sessionOutput?: string | null;
+}): string {
+  const permissionReason = getMergeConflictPermissionReason(params.sessionOutput);
+  if (permissionReason) return permissionReason;
+  if (params.timedOut) {
+    return `Merge-conflict recovery timed out waiting for updated PR state for ${params.prUrl}`;
+  }
+  if (params.mergeStateStatus === "DIRTY") {
+    return `Merge conflicts remain after recovery attempt for ${params.prUrl}`;
+  }
+  return `Merge-conflict recovery failed for ${params.prUrl}`;
+}
+
 export function buildMergeConflictCommentLines(params: {
   prUrl: string;
   baseRefName: string | null;
@@ -202,7 +227,7 @@ export function buildMergeConflictCommentLines(params: {
   }
 
   if (params.reason) {
-    lines.push("", `Reason: ${params.reason}`);
+    lines.push("", `Reason: ${sanitizeEscalationReason(params.reason)}`);
   }
 
   lines.push("", `Action: ${params.action}`, `Attempts: ${params.attemptCount}/${params.maxAttempts}`);
@@ -227,7 +252,7 @@ export function buildMergeConflictEscalationDetails(params: {
 
   const lines: string[] = [];
   lines.push("Merge-conflict escalation summary", "", `PR: ${params.prUrl}`, `Base: ${baseName}`, `Head: ${headName}`);
-  lines.push("", "Reason:", params.reason);
+  lines.push("", "Reason:", sanitizeEscalationReason(params.reason));
 
   const latestWithPaths = [...params.attempts].reverse().find((attempt) => attempt.conflictPaths?.length);
   const conflictSample = formatMergeConflictPaths(latestWithPaths?.conflictPaths ?? []);

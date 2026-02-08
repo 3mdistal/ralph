@@ -1,11 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import type { MergeConflictAttempt } from "../github/merge-conflict-comment";
 import {
+  buildMergeConflictPostRecoveryFailureReason,
   buildMergeConflictCommentLines,
   buildMergeConflictEscalationDetails,
   buildMergeConflictSignature,
   classifyMergeConflictFailure,
   computeMergeConflictDecision,
+  getMergeConflictPermissionReason,
 } from "../merge-conflict-recovery";
 
 describe("merge-conflict recovery helpers", () => {
@@ -100,9 +102,31 @@ describe("merge-conflict recovery helpers", () => {
       attemptCount: 1,
       maxAttempts: 2,
       action: "Ralph is resolving conflicts.",
+      reason: "permission requested: external_directory (/tmp/private.patch); auto-rejecting",
     });
     expect(lines.join("\n")).toContain("Action:");
     expect(lines.join("\n")).toContain("Attempts:");
+    expect(lines.join("\n")).toContain("/tmp/[REDACTED]");
+  });
+
+  test("detects permission-denied output", () => {
+    const reason = getMergeConflictPermissionReason(
+      "permission requested: external_directory (/tmp/merge.patch); auto-rejecting"
+    );
+    expect(reason).toContain("blocked:permission");
+    expect(reason).toContain("external_directory");
+  });
+
+  test("post-recovery timeout prefers permission-denied reason", () => {
+    const reason = buildMergeConflictPostRecoveryFailureReason({
+      prUrl: "https://github.com/3mdistal/ralph/pull/1",
+      mergeStateStatus: "CLEAN",
+      timedOut: true,
+      sessionOutput: "permission requested: external_directory (/tmp/merge.patch); auto-rejecting",
+    });
+
+    expect(reason).toContain("blocked:permission");
+    expect(reason).not.toContain("timed out waiting for updated PR state");
   });
 
   test("buildMergeConflictEscalationDetails includes commands and bounded file sample", () => {
