@@ -3,7 +3,9 @@
  * Keep this conservative: only explicit line-start markers.
  */
 export function hasProductGap(output: string): boolean {
-  // This must never match "NO PRODUCT GAP:".
-  const productGapMarker = /^(?!\s*(?:[-*]\s+)?NO\s+PRODUCT\s+GAP\s*:)\s*(?:[-*]\s+)?PRODUCT\s+GAP\s*:/im;
-  return productGapMarker.test(output);
+  const text = String(output ?? "");
+  const noProductGapMarker = /^\s*(?:[-*]\s+)?NO\s+PRODUCT\s+GAP\s*:/im;
+  if (noProductGapMarker.test(text)) return false;
+  const productGapMarker = /^\s*(?:[-*]\s+)?PRODUCT\s+GAP\s*:/im;
+  return productGapMarker.test(text);
 }

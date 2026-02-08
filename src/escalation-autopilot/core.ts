@@ -3,7 +3,10 @@ import { isContractSurfaceReason } from "../escalation";
 import { patchResolutionSection } from "../escalation-notes";
 import { hasProductGap } from "../product-gap";
 import type { EscalationType } from "../github/escalation-constants";
-import type { ConsultantDecision } from "../escalation-consultant/core";
+import {
+  parseConsultantDecisionFromEscalationNote as parseConsultantDecisionFromEscalationNoteShared,
+  type ConsultantDecision,
+} from "../escalation-consultant/core";
 
 export const AUTO_RESOLVE_MAX_ATTEMPTS = 2;
 
@@ -46,41 +49,8 @@ export type LoopBudgetResult = {
   reason: "ok" | "max-attempts";
 };
 
-function parseJsonFenceAfterHeading(noteContent: string, heading: string): Record<string, unknown> | null {
-  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(escapedHeading + "\\s*\\n\\s*```json\\s*\\n([\\s\\S]*?)\\n```", "i");
-  const match = noteContent.match(re);
-  if (!match?.[1]) return null;
-  try {
-    const parsed = JSON.parse(match[1]);
-    if (!parsed || typeof parsed !== "object") return null;
-    return parsed as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function normalizeDecision(raw: Record<string, unknown>): ConsultantDecision {
-  return {
-    schema_version: Number(raw.schema_version) || 0,
-    decision: raw.decision === "auto-resolve" ? "auto-resolve" : "needs-human",
-    confidence: raw.confidence === "high" || raw.confidence === "medium" ? raw.confidence : "low",
-    requires_approval: true,
-    current_state: String(raw.current_state ?? ""),
-    whats_missing: String(raw.whats_missing ?? ""),
-    options: Array.isArray(raw.options) ? raw.options.map((v) => String(v ?? "")) : [],
-    recommendation: String(raw.recommendation ?? ""),
-    questions: Array.isArray(raw.questions) ? raw.questions.map((v) => String(v ?? "")) : [],
-    proposed_resolution_text: String(raw.proposed_resolution_text ?? ""),
-    reason: String(raw.reason ?? ""),
-    followups: [],
-  };
-}
-
 export function parseConsultantDecisionFromEscalationNote(noteContent: string): ConsultantDecision | null {
-  const raw = parseJsonFenceAfterHeading(noteContent, "## Consultant Decision (machine)");
-  if (!raw) return null;
-  return normalizeDecision(raw);
+  return parseConsultantDecisionFromEscalationNoteShared(noteContent);
 }
 
 function parseDependencyBlockedRef(reason: string): string | null {

@@ -22,6 +22,16 @@ describe("hasProductGap", () => {
     expect(hasProductGap("PRODUCT GAP")).toBe(false);
     expect(hasProductGap("Here is the marker: PRODUCT GAP: missing policy")).toBe(false);
   });
+
+  test("NO PRODUCT GAP takes precedence globally", () => {
+    const mixed = [
+      "PRODUCT GAP: docs appear incomplete",
+      "Some extra context",
+      "- NO PRODUCT GAP: clarified by latest comment",
+    ].join("\n");
+
+    expect(hasProductGap(mixed)).toBe(false);
+  });
 });
 
 describe("PR URL selection", () => {

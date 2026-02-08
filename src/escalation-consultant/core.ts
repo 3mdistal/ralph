@@ -107,6 +107,20 @@ function extractDelimitedBlock(text: string, start: string, end: string): string
   return slice ? slice : null;
 }
 
+function extractJsonFenceAfterHeading(noteContent: string, heading: string): Record<string, unknown> | null {
+  const escapedHeading = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(escapedHeading + "\\s*\\n\\s*```json\\s*\\n([\\s\\S]*?)\\n```", "i");
+  const match = noteContent.match(re);
+  if (!match?.[1]) return null;
+  try {
+    const parsed = JSON.parse(match[1]);
+    if (!parsed || typeof parsed !== "object") return null;
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 function normalizeDecision(value: unknown): "auto-resolve" | "needs-human" {
   return value === "auto-resolve" ? "auto-resolve" : "needs-human";
 }
@@ -268,6 +282,12 @@ export function parseConsultantResponse(text: string): ParsedConsultantResponse 
     brief: sanitizeEscalationText(brief, MAX_BRIEF_CHARS),
     decision: normalized,
   };
+}
+
+export function parseConsultantDecisionFromEscalationNote(noteContent: string): ConsultantDecision | null {
+  const raw = extractJsonFenceAfterHeading(noteContent, CONSULTANT_DECISION_HEADING);
+  if (!raw) return null;
+  return normalizeConsultantDecision(raw);
 }
 
 function extractProductConsultation(output: string): string | null {

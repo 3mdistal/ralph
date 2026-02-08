@@ -26,6 +26,7 @@ export type EscalationConsultantSchedulerDeps = {
   editEscalation: (path: string, fields: Record<string, string>) => Promise<EditEscalationResult>;
   getTaskByPath: (taskPath: string) => Promise<AgentTask | null>;
   updateTaskStatus: (task: AgentTask, status: AgentTask["status"], fields?: Record<string, string | number>) => Promise<boolean>;
+  nowIso?: () => string;
   log?: (message: string) => void;
 };
 
@@ -65,9 +66,9 @@ function hasSuppressionMarker(noteContent: string, signature: string): boolean {
   return noteContent.includes(`ralph-autopilot:suppressed signature=${signature} `);
 }
 
-function appendSuppressionMarker(noteContent: string, signature: string, reason: string): string {
+function appendSuppressionMarker(noteContent: string, signature: string, reason: string, nowIso: string): string {
   if (hasSuppressionMarker(noteContent, signature)) return noteContent;
-  const marker = `<!-- ralph-autopilot:suppressed signature=${signature} reason=${reason} at=${new Date().toISOString()} -->`;
+  const marker = `<!-- ralph-autopilot:suppressed signature=${signature} reason=${reason} at=${nowIso} -->`;
   const base = noteContent.endsWith("\n") ? noteContent : `${noteContent}\n`;
   return `${base}\n${marker}\n`;
 }
@@ -98,6 +99,7 @@ function buildInputFromEscalation(params: {
 
 export function createEscalationConsultantScheduler(deps: EscalationConsultantSchedulerDeps) {
   const state: SchedulerState = { inFlight: false };
+  const nowIso = () => deps.nowIso?.() ?? new Date().toISOString();
 
   const tick = async (): Promise<void> => {
     if (state.inFlight) return;
@@ -157,7 +159,7 @@ export function createEscalationConsultantScheduler(deps: EscalationConsultantSc
             noteContent,
           });
           if (!eligibility.eligible) {
-            const suppressed = appendSuppressionMarker(noteContent, signature, eligibility.reason);
+            const suppressed = appendSuppressionMarker(noteContent, signature, eligibility.reason, nowIso());
             if (suppressed !== noteContent) {
               await writeFile(notePath, suppressed, "utf8");
             }
@@ -175,11 +177,11 @@ export function createEscalationConsultantScheduler(deps: EscalationConsultantSc
           const budget = computeLoopBudget({
             ledgerRaw: task["auto-resolve-ledger"],
             signature,
-            nowIso: new Date().toISOString(),
+            nowIso: nowIso(),
             maxAttempts: AUTO_RESOLVE_MAX_ATTEMPTS,
           });
           if (!budget.allowed) {
-            const suppressed = appendSuppressionMarker(noteContent, signature, budget.reason);
+            const suppressed = appendSuppressionMarker(noteContent, signature, budget.reason, nowIso());
             if (suppressed !== noteContent) {
               await writeFile(notePath, suppressed, "utf8");
             }
@@ -197,7 +199,7 @@ export function createEscalationConsultantScheduler(deps: EscalationConsultantSc
 
           const patch = applyAutopilotResolutionPatch(noteContent, decision.proposed_resolution_text);
           if (!patch.changed) {
-            const suppressed = appendSuppressionMarker(noteContent, signature, patch.reason);
+            const suppressed = appendSuppressionMarker(noteContent, signature, patch.reason, nowIso());
             if (suppressed !== noteContent) {
               await writeFile(notePath, suppressed, "utf8");
             }
@@ -215,7 +217,7 @@ export function createEscalationConsultantScheduler(deps: EscalationConsultantSc
 
           await deps.updateTaskStatus(task, task.status, {
             "auto-resolve-ledger": budget.ledgerJson,
-            "auto-resolve-last-at": new Date().toISOString(),
+            "auto-resolve-last-at": nowIso(),
           });
           recordIdempotencyKey({
             key: idempotencyKey,

@@ -37,6 +37,8 @@ describe("escalation autopilot core", () => {
     const parsed = parseConsultantDecisionFromEscalationNote(note);
     expect(parsed?.decision).toBe("auto-resolve");
     expect(parsed?.confidence).toBe("high");
+    expect(parsed?.schema_version).toBe(2);
+    expect(parsed?.options.length).toBeGreaterThanOrEqual(2);
   });
 
   test("eligibility allows watchdog auto-resolve at high confidence", () => {
@@ -65,6 +67,21 @@ describe("escalation autopilot core", () => {
       decision: buildDecision(),
     });
     expect(contract).toEqual({ eligible: false, reason: "contract-surface" });
+  });
+
+  test("eligibility respects NO PRODUCT GAP precedence", () => {
+    const mixed = [
+      "PRODUCT GAP: initial concern",
+      "More notes",
+      "NO PRODUCT GAP: later clarification",
+    ].join("\n");
+    const result = evaluateAutopilotEligibility({
+      escalationType: "watchdog",
+      reason: "tool timed out",
+      noteContent: mixed,
+      decision: buildDecision(),
+    });
+    expect(result).toEqual({ eligible: true });
   });
 
   test("blocked eligibility requires dependency reference", () => {
