@@ -15,8 +15,8 @@ function makeSnapshot(signals: RelationshipSignal[], coverage?: Partial<IssueRel
     issue: { repo: "3mdistal/ralph", number: 10 },
     signals,
     coverage: {
-      githubDepsComplete: true,
-      githubSubIssuesComplete: true,
+      githubDeps: "complete",
+      githubSubIssues: "complete",
       bodyDeps: false,
       ...(coverage ?? {}),
     },
@@ -37,7 +37,7 @@ describe("child completion dossier core", () => {
     const signals: RelationshipSignal[] = [
       { source: "github", kind: "sub_issue", state: "unknown", ref: { repo: "3mdistal/ralph", number: 1 } },
     ];
-    const snapshot = makeSnapshot(signals, { githubSubIssuesComplete: false });
+    const snapshot = makeSnapshot(signals, { githubSubIssues: "partial" });
     const eligibility = evaluateChildCompletionEligibility({ snapshot, signals });
     expect(eligibility.decision).toBe("skip");
   });

@@ -261,7 +261,7 @@ describe("groupByRepo behavior", () => {
   test("groups tasks by repo correctly", () => {
     const tasks = [
       createMockTask({ repo: "3mdistal/ralph", name: "Ralph Task 1" }),
-      createMockTask({ repo: "3mdistal/tooling", name: "Tooling Task 1" }),
+      createMockTask({ repo: "3mdistal/agentlib", name: "Agentlib Task 1" }),
       createMockTask({ repo: "3mdistal/ralph", name: "Ralph Task 2" }),
     ];
 
@@ -274,6 +274,6 @@ describe("groupByRepo behavior", () => {
 
     expect(grouped.size).toBe(2);
     expect(grouped.get("3mdistal/ralph")?.length).toBe(2);
-    expect(grouped.get("3mdistal/tooling")?.length).toBe(1);
+    expect(grouped.get("3mdistal/agentlib")?.length).toBe(1);
   });
 });

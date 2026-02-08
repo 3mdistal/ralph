@@ -121,7 +121,7 @@ export function evaluateChildCompletionEligibility(params: {
   const childSignals = params.signals.filter((signal) => signal.kind === "sub_issue" && signal.ref);
   const childIssues = sortIssues(dedupeIssues(childSignals.map((signal) => signal.ref!).filter(Boolean)));
 
-  if (!params.snapshot.coverage.githubSubIssuesComplete) {
+  if (params.snapshot.coverage.githubSubIssues !== "complete") {
     return { decision: "skip", reason: "sub-issue coverage incomplete", childIssues };
   }
 

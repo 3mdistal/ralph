@@ -1,8 +1,15 @@
 import { $ } from "bun";
+import { sanitizeEscalationText } from "./escalation-consultant/core";
 import type { TaskPriority } from "./queue/priority";
 import type { EscalationType } from "./github/escalation-constants";
+import { hasIdempotencyKey, recordIdempotencyKey } from "./state";
+import { sanitizeNoteName } from "./util/sanitize-note-name";
 import { recordIssueAlert, recordIssueErrorAlert, recordRepoErrorAlert, recordRollupReadyAlert } from "./alerts/service";
 import { parseIssueRef } from "./github/issue-ref";
+
+const sanitizeNoteTitle = sanitizeNoteName;
+
+export type NotificationType = "escalation" | "rollup-ready" | "error" | "task-complete";
 
 export type ErrorNotificationContext = {
   repo?: string | null;
@@ -17,8 +24,13 @@ export type ErrorNotificationContext = {
 
 type ErrorNotificationInput = ErrorNotificationContext | string | null | undefined;
 
+// Cache for terminal-notifier availability check
 let terminalNotifierAvailable: boolean | null = null;
 
+/**
+ * Check if terminal-notifier is installed on the system.
+ * Result is cached for the lifetime of the process.
+ */
 async function isTerminalNotifierAvailable(): Promise<boolean> {
   if (terminalNotifierAvailable !== null) {
     return terminalNotifierAvailable;
@@ -27,13 +39,19 @@ async function isTerminalNotifierAvailable(): Promise<boolean> {
   try {
     await $`which terminal-notifier`.quiet();
     terminalNotifierAvailable = true;
+    console.log("[ralph:notify] terminal-notifier is available");
   } catch {
     terminalNotifierAvailable = false;
+    console.log("[ralph:notify] terminal-notifier not found, desktop notifications disabled");
   }
 
   return terminalNotifierAvailable;
 }
 
+/**
+ * Send a desktop notification using terminal-notifier (macOS).
+ * Falls back silently if terminal-notifier is not installed.
+ */
 async function sendDesktopNotification(opts: {
   title: string;
   subtitle?: string;
@@ -46,25 +64,79 @@ async function sendDesktopNotification(opts: {
   }
 
   try {
-    const args: string[] = ["-title", opts.title, "-message", opts.message];
-    if (opts.subtitle) args.push("-subtitle", opts.subtitle);
-    if (opts.openUrl) args.push("-open", opts.openUrl);
-    if (opts.sound) args.push("-sound", opts.sound);
+    const args: string[] = [
+      "-title", opts.title,
+      "-message", opts.message,
+    ];
+
+    if (opts.subtitle) {
+      args.push("-subtitle", opts.subtitle);
+    }
+
+    if (opts.openUrl) {
+      args.push("-open", opts.openUrl);
+    }
+
+    if (opts.sound) {
+      args.push("-sound", opts.sound);
+    }
+
     await $`terminal-notifier ${args}`.quiet();
     return true;
-  } catch {
+  } catch (e) {
+    console.warn("[ralph:notify] Failed to send desktop notification:", e);
     return false;
   }
 }
 
+function getNotificationPrefix(type: NotificationType): string {
+  switch (type) {
+    case "escalation":
+      return "[ESCALATION]";
+    case "rollup-ready":
+      return "[ROLLUP READY]";
+    case "error":
+      return "[ERROR]";
+    case "task-complete":
+      return "[COMPLETE]";
+    default:
+      return "[RALPH]";
+  }
+}
+
+/**
+ * Persist notification surfaces outside note files.
+ */
+async function createNotification(
+  type: NotificationType,
+  title: string,
+  body: string,
+  relatedTask?: string
+): Promise<boolean> {
+  const prefix = getNotificationPrefix(type);
+
+  const label = sanitizeNoteTitle(`${prefix} ${title}`);
+  const related = relatedTask ? ` task=${relatedTask}` : "";
+  const firstLine = body.split(/\r?\n/, 1)[0] ?? "";
+  const preview = firstLine.slice(0, 200);
+  console.log(`[ralph:notify] ${label}${related}${preview ? ` :: ${preview}` : ""}`);
+  return true;
+}
+
 export interface EscalationContext {
+  /** The display name of the task (from frontmatter `name` field) */
   taskName: string;
+  /** Legacy task file identifier (best-effort; optional). */
   taskFileName: string;
+  /** Stable task reference/path (best-effort; optional). */
   taskPath: string;
   issue: string;
   repo: string;
+  /** The original task scope (if known) */
   scope?: string;
+  /** The original task priority (if known) */
   priority?: TaskPriority;
+  /** OpenCode session ID (for resuming after resolution) */
   sessionId?: string;
   reason: string;
   escalationType: EscalationType;
@@ -83,29 +155,175 @@ export interface EscalationContext {
   };
 }
 
+/**
+ * Extract the @product consultation section from agent output.
+ * Looks for patterns like "**Product context (@product)**" followed by content.
+ */
+function extractProductConsultation(output: string): string | null {
+  // Look for product agent output patterns - capture until next ## heading or end
+  const patterns = [
+    // ## Product Review section
+    /## Product Review\s*\n([\s\S]*?)(?=\n##|$)/i,
+    // **Product context (@product)** followed by content until next ## or routing decision
+    /\*\*Product[^*]*\*\*[:\s]*([\s\S]*?)(?=\n##|\n\*\*Routing|\{"decision"|$)/i,
+    // @product subagent output
+    /@product[^:]*:\s*([\s\S]*?)(?=\n##|\n@|$)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = output.match(pattern);
+    if (match && match[1]?.trim()) {
+      return match[1].trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract implementation plan summary from agent output.
+ */
+function extractPlanSummary(output: string): string | null {
+  const patterns = [
+    // ## Implementation Plan section - capture content after heading
+    /## Implementation Plan\s*\n([\s\S]*?)(?=\n##|$)/i,
+    // ## Plan section
+    /## Plan\s*\n([\s\S]*?)(?=\n##|$)/i,
+    // **Plan** inline format
+    /\*\*Plan[^*]*\*\*[:\s]*([\s\S]*?)(?=\n##|\n\*\*Routing|\{"decision"|$)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = output.match(pattern);
+    if (match && match[1]?.trim()) {
+      return match[1].trim();
+    }
+  }
+  return null;
+}
+
+function sanitizeDiagnostics(text: string): string {
+  return sanitizeEscalationText(text, 20000);
+}
+
 export async function notifyEscalation(ctx: EscalationContext): Promise<boolean> {
-  const issueRef = parseIssueRef(ctx.issue, ctx.repo);
-  if (issueRef) {
-    try {
-      await recordIssueAlert({
-        repo: issueRef.repo,
-        issueNumber: issueRef.number,
-        taskName: ctx.taskName,
-        kind: "error",
-        fingerprintSeed: `escalation:${ctx.escalationType}:${ctx.reason}`,
-        summary: `Escalation: ${ctx.reason}`,
-        details: ctx.planOutput ?? null,
-      });
-    } catch (error: any) {
-      console.warn(`[ralph:notify] Failed to record escalation alert: ${error?.message ?? String(error)}`);
+  const shortIssue = ctx.issue.split("/").pop() || ctx.issue;
+
+  const idempotencyKey = [
+    "notifyEscalation",
+    ctx.issue,
+    ctx.taskPath,
+    ctx.sessionId ?? "",
+    ctx.escalationType,
+  ].join(":");
+
+  try {
+    if (hasIdempotencyKey(idempotencyKey)) {
+      console.warn(`[ralph:notify] Escalation already recorded (idempotency); skipping duplicate: ${idempotencyKey}`);
+      return true;
+    }
+  } catch {
+    // best-effort
+  }
+
+  const bodyParts: string[] = [
+    `## Escalation Summary`,
+    "",
+    `Task **${ctx.taskName}** requires your attention.`,
+    "",
+    `| Field | Value |`,
+    `|-------|-------|`,
+    `| Issue | ${ctx.issue} |`,
+    ...(ctx.githubCommentUrl ? [`| GitHub Comment | ${ctx.githubCommentUrl} |`] : []),
+    `| Repo | ${ctx.repo} |`,
+    `| Type | ${ctx.escalationType} |`,
+    `| Reason | ${ctx.reason} |`,
+    "",
+  ];
+
+  // Add routing decision if available
+  if (ctx.routing) {
+    bodyParts.push(
+      `## Routing Decision`,
+      "",
+      `- **Decision:** ${ctx.routing.decision}`,
+      ctx.routing.confidence ? `- **Confidence:** ${ctx.routing.confidence}` : "",
+      ctx.routing.plan_summary ? `- **Plan Summary:** ${ctx.routing.plan_summary}` : "",
+      ""
+    );
+  }
+
+  // Add devex consultation if provided
+  if (ctx.devex?.consulted) {
+    bodyParts.push(
+      `## Devex Consult`,
+      "",
+      ctx.devex.sessionId ? `- **Session:** ${ctx.devex.sessionId}` : "",
+      ctx.devex.summary ? ctx.devex.summary : "(Devex consulted; no summary captured)",
+      ""
+    );
+  }
+
+  // Add product consultation if found in output
+  if (ctx.planOutput) {
+    const productSection = extractProductConsultation(ctx.planOutput);
+    if (productSection) {
+      bodyParts.push(`## Product Review`, "", productSection, "");
+    }
+
+    const planSection = extractPlanSummary(ctx.planOutput);
+    if (planSection) {
+      bodyParts.push(`## Implementation Plan`, "", planSection, "");
+    }
+
+    // Always include bounded diagnostics to make escalations actionable.
+    const diagnostics = sanitizeDiagnostics(ctx.planOutput).trim();
+    if (diagnostics) {
+      bodyParts.push(
+        `## Diagnostics`,
+        "",
+        "```",
+        diagnostics.slice(0, 20000).trimEnd(),
+        "```",
+        ""
+      );
     }
   }
 
-  const issueUrl = ctx.githubCommentUrl ?? (issueRef ? `https://github.com/${issueRef.repo}/issues/${issueRef.number}` : undefined);
+  // Add action items
+  bodyParts.push(
+    `## Next Steps`,
+    "",
+    `1. Review the escalation reason and product context above`,
+    `2. Update product documentation if there's a gap`,
+    `3. Clarify requirements on the GitHub issue if needed`,
+    `4. Add the human guidance under the ## Resolution section above`,
+    `5. Mark this escalation note's status as resolved`,
+    `6. Ralph will resume the existing OpenCode session using the resolution text (or fall back to a fresh run if resume fails)`,
+    "",
+    `*Generated by Ralph Loop at ${new Date().toISOString()}*`
+  );
+
+  const noteBody = bodyParts.filter(Boolean).join("\n");
+  await createNotification("escalation", `Escalation for ${shortIssue}`, noteBody, ctx.taskName);
+
+  try {
+    recordIdempotencyKey({
+      key: idempotencyKey,
+      scope: "notifyEscalation",
+      payloadJson: JSON.stringify({ issue: ctx.issue, taskPath: ctx.taskPath, sessionId: ctx.sessionId ?? "" }),
+    });
+  } catch {
+    // best-effort
+  }
+
+  const issueUrl = ctx.issue.includes("github.com")
+    ? ctx.issue
+    : `https://github.com/${ctx.issue.replace("#", "/issues/")}`;
+
   await sendDesktopNotification({
     title: "Ralph: Escalation",
     subtitle: ctx.escalationType,
-    message: `${ctx.taskName.slice(0, 80)}: ${ctx.reason.slice(0, 100)}`,
+    message: `${shortIssue} needs attention: ${ctx.reason.slice(0, 100)}`,
     openUrl: issueUrl,
     sound: "Ping",
   });
@@ -127,6 +345,23 @@ export async function notifyRollupReady(repo: string, prUrl: string, mergedPRs: 
   } catch (error: any) {
     console.warn(`[ralph:notify] Failed to record rollup-ready alert for ${repo}: ${error?.message ?? String(error)}`);
   }
+
+  if (!prNumber || !Number.isFinite(prNumber)) {
+    console.warn(`[ralph:notify] Unable to parse rollup PR number from ${prUrl}`);
+  }
+
+  const body = [
+    `A rollup PR is ready for review in **${repo}**.`,
+    "",
+    `**Rollup PR:** ${prUrl}`,
+    "",
+    `**Included PRs (${mergedPRs.length}):**`,
+    ...mergedPRs.map((pr) => `- ${pr}`),
+    "",
+    "Please review and merge to main when ready.",
+  ].join("\n");
+
+  await createNotification("rollup-ready", `Rollup for ${repo}`, body);
 
   await sendDesktopNotification({
     title: "Ralph: Rollup Ready",
@@ -166,9 +401,9 @@ export async function notifyError(context: string, error: string, input?: ErrorN
           error,
         });
       }
-    } catch (recordError: any) {
+    } catch (error: any) {
       console.warn(
-        `[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${recordError?.message ?? String(recordError)}`
+        `[ralph:notify] Failed to record alert for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
       );
     }
   } else if (normalizedInput?.repo) {
@@ -179,9 +414,27 @@ export async function notifyError(context: string, error: string, input?: ErrorN
         error,
       });
     } catch (recordError: any) {
-      console.warn(`[ralph:notify] Failed to record repo alert for ${normalizedInput.repo}: ${recordError?.message ?? String(recordError)}`);
+      console.warn(
+        `[ralph:notify] Failed to record repo alert for ${normalizedInput.repo}: ${recordError?.message ?? String(recordError)}`
+      );
     }
+  } else if (normalizedInput?.issue) {
+    console.warn(`[ralph:notify] Unable to resolve issue ref for alert (issue=${normalizedInput?.issue ?? ""})`);
   }
+
+  const body = [
+    `An error occurred during: **${context}**`,
+    "",
+    "```",
+    error,
+    "```",
+    "",
+    taskName ? `Task: [[${taskName}]]` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  await createNotification("error", `Error: ${context}`, body, taskName);
 
   await sendDesktopNotification({
     title: "Ralph: Error",
@@ -191,7 +444,11 @@ export async function notifyError(context: string, error: string, input?: ErrorN
   });
 }
 
-export async function notifyTaskComplete(taskName: string, repo: string, prUrl?: string): Promise<void> {
+export async function notifyTaskComplete(
+  taskName: string,
+  repo: string,
+  prUrl?: string
+): Promise<void> {
   await sendDesktopNotification({
     title: "Ralph: Task Complete",
     subtitle: repo,

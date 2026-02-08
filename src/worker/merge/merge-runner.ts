@@ -125,6 +125,7 @@ export async function mergePrWithRequiredChecks(params: {
 
   updatePullRequestBranch: (prUrl: string, cwd: string) => Promise<void>;
   formatGhError: (error: unknown) => string;
+  isAuthError: (error: unknown) => boolean;
 
   mergePullRequest: (prUrl: string, headSha: string, cwd: string) => Promise<void>;
   recordPrSnapshotBestEffort: (input: { issue: string; prUrl: string; state: string }) => void;
@@ -197,7 +198,73 @@ export async function mergePrWithRequiredChecks(params: {
   const isCiIssue = isCiRelatedIssue(params.issueMeta.labels ?? []);
   const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
 
-  const baseBranch = await params.getPullRequestBaseBranch(prUrl);
+  const blockOnAuthFailure = async (error: unknown, context: string) => {
+    const reason = `Blocked: GitHub auth failed (${context})`;
+    const details = params.formatGhError(error);
+    await params.markTaskBlocked(params.task, "auth", { reason, details, sessionId });
+    return {
+      ok: false as const,
+      run: {
+        taskName: params.task.name,
+        repo: params.repo,
+        outcome: "failed" as const,
+        pr: prUrl ?? undefined,
+        sessionId,
+        escalationReason: reason,
+      },
+    };
+  };
+
+  let baseBranch: string | null = null;
+  try {
+    baseBranch = await params.getPullRequestBaseBranch(prUrl);
+  } catch (error: any) {
+    if (params.isAuthError(error)) return await blockOnAuthFailure(error, "reading PR base branch");
+
+    const completed = new Date();
+    const completedAt = completed.toISOString().split("T")[0];
+    const details = params.formatGhError(error);
+    const reason = "Blocked: Ralph could not verify the PR base branch before merge.";
+
+    await params.createAgentRun(params.task, {
+      outcome: "failed",
+      started: completed,
+      completed,
+      sessionId,
+      bodyPrefix: [
+        reason,
+        "",
+        `Issue: ${params.task.issue}`,
+        `PR: ${prUrl}`,
+        details ? `Details: ${details}` : "Details: unknown",
+      ].join("\n"),
+    });
+
+    await params.markTaskBlocked(params.task, "merge-target", {
+      reason,
+      details,
+      skipRunNote: true,
+      extraFields: {
+        "completed-at": completedAt,
+        "session-id": "",
+        "watchdog-retries": "",
+        "stall-retries": "",
+        ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+      },
+    });
+
+    return {
+      ok: false,
+      run: {
+        taskName: params.task.name,
+        repo: params.repo,
+        outcome: "failed",
+        pr: prUrl ?? undefined,
+        sessionId,
+        escalationReason: reason,
+      },
+    };
+  }
   if (!params.isMainMergeAllowed(baseBranch, params.botBranch, params.issueMeta.labels ?? [])) {
     const completed = new Date();
     const completedAt = completed.toISOString().split("T")[0];
@@ -307,6 +374,9 @@ export async function mergePrWithRequiredChecks(params: {
         headRef: prStatus.headSha,
       });
     } catch (error: any) {
+      if (params.isAuthError(error)) {
+        return await blockOnAuthFailure(error, "preparing review diff artifacts");
+      }
       const reason = `Review gate skipped: could not prepare diff artifacts (${error?.message ?? String(error)})`;
       warn(`[ralph:worker:${params.repo}] ${reason}`);
       recordReviewGateSkipped({ runId: reviewRunId, gate: "product_review", reason });
@@ -341,7 +411,7 @@ export async function mergePrWithRequiredChecks(params: {
           }),
         runRepairAgent: (prompt, continueSessionId) =>
           params.runReviewAgent({
-            agent: "ralph-plan",
+            agent,
             prompt,
             cacheKey: `review-${params.cacheKey}-${agent}-repair`,
             stage: `${stage} marker repair`,
@@ -467,27 +537,31 @@ export async function mergePrWithRequiredChecks(params: {
           return await recurse({ prUrl, sessionId });
         }
 
-        const reason = `Merge blocked: required checks not green for ${prUrl}`;
-        const details = [
-          formatRequiredChecksForHumans(summary),
-          "",
-          "Merge attempt would be rejected by branch protection.",
-        ].join("\n");
-        await params.markTaskBlocked(params.task, "ci-failure", { reason, details, sessionId });
-        return {
-          ok: false,
-          run: {
-            taskName: params.task.name,
-            repo: params.repo,
-            outcome: "failed",
-            sessionId,
-            escalationReason: reason,
-          },
-        };
+        log(`[ralph:worker:${params.repo}] Required checks failing at merge time; entering CI remediation for ${prUrl}`);
+        const ciDebug = await params.runCiFailureTriage({
+          task: params.task,
+          issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+          cacheKey: params.cacheKey,
+          prUrl,
+          requiredChecks: REQUIRED_CHECKS,
+          issueMeta: params.issueMeta,
+          botBranch: params.botBranch,
+          timedOut: false,
+          repoPath: params.repoPath,
+          sessionId,
+          opencodeXdg: params.opencodeXdg,
+          opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
+        });
+        if (ciDebug.status !== "success") return { ok: false, run: ciDebug.run };
+        sessionId = ciDebug.sessionId || sessionId;
+        return await mergeWhenReady(ciDebug.headSha);
       }
 
       headSha = status.headSha;
     } catch (error: any) {
+      if (params.isAuthError(error)) {
+        return await blockOnAuthFailure(error, "pre-merge guard (reading PR checks/state)");
+      }
       warn(`[ralph:worker:${params.repo}] Pre-merge guard failed (continuing): ${params.formatGhError(error)}`);
     }
 
