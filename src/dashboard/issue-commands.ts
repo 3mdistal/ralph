@@ -10,7 +10,7 @@ import { normalizePriorityInputToRalphPriorityLabel, planRalphPriorityLabelSet }
 import type { GitHubClient } from "../github/client";
 import { ControlPlaneHttpError } from "./control-plane-errors";
 
-export const ISSUE_COMMANDS = ["queue", "pause", "stop", "satisfy"] as const;
+const ISSUE_COMMANDS = ["queue", "pause", "stop", "satisfy"] as const;
 export type IssueCommandName = (typeof ISSUE_COMMANDS)[number];
 
 const ISSUE_COMMAND_LABEL_BY_NAME: Record<IssueCommandName, string> = {
