@@ -4,7 +4,7 @@ Status: archived
 Owner: @3mdistal
 Last updated: 2026-02-01
 
-**Status:** draft (copied from bwrb idea)
+**Status:** draft (copied from legacy note)
 **Owner:** @3mdistal
 **Last updated:** 2026-01-10
 **Related:** `docs/product/vision.md`, `docs/product/dashboard-mvp-control-plane-tui.md`
@@ -42,7 +42,7 @@ Escalations are HITL checkpoints and should behave like paused/resumable runs.
 
 **Contract (MVP)**
 - The created `agent-escalation` note must include frontmatter fields:
-  - `task-path`: the exact bwrb `_path` of the `agent-task` note to resume
+  - `task-path`: the exact task identifier path of the active task to resume
   - `session-id`: the OpenCode `ses_*` identifier to continue
 - The escalation note body must include a section headed exactly `## Resolution`.
   - Operators write the human guidance under this heading.
@@ -93,7 +93,7 @@ Use the same list described in the existing idea note `reflections/ideas/Ralph D
 - Must work on macOS and Linux/NixOS.
 - Prefer XDG paths where possible (target state). Current implementation:
   - Config: `~/.ralph/config.toml` > `~/.ralph/config.json` > legacy `~/.config/opencode/ralph/ralph.json`
-  - Queue backend: GitHub-first by default; set `queueBackend = "bwrb"` for legacy or `"none"` to disable queue
+  - Queue backend: GitHub-first by default; set `queueBackend = "none"` to disable queue
   - State/logs: `~/.ralph/...` (overridable via `RALPH_SESSIONS_DIR` / `RALPH_WORKTREES_DIR`)
   - Caches: TBD
 - Avoid macOS-only supervisors (launchd) in the core protocol. Supervisors can exist, but they shouldn’t be required.

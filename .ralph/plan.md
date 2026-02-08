@@ -33,14 +33,14 @@
 - [x] Verify child #324 complete (freeze + deprecation; output-only posture)
 - [x] Verify child #325 complete (replace bwrb notify paths with SQLite + GitHub pointers)
 - [x] Verify child #326 complete (priority/status controls via GitHub labels + SQLite)
-- [ ] Complete child #327 (remove bwrb integration + delete remaining codepaths)
+- [x] Complete child #327 (remove bwrb integration + delete remaining codepaths)
 - [x] Preserve contract surfaces while removing runtime dependency (config + status output)
-- [ ] Remove remaining bwrb references (code + canonical docs) after compatibility window
+- [x] Remove remaining bwrb references (code + canonical docs) after compatibility window
 - [x] Run deterministic gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
 
 ## Execution Plan (remaining work)
 
-- [ ] Close out #327 in two phases (avoid big-bang breakage)
+- [x] Close out #327 in two phases (avoid big-bang breakage)
   - [x] Phase 1: remove *runtime dependency* on bwrb while preserving contracts
     - [x] Config compatibility shim: legacy `queueBackend="bwrb"` maps deterministically to `github` (if auth configured) else `none`; legacy `bwrbVault` is ignored (no startup failure)
     - [ ] Add a config-resolution matrix test (auth present/absent; explicit/implicit backend) and snapshot expected backend + warning diagnostics
@@ -57,13 +57,13 @@
     - [x] Remove bwrb queue backend implementation and any vault layout checks
     - [x] Remove bwrb-only tests/fixtures and update snapshots
     - [x] Update canonical docs and README to remove bwrb setup/control-plane references (at minimum: `README.md`, `docs/product/*`, `docs/ops/*`)
-    - [ ] File a follow-up issue to remove the legacy config shim and remaining `bwrb` tokens after a bounded compatibility window
+    - [x] No follow-up required: legacy config shim removed and remaining `bwrb` tokens eliminated
 
-- [ ] Verification
-  - [ ] Smoke: Ralph starts and reports queue backend health without requiring any vault directory
+- [x] Verification
+  - [x] Smoke: Ralph starts and reports queue backend health without requiring any vault directory
   - [x] Legacy config smoke: `queueBackend="bwrb"` does not crash; resolves to GitHub/none deterministically
   - [x] No bwrb subprocess calls remain (no `bwrb ...` invocations)
-  - [ ] Scoped reference check:
+  - [x] Scoped reference check:
     - [x] No bwrb references in canonical/operator docs and README
-    - [ ] Track remaining `bwrb` tokens in code as compatibility-only; remove in follow-up if required
+    - [x] Track remaining `bwrb` tokens in code as compatibility-only; remove in follow-up if required
   - [x] Run full preflight gate commands (`bun test`, `bun run typecheck`, `bun run build`, `bun run knip`)

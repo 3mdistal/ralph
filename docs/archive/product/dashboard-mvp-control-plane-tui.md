@@ -4,7 +4,7 @@ Status: archived
 Owner: @3mdistal
 Last updated: 2026-02-01
 
-**Status:** draft (copied from bwrb idea)
+**Status:** draft (copied from legacy note)
 **Owner:** @3mdistal
 **Last updated:** 2026-01-10
 **Related:** `docs/product/vision.md`, `docs/product/graceful-drain-rolling-restart.md`
@@ -36,7 +36,7 @@ This control plane (operator dashboard) is **operator tooling**, not a user-faci
 - **Grouped streams:** logs grouped by **workerId** (not just repo) and optionally by `sessionId`.
 - **Stepwise pause:** pause at safe checkpoints; resume on demand.
 - **Steering:** send a message into a session (queued or interrupt).
-- **Task controls:** reprioritize by editing bwrb note fields (priority), plus basic status transitions (bwrb-only during GitHub-first migration).
+- **Task controls:** reprioritize via GitHub labels + status transitions.
 - **Security:** token auth from day 1; bind localhost by default.
 - **Remote-ready:** no built-in TLS; BYO tunnel/proxy.
 
@@ -44,8 +44,8 @@ This control plane (operator dashboard) is **operator tooling**, not a user-faci
 
 - No first-party TLS / ACME / user management.
 - No perfect semantic understanding of agent intent.
-- No full-featured kanban editor for arbitrary bwrb schema (we can grow toward that later).
-- No GitHub-first task editing in the MVP (queue controls remain bwrb-only until GitHub queue support ships).
+- No full-featured kanban editor for arbitrary task schemas (we can grow toward that later).
+- No rich task editing in the MVP beyond labels/status transitions.
 
 ## Design Principles
 
@@ -75,7 +75,7 @@ This control plane (operator dashboard) is **operator tooling**, not a user-faci
 - `p` pause/resume (stepwise)
 - `m` enqueue message (deliver at next checkpoint)
 - `i` interrupt + message (abort then send; requires OpenCode server)
-- `r` reprioritize selected task (bwrb priority)
+- `r` reprioritize selected task (label-based priority)
 - `/` filter workers/tasks
 
 ## Core Architecture
@@ -94,7 +94,7 @@ This control plane (operator dashboard) is **operator tooling**, not a user-faci
 
 ### Data model: IDs
 
-- `taskId`: use bwrb `_path` (titles aren’t globally unique). GitHub tasks will need a separate identifier once the GitHub backend lands.
+- `taskId`: use stable issue references (`owner/repo#number`).
 - `sessionId`: OpenCode session identifier.
 - `workerId`: stable identity for one concurrent worker instance.
 
@@ -152,7 +152,7 @@ No TLS in Ralph.
 - `POST /v1/commands/message/interrupt`
   - `{ workerId | sessionId, text }` (requires OpenCode server APIs)
 - `POST /v1/commands/task/priority`
-  - `{ taskId, priority }` (writes via `bwrb edit --path`)
+  - `{ taskId, priority }` (writes via GitHub label mutations)
 
 Optional (nice-to-have in MVP):
 - `POST /v1/commands/task/status` `{ taskId, status }`
@@ -169,8 +169,8 @@ All events are JSON objects with:
   "type": "worker.checkpoint.reached",
   "level": "info",
   "runId": "run_abc123",
-  "workerId": "3mdistal/bwrb#orchestration/tasks/...",
-  "repo": "3mdistal/bwrb",
+  "workerId": "3mdistal/ralph#123",
+  "repo": "3mdistal/ralph",
   "taskId": "orchestration/tasks/...",
   "sessionId": "ses_abc123",
   "data": { "checkpoint": "pr_ready" }
@@ -407,10 +407,10 @@ Implementation issues:
 - https://github.com/3mdistal/ralph/issues/34 — Control plane server (state + events + auth)
 - https://github.com/3mdistal/ralph/issues/35 — Checkpoints + stepwise pause/resume
 - https://github.com/3mdistal/ralph/issues/36 — Message queue + deliver at checkpoint
-- https://github.com/3mdistal/ralph/issues/37 — bwrb edit endpoints (priority/status)
+- https://github.com/3mdistal/ralph/issues/37 — task edit endpoints (priority/status)
 - https://github.com/3mdistal/ralph/issues/38 — TUI client MVP (workers list + logs tabs)
 - https://github.com/3mdistal/ralph/issues/39 — TUI controls (pause/resume + enqueue message)
-- https://github.com/3mdistal/ralph/issues/40 — TUI task controls (reprioritize via bwrb)
+- https://github.com/3mdistal/ralph/issues/40 — TUI task controls (reprioritize via labels)
 - https://github.com/3mdistal/ralph/issues/41 — Activity classifier (heuristics)
 - https://github.com/3mdistal/ralph/issues/42 — OpenCode server client (SSE + prompt_async)
 - https://github.com/3mdistal/ralph/issues/43 — Interrupt messaging (abort + prompt_async)
@@ -424,6 +424,6 @@ Implementation issues:
 4. Activity classifier (heuristic)
 5. TUI client MVP (connect, render workers, render logs)
 6. Commands: pause/resume + message enqueue
-7. Commands: bwrb priority edit
+7. Commands: priority label edit
 8. OpenCode server integration (prompt_async + abort)
 9. Optional: summaries + stall pause policy

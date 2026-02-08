@@ -15,7 +15,7 @@ Migration policy for `state.sqlite`: see `docs/ops/state-sqlite.md`.
 - GitHub Issues are authoritative for: queue state, dependency graph, and completion status.
 - SQLite is authoritative for: session IDs, worktree paths, heartbeat/ownership, retry counters,
   and last-sync cursors. These do not round-trip to GitHub.
-- bwrb notes (if present) are optional audit artifacts, not the queue source of truth.
+- Legacy note artifacts (if present) are optional audit artifacts, not the queue source of truth.
 
 ## Ralph-managed labels
 
