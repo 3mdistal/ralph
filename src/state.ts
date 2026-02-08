@@ -3189,6 +3189,130 @@ export type RalphRunSummary = {
   triageFlags: string[];
 };
 
+export type RalphRunStepMetric = {
+  runId: string;
+  stepTitle: string;
+  wallTimeMs: number | null;
+  toolCallCount: number;
+  toolTimeMs: number | null;
+  anomalyCount: number;
+  tokensTotal: number | null;
+  quality: string;
+};
+
+export function listRalphRunStepMetrics(runId: string): RalphRunStepMetric[] {
+  const trimmed = runId?.trim();
+  if (!trimmed) return [];
+
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT
+         run_id as run_id,
+         step_title as step_title,
+         wall_time_ms as wall_time_ms,
+         tool_call_count as tool_call_count,
+         tool_time_ms as tool_time_ms,
+         anomaly_count as anomaly_count,
+         tokens_total as tokens_total,
+         quality as quality
+       FROM ralph_run_step_metrics
+       WHERE run_id = $run_id
+       ORDER BY step_title ASC`
+    )
+    .all({ $run_id: trimmed }) as Array<{
+    run_id?: string;
+    step_title?: string;
+    wall_time_ms?: number | null;
+    tool_call_count?: number | null;
+    tool_time_ms?: number | null;
+    anomaly_count?: number | null;
+    tokens_total?: number | null;
+    quality?: string | null;
+  }>;
+
+  return rows
+    .map((row) => {
+      const runId = row.run_id ?? "";
+      const stepTitle = row.step_title ?? "";
+      if (!runId || !stepTitle) return null;
+      return {
+        runId,
+        stepTitle,
+        wallTimeMs: typeof row.wall_time_ms === "number" ? row.wall_time_ms : null,
+        toolCallCount: typeof row.tool_call_count === "number" ? row.tool_call_count : 0,
+        toolTimeMs: typeof row.tool_time_ms === "number" ? row.tool_time_ms : null,
+        anomalyCount: typeof row.anomaly_count === "number" ? row.anomaly_count : 0,
+        tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+        quality: typeof row.quality === "string" && row.quality ? row.quality : "missing",
+      } satisfies RalphRunStepMetric;
+    })
+    .filter((row): row is RalphRunStepMetric => Boolean(row));
+}
+
+export function listRalphRunStepMetricsByRunIds(runIds: string[]): Map<string, RalphRunStepMetric[]> {
+  const deduped = Array.from(new Set(runIds.map((id) => id.trim()).filter(Boolean)));
+  if (deduped.length === 0) return new Map();
+
+  const database = requireDb();
+  const params: Record<string, string> = {};
+  const placeholders = deduped.map((runId, idx) => {
+    const key = `$run_id_${idx}`;
+    params[key] = runId;
+    return key;
+  });
+
+  const rows = database
+    .query(
+      `SELECT
+         run_id as run_id,
+         step_title as step_title,
+         wall_time_ms as wall_time_ms,
+         tool_call_count as tool_call_count,
+         tool_time_ms as tool_time_ms,
+         anomaly_count as anomaly_count,
+         tokens_total as tokens_total,
+         quality as quality
+       FROM ralph_run_step_metrics
+       WHERE run_id IN (${placeholders.join(", ")})
+       ORDER BY run_id ASC, step_title ASC`
+    )
+    .all(params) as Array<{
+    run_id?: string;
+    step_title?: string;
+    wall_time_ms?: number | null;
+    tool_call_count?: number | null;
+    tool_time_ms?: number | null;
+    anomaly_count?: number | null;
+    tokens_total?: number | null;
+    quality?: string | null;
+  }>;
+
+  const byRun = new Map<string, RalphRunStepMetric[]>();
+  for (const row of rows) {
+    const runId = row.run_id ?? "";
+    const stepTitle = row.step_title ?? "";
+    if (!runId || !stepTitle) continue;
+
+    const entry: RalphRunStepMetric = {
+      runId,
+      stepTitle,
+      wallTimeMs: typeof row.wall_time_ms === "number" ? row.wall_time_ms : null,
+      toolCallCount: typeof row.tool_call_count === "number" ? row.tool_call_count : 0,
+      toolTimeMs: typeof row.tool_time_ms === "number" ? row.tool_time_ms : null,
+      anomalyCount: typeof row.anomaly_count === "number" ? row.anomaly_count : 0,
+      tokensTotal: typeof row.tokens_total === "number" ? row.tokens_total : null,
+      quality: typeof row.quality === "string" && row.quality ? row.quality : "missing",
+    };
+
+    const list = byRun.get(runId);
+    if (list) list.push(entry);
+    else byRun.set(runId, [entry]);
+  }
+
+  return byRun;
+}
+
 export function listRalphRunsTop(params?: {
   limit?: number;
   sinceIso?: string | null;
