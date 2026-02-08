@@ -126,9 +126,9 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
-  test("statusToRalphLabelDelta preserves queued when blocked", () => {
+  test("statusToRalphLabelDelta maps blocked to in-progress from queued", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
-    expect(delta).toEqual({ add: [], remove: [] });
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
   test("statusToRalphLabelDelta preserves in-progress when blocked", () => {
@@ -152,6 +152,23 @@ describe("github queue core", () => {
       add: [],
       remove: ["ralph:status:queued"],
     });
+  });
+
+  test("statusToRalphLabelDelta maps blocked to in-progress when no status label exists", () => {
+    const delta = statusToRalphLabelDelta("blocked", ["bug"]);
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: [] });
+  });
+
+  test("statusToRalphLabelDelta supports blocked to queued round-trip", () => {
+    const blockedDelta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
+    const blockedLabels = applyDelta(["ralph:status:queued"], blockedDelta);
+    expect(blockedLabels).toContain("ralph:status:in-progress");
+    expect(blockedLabels).not.toContain("ralph:status:queued");
+
+    const queuedDelta = statusToRalphLabelDelta("queued", blockedLabels);
+    const queuedLabels = applyDelta(blockedLabels, queuedDelta);
+    expect(queuedLabels).toContain("ralph:status:queued");
+    expect(queuedLabels).not.toContain("ralph:status:in-progress");
   });
 
   test("statusToRalphLabelDelta maps escalated to escalated", () => {
