@@ -8,7 +8,11 @@ export type MergeConflictAttempt = {
   status?: "running" | "failed" | "succeeded";
   conflictCount?: number;
   conflictPaths?: string[];
+  failureClass?: MergeConflictFailureClass;
+  failureReason?: string;
 };
+
+export type MergeConflictFailureClass = "merge-content" | "permission" | "tooling" | "runtime" | "unknown";
 
 export type MergeConflictLease = {
   holder: string;
@@ -60,7 +64,7 @@ function buildMergeConflictMarker(params: { repo: string; issueNumber: number })
 }
 
 function serializeMergeConflictState(state: MergeConflictCommentState): string {
-  return JSON.stringify(state);
+  return JSON.stringify(state).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 }
 
 export function parseMergeConflictState(body: string): MergeConflictCommentState | null {

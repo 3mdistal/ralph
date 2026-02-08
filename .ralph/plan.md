@@ -1,80 +1,34 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: Merge-conflict repeated-signature grace retry (Issue #627)
 
-## Goal
+- [x] Read issue context + relevant product/policy docs.
+- [x] Locate current merge-conflict recovery code + unit tests.
 
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
+## Implementation
 
-## Assumptions
+- [x] Extend persisted merge-conflict attempt model to include a failure class (additive): `merge-content | permission | tooling | runtime | unknown`.
+- [x] Centralize failure classification in a single helper (called from all failure branches).
+- [x] Populate `failureClass` and a short bounded `failureReason` when a merge-conflict attempt fails.
+- [x] Make merge-conflict comment-state JSON safe for HTML-comment transport (escape `<`/`>` and bound any new strings) so state parsing cannot be corrupted.
+- [x] Update `computeMergeConflictDecision` with explicit precedence:
+      - `maxAttempts` remains a hard cap (always stop when exhausted)
+      - repeated-signature loop prevention applies immediately for `merge-content|unknown`
+      - repeated signature after `permission|tooling|runtime` gets exactly one signature-scoped grace retry
+      - repeated signature after grace is exhausted stops
+- [x] Add a small machine-readable decision code (e.g. `repeat_merge_content`, `repeat_grace_exhausted`, `attempts_exhausted`) and derive human text from it.
+- [x] Update stop/escalation reason text to explicitly distinguish loop prevention vs grace exhausted.
 
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+## Tests
 
-## Checklist
+- [x] Update/add unit tests in `src/__tests__/merge-conflict-recovery.test.ts`:
+      - repeated signature after `runtime/tooling/permission` allows one grace retry
+      - repeated signature after grace exhausted stops
+      - repeated signature after `merge-content` stops immediately
+      - legacy attempts with no class preserve current stop behavior
+- [x] Add round-trip parse/serialize tests for merge-conflict comment-state with new fields + tricky characters.
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+## Verification (local)
 
-## Steps
-
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
-
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
-
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
-
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
-
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
-
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
-
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
-
-- [x] Run verification gates
-  - [x] `bun test`
-  - [x] `bun run typecheck`
+- [x] `bun test`
+- [x] `bun run typecheck`
+- [x] `bun run build`
+- [x] `bun run knip`

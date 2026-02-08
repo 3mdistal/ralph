@@ -41,6 +41,7 @@ export function computeMergeConflictDecision(params: {
 }): {
   stop: boolean;
   reason?: string;
+  code?: "repeat-merge-content" | "repeat-unknown" | "repeat-grace-exhausted" | "attempts-exhausted";
   repeated: boolean;
   attemptsExhausted: boolean;
 } {
@@ -52,21 +53,63 @@ export function computeMergeConflictDecision(params: {
     Boolean(lastAttempt?.signature) &&
     lastAttempt.signature === params.nextSignature;
 
-  if (repeated) {
-    return {
-      stop: true,
-      repeated: true,
-      attemptsExhausted,
-      reason: "Merge conflicts repeat with the same signature; stopping automated recovery.",
-    };
-  }
-
   if (attemptsExhausted) {
     return {
       stop: true,
-      repeated: false,
+      code: "attempts-exhausted",
+      repeated,
       attemptsExhausted: true,
       reason: `Merge conflicts still unresolved after ${params.maxAttempts} attempt(s).`,
+    };
+  }
+
+  if (repeated) {
+    const failureClass = lastAttempt?.failureClass ?? "unknown";
+
+    if (failureClass === "merge-content") {
+      return {
+        stop: true,
+        code: "repeat-merge-content",
+        repeated: true,
+        attemptsExhausted,
+        reason: "Merge conflicts repeat with the same signature after a merge-content failure; stopping automated recovery to prevent a stasis loop.",
+      };
+    }
+
+    if (failureClass === "unknown") {
+      return {
+        stop: true,
+        code: "repeat-unknown",
+        repeated: true,
+        attemptsExhausted,
+        reason: "Merge conflicts repeat with the same signature after an unclassified failure; stopping automated recovery.",
+      };
+    }
+
+    let repeatedGraceEligibleFailures = 0;
+    for (let i = params.attempts.length - 1; i >= 0; i -= 1) {
+      const attempt = params.attempts[i];
+      if (attempt.status !== "failed" || attempt.signature !== params.nextSignature) break;
+      if (attempt.failureClass === "permission" || attempt.failureClass === "tooling" || attempt.failureClass === "runtime") {
+        repeatedGraceEligibleFailures += 1;
+      }
+    }
+
+    if (repeatedGraceEligibleFailures >= 2) {
+      return {
+        stop: true,
+        code: "repeat-grace-exhausted",
+        repeated: true,
+        attemptsExhausted,
+        reason:
+          "Merge conflicts repeat with the same signature after the non-merge-progress grace retry was already used; stopping automated recovery.",
+      };
+    }
+
+    return {
+      stop: false,
+      repeated: true,
+      attemptsExhausted,
     };
   }
 

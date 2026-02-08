@@ -21,6 +21,7 @@ import {
   computeMergeConflictDecision,
   formatMergeConflictPaths,
 } from "../../merge-conflict-recovery";
+import { classifyMergeConflictFailure } from "./merge-conflict-failure-classifier";
 
 // Keep these values aligned with src/worker/repo-worker.ts
 const MERGE_CONFLICT_COMMENT_SCAN_LIMIT = 50;
@@ -342,9 +343,11 @@ export async function runMergeConflictRecovery(
     await worker.queue.updateTaskStatus(params.task, "in-progress", { "session-id": sessionResult.sessionId });
   }
 
-  if (!sessionResult.success) {
+  const persistFailedAttempt = async (failure: { failureClass: MergeConflictAttempt["failureClass"]; failureReason?: string }) => {
     attempt.status = "failed";
     attempt.completedAt = completedAt;
+    attempt.failureClass = failure.failureClass;
+    attempt.failureReason = failure.failureReason;
     const failedState: MergeConflictCommentState = {
       version: 1,
       attempts: [...attempts, attempt],
@@ -358,8 +361,13 @@ export async function runMergeConflictRecovery(
       attemptCount: attemptNumber,
       maxAttempts,
       action: "Merge-conflict recovery attempt failed; retrying if attempts remain.",
+      reason: failure.failureReason,
     });
     await worker.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+  };
+
+  if (!sessionResult.success) {
+    await persistFailedAttempt(classifyMergeConflictFailure({ kind: "agent-run-failed", sessionResult }));
     await worker.cleanupGitWorktree(worktreePath);
     return await runMergeConflictRecovery(worker, { ...params, opencodeSessionOptions: params.opencodeSessionOptions });
   }
@@ -376,24 +384,7 @@ export async function runMergeConflictRecovery(
   } catch (error: any) {
     const reason = `Merge-conflict recovery failed while waiting for updated PR state: ${worker.formatGhError(error)}`;
     console.warn(`[ralph:worker:${worker.repo}] ${reason}`);
-    attempt.status = "failed";
-    attempt.completedAt = completedAt;
-    const failedState: MergeConflictCommentState = {
-      version: 1,
-      attempts: [...attempts, attempt],
-      lastSignature: signature,
-    };
-    const failedLines = buildMergeConflictCommentLines({
-      prUrl: params.prUrl,
-      baseRefName,
-      headRefName,
-      conflictPaths,
-      attemptCount: attemptNumber,
-      maxAttempts,
-      action: "Merge-conflict recovery attempt failed; retrying if attempts remain.",
-      reason,
-    });
-    await worker.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+    await persistFailedAttempt(classifyMergeConflictFailure({ kind: "wait-failed", reason }));
     await worker.cleanupGitWorktree(worktreePath);
     return await runMergeConflictRecovery(worker, { ...params, opencodeSessionOptions: params.opencodeSessionOptions });
   }
@@ -402,24 +393,12 @@ export async function runMergeConflictRecovery(
     const reason = postRecovery.timedOut
       ? `Merge-conflict recovery timed out waiting for updated PR state for ${params.prUrl}`
       : `Merge conflicts remain after recovery attempt for ${params.prUrl}`;
-    attempt.status = "failed";
-    attempt.completedAt = completedAt;
-    const failedState: MergeConflictCommentState = {
-      version: 1,
-      attempts: [...attempts, attempt],
-      lastSignature: signature,
-    };
-    const failedLines = buildMergeConflictCommentLines({
-      prUrl: params.prUrl,
-      baseRefName,
-      headRefName,
-      conflictPaths,
-      attemptCount: attemptNumber,
-      maxAttempts,
-      action: "Merge-conflict recovery attempt failed; retrying if attempts remain.",
-      reason,
-    });
-    await worker.upsertMergeConflictComment({ issueNumber: Number(params.issueNumber), lines: failedLines, state: failedState });
+    await persistFailedAttempt(
+      classifyMergeConflictFailure({
+        kind: postRecovery.timedOut ? "merge-state-timeout" : "merge-state-dirty",
+        reason,
+      })
+    );
     await worker.cleanupGitWorktree(worktreePath);
     return await runMergeConflictRecovery(worker, { ...params, opencodeSessionOptions: params.opencodeSessionOptions });
   }
