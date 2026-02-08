@@ -2,6 +2,9 @@ import type { MergeConflictAttempt } from "./github/merge-conflict-comment";
 import { sanitizeEscalationReason } from "./github/escalation-writeback";
 import { classifyOpencodeFailure } from "./opencode-error-classifier";
 
+export type MergeConflictFailureClass = "merge-content" | "permission" | "tooling" | "runtime";
+export type MergeConflictStopKind = "loop-protection" | "grace-exhausted" | "attempts-exhausted";
+
 const FNV_OFFSET = 2166136261;
 const FNV_PRIME = 16777619;
 
@@ -43,8 +46,10 @@ export function computeMergeConflictDecision(params: {
 }): {
   stop: boolean;
   reason?: string;
+  stopKind?: MergeConflictStopKind;
   repeated: boolean;
   attemptsExhausted: boolean;
+  graceApplied: boolean;
 } {
   const attemptsExhausted = params.attempts.length >= params.maxAttempts;
   const lastAttempt = params.attempts[params.attempts.length - 1];
@@ -54,25 +59,115 @@ export function computeMergeConflictDecision(params: {
     Boolean(lastAttempt?.signature) &&
     lastAttempt.signature === params.nextSignature;
 
+  const tailFailedWithSignatureCount = (() => {
+    let count = 0;
+    for (let i = params.attempts.length - 1; i >= 0; i -= 1) {
+      const attempt = params.attempts[i];
+      if (!attempt || attempt.status !== "failed") break;
+      if (!attempt.signature || attempt.signature !== params.nextSignature) break;
+      count += 1;
+    }
+    return count;
+  })();
+
   if (repeated) {
+    if (attemptsExhausted) {
+      return {
+        stop: true,
+        stopKind: "attempts-exhausted",
+        repeated: true,
+        attemptsExhausted: true,
+        graceApplied: false,
+        reason: `Merge conflicts still unresolved after ${params.maxAttempts} attempt(s).`,
+      };
+    }
+
+    const lastFailureClass: MergeConflictFailureClass = lastAttempt?.failureClass ?? "merge-content";
+    if (lastFailureClass === "merge-content") {
+      return {
+        stop: true,
+        stopKind: "loop-protection",
+        repeated: true,
+        attemptsExhausted,
+        graceApplied: false,
+        reason:
+          "Stopped: repeated conflict signature (merge stasis loop protection after merge-content failure).",
+      };
+    }
+
+    if (tailFailedWithSignatureCount <= 1) {
+      return {
+        stop: false,
+        repeated: true,
+        attemptsExhausted: false,
+        graceApplied: true,
+      };
+    }
+
     return {
       stop: true,
+      stopKind: "grace-exhausted",
       repeated: true,
       attemptsExhausted,
-      reason: "Merge conflicts repeat with the same signature; stopping automated recovery.",
+      graceApplied: false,
+      reason:
+        "Stopped: repeated conflict signature after grace exhausted (prior failure was non-merge-progress).",
     };
   }
 
   if (attemptsExhausted) {
     return {
       stop: true,
+      stopKind: "attempts-exhausted",
       repeated: false,
       attemptsExhausted: true,
+      graceApplied: false,
       reason: `Merge conflicts still unresolved after ${params.maxAttempts} attempt(s).`,
     };
   }
 
-  return { stop: false, repeated: false, attemptsExhausted: false };
+  return { stop: false, repeated: false, attemptsExhausted: false, graceApplied: false };
+}
+
+const PERMISSION_PATTERNS: RegExp[] = [
+  /permission denied/i,
+  /operation not permitted/i,
+  /eacces/i,
+  /access denied/i,
+  /authentication failed/i,
+  /not authorized/i,
+];
+
+const TOOLING_PATTERNS: RegExp[] = [
+  /command not found/i,
+  /executable file not found/i,
+  /no such file or directory/i,
+  /cannot find module/i,
+  /module not found/i,
+  /tool .* not found/i,
+];
+
+const RUNTIME_PATTERNS: RegExp[] = [
+  /timed out/i,
+  /timeout/i,
+  /connection reset/i,
+  /connection refused/i,
+  /temporar(?:y|ily) unavailable/i,
+  /network error/i,
+];
+
+export function classifyMergeConflictFailure(params: {
+  reason?: string;
+  loopTrip?: boolean;
+  watchdogTimeout?: boolean;
+  waitTimedOut?: boolean;
+}): MergeConflictFailureClass {
+  if (params.loopTrip || params.watchdogTimeout || params.waitTimedOut) return "runtime";
+  const reason = params.reason ?? "";
+  if (PERMISSION_PATTERNS.some((pattern) => pattern.test(reason))) return "permission";
+  if (TOOLING_PATTERNS.some((pattern) => pattern.test(reason))) return "tooling";
+  if (RUNTIME_PATTERNS.some((pattern) => pattern.test(reason))) return "runtime";
+  return "merge-content";
 }
 
 export function formatMergeConflictPaths(paths: string[], maxCount = 8): { total: number; sample: string[] } {
@@ -175,9 +270,10 @@ export function buildMergeConflictEscalationDetails(params: {
     lines.push("", "Attempts:");
     for (const attempt of params.attempts) {
       const when = attempt.completedAt || attempt.startedAt;
+      const failureClass = attempt.status === "failed" && attempt.failureClass ? `, ${attempt.failureClass}` : "";
       const conflictCount = typeof attempt.conflictCount === "number" ? `, ${attempt.conflictCount} files` : "";
       lines.push(
-        `- Attempt ${attempt.attempt} (${attempt.status ?? "unknown"}, ${when})${conflictCount}: ${
+        `- Attempt ${attempt.attempt} (${attempt.status ?? "unknown"}${failureClass}, ${when})${conflictCount}: ${
           attempt.signature || "(no signature)"
         }`
       );
