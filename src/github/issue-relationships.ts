@@ -8,11 +8,16 @@ export type IssueRelationshipSnapshot = {
   issue: IssueRef;
   signals: RelationshipSignal[];
   coverage: {
-    githubDepsComplete: boolean;
-    githubSubIssuesComplete: boolean;
+    // `complete`: relationship query succeeded and we can prove no more pages.
+    // `partial`: relationship query succeeded, but may be incomplete (pagination/unknown page boundary).
+    // `unavailable`: relationship query could not be obtained from GitHub.
+    githubDeps: RelationshipCoverage;
+    githubSubIssues: RelationshipCoverage;
     bodyDeps: boolean;
   };
 };
+
+export type RelationshipCoverage = "complete" | "partial" | "unavailable";
 
 export interface IssueRelationshipProvider {
   getSnapshot(issue: IssueRef): Promise<IssueRelationshipSnapshot>;
@@ -204,8 +209,8 @@ function parseLinkHasNextPage(link: string | null): PageSignal {
   return { hasNextPage: hasNext };
 }
 
-function isCoverageComplete(page: PageSignal): boolean {
-  return page.hasNextPage === false;
+function deriveCoverageState(page: PageSignal): RelationshipCoverage {
+  return page.hasNextPage === false ? "complete" : "partial";
 }
 
 function isDependencySatisfiedOverride(ref: IssueRef): boolean {
@@ -235,7 +240,11 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
   async getSnapshot(issue: IssueRef): Promise<IssueRelationshipSnapshot> {
     const basics = await this.fetchIssueBasics(issue);
     const signals: RelationshipSignal[] = [];
-    const coverage = { githubDepsComplete: false, githubSubIssuesComplete: false, bodyDeps: false };
+    const coverage: IssueRelationshipSnapshot["coverage"] = {
+      githubDeps: "unavailable",
+      githubSubIssues: "unavailable",
+      bodyDeps: false,
+    };
 
     const parsed = parseIssueBodyDependencies(basics.body, issue.repo);
     signals.push(...parsed.blockedBy);
@@ -244,13 +253,13 @@ export class GitHubRelationshipProvider implements IssueRelationshipProvider {
     const blockedBy = await this.fetchBlockedBy(issue);
     if (blockedBy !== null) {
       signals.push(...mapIssueStatesToSignals(blockedBy.issues, "blocked_by", "github"));
-      coverage.githubDepsComplete = isCoverageComplete(blockedBy.page);
+      coverage.githubDeps = deriveCoverageState(blockedBy.page);
     }
 
     const subIssues = await this.fetchSubIssues(issue);
     if (subIssues !== null) {
       signals.push(...mapIssueStatesToSignals(subIssues.issues, "sub_issue", "github"));
-      coverage.githubSubIssuesComplete = isCoverageComplete(subIssues.page);
+      coverage.githubSubIssues = deriveCoverageState(subIssues.page);
     }
 
     const overridden = signals.map((signal) => {
