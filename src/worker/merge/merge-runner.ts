@@ -105,11 +105,12 @@ export async function mergePrWithRequiredChecks(params: {
   recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary) => void;
   buildIssueContextForAgent: (params: { repo: string; issueNumber: string }) => Promise<string>;
   runReviewAgent: (params: {
-    agent: "product" | "devex";
+    agent: "product" | "devex" | "general" | "ralph-plan";
     prompt: string;
     cacheKey: string;
     stage: string;
     sessionId: string;
+    continueSessionId?: string;
   }) => Promise<SessionResult>;
   runMergeConflictRecovery: (input: {
     task: AgentTask;
@@ -337,6 +338,15 @@ export async function mergePrWithRequiredChecks(params: {
             cacheKey: `review-${params.cacheKey}-${agent}`,
             stage,
             sessionId,
+          }),
+        runRepairAgent: (prompt, continueSessionId) =>
+          params.runReviewAgent({
+            agent: "ralph-plan",
+            prompt,
+            cacheKey: `review-${params.cacheKey}-${agent}-repair`,
+            stage: `${stage} marker repair`,
+            sessionId,
+            continueSessionId,
           }),
       });
     };

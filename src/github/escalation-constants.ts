@@ -11,20 +11,11 @@ const ESCALATION_TYPES = [
   "low-confidence",
   "ambiguous-requirements",
   "blocked",
+  "watchdog",
   "merge-conflict",
   "other",
 ] as const;
 
 export type EscalationType = (typeof ESCALATION_TYPES)[number];
-
-export function normalizeEscalationType(input: string | null | undefined): EscalationType {
-  const normalized = String(input ?? "")
-    .trim()
-    .toLowerCase();
-  if ((ESCALATION_TYPES as readonly string[]).includes(normalized)) {
-    return normalized as EscalationType;
-  }
-  return "other";
-}
 
 export const RALPH_ESCALATION_MARKER_REGEX = /<!--\s*ralph-escalation:id=([a-f0-9]+)\s*-->/i;
