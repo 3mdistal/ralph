@@ -81,13 +81,13 @@ describe("github-usage miner", () => {
         },
       }) +
       line({
-        repo: "3mdistal/tooling",
+        repo: "3mdistal/ralph",
         type: "github.request",
         level: "warn",
         ts: "2026-02-03T12:03:00.000Z",
         data: {
           method: "GET",
-          path: "/repos/3mdistal/tooling/issues/428",
+          path: "/repos/3mdistal/ralph/issues/428",
           status: 500,
           ok: false,
           write: false,
@@ -142,7 +142,7 @@ describe("github-usage miner", () => {
 
     const repos = summary.repos.map((r) => r.repo);
     expect(repos).toContain("3mdistal/ralph");
-    expect(repos).toContain("3mdistal/tooling");
+    expect(repos).toContain("3mdistal/ralph");
   });
 
   test("is resilient to missing day files", async () => {

@@ -47,7 +47,7 @@ const DAEMON_RECORD_VERSION = 1;
 const REGISTRY_LOCK_FILE = "daemon-registry.lock";
 const DAEMON_LOCK_FILE = "daemon.lock";
 
-function isPidAlive(pid: number): boolean {
+export function isPidAlive(pid: number): boolean {
   if (!Number.isFinite(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
@@ -124,6 +124,25 @@ function parseRecord(
     cwd,
     controlFilePath,
   };
+}
+
+
+export function readDaemonRecordAtPath(path: string, opts?: { homeDir?: string; xdgStateHome?: string; log?: (message: string) => void }): DaemonRecord | null {
+  if (!existsSync(path)) return null;
+  try {
+    assertSafeRecordFile(path);
+    const raw = readFileSync(path, "utf8");
+    return (
+      parseRecord(raw, {
+        controlRoot: dirname(path),
+        controlFilePath: resolveCanonicalControlFilePath({ homeDir: opts?.homeDir }),
+        cwd: process.cwd(),
+      }) ?? null
+    );
+  } catch (e: any) {
+    opts?.log?.(`[ralph] Failed to read daemon record ${path}: ${e?.message ?? String(e)}`);
+    return null;
+  }
 }
 
 function chooseBestRecord(records: DaemonRecord[]): DaemonRecord | null {

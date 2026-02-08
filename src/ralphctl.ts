@@ -1,7 +1,9 @@
 #!/usr/bin/env bun
 
-import { spawn } from "child_process";
-import { readDaemonRecord, resolveDaemonRecordPathCandidates, type DaemonRecord } from "./daemon-record";
+import { spawn, spawnSync } from "child_process";
+import { readFileSync } from "fs";
+import { resolveDaemonRecordPathCandidates, type DaemonRecord } from "./daemon-record";
+import { discoverDaemon } from "./daemon-discovery";
 import { updateControlFile } from "./control-file";
 import { getStatusSnapshot } from "./commands/status";
 import type { StatusSnapshot } from "./status-snapshot";
@@ -194,6 +196,50 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
+function readProcessCommandLine(pid: number): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    const text = raw.replace(/\0+/g, " ").trim();
+    if (text) return text;
+  } catch {
+    // ignore
+  }
+
+  try {
+    const out = spawnSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+    const text = (out.stdout ?? "").trim();
+    if (text) return text;
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
+
+function verifyProcessIdentity(record: DaemonRecord): { ok: boolean; reason: string } {
+  const commandLine = readProcessCommandLine(record.pid);
+  if (!commandLine) {
+    return { ok: false, reason: "unable to verify process command line" };
+  }
+
+  const haystack = commandLine.toLowerCase();
+  const tokens = record.command
+    .map((token) => token.trim())
+    .filter(Boolean)
+    .map((token) => token.split("/").pop() ?? token)
+    .map((token) => token.toLowerCase())
+    .slice(0, 3);
+
+  if (tokens.length === 0) return { ok: true, reason: "" };
+  const matched = tokens.some((token) => haystack.includes(token));
+  if (matched) return { ok: true, reason: "" };
+
+  return {
+    ok: false,
+    reason: `pid command mismatch (expected one of: ${tokens.join(", ")}; actual: ${commandLine})`,
+  };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -209,11 +255,17 @@ async function waitForDrained(timeoutMs: number): Promise<StatusSnapshot> {
   return lastSnapshot;
 }
 
-async function waitForDaemonRecordChange(oldRecord: DaemonRecord, timeoutMs: number): Promise<DaemonRecord> {
+async function waitForDaemonRecordChange(oldRecord: DaemonRecord | null, timeoutMs: number): Promise<DaemonRecord> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const next = readDaemonRecord();
-    if (next && (next.daemonId !== oldRecord.daemonId || next.pid !== oldRecord.pid)) return next;
+    const nextDiscovery = discoverDaemon({ healStale: false });
+    const next = nextDiscovery.state === "live" ? nextDiscovery.live?.record ?? null : null;
+    if (!next) {
+      await sleep(500);
+      continue;
+    }
+    if (!oldRecord) return next;
+    if (next.daemonId !== oldRecord.daemonId || next.pid !== oldRecord.pid) return next;
     await sleep(500);
   }
   throw new Error("Timed out waiting for new daemon record");
@@ -254,6 +306,13 @@ async function stopDaemon(record: DaemonRecord, force: boolean): Promise<void> {
 
   if (!force && !record.daemonId) {
     throw new Error("Refusing to stop daemon without daemonId; use --force to override.");
+  }
+
+  if (!force) {
+    const identity = verifyProcessIdentity(record);
+    if (!identity.ok) {
+      throw new Error(`Refusing to signal pid=${record.pid}: ${identity.reason}; use --force to override.`);
+    }
   }
 
   try {
@@ -322,13 +381,28 @@ async function restartFlow(opts: {
     console.warn("Drain timeout reached; proceeding with restart.");
   }
 
-  const daemonRecord = readDaemonRecord();
+  const daemonDiscovery = discoverDaemon({ healStale: true });
+  if (daemonDiscovery.healedPaths.length > 0) {
+    console.log(`Healed stale daemon record(s): ${daemonDiscovery.healedPaths.join(", ")}`);
+  }
+
+  if (daemonDiscovery.state === "conflict") {
+    throw new Error("Multiple live daemon records detected; stop extra daemons or use --force.");
+  }
+
+  const daemonRecord = daemonDiscovery.state === "live"
+    ? daemonDiscovery.live?.record ?? null
+    : daemonDiscovery.latestRecord;
   if (!daemonRecord) {
     const candidates = resolveDaemonRecordPathCandidates();
     throw new Error(`Daemon record not found (checked: ${candidates.join(", ")})`);
   }
 
-  await stopDaemon(daemonRecord, opts.force);
+  if (daemonDiscovery.state === "live") {
+    await stopDaemon(daemonRecord, opts.force);
+  } else {
+    console.log("No live daemon PID found; continuing restart from stale record metadata.");
+  }
 
   if (opts.upgradeCmd) {
     console.log("Running upgrade command...");
@@ -343,7 +417,7 @@ async function restartFlow(opts: {
   console.log("Starting daemon...");
   spawnDetached(command, daemonRecord.cwd || process.cwd());
 
-  const newRecord = await waitForDaemonRecordChange(daemonRecord, DAEMON_START_TIMEOUT_MS);
+  const newRecord = await waitForDaemonRecordChange(daemonDiscovery.state === "live" ? daemonRecord : null, DAEMON_START_TIMEOUT_MS);
   const afterSnapshot = await getStatusSnapshot();
   if (afterSnapshot.mode === "draining") {
     console.warn("Daemon still in draining mode after restart.");
@@ -394,6 +468,8 @@ async function run(): Promise<void> {
       console.log(
         `Daemon: id=${snapshot.daemon.daemonId ?? "unknown"} pid=${snapshot.daemon.pid ?? "unknown"}`
       );
+    } else {
+      console.log("Daemon: not running");
     }
     const daemonLivenessLine = snapshot.daemonLiveness ? formatDaemonLivenessLine(snapshot.daemonLiveness) : null;
     if (daemonLivenessLine) console.log(daemonLivenessLine);
@@ -411,40 +487,70 @@ async function run(): Promise<void> {
   if (cmd === "drain") {
     const timeoutMs = parseDuration(getFlagValue(args, "--timeout"));
     const pauseAtCheckpoint = getFlagValue(args, "--pause-at-checkpoint");
+    const discovery = discoverDaemon({ healStale: true });
+    if (discovery.state === "conflict") {
+      console.error("Multiple live daemon records detected; refusing to send control signal.");
+      process.exit(1);
+    }
+
     const patch = {
       mode: "draining" as const,
       drainTimeoutMs: timeoutMs ?? undefined,
       pauseRequested: pauseAtCheckpoint ? true : undefined,
       pauseAtCheckpoint: pauseAtCheckpoint ?? undefined,
     };
-    const { path } = updateControlFile({ patch });
-    const record = readDaemonRecord();
-    if (record?.pid && isPidAlive(record.pid)) {
+    const liveRecord = discovery.state === "live" ? discovery.live?.record ?? null : null;
+    const { path } = updateControlFile({ patch, path: liveRecord?.controlFilePath?.trim() || undefined });
+    if (liveRecord?.pid && isPidAlive(liveRecord.pid)) {
+      const identity = verifyProcessIdentity(liveRecord);
       try {
-        process.kill(record.pid, "SIGUSR1");
+        if (identity.ok) process.kill(liveRecord.pid, "SIGUSR1");
       } catch {
         // ignore
       }
+      if (!identity.ok) {
+        console.warn(`Drain signal skipped: ${identity.reason}`);
+      }
+    } else if (discovery.state === "stale") {
+      console.warn("No live daemon PID found; wrote control intent for next daemon startup.");
+    }
+    if (discovery.healedPaths.length > 0) {
+      console.log(`Healed stale daemon record(s): ${discovery.healedPaths.join(", ")}`);
     }
     console.log(`Drain requested (control file: ${path}).`);
     process.exit(0);
   }
 
   if (cmd === "resume") {
+    const discovery = discoverDaemon({ healStale: true });
+    if (discovery.state === "conflict") {
+      console.error("Multiple live daemon records detected; refusing to send control signal.");
+      process.exit(1);
+    }
+
     const patch = {
       mode: "running" as const,
       pauseRequested: null,
       pauseAtCheckpoint: null,
       drainTimeoutMs: null,
     };
-    const { path } = updateControlFile({ patch });
-    const record = readDaemonRecord();
-    if (record?.pid && isPidAlive(record.pid)) {
+    const liveRecord = discovery.state === "live" ? discovery.live?.record ?? null : null;
+    const { path } = updateControlFile({ patch, path: liveRecord?.controlFilePath?.trim() || undefined });
+    if (liveRecord?.pid && isPidAlive(liveRecord.pid)) {
+      const identity = verifyProcessIdentity(liveRecord);
       try {
-        process.kill(record.pid, "SIGUSR1");
+        if (identity.ok) process.kill(liveRecord.pid, "SIGUSR1");
       } catch {
         // ignore
       }
+      if (!identity.ok) {
+        console.warn(`Resume signal skipped: ${identity.reason}`);
+      }
+    } else if (discovery.state === "stale") {
+      console.warn("No live daemon PID found; wrote control intent for next daemon startup.");
+    }
+    if (discovery.healedPaths.length > 0) {
+      console.log(`Healed stale daemon record(s): ${discovery.healedPaths.join(", ")}`);
     }
     console.log(`Resume requested (control file: ${path}).`);
     process.exit(0);

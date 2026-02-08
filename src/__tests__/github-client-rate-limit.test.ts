@@ -206,14 +206,14 @@ describe("GitHubClient rate limit handling", () => {
         });
       };
 
-      const clientA = new GitHubClient("3mdistal/tooling", {
+      const clientA = new GitHubClient("3mdistal/ralph", {
         getToken: async () => "token-a",
         sleepMs: async (ms) => {
           sleepCalls.push({ token: "a", ms });
         },
       });
 
-      const clientB = new GitHubClient("3mdistal/ralph", {
+      const clientB = new GitHubClient("3mdistal/agentlib", {
         getToken: async () => "token-b",
         sleepMs: async (ms) => {
           sleepCalls.push({ token: "b", ms });

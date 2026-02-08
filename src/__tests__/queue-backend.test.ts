@@ -58,6 +58,24 @@ describe("queue backend selection", () => {
 
   test("falls back to none when GitHub auth is missing", async () => {
     const configPath = getRalphConfigJsonPath();
+    const missingVault = join(homeDir, "missing-vault");
+    await writeJson(configPath, {
+      repos: [],
+    });
+
+    __resetConfigForTests();
+    __resetQueueBackendStateForTests();
+
+    const state = getQueueBackendState();
+    expect(state.desiredBackend).toBe("github");
+    expect(state.backend).toBe("none");
+    expect(state.health).toBe("degraded");
+    expect(state.fallback).toBe(true);
+    expect(state.diagnostics ?? "").toContain("auth is not configured");
+  });
+
+  test("does not use legacy backend when GitHub auth is missing", async () => {
+    const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {
       repos: [],
     });
@@ -128,7 +146,7 @@ describe("queue backend selection", () => {
 
     const state = getQueueBackendState();
     expect(state.desiredBackend).toBe("github");
-    expect(state.backend).toBe("github");
+    expect(state.backend).toBe("none");
     expect(state.health).toBe("unavailable");
     expect(state.fallback).toBe(false);
     expect(state.diagnostics ?? "").toContain("Invalid queueBackend");
