@@ -8,15 +8,12 @@ import { getStatusSnapshot } from "../commands/status";
 import { __resetQueueBackendStateForTests } from "../queue-backend";
 import { closeStateDbForTests } from "../state";
 import { resolveDaemonRecordPath } from "../daemon-record";
-import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir = "";
 let priorHome: string | undefined;
 let priorStateDb: string | undefined;
-let releaseLock: (() => void) | null = null;
 
 beforeEach(async () => {
-  releaseLock = await acquireGlobalTestLock();
   priorHome = process.env.HOME;
   priorStateDb = process.env.RALPH_STATE_DB_PATH;
 
@@ -50,8 +47,6 @@ afterEach(async () => {
     await rm(homeDir, { recursive: true, force: true });
   }
 
-  releaseLock?.();
-  releaseLock = null;
 });
 
 describe("status daemon discovery", () => {

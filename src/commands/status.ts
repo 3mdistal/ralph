@@ -1,7 +1,6 @@
 import { getConfig, getRequestedOpencodeProfileName, isOpencodeProfilesEnabled, listOpencodeProfileNames } from "../config";
 import { readControlStateSnapshot, type DaemonMode } from "../drain";
 import { discoverDaemon } from "../daemon-discovery";
-import { getEscalationsByStatus } from "../escalation-notes";
 import { getSessionNowDoing } from "../live-status";
 import { resolveOpencodeProfileForNewWork } from "../opencode-auto-profile";
 import { getQueueBackendStateWithLabelHealth, getQueuedTasks, getTasksByStatus } from "../queue-backend";
