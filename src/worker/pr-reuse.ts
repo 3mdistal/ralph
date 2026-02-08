@@ -9,12 +9,35 @@ export type ResolvedIssuePr = {
   diagnostics: string[];
 };
 
+type IssuePrResolutionCacheEntry = {
+  createdAtMs: number;
+  promise: Promise<ResolvedIssuePr>;
+};
+
+const DEFAULT_ISSUE_PR_RESOLUTION_CACHE_TTL_MS = 30_000;
+
 export function createIssuePrResolver(params: {
   repo: string;
   formatGhError: (error: unknown) => string;
   recordOpenPrSnapshot: (issueRef: string, prUrl: string) => void;
+  cacheTtlMs?: number;
+  deps?: {
+    listOpenPrCandidatesForIssue?: typeof listOpenPrCandidatesForIssue;
+    normalizePrUrl?: typeof normalizePrUrl;
+    searchOpenPullRequestsByIssueLink?: typeof searchOpenPullRequestsByIssueLink;
+    viewPullRequest?: typeof viewPullRequest;
+  };
 }) {
-  const cache = new Map<string, Promise<ResolvedIssuePr>>();
+  const listOpenPrCandidates = params.deps?.listOpenPrCandidatesForIssue ?? listOpenPrCandidatesForIssue;
+  const normalize = params.deps?.normalizePrUrl ?? normalizePrUrl;
+  const searchOpenPrs = params.deps?.searchOpenPullRequestsByIssueLink ?? searchOpenPullRequestsByIssueLink;
+  const viewPr = params.deps?.viewPullRequest ?? viewPullRequest;
+
+  const cache = new Map<string, IssuePrResolutionCacheEntry>();
+  const cacheTtlMs =
+    Number.isFinite(params.cacheTtlMs) && (params.cacheTtlMs ?? 0) >= 0
+      ? Math.floor(params.cacheTtlMs ?? 0)
+      : DEFAULT_ISSUE_PR_RESOLUTION_CACHE_TTL_MS;
 
   const recordResolvedPrSnapshots = (
     issueNumber: string,
@@ -50,7 +73,7 @@ export function createIssuePrResolver(params: {
   };
 
   const resolveDbPrCandidates = async (issueNumber: number, diagnostics: string[]): Promise<ResolvedPrCandidate[]> => {
-    const rows = listOpenPrCandidatesForIssue(params.repo, issueNumber);
+    const rows = listOpenPrCandidates(params.repo, issueNumber);
     if (rows.length === 0) return [];
     diagnostics.push(`- DB PR candidates: ${rows.length}`);
 
@@ -58,12 +81,12 @@ export function createIssuePrResolver(params: {
     const seen = new Set<string>();
 
     for (const row of rows) {
-      const normalized = normalizePrUrl(row.url);
+      const normalized = normalize(row.url);
       if (seen.has(normalized)) continue;
       seen.add(normalized);
 
       try {
-        const view = await viewPullRequest(params.repo, row.url);
+        const view = await viewPr(params.repo, row.url);
         if (!view) continue;
         const state = String(view.state ?? "").toUpperCase();
         if (state !== "OPEN") continue;
@@ -88,7 +111,7 @@ export function createIssuePrResolver(params: {
   const resolveSearchPrCandidates = async (issueNumber: string, diagnostics: string[]): Promise<ResolvedPrCandidate[]> => {
     let searchResults: PullRequestSearchResult[] = [];
     try {
-      searchResults = await searchOpenPullRequestsByIssueLink(params.repo, issueNumber);
+      searchResults = await searchOpenPrs(params.repo, issueNumber);
     } catch (error: any) {
       diagnostics.push(`- GitHub PR search failed: ${params.formatGhError(error)}`);
       return [];
@@ -100,7 +123,7 @@ export function createIssuePrResolver(params: {
     const results: ResolvedPrCandidate[] = [];
     const seen = new Set<string>();
     for (const result of searchResults) {
-      const normalized = normalizePrUrl(result.url);
+      const normalized = normalize(result.url);
       if (seen.has(normalized)) continue;
       seen.add(normalized);
       results.push({
@@ -141,20 +164,38 @@ export function createIssuePrResolver(params: {
     return { selectedUrl: null, duplicates: [], source: null, diagnostics };
   };
 
-  const getIssuePrResolution = (issueNumber: string): Promise<ResolvedIssuePr> => {
+  const getIssuePrResolution = (
+    issueNumber: string,
+    opts: { fresh?: boolean } = {}
+  ): Promise<ResolvedIssuePr> => {
     const cacheKey = `${params.repo}#${issueNumber}`;
-    const cached = cache.get(cacheKey);
-    if (cached) return cached;
+    if (opts.fresh) {
+      cache.delete(cacheKey);
+    } else {
+      const cached = cache.get(cacheKey);
+      if (cached) {
+        if (Date.now() - cached.createdAtMs <= cacheTtlMs) {
+          return cached.promise;
+        }
+        cache.delete(cacheKey);
+      }
+    }
 
     const promise = findExistingOpenPrForIssue(issueNumber).catch((error) => {
       cache.delete(cacheKey);
       throw error;
     });
-    cache.set(cacheKey, promise);
+    cache.set(cacheKey, { createdAtMs: Date.now(), promise });
     return promise;
+  };
+
+  const invalidateIssuePrResolution = (issueNumber: string): void => {
+    const cacheKey = `${params.repo}#${issueNumber}`;
+    cache.delete(cacheKey);
   };
 
   return {
     getIssuePrResolution,
+    invalidateIssuePrResolution,
   };
 }

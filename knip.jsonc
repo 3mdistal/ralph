@@ -1,8 +1,7 @@
 {
   "$schema": "https://unpkg.com/knip@5/schema.json",
 
-  // Mirror the intent of bwrb's Knip setup: keep CI signal stable
-  // and explicitly ignore environment-provided tooling.
+  // Keep CI signal stable and ignore environment-provided tooling.
 
   // These binaries are expected to exist in the operator environment.
   "ignoreBinaries": ["which", "terminal-notifier"],

@@ -2,11 +2,11 @@
 
 Autonomous coding task orchestrator for OpenCode.
 
-Ralph watches for GitHub issues labeled with `ralph:*` workflow labels (with optional bwrb fallback) and dispatches them to OpenCode agents. It handles the full lifecycle: planning, implementation, PR creation, and merge.
+Ralph watches for GitHub issues labeled with `ralph:*` workflow labels and dispatches them to OpenCode agents. It handles the full lifecycle: planning, implementation, PR creation, and merge.
 
 ## Features
 
-- **Queue-based task management** via GitHub issues (`ralph:*` labels) with optional bwrb fallback
+- **Queue-based task management** via GitHub issues (`ralph:*` labels)
 - **Parallel processing** across repos, sequential within each repo
 - **Smart escalation** when agents need human guidance (policy: `docs/escalation-policy.md`)
 - **Anomaly detection** catches agents stuck in loops
@@ -46,7 +46,6 @@ Optional flags: `--url`, `--host`, `--port`, `--token`, `--replay-last`.
 
 - [Bun](https://bun.sh) >= 1.0.0
 - [OpenCode](https://opencode.ai) CLI
-- [bwrb](https://github.com/3mdistal/bwrb) CLI >= 0.1.3 (`npm install -g bwrb`) (needed for `.bwrbignore` negation)
 - [gh](https://cli.github.com) CLI
 
 ## Worktree isolation guardrail
@@ -68,8 +67,6 @@ Optional: migrate safe legacy worktrees into the managed worktrees directory:
 ralph worktrees legacy --repo <owner/repo> --action migrate
 ```
 
-If you previously installed bwrb via `pnpm link -g`, unlink it first so Ralph uses the published CLI on your PATH (Bun just shells out to the `bwrb` binary).
-
 ## Installation
 
 ```bash
@@ -82,11 +79,7 @@ bun install
 
 Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
-When using the GitHub queue backend, `bwrbVault` is optional. When `queueBackend = "bwrb"`, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
-
-`bwrb` is a legacy backend. GitHub Issues plus `~/.ralph/state.sqlite` are the canonical queue surfaces. Existing bwrb usage (escalation notes, agent-run notes, notifications) is best-effort mirror output only, and new bwrb-dependent behavior should not be added.
-
-Note: `orchestration/` is gitignored in this repo, but bwrb still needs to traverse it for queue operations. `.bwrbignore` re-includes `orchestration/**` for bwrb even when `.gitignore` excludes it; if your queue appears empty, check `bwrb --version` and upgrade to >= 0.1.3.
+GitHub Issues plus `~/.ralph/state.sqlite` are the canonical queue surfaces.
 
 Config is loaded once at startup, so restart the daemon after editing.
 
@@ -202,8 +195,7 @@ ralph sandbox tag --failed --apply
 
 ### Supported settings
 
-- `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
-- `bwrbVault` (string): bwrb vault path for the task queue (required when `queueBackend = "bwrb"`)
+- `queueBackend` (string): `github` (default) or `none` (single daemon per queue required for GitHub)
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
 - `profile` (string): `prod` (default) or `sandbox`
@@ -469,30 +461,11 @@ ralph sandbox seed --repo <owner/repo> --manifest sandbox/seed-manifest.v1.json 
 
 ### Queue a task
 
-Create an `agent-task` note in your bwrb vault:
-
-```bash
-bwrb new agent-task --json '{
-  "name": "repo 123 - Fix the bug",
-  "issue": "owner/repo#123",
-  "repo": "owner/repo",
-  "status": "queued",
-  "priority": "p2-medium",
-  "scope": "builder",
-  "creation-date": "2026-01-09"
-}'
-```
-
-Ralph will pick it up and dispatch an agent.
+Apply `ralph:status:queued` to a GitHub issue in a configured repo. Ralph will pick it up and dispatch an agent.
 
 ## Architecture
 
 ```
-orchestration/
-  tasks/          # agent-task notes (queue)
-  runs/           # agent-run notes (completed work)
-  escalations/    # agent-escalation notes (needs human)
-
 ~/.ralph/
   config.toml     # preferred config (if present)
   config.json     # fallback config
@@ -548,9 +521,8 @@ Ralph supports an operator-controlled "draining" mode that stops scheduling/dequ
 
 Control file:
 
-- `$XDG_STATE_HOME/ralph/control.json`
-- Fallback: `~/.local/state/ralph/control.json`
-- Last resort: `/tmp/ralph/<uid>/control.json`
+- Canonical: `~/.ralph/control/control.json`
+- Fallback reads: `$XDG_STATE_HOME/ralph/control.json`, `~/.local/state/ralph/control.json`, `/tmp/ralph/<uid>/control.json`
 
 Ralph auto-creates the control file on startup with `{ "mode": "running" }` unless disabled via config.
 
@@ -582,11 +554,10 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 
 Daemon discovery for restart/upgrade uses a lease record at:
 
-- `$XDG_STATE_HOME/ralph/daemon.json`
-- Fallback: `~/.local/state/ralph/daemon.json`
-- Last resort: `/tmp/ralph/<uid>/daemon.json`
+- Canonical: `~/.ralph/control/daemon-registry.json`
+- Fallback reads: `$XDG_STATE_HOME/ralph/daemon.json`, `~/.local/state/ralph/daemon.json`, `/tmp/ralph/<uid>/daemon.json`
 
-The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
+The daemon writes this file on startup and refreshes heartbeat updates while running. Use `--start-cmd` to override when needed.
 
 ## Managed OpenCode config (daemon runs)
 
