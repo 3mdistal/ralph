@@ -73,7 +73,8 @@ describe("status daemon discovery", () => {
     );
 
     const snapshot = await getStatusSnapshot();
-    expect(snapshot.daemon).toBeNull();
-    expect(snapshot.daemonDiscovery?.state).toBe("stale");
+    expect(snapshot.daemon).not.toBeNull();
+    expect(["dead", "missing", "unknown"]).toContain(snapshot.daemonLiveness?.state);
+    expect(snapshot.daemonLiveness?.mismatch).toBe(true);
   });
 });
