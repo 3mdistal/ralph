@@ -2,7 +2,7 @@
 
 import { spawn, spawnSync } from "child_process";
 import { readFileSync } from "fs";
-import { resolveDaemonRecordPath, type DaemonRecord } from "./daemon-record";
+import { resolveDaemonRecordPathCandidates, type DaemonRecord } from "./daemon-record";
 import { discoverDaemon } from "./daemon-discovery";
 import { updateControlFile } from "./control-file";
 import { getStatusSnapshot } from "./commands/status";
@@ -393,8 +393,8 @@ async function restartFlow(opts: {
     ? daemonDiscovery.live?.record ?? null
     : daemonDiscovery.latestRecord;
   if (!daemonRecord) {
-    const recordPath = resolveDaemonRecordPath();
-    throw new Error(`Daemon record not found at ${recordPath}`);
+    const candidates = resolveDaemonRecordPathCandidates();
+    throw new Error(`Daemon record not found (checked: ${candidates.join(", ")})`);
   }
 
   if (daemonDiscovery.state === "live") {

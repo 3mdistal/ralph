@@ -5,6 +5,7 @@ import { tmpdir } from "os";
 import { Database } from "bun:sqlite";
 
 import {
+  bumpLoopTriageAttempt,
   closeStateDbForTests,
   completeRalphRun,
   createRalphRun,
@@ -12,6 +13,7 @@ import {
   deleteIdempotencyKey,
   ensureRalphRunGateRows,
   getIdempotencyPayload,
+  getLoopTriageAttempt,
   getLatestRunGateStateForIssue,
   getLatestRunGateStateForPr,
   getRalphRunGateState,
@@ -43,6 +45,7 @@ import {
   PR_STATE_OPEN,
   recordRollupMerge,
   upsertRalphRunGateResult,
+  shouldAllowLoopTriageAttempt,
   upsertIdempotencyKey,
 } from "../state";
 import { getRalphStateDbPath } from "../paths";
@@ -306,7 +309,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("17");
+      expect(meta.value).toBe("18");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -426,7 +429,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("17");
+      expect(meta.value).toBe("18");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -540,7 +543,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '17')");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '18')");
       db.exec(`
         CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
           run_id TEXT NOT NULL,
@@ -594,7 +597,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '17')");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '18')");
       db.exec("CREATE VIEW ralph_run_gate_results AS SELECT 'run-1' AS run_id");
     } finally {
       db.close();
@@ -909,7 +912,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("17");
+      expect(meta.value).toBe("18");
 
       migrated
         .query(
@@ -1172,7 +1175,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("17");
+      expect(meta.value).toBe("18");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -1280,6 +1283,65 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     } finally {
       db.close();
     }
+  });
+
+  test("records loop triage attempts per signature", () => {
+    initStateDb();
+
+    expect(getLoopTriageAttempt({ repo: "3mdistal/ralph", issueNumber: 347, signature: "sig-a" })).toBeNull();
+
+    const first = bumpLoopTriageAttempt({
+      repo: "3mdistal/ralph",
+      issueNumber: 347,
+      signature: "sig-a",
+      decision: "restart-new-agent",
+      rationale: "Parse failed",
+      nowMs: 1000,
+    });
+
+    expect(first.attemptCount).toBe(1);
+    expect(first.lastDecision).toBe("restart-new-agent");
+    expect(first.lastRationale).toBe("Parse failed");
+
+    const second = bumpLoopTriageAttempt({
+      repo: "3mdistal/ralph",
+      issueNumber: 347,
+      signature: "sig-a",
+      decision: "resume-existing",
+      rationale: "Model decision",
+      nowMs: 2000,
+    });
+    expect(second.attemptCount).toBe(2);
+
+    const differentSig = bumpLoopTriageAttempt({
+      repo: "3mdistal/ralph",
+      issueNumber: 347,
+      signature: "sig-b",
+      decision: "restart-ci-debug",
+      rationale: "CI override",
+      nowMs: 3000,
+    });
+    expect(differentSig.attemptCount).toBe(1);
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      const rows = db
+        .query("SELECT signature, attempt_count FROM loop_triage_attempts ORDER BY signature")
+        .all() as Array<{ signature: string; attempt_count: number }>;
+      expect(rows).toEqual([
+        { signature: "sig-a", attempt_count: 2 },
+        { signature: "sig-b", attempt_count: 1 },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("loop triage attempt budget helper is strict", () => {
+    expect(shouldAllowLoopTriageAttempt(0, 2)).toBe(true);
+    expect(shouldAllowLoopTriageAttempt(1, 2)).toBe(true);
+    expect(shouldAllowLoopTriageAttempt(2, 2)).toBe(false);
+    expect(shouldAllowLoopTriageAttempt(3, 2)).toBe(false);
   });
 
   test("lists open PR candidates for an issue", () => {

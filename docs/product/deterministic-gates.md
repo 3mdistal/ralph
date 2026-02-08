@@ -217,9 +217,7 @@ Behavior:
 - Detect: if required checks are failing or timed out, do not escalate until bounded remediation attempts complete.
 - Comment: post a single canonical GitHub **issue** comment listing failing required check names + links, base/head refs, and the action statement: “Ralph is spawning a dedicated CI-debug run to make required checks green.” Edit this comment as CI state changes (no duplicates).
 - Run: spawn a dedicated CI-debug run immediately with a fresh worktree and fresh OpenCode session (no planning phase). Seed the prompt with failing check names/URLs/refs and a brief failure summary.
-- Retries: bounded attempts; if the same failure signature repeats across attempts, stop early and escalate.
-
-Retries are per-lane configurable; do not assume a default count.
+- Retries: bounded attempts; configurable via `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` (default: 5). If the same failure signature repeats across attempts, stop early and escalate.
 
 - GitHub status: keep `ralph:status:in-progress` while remediation attempts continue. Set `ralph:status:escalated` only after bounded CI-debug attempts fail.
 - Escalation: post a final comment summarizing what failed, what was tried (links to attempts), and the exact next human action.
@@ -233,9 +231,7 @@ Behavior:
 - Comment: post a single canonical GitHub **issue** comment with PR/base/head refs, conflict file count/sample, and the action statement. Edit the same comment as state changes (no duplicates).
 - Run: spawn a dedicated merge-conflict recovery run with a fresh worktree and fresh OpenCode session (no planning phase). Merge base into head (no rebase / no force-push), resolve conflicts, run tests/typecheck/build/knip, then push updates.
 - Wait: after pushing, wait for `mergeStateStatus != DIRTY` and for required checks to appear for the new head SHA before resuming merge-gate logic.
-- Retries: bounded attempts (2–3). If the same conflict signature repeats across attempts, stop early and escalate.
-
-Retries are per-lane configurable; do not assume a default count.
+- Retries: bounded attempts; configurable via `RALPH_MERGE_CONFLICT_MAX_ATTEMPTS` (default: 2). If the same conflict signature repeats across attempts, stop early and escalate.
 
 - GitHub status: keep `ralph:status:in-progress` while recovery attempts continue. Set `ralph:status:escalated` only after bounded attempts fail.
 - Escalation: post a final comment summarizing the conflict files and the exact next human action needed.
