@@ -17,7 +17,7 @@ export type TaskCommandValidationError = {
   message: string;
 };
 
-export const TASK_COMMAND_LABELS: readonly TaskCommandLabel[] = [
+const TASK_COMMAND_LABELS: readonly TaskCommandLabel[] = [
   RALPH_LABEL_CMD_QUEUE,
   RALPH_LABEL_CMD_PAUSE,
   RALPH_LABEL_CMD_STOP,
