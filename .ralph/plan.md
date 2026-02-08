@@ -43,15 +43,15 @@
 - [x] Close out #327 in two phases (avoid big-bang breakage)
   - [x] Phase 1: remove *runtime dependency* on bwrb while preserving contracts
     - [x] Config compatibility shim: legacy `queueBackend="bwrb"` maps deterministically to `github` (if auth configured) else `none`; legacy `bwrbVault` is ignored (no startup failure)
-    - [ ] Add a config-resolution matrix test (auth present/absent; explicit/implicit backend) and snapshot expected backend + warning diagnostics
-    - [ ] Extract bwrb-shaped identifiers out of core types
-      - [ ] Introduce a backend-agnostic task identity (repo + issue number) and stop requiring `_path`/`_name` in core flows
-      - [ ] Move any bwrb path/name normalization behind a thin adapter module (functional-core stays bwrb-free)
+    - [x] Add a config-resolution matrix test (auth present/absent; explicit/implicit backend) and snapshot expected backend + warning diagnostics
+    - [x] Extract bwrb-shaped identifiers out of core types
+      - [x] Introduce a backend-agnostic task identity (repo + issue number) and stop requiring `_path`/`_name` in core flows
+      - [x] Move any bwrb path/name normalization behind a thin adapter module (functional-core stays bwrb-free)
     - [x] Replace any remaining operator-visible escalation/notification behavior that currently depends on bwrb artifacts/notes with GitHub + SQLite pointers
     - [x] Add contract tests for `status --json` / queue backend state to prevent output drift
     - [x] Add config migration tests (legacy config still boots; no vault required)
-    - [ ] Add a regression guard that fails if runtime code shells out to `bwrb` (focused unit test around the runner, or a static scan in tests)
-    - [ ] Add one degraded-mode integration test: GitHub label writes blocked -> SQLite remains authoritative -> reconciliation converges when unblocked
+    - [x] Add a regression guard that fails if runtime code shells out to `bwrb` (focused unit test around the runner, or a static scan in tests)
+    - [x] Add one degraded-mode integration test: GitHub label writes blocked -> SQLite remains authoritative -> reconciliation converges when unblocked
   - [ ] Phase 2: delete codepaths and docs
     - [x] Delete `src/bwrb/**` and remove bwrb subprocess calls
     - [x] Remove bwrb queue backend implementation and any vault layout checks
