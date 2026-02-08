@@ -5,7 +5,7 @@ import { hasProductGap } from "../product-gap";
 import type { EscalationType } from "../github/escalation-constants";
 import type { ConsultantDecision } from "../escalation-consultant/core";
 
-export const AUTO_RESOLVE_MAX_ATTEMPTS = 2;
+const AUTO_RESOLVE_MAX_ATTEMPTS = 2;
 
 type LoopLedgerEntry = {
   attempts: number;
