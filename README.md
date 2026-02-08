@@ -2,11 +2,11 @@
 
 Autonomous coding task orchestrator for OpenCode.
 
-Ralph watches for GitHub issues labeled with `ralph:*` workflow labels (with optional bwrb fallback) and dispatches them to OpenCode agents. It handles the full lifecycle: planning, implementation, PR creation, and merge.
+Ralph watches GitHub issues labeled with `ralph:*` workflow labels and dispatches them to OpenCode agents. It handles the full lifecycle: planning, implementation, PR creation, and merge.
 
 ## Features
 
-- **Queue-based task management** via GitHub issues (`ralph:*` labels) with optional bwrb fallback
+- **Queue-based task management** via GitHub issues (`ralph:*` labels)
 - **Parallel processing** across repos, sequential within each repo
 - **Smart escalation** when agents need human guidance (policy: `docs/escalation-policy.md`)
 - **Anomaly detection** catches agents stuck in loops
@@ -46,7 +46,6 @@ Optional flags: `--url`, `--host`, `--port`, `--token`, `--replay-last`.
 
 - [Bun](https://bun.sh) >= 1.0.0
 - [OpenCode](https://opencode.ai) CLI
-- [bwrb](https://github.com/3mdistal/bwrb) CLI >= 0.1.3 (`npm install -g bwrb`) (needed for `.bwrbignore` negation)
 - [gh](https://cli.github.com) CLI
 
 ## Worktree isolation guardrail
@@ -68,8 +67,6 @@ Optional: migrate safe legacy worktrees into the managed worktrees directory:
 ralph worktrees legacy --repo <owner/repo> --action migrate
 ```
 
-If you previously installed bwrb via `pnpm link -g`, unlink it first so Ralph uses the published CLI on your PATH (Bun just shells out to the `bwrb` binary).
-
 ## Installation
 
 ```bash
@@ -82,11 +79,7 @@ bun install
 
 Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
-When using the GitHub queue backend, `bwrbVault` is optional. When `queueBackend = "bwrb"`, `bwrbVault` resolves to the nearest directory containing `.bwrb/schema.json` starting from the current working directory (fallback: `process.cwd()`). This is a convenience for local development; for daemon use, set `bwrbVault` explicitly so Ralph always reads/writes the same queue. This repo ships with a vault schema at `.bwrb/schema.json`, so you can use your `ralph` checkout as the vault (and keep orchestration notes out of unrelated repos).
-
-`bwrb` is a legacy backend. GitHub Issues plus `~/.ralph/state.sqlite` are the canonical queue surfaces. Existing bwrb usage (escalation notes, agent-run notes, notifications) is best-effort mirror output only, and new bwrb-dependent behavior should not be added.
-
-Note: `orchestration/` is gitignored in this repo, but bwrb still needs to traverse it for queue operations. `.bwrbignore` re-includes `orchestration/**` for bwrb even when `.gitignore` excludes it; if your queue appears empty, check `bwrb --version` and upgrade to >= 0.1.3.
+GitHub Issues + labels are the operator queue surface. `~/.ralph/state.sqlite` is Ralph's canonical local machine state.
 
 Config is loaded once at startup, so restart the daemon after editing.
 
@@ -202,8 +195,7 @@ ralph sandbox tag --failed --apply
 
 ### Supported settings
 
-- `queueBackend` (string): `github` (default), `bwrb`, or `none` (single daemon per queue required for GitHub)
-- `bwrbVault` (string): bwrb vault path for the task queue (required when `queueBackend = "bwrb"`)
+- `queueBackend` (string): `github` (default) or `none` (single daemon per queue required for GitHub)
 - `devDir` (string): base directory used to derive repo paths when not explicitly configured
 - `owner` (string): default GitHub owner for short repo names
 - `profile` (string): `prod` (default) or `sandbox`
@@ -469,18 +461,10 @@ ralph sandbox seed --repo <owner/repo> --manifest sandbox/seed-manifest.v1.json 
 
 ### Queue a task
 
-Create an `agent-task` note in your bwrb vault:
+Use GitHub labels on the issue:
 
 ```bash
-bwrb new agent-task --json '{
-  "name": "repo 123 - Fix the bug",
-  "issue": "owner/repo#123",
-  "repo": "owner/repo",
-  "status": "queued",
-  "priority": "p2-medium",
-  "scope": "builder",
-  "creation-date": "2026-01-09"
-}'
+gh issue edit <number> --add-label "ralph:status:queued"
 ```
 
 Ralph will pick it up and dispatch an agent.
@@ -488,11 +472,6 @@ Ralph will pick it up and dispatch an agent.
 ## Architecture
 
 ```
-orchestration/
-  tasks/          # agent-task notes (queue)
-  runs/           # agent-run notes (completed work)
-  escalations/    # agent-escalation notes (needs human)
-
 ~/.ralph/
   config.toml     # preferred config (if present)
   config.json     # fallback config
@@ -502,13 +481,13 @@ orchestration/
 
 ## How it works
 
-1. **Watch** - Ralph watches `orchestration/tasks/**` for queued (and restart-orphaned starting) tasks
+1. **Watch** - Ralph watches GitHub issues with `ralph:status:queued` (and restart-orphaned `starting`) tasks
 2. **Dispatch** - Runs the planner prompt with `--agent ralph-plan`
 3. **Route** - Parses agent's decision (policy: `docs/escalation-policy.md`): proceed or escalate
 4. **Build** - If proceeding, tells agent to implement
 5. **Monitor** - Watches for anomalies (stuck loops)
 6. **Complete** - Extracts PR URL, triggers merge, runs survey
-7. **Record** - Creates `agent-run` note with session summary
+7. **Record** - Persists run metadata and gate artifacts to SQLite
 
 ## Session Persistence
 

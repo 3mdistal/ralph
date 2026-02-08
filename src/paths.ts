@@ -56,6 +56,10 @@ export function getRalphOpencodeConfigDir(): string {
   return join(getRalphHomeDir(), "opencode");
 }
 
+export function getRalphGhConfigDir(): string {
+  return join(getRalphHomeDir(), "gh");
+}
+
 export function getRalphLegacyConfigPath(): string {
   return join(resolveHomeDir(), ".config", "opencode", "ralph", "ralph.json");
 }

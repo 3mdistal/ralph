@@ -28,6 +28,7 @@ export type ReviewDiffArtifacts = {
   headRef: string;
   diffPath: string;
   diffStat: string;
+  diffExcerpt?: string;
 };
 
 export type ReviewGateResult = {
@@ -37,20 +38,107 @@ export type ReviewGateResult = {
 };
 
 const REVIEW_MARKER_PREFIX = "RALPH_REVIEW:";
+const REVIEW_MARKER_REGEX = /^\s*RALPH_REVIEW\b\s*[:\-]?\s*/i;
+const MARKDOWN_FENCE_LINE_REGEX = /^```(?:[a-z0-9_-]+)?$/i;
+
+function tryParseReviewPayload(jsonText: string):
+  | { ok: true; status: "pass" | "fail"; reason: string }
+  | { ok: false; reason: string } {
+  if (!jsonText.trim()) {
+    return { ok: false, reason: "Review marker invalid: missing JSON payload" };
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (error: any) {
+    return {
+      ok: false,
+      reason: `Review marker invalid: malformed JSON (${error?.message ?? String(error)})`,
+    };
+  }
+
+  const status = parsed?.status;
+  if (status !== "pass" && status !== "fail") {
+    return { ok: false, reason: "Review marker invalid: status must be pass|fail" };
+  }
+
+  const reason = typeof parsed?.reason === "string" ? parsed.reason.trim() : "";
+  if (!reason) {
+    return { ok: false, reason: "Review marker invalid: reason is required" };
+  }
+
+  return { ok: true, status, reason };
+}
+
+function tryParseFallbackPayload(lines: string[], lastNonEmptyIndex: number):
+  | { ok: true; status: "pass" | "fail"; reason: string }
+  | { ok: false } {
+  const candidates: string[] = [];
+  const lastLine = lines[lastNonEmptyIndex].trim();
+
+  candidates.push(lastLine);
+
+  if (lastLine.startsWith("`") && lastLine.endsWith("`") && lastLine.length >= 2) {
+    candidates.push(lastLine.replace(/^`+|`+$/g, "").trim());
+  }
+
+  if (lastLine === "```") {
+    let i = lastNonEmptyIndex - 1;
+    while (i >= 0 && !lines[i].trim()) i -= 1;
+    if (i >= 0) {
+      candidates.push(lines[i].trim());
+    }
+  }
+
+  for (let start = lastNonEmptyIndex; start >= 0; start -= 1) {
+    if (lines[start].includes("{")) {
+      candidates.push(lines.slice(start, lastNonEmptyIndex + 1).join("\n").trim());
+      break;
+    }
+  }
+
+  for (const candidate of candidates) {
+    const parsed = tryParseReviewPayload(candidate);
+    if (parsed.ok) {
+      return parsed;
+    }
+  }
+
+  return { ok: false };
+}
 
 export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult {
   const text = String(output ?? "");
   const lines = text.split(/\r?\n/);
-  let lastNonEmptyIndex = -1;
+  let rawLastNonEmptyIndex = -1;
   const markerIndices: number[] = [];
 
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i];
     const trimmed = line.trim();
-    if (trimmed) lastNonEmptyIndex = i;
-    if (line.trimStart().startsWith(REVIEW_MARKER_PREFIX)) {
+    if (trimmed) rawLastNonEmptyIndex = i;
+    if (REVIEW_MARKER_REGEX.test(line)) {
       markerIndices.push(i);
     }
+  }
+
+  if (rawLastNonEmptyIndex < 0) {
+    return {
+      ok: false,
+      failure: "empty_output",
+      reason: "Review marker invalid: output was empty",
+    };
+  }
+
+  let lastNonEmptyIndex = rawLastNonEmptyIndex;
+  while (lastNonEmptyIndex >= 0) {
+    const line = lines[lastNonEmptyIndex].trim();
+    if (!line || MARKDOWN_FENCE_LINE_REGEX.test(line)) {
+      lastNonEmptyIndex -= 1;
+      continue;
+    }
+    break;
   }
 
   if (lastNonEmptyIndex < 0) {
@@ -62,6 +150,15 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
   }
 
   if (markerIndices.length === 0) {
+    const fallbackPayload = tryParseFallbackPayload(lines, lastNonEmptyIndex);
+    if (fallbackPayload.ok) {
+      return {
+        ok: true,
+        status: fallbackPayload.status,
+        reason: fallbackPayload.reason,
+        markerLine: `${REVIEW_MARKER_PREFIX} ${lines[lastNonEmptyIndex].trim()}`,
+      };
+    }
     return {
       ok: false,
       failure: "missing_marker",
@@ -86,7 +183,7 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
   }
 
   const markerLine = lines[lastNonEmptyIndex].trim();
-  if (!markerLine.startsWith(REVIEW_MARKER_PREFIX)) {
+  if (!REVIEW_MARKER_REGEX.test(markerLine)) {
     return {
       ok: false,
       failure: "missing_marker",
@@ -94,94 +191,139 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
     };
   }
 
-  const jsonText = markerLine.slice(REVIEW_MARKER_PREFIX.length).trim();
-  if (!jsonText) {
-    return {
-      ok: false,
-      failure: "missing_json",
-      reason: "Review marker invalid: missing JSON payload",
-    };
+  const jsonText = markerLine.replace(REVIEW_MARKER_REGEX, "").trim();
+  const payload = tryParseReviewPayload(jsonText);
+  if (!payload.ok) {
+    const reason = payload.reason;
+    if (reason.includes("missing JSON payload")) {
+      return { ok: false, failure: "missing_json", reason };
+    }
+    if (reason.includes("malformed JSON")) {
+      return { ok: false, failure: "invalid_json", reason };
+    }
+    if (reason.includes("status must be")) {
+      return { ok: false, failure: "invalid_status", reason };
+    }
+    return { ok: false, failure: "missing_reason", reason };
   }
 
-  let parsed: any;
-  try {
-    parsed = JSON.parse(jsonText);
-  } catch (error: any) {
-    return {
-      ok: false,
-      failure: "invalid_json",
-      reason: `Review marker invalid: malformed JSON (${error?.message ?? String(error)})`,
-    };
-  }
-
-  const status = parsed?.status;
-  if (status !== "pass" && status !== "fail") {
-    return {
-      ok: false,
-      failure: "invalid_status",
-      reason: "Review marker invalid: status must be pass|fail",
-    };
-  }
-
-  const reason = typeof parsed?.reason === "string" ? parsed.reason.trim() : "";
-  if (!reason) {
-    return {
-      ok: false,
-      failure: "missing_reason",
-      reason: "Review marker invalid: reason is required",
-    };
-  }
-
-  return { ok: true, status, reason, markerLine };
+  return { ok: true, status: payload.status, reason: payload.reason, markerLine };
 }
 
 function buildReviewPrompt(params: {
   repo: string;
   issueRef: string;
-  prUrl: string;
+  prUrl?: string;
   baseRef: string;
   headRef: string;
   diffPath: string;
   diffStat: string;
+  diffExcerpt?: string;
   issueContext?: string;
 }): string {
-  const stat = params.diffStat.trim() || "(no changes)";
+  const stat = (typeof params.diffStat === "string" ? params.diffStat : "").trim() || "(no changes)";
+  const excerpt = (typeof params.diffExcerpt === "string" ? params.diffExcerpt : "").trim() || "(diff excerpt unavailable)";
   const issueContext = params.issueContext?.trim();
 
   const lines = [
     "Review request (deterministic gate)",
+    "IMPORTANT: respond with exactly one line; do not call tools.",
+    "If uncertain, return fail with a concise actionable reason.",
     `Repo: ${params.repo}`,
     `Issue: ${params.issueRef}`,
-    `PR: ${params.prUrl}`,
+    params.prUrl?.trim() ? `PR: ${params.prUrl.trim()}` : "PR: (not created yet)",
     `Base: ${params.baseRef}`,
     `Head: ${params.headRef}`,
     "",
-    "Diff artifact (read this file; do not request pasted diff chunks):",
+    "Intent (required):",
+    "- Describe the user-facing behavior change.",
+    "",
+    "Risk (required):",
+    "- Describe what could break and where.",
+    "",
+    "Testing notes (required):",
+    "- Note tests added/updated and why they matter.",
+    "",
+    "Consistency/reuse (required):",
+    "- Explain which existing modules/patterns this follows (or why divergence is necessary).",
+    "",
+    "Full diff artifact (read this file; do NOT request pasted diff chunks; do NOT paste full diff back verbatim):",
     params.diffPath,
     "",
     "git diff --stat:",
     stat,
+    "",
+    "Diff excerpt (truncated):",
+    excerpt,
   ];
 
   if (issueContext) {
     lines.push("", "Issue context:", issueContext);
   }
 
-  lines.push("", "Return the required RALPH_REVIEW marker on the final line.");
+  lines.push(
+    "",
+    "Do not call tools. Do not request additional files. Do not add explanation text.",
+    "Return the required RALPH_REVIEW marker on the final line.",
+    "Final line format:",
+    'RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}',
+    "Do not add any text before or after the marker line."
+  );
 
   return lines.join("\n");
 }
 
+function buildReviewRepairPrompt(reason: string): string {
+  return [
+    "Your prior review response failed deterministic marker parsing.",
+    `Parser error: ${reason}`,
+    "Do not call tools.",
+    "Do not change your decision; only fix the marker formatting.",
+    "Re-emit your decision as exactly one final line with valid JSON:",
+    'RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}',
+    "No code fences.",
+    "No extra lines before or after.",
+  ].join("\n");
+}
+
+const MAX_REPAIR_ATTEMPTS = 2;
+const REVIEW_DIFF_EXCERPT_MAX_CHARS = 20_000;
+
+function buildDiffExcerpt(diffText: string): string {
+  const normalized = String(diffText ?? "").trim();
+  if (!normalized) return "";
+  if (normalized.length <= REVIEW_DIFF_EXCERPT_MAX_CHARS) return normalized;
+  return `${normalized.slice(0, REVIEW_DIFF_EXCERPT_MAX_CHARS)}\n... (truncated)`;
+}
+
 function buildDiffArtifactNote(params: ReviewDiffArtifacts): string {
-  const stat = params.diffStat.trim() || "(no changes)";
+  const stat = (typeof params.diffStat === "string" ? params.diffStat : "").trim() || "(no changes)";
+  const base = params.baseRef.trim();
+  const head = params.headRef.trim();
+  const range = base && head ? `origin/${base}...${head}` : "(unresolved)";
   return [
     "Review diff artifact:",
     `Path: ${params.diffPath}`,
     `Base: ${params.baseRef}`,
     `Head: ${params.headRef}`,
+    `Range: ${range}`,
     "git diff --stat:",
     stat,
   ].join("\n");
+}
+
+function isCommitSha(value: string): boolean {
+  return /^[0-9a-f]{7,40}$/i.test(value.trim());
+}
+
+function resolveHeadForDiff(headRef: string): string {
+  const head = headRef.trim();
+  if (!head) return "";
+  if (head === "HEAD") return "HEAD";
+  if (isCommitSha(head)) return head;
+  if (head.startsWith("origin/")) return head;
+  if (head.startsWith("refs/")) return head;
+  return head;
 }
 
 async function execGitCommand(params: { cwd: string; args: string[] }): Promise<string> {
@@ -225,13 +367,10 @@ export async function prepareReviewDiffArtifacts(params: {
 
   const diffPath = join(artifactsDir, "review-diff.patch");
   const baseRef = params.baseRef.trim();
-  const headRef = params.headRef.trim();
+  const headRef = resolveHeadForDiff(params.headRef);
 
   if (baseRef) {
     await execGit(["fetch", "origin", baseRef]);
-  }
-  if (headRef) {
-    await execGit(["fetch", "origin", headRef]);
   }
 
   const baseForDiff = baseRef ? `origin/${baseRef}` : "";
@@ -240,8 +379,8 @@ export async function prepareReviewDiffArtifacts(params: {
     throw new Error("Missing base/head refs for review diff");
   }
 
-  const diffStat = (await execGit(["diff", "--stat", range])).trim();
-  const diffText = await execGit(["diff", range]);
+  const diffStat = (await execGit(["diff", "--no-color", "--stat", range])).trim();
+  const diffText = await execGit(["diff", "--no-color", range]);
   await writeFile(diffPath, diffText, "utf8");
 
   return {
@@ -249,6 +388,7 @@ export async function prepareReviewDiffArtifacts(params: {
     headRef,
     diffPath,
     diffStat,
+    diffExcerpt: buildDiffExcerpt(diffText),
   };
 }
 
@@ -279,6 +419,7 @@ export async function runReviewGate(params: {
   issueContext?: string;
   diff: ReviewDiffArtifacts;
   runAgent: (prompt: string) => Promise<SessionResult>;
+  runRepairAgent?: (prompt: string, continueSessionId?: string) => Promise<SessionResult>;
 }): Promise<ReviewGateResult> {
   const { runId, gate, diff } = params;
   upsertRalphRunGateResult({ runId, gate, status: "pending" });
@@ -292,6 +433,7 @@ export async function runReviewGate(params: {
     headRef: diff.headRef,
     diffPath: diff.diffPath,
     diffStat: diff.diffStat,
+    diffExcerpt: diff.diffExcerpt,
     issueContext: params.issueContext,
   });
 
@@ -324,12 +466,50 @@ export async function runReviewGate(params: {
     return { status: "fail", reason, sessionId: result.sessionId };
   }
 
-  const parsed = parseRalphReviewMarker(output);
+  let parsed = parseRalphReviewMarker(output);
+  let finalSessionId = result.sessionId;
+  let lastParseReason = parsed.ok ? "" : parsed.reason;
+
+  for (let attempt = 1; !parsed.ok && attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
+    const repairPrompt = buildReviewRepairPrompt(lastParseReason);
+    recordRalphRunGateArtifact({
+      runId,
+      gate,
+      kind: "note",
+      content: [`Review marker parse failed (attempt ${attempt}); requesting repair:`, lastParseReason].join("\n"),
+    });
+
+    try {
+      const repairRunner = params.runRepairAgent ?? ((prompt: string) => params.runAgent(prompt));
+      const repair = await repairRunner(repairPrompt, finalSessionId);
+      finalSessionId = repair.sessionId ?? finalSessionId;
+      const repairedOutput = repair.output ?? "";
+      recordRalphRunGateArtifact({
+        runId,
+        gate,
+        kind: "note",
+        content: [`Review repair output (attempt ${attempt}):`, repairedOutput].join("\n").trim(),
+      });
+
+      if (!repair.success) {
+        lastParseReason = "Review repair attempt did not complete successfully";
+        continue;
+      }
+
+      parsed = parseRalphReviewMarker(repairedOutput);
+      if (!parsed.ok) {
+        lastParseReason = parsed.reason;
+      }
+    } catch {
+      lastParseReason = "Review repair attempt failed to execute";
+    }
+  }
+
   if (!parsed.ok) {
     upsertRalphRunGateResult({ runId, gate, status: "fail", reason: parsed.reason });
-    return { status: "fail", reason: parsed.reason, sessionId: result.sessionId };
+    return { status: "fail", reason: parsed.reason, sessionId: finalSessionId };
   }
 
   upsertRalphRunGateResult({ runId, gate, status: parsed.status, reason: parsed.reason });
-  return { status: parsed.status, reason: parsed.reason, sessionId: result.sessionId };
+  return { status: parsed.status, reason: parsed.reason, sessionId: finalSessionId };
 }

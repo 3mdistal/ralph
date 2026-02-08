@@ -1,6 +1,6 @@
 # Plan: Trace bundle exporter for sandbox runs (#254)
 
-## Goal
+This file is a lightweight scratch plan used during agent work.
 
 - Persist a run-scoped trace directory keyed by `runId` with worker/tool timeline and GitHub request ids.
 - Add `sandbox:collect` to package logs + manifest + key links into one folder.

@@ -72,4 +72,26 @@ describe("OpenCode config env", () => {
     const env = __buildOpencodeEnvForTests({ repo: "demo", cacheKey: "789" });
     expect(env.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
   });
+
+  test("sets temp environment variables when tempDir is provided", () => {
+    const tempDir = join(homeDir, "worktree", ".ralph-tmp");
+    const env = __buildOpencodeEnvForTests({ repo: "demo", cacheKey: "tmp", tempDir });
+
+    expect(env.TMPDIR).toBe(tempDir);
+    expect(env.TMP).toBe(tempDir);
+    expect(env.TEMP).toBe(tempDir);
+  });
+
+  test("tempDir override wins over inherited TMP variables", () => {
+    process.env.TMPDIR = "/tmp/inherited";
+    process.env.TMP = "/tmp/inherited";
+    process.env.TEMP = "/tmp/inherited";
+
+    const tempDir = join(homeDir, "override", ".ralph-tmp");
+    const env = __buildOpencodeEnvForTests({ repo: "demo", cacheKey: "tmp-override", tempDir });
+
+    expect(env.TMPDIR).toBe(tempDir);
+    expect(env.TMP).toBe(tempDir);
+    expect(env.TEMP).toBe(tempDir);
+  });
 });

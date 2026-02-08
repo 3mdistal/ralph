@@ -1,6 +1,6 @@
 import { describe, expect, mock, test, beforeEach } from "bun:test";
 
-// Mock queue updates so tests don't touch the real vault.
+// Mock queue updates so tests do not touch persistent state.
 const updateTaskStatusMock = mock(async () => true);
 
 const queueAdapter = {
@@ -16,8 +16,8 @@ function createMockTask(overrides: Record<string, unknown> = {}) {
     type: "agent-task",
     "creation-date": "2026-01-10",
     scope: "builder",
-    issue: "3mdistal/bwrb#319",
-    repo: "3mdistal/bwrb",
+    issue: "3mdistal/ralph#319",
+    repo: "3mdistal/ralph",
     status: "queued",
     priority: "p2-medium",
     name: "Test Task",
@@ -37,7 +37,7 @@ describe("closed issue guardrail", () => {
       labels: [],
       title: "Already fixed",
       state: "CLOSED",
-      url: "https://github.com/3mdistal/bwrb/issues/319",
+      url: "https://github.com/3mdistal/ralph/issues/319",
       closedAt: "2026-01-09T21:24:15Z",
       stateReason: "completed",
     };
@@ -82,7 +82,7 @@ describe("closed issue guardrail", () => {
       labels: [],
       title: "Already fixed",
       state: "CLOSED",
-      url: "https://github.com/3mdistal/bwrb/issues/319",
+      url: "https://github.com/3mdistal/ralph/issues/319",
       closedAt: "2026-01-09T21:24:15Z",
       stateReason: "completed",
     };

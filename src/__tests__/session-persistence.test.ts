@@ -1,5 +1,5 @@
 import { describe, test, expect, mock, beforeEach, afterEach } from "bun:test";
-import type { AgentTask } from "../queue";
+import type { AgentTask } from "../queue/types";
 import { getRalphRunLogPath } from "../paths";
 
 /**
@@ -261,7 +261,7 @@ describe("groupByRepo behavior", () => {
   test("groups tasks by repo correctly", () => {
     const tasks = [
       createMockTask({ repo: "3mdistal/ralph", name: "Ralph Task 1" }),
-      createMockTask({ repo: "3mdistal/bwrb", name: "BWRB Task 1" }),
+      createMockTask({ repo: "3mdistal/agentlib", name: "Agentlib Task 1" }),
       createMockTask({ repo: "3mdistal/ralph", name: "Ralph Task 2" }),
     ];
 
@@ -274,105 +274,6 @@ describe("groupByRepo behavior", () => {
 
     expect(grouped.size).toBe(2);
     expect(grouped.get("3mdistal/ralph")?.length).toBe(2);
-    expect(grouped.get("3mdistal/bwrb")?.length).toBe(1);
-  });
-});
-
-describe("Queue discovery", () => {
-  let dataset: AgentTask[] = [];
-  let lastCommand = "";
-
-  function buildCommand(strings: TemplateStringsArray, values: unknown[]): string {
-    let out = "";
-    for (let i = 0; i < strings.length; i++) {
-      out += strings[i] ?? "";
-      if (i < values.length) out += String(values[i]);
-    }
-    return out;
-  }
-
-  function applyWhereFilter(rows: AgentTask[], cmd: string): AgentTask[] {
-    if (cmd.includes("type == 'agent-task'")) {
-      rows = rows.filter((r) => r.type === "agent-task");
-    }
-
-    const statusMatch = cmd.match(/status == '([^']+)'/);
-    if (statusMatch?.[1]) {
-      const status = statusMatch[1] as AgentTask["status"];
-      rows = rows.filter((r) => r.status === status);
-    }
-
-    return rows;
-  }
-
-  function createMockBwrbRunner() {
-    return (strings: TemplateStringsArray, ...values: unknown[]) => {
-      lastCommand = buildCommand(strings, values);
-
-      const runner = {
-        cwd: () => runner,
-        quiet: async () => {
-          const filtered = applyWhereFilter(dataset, lastCommand);
-          return { stdout: Buffer.from(JSON.stringify(filtered)) };
-        },
-      };
-
-      return runner;
-    };
-  }
-
-  async function loadQueue() {
-    return await import("../queue");
-  }
-
-  beforeEach(async () => {
-    dataset = [];
-    lastCommand = "";
-
-    const queue = await loadQueue();
-    queue.__setBwrbRunnerForTests(createMockBwrbRunner());
-  });
-
-  afterEach(async () => {
-    const queue = await loadQueue();
-    queue.__resetBwrbRunnerForTests();
-  });
-
-  test("discovers queued agent-task notes nested under orchestration/tasks/**", async () => {
-    dataset = [
-      createMockTask({ _path: "orchestration/tasks/Foo/bar.md", _name: "bar", status: "queued" }),
-      createMockTask({ _path: "orchestration/tasks/root-task.md", _name: "root-task", status: "queued" }),
-      createMockTask({ _path: "orchestration/tasks/Baz/qux.md", _name: "qux", status: "done" }),
-    ];
-
-    const { getQueuedTasks } = await loadQueue();
-    const tasks = await getQueuedTasks();
-
-    expect(lastCommand).toContain("bwrb list");
-    expect(lastCommand).toContain("--path orchestration/tasks/**");
-    expect(lastCommand).toContain("type == 'agent-task'");
-    expect(lastCommand).toContain("status == 'queued'");
-
-    expect(tasks.map((t) => t._path).sort()).toEqual(
-      ["orchestration/tasks/Foo/bar.md", "orchestration/tasks/root-task.md"].sort()
-    );
-  });
-
-  test("queries status using bwrb --where instead of JS filtering", async () => {
-    dataset = [
-      createMockTask({ _path: "orchestration/tasks/a.md", _name: "a", status: "in-progress" }),
-      createMockTask({ _path: "orchestration/tasks/b.md", _name: "b", status: "queued" }),
-      createMockTask({ _path: "orchestration/tasks/c.md", _name: "c", status: "starting" }),
-    ];
-
-    const { getTasksByStatus } = await loadQueue();
-
-    const inProgressTasks = await getTasksByStatus("in-progress");
-    expect(lastCommand).toContain("status == 'in-progress'");
-    expect(inProgressTasks.map((t) => t._path)).toEqual(["orchestration/tasks/a.md"]);
-
-    const startingTasks = await getTasksByStatus("starting");
-    expect(lastCommand).toContain("status == 'starting'");
-    expect(startingTasks.map((t) => t._path)).toEqual(["orchestration/tasks/c.md"]);
+    expect(grouped.get("3mdistal/agentlib")?.length).toBe(1);
   });
 });
