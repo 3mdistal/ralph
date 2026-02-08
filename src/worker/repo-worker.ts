@@ -1628,6 +1628,40 @@ export class RepoWorker {
     };
   }
 
+  private async escalateMissingPrWithDerivedReason(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    continueAttempts: number;
+    evidence: string[];
+    latestOutput: string;
+    prRecoveryDiagnostics: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    const derived = derivePrCreateEscalationReason({
+      continueAttempts: params.continueAttempts,
+      evidence: params.evidence,
+    });
+    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+
+    this.recordMissingPrEvidence({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      botBranch: params.botBranch,
+      reason: derived.reason,
+      blockedSource: derived.classification?.blockedSource,
+      diagnostics: planOutput,
+    });
+
+    return await this.escalateNoPrAfterRetries({
+      task: params.task,
+      reason: derived.reason,
+      details: derived.details,
+      planOutput,
+      sessionId: params.sessionId,
+    });
+  }
+
   private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
     return await this.branchProtection.fetchAvailableCheckContexts(branch);
   }
@@ -2236,6 +2270,7 @@ export class RepoWorker {
     issueNumber: string;
     botBranch: string;
     reason: string;
+    blockedSource?: string;
     diagnostics?: string;
   }): void {
     const runId = this.activeRunId;
@@ -2259,6 +2294,7 @@ export class RepoWorker {
       const content = [
         "PR evidence gate failed: missing PR URL.",
         `Reason: ${params.reason}`,
+        params.blockedSource ? `Blocked source: ${params.blockedSource}` : null,
         `Issue: ${params.task.issue}`,
         `Worktree: ${worktreePath}`,
         "",
@@ -5842,23 +5878,14 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const derived = derivePrCreateEscalationReason({
-          continueAttempts,
-          evidence: prCreateEvidence,
-        });
-        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
-        this.recordMissingPrEvidence({
+        return await this.escalateMissingPrWithDerivedReason({
           task,
           issueNumber,
           botBranch,
-          reason: derived.reason,
-          diagnostics: planOutput,
-        });
-        return await this.escalateNoPrAfterRetries({
-          task,
-          reason: derived.reason,
-          details: derived.details,
-          planOutput,
+          continueAttempts,
+          evidence: prCreateEvidence,
+          latestOutput: buildResult.output,
+          prRecoveryDiagnostics,
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
         });
       }
@@ -7114,23 +7141,14 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const derived = derivePrCreateEscalationReason({
-          continueAttempts,
-          evidence: prCreateEvidence,
-        });
-        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
-        this.recordMissingPrEvidence({
+        return await this.escalateMissingPrWithDerivedReason({
           task,
           issueNumber,
           botBranch,
-          reason: derived.reason,
-          diagnostics: planOutput,
-        });
-        return await this.escalateNoPrAfterRetries({
-          task,
-          reason: derived.reason,
-          details: derived.details,
-          planOutput,
+          continueAttempts,
+          evidence: prCreateEvidence,
+          latestOutput: buildResult.output,
+          prRecoveryDiagnostics,
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
         });
       }
