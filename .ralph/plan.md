@@ -1,80 +1,69 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+---
+# Plan: Deprecate and remove bwrb (GitHub + SQLite) (#323)
 
 ## Goal
 
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
+- Stop using bwrb/Obsidian notes as part of Ralph's core state + control loop.
+- Target model:
+  - GitHub issues/labels/comments = operator interface + shared state
+  - SQLite (local) = canonical machine state (runs/tasks/events/alerts) + pointers to artifacts
+  - Optional JSONL trace files referenced from SQLite
+
+## Policy (immediate)
+
+- bwrb is legacy output-only (best-effort mirror). No new features should depend on bwrb.
+
+## Done (acceptance)
+
+- Operator control is exclusively via GitHub (`ralph:cmd:*`, `ralph:status:*`, `ralph:priority:*` labels + normal comments).
+- Canonical machine state is exclusively in `~/.ralph/state.sqlite` (runs/tasks/events/alerts + artifact pointers).
+- Notifications/alerts are operator-visible via GitHub with clear pointers back to SQLite/artifacts.
+- bwrb is not required to run Ralph.
+- No runtime behavior depends on bwrb (no vault required; no bwrb subprocess calls; no bwrb-backed control plane).
+- Long-term end state: remove bwrb references from repo code/docs entirely (except historical notes in closed GitHub issues).
 
 ## Assumptions
 
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+- Child work is authoritative; do not redo closed child issues.
+- Degraded GitHub label writes remain best-effort; orchestration continues safely from SQLite truth and reconciles later (`docs/product/orchestration-contract.md`).
+- SQLite migration policy remains forward-only, transactional, fail-closed on newer schema (`docs/ops/state-sqlite.md`).
 
 ## Checklist
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+- [x] Verify child #324 complete (freeze + deprecation; output-only posture)
+- [x] Verify child #325 complete (replace bwrb notify paths with SQLite + GitHub pointers)
+- [x] Verify child #326 complete (priority/status controls via GitHub labels + SQLite)
+- [ ] Complete child #327 (remove bwrb integration + delete remaining codepaths)
+- [x] Preserve contract surfaces while removing runtime dependency (config + status output)
+- [ ] Remove remaining bwrb references (code + canonical docs) after compatibility window
+- [x] Run deterministic gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
 
-## Steps
+## Execution Plan (remaining work)
 
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
+- [ ] Close out #327 in two phases (avoid big-bang breakage)
+  - [x] Phase 1: remove *runtime dependency* on bwrb while preserving contracts
+    - [x] Config compatibility shim: legacy `queueBackend="bwrb"` maps deterministically to `github` (if auth configured) else `none`; legacy `bwrbVault` is ignored (no startup failure)
+    - [ ] Add a config-resolution matrix test (auth present/absent; explicit/implicit backend) and snapshot expected backend + warning diagnostics
+    - [ ] Extract bwrb-shaped identifiers out of core types
+      - [ ] Introduce a backend-agnostic task identity (repo + issue number) and stop requiring `_path`/`_name` in core flows
+      - [ ] Move any bwrb path/name normalization behind a thin adapter module (functional-core stays bwrb-free)
+    - [x] Replace any remaining operator-visible escalation/notification behavior that currently depends on bwrb artifacts/notes with GitHub + SQLite pointers
+    - [x] Add contract tests for `status --json` / queue backend state to prevent output drift
+    - [x] Add config migration tests (legacy config still boots; no vault required)
+    - [ ] Add a regression guard that fails if runtime code shells out to `bwrb` (focused unit test around the runner, or a static scan in tests)
+    - [ ] Add one degraded-mode integration test: GitHub label writes blocked -> SQLite remains authoritative -> reconciliation converges when unblocked
+  - [ ] Phase 2: delete codepaths and docs
+    - [x] Delete `src/bwrb/**` and remove bwrb subprocess calls
+    - [x] Remove bwrb queue backend implementation and any vault layout checks
+    - [x] Remove bwrb-only tests/fixtures and update snapshots
+    - [ ] Update canonical docs and README to remove bwrb setup/control-plane references (at minimum: `README.md`, `docs/product/*`, `docs/ops/*`)
+    - [ ] File a follow-up issue to remove the legacy config shim and remaining `bwrb` tokens after a bounded compatibility window
 
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
-
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
-
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
-
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
-
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
-
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
-
-- [x] Run verification gates
-  - [x] `bun test`
-  - [x] `bun run typecheck`
+- [ ] Verification
+  - [ ] Smoke: Ralph starts and reports queue backend health without requiring any vault directory
+  - [x] Legacy config smoke: `queueBackend="bwrb"` does not crash; resolves to GitHub/none deterministically
+  - [x] No bwrb subprocess calls remain (no `bwrb ...` invocations)
+  - [ ] Scoped reference check:
+    - [ ] No bwrb references in canonical/operator docs and README
+    - [ ] Track remaining `bwrb` tokens in code as compatibility-only; remove in follow-up if required
+  - [x] Run full preflight gate commands (`bun test`, `bun run typecheck`, `bun run build`, `bun run knip`)

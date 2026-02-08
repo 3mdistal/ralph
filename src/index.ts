@@ -2,17 +2,16 @@
 /**
  * Ralph Loop - Autonomous Coding Task Orchestrator
  * 
- * Watches the queue backend (GitHub-first, bwrb legacy) for agent-tasks and dispatches them to OpenCode agents.
+ * Watches the queue backend (GitHub-first) for agent-tasks and dispatches them to OpenCode agents.
  * Processes tasks in parallel across repos, sequentially within each repo.
  * Creates rollup PRs after N successful merges for batch review.
  */
 
-import { existsSync, watch } from "fs";
+import { existsSync } from "fs";
 import { join } from "path";
 import crypto from "crypto";
 
 import {
-  ensureBwrbVaultLayout,
   getConfig,
   getDashboardEventsRetentionDays,
   getDashboardControlPlaneConfig,
@@ -29,7 +28,6 @@ import {
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
-  getBwrbVaultIfValid,
   getQueueBackendState,
   getQueueBackendStateWithLabelHealth,
   initialPoll,
@@ -296,23 +294,6 @@ const repoSemaphores = new Map<string, Semaphore>();
 
 const rrCursor = { value: 0 };
 const schedulerPriorityState = { value: createPrioritySelectorState() };
-
-function requireBwrbQueueOrExit(action: string): void {
-  const state = getQueueBackendState();
-  if (state.backend === "bwrb" && state.health === "ok") {
-    if (!ensureBwrbVaultLayout(getConfig().bwrbVault)) process.exit(1);
-    return;
-  }
-
-  if (state.backend !== "bwrb") {
-    console.warn(`[ralph] ${action} requires bwrb queue backend (current: ${state.backend}).`);
-    process.exit(1);
-  }
-
-  const reason = state.diagnostics ? ` ${state.diagnostics}` : "";
-  console.error(`[ralph] bwrb queue backend unavailable.${reason}`);
-  process.exit(1);
-}
 
 function maybeExitIfAllReposUnschedulableDueToLegacyLabels(repos: string[]): void {
   if (repos.length === 0) return;
@@ -629,9 +610,6 @@ function scheduleResumeTasksSoon(): void {
   schedulerController.scheduleResumeTasksSoon();
 }
 
-let escalationWatcher: ReturnType<typeof watch> | null = null;
-let escalationDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-
 const resumeAttemptedThisRun = new Set<string>();
 let resumeDisabledUntil = 0;
 
@@ -648,7 +626,7 @@ async function attemptResumeResolvedEscalations(): Promise<void> {
       resumeDisabledUntil = ts;
     },
     resumeDisableMs: RESUME_DISABLE_MS,
-    getVaultPathForLogs: () => getBwrbVaultIfValid() ?? "<unknown>",
+    getVaultPathForLogs: () => "<not-applicable>",
 
     ensureSemaphores,
     getGlobalSemaphore: () => globalSemaphore,
@@ -1463,10 +1441,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  if (queueState.backend === "bwrb") {
-    if (!ensureBwrbVaultLayout(config.bwrbVault)) process.exit(1);
-  }
-
   try {
     writeDaemonRecord({
       version: 1,
@@ -1757,9 +1731,6 @@ async function main(): Promise<void> {
   const backendSuffix = backendTags.length > 0 ? ` (${backendTags.join(", ")})` : "";
 
   console.log(`        Queue backend: ${queueState.backend}${backendSuffix}`);
-  if (queueState.backend === "bwrb") {
-    console.log(`        Vault: ${config.bwrbVault}`);
-  }
   if (queueState.diagnostics) {
     console.log(`        Queue diagnostics: ${queueState.diagnostics}`);
   }
@@ -1793,54 +1764,7 @@ async function main(): Promise<void> {
   // Initialize rollup monitor
   rollupMonitor = new RollupMonitor(config.batchSize);
 
-  if (queueState.backend === "bwrb") {
-    // Do initial poll on startup
-    console.log("[ralph] Running initial poll...");
-    const initialTasks = await initialPoll();
-    console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
-
-    if (initialTasks.length > 0 && getDaemonMode(config.control) !== "draining") {
-      await processNewTasks(initialTasks, config.control ?? {});
-    } else {
-      resetIdleState(initialTasks);
-    }
-
-    // Start file watching (no polling - watcher is reliable)
-    console.log("[ralph] Starting queue watcher...");
-    startWatching(async (tasks) => {
-      if (!isShuttingDown && getDaemonMode(config.control) !== "draining") {
-        await processNewTasks(tasks, config.control ?? {});
-      }
-    });
-
-    // Resume orphaned tasks from previous daemon runs.
-    void resumeTasksOnStartup({ awaitCompletion: false });
-
-    // Resume any resolved escalations (HITL checkpoint) from the same session.
-    void attemptResumeResolvedEscalations();
-
-    // Resume any tasks paused by hard throttle.
-    void attemptResumeThrottledTasks(config.control ?? {});
-
-    // Watch escalations for resolution and resume the same OpenCode session.
-    const escalationsDir = join(config.bwrbVault, "orchestration/escalations");
-    if (existsSync(escalationsDir)) {
-      console.log(`[ralph:escalations] Watching ${escalationsDir} for changes`);
-
-      escalationWatcher = watch(escalationsDir, { recursive: true }, async (_eventType: string, filename: string | null) => {
-        if (!filename || !filename.endsWith(".md")) return;
-
-        if (escalationDebounceTimer) clearTimeout(escalationDebounceTimer);
-        escalationDebounceTimer = setTimeout(() => {
-          attemptResumeResolvedEscalations().catch(() => {
-            // ignore
-          });
-        }, 750);
-      });
-    } else {
-      console.log(`[ralph:escalations] Escalations dir not found: ${escalationsDir}`);
-    }
-  } else if (queueState.backend === "github") {
+  if (queueState.backend === "github") {
     console.log("[ralph] Running initial poll...");
     const initialTasks = await getRunnableTasks();
     console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
@@ -1867,7 +1791,7 @@ async function main(): Promise<void> {
 
   const escalationConsultantScheduler = createEscalationConsultantScheduler({
     getEscalationsByStatus,
-    getVaultPath: () => getBwrbVaultIfValid(),
+    getVaultPath: () => null,
     isShuttingDown: () => isShuttingDown,
     allowModelSend: async () => {
       const requestedProfile = getRequestedOpencodeProfileName(null);
@@ -1895,10 +1819,10 @@ async function main(): Promise<void> {
   const heartbeatTimer = setInterval(() => {
     if (isShuttingDown) return;
 
-    // Avoid hitting bwrb repeatedly when the daemon is idle.
+    // Avoid unnecessary ownership checks when idle.
     if (inFlightTasks.size === 0 && ownedTasks.size === 0) return;
 
-    // Avoid overlapping ticks if bwrb/filesystem are slow.
+    // Avoid overlapping ticks if queue/status IO is slow.
     if (heartbeatInFlight) return;
     heartbeatInFlight = true;
 
@@ -1967,14 +1891,6 @@ async function main(): Promise<void> {
     githubLabelReconciler = null;
     githubCmdProcessor?.stop();
     githubCmdProcessor = null;
-    if (escalationWatcher) {
-      escalationWatcher.close();
-      escalationWatcher = null;
-    }
-    if (escalationDebounceTimer) {
-      clearTimeout(escalationDebounceTimer);
-      escalationDebounceTimer = null;
-    }
     schedulerController.clearTimers();
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
@@ -2335,8 +2251,6 @@ if (args[0] === "resume") {
     printCommandHelp("resume");
     process.exit(0);
   }
-
-  requireBwrbQueueOrExit("resume");
 
   // Resume any orphaned in-progress tasks and exit
   resumeSchedulingMode = "resume-only";
@@ -2759,8 +2673,6 @@ if (args[0] === "nudge") {
 
   const taskRef = taskRefRaw;
   const message = messageRaw;
-
-  requireBwrbQueueOrExit("nudge");
 
   const tasks = await getTasksByStatus("in-progress");
   if (tasks.length === 0) {
