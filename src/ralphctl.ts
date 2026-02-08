@@ -4,6 +4,8 @@ import { spawn } from "child_process";
 import { readDaemonRecord, resolveDaemonRecordPath, type DaemonRecord } from "./daemon-record";
 import { updateControlFile } from "./control-file";
 import { getStatusSnapshot } from "./commands/status";
+import { runDoctorCommand } from "./commands/doctor";
+import { renderDoctorHuman } from "./commands/doctor/render";
 import type { StatusSnapshot } from "./status-snapshot";
 import { startDashboardTui } from "./dashboard/client/ui-blessed";
 
@@ -24,6 +26,7 @@ function printGlobalHelp(): void {
       "  ralphctl dashboard [--url <url>] [--host <host>] [--port <port>] [--token <token>] [--replay-last <n>]",
       "  ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]",
       "  ralphctl resume",
+      "  ralphctl doctor [--json] [--apply] [--verbose] [--root <path>]",
       "  ralphctl restart [--grace 5m] [--force] [--start-cmd \"<command>\"]",
       "  ralphctl upgrade [--grace 5m] [--force] [--start-cmd \"<command>\"] [--upgrade-cmd \"<command>\"]",
       "",
@@ -33,6 +36,9 @@ function printGlobalHelp(): void {
       "  --timeout <dur>  Drain timeout (e.g. 30s, 5m)",
       "  --grace <dur>    Restart grace period (e.g. 30s, 5m)",
       "  --pause-at-checkpoint <name>  Pause workers at checkpoint while draining",
+      "  --apply          Apply doctor repair actions",
+      "  --verbose        Include per-record details in doctor output",
+      "  --root <path>    Override canonical control root for doctor",
       "  --start-cmd <cmd>             Override daemon start command",
       "  --upgrade-cmd <cmd>           Command to run before restart",
       "  --force          Proceed with kill even when safety checks fail",
@@ -68,6 +74,12 @@ function printCommandHelp(command: string): void {
       return;
     case "resume":
       console.log(["Usage:", "  ralphctl resume"].join("\n"));
+      return;
+    case "doctor":
+      console.log([
+        "Usage:",
+        "  ralphctl doctor [--json] [--apply] [--verbose] [--root <path>]",
+      ].join("\n"));
       return;
     case "restart":
       console.log([
@@ -442,6 +454,17 @@ async function run(): Promise<void> {
     }
     console.log(`Resume requested (control file: ${path}).`);
     process.exit(0);
+  }
+
+  if (cmd === "doctor") {
+    const json = hasFlag(args, "--json");
+    const apply = hasFlag(args, "--apply");
+    const verbose = hasFlag(args, "--verbose");
+    const rootOverride = getFlagValue(args, "--root") ?? undefined;
+    const { report, exitCode } = runDoctorCommand({ apply, rootOverride });
+    if (json) console.log(JSON.stringify(report, null, 2));
+    else console.log(renderDoctorHuman(report, { verbose }));
+    process.exit(exitCode);
   }
 
   if (cmd === "restart" || cmd === "upgrade") {

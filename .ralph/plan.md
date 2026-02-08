@@ -1,80 +1,82 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: Add `ralphctl doctor` for stale discovery/control record repair (#605)
 
 ## Goal
 
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
+- Provide an operator command (`ralphctl doctor`) that audits daemon discovery + control-plane artifacts across known roots.
+- Default is non-destructive: report findings + recommended actions.
+- Optional explicit repair mode applies safe, idempotent fixes.
+- Support machine-readable JSON output for CI/ops automation.
 
-## Assumptions
+## Key Inputs
 
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+- Issue: `https://github.com/3mdistal/ralph/issues/605`
+- Dependency chain:
+  - `#605` blocked by `#607` (profile-agnostic discovery + PID liveness)
+  - `#607` blocked by `#604` (canonical control root + authoritative registry)
+
+## Assumptions (explicit defaults)
+
+- Dry-run by default; repair only with `--apply`.
+- Doctor never kills or starts daemons.
+- Doctor does not change operational intent (does not change `control.json` mode). It may create missing discovery/registry records when explicitly applying repairs.
+- If multiple live daemons are detected, doctor fails closed (collision) and only recommends manual intervention.
+- PID liveness is tri-state:
+  - `alive`: `process.kill(pid, 0)` succeeds
+  - `dead`: throws `ESRCH`
+  - `unknown`: throws `EPERM` or non-standard errors
+  - Doctor must not quarantine/overwrite records based on `unknown` liveness.
+- Exit codes are automation-friendly and deterministic:
+  - `0`: `result=healthy` OR `result=repaired`
+  - `2`: `result=needs_repair` (dry-run)
+  - `3`: `result=collision` OR any apply-mode partial failures
+  - `1`: `result=error` (fatal audit error)
+
+## Output Contract (JSON v1)
+
+- `ralphctl doctor --json` prints JSON only to stdout.
+- Shape (versioned):
+  - `version: 1`
+  - `result: "healthy"|"needs_repair"|"repaired"|"collision"|"error"`
+  - `canonicalRoot: string | null`
+  - `searchedRoots: string[]`
+  - `records: Array<{ kind: "registry"|"daemon.json"|"control.json"; path: string; status: "live"|"stale"|"unreadable"|"missing"|"invalid"; details?: {...} }>`
+  - `findings: Array<{ code: string; severity: "info"|"warning"|"error"; message: string; recordPath?: string }>`
+  - `actions: Array<{ kind: "write"|"copy"|"move"|"quarantine"; from?: string; to?: string; ok: boolean; error?: string; preconditions?: {...} }>`
+  - `warnings: string[]`
 
 ## Checklist
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+- [x] Reconcile dependency surfaces from `#604` + `#607` (canonical root + registry, profile-agnostic discovery)
+- [x] Implement functional-core analysis + action planning (IO-free, unit-testable)
+- [x] Implement imperative-shell IO (root scan, safe reads, TOCTOU-safe apply)
+- [x] Keep boundaries tight (ralphctl routes only; doctor in dedicated modules)
+- [x] Wire into `src/ralphctl.ts` (`doctor` command + help/flags)
+- [x] Add high-signal tests for stale/mismatch/collision cases
+- [x] Update docs (`README.md`) with usage + exit codes + JSON note
+- [x] Run verification gates (`bun test`, `bun run typecheck`, `bun run build`, `bun run knip`)
 
 ## Steps
 
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
-
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
-
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
-
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
-
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
-
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
-
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
-
-- [x] Run verification gates
+- [x] Added dedicated doctor modules:
+  - [x] `src/commands/doctor/collect.ts`
+  - [x] `src/commands/doctor/core.ts`
+  - [x] `src/commands/doctor/execute.ts`
+  - [x] `src/commands/doctor/render.ts`
+  - [x] `src/commands/doctor/index.ts`
+- [x] Implemented root scanning across canonical + legacy + profile `xdgStateHome` roots.
+- [x] Implemented tri-state PID liveness (`alive|dead|unknown`) and collision detection.
+- [x] Implemented non-destructive default planning plus explicit `--apply` execution.
+- [x] Implemented TOCTOU precondition checks for apply actions (mtime/size drift checks).
+- [x] Added `ralphctl doctor` command integration (`--json`, `--apply`, `--verbose`, `--root`).
+- [x] Added JSON v1 report with `findings`, `actions`, `warnings`, and deterministic result states.
+- [x] Added tests:
+  - [x] `src/__tests__/doctor-core.test.ts`
+  - [x] `src/__tests__/doctor-execute.test.ts`
+- [x] Updated docs in `README.md` with command usage and exit codes.
+- [x] Verification gates completed:
   - [x] `bun test`
   - [x] `bun run typecheck`
+  - [x] `bun run build`
+  - [x] `bun run knip`
+
+Implementation note: until `#604` lands a separate canonical registry artifact, doctor treats canonical `daemon.json` as the authoritative registry surface for audit/repair.

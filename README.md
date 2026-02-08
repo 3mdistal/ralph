@@ -577,8 +577,18 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - `ralphctl status [--json]`
 - `ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]`
 - `ralphctl resume`
+- `ralphctl doctor [--json] [--apply] [--verbose] [--root <path>]`
 - `ralphctl restart [--grace 5m] [--start-cmd "<command>"]`
 - `ralphctl upgrade [--grace 5m] [--start-cmd "<command>"] [--upgrade-cmd "<command>"]`
+
+`ralphctl doctor` audits `daemon.json`/`control.json` across known roots, reports stale or mismatched records, and proposes repair actions. By default it is non-destructive (dry-run). Pass `--apply` to execute planned repairs (quarantine stale/invalid records and rewrite canonical daemon record when safe). Use `--json` for machine-readable output.
+
+Doctor exit codes:
+
+- `0`: healthy state or repairs applied successfully
+- `2`: repairs needed (dry-run; no changes made)
+- `3`: collision/partial failure (for example, multiple live daemons or apply failures)
+- `1`: fatal doctor error
 
 Daemon discovery for restart/upgrade uses a lease record at:
 
