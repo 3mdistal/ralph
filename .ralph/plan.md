@@ -16,11 +16,12 @@
 
 - [x] Confirm current behavior + repro path
 - [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
 - [x] Keep escalation writeback/notify/run metadata aligned on the same reason
 - [x] Add regression test (continueSession retries with hard failure output)
 - [x] Add focused unit tests for reason derivation helper
+- [ ] Unify build/resume PR-create retry loops to eliminate drift
+- [x] Add resume-path integration coverage for classification-vs-fallback behavior
+- [x] (Optional) Propagate machine-stable `blockedSource` in internal metadata for this escalation
 - [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
 
 ## Steps
@@ -37,14 +38,14 @@
     - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
   - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
 
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
+- [ ] Unify build/resume PR-create retry loops to eliminate drift
+  - [ ] Extract a single helper for the missing-PR retry/recovery flow used by both build and resume, with a typed return to avoid silent behavior drift.
+  - [ ] Keep stage-specific differences limited to labels/log strings (e.g. "build" vs "resume" run log paths) and pass them in explicitly.
+  - [ ] Ensure both flows share:
+    - [ ] evidence aggregation
+    - [ ] lease behavior
+    - [ ] retry counter semantics
+    - [ ] final escalation envelope (`reason`, `details`, `planOutput`, `sessionId`)
 
 - [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
   - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
@@ -74,6 +75,14 @@
     - [x] classification wins over no-PR fallback
     - [x] fallback used only when classifier returns null
     - [x] accumulated evidence (classification present only in a later continue output still wins)
+
+- [x] Add resume-path integration coverage for classification-vs-fallback behavior
+  - [x] Add/extend an integration-harness test that exercises the resume path (pre-set `session-id`) with 5 continue attempts returning the invalid tool schema output.
+  - [x] Assert both the returned `AgentRun.escalationReason` and the escalation writeback/notify `reason` match the classifier headline (not the no-PR fallback).
+
+- [x] (Optional) Propagate machine-stable `blockedSource` in internal metadata for this escalation
+  - [x] If a classifier hit occurs, attach `classification.blockedSource` to the internal run note / missing-pr evidence record so operators can group failures without parsing strings.
+  - [x] Do not change the human-facing `reason` string format.
 
 - [x] Run verification gates
   - [x] `bun test`
