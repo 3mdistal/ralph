@@ -102,6 +102,16 @@ describe("gates command output", () => {
           prUrl: null,
         },
         {
+          name: "pr_evidence",
+          status: "pending",
+          command: null,
+          skipReason: null,
+          reason: null,
+          url: null,
+          prNumber: null,
+          prUrl: null,
+        },
+        {
           name: "preflight",
           status: "pending",
           command: null,

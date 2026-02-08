@@ -50,6 +50,8 @@ describe("run context helpers", () => {
           ensureGateCalls += 1;
         },
         completeRun: () => {},
+        upsertRunGateResult: () => {},
+        recordRunGateArtifact: () => {},
         buildRunDetails: () => undefined,
         getPinnedOpencodeProfileName: () => null,
         refreshRalphRunTokenTotals: async () => {},
@@ -119,6 +121,8 @@ describe("run context helpers", () => {
           createRunRecord: () => "run-2",
           ensureRunGateRows: () => {},
           completeRun: () => {},
+          upsertRunGateResult: () => {},
+          recordRunGateArtifact: () => {},
           buildRunDetails: () => undefined,
           getPinnedOpencodeProfileName: () => null,
           refreshRalphRunTokenTotals: async () => {},
@@ -170,5 +174,111 @@ describe("run context helpers", () => {
       "123"
     );
     expect(seen.length).toBe(3);
+  });
+
+  test("withRunContext fails closed when issue-linked success has no PR evidence", async () => {
+    let completedOutcome: any = null;
+    let completedDetails: any = null;
+    const gateWrites: Array<any> = [];
+    const artifacts: Array<any> = [];
+
+    await withRunContext({
+      task: {
+        _path: "orchestration/tasks/4",
+        name: "Task 4",
+        issue: "3mdistal/ralph#4",
+        "worktree-path": "/tmp/wt-4",
+      } as any,
+      attemptKind: "process" satisfies RalphRunAttemptKind,
+      run: async () => ({ outcome: "success" }),
+      ports: {
+        repo: "3mdistal/ralph",
+        getActiveRunId: () => null,
+        setActiveRunId: () => {},
+        baseSession: makeSessionAdapter(),
+        createRunRecordingSessionAdapter: ({ base }) => base,
+        createContextRecoveryAdapter: (base) => base,
+        withDashboardContext: async (_context, runner) => await runner(),
+        withSessionAdapters: async (_next, runner) => await runner(),
+        buildDashboardContext: () => ({ repo: "3mdistal/ralph" }) as DashboardEventContext,
+        publishDashboardEvent: () => {},
+        createRunRecord: () => "run-4",
+        ensureRunGateRows: () => {},
+        completeRun: (params) => {
+          completedOutcome = params.outcome;
+          completedDetails = params.details;
+        },
+        upsertRunGateResult: (params) => gateWrites.push(params),
+        recordRunGateArtifact: (params) => artifacts.push(params),
+        buildRunDetails: () => ({ completionKind: "pr" }),
+        getPinnedOpencodeProfileName: () => null,
+        refreshRalphRunTokenTotals: async () => {},
+        getRalphRunTokenTotals: () => null,
+        listRalphRunSessionTokenTotals: () => [],
+        appendFile: async () => {},
+        existsSync: () => false,
+        computeAndStoreRunMetrics: async () => {},
+        warn: () => {},
+      },
+    });
+
+    expect(completedOutcome).toBe("escalated");
+    expect(completedDetails?.reasonCode).toBe("missing_pr_url");
+    expect(gateWrites).toEqual([
+      {
+        runId: "run-4",
+        gate: "pr_evidence",
+        status: "fail",
+        skipReason: "missing pr_url",
+      },
+    ]);
+    expect(artifacts.length).toBe(1);
+    expect(String(artifacts[0]?.content ?? "")).toContain("Missing PR evidence");
+  });
+
+  test("withRunContext allows verified success without PR evidence", async () => {
+    let completedOutcome: any = null;
+    const gateWrites: Array<any> = [];
+
+    await withRunContext({
+      task: {
+        _path: "orchestration/tasks/5",
+        name: "Task 5",
+        issue: "3mdistal/ralph#5",
+      } as any,
+      attemptKind: "process" satisfies RalphRunAttemptKind,
+      run: async () => ({ outcome: "success" }),
+      ports: {
+        repo: "3mdistal/ralph",
+        getActiveRunId: () => null,
+        setActiveRunId: () => {},
+        baseSession: makeSessionAdapter(),
+        createRunRecordingSessionAdapter: ({ base }) => base,
+        createContextRecoveryAdapter: (base) => base,
+        withDashboardContext: async (_context, runner) => await runner(),
+        withSessionAdapters: async (_next, runner) => await runner(),
+        buildDashboardContext: () => ({ repo: "3mdistal/ralph" }) as DashboardEventContext,
+        publishDashboardEvent: () => {},
+        createRunRecord: () => "run-5",
+        ensureRunGateRows: () => {},
+        completeRun: (params) => {
+          completedOutcome = params.outcome;
+        },
+        upsertRunGateResult: (params) => gateWrites.push(params),
+        recordRunGateArtifact: () => {},
+        buildRunDetails: () => ({ completionKind: "verified" }),
+        getPinnedOpencodeProfileName: () => null,
+        refreshRalphRunTokenTotals: async () => {},
+        getRalphRunTokenTotals: () => null,
+        listRalphRunSessionTokenTotals: () => [],
+        appendFile: async () => {},
+        existsSync: () => false,
+        computeAndStoreRunMetrics: async () => {},
+        warn: () => {},
+      },
+    });
+
+    expect(completedOutcome).toBe("success");
+    expect(gateWrites).toEqual([]);
   });
 });
