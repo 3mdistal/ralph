@@ -51,9 +51,7 @@ import { createSchedulerController, startQueuedTasks } from "./scheduler";
 import { createPrioritySelectorState } from "./scheduler/priority-policy";
 import {
   issuePriorityWeight,
-  normalizePriorityInputToRalphPriorityLabel,
   normalizeTaskPriority,
-  planRalphPriorityLabelSet,
 } from "./queue/priority";
 
 import { DrainMonitor, readControlStateSnapshot, resolveControlFilePath, type DaemonMode } from "./drain";
@@ -88,8 +86,8 @@ import { resolveGitHubToken } from "./github-auth";
 import { GitHubClient } from "./github/client";
 import { createGhRunner } from "./github/gh-runner";
 import { parseIssueRef } from "./github/issue-ref";
+import { createRalphWorkflowLabelsEnsurer, ensureRalphWorkflowLabelsOnce } from "./github/ensure-ralph-workflow-labels";
 import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
-import { ensureRalphWorkflowLabelsOnce } from "./github/ensure-ralph-workflow-labels";
 import {
   ACTIVITY_EMIT_INTERVAL_MS,
   ACTIVITY_WINDOW_MS,
@@ -112,7 +110,9 @@ import {
   startControlPlaneServer,
   type ControlPlaneServer,
 } from "./dashboard/control-plane-server";
+import { ControlPlaneHttpError } from "./dashboard/control-plane-errors";
 import { toControlPlaneStateV1 } from "./dashboard/control-plane-state";
+import { applyIssueCommand, applyIssuePriority } from "./dashboard/issue-commands";
 import {
   buildTaskStatusCmdLabelMutation,
   mapTaskStatusInputToCmdLabel,
@@ -1560,6 +1560,20 @@ async function main(): Promise<void> {
         return null;
       };
 
+      const controlPlaneLabelEnsurer = createRalphWorkflowLabelsEnsurer({
+        githubFactory: (repo) => new GitHubClient(repo, { getToken: resolveGitHubToken }),
+        log: (message) => console.log(message),
+        warn: (message) => console.warn(message),
+      });
+
+      const createGitHubClientOrThrow = async (repo: string): Promise<GitHubClient> => {
+        const token = await resolveGitHubToken();
+        if (!token) {
+          throw new ControlPlaneHttpError(503, "github_not_configured", "GitHub auth is not configured");
+        }
+        return new GitHubClient(repo, { getToken: resolveGitHubToken });
+      };
+
       controlPlaneServer = startControlPlaneServer({
         bus: ralphEventBus,
         getStateSnapshot: async () =>
@@ -1671,32 +1685,14 @@ async function main(): Promise<void> {
             const issueRef = parseIssueRef(raw, "");
 
             if (issueRef) {
-              const token = await resolveGitHubToken();
-              if (!token) throw new Error("GitHub auth is not configured");
-
-              const github = new GitHubClient(issueRef.repo, { getToken: resolveGitHubToken });
-              const canonicalLabel = normalizePriorityInputToRalphPriorityLabel(priority);
-              const labelPlan = planRalphPriorityLabelSet(canonicalLabel);
-
-              const ops = planIssueLabelOps({
-                add: labelPlan.add,
-                remove: labelPlan.remove,
-              });
-
-              const result = await executeIssueLabelOps({
+              const github = await createGitHubClientOrThrow(issueRef.repo);
+              const { canonicalLabel } = await applyIssuePriority({
                 github,
                 repo: issueRef.repo,
                 issueNumber: issueRef.number,
-                ops,
-                ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: issueRef.repo, github }),
-                ensureBefore: true,
-                retryMissingLabelOnce: true,
+                priority,
+                ensureLabels: async () => await controlPlaneLabelEnsurer.ensure(issueRef.repo),
               });
-
-              if (!result.ok) {
-                const message = result.error instanceof Error ? result.error.message : String(result.error);
-                throw new Error(`Failed to update issue priority: ${message}`);
-              }
 
               publishDashboardEvent({
                 type: "log.ralph",
@@ -1769,6 +1765,42 @@ async function main(): Promise<void> {
               repo: parsedTask.repo,
               taskId,
               data: { message: `Applied ${mappedStatus.cmdLabel} on ${parsedTask.issueRef}` },
+            });
+          },
+          setIssuePriority: async ({ repo, issueNumber, priority }) => {
+            const github = await createGitHubClientOrThrow(repo);
+            const { canonicalLabel } = await applyIssuePriority({
+              github,
+              repo,
+              issueNumber,
+              priority,
+              ensureLabels: async () => await controlPlaneLabelEnsurer.ensure(repo),
+            });
+
+            publishDashboardEvent({
+              type: "log.ralph",
+              level: "info",
+              repo,
+              taskId: `github:${repo}#${issueNumber}`,
+              data: { message: `Set priority ${canonicalLabel} on ${repo}#${issueNumber}` },
+            });
+          },
+          enqueueIssueCommand: async ({ repo, issueNumber, cmd }) => {
+            const github = await createGitHubClientOrThrow(repo);
+            const { label } = await applyIssueCommand({
+              github,
+              repo,
+              issueNumber,
+              cmd,
+              ensureLabels: async () => await controlPlaneLabelEnsurer.ensure(repo),
+            });
+
+            publishDashboardEvent({
+              type: "log.ralph",
+              level: "info",
+              repo,
+              taskId: `github:${repo}#${issueNumber}`,
+              data: { message: `Accepted issue command ${label} on ${repo}#${issueNumber}` },
             });
           },
         },
