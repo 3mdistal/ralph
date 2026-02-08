@@ -1,80 +1,82 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: Epic #25 Control Commands + Checkpoints
 
 ## Goal
 
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
+- Finish the dashboard/control-plane MVP “control” surface for #25 by ensuring the remaining child (#37) is GitHub-first (no new bwrb writes): priority via `ralph:priority:*`, and status/actions via `ralph:cmd:*`.
+- Keep `/v1` additive-only: add endpoints/fields, avoid breaking existing clients.
+- Preserve the existing (already-merged) behavior from #35 (checkpoints/pause) and #36 (message-at-checkpoint) without re-implementing.
 
 ## Assumptions
 
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+- Child issues #35 and #36 are already satisfied by merged PRs; do not redo that work.
+- bwrb is legacy output-only (per #37 comment); do not add new `bwrb edit` dependencies.
+- Operator intent for GitHub tasks is expressed via labels per `docs/product/orchestration-contract.md`:
+  - priority: `ralph:priority:p0..p4`
+  - actions: `ralph:cmd:queue|pause|stop|satisfy`
 
 ## Checklist
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+- [x] Verify current control-plane endpoints cover pause/resume, message enqueue, and `task/priority`
+- [x] Define GitHub-first task editing contract (priority + cmd actions; no direct status setting)
+- [x] Add control-plane endpoints for GitHub issue priority + cmd actions (additive)
+- [x] Implement GitHub mutation logic in a small module (keep `src/index.ts` as composition)
+- [x] Define cmd conflict semantics (ensure at most one `ralph:cmd:*` label is set)
+- [x] Add typed control-plane error contract with deterministic HTTP mapping
+- [x] Wire handlers in `src/index.ts` using label ops + cached label bootstrap
+- [x] Emit structured dashboard events for operator actions (at least `log.ralph`)
+- [x] Add/extend unit tests for request validation + handler dispatch
+- [x] Run verification gates (`bun test`, `bun run typecheck`, `bun run build`)
 
 ## Steps
 
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
+- [x] Verify existing #25 child work is present (no redo)
+  - [x] Confirm `/v1/commands/pause`, `/v1/commands/resume`, `/v1/commands/message/enqueue` exist and are token-authenticated.
+  - [x] Confirm checkpoint + pause events exist (`worker.checkpoint.reached`, `worker.pause.*`) and message delivery events exist (`message.*`).
+  - [x] Confirm `/v1/commands/task/priority` exists and supports GitHub tasks.
 
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
+- [x] Define GitHub-first task editing contract (for #37)
+  - [x] Priority editing: ensure exactly one `ralph:priority:*` label is set.
+  - [x] Status/actions: expose `queue|pause|stop|satisfy` via `ralph:cmd:*` labels (do not directly set `ralph:status:*`).
+  - [x] Keep bwrb-only behavior as legacy (no new endpoints that require bwrb).
 
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
+- [x] Add control-plane endpoints (additive)
+  - [x] `POST /v1/commands/issue/priority` body `{ repo, issueNumber, priority }`.
+  - [x] `POST /v1/commands/issue/cmd` body `{ repo, issueNumber, cmd }` where `cmd in {queue,pause,stop,satisfy}`.
+  - [x] Keep existing `POST /v1/commands/task/priority` unchanged for compatibility.
+  - [x] Input validation: 400 for missing/invalid fields; 501 when commands are disabled.
 
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
+- [x] Implement GitHub-first issue command module
+  - [x] Add a small module (e.g. `src/dashboard/issue-commands.ts`) with:
+    - [x] Pure helpers: validate inputs, map `cmd -> ralph:cmd:*` label, plan label ops (priority + cmd)
+    - [x] Explicit cmd conflict semantics: when applying a cmd, remove other `ralph:cmd:*` labels so at most one cmd label is present.
+    - [x] Thin executor that calls `executeIssueLabelOps` (no direct GitHub calls spread across `src/index.ts`).
 
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
+- [x] Add typed control-plane error contract
+  - [x] Introduce an error type (e.g. `ControlPlaneHttpError`) with `{ status, code, message }`.
+  - [x] Update `src/dashboard/control-plane-server.ts` to catch this error type and return deterministic `{ error: { code, message } }` JSON with the chosen HTTP status.
+  - [x] Map GitHub label op failures deterministically (`policy|auth|transient|unknown`) to stable `error.code` values.
 
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
+- [x] Wire command handlers in `src/index.ts`
+  - [x] Keep `src/index.ts` as composition: parse body -> call issue-command module -> publish dashboard events.
+  - [x] Use a cached label ensurer (`createRalphWorkflowLabelsEnsurer`) rather than calling `ensureRalphWorkflowLabelsOnce` per request.
+  - [x] Publish `log.ralph` events describing the accepted action (repo/issue/label); treat responses as “accepted” (command processing is async).
 
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
+- [x] Tests
+  - [x] Extend `src/__tests__/control-plane-server.test.ts` with cases for:
+    - [x] `/v1/commands/issue/priority` calls handler and validates body
+    - [x] `/v1/commands/issue/cmd` calls handler and rejects invalid cmd values
+  - [x] Add focused unit tests for pure helpers:
+    - [x] cmd->label mapping is exhaustive and stable
+    - [x] cmd conflict planning removes other `ralph:cmd:*` labels
+    - [x] error mapping produces stable HTTP + `error.code`
 
-- [x] Run verification gates
+- [x] Verification
   - [x] `bun test`
   - [x] `bun run typecheck`
+  - [x] `bun run build`
+
+## Verification notes
+
+- `bun run typecheck`: pass.
+- `bun run build`: pass.
+- `bun test`: partial pass for changed scope; repository has unrelated pre-existing failures in broader suite (fixture and environment-dependent tests under `dist/__tests__` and some integration/required-checks tests).

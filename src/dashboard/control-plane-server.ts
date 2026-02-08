@@ -12,6 +12,8 @@ import {
   serializeStateSnapshot,
   tokensMatch,
 } from "./control-plane-core";
+import { isControlPlaneHttpError } from "./control-plane-errors";
+import { isIssueCommandName } from "./issue-commands";
 
 export type ControlPlaneStateProvider<TSnapshot> = () => Promise<TSnapshot>;
 
@@ -27,6 +29,10 @@ export type ControlPlaneCommandHandlers = {
     | { id?: string }
     | void;
   setTaskPriority: (params: { taskId: string; priority: string }) => Promise<void> | void;
+  setIssuePriority?: (params: { repo: string; issueNumber: number; priority: string }) => Promise<void> | void;
+  enqueueIssueCommand?: (params: { repo: string; issueNumber: number; cmd: "queue" | "pause" | "stop" | "satisfy" }) =>
+    | Promise<void>
+    | void;
 };
 
 export type ControlPlaneServerOptions<TSnapshot> = {
@@ -107,6 +113,11 @@ function publishInternalError(bus: RalphEventBus, message: string): void {
       data: { message },
     })
   );
+}
+
+function parseIssueNumber(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) return null;
+  return value;
 }
 
 export function startControlPlaneServer<TSnapshot>(
@@ -264,11 +275,54 @@ export function startControlPlaneServer<TSnapshot>(
             return jsonResponse(200, { ok: true });
           }
 
+          if (path === "/v1/commands/issue/priority") {
+            if (!commands.setIssuePriority) {
+              return jsonError(501, "not_implemented", "Issue priority commands are not enabled");
+            }
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const body = parsed.value;
+
+            const repo = typeof body?.repo === "string" ? body.repo : "";
+            const issueNumber = parseIssueNumber(body?.issueNumber);
+            const priority = typeof body?.priority === "string" ? body.priority : "";
+            if (!repo.trim()) return jsonError(400, "bad_request", "Missing repo");
+            if (issueNumber === null) return jsonError(400, "bad_request", "Missing or invalid issueNumber");
+            if (!priority.trim()) return jsonError(400, "bad_request", "Missing priority");
+
+            await commands.setIssuePriority({ repo, issueNumber, priority });
+            return jsonResponse(202, { ok: true, accepted: true });
+          }
+
+          if (path === "/v1/commands/issue/cmd") {
+            if (!commands.enqueueIssueCommand) {
+              return jsonError(501, "not_implemented", "Issue command queueing is not enabled");
+            }
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const body = parsed.value;
+
+            const repo = typeof body?.repo === "string" ? body.repo : "";
+            const issueNumber = parseIssueNumber(body?.issueNumber);
+            const cmdRaw = typeof body?.cmd === "string" ? body.cmd : "";
+            if (!repo.trim()) return jsonError(400, "bad_request", "Missing repo");
+            if (issueNumber === null) return jsonError(400, "bad_request", "Missing or invalid issueNumber");
+            if (!isIssueCommandName(cmdRaw)) {
+              return jsonError(400, "bad_request", "Invalid cmd (expected queue|pause|stop|satisfy)");
+            }
+
+            await commands.enqueueIssueCommand({ repo, issueNumber, cmd: cmdRaw });
+            return jsonResponse(202, { ok: true, accepted: true });
+          }
+
           return jsonError(404, "not_found", "Not found");
         }
 
         return jsonError(404, "not_found", "Not found");
       } catch (error: any) {
+        if (isControlPlaneHttpError(error)) {
+          return jsonError(error.status, error.code, error.message);
+        }
         const message = error?.message ?? String(error);
         console.warn(`${LOG_PREFIX} Request failed: ${message}`);
         publishInternalError(options.bus, `Control plane request failed: ${message}`);
