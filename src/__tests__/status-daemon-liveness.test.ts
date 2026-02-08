@@ -9,13 +9,11 @@ import { writeDaemonRecord } from "../daemon-record";
 import { __resetQueueBackendStateForTests } from "../queue-backend";
 import { closeStateDbForTests, initStateDb } from "../state";
 import { runStatusCommand } from "../commands/status";
-import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir = "";
 let priorHome: string | undefined;
 let priorStateDb: string | undefined;
 let priorXdgStateHome: string | undefined;
-let releaseLock: (() => void) | null = null;
 
 async function setupEnv(): Promise<void> {
   priorHome = process.env.HOME;
@@ -84,14 +82,11 @@ async function runStatusJson(): Promise<any> {
 }
 
 beforeEach(async () => {
-  releaseLock = await acquireGlobalTestLock();
   await setupEnv();
 });
 
 afterEach(async () => {
   await teardownEnv();
-  releaseLock?.();
-  releaseLock = null;
 });
 
 test("status --json fails closed when no live daemon can be confirmed", async () => {
@@ -110,6 +105,8 @@ test("status --json fails closed when daemon pid is dead", async () => {
     daemonId: "d-test",
     pid: 999_999,
     startedAt: new Date("2026-02-08T00:00:00.000Z").toISOString(),
+    heartbeatAt: new Date("2026-02-08T00:00:00.000Z").toISOString(),
+    controlRoot: join(homeDir, "xdg-state", "ralph"),
     ralphVersion: "test",
     command: ["bun", "run", "src/index.ts"],
     cwd: homeDir,
