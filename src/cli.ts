@@ -30,7 +30,7 @@ function printGlobalHelp(): void {
       "  --version                          Print version and exit",
       "",
       "Notes:",
-      "  Control file: set version=1 and mode=running|draining|paused in ~/.local/state/ralph/control.json (fallback /tmp/ralph/<uid>/control.json when HOME is unavailable).",
+      "  Control file: set version=1 and mode=running|draining|paused in ~/.ralph/control/control.json (fallback reads: $XDG_STATE_HOME/ralph/control.json, ~/.local/state/ralph/control.json, /tmp/ralph/<uid>/control.json).",
       "  Pause at next checkpoint: set pause_requested=true in the same control file (clear to resume).",
       "  OpenCode profile: set [opencode].defaultProfile in ~/.ralph/config.toml (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",

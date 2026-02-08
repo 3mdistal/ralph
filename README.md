@@ -521,8 +521,8 @@ Ralph supports an operator-controlled "draining" mode that stops scheduling/dequ
 
 Control file:
 
-- `~/.local/state/ralph/control.json` (canonical control root)
-- Fallback: `/tmp/ralph/<uid>/control.json` when HOME is unavailable
+- Canonical: `~/.ralph/control/control.json`
+- Fallback reads: `$XDG_STATE_HOME/ralph/control.json`, `~/.local/state/ralph/control.json`, `/tmp/ralph/<uid>/control.json`
 
 Ralph auto-creates the control file on startup with `{ "mode": "running" }` unless disabled via config.
 
@@ -554,10 +554,10 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 
 Daemon discovery for restart/upgrade uses a lease record at:
 
-- `~/.local/state/ralph/daemon.json` (canonical control root)
-- Fallback: `/tmp/ralph/<uid>/daemon.json` when HOME is unavailable
+- Canonical: `~/.ralph/control/daemon-registry.json`
+- Fallback reads: `$XDG_STATE_HOME/ralph/daemon.json`, `~/.local/state/ralph/daemon.json`, `/tmp/ralph/<uid>/daemon.json`
 
-The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
+The daemon writes this file on startup and refreshes heartbeat updates while running. Use `--start-cmd` to override when needed.
 
 ## Managed OpenCode config (daemon runs)
 

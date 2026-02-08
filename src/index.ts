@@ -8,7 +8,7 @@
  */
 
 import { existsSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import crypto from "crypto";
 
 import {
@@ -60,8 +60,12 @@ import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessionLockPath } from "./paths";
-import { removeDaemonRecord, writeDaemonRecord } from "./daemon-record";
-import { acquireDaemonStartupLock, type DaemonStartupLock } from "./daemon-lock";
+import {
+  acquireDaemonSingletonLock,
+  removeDaemonRecord,
+  touchDaemonRecordHeartbeat,
+  writeDaemonRecord,
+} from "./daemon-record";
 import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { getRepoLabelSchemeState, initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
@@ -99,8 +103,18 @@ import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
-import { isLoopbackHost, startControlPlaneServer, type ControlPlaneServer } from "./dashboard/control-plane-server";
+import {
+  ControlPlaneCommandError,
+  isLoopbackHost,
+  startControlPlaneServer,
+  type ControlPlaneServer,
+} from "./dashboard/control-plane-server";
 import { toControlPlaneStateV1 } from "./dashboard/control-plane-state";
+import {
+  buildTaskStatusCmdLabelMutation,
+  mapTaskStatusInputToCmdLabel,
+  parseGitHubTaskId,
+} from "./dashboard/task-command-core";
 import { buildProvisionPlan } from "./sandbox/provisioning-core";
 import {
   applySeedFromSpec,
@@ -131,7 +145,6 @@ let githubDoneReconciler: { stop: () => void } | null = null;
 let githubLabelReconciler: { stop: () => void } | null = null;
 let githubCmdProcessor: { stop: () => void } | null = null;
 let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
-let daemonStartupLock: DaemonStartupLock | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
 const daemonStartedAt = new Date().toISOString();
@@ -140,6 +153,7 @@ const daemonVersion = getRalphVersion();
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
+const DAEMON_REGISTRY_HEARTBEAT_MS = 5000;
 
 const idleState = new Map<
   string,
@@ -1380,22 +1394,21 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const lockResult = await acquireDaemonStartupLock({
-    daemonId,
-    startedAt: daemonStartedAt,
-  });
-  if (!lockResult.ok) {
-    console.error(`[ralph] ${lockResult.message}`);
-    process.exit(lockResult.exitCode);
+  let daemonSingletonLock: { release: () => void } | null = null;
+  try {
+    daemonSingletonLock = acquireDaemonSingletonLock({ daemonId, startedAt: daemonStartedAt });
+  } catch (e: any) {
+    console.error(`[ralph] ${e?.message ?? String(e)}`);
+    process.exit(1);
   }
-  daemonStartupLock = lockResult.lock;
-
   try {
     writeDaemonRecord({
       version: 1,
       daemonId,
       pid: process.pid,
       startedAt: daemonStartedAt,
+      heartbeatAt: daemonStartedAt,
+      controlRoot: dirname(resolveControlFilePath()),
       ralphVersion: daemonVersion,
       command: daemonCommand,
       cwd: process.cwd(),
@@ -1407,6 +1420,15 @@ async function main(): Promise<void> {
   if (queueState.backend !== "none") {
     await seedRepoSlotReservations();
   }
+
+  const daemonRegistryHeartbeatTimer = setInterval(() => {
+    if (isShuttingDown) return;
+    try {
+      touchDaemonRecordHeartbeat();
+    } catch {
+      // ignore
+    }
+  }, DAEMON_REGISTRY_HEARTBEAT_MS);
 
   const retentionDays = getDashboardEventsRetentionDays();
   await cleanupDashboardEventLogs({ retentionDays });
@@ -1612,6 +1634,49 @@ async function main(): Promise<void> {
               taskId,
               sessionId: task["session-id"],
               data: { message: `Set priority ${normalized} for ${taskId}` },
+            });
+          },
+          setTaskStatus: async ({ taskId, status }) => {
+            const parsedTask = parseGitHubTaskId(taskId);
+            if (!parsedTask.ok) {
+              throw new ControlPlaneCommandError(400, parsedTask.error.code, parsedTask.error.message);
+            }
+
+            const mappedStatus = mapTaskStatusInputToCmdLabel(status);
+            if (!mappedStatus.ok) {
+              throw new ControlPlaneCommandError(400, mappedStatus.error.code, mappedStatus.error.message);
+            }
+
+            const token = await resolveGitHubToken();
+            if (!token) {
+              throw new ControlPlaneCommandError(503, "github_auth_unavailable", "GitHub auth is not configured");
+            }
+
+            const github = new GitHubClient(parsedTask.repo, { getToken: resolveGitHubToken });
+            const mutation = buildTaskStatusCmdLabelMutation(mappedStatus.cmdLabel);
+            const ops = planIssueLabelOps({ add: mutation.add, remove: mutation.remove });
+
+            const result = await executeIssueLabelOps({
+              github,
+              repo: parsedTask.repo,
+              issueNumber: parsedTask.issueNumber,
+              ops,
+              ensureLabels: async () => await ensureRalphWorkflowLabelsOnce({ repo: parsedTask.repo, github }),
+              ensureBefore: true,
+              retryMissingLabelOnce: true,
+            });
+
+            if (!result.ok) {
+              const message = result.error instanceof Error ? result.error.message : String(result.error);
+              throw new ControlPlaneCommandError(502, "upstream_unavailable", `Failed to update task status: ${message}`);
+            }
+
+            publishDashboardEvent({
+              type: "log.ralph",
+              level: "info",
+              repo: parsedTask.repo,
+              taskId,
+              data: { message: `Applied ${mappedStatus.cmdLabel} on ${parsedTask.issueRef}` },
             });
           },
         },
@@ -1821,6 +1886,7 @@ async function main(): Promise<void> {
     schedulerController.clearTimers();
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
+    clearInterval(daemonRegistryHeartbeatTimer);
     clearInterval(idleRollupTimer);
     clearInterval(throttleResumeTimer);
     controlPlaneServer?.stop();
@@ -1882,8 +1948,7 @@ async function main(): Promise<void> {
     }
 
     try {
-      daemonStartupLock?.release();
-      daemonStartupLock = null;
+      daemonSingletonLock?.release();
     } catch {
       // ignore
     }
@@ -1929,7 +1994,7 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Control file: set version=1 and mode=running|draining|paused in ~/.local/state/ralph/control.json (fallback /tmp/ralph/<uid>/control.json when HOME is unavailable).",
+      "  Control file: set version=1 and mode=running|draining|paused in ~/.ralph/control/control.json (fallback reads: $XDG_STATE_HOME/ralph/control.json, ~/.local/state/ralph/control.json, /tmp/ralph/<uid>/control.json).",
       "  OpenCode profile: set [opencode].defaultProfile in ~/.ralph/config.toml (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
@@ -2769,12 +2834,6 @@ if (args[0] === "sandbox") {
 
 // Default: run daemon
 main().catch((e) => {
-  try {
-    daemonStartupLock?.release();
-    daemonStartupLock = null;
-  } catch {
-    // ignore
-  }
   console.error("[ralph] Fatal error:", e);
   process.exit(1);
 });

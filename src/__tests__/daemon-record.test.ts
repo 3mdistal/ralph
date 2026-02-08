@@ -3,7 +3,12 @@ import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 
-import { readDaemonRecord, resolveDaemonRecordPath, writeDaemonRecord } from "../daemon-record";
+import {
+  readDaemonRecord,
+  resolveDaemonRecordPath,
+  resolveDaemonRecordPathCandidates,
+  writeDaemonRecord,
+} from "../daemon-record";
 
 describe("daemon record", () => {
   let priorXdgStateHome: string | undefined;
@@ -29,13 +34,15 @@ describe("daemon record", () => {
   test("writes and reads daemon record", () => {
     const base = mkdtempSync(join(tmpdir(), "ralph-daemon-"));
     tempDirs.push(base);
-    process.env.HOME = base;
+    process.env.XDG_STATE_HOME = base;
 
     writeDaemonRecord({
       version: 1,
       daemonId: "d_test",
       pid: 1234,
       startedAt: new Date().toISOString(),
+      heartbeatAt: new Date().toISOString(),
+      controlRoot: join(base, ".ralph", "control"),
       ralphVersion: "0.1.0",
       command: ["bun", "src/index.ts"],
       cwd: "/tmp",
@@ -61,7 +68,7 @@ describe("daemon record", () => {
     expect(record).toBeNull();
   });
 
-  test("discovers legacy XDG_STATE_HOME daemon record during transition", () => {
+  test("prefers canonical path under ~/.ralph/control", () => {
     const xdg = mkdtempSync(join(tmpdir(), "ralph-daemon-xdg-"));
     const home = mkdtempSync(join(tmpdir(), "ralph-daemon-home-"));
     tempDirs.push(xdg, home);
@@ -69,27 +76,26 @@ describe("daemon record", () => {
     process.env.XDG_STATE_HOME = xdg;
     process.env.HOME = home;
 
-    const legacyRecordPath = join(xdg, "ralph", "daemon.json");
-    mkdirSync(dirname(legacyRecordPath), { recursive: true });
-    writeFileSync(
-      legacyRecordPath,
-      `${JSON.stringify(
-        {
-          version: 1,
-          daemonId: "d_legacy",
-          pid: 1234,
-          startedAt: new Date().toISOString(),
-          ralphVersion: "0.1.0",
-          command: ["bun", "src/index.ts"],
-          cwd: "/tmp",
-          controlFilePath: "/tmp/control.json",
-        },
-        null,
-        2
-      )}\n`
+    writeDaemonRecord(
+      {
+        version: 1,
+        daemonId: "d_home",
+        pid: 1234,
+        startedAt: new Date().toISOString(),
+        heartbeatAt: new Date().toISOString(),
+        controlRoot: join(home, ".ralph", "control"),
+        ralphVersion: "0.1.0",
+        command: ["bun", "src/index.ts"],
+        cwd: "/tmp",
+        controlFilePath: "/tmp/control.json",
+      },
+      { homeDir: home, xdgStateHome: "" }
     );
 
     const record = readDaemonRecord();
-    expect(record?.daemonId).toBe("d_legacy");
+    expect(record?.daemonId).toBe("d_home");
+    const recordPath = resolveDaemonRecordPath();
+    expect(recordPath).toBe(join(home, ".ralph", "control", "daemon-registry.json"));
+    expect(resolveDaemonRecordPathCandidates()[0]).toBe(recordPath);
   });
 });
