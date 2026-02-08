@@ -48,6 +48,7 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import { prepareReviewDiffArtifacts, recordReviewGateFailure, recordReviewGateSkipped, runReviewGate } from "../gates/review";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
@@ -120,6 +121,11 @@ import {
 } from "../merge-conflict-recovery";
 import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "../github/watchdog-writeback";
 import { buildLoopTripDetails } from "../loop-detection/format";
+import {
+  computeLoopTriageSignature,
+  decideLoopTripAction,
+  parseLoopTriageMarker,
+} from "../loop-triage/core";
 import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
 import { classifyOpencodeFailure } from "../opencode-error-classifier";
 import { derivePrCreateEscalationReason } from "./pr-create-escalation-reason";
@@ -135,6 +141,7 @@ import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "../das
 import type { DashboardEventContext } from "../dashboard/publisher";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-recording-session-adapter";
 import { redactHomePathForDisplay } from "../redaction";
+import { buildGhErrorSearchText, formatGhError as formatGhErrorShared } from "./gh-error-format";
 import { isSafeSessionId } from "../session-id";
 import {
   createContextRecoveryAdapter as createContextRecoveryAdapterImpl,
@@ -150,29 +157,32 @@ import {
 import { PAUSED_AT_CHECKPOINT_FIELD, parseCheckpointValue } from "./checkpoint-fields";
 import { applyTaskPatch } from "./task-patch";
 import {
+  bumpLoopTriageAttempt,
   completeParentVerification,
   completeRalphRun,
   createRalphRun,
   ensureRalphRunGateRows,
-  getParentVerificationState,
-  getLatestRunIdForSession,
-  getRalphRunTokenTotals,
   getIdempotencyRecord,
   getIdempotencyPayload,
+  getLatestRunIdForSession,
+  getLoopTriageAttempt,
+  getParentVerificationState,
+  getRalphRunTokenTotals,
   listRalphRunSessionTokenTotals,
-  recordIdempotencyKey,
   deleteIdempotencyKey,
+  recordIdempotencyKey,
   recordParentVerificationAttemptFailure,
+  recordIssueSnapshot,
   recordRalphRunGateArtifact,
   recordRalphRunTracePointer,
-  upsertIdempotencyKey,
-  recordIssueSnapshot,
   PR_STATE_MERGED,
   PR_STATE_OPEN,
+  shouldAllowLoopTriageAttempt,
   type PrState,
   type RalphRunAttemptKind,
   type RalphRunDetails,
   tryClaimParentVerification,
+  upsertIdempotencyKey,
   upsertRalphRunGateResult,
 } from "../state";
 import { refreshRalphRunTokenTotals } from "../run-token-accounting";
@@ -408,6 +418,9 @@ const MERGE_CONFLICT_COMMENT_SCAN_LIMIT = 50;
 const MERGE_CONFLICT_COMMENT_MIN_EDIT_MS = 60_000;
 const MERGE_CONFLICT_WAIT_TIMEOUT_MS = 10 * 60_000;
 const MERGE_CONFLICT_WAIT_POLL_MS = 15_000;
+const LOOP_TRIAGE_EVENTS_LIMIT = 30;
+const LOOP_TRIAGE_LOG_LINES_LIMIT = 40;
+const LOOP_TRIAGE_NUDGE_MAX_CHARS = 600;
 
 const CI_REMEDIATION_BACKOFF_BASE_MS = 30_000;
 const CI_REMEDIATION_BACKOFF_MAX_MS = 120_000;
@@ -448,7 +461,6 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 }
 
 // (applyTaskPatch extracted to src/worker/task-patch.ts)
-  // (legacy vault path resolution removed)
 export class RepoWorker {
   private session: SessionAdapter;
   private baseSession: SessionAdapter;
@@ -1171,8 +1183,12 @@ export class RepoWorker {
     return updateOpenPrSnapshotImpl({ repo: this.repo }, task, currentPrUrl, nextPrUrl);
   }
 
-  private getIssuePrResolution(issueNumber: string): Promise<ResolvedIssuePr> {
-    return this.prResolver.getIssuePrResolution(issueNumber);
+  private getIssuePrResolution(issueNumber: string, opts: { fresh?: boolean } = {}): Promise<ResolvedIssuePr> {
+    return this.prResolver.getIssuePrResolution(issueNumber, opts);
+  }
+
+  private invalidateIssuePrResolution(issueNumber: string): void {
+    this.prResolver.invalidateIssuePrResolution(issueNumber);
   }
 
   private buildPrCreateLeaseKey(issueNumber: string, botBranch: string): string {
@@ -1229,7 +1245,7 @@ export class RepoWorker {
   }): Promise<ResolvedIssuePr | null> {
     const deadline = Date.now() + Math.max(0, Math.floor(params.maxWaitMs));
     while (Date.now() < deadline) {
-      const resolved = await this.getIssuePrResolution(params.issueNumber);
+      const resolved = await this.getIssuePrResolution(params.issueNumber, { fresh: true });
       if (resolved.selectedUrl) return resolved;
       await this.sleepMs(PR_CREATE_CONFLICT_POLL_MS);
     }
@@ -1613,6 +1629,40 @@ export class RepoWorker {
     };
   }
 
+  private async escalateMissingPrWithDerivedReason(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    continueAttempts: number;
+    evidence: string[];
+    latestOutput: string;
+    prRecoveryDiagnostics: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    const derived = derivePrCreateEscalationReason({
+      continueAttempts: params.continueAttempts,
+      evidence: params.evidence,
+    });
+    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+
+    this.recordMissingPrEvidence({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      botBranch: params.botBranch,
+      reason: derived.reason,
+      blockedSource: derived.classification?.blockedSource,
+      diagnostics: planOutput,
+    });
+
+    return await this.escalateNoPrAfterRetries({
+      task: params.task,
+      reason: derived.reason,
+      details: derived.details,
+      planOutput,
+      sessionId: params.sessionId,
+    });
+  }
+
   private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
     return await this.branchProtection.fetchAvailableCheckContexts(branch);
   }
@@ -1860,6 +1910,101 @@ export class RepoWorker {
     return this.normalizeRepoSlot(preferred, limit);
   }
 
+  private async runPrReadinessChecks(params: {
+    task: AgentTask;
+    issueNumber: string;
+    worktreePath: string;
+    botBranch: string;
+    runId: string;
+  }): Promise<{ ok: true; diagnostics: string[] } | { ok: false; diagnostics: string[] }> {
+    const diagnostics: string[] = [];
+    const issueContextParts: string[] = [];
+
+    try {
+      const issueContext = await this.buildIssueContextForAgent({
+        repo: this.repo,
+        issueNumber: params.issueNumber,
+      });
+      if (issueContext.trim()) issueContextParts.push(issueContext.trim());
+    } catch (error: any) {
+      issueContextParts.push(`Issue context unavailable: ${error?.message ?? String(error)}`);
+    }
+
+    const reviewIssueContext = issueContextParts.join("\n\n");
+
+    let reviewDiff: { baseRef: string; headRef: string; diffPath: string; diffStat: string };
+    try {
+      reviewDiff = await prepareReviewDiffArtifacts({
+        runId: params.runId,
+        repoPath: params.worktreePath,
+        baseRef: params.botBranch,
+        headRef: "HEAD",
+      });
+      diagnostics.push(`- Review diff artifact prepared: ${reviewDiff.diffPath}`);
+    } catch (error: any) {
+      const reason = `Review readiness failed: could not prepare diff artifacts (${error?.message ?? String(error)})`;
+      diagnostics.push(`- ${reason}`);
+      recordReviewGateFailure({ runId: params.runId, gate: "product_review", reason });
+      recordReviewGateFailure({ runId: params.runId, gate: "devex_review", reason });
+      return { ok: false, diagnostics };
+    }
+
+    const runReviewAgent = async (
+      gate: "product_review" | "devex_review",
+      agent: "product" | "devex",
+      stage: string
+    ) => {
+      return await runReviewGate({
+        runId: params.runId,
+        gate,
+        repo: this.repo,
+        issueRef: params.task.issue,
+        prUrl: "(not created yet)",
+        issueContext: reviewIssueContext,
+        diff: reviewDiff,
+        runAgent: async (prompt: string) => {
+          const runLogPath = await this.recordRunLogPath(params.task, params.issueNumber, stage, "in-progress");
+          return await this.session.runAgent(params.worktreePath, agent, prompt, {
+            repo: this.repo,
+            cacheKey: `pr-readiness-${params.issueNumber}-${agent}`,
+            runLogPath,
+            introspection: {
+              repo: this.repo,
+              issue: params.task.issue,
+              taskName: params.task.name,
+              step: 4,
+              stepTitle: stage,
+            },
+            ...this.buildWatchdogOptions(params.task, stage),
+            ...this.buildStallOptions(params.task, stage),
+            ...this.buildLoopDetectionOptions(params.task, stage),
+          });
+        },
+      });
+    };
+
+    const productReview = await runReviewAgent("product_review", "product", "pr readiness product review");
+    if (productReview.status !== "pass") {
+      diagnostics.push(`- Review failed: product (${productReview.reason})`);
+      recordReviewGateSkipped({
+        runId: params.runId,
+        gate: "devex_review",
+        reason: "Skipped because product review did not pass",
+      });
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Review passed: product");
+
+    const devexReview = await runReviewAgent("devex_review", "devex", "pr readiness devex review");
+    if (devexReview.status !== "pass") {
+      diagnostics.push(`- Review failed: devex (${devexReview.reason})`);
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Review passed: devex");
+
+    return { ok: true, diagnostics };
+  }
+
   private async tryEnsurePrFromWorktree(params: {
     task: AgentTask;
     issueNumber: string;
@@ -1933,36 +2078,50 @@ export class RepoWorker {
       return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
-    const preflightConfig = getRepoPreflightCommands(this.repo);
     const runId = this.activeRunId;
-    if (runId) {
-      const skipReason =
-        preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
-          ? "preflight disabled (preflightCommand=[])"
-          : preflightConfig.configured
-            ? "preflight configured but empty"
-            : "no preflight configured";
+    if (!runId) {
+      diagnostics.push("- Missing runId; refusing PR creation because deterministic gates cannot be persisted");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
 
-      const preflightResult = await runPreflightGate({
-        runId,
-        worktreePath: candidate.worktreePath,
-        commands: preflightConfig.commands,
-        skipReason,
-      });
+    const preflightConfig = getRepoPreflightCommands(this.repo);
+    const skipReason =
+      preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
+        ? "preflight disabled (preflightCommand=[])"
+        : preflightConfig.configured
+          ? "preflight configured but empty"
+          : "no preflight configured";
 
-      if (preflightResult.status === "fail") {
-        diagnostics.push("- Preflight failed; refusing to create PR");
-        diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
-        return { prUrl: null, diagnostics: diagnostics.join("\n") };
-      }
+    const preflightResult = await runPreflightGate({
+      runId,
+      worktreePath: candidate.worktreePath,
+      commands: preflightConfig.commands,
+      skipReason,
+    });
 
-      if (preflightResult.status === "skipped") {
-        diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
-      } else {
-        diagnostics.push("- Preflight passed");
-      }
-    } else if (preflightConfig.commands.length > 0) {
-      diagnostics.push("- WARNING: missing runId; skipping deterministic preflight gate recording");
+    if (preflightResult.status === "fail") {
+      diagnostics.push("- Preflight failed; refusing to create PR");
+      diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    if (preflightResult.status === "skipped") {
+      diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
+    } else {
+      diagnostics.push("- Preflight passed");
+    }
+
+    const readiness = await this.runPrReadinessChecks({
+      task,
+      issueNumber,
+      worktreePath: candidate.worktreePath,
+      botBranch,
+      runId,
+    });
+    diagnostics.push(...readiness.diagnostics);
+    if (!readiness.ok) {
+      diagnostics.push("- PR readiness failed; refusing to create PR");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
     try {
@@ -1985,6 +2144,15 @@ export class RepoWorker {
       "- (Please fill in)",
       "",
     ].join("\n");
+
+    const canonicalBeforeCreate = await this.getIssuePrResolution(issueNumber, { fresh: true });
+    if (canonicalBeforeCreate.diagnostics.length > 0) {
+      diagnostics.push(...canonicalBeforeCreate.diagnostics);
+    }
+    if (canonicalBeforeCreate.selectedUrl) {
+      diagnostics.push(`- Reusing canonical PR before create: ${canonicalBeforeCreate.selectedUrl}`);
+      return { prUrl: canonicalBeforeCreate.selectedUrl, diagnostics: diagnostics.join("\n") };
+    }
 
     const lease = this.tryClaimPrCreateLease({
       task,
@@ -2023,6 +2191,7 @@ export class RepoWorker {
         } catch {
           // ignore
         }
+        this.invalidateIssuePrResolution(issueNumber);
         return { prUrl, diagnostics: diagnostics.join("\n") };
       }
     } catch (e: any) {
@@ -2035,6 +2204,7 @@ export class RepoWorker {
       const url = data?.[0]?.url as string | undefined;
       if (url) {
         diagnostics.push(`- Found PR after create attempt: ${url}`);
+        this.invalidateIssuePrResolution(issueNumber);
         return { prUrl: url, diagnostics: diagnostics.join("\n") };
       }
     } catch (e: any) {
@@ -2115,6 +2285,10 @@ export class RepoWorker {
 
   private resolveCiFixAttempts(): number {
     return parseCiFixAttempts(process.env.RALPH_CI_REMEDIATION_MAX_ATTEMPTS) ?? 5;
+  }
+
+  private resolveLoopTriageAttempts(): number {
+    return parseCiFixAttempts(process.env.RALPH_LOOP_TRIAGE_MAX_ATTEMPTS) ?? 2;
   }
 
   private resolveMergeConflictAttempts(): number {
@@ -2206,6 +2380,7 @@ export class RepoWorker {
     issueNumber: string;
     botBranch: string;
     reason: string;
+    blockedSource?: string;
     diagnostics?: string;
   }): void {
     const runId = this.activeRunId;
@@ -2229,6 +2404,7 @@ export class RepoWorker {
       const content = [
         "PR evidence gate failed: missing PR URL.",
         `Reason: ${params.reason}`,
+        params.blockedSource ? `Blocked source: ${params.blockedSource}` : null,
         `Issue: ${params.task.issue}`,
         `Worktree: ${worktreePath}`,
         "",
@@ -2444,57 +2620,19 @@ export class RepoWorker {
     return /required status checks are expected/i.test(message);
   }
 
-  private getGhErrorSearchText(error: any): string {
-    const parts: string[] = [];
-    const message = String(error?.message ?? "").trim();
-    const stderr = this.stringifyGhOutput(error?.stderr);
-    const stdout = this.stringifyGhOutput(error?.stdout);
-
-    if (message) parts.push(message);
-    if (stderr) parts.push(stderr);
-    if (stdout) parts.push(stdout);
-
-    return parts.join("\n").trim();
+  private isGhAuthError(error: any): boolean {
+    if (error?.ralphAuthError) return true;
+    const message = this.getGhErrorSearchText(error);
+    if (!message) return false;
+    return /HTTP\s+401|HTTP\s+403|Missing\s+GH_TOKEN|authentication required|unauthorized|forbidden|bad credentials/i.test(message);
   }
 
-  private stringifyGhOutput(value: unknown): string {
-    if (value === null || value === undefined) return "";
-    if (typeof value === "string") return value.trim();
-    if (typeof (value as any)?.toString === "function") {
-      try {
-        return String((value as any).toString()).trim();
-      } catch {
-        return "";
-      }
-    }
-    try {
-      return String(value).trim();
-    } catch {
-      return "";
-    }
+  private getGhErrorSearchText(error: any): string {
+    return buildGhErrorSearchText(error);
   }
 
   private formatGhError(error: any): string {
-    const lines: string[] = [];
-
-    const command = String(error?.ghCommand ?? error?.command ?? "").trim();
-    const redactedCommand = command ? redactSensitiveText(command).trim() : "";
-    if (redactedCommand) lines.push(`Command: ${redactedCommand}`);
-
-    const exitCodeRaw = error?.exitCode ?? error?.code ?? null;
-    const exitCode = exitCodeRaw === null || exitCodeRaw === undefined ? "" : String(exitCodeRaw).trim();
-    if (exitCode) lines.push(`Exit code: ${exitCode}`);
-
-    const message = String(error?.message ?? "").trim();
-    if (message) lines.push(message);
-
-    const stderr = this.stringifyGhOutput(error?.stderr);
-    const stdout = this.stringifyGhOutput(error?.stdout);
-
-    if (stderr) lines.push("", "stderr:", summarizeForNote(stderr, 1600));
-    if (stdout) lines.push("", "stdout:", summarizeForNote(stdout, 1600));
-
-    return lines.join("\n").trim();
+    return formatGhErrorShared(error);
   }
 
   private buildMergeConflictPrompt(prUrl: string, baseRefName: string | null, botBranch: string): string {
@@ -2503,6 +2641,7 @@ export class RepoWorker {
       `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
       `Resolve merge conflicts by merging '${baseName}' into the PR branch (no rebase or force-push).`,
       "The base branch has already been merged into the PR branch in this worktree; finish the merge and resolve conflicts if present.",
+      "Do not use /tmp or any external-directory path; keep temporary files inside this worktree (for example ./.ralph-tmp/).",
       "Do NOT create a new PR.",
       "After resolving conflicts, run tests/typecheck/build/knip and push updates on the PR branch.",
       "",
@@ -4218,7 +4357,7 @@ export class RepoWorker {
       buildIssueContextForAgent: async (input) => await this.buildIssueContextForAgent(input),
       runReviewAgent: async (input) => {
         const runLogPath = await this.recordRunLogPath(params.task, issueNumber, input.stage, "in-progress");
-        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, {
+        const baseOptions = {
           repo: this.repo,
           cacheKey: input.cacheKey,
           runLogPath,
@@ -4233,11 +4372,20 @@ export class RepoWorker {
           ...this.buildStallOptions(params.task, input.stage),
           ...this.buildLoopDetectionOptions(params.task, input.stage),
           ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
-        });
+        };
+        const continueSessionId = input.continueSessionId?.trim();
+        if (continueSessionId) {
+          return await this.session.continueSession(params.repoPath, continueSessionId, input.prompt, {
+            ...baseOptions,
+            agent: input.agent,
+          });
+        }
+        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, baseOptions);
       },
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),
       formatGhError: (err) => this.formatGhError(err),
+      isAuthError: (err) => this.isGhAuthError(err as any),
       mergePullRequest: async (url, sha, cwd) => await this.mergePullRequest(url, sha, cwd),
       recordPrSnapshotBestEffort: (input) => this.recordPrSnapshotBestEffort(input as any),
       applyMidpointLabelsBestEffort: async (input) => await this.applyMidpointLabelsBestEffort(input as any),
@@ -4969,10 +5117,87 @@ export class RepoWorker {
     };
   }
 
+  private async readLoopTriageEvents(sessionId: string, limit: number): Promise<string[]> {
+    if (!sessionId || !isSafeSessionId(sessionId)) return [];
+    try {
+      const raw = await readFile(getSessionEventsPath(sessionId), "utf8");
+      const rows = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const selected: string[] = [];
+
+      for (const line of rows) {
+        try {
+          const event = JSON.parse(line) as any;
+          const type = String(event?.type ?? "");
+          if (!["tool-start", "step-start", "run-start", "tool-end", "loop-trip"].includes(type)) continue;
+          selected.push(
+            sanitizeEscalationReason(
+              redactSensitiveText(
+                JSON.stringify({
+                  type,
+                  ts: event?.ts,
+                  step: event?.step,
+                  title: event?.title,
+                  toolName: event?.toolName,
+                  argsPreview: event?.argsPreview,
+                  callId: event?.callId,
+                })
+              )
+            )
+          );
+        } catch {
+          // ignore malformed lines
+        }
+      }
+
+      return selected.slice(Math.max(0, selected.length - limit));
+    } catch {
+      return [];
+    }
+  }
+
+  private async readLoopTriageLogTail(path: string | undefined, maxLines: number): Promise<string[]> {
+    const filePath = path?.trim();
+    if (!filePath || !existsSync(filePath)) return [];
+    try {
+      const raw = await readFile(filePath, "utf8");
+      const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      const tail = lines.slice(Math.max(0, lines.length - maxLines));
+      return tail.map((line) => sanitizeEscalationReason(redactSensitiveText(line))).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  private buildLoopTriagePrompt(params: {
+    stage: string;
+    bundle: string;
+    recommendedGateCommand: string;
+  }): string {
+    const gate = params.recommendedGateCommand.trim() || "bun test";
+    return [
+      "Loop triage prompt v1",
+      "Decide the safest next action after loop detection tripped.",
+      "Prefer progress: restart/resume if plausible, escalate only when needed.",
+      "",
+      `Stage: ${params.stage}`,
+      `Recommended deterministic gate: ${gate}`,
+      "",
+      "Compact context bundle:",
+      params.bundle,
+      "",
+      "Output instructions:",
+      "- Return concise reasoning.",
+      "- Final line must be exactly one marker:",
+      'RALPH_LOOP_TRIAGE: {"version":1,"decision":"resume-existing|restart-new-agent|restart-ci-debug|escalate","rationale":"...","nudge":"..."}',
+    ].join("\n");
+  }
+
   private async handleLoopTrip(task: AgentTask, cacheKey: string, stage: string, result: SessionResult): Promise<AgentRun> {
     const trip = result.loopTrip;
     const sessionId = result.sessionId || task["session-id"]?.trim() || "";
     const worktreePath = task["worktree-path"]?.trim() || "";
+    const issueMatch = task.issue.match(/#(\d+)$/);
+    const issueNumber = issueMatch?.[1] ?? "";
 
     const reason = trip ? `Loop detection tripped: ${trip.reason} (${stage})` : `Loop detection tripped (${stage})`;
 
@@ -4992,8 +5217,7 @@ export class RepoWorker {
 
     const loopCfg = getRepoLoopDetectionConfig(this.repo);
     const recommendedGateCommand = loopCfg?.recommendedGateCommand ?? "bun test";
-
-    const details =
+    const loopDetails =
       trip != null
         ? buildLoopTripDetails({
             trip,
@@ -5001,7 +5225,177 @@ export class RepoWorker {
             lastDiagnosticSnippet: result.output,
             fallbackTouchedFiles,
           })
-        : undefined;
+        : "";
+
+    const eventTail = await this.readLoopTriageEvents(sessionId, LOOP_TRIAGE_EVENTS_LIMIT);
+    const runLogTail = await this.readLoopTriageLogTail(task["run-log-path"], LOOP_TRIAGE_LOG_LINES_LIMIT);
+    const fallbackOutputTail = result.output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-LOOP_TRIAGE_LOG_LINES_LIMIT)
+      .map((line) => sanitizeEscalationReason(redactSensitiveText(line)));
+
+    let prSnapshot = "PR status: (no open PR detected)";
+    let deterministicCiDebug = false;
+    try {
+      if (issueNumber) {
+        const existingPr = await this.getIssuePrResolution(issueNumber);
+        if (existingPr.selectedUrl) {
+          const { checks: requiredChecks } = await this.resolveRequiredChecksForMerge();
+          const prStatus = await this.getPullRequestChecks(existingPr.selectedUrl);
+          const summary = summarizeRequiredChecks(prStatus.checks, requiredChecks);
+          deterministicCiDebug = summary.status === "failure";
+          const lines = summary.required.slice(0, 8).map((check) => {
+            const detailsUrl = check.detailsUrl ? ` (${check.detailsUrl})` : "";
+            return `- ${check.name}: ${check.rawState}${detailsUrl}`;
+          });
+          prSnapshot = [
+            `PR: ${existingPr.selectedUrl}`,
+            `Required checks: ${summary.status}`,
+            ...(lines.length > 0 ? lines : ["- (no required checks configured)"]),
+          ].join("\n");
+        }
+      }
+    } catch (error: any) {
+      prSnapshot = `PR status lookup failed: ${this.formatGhError(error)}`;
+    }
+
+    const signature = computeLoopTriageSignature({ stage, trip });
+    const maxAttempts = this.resolveLoopTriageAttempts();
+    const issueNumberValue = Number.parseInt(issueNumber, 10);
+    const priorAttempt =
+      issueNumber && Number.isFinite(issueNumberValue)
+        ? getLoopTriageAttempt({ repo: this.repo, issueNumber: issueNumberValue, signature })
+        : null;
+    const priorAttempts = priorAttempt?.attemptCount ?? 0;
+
+    const bundle = sanitizeEscalationReason(
+      [
+        loopDetails || "Loop details unavailable.",
+        "",
+        "Recent events (bounded):",
+        ...(eventTail.length > 0 ? eventTail.map((line) => `- ${line}`) : ["- (none captured)"]),
+        "",
+        "Recent stderr/output tail (bounded):",
+        ...((runLogTail.length > 0 ? runLogTail : fallbackOutputTail).map((line) => `- ${line}`)),
+        "",
+        prSnapshot,
+      ].join("\n")
+    );
+
+    let parseResult = parseLoopTriageMarker("RALPH_LOOP_TRIAGE: {\"version\":1,\"decision\":\"escalate\",\"rationale\":\"deterministic default\",\"nudge\":\"escalate\"}");
+    if (!deterministicCiDebug) {
+      const prompt = this.buildLoopTriagePrompt({ stage, bundle, recommendedGateCommand });
+      const triageRepoPath = existsSync(worktreePath) ? worktreePath : this.repoPath;
+      const triageResult = await this.session.runAgent(triageRepoPath, "loop-triage", prompt, {
+        repo: this.repo,
+        cacheKey,
+        introspection: {
+          repo: this.repo,
+          issue: task.issue,
+          taskName: task.name,
+          step: 0,
+          stepTitle: "loop-triage",
+        },
+      });
+      parseResult = parseLoopTriageMarker(triageResult.output);
+      if (!triageResult.success && !parseResult.ok) {
+        parseResult = { ok: false, error: `Loop triage run failed: ${sanitizeEscalationReason(triageResult.output)}` };
+      }
+    }
+
+    const decision = decideLoopTripAction({
+      deterministicCiDebug,
+      parse: parseResult,
+      priorAttempts,
+      maxAttempts,
+      canResumeExisting: Boolean(sessionId),
+    });
+
+    if (decision.action !== "escalate") {
+      const nowIso = new Date().toISOString();
+      if (issueNumber && Number.isFinite(issueNumberValue)) {
+        const nextAttempt = bumpLoopTriageAttempt({
+          repo: this.repo,
+          issueNumber: issueNumberValue,
+          signature,
+          decision: decision.action,
+          rationale: decision.rationale,
+        });
+        if (!shouldAllowLoopTriageAttempt(nextAttempt.attemptCount, maxAttempts)) {
+          decision.action = "escalate";
+          decision.reasonCode = "budget_exhausted";
+          decision.rationale = `Loop-triage budget exhausted (${nextAttempt.attemptCount}/${maxAttempts})`;
+        }
+      }
+
+      if (decision.action === "resume-existing") {
+        const nudge = decision.nudge.slice(0, LOOP_TRIAGE_NUDGE_MAX_CHARS);
+        const details = sanitizeEscalationReason(bundle.slice(0, 1200));
+        await this.queue.updateTaskStatus(task, "queued", {
+          "session-id": sessionId,
+          "blocked-source": "loop-triage",
+          "blocked-reason": decision.rationale,
+          "blocked-details": `${nudge}\n\n${details}`,
+          "blocked-at": nowIso,
+          "blocked-checked-at": nowIso,
+        });
+        try {
+          await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+        } catch {
+          // ignore
+        }
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: sessionId || undefined,
+          escalationReason: `Loop triage: ${decision.action} (${decision.reasonCode})`,
+        };
+      }
+
+      const queueFields: Record<string, string> = {
+        "session-id": "",
+        "blocked-source": "",
+        "blocked-reason": "",
+        "blocked-details": "",
+        "blocked-at": "",
+        "blocked-checked-at": "",
+      };
+      await this.queue.updateTaskStatus(task, "queued", queueFields);
+      try {
+        await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: `Loop triage: ${decision.action} (${decision.reasonCode})`,
+      };
+    }
+
+    const escalateReason = `${reason}; triage=${decision.action} code=${decision.reasonCode}`;
+    const details = sanitizeEscalationReason(
+      [
+        loopDetails,
+        "",
+        `Triage decision: ${decision.action}`,
+        `Triage rationale: ${decision.rationale}`,
+        `Triage source: ${decision.source}`,
+        `Signature: ${signature}`,
+        `Attempts: ${priorAttempts}/${maxAttempts}`,
+        decision.parseError ? `Parse error: ${decision.parseError}` : "",
+        "",
+        "Context bundle (bounded):",
+        bundle,
+      ]
+        .filter(Boolean)
+        .join("\n")
+    );
 
     const escalationFields: Record<string, string> = {};
     if (sessionId) escalationFields["session-id"] = sessionId;
@@ -5013,7 +5407,7 @@ export class RepoWorker {
     }
 
     const githubCommentUrl = await this.writeEscalationWriteback(task, {
-      reason,
+      reason: escalateReason,
       details,
       escalationType: "other",
     });
@@ -5027,7 +5421,7 @@ export class RepoWorker {
       scope: task.scope,
       priority: task.priority,
       sessionId: sessionId || undefined,
-      reason,
+      reason: escalateReason,
       escalationType: "other",
       githubCommentUrl: githubCommentUrl ?? undefined,
       planOutput: result.output,
@@ -5035,13 +5429,12 @@ export class RepoWorker {
 
     if (escalated && !wasEscalated) {
       await this.recordEscalatedRunNote(task, {
-        reason,
+        reason: escalateReason,
         sessionId: sessionId || undefined,
-        details: result.output,
+        details,
       });
     }
 
-    // Best-effort: clear per-task cache after a loop-trip, since we killed the session.
     try {
       await rm(this.session.getRalphXdgCacheHome(this.repo, cacheKey), { recursive: true, force: true });
     } catch {
@@ -5053,7 +5446,7 @@ export class RepoWorker {
       repo: this.repo,
       outcome: "escalated",
       sessionId: sessionId || undefined,
-      escalationReason: reason,
+      escalationReason: escalateReason,
     };
   }
 
@@ -5595,23 +5988,14 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const derived = derivePrCreateEscalationReason({
-          continueAttempts,
-          evidence: prCreateEvidence,
-        });
-        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
-        this.recordMissingPrEvidence({
+        return await this.escalateMissingPrWithDerivedReason({
           task,
           issueNumber,
           botBranch,
-          reason: derived.reason,
-          diagnostics: planOutput,
-        });
-        return await this.escalateNoPrAfterRetries({
-          task,
-          reason: derived.reason,
-          details: derived.details,
-          planOutput,
+          continueAttempts,
+          evidence: prCreateEvidence,
+          latestOutput: buildResult.output,
+          prRecoveryDiagnostics,
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
         });
       }
@@ -6867,23 +7251,14 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const derived = derivePrCreateEscalationReason({
-          continueAttempts,
-          evidence: prCreateEvidence,
-        });
-        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
-        this.recordMissingPrEvidence({
+        return await this.escalateMissingPrWithDerivedReason({
           task,
           issueNumber,
           botBranch,
-          reason: derived.reason,
-          diagnostics: planOutput,
-        });
-        return await this.escalateNoPrAfterRetries({
-          task,
-          reason: derived.reason,
-          details: derived.details,
-          planOutput,
+          continueAttempts,
+          evidence: prCreateEvidence,
+          latestOutput: buildResult.output,
+          prRecoveryDiagnostics,
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
         });
       }
@@ -7065,8 +7440,7 @@ export class RepoWorker {
       bodyPrefix?: string;
     }
   ): Promise<void> {
-    // Agent run persistence is handled via SQLite run records + gate artifacts.
-    // Legacy note artifacts are intentionally disabled.
+    // Agent-run artifacts are persisted via SQLite run records.
     if (data.sessionId) {
       await cleanupIntrospectionLogs(data.sessionId);
     }

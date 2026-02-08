@@ -1,8 +1,14 @@
 import { homedir } from "os";
 import { dirname, isAbsolute, join } from "path";
-import { existsSync, mkdirSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from "fs";
 
-import { getRalphConfigJsonPath, getRalphConfigTomlPath, getRalphLegacyConfigPath } from "./paths";
+import {
+  getRalphConfigJsonPath,
+  getRalphConfigTomlPath,
+  getRalphLegacyConfigPath,
+  getRalphSandboxManifestPath,
+  getRalphSandboxManifestsDir,
+} from "./paths";
 import { resolveRequestedOpencodeProfile, type RequestedOpencodeProfile } from "./opencode-profile-utils";
 
 export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
@@ -37,8 +43,8 @@ export type RepoVerificationConfig = {
 };
 
 export interface RepoConfig {
-  name: string;      // "3mdistal/ralph"
-  path: string;      // "/Users/alicemoore/Developer/ralph"
+  name: string;      // "owner/repo"
+  path: string;      // "/Users/alice/Developer/repo"
   botBranch: string; // "bot/integration"
   /**
    * Optional deterministic preflight commands run in the task worktree before Ralph opens a PR.
@@ -353,6 +359,7 @@ const DEFAULT_THROTTLE_MIN_CHECK_INTERVAL_MS = 15_000;
 const DEFAULT_THROTTLE_BUDGET_5H_TOKENS = 16_987_015;
 const DEFAULT_THROTTLE_BUDGET_WEEKLY_TOKENS = 55_769_305;
 const DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS = 14;
+const DEFAULT_SANDBOX_EVENTS_RETENTION_DAYS = 30;
 const DEFAULT_CONTROL_PLANE_HOST = "127.0.0.1";
 const DEFAULT_CONTROL_PLANE_PORT = 8787;
 const DEFAULT_CONTROL_PLANE_REPLAY_DEFAULT = 50;
@@ -389,6 +396,192 @@ export type ConfigLoadResult = {
 };
 
 let configResult: ConfigLoadResult | null = null;
+
+type SandboxRuntimeSelection = {
+  source: "run-id" | "latest";
+  runId: string;
+  manifestPath: string;
+  repoFullName: string;
+  botBranch: string;
+  defaultBranch: string;
+};
+
+let sandboxRuntimeSelection: SandboxRuntimeSelection | null = null;
+
+const RALPH_PROFILE_ENV = "RALPH_PROFILE";
+const RALPH_SANDBOX_TARGET_FROM_MANIFEST_ENV = "RALPH_SANDBOX_TARGET_FROM_MANIFEST";
+const RALPH_SANDBOX_RUN_ID_ENV = "RALPH_SANDBOX_RUN_ID";
+
+function resolveProfileFromConfigAndEnv(rawProfile: unknown): RalphProfile {
+  const envProfile = process.env[RALPH_PROFILE_ENV]?.trim();
+  const candidate = envProfile || (typeof rawProfile === "string" ? rawProfile.trim() : rawProfile);
+
+  if (candidate === undefined || candidate === null || candidate === "") return "prod";
+  if (candidate === "prod" || candidate === "sandbox") return candidate;
+
+  throw new RalphConfigError(
+    "RALPH_CONFIG_INVALID",
+    `[ralph] Invalid ${envProfile ? `env ${RALPH_PROFILE_ENV}` : "config profile"}=${JSON.stringify(candidate)}; expected "prod" or "sandbox".`
+  );
+}
+
+function readSandboxManifestForRuntime(path: string): {
+  runId: string;
+  createdAtTs: number | null;
+  repoFullName: string;
+  botBranch: string;
+  defaultBranch: string;
+} {
+  let raw = "";
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_SANDBOX_INVALID",
+      `[ralph] Failed to read sandbox manifest ${path}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_SANDBOX_INVALID",
+      `[ralph] Invalid sandbox manifest JSON ${path}: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+
+  if (!parsed || typeof parsed !== "object" || parsed.schemaVersion !== 1) {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_SANDBOX_INVALID",
+      `[ralph] Invalid sandbox manifest ${path}: expected schemaVersion=1 object.`
+    );
+  }
+
+  const runId = toNonEmptyStringOrNull(parsed.runId);
+  const repoFullName = toNonEmptyStringOrNull(parsed?.repo?.fullName);
+  const botBranch = toNonEmptyStringOrNull(parsed.botBranch);
+  const defaultBranch = toNonEmptyStringOrNull(parsed.defaultBranch);
+
+  if (!runId || !repoFullName || !botBranch || !defaultBranch) {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_SANDBOX_INVALID",
+      `[ralph] Invalid sandbox manifest ${path}: missing runId/repo.fullName/botBranch/defaultBranch.`
+    );
+  }
+
+  const createdAtRaw = toNonEmptyStringOrNull(parsed.createdAt);
+  const createdAtTs = createdAtRaw ? Date.parse(createdAtRaw) : Number.NaN;
+  return {
+    runId,
+    createdAtTs: Number.isFinite(createdAtTs) ? createdAtTs : null,
+    repoFullName,
+    botBranch,
+    defaultBranch,
+  };
+}
+
+function shouldResolveSandboxRepoFromManifest(): boolean {
+  const raw = process.env[RALPH_SANDBOX_TARGET_FROM_MANIFEST_ENV]?.trim().toLowerCase();
+  if (!raw) return false;
+  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
+}
+
+function resolveSandboxRuntimeSelection(): SandboxRuntimeSelection {
+  const requestedRunId = toNonEmptyStringOrNull(process.env[RALPH_SANDBOX_RUN_ID_ENV]);
+
+  if (requestedRunId) {
+    const manifestPath = getRalphSandboxManifestPath(requestedRunId);
+    const manifest = readSandboxManifestForRuntime(manifestPath);
+    return {
+      source: "run-id",
+      runId: manifest.runId,
+      manifestPath,
+      repoFullName: manifest.repoFullName,
+      botBranch: manifest.botBranch,
+      defaultBranch: manifest.defaultBranch,
+    };
+  }
+
+  const manifestsDir = getRalphSandboxManifestsDir();
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(manifestsDir).filter((name) => name.endsWith(".json")).sort();
+  } catch {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_SANDBOX_INVALID",
+      `[ralph] Sandbox profile requires a manifest. No manifests found in ${manifestsDir}. Run sandbox:init first.`
+    );
+  }
+
+  const candidates: Array<{
+    runId: string;
+    manifestPath: string;
+    createdAtTs: number | null;
+    mtimeMs: number;
+    repoFullName: string;
+    botBranch: string;
+    defaultBranch: string;
+  }> = [];
+
+  for (const name of entries) {
+    const manifestPath = join(manifestsDir, name);
+    let mtimeMs = 0;
+    try {
+      const info = statSync(manifestPath);
+      if (!info.isFile()) continue;
+      mtimeMs = info.mtimeMs;
+    } catch {
+      continue;
+    }
+
+    try {
+      const manifest = readSandboxManifestForRuntime(manifestPath);
+      candidates.push({
+        runId: manifest.runId,
+        manifestPath,
+        createdAtTs: manifest.createdAtTs,
+        mtimeMs,
+        repoFullName: manifest.repoFullName,
+        botBranch: manifest.botBranch,
+        defaultBranch: manifest.defaultBranch,
+      });
+    } catch {
+      // Skip invalid manifests while scanning for the latest valid v1 manifest.
+    }
+  }
+
+  if (candidates.length === 0) {
+    throw new RalphConfigError(
+      "RALPH_CONFIG_SANDBOX_INVALID",
+      `[ralph] Sandbox profile requires a valid manifest. No valid v1 manifests found in ${manifestsDir}.`
+    );
+  }
+
+  candidates.sort((a, b) => {
+    const aCreated = a.createdAtTs ?? Number.NEGATIVE_INFINITY;
+    const bCreated = b.createdAtTs ?? Number.NEGATIVE_INFINITY;
+    if (aCreated !== bCreated) return bCreated - aCreated;
+    if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
+    return b.runId.localeCompare(a.runId);
+  });
+
+  const selected = candidates[0];
+  return {
+    source: "latest",
+    runId: selected.runId,
+    manifestPath: selected.manifestPath,
+    repoFullName: selected.repoFullName,
+    botBranch: selected.botBranch,
+    defaultBranch: selected.defaultBranch,
+  };
+}
+
+function getDefaultRepoPath(devDir: string, repoName: string): string {
+  const shortName = repoName.includes("/") ? repoName.split("/")[1] : repoName;
+  return join(devDir, shortName);
+}
 
 function isQueueBackendValue(value: unknown): value is QueueBackend {
   return value === "github" || value === "none";
@@ -729,17 +922,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     loaded.queueBackend = "github";
   }
 
-  const rawProfile = (loaded as any).profile;
-  if (rawProfile === undefined || rawProfile === null || rawProfile === "") {
-    loaded.profile = "prod";
-  } else if (rawProfile === "prod" || rawProfile === "sandbox") {
-    loaded.profile = rawProfile;
-  } else {
-    throw new RalphConfigError(
-      "RALPH_CONFIG_INVALID",
-      `[ralph] Invalid config profile=${JSON.stringify(rawProfile)}; expected "prod" or "sandbox".`
-    );
-  }
+  loaded.profile = resolveProfileFromConfigAndEnv((loaded as any).profile);
 
   // Validate per-repo concurrencySlots/maxWorkers + rollupBatchSize. We keep them optional in the config, but sanitize invalid values.
   loaded.repos = (loaded.repos ?? []).map((repo) => {
@@ -1125,6 +1308,18 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       ...(retention ? { retention } : {}),
       ...(provisioning ? { provisioning } : {}),
     };
+
+    if (shouldResolveSandboxRepoFromManifest()) {
+      const selection = resolveSandboxRuntimeSelection();
+      sandboxRuntimeSelection = selection;
+      loaded.repos = [
+        {
+          name: selection.repoFullName,
+          path: getDefaultRepoPath(loaded.devDir, selection.repoFullName),
+          botBranch: selection.botBranch,
+        },
+      ];
+    }
   }
 
   // Best-effort validation for GitHub App auth config.
@@ -1758,6 +1953,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
 
 export function loadConfig(): ConfigLoadResult {
   if (configResult) return configResult;
+  sandboxRuntimeSelection = null;
 
   // Start with defaults
   let loaded: RalphConfig = { ...DEFAULT_CONFIG };
@@ -1842,6 +2038,7 @@ export function loadConfig(): ConfigLoadResult {
 
 export function __resetConfigForTests(): void {
   configResult = null;
+  sandboxRuntimeSelection = null;
 }
 
 export function getConfigSource(): ConfigSource {
@@ -1858,6 +2055,10 @@ export function isQueueBackendExplicit(): boolean {
 
 export function getConfig(): RalphConfig {
   return loadConfig().config;
+}
+
+export function getSandboxRuntimeSelection(): SandboxRuntimeSelection | null {
+  return sandboxRuntimeSelection;
 }
 
 export function getProfile(): RalphProfile {
@@ -2006,7 +2207,9 @@ export function getDashboardEventsRetentionDays(): number {
   const cfg = getConfig();
   const raw = cfg.dashboard?.eventsRetentionDays;
   const parsed = toPositiveIntOrNull(raw);
-  return parsed ?? DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
+  if (parsed !== null) return parsed;
+  if (getProfile() === "sandbox") return DEFAULT_SANDBOX_EVENTS_RETENTION_DAYS;
+  return DEFAULT_DASHBOARD_EVENTS_RETENTION_DAYS;
 }
 
 export type DashboardControlPlaneResolved = {
