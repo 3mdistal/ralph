@@ -18,7 +18,7 @@ const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   "in-progress": RALPH_LABEL_STATUS_IN_PROGRESS,
   "waiting-on-pr": RALPH_LABEL_STATUS_IN_PROGRESS,
   paused: RALPH_LABEL_STATUS_PAUSED,
-  blocked: null,
+  blocked: RALPH_LABEL_STATUS_IN_PROGRESS,
   escalated: RALPH_LABEL_STATUS_ESCALATED,
   done: RALPH_LABEL_STATUS_DONE,
   starting: RALPH_LABEL_STATUS_IN_PROGRESS,
