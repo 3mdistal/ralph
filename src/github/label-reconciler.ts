@@ -21,6 +21,7 @@ import {
 } from "../github-queue/core";
 import type { QueueTaskStatus } from "../queue/types";
 import { RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_STOPPED } from "../github-labels";
+import { auditQueueParityForRepo } from "./queue-parity-audit";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_MAX_ISSUES_PER_TICK = 10;
@@ -60,7 +61,12 @@ function toDesiredStatus(raw: string | null | undefined): QueueTaskStatus | null
   return raw as QueueTaskStatus;
 }
 
-async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number): Promise<number> {
+async function reconcileRepo(
+  repo: string,
+  maxIssues: number,
+  cooldownMs: number
+): Promise<{ processed: number; queuedBlockedBefore: number; queuedBlockedAfter: number }> {
+  const parityBefore = auditQueueParityForRepo(repo);
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
   const debounceMsRaw = Number(process.env.RALPH_GITHUB_QUEUE_STATUS_DEBOUNCE_MS ?? DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS);
@@ -73,7 +79,13 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
   }
 
   const issues = listIssueSnapshotsWithRalphLabels(repo);
-  if (issues.length === 0) return 0;
+  if (issues.length === 0) {
+    return {
+      processed: 0,
+      queuedBlockedBefore: parityBefore.ghQueuedLocalBlocked,
+      queuedBlockedAfter: parityBefore.ghQueuedLocalBlocked,
+    };
+  }
 
   const github = new GitHubClient(repo);
   const labelIdCache = new Map<string, string>();
@@ -189,7 +201,23 @@ async function reconcileRepo(repo: string, maxIssues: number, cooldownMs: number
     processed += 1;
   }
 
-  return processed;
+  const parityAfter = auditQueueParityForRepo(repo);
+  const shouldReportDrift =
+    parityBefore.ghQueuedLocalBlocked !== parityAfter.ghQueuedLocalBlocked || parityAfter.ghQueuedLocalBlocked > 0;
+  if (shouldReportDrift) {
+    const samples = parityAfter.sampleGhQueuedLocalBlocked.length > 0
+      ? ` samples=${parityAfter.sampleGhQueuedLocalBlocked.join(",")}`
+      : "";
+    console.log(
+      `[ralph:labels:reconcile:${repo}] queued/local-blocked drift before=${parityBefore.ghQueuedLocalBlocked} after=${parityAfter.ghQueuedLocalBlocked}${samples}`
+    );
+  }
+
+  return {
+    processed,
+    queuedBlockedBefore: parityBefore.ghQueuedLocalBlocked,
+    queuedBlockedAfter: parityAfter.ghQueuedLocalBlocked,
+  };
 }
 
 export function startGitHubLabelReconciler(params?: {
@@ -216,13 +244,21 @@ export function startGitHubLabelReconciler(params?: {
     try {
       const repos = getConfig().repos.map((entry) => entry.name);
       let remaining = maxIssuesPerTick;
+      let totalProcessed = 0;
+      let queuedBlockedBefore = 0;
+      let queuedBlockedAfter = 0;
       for (const repo of repos) {
         if (remaining <= 0) break;
-        const processed = await reconcileRepo(repo, remaining, cooldownMs);
-        remaining -= processed;
+        const result = await reconcileRepo(repo, remaining, cooldownMs);
+        remaining -= result.processed;
+        totalProcessed += result.processed;
+        queuedBlockedBefore += result.queuedBlockedBefore;
+        queuedBlockedAfter += result.queuedBlockedAfter;
       }
       if (shouldLog("labels:reconcile", 5 * 60_000)) {
-        log("[ralph:labels] Reconcile tick complete");
+        log(
+          `[ralph:labels] Reconcile tick complete processed=${totalProcessed} queued/local-blocked=${queuedBlockedBefore}->${queuedBlockedAfter}`
+        );
       }
     } catch (error: any) {
       log(`[ralph:labels] Reconcile tick failed: ${error?.message ?? String(error)}`);
