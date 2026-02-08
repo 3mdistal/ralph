@@ -194,6 +194,7 @@ export function getManagedOpencodeConfigManifest(configDir?: string): ManagedCon
     { path: join(resolvedDir, "agent", "ralph-plan.md"), contents: readTemplate("agent/ralph-plan.md") },
     { path: join(resolvedDir, "agent", "product.md"), contents: readTemplate("agent/product.md") },
     { path: join(resolvedDir, "agent", "devex.md"), contents: readTemplate("agent/devex.md") },
+    { path: join(resolvedDir, "agent", "loop-triage.md"), contents: readTemplate("agent/loop-triage.md") },
     { path: join(resolvedDir, MARKER_FILENAME), contents: MARKER_CONTENTS },
   ];
 

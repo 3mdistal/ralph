@@ -3,6 +3,7 @@ import { readFile } from "fs/promises";
 import { join } from "path";
 
 import { computeLiveAnomalyCountFromJsonl } from "../anomaly";
+import { getProfile } from "../config";
 import { cleanupSessionArtifacts } from "../introspection-traces";
 import { isIntrospectionSummary, type IntrospectionSummary } from "../introspection/summary";
 import { getRalphSessionDir, getSessionEventsPath } from "../paths";
@@ -73,6 +74,7 @@ export function hasRepeatedToolPattern(recentEvents?: string[]): boolean {
 }
 
 export async function cleanupIntrospectionLogs(sessionId: string): Promise<void> {
+  if (getProfile() === "sandbox") return;
   try {
     await cleanupSessionArtifacts(sessionId);
   } catch (e) {

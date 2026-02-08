@@ -8,6 +8,7 @@
  */
 
 import { existsSync } from "fs";
+import { mkdir } from "fs/promises";
 import { dirname, join } from "path";
 import crypto from "crypto";
 
@@ -24,6 +25,7 @@ import {
   getRepoPath,
   getSandboxProfileConfig,
   getSandboxProvisioningConfig,
+  getSandboxRuntimeSelection,
   type ControlConfig,
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
@@ -125,6 +127,8 @@ import {
 } from "./sandbox/provisioning-io";
 import { writeSandboxManifest } from "./sandbox/manifest";
 import { getBaselineSeedSpec, loadSeedSpecFromFile } from "./sandbox/seed-spec";
+import { createGhRunner } from "./github/gh-runner";
+import { parseGlobalRuntimeFlags } from "./runtime-flags";
 
 // --- State ---
 
@@ -825,7 +829,9 @@ async function startTask(opts: {
       const sessionId = claimedTask["session-id"]?.trim() || "";
       const shouldResumeMergeConflict = sessionId && blockedSource === "merge-conflict";
       const shouldResumeStall = sessionId && blockedSource === "stall";
-      const shouldResumeQueuedSession = sessionId && !shouldResumeMergeConflict && !shouldResumeStall;
+      const shouldResumeLoopTriage = sessionId && blockedSource === "loop-triage";
+      const shouldResumeQueuedSession =
+        sessionId && !shouldResumeMergeConflict && !shouldResumeStall && !shouldResumeLoopTriage;
 
       if (shouldResumeMergeConflict) {
         console.log(
@@ -904,6 +910,69 @@ async function startTask(opts: {
           .resumeTask(claimedTask, {
             resumeMessage:
               `You have been idle for ~${idleMinutes}m. Decide next action: continue, rerun the last command, or escalate with a question. Then proceed.`,
+            repoSlot: slot,
+          })
+          .then(async (run: AgentRun) => {
+            if (run.outcome === "success" && run.pr) {
+              try {
+                recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: PR_STATE_MERGED });
+              } catch {
+                // best-effort
+              }
+
+              await rollupMonitor.recordMerge(repo, run.pr);
+            }
+          })
+          .catch((e) => {
+            console.error(`[ralph] Error resuming task ${claimedTask.name}:`, e);
+          })
+          .finally(() => {
+            inFlightTasks.delete(key);
+            forgetOwnedTask(claimedTask);
+            releaseSlot?.();
+            releaseGlobal();
+            releaseRepo();
+            if (!isShuttingDown) {
+              scheduleQueuedTasksSoon();
+              void checkIdleRollups();
+            }
+          });
+
+        return true;
+      }
+
+      if (shouldResumeLoopTriage) {
+        const blockedReason = claimedTask["blocked-reason"]?.trim() || "Loop triage requested resume-existing.";
+        const blockedDetails = claimedTask["blocked-details"]?.trim() || "";
+
+        console.log(`[ralph] Requeued loop-triage task ${claimedTask.name}; resuming session ${sessionId}`);
+
+        await updateTaskStatus(claimedTask, "in-progress", {
+          "assigned-at": new Date().toISOString().split("T")[0],
+          "session-id": sessionId,
+          "throttled-at": "",
+          "resume-at": "",
+          "usage-snapshot": "",
+          "blocked-source": "",
+          "blocked-reason": "",
+          "blocked-details": "",
+          "blocked-at": "",
+          "blocked-checked-at": "",
+        });
+
+        const resumeMessage = [
+          "Loop triage selected resume-existing.",
+          `Reason: ${blockedReason}`,
+          blockedDetails ? `Context:\n${blockedDetails}` : "",
+          "Immediately run one deterministic gate command (for example: bun test or bun run typecheck) before additional edits.",
+          "Then continue the task with a narrow, concrete next step.",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
+
+        void getOrCreateWorkerForSlot(repo, slot)
+          .resumeTask(claimedTask, {
+            resumeMessage,
             repoSlot: slot,
           })
           .then(async (run: AgentRun) => {
@@ -1993,7 +2062,7 @@ function printGlobalHelp(): void {
       "Ralph Loop (ralph)",
       "",
       "Usage:",
-      "  ralph                              Run daemon (default)",
+      "  ralph [--profile <prod|sandbox>] [--run-id <id>]  Run daemon (default)",
       "  ralph resume                       Resume orphaned in-progress tasks, then exit",
       "  ralph status [--json]              Show daemon/task status",
       "  ralph runs top|show ...             List expensive runs + trace pointers",
@@ -2016,8 +2085,11 @@ function printGlobalHelp(): void {
       "",
       "Options:",
       "  -h, --help                         Show help (also: ralph help [command])",
+      "  --profile <prod|sandbox>           Runtime profile override (global flag before command)",
+      "  --run-id <id>                      Sandbox manifest runId override (global flag before command)",
       "",
       "Notes:",
+      "  Runtime --profile is distinct from `ralph usage --profile` (OpenCode usage meter filter).",
       "  Control file: set version=1 and mode=running|draining|paused in ~/.ralph/control/control.json (fallback reads: $XDG_STATE_HOME/ralph/control.json, ~/.local/state/ralph/control.json, /tmp/ralph/<uid>/control.json).",
       "  OpenCode profile: set [opencode].defaultProfile in ~/.ralph/config.toml (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
@@ -2249,7 +2321,53 @@ function formatResetAt(value: unknown): string {
   return value;
 }
 
-const args = process.argv.slice(2);
+async function ensureSandboxDaemonRepoCheckout(config: ReturnType<typeof getConfig>): Promise<void> {
+  if (config.profile !== "sandbox") return;
+  const selection = getSandboxRuntimeSelection();
+  if (!selection) return;
+
+  const target = config.repos[0];
+  if (!target || !target.name || !target.path) {
+    throw new Error("[ralph:sandbox] Manifest-derived sandbox target repo is missing from runtime config.");
+  }
+
+  if (existsSync(target.path)) {
+    const gitDir = join(target.path, ".git");
+    if (!existsSync(gitDir)) {
+      throw new Error(
+        `[ralph:sandbox] Refusing to use non-git path for sandbox target ${target.name}: ${target.path}`
+      );
+    }
+    console.log(
+      `[ralph:sandbox] Using manifest target ${target.name} (runId=${selection.runId}, source=${selection.source}, manifest=${selection.manifestPath})`
+    );
+    return;
+  }
+
+  await mkdir(dirname(target.path), { recursive: true });
+  const ghRead = createGhRunner({ repo: target.name, mode: "read" });
+  await ghRead`gh repo clone ${target.name} ${target.path}`.quiet();
+  console.log(
+    `[ralph:sandbox] Cloned manifest target ${target.name} to ${target.path} (runId=${selection.runId}, source=${selection.source}, manifest=${selection.manifestPath})`
+  );
+}
+
+let runtimeFlagResult: ReturnType<typeof parseGlobalRuntimeFlags>;
+try {
+  runtimeFlagResult = parseGlobalRuntimeFlags(process.argv.slice(2));
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}
+
+if (runtimeFlagResult.profileOverride) {
+  process.env.RALPH_PROFILE = runtimeFlagResult.profileOverride;
+}
+if (runtimeFlagResult.sandboxRunId) {
+  process.env.RALPH_SANDBOX_RUN_ID = runtimeFlagResult.sandboxRunId;
+}
+
+const args = runtimeFlagResult.args;
 const cmd = args[0];
 
 const hasHelpFlag = args.includes("-h") || args.includes("--help");
@@ -2857,6 +2975,15 @@ if (args[0] === "sandbox") {
 }
 
 // Default: run daemon
+try {
+  process.env.RALPH_SANDBOX_TARGET_FROM_MANIFEST = "1";
+  const bootstrapConfig = getConfig();
+  await ensureSandboxDaemonRepoCheckout(bootstrapConfig);
+} catch (e) {
+  console.error("[ralph] Fatal error:", e);
+  process.exit(1);
+}
+
 main().catch((e) => {
   console.error("[ralph] Fatal error:", e);
   process.exit(1);
