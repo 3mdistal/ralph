@@ -1628,6 +1628,40 @@ export class RepoWorker {
     };
   }
 
+  private async escalateMissingPrWithDerivedReason(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    continueAttempts: number;
+    evidence: string[];
+    latestOutput: string;
+    prRecoveryDiagnostics: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    const derived = derivePrCreateEscalationReason({
+      continueAttempts: params.continueAttempts,
+      evidence: params.evidence,
+    });
+    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+
+    this.recordMissingPrEvidence({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      botBranch: params.botBranch,
+      reason: derived.reason,
+      blockedSource: derived.classification?.blockedSource,
+      diagnostics: planOutput,
+    });
+
+    return await this.escalateNoPrAfterRetries({
+      task: params.task,
+      reason: derived.reason,
+      details: derived.details,
+      planOutput,
+      sessionId: params.sessionId,
+    });
+  }
+
   private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
     return await this.branchProtection.fetchAvailableCheckContexts(branch);
   }
@@ -2236,6 +2270,7 @@ export class RepoWorker {
     issueNumber: string;
     botBranch: string;
     reason: string;
+    blockedSource?: string;
     diagnostics?: string;
   }): void {
     const runId = this.activeRunId;
@@ -2259,6 +2294,7 @@ export class RepoWorker {
       const content = [
         "PR evidence gate failed: missing PR URL.",
         `Reason: ${params.reason}`,
+        params.blockedSource ? `Blocked source: ${params.blockedSource}` : null,
         `Issue: ${params.task.issue}`,
         `Worktree: ${worktreePath}`,
         "",
@@ -2472,6 +2508,13 @@ export class RepoWorker {
     const message = this.getGhErrorSearchText(error);
     if (!message) return false;
     return /required status checks are expected/i.test(message);
+  }
+
+  private isGhAuthError(error: any): boolean {
+    if (error?.ralphAuthError) return true;
+    const message = this.getGhErrorSearchText(error);
+    if (!message) return false;
+    return /HTTP\s+401|HTTP\s+403|Missing\s+GH_TOKEN|authentication required|unauthorized|forbidden|bad credentials/i.test(message);
   }
 
   private getGhErrorSearchText(error: any): string {
@@ -4231,6 +4274,7 @@ export class RepoWorker {
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),
       formatGhError: (err) => this.formatGhError(err),
+      isAuthError: (err) => this.isGhAuthError(err as any),
       mergePullRequest: async (url, sha, cwd) => await this.mergePullRequest(url, sha, cwd),
       recordPrSnapshotBestEffort: (input) => this.recordPrSnapshotBestEffort(input as any),
       applyMidpointLabelsBestEffort: async (input) => await this.applyMidpointLabelsBestEffort(input as any),
@@ -5833,23 +5877,14 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const derived = derivePrCreateEscalationReason({
-          continueAttempts,
-          evidence: prCreateEvidence,
-        });
-        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
-        this.recordMissingPrEvidence({
+        return await this.escalateMissingPrWithDerivedReason({
           task,
           issueNumber,
           botBranch,
-          reason: derived.reason,
-          diagnostics: planOutput,
-        });
-        return await this.escalateNoPrAfterRetries({
-          task,
-          reason: derived.reason,
-          details: derived.details,
-          planOutput,
+          continueAttempts,
+          evidence: prCreateEvidence,
+          latestOutput: buildResult.output,
+          prRecoveryDiagnostics,
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
         });
       }
@@ -7105,23 +7140,14 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const derived = derivePrCreateEscalationReason({
-          continueAttempts,
-          evidence: prCreateEvidence,
-        });
-        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
-        this.recordMissingPrEvidence({
+        return await this.escalateMissingPrWithDerivedReason({
           task,
           issueNumber,
           botBranch,
-          reason: derived.reason,
-          diagnostics: planOutput,
-        });
-        return await this.escalateNoPrAfterRetries({
-          task,
-          reason: derived.reason,
-          details: derived.details,
-          planOutput,
+          continueAttempts,
+          evidence: prCreateEvidence,
+          latestOutput: buildResult.output,
+          prRecoveryDiagnostics,
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
         });
       }
