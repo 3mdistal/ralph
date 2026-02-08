@@ -2,7 +2,7 @@
 
 Autonomous coding task orchestrator for OpenCode.
 
-Ralph watches for GitHub issues labeled with `ralph:*` workflow labels and dispatches them to OpenCode agents. It handles the full lifecycle: planning, implementation, PR creation, and merge.
+Ralph watches GitHub issues labeled with `ralph:*` workflow labels and dispatches them to OpenCode agents. It handles the full lifecycle: planning, implementation, PR creation, and merge.
 
 ## Features
 
@@ -79,7 +79,7 @@ bun install
 
 Ralph loads config from `~/.ralph/config.toml`, then `~/.ralph/config.json`, then falls back to legacy `~/.config/opencode/ralph/ralph.json` (with a warning). Config is merged over built-in defaults via a shallow merge (arrays/objects are replaced, not deep-merged).
 
-GitHub Issues plus `~/.ralph/state.sqlite` are the canonical queue surfaces.
+GitHub Issues + labels are the operator queue surface. `~/.ralph/state.sqlite` is Ralph's canonical local machine state.
 
 Config is loaded once at startup, so restart the daemon after editing.
 
@@ -461,7 +461,13 @@ ralph sandbox seed --repo <owner/repo> --manifest sandbox/seed-manifest.v1.json 
 
 ### Queue a task
 
-Apply `ralph:status:queued` to a GitHub issue in a configured repo. Ralph will pick it up and dispatch an agent.
+Use GitHub labels on the issue:
+
+```bash
+gh issue edit <number> --add-label "ralph:status:queued"
+```
+
+Ralph will pick it up and dispatch an agent.
 
 ## Architecture
 
@@ -475,13 +481,13 @@ Apply `ralph:status:queued` to a GitHub issue in a configured repo. Ralph will p
 
 ## How it works
 
-1. **Watch** - Ralph watches `orchestration/tasks/**` for queued (and restart-orphaned starting) tasks
+1. **Watch** - Ralph watches GitHub issues with `ralph:status:queued` (and restart-orphaned `starting`) tasks
 2. **Dispatch** - Runs the planner prompt with `--agent ralph-plan`
 3. **Route** - Parses agent's decision (policy: `docs/escalation-policy.md`): proceed or escalate
 4. **Build** - If proceeding, tells agent to implement
 5. **Monitor** - Watches for anomalies (stuck loops)
 6. **Complete** - Extracts PR URL, triggers merge, runs survey
-7. **Record** - Creates `agent-run` note with session summary
+7. **Record** - Persists run metadata and gate artifacts to SQLite
 
 ## Session Persistence
 
@@ -521,8 +527,9 @@ Ralph supports an operator-controlled "draining" mode that stops scheduling/dequ
 
 Control file:
 
-- Canonical: `~/.ralph/control/control.json`
-- Fallback reads: `$XDG_STATE_HOME/ralph/control.json`, `~/.local/state/ralph/control.json`, `/tmp/ralph/<uid>/control.json`
+- `$XDG_STATE_HOME/ralph/control.json`
+- Fallback: `~/.local/state/ralph/control.json`
+- Last resort: `/tmp/ralph/<uid>/control.json`
 
 Ralph auto-creates the control file on startup with `{ "mode": "running" }` unless disabled via config.
 
@@ -554,10 +561,11 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 
 Daemon discovery for restart/upgrade uses a lease record at:
 
-- Canonical: `~/.ralph/control/daemon-registry.json`
-- Fallback reads: `$XDG_STATE_HOME/ralph/daemon.json`, `~/.local/state/ralph/daemon.json`, `/tmp/ralph/<uid>/daemon.json`
+- `$XDG_STATE_HOME/ralph/daemon.json`
+- Fallback: `~/.local/state/ralph/daemon.json`
+- Last resort: `/tmp/ralph/<uid>/daemon.json`
 
-The daemon writes this file on startup and refreshes heartbeat updates while running. Use `--start-cmd` to override when needed.
+The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
 
 ## Managed OpenCode config (daemon runs)
 

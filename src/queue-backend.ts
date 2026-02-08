@@ -1,14 +1,23 @@
-import { getConfig, getConfigMeta, getProfile, getSandboxProfileConfig, isQueueBackendExplicit, type QueueBackend } from "./config";
+import {
+  getConfig,
+  getConfigMeta,
+  getProfile,
+  getSandboxProfileConfig,
+  isQueueBackendExplicit,
+  type RalphConfig,
+} from "./config";
 import { shouldLog } from "./logging";
 import type { QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
+import type { TaskPriority } from "./queue/priority";
+import { priorityRank } from "./queue/priority";
 import { createGitHubQueueDriver } from "./github-queue";
 import { isStateDbInitialized, listRepoLabelSchemeStates, listRepoLabelWriteStates } from "./state";
-import { groupByRepo, normalizeTaskRef } from "./queue/task-ref";
+import { parseIssueRef } from "./github/issue-ref";
 
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
 
 export type QueueBackendDriver = {
-  name: QueueBackend;
+  name: "github" | "none";
   initialPoll(): Promise<QueueTask[]>;
   startWatching(onChange: QueueChangeHandler): void;
   stopWatching(): void;
@@ -26,11 +35,20 @@ export type QueueBackendDriver = {
     status: QueueTaskStatus,
     extraFields?: Record<string, string | number>
   ): Promise<boolean>;
+  createAgentTask(opts: {
+    name: string;
+    issue: string;
+    repo: string;
+    scope: string;
+    status: QueueTaskStatus;
+    priority?: TaskPriority;
+  }): Promise<{ taskPath: string; taskFileName: string } | null>;
+  resolveAgentTaskByIssue(issue: string, repo?: string): Promise<QueueTask | null>;
 };
 
 export type QueueBackendState = {
-  desiredBackend: QueueBackend;
-  backend: QueueBackend;
+  desiredBackend: "github" | "none";
+  backend: "github" | "none";
   health: QueueBackendHealth;
   fallback: boolean;
   diagnostics?: string;
@@ -40,8 +58,7 @@ export type QueueBackendState = {
 let cachedState: QueueBackendState | null = null;
 let cachedDriver: QueueBackendDriver | null = null;
 
-function isGitHubAuthConfigured(): boolean {
-  const config = getConfig();
+function isGitHubAuthConfigured(config: RalphConfig): boolean {
   const profile = getProfile();
   if (profile === "sandbox") {
     const sandbox = getSandboxProfileConfig();
@@ -66,32 +83,36 @@ export function getQueueBackendState(): QueueBackendState {
 
   const config = getConfig();
   const meta = getConfigMeta();
-  const desiredBackend = config.queueBackend ?? "github";
+  const desiredBackend = (config.queueBackend ?? "github") as "github" | "none";
   const explicit = isQueueBackendExplicit();
-
-  let backend: QueueBackend = desiredBackend;
-  let health: QueueBackendHealth = "ok";
-  let diagnostics: string | undefined;
 
   if (meta.queueBackendExplicit && !meta.queueBackendValid) {
     cachedState = {
       desiredBackend,
-      backend,
+      backend: "none",
       health: "unavailable",
       fallback: false,
-      diagnostics: `Invalid queueBackend=${JSON.stringify(meta.queueBackendRaw)}; valid values are "github" or "none".`,
+      diagnostics:
+        `Invalid queueBackend=${JSON.stringify(meta.queueBackendRaw)}; ` +
+        'valid values are "github", "none".',
       explicit,
     };
     return cachedState;
   }
 
-  if (desiredBackend === "github" && !isGitHubAuthConfigured()) {
-    diagnostics = "GitHub auth is not configured (set githubApp in ~/.ralph/config.* or GH_TOKEN/GITHUB_TOKEN).";
+  let backend = desiredBackend;
+  let health: QueueBackendHealth = "ok";
+  let diagnostics: string | undefined;
+
+  if (backend === "github" && !isGitHubAuthConfigured(config)) {
+    const authHint = "GitHub auth is not configured (set githubApp in ~/.ralph/config.* or GH_TOKEN/GITHUB_TOKEN).";
     if (explicit) {
       health = "unavailable";
+      diagnostics = diagnostics ? `${diagnostics} ${authHint}` : authHint;
     } else {
       backend = "none";
       health = "degraded";
+      diagnostics = diagnostics ? `${diagnostics} ${authHint}` : authHint;
     }
   }
 
@@ -194,6 +215,14 @@ function createDisabledDriver(state: QueueBackendState): QueueBackendDriver {
       warn("update task status");
       return false;
     },
+    createAgentTask: async () => {
+      warn("create agent task");
+      return null;
+    },
+    resolveAgentTaskByIssue: async () => {
+      warn("resolve agent task");
+      return null;
+    },
   };
 }
 
@@ -211,7 +240,37 @@ function getQueueBackendDriver(): QueueBackendDriver {
 }
 
 export type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
-export { groupByRepo } from "./queue/task-ref";
+
+export function groupByRepo<T extends Pick<QueueTask, "repo">>(tasks: T[]): Map<string, T[]> {
+  const byRepo = new Map<string, T[]>();
+  for (const task of tasks) {
+    const existing = byRepo.get(task.repo) ?? [];
+    existing.push(task);
+    byRepo.set(task.repo, existing);
+  }
+
+  for (const [repo, repoTasks] of byRepo) {
+    repoTasks.sort((a, b) => {
+      const aTask = a as unknown as Partial<QueueTask>;
+      const bTask = b as unknown as Partial<QueueTask>;
+      const aPriority = aTask.priority as TaskPriority | undefined;
+      const bPriority = bTask.priority as TaskPriority | undefined;
+      const rankDelta = priorityRank(aPriority) - priorityRank(bPriority);
+      if (rankDelta !== 0) return rankDelta;
+
+      const aIssue = parseIssueRef(aTask.issue ?? "", aTask.repo ?? "")?.number ?? Number.POSITIVE_INFINITY;
+      const bIssue = parseIssueRef(bTask.issue ?? "", bTask.repo ?? "")?.number ?? Number.POSITIVE_INFINITY;
+      if (aIssue !== bIssue) return aIssue - bIssue;
+
+      const aPath = aTask._path ?? "";
+      const bPath = bTask._path ?? "";
+      return aPath.localeCompare(bPath);
+    });
+    byRepo.set(repo, repoTasks);
+  }
+
+  return byRepo;
+}
 
 export async function initialPoll(): Promise<QueueTask[]> {
   return getQueueBackendDriver().initialPoll();

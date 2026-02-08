@@ -35,9 +35,9 @@ describe("Config precedence (~/.ralph)", () => {
     const configJsonPath = getRalphConfigJsonPath();
 
     await mkdir(join(homeDir, ".ralph"), { recursive: true });
-      await writeFile(
-        configTomlPath,
-        [
+    await writeFile(
+      configTomlPath,
+      [
         'queueBackend = "none"',
         "maxWorkers = 3",
         "batchSize = 11",
@@ -75,6 +75,7 @@ describe("Config precedence (~/.ralph)", () => {
     const configJsonPath = getRalphConfigJsonPath();
 
     await writeJson(configJsonPath, {
+      queueBackend: "github",
       maxWorkers: 4,
       ownershipTtlMs: 33000,
       repos: [],
@@ -84,6 +85,7 @@ describe("Config precedence (~/.ralph)", () => {
     cfgMod.__resetConfigForTests();
     const cfg = cfgMod.loadConfig().config;
 
+    expect(cfg.queueBackend).toBe("github");
     expect(cfg.maxWorkers).toBe(4);
     expect(cfg.ownershipTtlMs).toBe(33000);
   });
@@ -91,6 +93,7 @@ describe("Config precedence (~/.ralph)", () => {
   test("falls back to legacy ~/.config/opencode/ralph/ralph.json with warning", async () => {
     const legacyPath = getRalphLegacyConfigPath();
     await writeJson(legacyPath, {
+      queueBackend: "none",
       maxWorkers: 5,
       ownershipTtlMs: 120000,
       repos: [],
@@ -105,6 +108,7 @@ describe("Config precedence (~/.ralph)", () => {
       cfgMod.__resetConfigForTests();
       const cfg = cfgMod.loadConfig().config;
 
+      expect(cfg.queueBackend).toBe("none");
       expect(cfg.maxWorkers).toBe(5);
       expect(cfg.ownershipTtlMs).toBe(120000);
       expect(warn).toHaveBeenCalled();

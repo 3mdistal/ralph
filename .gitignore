@@ -7,5 +7,4 @@ dist/
 src/ralph.json
 
 # Local orchestration scratch
-# (Ralph may traverse this directory; ignoring only affects git)
 orchestration/
