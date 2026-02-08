@@ -4,8 +4,7 @@ import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
 
-import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "../queue-backend";
-import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "../bwrb/artifacts";
+import { type AgentTask, updateTaskStatus } from "../queue-backend";
 import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
@@ -150,7 +149,6 @@ import {
 } from "./events";
 import { PAUSED_AT_CHECKPOINT_FIELD, parseCheckpointValue } from "./checkpoint-fields";
 import { applyTaskPatch } from "./task-patch";
-import { resolveVaultPath } from "./vault-paths";
 import {
   completeParentVerification,
   completeRalphRun,
@@ -450,7 +448,6 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 }
 
 // (applyTaskPatch extracted to src/worker/task-patch.ts)
-// (resolveVaultPath extracted to src/worker/vault-paths.ts)
 export class RepoWorker {
   private session: SessionAdapter;
   private baseSession: SessionAdapter;
@@ -4220,7 +4217,7 @@ export class RepoWorker {
       buildIssueContextForAgent: async (input) => await this.buildIssueContextForAgent(input),
       runReviewAgent: async (input) => {
         const runLogPath = await this.recordRunLogPath(params.task, issueNumber, input.stage, "in-progress");
-        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, {
+        const baseOptions = {
           repo: this.repo,
           cacheKey: input.cacheKey,
           runLogPath,
@@ -4235,7 +4232,15 @@ export class RepoWorker {
           ...this.buildStallOptions(params.task, input.stage),
           ...this.buildLoopDetectionOptions(params.task, input.stage),
           ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
-        });
+        };
+        const continueSessionId = input.continueSessionId?.trim();
+        if (continueSessionId) {
+          return await this.session.continueSession(params.repoPath, continueSessionId, input.prompt, {
+            ...baseOptions,
+            agent: input.agent,
+          });
+        }
+        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, baseOptions);
       },
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),
@@ -5996,7 +6001,7 @@ export class RepoWorker {
     let allocatedSlot: number | null = null;
 
     try {
-      // 1. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
+      // 1. Extract issue number (e.g., "owner/repo#245" -> "245")
       const issueMatch = task.issue.match(/#(\d+)$/);
       if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
       const issueNumber = issueMatch[1];
@@ -6062,7 +6067,7 @@ export class RepoWorker {
       if (workerId) task["worker-id"] = workerId;
       if (typeof allocatedSlot === "number") task["repo-slot"] = String(allocatedSlot);
       if (!markedStarting) {
-        throw new Error("Failed to mark task starting (bwrb edit failed)");
+        throw new Error("Failed to mark task starting (queue status update failed)");
       }
 
       await this.ensureBranchProtectionOnce();
@@ -7067,149 +7072,9 @@ export class RepoWorker {
       bodyPrefix?: string;
     }
   ): Promise<void> {
-    if (this.isGitHubQueueTask(task)) {
-      return;
-    }
-    const vault = getBwrbVaultForStorage("create agent-run note");
-    if (!vault) {
-      return;
-    }
-    const taskPath = typeof task._path === "string" ? task._path : "";
-    const resolvedTaskPath = taskPath.endsWith(".md") ? resolveVaultPath(taskPath) : "";
-    if (!resolvedTaskPath || !existsSync(resolvedTaskPath)) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Skipping agent-run note; task note missing at ${taskPath || "(unknown)"}`
-      );
-      return;
-    }
-    const today = data.completed.toISOString().split("T")[0];
-    const shortIssue = task.issue.split("/").pop() || task.issue;
-
-    const runName = safeNoteName(`Run for ${shortIssue} - ${task.name.slice(0, 40)}`);
-
-    const payload = buildAgentRunPayload({
-      name: runName,
-      task: `[[${task._name}]]`,  // Use _name (filename) not name (display) for wikilinks
-      started: data.started.toISOString().split("T")[0],
-      completed: today,
-      outcome: data.outcome,
-      pr: data.pr || "",
-      creationDate: today,
-      scope: "builder",
-    });
-
-    try {
-      const output = await createBwrbNote({
-        type: "agent-run",
-        action: "create agent-run note",
-        payload,
-      });
-
-      if (!output.ok || !output.path) {
-        const error = output.ok ? "bwrb did not return a note path" : output.error;
-        const log = !output.ok && output.skipped ? console.warn : console.error;
-        log(`[ralph:worker:${this.repo}] Failed to create agent-run: ${error}`);
-        return;
-      }
-
-      const bodySections: string[] = [];
-
-      if (data.bodyPrefix?.trim()) {
-        bodySections.push(data.bodyPrefix.trim(), "");
-      }
-
-      // Add introspection summary if available
-      if (data.sessionId) {
-        const introspection = await readIntrospectionSummary(data.sessionId);
-        if (introspection) {
-          bodySections.push(
-            "## Session Summary",
-            "",
-            `- **Steps:** ${introspection.stepCount}`,
-            `- **Tool calls:** ${introspection.totalToolCalls}`,
-            `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
-            `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
-            ""
-          );
-        }
-      }
-
-      // Add token totals (best-effort). GitHub queue tasks skip agent-run notes.
-      const tokenRunId = this.activeRunId ?? (data.sessionId ? getLatestRunIdForSession(data.sessionId) : null);
-      if (tokenRunId) {
-        try {
-          const opencodeProfile = this.getPinnedOpencodeProfileName(task);
-          let tokenTotals = getRalphRunTokenTotals(tokenRunId);
-          let sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
-          if (!tokenTotals || !tokenTotals.tokensComplete) {
-            await refreshRalphRunTokenTotals({ runId: tokenRunId, opencodeProfile });
-            tokenTotals = getRalphRunTokenTotals(tokenRunId);
-            sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
-          }
-
-          if (tokenTotals) {
-            const totalLabel = tokenTotals.tokensComplete && typeof tokenTotals.tokensTotal === "number" ? tokenTotals.tokensTotal : "?";
-            const showSessions = sessionTotals.length > 1;
-            bodySections.push(
-              "## Token Usage",
-              "",
-              `- **Total:** ${totalLabel}`,
-              `- **Complete:** ${tokenTotals.tokensComplete ? "Yes" : "No"}`,
-              `- **Sessions:** ${tokenTotals.sessionCount}`,
-              ""
-            );
-
-            if (showSessions) {
-              const lines = sessionTotals.slice(0, 10).map((s) => {
-                const label = typeof s.tokensTotal === "number" ? s.tokensTotal : "?";
-                return `- ${s.sessionId}: ${label} (${s.quality})`;
-              });
-              if (lines.length > 0) {
-                bodySections.push("### Sessions", "", ...lines, "");
-              }
-            }
-          }
-        } catch {
-          // best-effort token accounting
-        }
-      }
-
-
-      // Add devex consult summary (if we used devex-before-escalate)
-      if (data.devex?.consulted) {
-        bodySections.push(
-          "## Devex Consult",
-          "",
-          data.devex.sessionId ? `- **Session:** ${data.devex.sessionId}` : "",
-          data.devex.summary ?? "",
-          ""
-        );
-      }
-
-      // Add survey results
-      if (data.surveyResults) {
-        bodySections.push("## Survey Results", "", data.surveyResults, "");
-      }
-
-      if (bodySections.length > 0) {
-        const bodyResult = await appendBwrbNoteBody({
-          notePath: output.path,
-          body: "\n" + bodySections.join("\n"),
-        });
-        if (!bodyResult.ok) {
-          const log = bodyResult.skipped ? console.warn : console.error;
-          log(`[ralph:worker:${this.repo}] Failed to write agent-run body: ${bodyResult.error}`);
-        }
-      }
-
-      // Clean up introspection logs
-      if (data.sessionId) {
-        await cleanupIntrospectionLogs(data.sessionId);
-      }
-
-      console.log(`[ralph:worker:${this.repo}] Created agent-run note`);
-    } catch (e) {
-      console.error(`[ralph:worker:${this.repo}] Failed to create agent-run:`, e);
+    // Agent-run artifacts are persisted via SQLite run records.
+    if (data.sessionId) {
+      await cleanupIntrospectionLogs(data.sessionId);
     }
   }
 }
