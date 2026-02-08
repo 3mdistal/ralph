@@ -13,7 +13,7 @@ export type DaemonLivenessSnapshot = {
 
 const LIVENESS_HINT = "Daemon liveness mismatch; restart the daemon or repair stale daemon state.";
 
-export function probePidState(pid: number): DaemonPidState {
+function probePidState(pid: number): DaemonPidState {
   if (!Number.isFinite(pid) || pid <= 0) return "unknown";
   try {
     process.kill(pid, 0);
