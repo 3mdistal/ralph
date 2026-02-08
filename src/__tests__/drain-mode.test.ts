@@ -59,7 +59,7 @@ describe("Drain mode", () => {
   test("resolveControlFilePath falls back to uid-scoped /tmp when home missing", () => {
     const controlPath = resolveControlFilePath("", "");
     const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
-    expect(controlPath).toBe(join("/tmp", "ralph", String(uid), "control.json"));
+    expect(controlPath).toBe(join("/tmp", "ralph", String(uid), "control", "control.json"));
   });
 
   test(
@@ -226,7 +226,7 @@ describe("Drain mode", () => {
     const homeDir = "";
     const path = resolveControlFilePath(homeDir, "");
     const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
-    expect(path).toBe(`/tmp/ralph/${uid}/control.json`);
+    expect(path).toBe(`/tmp/ralph/${uid}/control/control.json`);
   });
 
   test("refuses symlinked control dir", () => {

@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { RalphEventBus } from "../dashboard/event-bus";
 import { buildRalphEvent } from "../dashboard/events";
-import { startControlPlaneServer } from "../dashboard/control-plane-server";
+import { ControlPlaneCommandError, startControlPlaneServer } from "../dashboard/control-plane-server";
 import type { StatusSnapshot } from "../status-snapshot";
 
 function createSnapshot(): StatusSnapshot {
@@ -243,6 +243,7 @@ describe("control plane server", () => {
         },
         enqueueMessage: async () => ({ id: "n1" }),
         setTaskPriority: async () => {},
+        setTaskStatus: async () => {},
       },
     });
 
@@ -285,6 +286,7 @@ describe("control plane server", () => {
           return { id: "n2" };
         },
         setTaskPriority: async () => {},
+        setTaskStatus: async () => {},
       },
     });
 
@@ -332,6 +334,7 @@ describe("control plane server", () => {
         resume: async () => {},
         enqueueMessage: async () => ({ id: "n3" }),
         setTaskPriority: async () => {},
+        setTaskStatus: async () => {},
       },
     });
 
@@ -365,6 +368,7 @@ describe("control plane server", () => {
         setTaskPriority: async (params) => {
           seen = params;
         },
+        setTaskStatus: async () => {},
       },
     });
 
@@ -377,6 +381,104 @@ describe("control plane server", () => {
       expect(res.status).toBe(200);
       expect(seen?.taskId).toBe("github:owner/repo#123");
       expect(seen?.priority).toBe("p1");
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("set task status calls handler", async () => {
+    const bus = new RalphEventBus();
+    let seen: any = null;
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async () => {},
+        resume: async () => {},
+        enqueueMessage: async () => ({ id: "n5" }),
+        setTaskPriority: async () => {},
+        setTaskStatus: async (params) => {
+          seen = params;
+        },
+      },
+    });
+
+    try {
+      const res = await fetch(`${server.url}/v1/commands/task/status`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: "github:owner/repo#123", status: "queue" }),
+      });
+      expect(res.status).toBe(200);
+      expect(seen?.taskId).toBe("github:owner/repo#123");
+      expect(seen?.status).toBe("queue");
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("set task status validates missing status", async () => {
+    const bus = new RalphEventBus();
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async () => {},
+        resume: async () => {},
+        enqueueMessage: async () => ({ id: "n6" }),
+        setTaskPriority: async () => {},
+        setTaskStatus: async () => {},
+      },
+    });
+
+    try {
+      const res = await fetch(`${server.url}/v1/commands/task/status`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: "github:owner/repo#123" }),
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body?.error?.code).toBe("bad_request");
+    } finally {
+      server.stop();
+    }
+  });
+
+  test("command errors return typed 4xx", async () => {
+    const bus = new RalphEventBus();
+    const server = startControlPlaneServer({
+      bus,
+      getStateSnapshot: async () => createSnapshot(),
+      token: "secret",
+      host: "127.0.0.1",
+      port: 0,
+      commands: {
+        pause: async () => {},
+        resume: async () => {},
+        enqueueMessage: async () => ({ id: "n7" }),
+        setTaskPriority: async () => {},
+        setTaskStatus: async () => {
+          throw new ControlPlaneCommandError(400, "unsupported_task_id", "Only github taskIds are supported");
+        },
+      },
+    });
+
+    try {
+      const res = await fetch(`${server.url}/v1/commands/task/status`, {
+        method: "POST",
+        headers: { Authorization: "Bearer secret", "Content-Type": "application/json" },
+        body: JSON.stringify({ taskId: "legacy:path", status: "queue" }),
+      });
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body?.error?.code).toBe("unsupported_task_id");
     } finally {
       server.stop();
     }
