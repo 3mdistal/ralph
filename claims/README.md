@@ -34,3 +34,8 @@ Optional keys:
 Notes:
 
 - This is intentionally minimal; we will align it to Issue #460 as the implementation lands.
+
+## Keeping statuses in sync
+
+- When a claim moves from `planned` -> `implemented`, update `claims/canonical.jsonl` in the same PR as the shipped code change.
+- A lightweight guardrail test asserts key shipped claim statuses stay accurate: `src/__tests__/claims-status.test.ts`.
