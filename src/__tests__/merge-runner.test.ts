@@ -181,3 +181,65 @@ describe("mergePrWithRequiredChecks 405 handling", () => {
     expect(markTaskBlockedCalls[0]?.reason).not.toContain("required checks not green");
   });
 });
+
+describe("mergePrWithRequiredChecks pre-merge CI remediation", () => {
+  test("enters CI triage when required checks fail at merge time", async () => {
+    let statusCall = 0;
+    let triageCalls = 0;
+
+    const { params, mergeCalls, markTaskBlockedCalls } = buildParams({
+      getPullRequestChecks: async () => {
+        statusCall += 1;
+        if (statusCall === 1) {
+          return {
+            headSha: "sha-initial",
+            mergeStateStatus: "CLEAN",
+            baseRefName: "bot/integration",
+            checks: [{ name: "Test", state: "FAILURE", rawState: "FAILURE", detailsUrl: null }],
+          };
+        }
+        return {
+          headSha: "sha-after-ci",
+          mergeStateStatus: "CLEAN",
+          baseRefName: "bot/integration",
+          checks: [{ name: "Test", state: "SUCCESS", rawState: "SUCCESS", detailsUrl: null }],
+        };
+      },
+      runCiFailureTriage: async () => {
+        triageCalls += 1;
+        return { status: "success", headSha: "sha-after-ci", sessionId: "ses_ci" };
+      },
+    });
+
+    const result = await mergePrWithRequiredChecks(params);
+
+    expect(result.ok).toBe(true);
+    expect(triageCalls).toBe(1);
+    expect(mergeCalls).toEqual(["sha-after-ci"]);
+    expect(markTaskBlockedCalls).toHaveLength(0);
+  });
+
+  test("propagates CI triage failure instead of blocking immediately", async () => {
+    let triageCalls = 0;
+
+    const { params, mergeCalls, markTaskBlockedCalls } = buildParams({
+      getPullRequestChecks: async () => ({
+        headSha: "sha-initial",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "bot/integration",
+        checks: [{ name: "Test", state: "FAILURE", rawState: "FAILURE", detailsUrl: null }],
+      }),
+      runCiFailureTriage: async () => {
+        triageCalls += 1;
+        return { status: "failed", run: { taskName: "x", repo: "x", outcome: "failed" } };
+      },
+    });
+
+    const result = await mergePrWithRequiredChecks(params);
+
+    expect(result.ok).toBe(false);
+    expect(triageCalls).toBe(1);
+    expect(mergeCalls).toHaveLength(0);
+    expect(markTaskBlockedCalls).toHaveLength(0);
+  });
+});
