@@ -2,17 +2,16 @@
 /**
  * Ralph Loop - Autonomous Coding Task Orchestrator
  * 
- * Watches the queue backend (GitHub-first, bwrb legacy) for agent-tasks and dispatches them to OpenCode agents.
+ * Watches the queue backend (GitHub-first) for agent-tasks and dispatches them to OpenCode agents.
  * Processes tasks in parallel across repos, sequentially within each repo.
  * Creates rollup PRs after N successful merges for batch review.
  */
 
-import { existsSync, watch } from "fs";
+import { existsSync } from "fs";
 import { join } from "path";
 import crypto from "crypto";
 
 import {
-  ensureBwrbVaultLayout,
   getConfig,
   getDashboardEventsRetentionDays,
   getDashboardControlPlaneConfig,
@@ -29,7 +28,6 @@ import {
 } from "./config";
 import { filterReposToAllowedOwners, listAccessibleRepos } from "./github-app-auth";
 import {
-  getBwrbVaultIfValid,
   getQueueBackendState,
   getQueueBackendStateWithLabelHealth,
   initialPoll,
@@ -90,13 +88,6 @@ import {
   classifyActivity,
 } from "./activity-classifier";
 import type { ActivityLabel } from "./activity-classifier";
-import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
-import {
-  buildWaitingResolutionUpdate,
-  DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
-  shouldDeferWaitingResolutionCheck,
-} from "./escalation-resume";
-import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 import { computeDaemonGate } from "./daemon-gate";
 import { runGatesCommand } from "./commands/gates";
 import { runRunsCommand } from "./commands/runs";
@@ -106,7 +97,6 @@ import { runWorktreesCommand } from "./commands/worktrees";
 import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
-import { createEscalationConsultantScheduler } from "./escalation-consultant/scheduler";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 import { isLoopbackHost, startControlPlaneServer, type ControlPlaneServer } from "./dashboard/control-plane-server";
 import { toControlPlaneStateV1 } from "./dashboard/control-plane-state";
@@ -148,7 +138,6 @@ const daemonVersion = getRalphVersion();
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
-const ESCALATION_CONSULTANT_INTERVAL_MS = 60_000;
 
 const idleState = new Map<
   string,
@@ -296,23 +285,6 @@ const repoSemaphores = new Map<string, Semaphore>();
 
 const rrCursor = { value: 0 };
 const schedulerPriorityState = { value: createPrioritySelectorState() };
-
-function requireBwrbQueueOrExit(action: string): void {
-  const state = getQueueBackendState();
-  if (state.backend === "bwrb" && state.health === "ok") {
-    if (!ensureBwrbVaultLayout(getConfig().bwrbVault)) process.exit(1);
-    return;
-  }
-
-  if (state.backend !== "bwrb") {
-    console.warn(`[ralph] ${action} requires bwrb queue backend (current: ${state.backend}).`);
-    process.exit(1);
-  }
-
-  const reason = state.diagnostics ? ` ${state.diagnostics}` : "";
-  console.error(`[ralph] bwrb queue backend unavailable.${reason}`);
-  process.exit(1);
-}
 
 function maybeExitIfAllReposUnschedulableDueToLegacyLabels(repos: string[]): void {
   if (repos.length === 0) return;
@@ -627,63 +599,6 @@ function scheduleQueuedTasksSoon(): void {
 
 function scheduleResumeTasksSoon(): void {
   schedulerController.scheduleResumeTasksSoon();
-}
-
-let escalationWatcher: ReturnType<typeof watch> | null = null;
-let escalationDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-
-const resumeAttemptedThisRun = new Set<string>();
-let resumeDisabledUntil = 0;
-
-const RESUME_DISABLE_MS = 60_000;
-
-async function attemptResumeResolvedEscalations(): Promise<void> {
-  return attemptResumeResolvedEscalationsImpl({
-    isShuttingDown: () => isShuttingDown,
-    now: () => Date.now(),
-
-    resumeAttemptedThisRun,
-    getResumeDisabledUntil: () => resumeDisabledUntil,
-    setResumeDisabledUntil: (ts) => {
-      resumeDisabledUntil = ts;
-    },
-    resumeDisableMs: RESUME_DISABLE_MS,
-    getVaultPathForLogs: () => getBwrbVaultIfValid() ?? "<unknown>",
-
-    ensureSemaphores,
-    getGlobalSemaphore: () => globalSemaphore,
-    getRepoSemaphore,
-
-    getTaskKey,
-    inFlightTasks,
-    tryClaimTask,
-    recordOwnedTask,
-    forgetOwnedTask,
-    daemonId,
-
-    getEscalationsByStatus,
-    editEscalation,
-    readResolutionMessage,
-
-    getTaskByPath,
-    updateTaskStatus,
-
-    shouldDeferWaitingResolutionCheck,
-    buildWaitingResolutionUpdate,
-    resolutionRecheckIntervalMs: DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
-
-    getOrCreateWorker,
-    recordMerge: async (repo, prUrl) => {
-      try {
-        recordPrSnapshot({ repo, issue: "", prUrl, state: PR_STATE_MERGED });
-      } catch {
-        // best-effort
-      }
-
-      await rollupMonitor.recordMerge(repo, prUrl);
-    },
-    scheduleQueuedTasksSoon,
-  });
 }
 
 async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Promise<void> {
@@ -1183,7 +1098,7 @@ async function processNewTasks(tasks: AgentTask[], defaults: Partial<ControlConf
   const blockedTasks = await getTasksByStatus("blocked");
   const blockedPaths = new Set<string>();
   const tasksForSync = [...tasks, ...blockedTasks];
-  const tasksByRepoForSync = groupByRepo(tasksForSync);
+  const tasksByRepoForSync: Map<string, AgentTask[]> = groupByRepo(tasksForSync);
   await Promise.all(
     Array.from(tasksByRepoForSync.entries()).map(async ([repo, repoTasks]) => {
       const worker = getOrCreateWorker(repo);
@@ -1363,7 +1278,7 @@ async function resumeTasksOnStartup(opts?: {
     }
   }
 
-  const inProgressByRepo = groupByRepo(claimable);
+  const inProgressByRepo: Map<string, AgentTask[]> = groupByRepo(claimable);
   await Promise.all(
     Array.from(inProgressByRepo.entries()).map(async ([repo, tasks]) => {
       const worker = getOrCreateWorker(repo);
@@ -1384,7 +1299,7 @@ async function resumeTasksOnStartup(opts?: {
 
   const globalLimit = getConfig().maxWorkers;
 
-  const withSessionByRepo = groupByRepo(withSession);
+  const withSessionByRepo: Map<string, AgentTask[]> = groupByRepo(withSession);
   const repos = Array.from(withSessionByRepo.keys());
   const perRepoResumed = new Map<string, number>();
 
@@ -1461,10 +1376,6 @@ async function main(): Promise<void> {
     const reason = queueState.diagnostics ? ` ${queueState.diagnostics}` : "";
     console.error(`[ralph] Queue backend ${queueState.backend} unavailable.${reason}`);
     process.exit(1);
-  }
-
-  if (queueState.backend === "bwrb") {
-    if (!ensureBwrbVaultLayout(config.bwrbVault)) process.exit(1);
   }
 
   try {
@@ -1757,9 +1668,6 @@ async function main(): Promise<void> {
   const backendSuffix = backendTags.length > 0 ? ` (${backendTags.join(", ")})` : "";
 
   console.log(`        Queue backend: ${queueState.backend}${backendSuffix}`);
-  if (queueState.backend === "bwrb") {
-    console.log(`        Vault: ${config.bwrbVault}`);
-  }
   if (queueState.diagnostics) {
     console.log(`        Queue diagnostics: ${queueState.diagnostics}`);
   }
@@ -1793,54 +1701,7 @@ async function main(): Promise<void> {
   // Initialize rollup monitor
   rollupMonitor = new RollupMonitor(config.batchSize);
 
-  if (queueState.backend === "bwrb") {
-    // Do initial poll on startup
-    console.log("[ralph] Running initial poll...");
-    const initialTasks = await initialPoll();
-    console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
-
-    if (initialTasks.length > 0 && getDaemonMode(config.control) !== "draining") {
-      await processNewTasks(initialTasks, config.control ?? {});
-    } else {
-      resetIdleState(initialTasks);
-    }
-
-    // Start file watching (no polling - watcher is reliable)
-    console.log("[ralph] Starting queue watcher...");
-    startWatching(async (tasks) => {
-      if (!isShuttingDown && getDaemonMode(config.control) !== "draining") {
-        await processNewTasks(tasks, config.control ?? {});
-      }
-    });
-
-    // Resume orphaned tasks from previous daemon runs.
-    void resumeTasksOnStartup({ awaitCompletion: false });
-
-    // Resume any resolved escalations (HITL checkpoint) from the same session.
-    void attemptResumeResolvedEscalations();
-
-    // Resume any tasks paused by hard throttle.
-    void attemptResumeThrottledTasks(config.control ?? {});
-
-    // Watch escalations for resolution and resume the same OpenCode session.
-    const escalationsDir = join(config.bwrbVault, "orchestration/escalations");
-    if (existsSync(escalationsDir)) {
-      console.log(`[ralph:escalations] Watching ${escalationsDir} for changes`);
-
-      escalationWatcher = watch(escalationsDir, { recursive: true }, async (_eventType: string, filename: string | null) => {
-        if (!filename || !filename.endsWith(".md")) return;
-
-        if (escalationDebounceTimer) clearTimeout(escalationDebounceTimer);
-        escalationDebounceTimer = setTimeout(() => {
-          attemptResumeResolvedEscalations().catch(() => {
-            // ignore
-          });
-        }, 750);
-      });
-    } else {
-      console.log(`[ralph:escalations] Escalations dir not found: ${escalationsDir}`);
-    }
-  } else if (queueState.backend === "github") {
+  if (queueState.backend === "github") {
     console.log("[ralph] Running initial poll...");
     const initialTasks = await getRunnableTasks();
     console.log(`[ralph] Found ${initialTasks.length} runnable task(s) (queued + starting)`);
@@ -1859,31 +1720,12 @@ async function main(): Promise<void> {
     });
 
     void resumeTasksOnStartup({ awaitCompletion: false });
+    void attemptResumeThrottledTasks(config.control ?? {});
   } else {
     const detail = queueState.diagnostics ? ` ${queueState.diagnostics}` : "";
     console.log(`[ralph] Queue backend disabled; running without queued tasks.${detail}`);
     resetIdleState([]);
   }
-
-  const escalationConsultantScheduler = createEscalationConsultantScheduler({
-    getEscalationsByStatus,
-    getVaultPath: () => getBwrbVaultIfValid(),
-    isShuttingDown: () => isShuttingDown,
-    allowModelSend: async () => {
-      const requestedProfile = getRequestedOpencodeProfileName(null);
-      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile);
-      const gate = computeDaemonGate({ mode: getDaemonMode(config.control), throttle: selection.decision, isShuttingDown });
-      return gate.allowModelSend;
-    },
-    repoPath: () => ".",
-    log: (message) => console.log(message),
-  });
-  void escalationConsultantScheduler.tick();
-  const escalationConsultantTimer = setInterval(() => {
-    escalationConsultantScheduler.tick().catch(() => {
-      // ignore
-    });
-  }, ESCALATION_CONSULTANT_INTERVAL_MS);
 
   const ownershipTtlMs = getConfig().ownershipTtlMs;
   const heartbeatIntervalMs = computeHeartbeatIntervalMs(ownershipTtlMs);
@@ -1892,10 +1734,10 @@ async function main(): Promise<void> {
   const heartbeatTimer = setInterval(() => {
     if (isShuttingDown) return;
 
-    // Avoid hitting bwrb repeatedly when the daemon is idle.
+    // Avoid repeated heartbeat scans when the daemon is idle.
     if (inFlightTasks.size === 0 && ownedTasks.size === 0) return;
 
-    // Avoid overlapping ticks if bwrb/filesystem are slow.
+    // Avoid overlapping ticks if queue/storage operations are slow.
     if (heartbeatInFlight) return;
     heartbeatInFlight = true;
 
@@ -1964,14 +1806,6 @@ async function main(): Promise<void> {
     githubLabelReconciler = null;
     githubCmdProcessor?.stop();
     githubCmdProcessor = null;
-    if (escalationWatcher) {
-      escalationWatcher.close();
-      escalationWatcher = null;
-    }
-    if (escalationDebounceTimer) {
-      clearTimeout(escalationDebounceTimer);
-      escalationDebounceTimer = null;
-    }
     schedulerController.clearTimers();
     drainMonitor?.stop();
     clearInterval(heartbeatTimer);
@@ -2332,8 +2166,6 @@ if (args[0] === "resume") {
     printCommandHelp("resume");
     process.exit(0);
   }
-
-  requireBwrbQueueOrExit("resume");
 
   // Resume any orphaned in-progress tasks and exit
   resumeSchedulingMode = "resume-only";
@@ -2756,8 +2588,6 @@ if (args[0] === "nudge") {
 
   const taskRef = taskRefRaw;
   const message = messageRaw;
-
-  requireBwrbQueueOrExit("nudge");
 
   const tasks = await getTasksByStatus("in-progress");
   if (tasks.length === 0) {

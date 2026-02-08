@@ -10,6 +10,8 @@ import {
   closeStateDbForTests,
   createRalphRun,
   initStateDb,
+  listRalphRunStepMetrics,
+  listRalphRunStepMetricsByRunIds,
   listRalphRunsTop,
   recordRalphRunTokenTotals,
 } from "../state";
@@ -182,5 +184,49 @@ describe("runs query", () => {
 
     expect(fullRows.map((r) => r.runId)).toEqual([runB, runA]);
     expect(fullRows.find((r) => r.runId === runC)).toBeUndefined();
+  });
+
+  test("lists run step metrics and maps by run id", () => {
+    const runA = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#301",
+      taskPath: "github:3mdistal/ralph#301",
+      attemptKind: "process",
+      startedAt: "2026-02-05T10:00:00.000Z",
+    });
+    const runB = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#302",
+      taskPath: "github:3mdistal/ralph#302",
+      attemptKind: "process",
+      startedAt: "2026-02-05T11:00:00.000Z",
+    });
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      db.query(
+        `INSERT INTO ralph_run_step_metrics(
+           run_id, step_title, wall_time_ms, tool_call_count, tool_time_ms, anomaly_count, anomaly_recent_burst,
+           tokens_total, event_count, parse_error_count, quality, computed_at, created_at, updated_at
+         ) VALUES
+           ($run_a, 'build', 1000, 3, 800, 0, 0, 500, 0, 0, 'ok', $at, $at, $at),
+           ($run_a, 'plan', 500, 1, 200, 0, 0, 100, 0, 0, 'ok', $at, $at, $at),
+           ($run_b, 'survey', 2000, 4, 1500, 0, 0, NULL, 0, 0, 'ok', $at, $at, $at)`
+      ).run({
+        $run_a: runA,
+        $run_b: runB,
+        $at: "2026-02-05T12:00:00.000Z",
+      });
+    } finally {
+      db.close();
+    }
+
+    const runASteps = listRalphRunStepMetrics(runA);
+    expect(runASteps.length).toBe(2);
+    expect(runASteps.map((row) => row.stepTitle)).toEqual(["build", "plan"]);
+
+    const byRun = listRalphRunStepMetricsByRunIds([runA, runB]);
+    expect(byRun.get(runA)?.length).toBe(2);
+    expect(byRun.get(runB)?.[0]?.stepTitle).toBe("survey");
   });
 });

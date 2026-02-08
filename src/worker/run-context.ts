@@ -3,6 +3,8 @@ import type { DashboardEventContext } from "../dashboard/publisher";
 import type { RunSessionOptionsBase, SessionResult } from "../session";
 import type { SessionAdapter } from "../run-recording-session-adapter";
 import type { RalphRunAttemptKind, RalphRunDetails, RalphRunOutcome } from "../state";
+import { parseIssueRef } from "../github/issue-ref";
+import { evaluatePrEvidenceCompletion } from "../gates/pr-evidence-gate";
 
 import type { WorkerDashboardEventInput } from "./events";
 
@@ -43,6 +45,20 @@ type WithRunContextPorts<TResult extends { outcome?: string }> = {
   }) => string | null;
   ensureRunGateRows: (runId: string) => void;
   completeRun: (params: { runId: string; outcome: RalphRunOutcome; details?: RalphRunDetails }) => void;
+  upsertRunGateResult: (params: {
+    runId: string;
+    gate: "pr_evidence";
+    status: "pass" | "fail";
+    skipReason?: string | null;
+    prNumber?: number | null;
+    prUrl?: string | null;
+  }) => void;
+  recordRunGateArtifact: (params: {
+    runId: string;
+    gate: "pr_evidence";
+    kind: "note";
+    content: string;
+  }) => void;
   buildRunDetails: (result: TResult | null) => RalphRunDetails | undefined;
   getPinnedOpencodeProfileName: (task: AgentTask) => string | null;
   refreshRalphRunTokenTotals: (params: { runId: string; opencodeProfile: string | null }) => Promise<unknown>;
@@ -53,6 +69,34 @@ type WithRunContextPorts<TResult extends { outcome?: string }> = {
   computeAndStoreRunMetrics: (params: { runId: string }) => Promise<void>;
   warn: (message: string) => void;
 };
+
+function extractPrNumber(prUrl: string | undefined): number | null {
+  const value = prUrl?.trim();
+  if (!value) return null;
+  const match = value.match(/\/pull\/(\d+)$/);
+  if (!match) return null;
+  const parsed = Number.parseInt(match[1], 10);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function buildMissingPrEvidenceNote(params: { task: AgentTask; repo: string; runId: string }): string {
+  const issueRef = parseIssueRef(params.task.issue, params.repo);
+  const issueNumber = issueRef?.number ?? null;
+  const worktreePath = params.task["worktree-path"]?.trim() || "(unknown)";
+  const fixesLine = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${params.task.issue}`;
+  return [
+    "Missing PR evidence for issue-linked success completion.",
+    `run_id: ${params.runId}`,
+    `issue: ${params.task.issue}`,
+    `worktree: ${worktreePath}`,
+    "",
+    "Suggested recovery:",
+    `- git -C \"${worktreePath}\" status`,
+    `- git -C \"${worktreePath}\" branch --show-current`,
+    `- git -C \"${worktreePath}\" push -u origin HEAD`,
+    `- gh pr create --base bot/integration --fill --body \"${fixesLine}\"`,
+  ].join("\n");
+}
 
 type DashboardSessionOptionsParams = {
   options?: RunSessionOptionsBase;
@@ -240,11 +284,64 @@ export async function withRunContext<TResult extends { outcome?: string }>(param
       data: { reason: result?.outcome },
     });
 
+    const attemptedOutcome = (result?.outcome ?? "failed") as RalphRunOutcome;
+    const runDetails = params.ports.buildRunDetails(result);
+    const issueLinked = Boolean(parseIssueRef(params.task.issue, params.ports.repo));
+    const completionDecision = evaluatePrEvidenceCompletion({
+      attemptedOutcome,
+      completionKind: runDetails?.completionKind ?? null,
+      issueLinked,
+      prUrl: runDetails?.prUrl ?? null,
+    });
+
+    const finalDetails: RalphRunDetails = { ...(runDetails ?? {}) };
+    let finalOutcome: RalphRunOutcome = completionDecision.finalOutcome;
+
+    if (completionDecision.reasonCode && !finalDetails.reasonCode) {
+      finalDetails.reasonCode = completionDecision.reasonCode;
+    }
+
+    if (attemptedOutcome === "success" && issueLinked && runDetails?.completionKind !== "verified") {
+      const prUrl = runDetails?.prUrl?.trim() || null;
+      try {
+        if (prUrl) {
+          params.ports.upsertRunGateResult({
+            runId,
+            gate: "pr_evidence",
+            status: "pass",
+            prUrl,
+            prNumber: extractPrNumber(prUrl),
+          });
+        } else {
+          params.ports.upsertRunGateResult({
+            runId,
+            gate: "pr_evidence",
+            status: "fail",
+            skipReason: "missing pr_url",
+          });
+          params.ports.recordRunGateArtifact({
+            runId,
+            gate: "pr_evidence",
+            kind: "note",
+            content: buildMissingPrEvidenceNote({ task: params.task, repo: params.ports.repo, runId }),
+          });
+        }
+      } catch (error: any) {
+        finalOutcome = "escalated";
+        if (!finalDetails.reasonCode) {
+          finalDetails.reasonCode = "pr_evidence_persist_failed";
+        }
+        params.ports.warn(
+          `[ralph:worker:${params.ports.repo}] Failed to persist PR evidence gate for ${params.task.name}: ${error?.message ?? String(error)}`
+        );
+      }
+    }
+
     try {
       params.ports.completeRun({
         runId,
-        outcome: (result?.outcome ?? "failed") as RalphRunOutcome,
-        details: params.ports.buildRunDetails(result),
+        outcome: finalOutcome,
+        details: Object.keys(finalDetails).length ? finalDetails : undefined,
       });
     } catch (error: any) {
       params.ports.warn(
