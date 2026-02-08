@@ -4,8 +4,7 @@ import { existsSync, realpathSync } from "fs";
 import { dirname, isAbsolute, join, resolve } from "path";
 import { createHash } from "crypto";
 
-import { type AgentTask, getBwrbVaultForStorage, getBwrbVaultIfValid, updateTaskStatus } from "../queue-backend";
-import { appendBwrbNoteBody, buildAgentRunPayload, createBwrbNote } from "../bwrb/artifacts";
+import { type AgentTask, updateTaskStatus } from "../queue-backend";
 import {
   getAutoUpdateBehindLabelGate,
   getAutoUpdateBehindMinMinutes,
@@ -123,6 +122,7 @@ import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "../github/watch
 import { buildLoopTripDetails } from "../loop-detection/format";
 import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
 import { classifyOpencodeFailure } from "../opencode-error-classifier";
+import { derivePrCreateEscalationReason } from "./pr-create-escalation-reason";
 import { computeBlockedDecision, type RelationshipSignal } from "../github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "../github/issue-ref";
 import {
@@ -149,7 +149,6 @@ import {
 } from "./events";
 import { PAUSED_AT_CHECKPOINT_FIELD, parseCheckpointValue } from "./checkpoint-fields";
 import { applyTaskPatch } from "./task-patch";
-import { resolveVaultPath } from "./vault-paths";
 import {
   completeParentVerification,
   completeRalphRun,
@@ -449,7 +448,6 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 }
 
 // (applyTaskPatch extracted to src/worker/task-patch.ts)
-// (resolveVaultPath extracted to src/worker/vault-paths.ts)
 export class RepoWorker {
   private session: SessionAdapter;
   private baseSession: SessionAdapter;
@@ -727,6 +725,8 @@ export class RepoWorker {
         createRunRecord: (params) => createRalphRun(params),
         ensureRunGateRows: (runId) => ensureRalphRunGateRows({ runId }),
         completeRun: (params) => completeRalphRun(params),
+        upsertRunGateResult: (params) => upsertRalphRunGateResult(params),
+        recordRunGateArtifact: (params) => recordRalphRunGateArtifact(params),
         buildRunDetails: (result) => buildRunDetails(result),
         getPinnedOpencodeProfileName: (contextTask) => this.getPinnedOpencodeProfileName(contextTask),
         refreshRalphRunTokenTotals: (params) => refreshRalphRunTokenTotals(params),
@@ -1563,6 +1563,55 @@ export class RepoWorker {
     return await writeEscalationWritebackImpl(this as any, task, params);
   }
 
+  private async escalateNoPrAfterRetries(params: {
+    task: AgentTask;
+    reason: string;
+    details?: string;
+    planOutput: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    console.log(`[ralph:worker:${this.repo}] Escalating: ${params.reason}`);
+
+    const wasEscalated = params.task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(params.task, "escalated");
+    if (escalated) {
+      applyTaskPatch(params.task, "escalated", {});
+    }
+
+    await this.writeEscalationWriteback(params.task, {
+      reason: params.reason,
+      details: params.details,
+      escalationType: "other",
+    });
+    await this.notify.notifyEscalation({
+      taskName: params.task.name,
+      taskFileName: params.task._name,
+      taskPath: params.task._path,
+      issue: params.task.issue,
+      repo: this.repo,
+      sessionId: params.sessionId || params.task["session-id"]?.trim() || undefined,
+      reason: params.reason,
+      escalationType: "other",
+      planOutput: params.planOutput,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(params.task, {
+        reason: params.reason,
+        sessionId: params.sessionId || params.task["session-id"]?.trim() || undefined,
+        details: [params.details, params.planOutput].filter(Boolean).join("\n\n"),
+      });
+    }
+
+    return {
+      taskName: params.task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      sessionId: params.sessionId,
+      escalationReason: params.reason,
+    };
+  }
+
   private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
     return await this.branchProtection.fetchAvailableCheckContexts(branch);
   }
@@ -2147,6 +2196,62 @@ export class RepoWorker {
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to persist CI triage artifact: ${error?.message ?? String(error)}`
+      );
+    }
+  }
+
+  private recordMissingPrEvidence(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    reason: string;
+    diagnostics?: string;
+  }): void {
+    const runId = this.activeRunId;
+    if (!runId) return;
+
+    try {
+      upsertRalphRunGateResult({
+        runId,
+        gate: "pr_evidence",
+        status: "fail",
+        skipReason: "missing pr_url",
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist PR evidence gate failure: ${error?.message ?? String(error)}`
+      );
+    }
+
+    try {
+      const worktreePath = params.task["worktree-path"]?.trim() || "(unknown)";
+      const content = [
+        "PR evidence gate failed: missing PR URL.",
+        `Reason: ${params.reason}`,
+        `Issue: ${params.task.issue}`,
+        `Worktree: ${worktreePath}`,
+        "",
+        "Suggested recovery commands:",
+        `git -C \"${worktreePath}\" status`,
+        `git -C \"${worktreePath}\" branch --show-current`,
+        `git -C \"${worktreePath}\" push -u origin HEAD`,
+        `gh pr create --base ${params.botBranch} --fill --body \"Fixes #${params.issueNumber}\"`,
+        params.diagnostics ? "" : null,
+        params.diagnostics ? "Diagnostics:" : null,
+        params.diagnostics ?? null,
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "pr_evidence",
+        kind: "note",
+        content,
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist PR evidence diagnostics: ${error?.message ?? String(error)}`
       );
     }
   }
@@ -4113,7 +4218,7 @@ export class RepoWorker {
       buildIssueContextForAgent: async (input) => await this.buildIssueContextForAgent(input),
       runReviewAgent: async (input) => {
         const runLogPath = await this.recordRunLogPath(params.task, issueNumber, input.stage, "in-progress");
-        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, {
+        const baseOptions = {
           repo: this.repo,
           cacheKey: input.cacheKey,
           runLogPath,
@@ -4128,7 +4233,15 @@ export class RepoWorker {
           ...this.buildStallOptions(params.task, input.stage),
           ...this.buildLoopDetectionOptions(params.task, input.stage),
           ...(params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {}),
-        });
+        };
+        const continueSessionId = input.continueSessionId?.trim();
+        if (continueSessionId) {
+          return await this.session.continueSession(params.repoPath, continueSessionId, input.prompt, {
+            ...baseOptions,
+            agent: input.agent,
+          });
+        }
+        return await this.session.runAgent(params.repoPath, input.agent, input.prompt, baseOptions);
       },
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),
@@ -4710,7 +4823,7 @@ export class RepoWorker {
     const githubCommentUrl = await this.writeEscalationWriteback(task, {
       reason: escalationReason,
       details: diagnostics ?? undefined,
-      escalationType: "other",
+      escalationType: "watchdog",
     });
     await this.notify.notifyEscalation({
       taskName: task.name,
@@ -4722,7 +4835,7 @@ export class RepoWorker {
       priority: task.priority,
       sessionId: result.sessionId || task["session-id"]?.trim() || undefined,
       reason: escalationReason,
-      escalationType: "other",
+      escalationType: "watchdog",
       githubCommentUrl: githubCommentUrl ?? undefined,
       planOutput: result.output,
     });
@@ -5201,6 +5314,12 @@ export class RepoWorker {
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
       let prCreateLeaseKey: string | null = null;
+      const prCreateEvidence: string[] = [];
+      const addPrCreateEvidence = (text: string | null | undefined): void => {
+        const normalized = String(text ?? "").trim();
+        if (normalized) prCreateEvidence.push(normalized);
+      };
+      addPrCreateEvidence(buildResult.output);
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
         await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
@@ -5225,7 +5344,7 @@ export class RepoWorker {
             if (escalated) {
               applyTaskPatch(task, "escalated", {});
             }
-            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+            await this.writeEscalationWriteback(task, { reason, escalationType: "watchdog" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -5234,7 +5353,7 @@ export class RepoWorker {
               repo: this.repo,
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
-              escalationType: "other",
+              escalationType: "watchdog",
               planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
@@ -5288,6 +5407,7 @@ export class RepoWorker {
               ...opencodeSessionOptions,
             }
           );
+          addPrCreateEvidence(buildResult.output);
 
           await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
 
@@ -5422,6 +5542,7 @@ export class RepoWorker {
           ...this.buildLoopDetectionOptions(task, "resume-continue"),
           ...opencodeSessionOptions,
         });
+        addPrCreateEvidence(buildResult.output);
 
         await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
 
@@ -5482,42 +5603,25 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
-        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
-
-        const wasEscalated = task.status === "escalated";
-        const escalated = await this.queue.updateTaskStatus(task, "escalated");
-        if (escalated) {
-          applyTaskPatch(task, "escalated", {});
-        }
-        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
-        await this.notify.notifyEscalation({
-          taskName: task.name,
-          taskFileName: task._name,
-          taskPath: task._path,
-          issue: task.issue,
-          repo: this.repo,
-          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-          reason,
-          escalationType: "other",
-          planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+        const derived = derivePrCreateEscalationReason({
+          continueAttempts,
+          evidence: prCreateEvidence,
         });
-
-        if (escalated && !wasEscalated) {
-          await this.recordEscalatedRunNote(task, {
-            reason,
-            sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-          });
-        }
-
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "escalated",
-          sessionId: buildResult.sessionId,
-          escalationReason: reason,
-        };
+        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+        this.recordMissingPrEvidence({
+          task,
+          issueNumber,
+          botBranch,
+          reason: derived.reason,
+          diagnostics: planOutput,
+        });
+        return await this.escalateNoPrAfterRetries({
+          task,
+          reason: derived.reason,
+          details: derived.details,
+          planOutput,
+          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
+        });
       }
 
       if (prUrl && prCreateLeaseKey) {
@@ -5575,7 +5679,7 @@ export class RepoWorker {
       });
 
       prUrl = mergeGate.prUrl;
-      buildResult.sessionId = mergeGate.sessionId;
+      buildResult.sessionId = mergeGate.sessionId || buildResult.sessionId;
 
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
       const pausedSurvey = await this.pauseIfHardThrottled(task, "resume survey", buildResult.sessionId || existingSessionId);
@@ -5898,7 +6002,7 @@ export class RepoWorker {
     let allocatedSlot: number | null = null;
 
     try {
-      // 1. Extract issue number (e.g., "3mdistal/bwrb#245" -> "245")
+      // 1. Extract issue number (e.g., "owner/repo#245" -> "245")
       const issueMatch = task.issue.match(/#(\d+)$/);
       if (!issueMatch) throw new Error(`Invalid issue format: ${task.issue}`);
       const issueNumber = issueMatch[1];
@@ -5964,7 +6068,7 @@ export class RepoWorker {
       if (workerId) task["worker-id"] = workerId;
       if (typeof allocatedSlot === "number") task["repo-slot"] = String(allocatedSlot);
       if (!markedStarting) {
-        throw new Error("Failed to mark task starting (bwrb edit failed)");
+        throw new Error("Failed to mark task starting (queue status update failed)");
       }
 
       await this.ensureBranchProtectionOnce();
@@ -6487,6 +6591,12 @@ export class RepoWorker {
       let anomalyAborts = 0;
       let lastAnomalyCount = 0;
       let prCreateLeaseKey: string | null = null;
+      const prCreateEvidence: string[] = [];
+      const addPrCreateEvidence = (text: string | null | undefined): void => {
+        const normalized = String(text ?? "").trim();
+        if (normalized) prCreateEvidence.push(normalized);
+      };
+      addPrCreateEvidence(buildResult.output);
 
       while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
         await this.drainNudges(task, taskRepoPath, buildResult.sessionId, cacheKey, "build", opencodeXdg);
@@ -6513,7 +6623,7 @@ export class RepoWorker {
             if (escalated) {
               applyTaskPatch(task, "escalated", {});
             }
-            await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+            await this.writeEscalationWriteback(task, { reason, escalationType: "watchdog" });
             await this.notify.notifyEscalation({
               taskName: task.name,
               taskFileName: task._name,
@@ -6522,7 +6632,7 @@ export class RepoWorker {
               repo: this.repo,
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
               reason,
-              escalationType: "other",
+              escalationType: "watchdog",
               planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
             });
 
@@ -6577,6 +6687,7 @@ export class RepoWorker {
               ...opencodeSessionOptions,
             }
           );
+          addPrCreateEvidence(buildResult.output);
 
           await this.recordImplementationCheckpoint(task, buildResult.sessionId);
 
@@ -6707,6 +6818,7 @@ export class RepoWorker {
           ...this.buildLoopDetectionOptions(task, "build-continue"),
           ...opencodeSessionOptions,
         });
+        addPrCreateEvidence(buildResult.output);
 
         await this.recordImplementationCheckpoint(task, buildResult.sessionId);
 
@@ -6763,43 +6875,25 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        // Escalate if we still don't have a PR after retries
-        const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
-        console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
-
-        const wasEscalated = task.status === "escalated";
-        const escalated = await this.queue.updateTaskStatus(task, "escalated");
-        if (escalated) {
-          applyTaskPatch(task, "escalated", {});
-        }
-        await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
-        await this.notify.notifyEscalation({
-          taskName: task.name,
-          taskFileName: task._name,
-          taskPath: task._path,
-          issue: task.issue,
-          repo: this.repo,
-          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-          reason,
-          escalationType: "other",
-          planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+        const derived = derivePrCreateEscalationReason({
+          continueAttempts,
+          evidence: prCreateEvidence,
         });
-
-        if (escalated && !wasEscalated) {
-          await this.recordEscalatedRunNote(task, {
-            reason,
-            sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
-          });
-        }
-
-        return {
-          taskName: task.name,
-          repo: this.repo,
-          outcome: "escalated",
-          sessionId: buildResult.sessionId,
-          escalationReason: reason,
-        };
+        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+        this.recordMissingPrEvidence({
+          task,
+          issueNumber,
+          botBranch,
+          reason: derived.reason,
+          diagnostics: planOutput,
+        });
+        return await this.escalateNoPrAfterRetries({
+          task,
+          reason: derived.reason,
+          details: derived.details,
+          planOutput,
+          sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
+        });
       }
 
       if (prUrl && prCreateLeaseKey) {
@@ -6852,7 +6946,7 @@ export class RepoWorker {
       });
 
       prUrl = mergeGate.prUrl;
-      buildResult.sessionId = mergeGate.sessionId;
+      buildResult.sessionId = mergeGate.sessionId || buildResult.sessionId;
 
       // 9. Run survey (configured command)
       console.log(`[ralph:worker:${this.repo}] Running survey...`);
@@ -6979,149 +7073,9 @@ export class RepoWorker {
       bodyPrefix?: string;
     }
   ): Promise<void> {
-    if (this.isGitHubQueueTask(task)) {
-      return;
-    }
-    const vault = getBwrbVaultForStorage("create agent-run note");
-    if (!vault) {
-      return;
-    }
-    const taskPath = typeof task._path === "string" ? task._path : "";
-    const resolvedTaskPath = taskPath.endsWith(".md") ? resolveVaultPath(taskPath) : "";
-    if (!resolvedTaskPath || !existsSync(resolvedTaskPath)) {
-      console.warn(
-        `[ralph:worker:${this.repo}] Skipping agent-run note; task note missing at ${taskPath || "(unknown)"}`
-      );
-      return;
-    }
-    const today = data.completed.toISOString().split("T")[0];
-    const shortIssue = task.issue.split("/").pop() || task.issue;
-
-    const runName = safeNoteName(`Run for ${shortIssue} - ${task.name.slice(0, 40)}`);
-
-    const payload = buildAgentRunPayload({
-      name: runName,
-      task: `[[${task._name}]]`,  // Use _name (filename) not name (display) for wikilinks
-      started: data.started.toISOString().split("T")[0],
-      completed: today,
-      outcome: data.outcome,
-      pr: data.pr || "",
-      creationDate: today,
-      scope: "builder",
-    });
-
-    try {
-      const output = await createBwrbNote({
-        type: "agent-run",
-        action: "create agent-run note",
-        payload,
-      });
-
-      if (!output.ok || !output.path) {
-        const error = output.ok ? "bwrb did not return a note path" : output.error;
-        const log = !output.ok && output.skipped ? console.warn : console.error;
-        log(`[ralph:worker:${this.repo}] Failed to create agent-run: ${error}`);
-        return;
-      }
-
-      const bodySections: string[] = [];
-
-      if (data.bodyPrefix?.trim()) {
-        bodySections.push(data.bodyPrefix.trim(), "");
-      }
-
-      // Add introspection summary if available
-      if (data.sessionId) {
-        const introspection = await readIntrospectionSummary(data.sessionId);
-        if (introspection) {
-          bodySections.push(
-            "## Session Summary",
-            "",
-            `- **Steps:** ${introspection.stepCount}`,
-            `- **Tool calls:** ${introspection.totalToolCalls}`,
-            `- **Anomalies:** ${introspection.hasAnomalies ? `Yes (${introspection.toolResultAsTextCount} tool-result-as-text)` : "None"}`,
-            `- **Recent tools:** ${introspection.recentTools.join(", ") || "none"}`,
-            ""
-          );
-        }
-      }
-
-      // Add token totals (best-effort). GitHub queue tasks skip agent-run notes.
-      const tokenRunId = this.activeRunId ?? (data.sessionId ? getLatestRunIdForSession(data.sessionId) : null);
-      if (tokenRunId) {
-        try {
-          const opencodeProfile = this.getPinnedOpencodeProfileName(task);
-          let tokenTotals = getRalphRunTokenTotals(tokenRunId);
-          let sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
-          if (!tokenTotals || !tokenTotals.tokensComplete) {
-            await refreshRalphRunTokenTotals({ runId: tokenRunId, opencodeProfile });
-            tokenTotals = getRalphRunTokenTotals(tokenRunId);
-            sessionTotals = listRalphRunSessionTokenTotals(tokenRunId);
-          }
-
-          if (tokenTotals) {
-            const totalLabel = tokenTotals.tokensComplete && typeof tokenTotals.tokensTotal === "number" ? tokenTotals.tokensTotal : "?";
-            const showSessions = sessionTotals.length > 1;
-            bodySections.push(
-              "## Token Usage",
-              "",
-              `- **Total:** ${totalLabel}`,
-              `- **Complete:** ${tokenTotals.tokensComplete ? "Yes" : "No"}`,
-              `- **Sessions:** ${tokenTotals.sessionCount}`,
-              ""
-            );
-
-            if (showSessions) {
-              const lines = sessionTotals.slice(0, 10).map((s) => {
-                const label = typeof s.tokensTotal === "number" ? s.tokensTotal : "?";
-                return `- ${s.sessionId}: ${label} (${s.quality})`;
-              });
-              if (lines.length > 0) {
-                bodySections.push("### Sessions", "", ...lines, "");
-              }
-            }
-          }
-        } catch {
-          // best-effort token accounting
-        }
-      }
-
-
-      // Add devex consult summary (if we used devex-before-escalate)
-      if (data.devex?.consulted) {
-        bodySections.push(
-          "## Devex Consult",
-          "",
-          data.devex.sessionId ? `- **Session:** ${data.devex.sessionId}` : "",
-          data.devex.summary ?? "",
-          ""
-        );
-      }
-
-      // Add survey results
-      if (data.surveyResults) {
-        bodySections.push("## Survey Results", "", data.surveyResults, "");
-      }
-
-      if (bodySections.length > 0) {
-        const bodyResult = await appendBwrbNoteBody({
-          notePath: output.path,
-          body: "\n" + bodySections.join("\n"),
-        });
-        if (!bodyResult.ok) {
-          const log = bodyResult.skipped ? console.warn : console.error;
-          log(`[ralph:worker:${this.repo}] Failed to write agent-run body: ${bodyResult.error}`);
-        }
-      }
-
-      // Clean up introspection logs
-      if (data.sessionId) {
-        await cleanupIntrospectionLogs(data.sessionId);
-      }
-
-      console.log(`[ralph:worker:${this.repo}] Created agent-run note`);
-    } catch (e) {
-      console.error(`[ralph:worker:${this.repo}] Failed to create agent-run:`, e);
+    // Agent-run artifacts are persisted via SQLite run records.
+    if (data.sessionId) {
+      await cleanupIntrospectionLogs(data.sessionId);
     }
   }
 }
