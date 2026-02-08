@@ -4,7 +4,6 @@ import {
   getProfile,
   getSandboxProfileConfig,
   isQueueBackendExplicit,
-  type QueueBackend,
   type RalphConfig,
 } from "./config";
 import { shouldLog } from "./logging";
@@ -18,7 +17,7 @@ import { parseIssueRef } from "./github/issue-ref";
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
 
 export type QueueBackendDriver = {
-  name: Exclude<QueueBackend, "bwrb">;
+  name: "github" | "none";
   initialPoll(): Promise<QueueTask[]>;
   startWatching(onChange: QueueChangeHandler): void;
   stopWatching(): void;
@@ -48,8 +47,8 @@ export type QueueBackendDriver = {
 };
 
 export type QueueBackendState = {
-  desiredBackend: QueueBackend;
-  backend: Exclude<QueueBackend, "bwrb">;
+  desiredBackend: "github" | "none";
+  backend: "github" | "none";
   health: QueueBackendHealth;
   fallback: boolean;
   diagnostics?: string;
@@ -74,32 +73,6 @@ function isGitHubAuthConfigured(config: RalphConfig): boolean {
   return Boolean(token && token.trim());
 }
 
-function mapLegacyBackend(
-  desiredBackend: QueueBackend,
-  config: RalphConfig
-): { backend: Exclude<QueueBackend, "bwrb">; diagnostics?: string; fallback: boolean } {
-  if (desiredBackend !== "bwrb") {
-    return {
-      backend: desiredBackend,
-      fallback: false,
-    };
-  }
-
-  if (isGitHubAuthConfigured(config)) {
-    return {
-      backend: "github",
-      fallback: true,
-      diagnostics: 'Legacy queueBackend "bwrb" is deprecated and mapped to "github".',
-    };
-  }
-
-  return {
-    backend: "none",
-    fallback: true,
-    diagnostics: 'Legacy queueBackend "bwrb" is deprecated and mapped to "none" because GitHub auth is not configured.',
-  };
-}
-
 export function __resetQueueBackendStateForTests(): void {
   cachedState = null;
   cachedDriver = null;
@@ -110,7 +83,7 @@ export function getQueueBackendState(): QueueBackendState {
 
   const config = getConfig();
   const meta = getConfigMeta();
-  const desiredBackend = config.queueBackend ?? "github";
+  const desiredBackend = (config.queueBackend ?? "github") as "github" | "none";
   const explicit = isQueueBackendExplicit();
 
   if (meta.queueBackendExplicit && !meta.queueBackendValid) {
@@ -127,14 +100,13 @@ export function getQueueBackendState(): QueueBackendState {
     return cachedState;
   }
 
-  const legacy = mapLegacyBackend(desiredBackend, config);
-  let backend = legacy.backend;
+  let backend = desiredBackend;
   let health: QueueBackendHealth = "ok";
-  let diagnostics = legacy.diagnostics;
+  let diagnostics: string | undefined;
 
   if (backend === "github" && !isGitHubAuthConfigured(config)) {
     const authHint = "GitHub auth is not configured (set githubApp in ~/.ralph/config.* or GH_TOKEN/GITHUB_TOKEN).";
-    if (explicit || desiredBackend === "bwrb") {
+    if (explicit) {
       health = "unavailable";
       diagnostics = diagnostics ? `${diagnostics} ${authHint}` : authHint;
     } else {
@@ -148,7 +120,7 @@ export function getQueueBackendState(): QueueBackendState {
     desiredBackend,
     backend,
     health,
-    fallback: legacy.fallback || backend !== desiredBackend,
+    fallback: backend !== desiredBackend,
     diagnostics,
     explicit,
   };
