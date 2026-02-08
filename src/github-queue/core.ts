@@ -13,11 +13,14 @@ import {
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
+const BLOCKED_PUBLIC_STATUS_LABEL = RALPH_LABEL_STATUS_IN_PROGRESS;
+
 const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   queued: RALPH_LABEL_STATUS_QUEUED,
   "in-progress": RALPH_LABEL_STATUS_IN_PROGRESS,
+  "waiting-on-pr": RALPH_LABEL_STATUS_IN_PROGRESS,
   paused: RALPH_LABEL_STATUS_PAUSED,
-  blocked: null,
+  blocked: BLOCKED_PUBLIC_STATUS_LABEL,
   escalated: RALPH_LABEL_STATUS_ESCALATED,
   done: RALPH_LABEL_STATUS_DONE,
   starting: RALPH_LABEL_STATUS_IN_PROGRESS,
@@ -79,6 +82,53 @@ export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: 
   if (!labelSet.has(target)) add.push(target);
   const remove = KNOWN_RALPH_STATUS_LABELS.filter((label) => label !== target && labelSet.has(label));
   return { add, remove };
+}
+
+export type LabelTransitionState = {
+  fromStatus: QueueTaskStatus | null;
+  toStatus: QueueTaskStatus;
+  reason: string;
+  atMs: number;
+};
+
+export function shouldDebounceOppositeStatusTransition(params: {
+  fromStatus: QueueTaskStatus | null;
+  toStatus: QueueTaskStatus;
+  reason: string;
+  nowMs: number;
+  windowMs: number;
+  previous?: LabelTransitionState | null;
+}): { suppress: boolean; reason?: string } {
+  const from = params.fromStatus;
+  const to = params.toStatus;
+  if (!from || from === to) return { suppress: false };
+  const isQueuedInProgressPair =
+    (from === "queued" && to === "in-progress") ||
+    (from === "in-progress" && to === "queued") ||
+    (from === "queued" && to === "waiting-on-pr") ||
+    (from === "waiting-on-pr" && to === "queued") ||
+    (from === "waiting-on-pr" && to === "in-progress") ||
+    (from === "in-progress" && to === "waiting-on-pr");
+  if (!isQueuedInProgressPair) return { suppress: false };
+  const previous = params.previous;
+  if (!previous) return { suppress: false };
+  if (params.windowMs <= 0) return { suppress: false };
+  const ageMs = params.nowMs - previous.atMs;
+  if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > params.windowMs) return { suppress: false };
+
+  const opposite = previous.fromStatus === to && previous.toStatus === from;
+  if (!opposite) return { suppress: false };
+
+  const previousReason = previous.reason.trim();
+  const nextReason = params.reason.trim();
+  if (previousReason && nextReason && previousReason !== nextReason) {
+    return { suppress: false };
+  }
+
+  return {
+    suppress: true,
+    reason: `debounced opposite transition ${from}->${to} within ${params.windowMs}ms`,
+  };
 }
 
 export function planClaim(currentLabels: string[]): {

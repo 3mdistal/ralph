@@ -7,6 +7,7 @@ import {
   deriveTaskView,
   planClaim,
   computeStaleInProgressRecovery,
+  shouldDebounceOppositeStatusTransition,
   statusToRalphLabelDelta,
 } from "../github-queue/core";
 
@@ -56,7 +57,7 @@ describe("github queue core", () => {
         repo: "3mdistal/ralph",
         number: 286,
         title: "Priority labels",
-        labels: ["p3-low", "p1-high"],
+        labels: ["ralph:priority:p3", "ralph:priority:p1"],
       },
       nowIso: "2026-01-23T00:00:00.000Z",
     });
@@ -84,12 +85,26 @@ describe("github queue core", () => {
         repo: "3mdistal/ralph",
         number: 288,
         title: "Priority labels",
-        labels: ["P2", "p4 backlog"],
+        labels: ["ralph:priority:P2", "p4 backlog"],
       },
       nowIso: "2026-01-23T00:00:00.000Z",
     });
 
     expect(task.priority).toBe("p2-medium");
+  });
+
+  test("deriveTaskView prefers canonical labels over legacy", () => {
+    const task = deriveTaskView({
+      issue: {
+        repo: "3mdistal/ralph",
+        number: 288,
+        title: "Priority labels",
+        labels: ["p0-critical", "ralph:priority:p3"],
+      },
+      nowIso: "2026-01-23T00:00:00.000Z",
+    });
+
+    expect(task.priority).toBe("p3-low");
   });
 
   test("deriveTaskView accepts priority prefixes with suffixes", () => {
@@ -111,9 +126,9 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
-  test("statusToRalphLabelDelta preserves queued when blocked", () => {
+  test("statusToRalphLabelDelta maps blocked to in-progress from queued", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
-    expect(delta).toEqual({ add: [], remove: [] });
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
   test("statusToRalphLabelDelta preserves in-progress when blocked", () => {
@@ -139,9 +154,65 @@ describe("github queue core", () => {
     });
   });
 
+  test("statusToRalphLabelDelta maps blocked to in-progress when no status label exists", () => {
+    const delta = statusToRalphLabelDelta("blocked", ["bug"]);
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: [] });
+  });
+
+  test("statusToRalphLabelDelta supports blocked to queued round-trip", () => {
+    const blockedDelta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
+    const blockedLabels = applyDelta(["ralph:status:queued"], blockedDelta);
+    expect(blockedLabels).toContain("ralph:status:in-progress");
+    expect(blockedLabels).not.toContain("ralph:status:queued");
+
+    const queuedDelta = statusToRalphLabelDelta("queued", blockedLabels);
+    const queuedLabels = applyDelta(blockedLabels, queuedDelta);
+    expect(queuedLabels).toContain("ralph:status:queued");
+    expect(queuedLabels).not.toContain("ralph:status:in-progress");
+  });
+
   test("statusToRalphLabelDelta maps escalated to escalated", () => {
     const delta = statusToRalphLabelDelta("escalated", ["ralph:status:queued"]);
     expect(delta).toEqual({ add: ["ralph:status:escalated"], remove: ["ralph:status:queued"] });
+  });
+
+  test("statusToRalphLabelDelta maps waiting-on-pr to in-progress label", () => {
+    const delta = statusToRalphLabelDelta("waiting-on-pr", ["ralph:status:queued"]);
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
+  });
+
+  test("debounces opposite queued/in-progress transition with unchanged reason", () => {
+    const result = shouldDebounceOppositeStatusTransition({
+      fromStatus: "in-progress",
+      toStatus: "queued",
+      reason: "stale-heartbeat",
+      nowMs: 1_000,
+      windowMs: 5_000,
+      previous: {
+        fromStatus: "queued",
+        toStatus: "in-progress",
+        reason: "stale-heartbeat",
+        atMs: 500,
+      },
+    });
+    expect(result.suppress).toBe(true);
+  });
+
+  test("allows opposite transition when reason changes", () => {
+    const result = shouldDebounceOppositeStatusTransition({
+      fromStatus: "in-progress",
+      toStatus: "queued",
+      reason: "operator-queue",
+      nowMs: 1_000,
+      windowMs: 5_000,
+      previous: {
+        fromStatus: "queued",
+        toStatus: "in-progress",
+        reason: "stale-heartbeat",
+        atMs: 500,
+      },
+    });
+    expect(result.suppress).toBe(false);
   });
 
   test("planClaim requires queued label", () => {

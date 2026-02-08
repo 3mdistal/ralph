@@ -2254,9 +2254,8 @@ export function getOpencodeDefaultProfileName(): string | null {
   return trimmed ? trimmed : null;
 }
 
-export function getRequestedOpencodeProfileName(controlProfileRaw?: string | null): RequestedOpencodeProfile {
+export function getRequestedOpencodeProfileName(_controlProfileRaw?: string | null): RequestedOpencodeProfile {
   return resolveRequestedOpencodeProfile({
-    controlProfile: controlProfileRaw,
     defaultProfile: getOpencodeDefaultProfileName(),
   });
 }

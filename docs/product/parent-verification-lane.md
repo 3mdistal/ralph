@@ -20,19 +20,22 @@ If an issue has a mergeable open PR that already closes the issue, reconcile tha
 
 The verifier must emit a last-line marker:
 
-`RALPH_PARENT_VERIFY: {"version":1,"work_remains":true|false,"reason":"..."}`
+`RALPH_PARENT_VERIFY: {"version":1,"work_remains":true|false,"reason":"...","confidence":"low|medium|high","checked":["..."],"why_satisfied":"...","evidence":[{"url":"https://...","note":"..."}]}`
 
-The JSON object may include additional keys for observability, for example:
+Marker notes:
 
-- `confidence`: `high|medium|low`
-- `evidence`: array of URLs/issue references that support the determination
+- `confidence`, `checked`, `why_satisfied`, and `evidence` are required for comment-only auto-completion when `work_remains=false`.
+- Backward-compatible markers that omit these keys are valid parse output, but they are not eligible for auto-close.
 
 ## Outcomes
 
 - `work_remains=true`: record outcome and proceed to the normal implementation pipeline.
 - `work_remains=false`: record outcome and either:
-  - close the issue automatically when confidence and evidence are strong, or
-  - escalate with a "close or clarify" summary when the result is opinionated/inconclusive.
+  - complete via comment-only path when confidence/evidence are strong:
+    - post or edit one verification comment using marker `<!-- ralph-verify:v1 id=ISSUE_NUMBER -->`
+    - include `RALPH_VERIFY: {"version":1,"work_remains":false,"confidence":"medium|high","checked":[...],"why_satisfied":"...","evidence":[{"url":"...","note":"..."}]}`
+    - set `ralph:status:done` and close the issue (no PR), or
+  - escalate with a "close or clarify" summary when confidence is low/unknown or evidence is weak.
 
 ## Failure handling
 

@@ -5,6 +5,21 @@ export type StatusQueueSnapshot = {
   diagnostics: string | null;
 };
 
+export type StatusQueueParityRepo = {
+  repo: string;
+  ghQueuedLocalBlocked: number;
+  multiStatusLabels: number;
+  missingStatusWithOpState: number;
+  sampleGhQueuedLocalBlocked: string[];
+};
+
+export type StatusQueueParitySnapshot = {
+  ghQueuedLocalBlocked: number;
+  multiStatusLabels: number;
+  missingStatusWithOpState: number;
+  repos: StatusQueueParityRepo[];
+};
+
 export type StatusDrainSnapshot = {
   requestedAt: string | null;
   timeoutMs: number | null;
@@ -84,6 +99,7 @@ import type { StatusUsageSnapshot } from "./status-usage";
 export type StatusSnapshot = {
   mode: string;
   queue: StatusQueueSnapshot;
+  parity?: StatusQueueParitySnapshot;
   daemon: StatusDaemonSnapshot | null;
   controlProfile: string | null;
   activeProfile: string | null;

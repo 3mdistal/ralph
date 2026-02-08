@@ -46,6 +46,7 @@ This doc is intended to supersede label/queue semantics in older docs.
 Notes:
 
 - Internal causes (deps blocked, CI failing, merge conflicts, rate limits, etc.) are tracked as internal metadata and surfaced via `bun run status` and/or dashboard, not as multiple GitHub state labels.
+- When local task status is `blocked`, GitHub label reconciliation projects that state as non-queued (currently `ralph:status:in-progress`) so `ralph:status:queued` does not drift against local blocked state.
 
 ### Command labels (operator-owned, ephemeral)
 
@@ -105,15 +106,20 @@ GitHub label writes are best-effort. When throttled/blocked by GitHub rate limit
 
 ## Done semantics (deterministic)
 
-`ralph:status:done` is derived from merged PR evidence:
+`ralph:status:done` is derived from one of two evidence paths:
 
-- Ralph uses GitHub issue timeline events to identify the closing PR.
-- Ralph then verifies the merge commit SHA (or equivalent head SHA) is reachable from the repo default branch head.
-- If verified, it sets `ralph:status:done` and closes the issue.
+- PR path (default):
+  - Ralph uses GitHub issue timeline events to identify the closing PR.
+  - Ralph then verifies the merge commit SHA (or equivalent head SHA) is reachable from the repo default branch head.
+  - If verified, it sets `ralph:status:done` and closes the issue.
+- Parent-verification no-PR path (narrow exception):
+  - Allowed only for the parent verification lane when `work_remains=false` with `confidence=medium|high` and strong evidence.
+  - Ralph posts/updates a single structured verification comment with marker `<!-- ralph-verify:v1 id=ISSUE_NUMBER -->` and `RALPH_VERIFY: {...}` payload.
+  - If writeback succeeds, Ralph sets `ralph:status:done` and closes the issue even without a PR.
 
 ## Label bootstrap
 
-Ralph ensures all required `ralph:status:*` and `ralph:cmd:*` labels exist in the repo, and enforces their label descriptions/colors to match the version shipped with Ralph.
+Ralph ensures all required `ralph:status:*`, `ralph:cmd:*`, and `ralph:priority:*` labels exist in the repo, and enforces their label descriptions/colors to match the version shipped with Ralph.
 
 Required set (vNext):
 
