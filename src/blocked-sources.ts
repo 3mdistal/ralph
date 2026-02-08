@@ -7,6 +7,7 @@ export const BLOCKED_SOURCES = [
   "ci-only",
   "review",
   "merge-conflict",
+  "permission",
   "stall",
   "guardrail",
   "auto-update",

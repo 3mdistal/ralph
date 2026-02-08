@@ -1,42 +1,34 @@
-# Plan: Fix queue/in-progress label flapping on long-lived open PRs (#599)
+# Plan: Merge-conflict recovery permission-denied classification + /tmp avoidance (#626)
 
 ## Goal
 
-- Stop `ralph:status:queued` <-> `ralph:status:in-progress` oscillation for issues that already have a long-lived open PR and no new operator input.
-- Preserve contract invariant: exactly one `ralph:status:*` label converges, and `queued` remains claimable while “open PR waiting” is not claimable.
-- Reduce GitHub label writes/timeline noise; avoid burning API quota.
+- Ensure merge-conflict recovery never relies on external-directory paths like `/tmp`.
+- When OpenCode sandbox denies permissions (e.g. `external_directory (/tmp/*)`), fail fast and surface an explicit classification (`blocked:permission`) in merge-conflict comments/escalations.
+- Prevent permission-denied failures from being misreported as generic “timed out waiting for updated PR state”.
 
-## Product Constraints (canonical)
+## Product constraints (canonical)
 
-- Status labels are fixed to the `ralph:status:*` set; internal “why” states should be internal metadata (`docs/product/orchestration-contract.md`).
-- `ralph:status:in-progress` includes “waiting on deterministic gates (e.g. CI)”; “open PR waiting” should therefore be stable `in-progress` on GitHub.
-- GitHub label writes are best-effort; convergence matters more than chattiness.
+- Minimize human interrupt surface; prefer accurate, actionable escalations over retries on non-actionable failures (`docs/product/vision.md`).
+- Merge-conflict recovery is a first-class remediation lane: single canonical issue comment (edit in place), bounded retries, then escalate (`docs/product/deterministic-gates.md`).
+- Diagnostics posted to GitHub must be bounded and redacted; avoid leaking local absolute paths (`docs/product/vision.md`).
 
 ## Assumptions
 
-- Introduce explicit durable status `waiting-on-pr` in task op-state (`tasks.status`) for “open PR exists, waiting”.
-- Map `waiting-on-pr` to GitHub label `ralph:status:in-progress` (no new GitHub-visible status labels).
-- Use SQLite PR snapshots (`prs` table) as the primary “does an open PR exist for this issue?” signal, with a freshness window to avoid indefinite parking on stale data.
+- OpenCode sandbox permission denials appear in session output with a recognizable marker like `permission requested: <capability> (<target>); auto-rejecting`.
+- Permission denial is non-retryable without changing commands/policy; treat it as an immediate escalation (no attempt churn).
 
 ## Checklist
 
-- [x] Unblock gate persistence drift (`ralph_run_gate_results.reason`)
-- [x] Add durable op-state for open-PR wait (`waiting-on-pr`)
-- [x] Park queued tasks on open PR (don’t keep them claimable)
-- [x] Gate stale in-progress sweep by open-PR wait state
-- [x] Make label reconciler respect open-PR wait mapping
-- [x] Remove passive open-PR in-progress writes for passive path
-- [x] Add anti-flap guardrail (single choke point debounce)
-- [x] Tests: no-flap regression + operator override + closed-PR recovery + no-duplicate writes
-- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
-
-## Steps
-
-- [x] Keep startup gate-schema repair covered and aligned with schema updates (`src/__tests__/state-sqlite.test.ts`).
-- [x] Add `waiting-on-pr` to queue status model and map it to `ralph:status:in-progress` label convergence.
-- [x] Park queued tasks with existing open PRs in `RepoWorker.processTask` before planner/build, clearing active ownership/session fields.
-- [x] Gate stale in-progress sweep: skip recovery when op-state is `waiting-on-pr` and open PR snapshot is fresh; allow recovery when snapshot is stale/closed.
-- [x] Add transition debounce guard (in-memory + durable SQLite record) for opposite queued/in-progress transitions; log suppressed transitions.
-- [x] Wire label reconciler to respect `waiting-on-pr` and transition debounce state.
-- [x] Add tests for no-flap regression, operator re-queue behavior, closed-PR recovery, waiting-on-pr label idempotence, and transition debounce core logic.
+- [x] Add a pure OpenCode output classifier (typed `permission-denied` + parsed capability/target).
+- [x] Plumb a worktree-local temp dir into spawned OpenCode env (`TMPDIR`/`TMP`/`TEMP`), with an explicit override in session options.
+- [x] Merge-conflict lane: detect permission-denied immediately after `runAgent` and escalate without retry/polling.
+- [x] Merge-conflict lane: if PR-state polling times out but the session output indicates permission-denied, report `blocked:permission` (not timeout).
+- [x] Merge-conflict recovery agent prompt explicitly forbids `/tmp` and suggests worktree-local temp/artifact paths.
+- [x] Add/extend diagnostics redaction so merge-conflict comments/escalations cannot leak local absolute paths (incl. `/tmp/...`).
+- [x] Regression tests:
+  - [x] Classifier unit tests (multiple phrasings + false-positive guard)
+  - [x] Merge-conflict recovery: permission-denied escalates with `blocked:permission`, skips PR-state polling, and never emits timeout reason
+  - [x] Session env: temp vars set and override precedence
+  - [x] Merge-conflict prompt contains no-`/tmp` instruction
+  - [x] Redaction: `/tmp/...` scrubbed in GitHub writeback payloads
 - [x] Run gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
