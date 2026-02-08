@@ -6,7 +6,6 @@ import { tmpdir } from "os";
 import { __resetConfigForTests } from "../config";
 import { getStatusSnapshot } from "../commands/status";
 import { __resetQueueBackendStateForTests } from "../queue-backend";
-import { __resetBwrbRunnerForTests, __setBwrbRunnerForTests } from "../queue";
 import { closeStateDbForTests } from "../state";
 import { resolveDaemonRecordPath } from "../daemon-record";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
@@ -15,16 +14,6 @@ let homeDir = "";
 let priorHome: string | undefined;
 let priorStateDb: string | undefined;
 let releaseLock: (() => void) | null = null;
-
-function createEmptyBwrbRunner() {
-  return () => {
-    const runner = {
-      cwd: () => runner,
-      quiet: async () => ({ stdout: Buffer.from("[]") }),
-    };
-    return runner;
-  };
-}
 
 beforeEach(async () => {
   releaseLock = await acquireGlobalTestLock();
@@ -35,25 +24,19 @@ beforeEach(async () => {
   process.env.HOME = homeDir;
   process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
 
-  const vaultDir = join(homeDir, "vault");
-  await mkdir(join(vaultDir, ".bwrb"), { recursive: true });
-  await writeFile(join(vaultDir, ".bwrb", "schema.json"), "{}", "utf8");
-
   await mkdir(join(homeDir, ".ralph"), { recursive: true });
   await writeFile(
     join(homeDir, ".ralph", "config.json"),
-    JSON.stringify({ queueBackend: "bwrb", bwrbVault: vaultDir }),
+    JSON.stringify({ queueBackend: "none" }),
     "utf8"
   );
 
-  __setBwrbRunnerForTests(createEmptyBwrbRunner() as any);
   __resetConfigForTests();
   __resetQueueBackendStateForTests();
   closeStateDbForTests();
 });
 
 afterEach(async () => {
-  __resetBwrbRunnerForTests();
   __resetQueueBackendStateForTests();
   __resetConfigForTests();
   closeStateDbForTests();
