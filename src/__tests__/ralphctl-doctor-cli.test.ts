@@ -33,6 +33,12 @@ function buildIsolatedEnv(homeDir: string, xdgStateHome: string): NodeJS.Process
     ...process.env,
     HOME: homeDir,
     XDG_STATE_HOME: xdgStateHome,
+    // Keep bun / XDG caches out of HOME so these contract tests can
+    // assert that ralphctl doctor does not mutate the provided HOME tree.
+    XDG_CACHE_HOME: join(xdgStateHome, "cache"),
+    XDG_CONFIG_HOME: join(xdgStateHome, "config"),
+    BUN_INSTALL: join(xdgStateHome, ".bun"),
+    BUN_INSTALL_CACHE_DIR: join(xdgStateHome, ".bun", "install", "cache"),
     RALPH_STATE_DB_PATH: join(homeDir, ".ralph", "state.sqlite"),
     RALPH_SESSIONS_DIR: join(homeDir, ".ralph", "sessions"),
     RALPH_WORKTREES_DIR: join(homeDir, ".ralph", "worktrees"),
