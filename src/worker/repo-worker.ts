@@ -48,6 +48,7 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import { prepareReviewDiffArtifacts, recordReviewGateFailure, recordReviewGateSkipped, runReviewGate } from "../gates/review";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
@@ -140,6 +141,7 @@ import { isRalphCheckpoint, type RalphCheckpoint, type RalphEvent } from "../das
 import type { DashboardEventContext } from "../dashboard/publisher";
 import { createRunRecordingSessionAdapter, type SessionAdapter } from "../run-recording-session-adapter";
 import { redactHomePathForDisplay } from "../redaction";
+import { buildGhErrorSearchText, formatGhError as formatGhErrorShared } from "./gh-error-format";
 import { isSafeSessionId } from "../session-id";
 import {
   createContextRecoveryAdapter as createContextRecoveryAdapterImpl,
@@ -1629,6 +1631,40 @@ export class RepoWorker {
     };
   }
 
+  private async escalateMissingPrWithDerivedReason(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    continueAttempts: number;
+    evidence: string[];
+    latestOutput: string;
+    prRecoveryDiagnostics: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    const derived = derivePrCreateEscalationReason({
+      continueAttempts: params.continueAttempts,
+      evidence: params.evidence,
+    });
+    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+
+    this.recordMissingPrEvidence({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      botBranch: params.botBranch,
+      reason: derived.reason,
+      blockedSource: derived.classification?.blockedSource,
+      diagnostics: planOutput,
+    });
+
+    return await this.escalateNoPrAfterRetries({
+      task: params.task,
+      reason: derived.reason,
+      details: derived.details,
+      planOutput,
+      sessionId: params.sessionId,
+    });
+  }
+
   private async fetchAvailableCheckContexts(branch: string): Promise<string[]> {
     return await this.branchProtection.fetchAvailableCheckContexts(branch);
   }
@@ -1876,6 +1912,101 @@ export class RepoWorker {
     return this.normalizeRepoSlot(preferred, limit);
   }
 
+  private async runPrReadinessChecks(params: {
+    task: AgentTask;
+    issueNumber: string;
+    worktreePath: string;
+    botBranch: string;
+    runId: string;
+  }): Promise<{ ok: true; diagnostics: string[] } | { ok: false; diagnostics: string[] }> {
+    const diagnostics: string[] = [];
+    const issueContextParts: string[] = [];
+
+    try {
+      const issueContext = await this.buildIssueContextForAgent({
+        repo: this.repo,
+        issueNumber: params.issueNumber,
+      });
+      if (issueContext.trim()) issueContextParts.push(issueContext.trim());
+    } catch (error: any) {
+      issueContextParts.push(`Issue context unavailable: ${error?.message ?? String(error)}`);
+    }
+
+    const reviewIssueContext = issueContextParts.join("\n\n");
+
+    let reviewDiff: { baseRef: string; headRef: string; diffPath: string; diffStat: string };
+    try {
+      reviewDiff = await prepareReviewDiffArtifacts({
+        runId: params.runId,
+        repoPath: params.worktreePath,
+        baseRef: params.botBranch,
+        headRef: "HEAD",
+      });
+      diagnostics.push(`- Review diff artifact prepared: ${reviewDiff.diffPath}`);
+    } catch (error: any) {
+      const reason = `Review readiness failed: could not prepare diff artifacts (${error?.message ?? String(error)})`;
+      diagnostics.push(`- ${reason}`);
+      recordReviewGateFailure({ runId: params.runId, gate: "product_review", reason });
+      recordReviewGateFailure({ runId: params.runId, gate: "devex_review", reason });
+      return { ok: false, diagnostics };
+    }
+
+    const runReviewAgent = async (
+      gate: "product_review" | "devex_review",
+      agent: "product" | "devex",
+      stage: string
+    ) => {
+      return await runReviewGate({
+        runId: params.runId,
+        gate,
+        repo: this.repo,
+        issueRef: params.task.issue,
+        prUrl: "(not created yet)",
+        issueContext: reviewIssueContext,
+        diff: reviewDiff,
+        runAgent: async (prompt: string) => {
+          const runLogPath = await this.recordRunLogPath(params.task, params.issueNumber, stage, "in-progress");
+          return await this.session.runAgent(params.worktreePath, agent, prompt, {
+            repo: this.repo,
+            cacheKey: `pr-readiness-${params.issueNumber}-${agent}`,
+            runLogPath,
+            introspection: {
+              repo: this.repo,
+              issue: params.task.issue,
+              taskName: params.task.name,
+              step: 4,
+              stepTitle: stage,
+            },
+            ...this.buildWatchdogOptions(params.task, stage),
+            ...this.buildStallOptions(params.task, stage),
+            ...this.buildLoopDetectionOptions(params.task, stage),
+          });
+        },
+      });
+    };
+
+    const productReview = await runReviewAgent("product_review", "product", "pr readiness product review");
+    if (productReview.status !== "pass") {
+      diagnostics.push(`- Review failed: product (${productReview.reason})`);
+      recordReviewGateSkipped({
+        runId: params.runId,
+        gate: "devex_review",
+        reason: "Skipped because product review did not pass",
+      });
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Review passed: product");
+
+    const devexReview = await runReviewAgent("devex_review", "devex", "pr readiness devex review");
+    if (devexReview.status !== "pass") {
+      diagnostics.push(`- Review failed: devex (${devexReview.reason})`);
+      return { ok: false, diagnostics };
+    }
+    diagnostics.push("- Review passed: devex");
+
+    return { ok: true, diagnostics };
+  }
+
   private async tryEnsurePrFromWorktree(params: {
     task: AgentTask;
     issueNumber: string;
@@ -1949,36 +2080,50 @@ export class RepoWorker {
       return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
-    const preflightConfig = getRepoPreflightCommands(this.repo);
     const runId = this.activeRunId;
-    if (runId) {
-      const skipReason =
-        preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
-          ? "preflight disabled (preflightCommand=[])"
-          : preflightConfig.configured
-            ? "preflight configured but empty"
-            : "no preflight configured";
+    if (!runId) {
+      diagnostics.push("- Missing runId; refusing PR creation because deterministic gates cannot be persisted");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
 
-      const preflightResult = await runPreflightGate({
-        runId,
-        worktreePath: candidate.worktreePath,
-        commands: preflightConfig.commands,
-        skipReason,
-      });
+    const preflightConfig = getRepoPreflightCommands(this.repo);
+    const skipReason =
+      preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
+        ? "preflight disabled (preflightCommand=[])"
+        : preflightConfig.configured
+          ? "preflight configured but empty"
+          : "no preflight configured";
 
-      if (preflightResult.status === "fail") {
-        diagnostics.push("- Preflight failed; refusing to create PR");
-        diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
-        return { prUrl: null, diagnostics: diagnostics.join("\n") };
-      }
+    const preflightResult = await runPreflightGate({
+      runId,
+      worktreePath: candidate.worktreePath,
+      commands: preflightConfig.commands,
+      skipReason,
+    });
 
-      if (preflightResult.status === "skipped") {
-        diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
-      } else {
-        diagnostics.push("- Preflight passed");
-      }
-    } else if (preflightConfig.commands.length > 0) {
-      diagnostics.push("- WARNING: missing runId; skipping deterministic preflight gate recording");
+    if (preflightResult.status === "fail") {
+      diagnostics.push("- Preflight failed; refusing to create PR");
+      diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    }
+
+    if (preflightResult.status === "skipped") {
+      diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
+    } else {
+      diagnostics.push("- Preflight passed");
+    }
+
+    const readiness = await this.runPrReadinessChecks({
+      task,
+      issueNumber,
+      worktreePath: candidate.worktreePath,
+      botBranch,
+      runId,
+    });
+    diagnostics.push(...readiness.diagnostics);
+    if (!readiness.ok) {
+      diagnostics.push("- PR readiness failed; refusing to create PR");
+      return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
     try {
@@ -2237,6 +2382,7 @@ export class RepoWorker {
     issueNumber: string;
     botBranch: string;
     reason: string;
+    blockedSource?: string;
     diagnostics?: string;
   }): void {
     const runId = this.activeRunId;
@@ -2260,6 +2406,7 @@ export class RepoWorker {
       const content = [
         "PR evidence gate failed: missing PR URL.",
         `Reason: ${params.reason}`,
+        params.blockedSource ? `Blocked source: ${params.blockedSource}` : null,
         `Issue: ${params.task.issue}`,
         `Worktree: ${worktreePath}`,
         "",
@@ -2475,57 +2622,19 @@ export class RepoWorker {
     return /required status checks are expected/i.test(message);
   }
 
-  private getGhErrorSearchText(error: any): string {
-    const parts: string[] = [];
-    const message = String(error?.message ?? "").trim();
-    const stderr = this.stringifyGhOutput(error?.stderr);
-    const stdout = this.stringifyGhOutput(error?.stdout);
-
-    if (message) parts.push(message);
-    if (stderr) parts.push(stderr);
-    if (stdout) parts.push(stdout);
-
-    return parts.join("\n").trim();
+  private isGhAuthError(error: any): boolean {
+    if (error?.ralphAuthError) return true;
+    const message = this.getGhErrorSearchText(error);
+    if (!message) return false;
+    return /HTTP\s+401|HTTP\s+403|Missing\s+GH_TOKEN|authentication required|unauthorized|forbidden|bad credentials/i.test(message);
   }
 
-  private stringifyGhOutput(value: unknown): string {
-    if (value === null || value === undefined) return "";
-    if (typeof value === "string") return value.trim();
-    if (typeof (value as any)?.toString === "function") {
-      try {
-        return String((value as any).toString()).trim();
-      } catch {
-        return "";
-      }
-    }
-    try {
-      return String(value).trim();
-    } catch {
-      return "";
-    }
+  private getGhErrorSearchText(error: any): string {
+    return buildGhErrorSearchText(error);
   }
 
   private formatGhError(error: any): string {
-    const lines: string[] = [];
-
-    const command = String(error?.ghCommand ?? error?.command ?? "").trim();
-    const redactedCommand = command ? redactSensitiveText(command).trim() : "";
-    if (redactedCommand) lines.push(`Command: ${redactedCommand}`);
-
-    const exitCodeRaw = error?.exitCode ?? error?.code ?? null;
-    const exitCode = exitCodeRaw === null || exitCodeRaw === undefined ? "" : String(exitCodeRaw).trim();
-    if (exitCode) lines.push(`Exit code: ${exitCode}`);
-
-    const message = String(error?.message ?? "").trim();
-    if (message) lines.push(message);
-
-    const stderr = this.stringifyGhOutput(error?.stderr);
-    const stdout = this.stringifyGhOutput(error?.stdout);
-
-    if (stderr) lines.push("", "stderr:", summarizeForNote(stderr, 1600));
-    if (stdout) lines.push("", "stdout:", summarizeForNote(stdout, 1600));
-
-    return lines.join("\n").trim();
+    return formatGhErrorShared(error);
   }
 
   private buildMergeConflictPrompt(prUrl: string, baseRefName: string | null, botBranch: string): string {
@@ -2534,6 +2643,7 @@ export class RepoWorker {
       `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
       `Resolve merge conflicts by merging '${baseName}' into the PR branch (no rebase or force-push).`,
       "The base branch has already been merged into the PR branch in this worktree; finish the merge and resolve conflicts if present.",
+      "Do not use /tmp or any external-directory path; keep temporary files inside this worktree (for example ./.ralph-tmp/).",
       "Do NOT create a new PR.",
       "After resolving conflicts, run tests/typecheck/build/knip and push updates on the PR branch.",
       "",
@@ -4277,6 +4387,7 @@ export class RepoWorker {
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),
       formatGhError: (err) => this.formatGhError(err),
+      isAuthError: (err) => this.isGhAuthError(err as any),
       mergePullRequest: async (url, sha, cwd) => await this.mergePullRequest(url, sha, cwd),
       recordPrSnapshotBestEffort: (input) => this.recordPrSnapshotBestEffort(input as any),
       applyMidpointLabelsBestEffort: async (input) => await this.applyMidpointLabelsBestEffort(input as any),
@@ -5880,23 +5991,14 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const derived = derivePrCreateEscalationReason({
-          continueAttempts,
-          evidence: prCreateEvidence,
-        });
-        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
-        this.recordMissingPrEvidence({
+        return await this.escalateMissingPrWithDerivedReason({
           task,
           issueNumber,
           botBranch,
-          reason: derived.reason,
-          diagnostics: planOutput,
-        });
-        return await this.escalateNoPrAfterRetries({
-          task,
-          reason: derived.reason,
-          details: derived.details,
-          planOutput,
+          continueAttempts,
+          evidence: prCreateEvidence,
+          latestOutput: buildResult.output,
+          prRecoveryDiagnostics,
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
         });
       }
@@ -7153,23 +7255,14 @@ export class RepoWorker {
       }
 
       if (!prUrl) {
-        const derived = derivePrCreateEscalationReason({
-          continueAttempts,
-          evidence: prCreateEvidence,
-        });
-        const planOutput = [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
-        this.recordMissingPrEvidence({
+        return await this.escalateMissingPrWithDerivedReason({
           task,
           issueNumber,
           botBranch,
-          reason: derived.reason,
-          diagnostics: planOutput,
-        });
-        return await this.escalateNoPrAfterRetries({
-          task,
-          reason: derived.reason,
-          details: derived.details,
-          planOutput,
+          continueAttempts,
+          evidence: prCreateEvidence,
+          latestOutput: buildResult.output,
+          prRecoveryDiagnostics,
           sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
         });
       }
