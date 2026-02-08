@@ -156,7 +156,7 @@ describe("GitHubRelationshipProvider coverage", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const provider = makeProvider();
     const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
-    expect(snapshot.coverage.githubDepsComplete).toBe(true);
+    expect(snapshot.coverage.githubDeps).toBe("complete");
   });
 
   test("graphql uses hasNextPage=true to mark deps partial", async () => {
@@ -194,7 +194,7 @@ describe("GitHubRelationshipProvider coverage", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const provider = makeProvider();
     const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
-    expect(snapshot.coverage.githubDepsComplete).toBe(false);
+    expect(snapshot.coverage.githubDeps).toBe("partial");
   });
 
   test("graphql missing pageInfo does not mark complete", async () => {
@@ -232,7 +232,7 @@ describe("GitHubRelationshipProvider coverage", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const provider = makeProvider();
     const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
-    expect(snapshot.coverage.githubDepsComplete).toBe(false);
+    expect(snapshot.coverage.githubDeps).toBe("partial");
   });
 
   test("rest without Link rel=next marks deps complete", async () => {
@@ -262,7 +262,7 @@ describe("GitHubRelationshipProvider coverage", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const provider = makeProvider();
     const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
-    expect(snapshot.coverage.githubDepsComplete).toBe(true);
+    expect(snapshot.coverage.githubDeps).toBe("complete");
   });
 
   test("rest with Link rel=next marks deps partial", async () => {
@@ -295,7 +295,7 @@ describe("GitHubRelationshipProvider coverage", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const provider = makeProvider();
     const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
-    expect(snapshot.coverage.githubDepsComplete).toBe(false);
+    expect(snapshot.coverage.githubDeps).toBe("partial");
   });
 
   test("rest Link without next rel keeps deps complete", async () => {
@@ -328,7 +328,7 @@ describe("GitHubRelationshipProvider coverage", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const provider = makeProvider();
     const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
-    expect(snapshot.coverage.githubDepsComplete).toBe(true);
+    expect(snapshot.coverage.githubDeps).toBe("complete");
   });
 
   test("rest Link parsing is case/whitespace tolerant", async () => {
@@ -361,7 +361,163 @@ describe("GitHubRelationshipProvider coverage", () => {
     globalThis.fetch = fetchMock as unknown as typeof fetch;
     const provider = makeProvider();
     const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
-    expect(snapshot.coverage.githubDepsComplete).toBe(false);
+    expect(snapshot.coverage.githubDeps).toBe("partial");
+  });
+
+  test("marks deps unavailable when REST and GraphQL are unavailable", async () => {
+    const fetchMock: FetchLike = async (input, init) => {
+      const url = String(input);
+      if (url.includes("/issues/1/dependencies")) {
+        return new Response("", { status: 404 });
+      }
+      if (url.includes("/issues/1/sub_issues")) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/issues/1")) {
+        return new Response(JSON.stringify({ body: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/graphql")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        const query = String(body.query ?? "");
+        if (query.includes("blockedBy")) {
+          return new Response(JSON.stringify({ errors: [{ message: "Feature unavailable" }] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify(buildGraphResponse("subIssues", [], false)), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("", { status: 500 });
+    };
+
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const provider = makeProvider();
+    const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
+    expect(snapshot.coverage.githubDeps).toBe("unavailable");
+  });
+
+  test("graphql uses hasNextPage=false to mark sub-issues complete", async () => {
+    const fetchMock: FetchLike = async (input, init) => {
+      const url = String(input);
+      if (url.includes("/issues/1/dependencies")) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/issues/1/sub_issues")) {
+        return new Response("", { status: 404 });
+      }
+      if (url.includes("/issues/1")) {
+        return new Response(JSON.stringify({ body: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/graphql")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        const query = String(body.query ?? "");
+        if (query.includes("subIssues")) {
+          return new Response(JSON.stringify(buildGraphResponse("subIssues", [], false)), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify(buildGraphResponse("blockedBy", [], false)), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("", { status: 500 });
+    };
+
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const provider = makeProvider();
+    const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
+    expect(snapshot.coverage.githubSubIssues).toBe("complete");
+  });
+
+  test("rest with Link rel=next marks sub-issues partial even when first page is empty", async () => {
+    const fetchMock: FetchLike = async (input) => {
+      const url = String(input);
+      if (url.includes("/issues/1/dependencies")) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/issues/1/sub_issues")) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            link: '<https://api.github.com/repos/org/repo/issues/1/sub_issues?page=2>; rel="next"',
+          },
+        });
+      }
+      if (url.includes("/issues/1")) {
+        return new Response(JSON.stringify({ body: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("", { status: 500 });
+    };
+
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const provider = makeProvider();
+    const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
+    expect(snapshot.coverage.githubSubIssues).toBe("partial");
+  });
+
+  test("marks sub-issues unavailable when REST and GraphQL are unavailable", async () => {
+    const fetchMock: FetchLike = async (input, init) => {
+      const url = String(input);
+      if (url.includes("/issues/1/dependencies")) {
+        return new Response(JSON.stringify([]), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/issues/1/sub_issues")) {
+        return new Response("", { status: 404 });
+      }
+      if (url.includes("/issues/1")) {
+        return new Response(JSON.stringify({ body: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/graphql")) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {};
+        const query = String(body.query ?? "");
+        if (query.includes("subIssues")) {
+          return new Response(JSON.stringify({ errors: [{ message: "Feature unavailable" }] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify(buildGraphResponse("blockedBy", [], false)), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response("", { status: 500 });
+    };
+
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const provider = makeProvider();
+    const snapshot = await provider.getSnapshot({ repo: "org/repo", number: 1 });
+    expect(snapshot.coverage.githubSubIssues).toBe("unavailable");
   });
 
   afterEach(() => {
