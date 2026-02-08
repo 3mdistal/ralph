@@ -25,6 +25,12 @@
       "model": "openai/gpt-5.3-codex",
       "prompt": "agent/devex.md",
       "mode": "subagent"
+    },
+    "loop-triage": {
+      "description": "Loop triage router",
+      "model": "openai/gpt-4o-mini",
+      "prompt": "agent/loop-triage.md",
+      "mode": "subagent"
     }
   },
   "command": {
