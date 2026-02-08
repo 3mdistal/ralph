@@ -263,6 +263,7 @@ function buildReviewRepairPrompt(reason: string): string {
     "Your prior review response failed deterministic marker parsing.",
     `Parser error: ${reason}`,
     "Do not call tools.",
+    "Do not change your decision; only fix the marker formatting.",
     "Re-emit your decision as exactly one final line with valid JSON:",
     'RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}',
     "No code fences.",
