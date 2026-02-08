@@ -68,9 +68,33 @@ Note: gate persistence should be stored in `~/.ralph/state.sqlite`. Treat this l
 - `devex_review.status`: `pending|pass|fail|skipped`
 - `ci.status`: `pending|pass|fail|skipped`
 - `ci.url`: string (run URL, when available)
+- `pr_evidence.status`: `pending|pass|fail|skipped`
+- `pr_evidence.pr_url`: string (required for issue-linked implementation success)
+- `pr_evidence.pr_number`: number (required for issue-linked implementation success)
+- `pr_evidence.skip_reason`: string (required when PR evidence is absent and gate fails/skips)
 - `ready_for_pr`: boolean (derived; true only when required gates are satisfied)
 
 Rule of thumb: gates should be derived from observable artifacts (command output, CI checks, explicit review agent output), not "agent says it ran tests".
+
+## Completion gate: PR evidence for issue-linked runs
+
+Default: required for issue-linked implementation success.
+
+Before Ralph records a run as `outcome=success`, it must persist PR evidence for issue-linked implementation runs:
+
+- `pr_evidence.status=pass`
+- `pr_evidence.pr_url` (canonical PR URL)
+- `pr_evidence.pr_number`
+
+Exception:
+
+- `completionKind=verified` (parent verification / no-work-remains paths) may complete successfully without a PR URL.
+
+If PR evidence is missing:
+
+- Ralph must not record success for that run.
+- Ralph routes to deterministic PR recovery first (bounded retries).
+- If retries are exhausted, Ralph records `pr_evidence.status=fail` with a `skip_reason` and actionable diagnostics (worktree/branch + push/create-PR steps), then escalates.
 
 ## Gate State Query Surface
 
