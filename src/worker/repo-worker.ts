@@ -1170,8 +1170,12 @@ export class RepoWorker {
     return updateOpenPrSnapshotImpl({ repo: this.repo }, task, currentPrUrl, nextPrUrl);
   }
 
-  private getIssuePrResolution(issueNumber: string): Promise<ResolvedIssuePr> {
-    return this.prResolver.getIssuePrResolution(issueNumber);
+  private getIssuePrResolution(issueNumber: string, opts: { fresh?: boolean } = {}): Promise<ResolvedIssuePr> {
+    return this.prResolver.getIssuePrResolution(issueNumber, opts);
+  }
+
+  private invalidateIssuePrResolution(issueNumber: string): void {
+    this.prResolver.invalidateIssuePrResolution(issueNumber);
   }
 
   private buildPrCreateLeaseKey(issueNumber: string, botBranch: string): string {
@@ -1228,7 +1232,7 @@ export class RepoWorker {
   }): Promise<ResolvedIssuePr | null> {
     const deadline = Date.now() + Math.max(0, Math.floor(params.maxWaitMs));
     while (Date.now() < deadline) {
-      const resolved = await this.getIssuePrResolution(params.issueNumber);
+      const resolved = await this.getIssuePrResolution(params.issueNumber, { fresh: true });
       if (resolved.selectedUrl) return resolved;
       await this.sleepMs(PR_CREATE_CONFLICT_POLL_MS);
     }
@@ -1985,6 +1989,15 @@ export class RepoWorker {
       "",
     ].join("\n");
 
+    const canonicalBeforeCreate = await this.getIssuePrResolution(issueNumber, { fresh: true });
+    if (canonicalBeforeCreate.diagnostics.length > 0) {
+      diagnostics.push(...canonicalBeforeCreate.diagnostics);
+    }
+    if (canonicalBeforeCreate.selectedUrl) {
+      diagnostics.push(`- Reusing canonical PR before create: ${canonicalBeforeCreate.selectedUrl}`);
+      return { prUrl: canonicalBeforeCreate.selectedUrl, diagnostics: diagnostics.join("\n") };
+    }
+
     const lease = this.tryClaimPrCreateLease({
       task,
       issueNumber,
@@ -2022,6 +2035,7 @@ export class RepoWorker {
         } catch {
           // ignore
         }
+        this.invalidateIssuePrResolution(issueNumber);
         return { prUrl, diagnostics: diagnostics.join("\n") };
       }
     } catch (e: any) {
@@ -2034,6 +2048,7 @@ export class RepoWorker {
       const url = data?.[0]?.url as string | undefined;
       if (url) {
         diagnostics.push(`- Found PR after create attempt: ${url}`);
+        this.invalidateIssuePrResolution(issueNumber);
         return { prUrl: url, diagnostics: diagnostics.join("\n") };
       }
     } catch (e: any) {
