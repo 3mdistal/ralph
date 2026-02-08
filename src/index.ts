@@ -63,6 +63,7 @@ import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessionLockPath } from "./paths";
 import { removeDaemonRecord, writeDaemonRecord } from "./daemon-record";
+import { acquireDaemonStartupLock, type DaemonStartupLock } from "./daemon-lock";
 import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { getRepoLabelSchemeState, initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
@@ -140,6 +141,7 @@ let githubDoneReconciler: { stop: () => void } | null = null;
 let githubLabelReconciler: { stop: () => void } | null = null;
 let githubCmdProcessor: { stop: () => void } | null = null;
 let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
+let daemonStartupLock: DaemonStartupLock | null = null;
 
 const daemonId = `d_${crypto.randomUUID()}`;
 const daemonStartedAt = new Date().toISOString();
@@ -1467,6 +1469,16 @@ async function main(): Promise<void> {
     if (!ensureBwrbVaultLayout(config.bwrbVault)) process.exit(1);
   }
 
+  const lockResult = await acquireDaemonStartupLock({
+    daemonId,
+    startedAt: daemonStartedAt,
+  });
+  if (!lockResult.ok) {
+    console.error(`[ralph] ${lockResult.message}`);
+    process.exit(lockResult.exitCode);
+  }
+  daemonStartupLock = lockResult.lock;
+
   try {
     writeDaemonRecord({
       version: 1,
@@ -2038,6 +2050,13 @@ async function main(): Promise<void> {
       // ignore
     }
 
+    try {
+      daemonStartupLock?.release();
+      daemonStartupLock = null;
+    } catch {
+      // ignore
+    }
+
     console.log("[ralph] Goodbye!");
     process.exit(0);
   };
@@ -2079,7 +2098,7 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Control file: set version=1 and mode=running|draining|paused in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
+      "  Control file: set version=1 and mode=running|draining|paused in ~/.local/state/ralph/control.json (fallback /tmp/ralph/<uid>/control.json when HOME is unavailable).",
       "  OpenCode profile: set [opencode].defaultProfile in ~/.ralph/config.toml (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")
@@ -2923,6 +2942,12 @@ if (args[0] === "sandbox") {
 
 // Default: run daemon
 main().catch((e) => {
+  try {
+    daemonStartupLock?.release();
+    daemonStartupLock = null;
+  } catch {
+    // ignore
+  }
   console.error("[ralph] Fatal error:", e);
   process.exit(1);
 });

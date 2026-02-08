@@ -1,6 +1,9 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
-import { homedir } from "os";
-import { dirname, join } from "path";
+import { dirname } from "path";
+import {
+  resolveDaemonRecordPath as resolveCanonicalDaemonRecordPath,
+  resolveDaemonRecordPathCandidates,
+} from "./control-plane-paths";
 
 export type DaemonRecord = {
   version: 1;
@@ -15,40 +18,8 @@ export type DaemonRecord = {
 
 const DAEMON_RECORD_VERSION = 1;
 
-function resolveHomeDirFallback(): string | undefined {
-  const homeEnv = process.env.HOME?.trim();
-  if (homeEnv) return homeEnv;
-  try {
-    return homedir();
-  } catch {
-    return undefined;
-  }
-}
-
-function resolveTmpStateDir(): string {
-  const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
-  return join("/tmp", "ralph", String(uid));
-}
-
-function resolveStateDir(opts?: { homeDir?: string; xdgStateHome?: string }): string {
-  const trimmedStateHome = opts?.xdgStateHome?.trim() ?? process.env.XDG_STATE_HOME?.trim();
-  if (trimmedStateHome) return join(trimmedStateHome, "ralph");
-
-  const resolvedHome = opts?.homeDir?.trim() ?? resolveHomeDirFallback();
-  if (resolvedHome) return join(resolvedHome, ".local", "state", "ralph");
-
-  return resolveTmpStateDir();
-}
-
 export function resolveDaemonRecordPath(opts?: { homeDir?: string; xdgStateHome?: string }): string {
-  return join(resolveStateDir(opts), "daemon.json");
-}
-
-function resolveDaemonRecordPathCandidates(opts?: { homeDir?: string; xdgStateHome?: string }): string[] {
-  const primary = resolveDaemonRecordPath(opts);
-  const homeFallback = resolveDaemonRecordPath({ homeDir: opts?.homeDir, xdgStateHome: "" });
-  const tmpFallback = join(resolveTmpStateDir(), "daemon.json");
-  return Array.from(new Set([primary, homeFallback, tmpFallback]));
+  return resolveCanonicalDaemonRecordPath({ homeDir: opts?.homeDir });
 }
 
 function isPidAlive(pid: number): boolean {

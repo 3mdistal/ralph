@@ -548,9 +548,8 @@ Ralph supports an operator-controlled "draining" mode that stops scheduling/dequ
 
 Control file:
 
-- `$XDG_STATE_HOME/ralph/control.json`
-- Fallback: `~/.local/state/ralph/control.json`
-- Last resort: `/tmp/ralph/<uid>/control.json`
+- `~/.local/state/ralph/control.json` (canonical control root)
+- Fallback: `/tmp/ralph/<uid>/control.json` when HOME is unavailable
 
 Ralph auto-creates the control file on startup with `{ "mode": "running" }` unless disabled via config.
 
@@ -582,9 +581,8 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 
 Daemon discovery for restart/upgrade uses a lease record at:
 
-- `$XDG_STATE_HOME/ralph/daemon.json`
-- Fallback: `~/.local/state/ralph/daemon.json`
-- Last resort: `/tmp/ralph/<uid>/daemon.json`
+- `~/.local/state/ralph/daemon.json` (canonical control root)
+- Fallback: `/tmp/ralph/<uid>/daemon.json` when HOME is unavailable
 
 The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
 

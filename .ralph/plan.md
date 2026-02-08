@@ -1,80 +1,43 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: #606 Startup safety (singleton daemon lock)
 
-## Goal
-
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
-
-## Assumptions
-
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+Assumptions
+- Runtime is Bun/Node on Linux in daemon mode; implement best-effort identity checks on Linux via `/proc`.
+- Canonical control root is HOME-based XDG default `~/.local/state/ralph` (profile-agnostic), per issue guidance.
 
 ## Checklist
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+- [x] Introduce a single control-plane paths module (no duplicated path logic):
+  - [x] `resolveCanonicalControlRoot()` -> HOME-based `~/.local/state/ralph` (fallback `/tmp/ralph/<uid>` only when HOME unavailable).
+  - [x] Typed accessors: `control.json`, `daemon.json`, `daemon.lock.d` under canonical root.
+- [x] Update control-plane artifacts to be profile-agnostic (writers use canonical root):
+  - [x] `control.json` read/write uses canonical root.
+  - [x] `daemon.json` write uses canonical root.
+  - [x] `ralphctl`/status/drain/control-file helpers discover daemon via canonical root.
+  - [x] Transitional discovery window: readers also probe legacy locations (prior `XDG_STATE_HOME/ralph/*` + `/tmp/ralph/<uid>/*`) to find pre-upgrade daemons.
+  - [x] Update user-facing help text/README notes that still advertise per-profile `XDG_STATE_HOME` fallbacks for control-plane files.
 
-## Steps
+- [x] Implement singleton daemon startup lock under canonical root:
+  - [x] Lock location: `~/.local/state/ralph/daemon.lock.d/` with `owner.json`.
+  - [x] Acquisition: atomic `mkdir` (exclusive); on `EEXIST`, load `owner.json` and run health check.
+  - [x] Health check (PID-only insufficient):
+    - [x] `kill(pid, 0)` liveness check.
+    - [x] Best-effort identity check: on Linux, record and compare `/proc/<pid>/stat` start-time identity (ticks). Do not rely on wall-clock-only `startedAt`.
+    - [x] Parser hardening: handle `/proc/<pid>/stat` names with spaces/parentheses.
+    - [x] Optional sanity-check: `/proc/<pid>/cmdline` contains `ralph` (never used to auto-delete; at most upgrades to "unknown/healthy").
+  - [x] Stale recovery: auto-remove lock only when health check definitively fails (PID dead or start identity mismatch).
+  - [x] Ambiguous identity: if PID alive but identity cannot be verified, treat as healthy/unknown; refuse to start and do not delete lock.
+  - [x] Handle startup race: if lock dir exists but `owner.json` is missing/partial, retry with small bounded backoff before classifying as ambiguous.
+  - [x] UX: stable non-zero exit for “already running” (use `2`), single-paragraph message including `pid`, `startedAt`, lock path, and suggesting `ralphctl status` / `ralphctl drain`.
+  - [x] Release: remove lock on graceful shutdown, and also via `finally` on any startup failure after acquisition.
 
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
+- [x] Wire lock into daemon startup early (before writing control records / starting workers); ensure failure exits quickly and cleanly.
 
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
+- [x] Tests (Bun):
+  - [x] Second daemon blocked when first is healthy (lock held + identity verified).
+  - [x] Stale lock removed and startup proceeds when PID dead.
+  - [x] Stale lock removed and startup proceeds when PID alive but start identity mismatch.
+  - [x] Ambiguous liveness refuses start and preserves existing lock.
+  - [x] Race: lock dir exists but `owner.json` not yet written -> bounded retry then proceed/refuse deterministically.
+  - [x] Regression tests for canonical control root behavior (profile flips do not affect control-plane paths).
 
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
-
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
-
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
-
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
-
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
-
-- [x] Run verification gates
-  - [x] `bun test`
-  - [x] `bun run typecheck`
+- [x] Run local preflight: `bun test`.
