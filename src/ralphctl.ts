@@ -468,10 +468,6 @@ async function run(): Promise<void> {
       console.log(
         `Daemon: id=${snapshot.daemon.daemonId ?? "unknown"} pid=${snapshot.daemon.pid ?? "unknown"}`
       );
-    } else if (snapshot.daemonDiscovery?.state === "stale") {
-      console.log("Daemon: stale record(s) detected (no live PID)");
-    } else if (snapshot.daemonDiscovery?.state === "conflict") {
-      console.log("Daemon: conflicting live records detected");
     } else {
       console.log("Daemon: not running");
     }
