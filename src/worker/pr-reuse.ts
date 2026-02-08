@@ -14,7 +14,7 @@ type IssuePrResolutionCacheEntry = {
   promise: Promise<ResolvedIssuePr>;
 };
 
-export const DEFAULT_ISSUE_PR_RESOLUTION_CACHE_TTL_MS = 30_000;
+const DEFAULT_ISSUE_PR_RESOLUTION_CACHE_TTL_MS = 30_000;
 
 export function createIssuePrResolver(params: {
   repo: string;
