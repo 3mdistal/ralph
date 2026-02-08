@@ -110,7 +110,7 @@ describe("GitHub queue listTasksByStatus", () => {
         getSnapshot: async (issue) => ({
           issue,
           signals: [],
-          coverage: { githubDepsComplete: true, githubSubIssuesComplete: true, bodyDeps: false },
+          coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: false },
         }),
       }),
       io: {

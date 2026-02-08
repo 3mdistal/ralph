@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { spawn } from "child_process";
-import { readDaemonRecord, resolveDaemonRecordPath, type DaemonRecord } from "./daemon-record";
+import { readDaemonRecord, resolveDaemonRecordPathCandidates, type DaemonRecord } from "./daemon-record";
 import { updateControlFile } from "./control-file";
 import { getStatusSnapshot } from "./commands/status";
 import type { StatusSnapshot } from "./status-snapshot";
@@ -324,8 +324,8 @@ async function restartFlow(opts: {
 
   const daemonRecord = readDaemonRecord();
   if (!daemonRecord) {
-    const recordPath = resolveDaemonRecordPath();
-    throw new Error(`Daemon record not found at ${recordPath}`);
+    const candidates = resolveDaemonRecordPathCandidates();
+    throw new Error(`Daemon record not found (checked: ${candidates.join(", ")})`);
   }
 
   await stopDaemon(daemonRecord, opts.force);
