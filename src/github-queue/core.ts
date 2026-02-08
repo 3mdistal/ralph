@@ -13,12 +13,14 @@ import {
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
+const BLOCKED_PUBLIC_STATUS_LABEL = RALPH_LABEL_STATUS_IN_PROGRESS;
+
 const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   queued: RALPH_LABEL_STATUS_QUEUED,
   "in-progress": RALPH_LABEL_STATUS_IN_PROGRESS,
   "waiting-on-pr": RALPH_LABEL_STATUS_IN_PROGRESS,
   paused: RALPH_LABEL_STATUS_PAUSED,
-  blocked: RALPH_LABEL_STATUS_IN_PROGRESS,
+  blocked: BLOCKED_PUBLIC_STATUS_LABEL,
   escalated: RALPH_LABEL_STATUS_ESCALATED,
   done: RALPH_LABEL_STATUS_DONE,
   starting: RALPH_LABEL_STATUS_IN_PROGRESS,
