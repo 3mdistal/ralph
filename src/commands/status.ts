@@ -17,6 +17,7 @@ import { parseIssueRef } from "../github/issue-ref";
 import { formatDuration } from "../logging";
 import { isHeartbeatStale, parseHeartbeatMs } from "../ownership";
 import { auditQueueParityForRepo } from "../github/queue-parity-audit";
+import { deriveDaemonLiveness, formatDaemonLivenessLine } from "../daemon-liveness";
 import {
   formatActiveOpencodeProfileLine,
   formatBlockedIdleSuffix,
@@ -55,6 +56,173 @@ function buildQueueParitySnapshot(repos: string[]) {
   };
 }
 
+function computeDesiredMode(params: { gateReason: string; throttleState: string }): string {
+  return params.gateReason === "hard-throttled"
+    ? "hard-throttled"
+    : params.gateReason === "paused"
+      ? "paused"
+      : params.gateReason === "draining"
+        ? "draining"
+        : params.throttleState === "soft"
+          ? "soft-throttled"
+          : "running";
+}
+
+type StatusBaseData = {
+  config: ReturnType<typeof getConfig>;
+  depSatisfaction: NonNullable<StatusSnapshot["dependencySatisfactionOverrides"]>;
+  queueState: ReturnType<typeof getQueueBackendStateWithLabelHealth>;
+  parity: ReturnType<typeof buildQueueParitySnapshot>;
+  daemon: StatusSnapshot["daemon"];
+  desiredMode: string;
+  mode: string;
+  daemonLiveness: NonNullable<StatusSnapshot["daemonLiveness"]>;
+  controlProfile: string;
+  requestedProfile: string | null;
+  selection: Awaited<ReturnType<typeof resolveOpencodeProfileForNewWork>>;
+  resolvedProfile: string | null;
+  throttle: Awaited<ReturnType<typeof resolveOpencodeProfileForNewWork>>["decision"];
+  starting: Awaited<ReturnType<typeof getTasksByStatus>>;
+  inProgress: Awaited<ReturnType<typeof getTasksByStatus>>;
+  queued: Awaited<ReturnType<typeof getQueuedTasks>>;
+  throttled: Awaited<ReturnType<typeof getTasksByStatus>>;
+  blockedSorted: Awaited<ReturnType<typeof getTasksByStatus>>;
+  pendingEscalations: Awaited<ReturnType<typeof getEscalationsByStatus>>;
+  triageRuns: ReturnType<typeof listTopRalphRunTriages>;
+  getAlertSummary: (task: { repo: string; issue: string }) =>
+    | {
+        totalCount: number;
+        latestSummary: string | null;
+        latestAt: string | null;
+        latestCommentUrl: string | null;
+      }
+    | null;
+  control: ReturnType<typeof readControlStateSnapshot>;
+};
+
+async function collectBaseStatusData(opts?: { disableGitHubQueueSweeps?: boolean }): Promise<StatusBaseData> {
+  const config = getConfig();
+  const depSatisfaction = listDependencySatisfactionOverrides({ limit: 50 }).map((row) => ({
+    repo: row.repo,
+    issueNumber: row.issueNumber,
+    createdAt: row.createdAt,
+    satisfiedAt: row.satisfiedAt,
+    via: row.via,
+  }));
+  const queueState = getQueueBackendStateWithLabelHealth();
+  const parity = buildQueueParitySnapshot(config.repos.map((repo) => repo.name));
+
+  const daemonRecord = readDaemonRecord();
+  const daemon = daemonRecord
+    ? {
+        daemonId: daemonRecord.daemonId ?? null,
+        pid: typeof daemonRecord.pid === "number" ? daemonRecord.pid : null,
+        startedAt: daemonRecord.startedAt ?? null,
+        version: daemonRecord.ralphVersion ?? null,
+        controlFilePath: daemonRecord.controlFilePath ?? null,
+        command: Array.isArray(daemonRecord.command) ? daemonRecord.command : null,
+      }
+    : null;
+
+  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
+  const controlProfile = "";
+  const requestedProfile = getRequestedOpencodeProfileName(null);
+
+  const now = Date.now();
+  const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
+  const resolvedProfile: string | null = selection.profileName;
+  const throttle = selection.decision;
+  const gate = computeDaemonGate({ mode: control.mode as DaemonMode, throttle, isShuttingDown: false });
+
+  const desiredMode = computeDesiredMode({ gateReason: gate.reason, throttleState: throttle.state });
+  const liveness = deriveDaemonLiveness({ desiredMode, daemonRecord });
+
+  const fetchTasks = async () =>
+    await Promise.all([
+      getTasksByStatus("starting"),
+      getTasksByStatus("in-progress"),
+      getQueuedTasks(),
+      getTasksByStatus("throttled"),
+      getTasksByStatus("blocked"),
+      getEscalationsByStatus("pending"),
+    ]);
+
+  const [starting, inProgress, queued, throttled, blocked, pendingEscalations] = opts?.disableGitHubQueueSweeps
+    ? await withEnv(DISABLE_GITHUB_QUEUE_SWEEPS_ENV, "1", fetchTasks)
+    : await fetchTasks();
+
+  const blockedSorted = [...blocked].sort((a, b) => {
+    const priorityDelta = priorityRank(a.priority) - priorityRank(b.priority);
+    if (priorityDelta !== 0) return priorityDelta;
+    const aTime = Date.parse(a["blocked-at"]?.trim() ?? "");
+    const bTime = Date.parse(b["blocked-at"]?.trim() ?? "");
+    if (Number.isFinite(aTime) && Number.isFinite(bTime)) return bTime - aTime;
+    if (Number.isFinite(aTime)) return -1;
+    if (Number.isFinite(bTime)) return 1;
+    const repoCompare = a.repo.localeCompare(b.repo);
+    if (repoCompare !== 0) return repoCompare;
+    return a.issue.localeCompare(b.issue);
+  });
+
+  const tasksForAlerts = [...starting, ...inProgress, ...queued, ...throttled, ...blocked];
+  const issuesByRepo = new Map<string, Set<number>>();
+  for (const task of tasksForAlerts) {
+    const ref = parseIssueRef(task.issue, task.repo);
+    if (!ref) continue;
+    const set = issuesByRepo.get(ref.repo) ?? new Set<number>();
+    set.add(ref.number);
+    issuesByRepo.set(ref.repo, set);
+  }
+
+  const alertSummaryByKey = new Map<string, ReturnType<typeof listIssueAlertSummaries>[number]>();
+  for (const [repo, numbers] of issuesByRepo.entries()) {
+    const summaries = listIssueAlertSummaries({ repo, issueNumbers: [...numbers] });
+    for (const summary of summaries) {
+      alertSummaryByKey.set(`${summary.repo}#${summary.issueNumber}`, summary);
+    }
+  }
+
+  const getAlertSummary = (task: { repo: string; issue: string }) => {
+    const ref = parseIssueRef(task.issue, task.repo);
+    if (!ref) return null;
+    const summary = alertSummaryByKey.get(`${ref.repo}#${ref.number}`);
+    if (!summary || summary.totalCount <= 0) return null;
+    return {
+      totalCount: summary.totalCount,
+      latestSummary: summary.latestSummary ?? null,
+      latestAt: summary.latestAt ?? null,
+      latestCommentUrl: summary.latestCommentUrl ?? null,
+    };
+  };
+
+  const triageRuns = listTopRalphRunTriages({ limit: 5, sinceDays: 14 });
+
+  return {
+    config,
+    depSatisfaction,
+    queueState,
+    parity,
+    daemon,
+    desiredMode: liveness.desiredMode,
+    mode: liveness.effectiveMode,
+    daemonLiveness: liveness.daemonLiveness,
+    controlProfile,
+    requestedProfile,
+    selection,
+    resolvedProfile,
+    throttle,
+    starting,
+    inProgress,
+    queued,
+    throttled,
+    blockedSorted,
+    pendingEscalations,
+    triageRuns,
+    getAlertSummary,
+    control,
+  };
+}
+
 export type StatusDrainState = {
   requestedAt: number | null;
   timeoutMs: number | null;
@@ -78,113 +246,11 @@ export async function collectStatusSnapshot(opts: { drain: StatusDrainState; ini
 }
 
 export async function getStatusSnapshot(): Promise<StatusSnapshot> {
-  const config = getConfig();
-
   initStateDb();
-  const depSatisfaction = listDependencySatisfactionOverrides({ limit: 50 }).map((row) => ({
-    repo: row.repo,
-    issueNumber: row.issueNumber,
-    createdAt: row.createdAt,
-    satisfiedAt: row.satisfiedAt,
-    via: row.via,
-  }));
-  const queueState = getQueueBackendStateWithLabelHealth();
-  const parity = buildQueueParitySnapshot(config.repos.map((repo) => repo.name));
-
-  const daemonRecord = readDaemonRecord();
-  const daemon = daemonRecord
-    ? {
-        daemonId: daemonRecord.daemonId ?? null,
-        pid: typeof daemonRecord.pid === "number" ? daemonRecord.pid : null,
-        startedAt: daemonRecord.startedAt ?? null,
-        version: daemonRecord.ralphVersion ?? null,
-        controlFilePath: daemonRecord.controlFilePath ?? null,
-        command: Array.isArray(daemonRecord.command) ? daemonRecord.command : null,
-      }
-    : null;
-
-  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
-  const controlProfile = "";
-  const requestedProfile = getRequestedOpencodeProfileName(null);
-
-  const now = Date.now();
-  const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
-  const resolvedProfile: string | null = selection.profileName;
-  const throttle = selection.decision;
-  const gate = computeDaemonGate({ mode: control.mode as DaemonMode, throttle, isShuttingDown: false });
-
-  const mode = gate.reason === "hard-throttled"
-    ? "hard-throttled"
-    : gate.reason === "paused"
-      ? "paused"
-      : gate.reason === "draining"
-        ? "draining"
-        : throttle.state === "soft"
-          ? "soft-throttled"
-          : "running";
-
-  const [starting, inProgress, queued, throttled, blocked, pendingEscalations] = await withEnv(
-    DISABLE_GITHUB_QUEUE_SWEEPS_ENV,
-    "1",
-    async () =>
-      await Promise.all([
-        getTasksByStatus("starting"),
-        getTasksByStatus("in-progress"),
-        getQueuedTasks(),
-        getTasksByStatus("throttled"),
-        getTasksByStatus("blocked"),
-        getEscalationsByStatus("pending"),
-      ])
-  );
-
-  const blockedSorted = [...blocked].sort((a, b) => {
-    const priorityDelta = priorityRank(a.priority) - priorityRank(b.priority);
-    if (priorityDelta !== 0) return priorityDelta;
-    const aTime = Date.parse(a["blocked-at"]?.trim() ?? "");
-    const bTime = Date.parse(b["blocked-at"]?.trim() ?? "");
-    if (Number.isFinite(aTime) && Number.isFinite(bTime)) return bTime - aTime;
-    if (Number.isFinite(aTime)) return -1;
-    if (Number.isFinite(bTime)) return 1;
-    const repoCompare = a.repo.localeCompare(b.repo);
-    if (repoCompare !== 0) return repoCompare;
-    return a.issue.localeCompare(b.issue);
-  });
-
-  const tasksForAlerts = [...starting, ...inProgress, ...queued, ...throttled, ...blocked];
-  const issuesByRepo = new Map<string, Set<number>>();
-  for (const task of tasksForAlerts) {
-    const ref = parseIssueRef(task.issue, task.repo);
-    if (!ref) continue;
-    const set = issuesByRepo.get(ref.repo) ?? new Set<number>();
-    set.add(ref.number);
-    issuesByRepo.set(ref.repo, set);
-  }
-
-  const alertSummaryByKey = new Map<string, ReturnType<typeof listIssueAlertSummaries>[number]>();
-  for (const [repo, numbers] of issuesByRepo.entries()) {
-    const summaries = listIssueAlertSummaries({ repo, issueNumbers: [...numbers] });
-    for (const summary of summaries) {
-      alertSummaryByKey.set(`${summary.repo}#${summary.issueNumber}`, summary);
-    }
-  }
-
-  const getAlertSummary = (task: { repo: string; issue: string }) => {
-    const ref = parseIssueRef(task.issue, task.repo);
-    if (!ref) return null;
-    const summary = alertSummaryByKey.get(`${ref.repo}#${ref.number}`);
-    if (!summary || summary.totalCount <= 0) return null;
-    return {
-      totalCount: summary.totalCount,
-      latestSummary: summary.latestSummary ?? null,
-      latestAt: summary.latestAt ?? null,
-      latestCommentUrl: summary.latestCommentUrl ?? null,
-    };
-  };
-
-  const triageRuns = listTopRalphRunTriages({ limit: 5, sinceDays: 14 });
+  const base = await collectBaseStatusData({ disableGitHubQueueSweeps: true });
 
   const inProgressWithStatus = await Promise.all(
-    inProgress.map(async (task) => {
+    base.inProgress.map(async (task) => {
       const sessionId = task["session-id"]?.trim() || null;
       const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
       return {
@@ -196,26 +262,28 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
         sessionId,
         nowDoing,
         line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
-        alerts: getAlertSummary(task),
+        alerts: base.getAlertSummary(task),
       };
     })
   );
 
   return buildStatusSnapshot({
-    mode,
+    mode: base.mode,
+    desiredMode: base.desiredMode,
     queue: {
-      backend: queueState.backend,
-      health: queueState.health,
-      fallback: queueState.fallback,
-      diagnostics: queueState.diagnostics ?? null,
+      backend: base.queueState.backend,
+      health: base.queueState.health,
+      fallback: base.queueState.fallback,
+      diagnostics: base.queueState.diagnostics ?? null,
     },
-    parity,
-    daemon,
-    controlProfile: controlProfile || null,
-    activeProfile: resolvedProfile ?? null,
-    throttle: throttle.snapshot,
-    dependencySatisfactionOverrides: depSatisfaction,
-    triageRuns: triageRuns.map((r) => ({
+    parity: base.parity,
+    daemon: base.daemon,
+    daemonLiveness: base.daemonLiveness,
+    controlProfile: base.controlProfile || null,
+    activeProfile: base.resolvedProfile ?? null,
+    throttle: base.throttle.snapshot,
+    dependencySatisfactionOverrides: base.depSatisfaction,
+    triageRuns: base.triageRuns.map((r) => ({
       runId: r.runId,
       repo: r.repo,
       issueNumber: r.issueNumber,
@@ -228,32 +296,32 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
       computedAt: r.computedAt,
     })),
     escalations: {
-      pending: pendingEscalations.length,
+      pending: base.pendingEscalations.length,
     },
     inProgress: inProgressWithStatus,
-    starting: starting.map((t) => ({
+    starting: base.starting.map((t) => ({
       name: t.name,
       repo: t.repo,
       issue: t.issue,
       priority: t.priority ?? "p2-medium",
       opencodeProfile: getTaskOpencodeProfileName(t),
-      alerts: getAlertSummary(t),
+      alerts: base.getAlertSummary(t),
     })),
     drain: {
       requestedAt: null,
-      timeoutMs: control.drainTimeoutMs ?? null,
-      pauseRequested: control.pauseRequested === true,
-      pauseAtCheckpoint: control.pauseAtCheckpoint ?? null,
+      timeoutMs: base.control.drainTimeoutMs ?? null,
+      pauseRequested: base.control.pauseRequested === true,
+      pauseAtCheckpoint: base.control.pauseAtCheckpoint ?? null,
     },
-    queued: queued.map((t) => ({
+    queued: base.queued.map((t) => ({
       name: t.name,
       repo: t.repo,
       issue: t.issue,
       priority: t.priority ?? "p2-medium",
       opencodeProfile: getTaskOpencodeProfileName(t),
-      alerts: getAlertSummary(t),
+      alerts: base.getAlertSummary(t),
     })),
-    throttled: throttled.map((t) => ({
+    throttled: base.throttled.map((t) => ({
       name: t.name,
       repo: t.repo,
       issue: t.issue,
@@ -261,9 +329,9 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
       opencodeProfile: getTaskOpencodeProfileName(t),
       sessionId: t["session-id"]?.trim() || null,
       resumeAt: t["resume-at"]?.trim() || null,
-      alerts: getAlertSummary(t),
+      alerts: base.getAlertSummary(t),
     })),
-    blocked: blockedSorted.map((t) => {
+    blocked: base.blockedSorted.map((t) => {
       const details = t["blocked-details"]?.trim() ?? "";
       return {
         name: t.name,
@@ -276,7 +344,7 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
         blockedSource: t["blocked-source"]?.trim() || null,
         blockedReason: t["blocked-reason"]?.trim() || null,
         blockedDetailsSnippet: details ? summarizeBlockedDetailsSnippet(details) : null,
-        alerts: getAlertSummary(t),
+        alerts: base.getAlertSummary(t),
       };
     }),
   });
@@ -285,134 +353,36 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
 export async function runStatusCommand(opts: { args: string[]; drain: StatusDrainState }): Promise<void> {
   const json = opts.args.includes("--json");
 
-  const config = getConfig();
-
   // Status reads from the durable SQLite state DB (GitHub issue snapshots, task op
   // state, idempotency). The daemon initializes this during startup, but CLI
   // subcommands need to do it explicitly.
   initStateDb();
-  const depSatisfaction = listDependencySatisfactionOverrides({ limit: 50 }).map((row) => ({
-    repo: row.repo,
-    issueNumber: row.issueNumber,
-    createdAt: row.createdAt,
-    satisfiedAt: row.satisfiedAt,
-    via: row.via,
-  }));
-
-  const queueState = getQueueBackendStateWithLabelHealth();
-  const parity = buildQueueParitySnapshot(config.repos.map((repo) => repo.name));
-
-  const daemonRecord = readDaemonRecord();
-  const daemon = daemonRecord
-    ? {
-        daemonId: daemonRecord.daemonId ?? null,
-        pid: typeof daemonRecord.pid === "number" ? daemonRecord.pid : null,
-        startedAt: daemonRecord.startedAt ?? null,
-        version: daemonRecord.ralphVersion ?? null,
-        controlFilePath: daemonRecord.controlFilePath ?? null,
-        command: Array.isArray(daemonRecord.command) ? daemonRecord.command : null,
-      }
-    : null;
-
-  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
-  const controlProfile = "";
-  const requestedProfile = getRequestedOpencodeProfileName(null);
-
-  const now = Date.now();
-  const selection = await resolveOpencodeProfileForNewWork(now, requestedProfile);
-  const resolvedProfile: string | null = selection.profileName;
-  const throttle = selection.decision;
-  const gate = computeDaemonGate({ mode: control.mode as DaemonMode, throttle, isShuttingDown: false });
-
-  const mode = gate.reason === "hard-throttled"
-    ? "hard-throttled"
-    : gate.reason === "paused"
-      ? "paused"
-      : gate.reason === "draining"
-        ? "draining"
-        : throttle.state === "soft"
-          ? "soft-throttled"
-          : "running";
-
-  const [starting, inProgress, queued, throttled, blocked, pendingEscalations] = await Promise.all([
-    getTasksByStatus("starting"),
-    getTasksByStatus("in-progress"),
-    getQueuedTasks(),
-    getTasksByStatus("throttled"),
-    getTasksByStatus("blocked"),
-    getEscalationsByStatus("pending"),
-  ]);
-
-  const blockedSorted = [...blocked].sort((a, b) => {
-    const priorityDelta = priorityRank(a.priority) - priorityRank(b.priority);
-    if (priorityDelta !== 0) return priorityDelta;
-    const aTime = Date.parse(a["blocked-at"]?.trim() ?? "");
-    const bTime = Date.parse(b["blocked-at"]?.trim() ?? "");
-    if (Number.isFinite(aTime) && Number.isFinite(bTime)) return bTime - aTime;
-    if (Number.isFinite(aTime)) return -1;
-    if (Number.isFinite(bTime)) return 1;
-    const repoCompare = a.repo.localeCompare(b.repo);
-    if (repoCompare !== 0) return repoCompare;
-    return a.issue.localeCompare(b.issue);
-  });
-
-  const tasksForAlerts = [...starting, ...inProgress, ...queued, ...throttled, ...blocked];
-  const issuesByRepo = new Map<string, Set<number>>();
-  for (const task of tasksForAlerts) {
-    const ref = parseIssueRef(task.issue, task.repo);
-    if (!ref) continue;
-    const set = issuesByRepo.get(ref.repo) ?? new Set<number>();
-    set.add(ref.number);
-    issuesByRepo.set(ref.repo, set);
-  }
-
-  const alertSummaryByKey = new Map<string, ReturnType<typeof listIssueAlertSummaries>[number]>();
-  for (const [repo, numbers] of issuesByRepo.entries()) {
-    const summaries = listIssueAlertSummaries({ repo, issueNumbers: [...numbers] });
-    for (const summary of summaries) {
-      alertSummaryByKey.set(`${summary.repo}#${summary.issueNumber}`, summary);
-    }
-  }
-
-  const getAlertSummary = (task: { repo: string; issue: string }) => {
-    const ref = parseIssueRef(task.issue, task.repo);
-    if (!ref) return null;
-    const summary = alertSummaryByKey.get(`${ref.repo}#${ref.number}`);
-    if (!summary || summary.totalCount <= 0) return null;
-    return {
-      totalCount: summary.totalCount,
-      latestSummary: summary.latestSummary ?? null,
-      latestAt: summary.latestAt ?? null,
-      latestCommentUrl: summary.latestCommentUrl ?? null,
-    };
-  };
+  const base = await collectBaseStatusData();
 
   const profileNames = isOpencodeProfilesEnabled() ? listOpencodeProfileNames() : [];
   const usageRows = await collectStatusUsageRows({
     profiles: profileNames,
-    activeProfile: resolvedProfile,
-    activeDecision: throttle,
-    decide: (profileKey) => getThrottleDecision(now, { opencodeProfile: profileKey }),
+    activeProfile: base.resolvedProfile,
+    activeDecision: base.throttle,
+    decide: (profileKey) => getThrottleDecision(Date.now(), { opencodeProfile: profileKey }),
     concurrency: STATUS_USAGE_CONCURRENCY,
     timeoutMs: STATUS_USAGE_TIMEOUT_MS,
   });
 
-  const triageRuns = listTopRalphRunTriages({ limit: 5, sinceDays: 14 });
-
-    if (json) {
-      const inProgressWithStatus = await Promise.all(
-        inProgress.map(async (task) => {
+  if (json) {
+    const inProgressWithStatus = await Promise.all(
+      base.inProgress.map(async (task) => {
         const sessionId = task["session-id"]?.trim() || null;
         const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
         const opencodeProfile = getTaskOpencodeProfileName(task);
-          const tokens = await readRunTokenTotals({
-            repo: task.repo,
-            issue: task.issue,
-            opencodeProfile,
-            timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
-            concurrency: STATUS_TOKEN_CONCURRENCY,
-            budgetMs: STATUS_TOKEN_BUDGET_MS,
-          });
+        const tokens = await readRunTokenTotals({
+          repo: task.repo,
+          issue: task.issue,
+          opencodeProfile,
+          timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
+          concurrency: STATUS_TOKEN_CONCURRENCY,
+          budgetMs: STATUS_TOKEN_BUDGET_MS,
+        });
         return {
           name: task.name,
           repo: task.repo,
@@ -424,27 +394,29 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
           line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
           tokensTotal: tokens.tokensTotal,
           tokensComplete: tokens.tokensComplete,
-          alerts: getAlertSummary(task),
+          alerts: base.getAlertSummary(task),
         };
       })
     );
 
     const snapshot = buildStatusSnapshot({
-      mode,
+      mode: base.mode,
+      desiredMode: base.desiredMode,
       queue: {
-        backend: queueState.backend,
-        health: queueState.health,
-        fallback: queueState.fallback,
-        diagnostics: queueState.diagnostics ?? null,
+        backend: base.queueState.backend,
+        health: base.queueState.health,
+        fallback: base.queueState.fallback,
+        diagnostics: base.queueState.diagnostics ?? null,
       },
-      parity,
-      daemon,
-      controlProfile: controlProfile || null,
-      activeProfile: resolvedProfile ?? null,
-      throttle: throttle.snapshot,
+      parity: base.parity,
+      daemon: base.daemon,
+      daemonLiveness: base.daemonLiveness,
+      controlProfile: base.controlProfile || null,
+      activeProfile: base.resolvedProfile ?? null,
+      throttle: base.throttle.snapshot,
       usage: { profiles: usageRows },
-      dependencySatisfactionOverrides: depSatisfaction,
-      triageRuns: triageRuns.map((r) => ({
+      dependencySatisfactionOverrides: base.depSatisfaction,
+      triageRuns: base.triageRuns.map((r) => ({
         runId: r.runId,
         repo: r.repo,
         issueNumber: r.issueNumber,
@@ -457,16 +429,16 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
         computedAt: r.computedAt,
       })),
       escalations: {
-        pending: pendingEscalations.length,
+        pending: base.pendingEscalations.length,
       },
       inProgress: inProgressWithStatus,
-      starting: starting.map((t) => ({
+      starting: base.starting.map((t) => ({
         name: t.name,
         repo: t.repo,
         issue: t.issue,
         priority: t.priority ?? "p2-medium",
         opencodeProfile: getTaskOpencodeProfileName(t),
-        alerts: getAlertSummary(t),
+        alerts: base.getAlertSummary(t),
       })),
       drain: {
         requestedAt: opts.drain.requestedAt ? new Date(opts.drain.requestedAt).toISOString() : null,
@@ -474,15 +446,15 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
         pauseRequested: opts.drain.pauseRequested,
         pauseAtCheckpoint: opts.drain.pauseAtCheckpoint,
       },
-      queued: queued.map((t) => ({
+      queued: base.queued.map((t) => ({
         name: t.name,
         repo: t.repo,
         issue: t.issue,
         priority: t.priority ?? "p2-medium",
         opencodeProfile: getTaskOpencodeProfileName(t),
-        alerts: getAlertSummary(t),
+        alerts: base.getAlertSummary(t),
       })),
-      throttled: throttled.map((t) => ({
+      throttled: base.throttled.map((t) => ({
         name: t.name,
         repo: t.repo,
         issue: t.issue,
@@ -490,9 +462,9 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
         opencodeProfile: getTaskOpencodeProfileName(t),
         sessionId: t["session-id"]?.trim() || null,
         resumeAt: t["resume-at"]?.trim() || null,
-        alerts: getAlertSummary(t),
+        alerts: base.getAlertSummary(t),
       })),
-      blocked: blockedSorted.map((t) => {
+      blocked: base.blockedSorted.map((t) => {
         const details = t["blocked-details"]?.trim() ?? "";
         return {
           name: t.name,
@@ -505,7 +477,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
           blockedSource: t["blocked-source"]?.trim() || null,
           blockedReason: t["blocked-reason"]?.trim() || null,
           blockedDetailsSnippet: details ? summarizeBlockedDetailsSnippet(details) : null,
-          alerts: getAlertSummary(t),
+          alerts: base.getAlertSummary(t),
         };
       }),
     });
@@ -514,30 +486,35 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     process.exit(0);
   }
 
-  console.log(`Mode: ${mode}`);
+  console.log(`Mode: ${base.mode}`);
+  if (base.desiredMode !== base.mode) {
+    console.log(`Desired mode: ${base.desiredMode}`);
+  }
   const statusTags = [
-    queueState.health === "degraded" ? "degraded" : null,
-    queueState.fallback ? "fallback" : null,
+    base.queueState.health === "degraded" ? "degraded" : null,
+    base.queueState.fallback ? "fallback" : null,
   ].filter(Boolean);
   const statusSuffix = statusTags.length > 0 ? ` (${statusTags.join(", ")})` : "";
-  console.log(`Queue backend: ${queueState.backend}${statusSuffix}`);
-  if (queueState.diagnostics) {
-    console.log(`Queue diagnostics: ${queueState.diagnostics}`);
+  console.log(`Queue backend: ${base.queueState.backend}${statusSuffix}`);
+  if (base.queueState.diagnostics) {
+    console.log(`Queue diagnostics: ${base.queueState.diagnostics}`);
   }
   console.log(
-    `Queue parity: ghQueued/localBlocked=${parity.ghQueuedLocalBlocked} multiStatus=${parity.multiStatusLabels} missingStatus=${parity.missingStatusWithOpState}`
+    `Queue parity: ghQueued/localBlocked=${base.parity.ghQueuedLocalBlocked} multiStatus=${base.parity.multiStatusLabels} missingStatus=${base.parity.missingStatusWithOpState}`
   );
-  if (parity.ghQueuedLocalBlocked > 0) {
-    const samples = parity.repos.flatMap((repo) => repo.sampleGhQueuedLocalBlocked).slice(0, 5);
+  if (base.parity.ghQueuedLocalBlocked > 0) {
+    const samples = base.parity.repos.flatMap((repo) => repo.sampleGhQueuedLocalBlocked).slice(0, 5);
     if (samples.length > 0) {
       console.log(`Queue parity samples: ${samples.join(", ")}`);
     }
   }
 
-  if (daemon) {
-    const version = daemon.version ?? "unknown";
-    console.log(`Daemon: id=${daemon.daemonId ?? "unknown"} pid=${daemon.pid ?? "unknown"} version=${version}`);
+  if (base.daemon) {
+    const version = base.daemon.version ?? "unknown";
+    console.log(`Daemon: id=${base.daemon.daemonId ?? "unknown"} pid=${base.daemon.pid ?? "unknown"} version=${version}`);
   }
+  const daemonLivenessLine = formatDaemonLivenessLine(base.daemonLiveness);
+  if (daemonLivenessLine) console.log(daemonLivenessLine);
 
   if (opts.drain.pauseRequested) {
     console.log(
@@ -545,27 +522,27 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     );
   }
   const activeProfileLine = formatActiveOpencodeProfileLine({
-    requestedProfile,
-    resolvedProfile,
-    selectionSource: selection.source,
+    requestedProfile: base.requestedProfile,
+    resolvedProfile: base.resolvedProfile,
+    selectionSource: base.selection.source,
   });
   if (activeProfileLine) console.log(activeProfileLine);
 
   const usageLines = formatStatusUsageSection(usageRows);
   for (const line of usageLines) console.log(line);
 
-  console.log(`Escalations: ${pendingEscalations.length} pending`);
+  console.log(`Escalations: ${base.pendingEscalations.length} pending`);
 
-  console.log(`Dependency satisfaction overrides: ${depSatisfaction.length}`);
-  for (const row of depSatisfaction.slice(0, 10)) {
+  console.log(`Dependency satisfaction overrides: ${base.depSatisfaction.length}`);
+  for (const row of base.depSatisfaction.slice(0, 10)) {
     const when = row.satisfiedAt ?? row.createdAt;
     const via = row.via ? ` via=${row.via}` : "";
     console.log(`  - ${row.repo}#${row.issueNumber} at=${when}${via}`);
   }
 
-  if (triageRuns.length > 0) {
-    console.log(`Triage runs (last 14d): ${triageRuns.length}`);
-    for (const run of triageRuns) {
+  if (base.triageRuns.length > 0) {
+    console.log(`Triage runs (last 14d): ${base.triageRuns.length}`);
+    for (const run of base.triageRuns) {
       const issueLabel = run.issueNumber ? `#${run.issueNumber}` : "(no issue)";
       const runShort = run.runId.slice(0, 8);
       const reasons = run.reasons.length > 0 ? run.reasons.join(",") : "(none)";
@@ -574,14 +551,14 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       );
     }
   }
-  console.log(`Starting tasks: ${starting.length}`);
-  for (const task of starting) {
+  console.log(`Starting tasks: ${base.starting.length}`);
+  for (const task of base.starting) {
     console.log(`  - ${await getTaskNowDoingLine(task)}`);
   }
 
-  console.log(`In-progress tasks: ${inProgress.length}`);
-  for (const task of inProgress) {
-    const ttlMs = config.ownershipTtlMs;
+  console.log(`In-progress tasks: ${base.inProgress.length}`);
+  for (const task of base.inProgress) {
+    const ttlMs = base.config.ownershipTtlMs;
     const sessionId = task["session-id"]?.trim() ?? "";
     const heartbeatAt = task["heartbeat-at"]?.trim() ?? "";
     const owner = task["daemon-id"]?.trim() ?? "";
@@ -613,13 +590,13 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     console.log(`  - ${await getTaskNowDoingLine(task)} tokens=${tokensLabel}${statusSuffix}`);
   }
 
-  console.log(`Blocked tasks: ${blockedSorted.length}`);
-  for (const task of blockedSorted) {
+  console.log(`Blocked tasks: ${base.blockedSorted.length}`);
+  for (const task of base.blockedSorted) {
     const reason = task["blocked-reason"]?.trim() || "(no reason)";
     const source = task["blocked-source"]?.trim();
     const idleSuffix = formatBlockedIdleSuffix(task);
     const sourceSuffix = source ? ` source=${source}` : "";
-    const alerts = getAlertSummary(task);
+    const alerts = base.getAlertSummary(task);
     const alertSummary = alerts?.latestSummary ? ` latest="${alerts.latestSummary}"` : "";
     const alertSuffix = alerts ? ` alerts=${alerts.totalCount}${alertSummary}` : "";
     console.log(
@@ -627,13 +604,13 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     );
   }
 
-  console.log(`Queued tasks: ${queued.length}`);
-  for (const task of queued) {
+  console.log(`Queued tasks: ${base.queued.length}`);
+  for (const task of base.queued) {
     console.log(`  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}]`);
   }
 
-  console.log(`Throttled tasks: ${throttled.length}`);
-  for (const task of throttled) {
+  console.log(`Throttled tasks: ${base.throttled.length}`);
+  for (const task of base.throttled) {
     const resumeAt = task["resume-at"]?.trim() || "unknown";
     console.log(`  - ${task.name} (${task.repo}) resumeAt=${resumeAt} [${task.priority || "p2-medium"}]`);
   }

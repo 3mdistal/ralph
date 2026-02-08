@@ -1,80 +1,66 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: Fix Daemon Liveness False-Positive In Status (#632)
 
 ## Goal
 
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
+- Fail closed: never report `mode=running` when daemon liveness cannot be confirmed.
+- Surface an explicit mismatch signal + remediation hint in both JSON and human output.
+- Lock the regression with tests covering `mode=running` + `daemon=null` + no process.
 
 ## Assumptions
 
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+- “Daemon liveness” is established via `daemon.json` + PID probe (`process.kill(pid, 0)`).
+- If PID probes error (e.g. EPERM), treat liveness as unconfirmed and fail closed.
+- This is a contract surface: `ralphctl status --json` and `ralph status --json` are machine-readable.
 
 ## Checklist
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+- [x] Centralize daemon liveness logic (single core + single PID probe adapter)
+- [x] Make status JSON contract additive: keep `desiredMode`, add `daemonLiveness`, set `mode` to effective fail-closed value
+- [x] Eliminate status snapshot assembly drift (`getStatusSnapshot` vs `runStatusCommand`)
+- [x] Print explicit liveness mismatch + remediation hint via a shared formatter
+- [x] Add regression + decision-table tests (missing record, dead PID, unknown/EPERM)
+- [x] Run verification gates (`bun test`, `bun run typecheck`)
 
 ## Steps
 
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
+- [x] Centralize daemon liveness logic
+  - [x] Add `src/daemon-liveness.ts` with a functional-core + imperative-shell split:
+    - [x] Core: `deriveDaemonLiveness({ desiredMode, hasRecord, pidProbe }) -> { state, mismatch, hint, effectiveMode }`
+    - [x] Shell: `probePid(pid) -> alive|dead|unknown` (map EPERM and unexpected errors to `unknown`)
+  - [x] Add a shared human formatter (e.g. `formatDaemonLivenessLine(...)`) so `ralph status` and `ralphctl status` never drift.
 
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
+- [x] Additive status JSON contract + fail-closed `mode`
+  - [x] Extend `src/status-snapshot.ts`:
+    - [x] Add `desiredMode` (current pre-liveness mode string)
+    - [x] Add `daemonLiveness` (state/mismatch/hint/pid/daemonId as appropriate)
+    - [x] Optionally tighten types: define a `StatusMode` union and a `DaemonLivenessState` union.
+  - [x] In `src/commands/status.ts` compute desired vs effective mode:
+    - [x] `desiredMode`: existing gate/throttle logic
+    - [x] `daemonLiveness`: from `readDaemonRecord()` + `probePid`
+    - [x] `mode`: set to `effectiveMode` from liveness core; ensure it is never `running` when liveness is missing/dead/unknown.
+  - [x] Compatibility note (in-code, not docs): consumers should treat unknown `mode` strings as not-running; prefer `daemonLiveness.mismatch` for health.
 
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
+- [x] Eliminate status snapshot assembly drift
+  - [x] Refactor `src/commands/status.ts` so there is one base snapshot builder shared by:
+    - [x] `getStatusSnapshot()` (used by `ralphctl` and dashboard)
+    - [x] `runStatusCommand()` (CLI)
+  - [x] Keep optional enrichments (usage rows, token totals) as a post-step applied to the base snapshot rather than duplicating core fields.
 
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
+- [x] Human output includes mismatch + remediation hint
+  - [x] In `src/commands/status.ts` non-JSON path, print exactly one liveness line when `daemonLiveness.state !== "alive"` or `daemonLiveness.mismatch`.
+  - [x] In `src/ralphctl.ts` status (non-JSON), print the same line using the shared formatter.
 
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
+- [x] Regression tests
+  - [x] Add pure decision-table tests for `deriveDaemonLiveness` (fast, deterministic):
+    - [x] desired running + missing record => effective non-running + mismatch + hint
+    - [x] desired running + dead pid => effective non-running + mismatch + hint
+    - [x] desired running + unknown pid probe (EPERM) => effective non-running + mismatch + hint
+    - [x] desired paused/draining + missing/dead => no “running” claim; mismatch behavior is explicit and stable
+  - [x] Add command-level regression tests `src/__tests__/status-daemon-liveness.test.ts`:
+    - [x] Fixture: control defaults to running and no live daemon can be confirmed => JSON `mode !== "running"`, `desiredMode === "running"`, `daemonLiveness.state` is non-`alive`.
+    - [x] Fixture: `daemon.json` with non-existent PID => JSON `mode !== "running"`, `daemonLiveness.state === "dead"`.
+    - [x] Assert `daemonLiveness.hint` is bounded and does not include absolute paths.
 
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
-
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
-
-- [x] Run verification gates
+- [x] Verification gates
   - [x] `bun test`
   - [x] `bun run typecheck`
