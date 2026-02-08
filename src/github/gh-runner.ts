@@ -1,7 +1,10 @@
 import { $ as bunDollar } from "bun";
 
+import { mkdirSync } from "fs";
+
 import { getProfile, getSandboxProfileConfig } from "../config";
 import { resolveGhTokenEnv } from "../github-app-auth";
+import { getRalphGhConfigDir } from "../paths";
 import { SandboxTripwireError, assertSandboxWriteAllowed } from "./sandbox-tripwire";
 
 type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
@@ -33,17 +36,41 @@ async function withGhEnvLock<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-function applyGhEnv(token: string | null): () => void {
-  if (!token) return () => {};
+function ensureGhConfigDirExists(): string {
+  const dir = getRalphGhConfigDir();
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    // ignore
+  }
+  return dir;
+}
+
+function applyGhEnv(opts: { token: string | null; ghConfigDir: string }): () => void {
   const priorGh = process.env.GH_TOKEN;
   const priorGithub = process.env.GITHUB_TOKEN;
-  process.env.GH_TOKEN = token;
-  process.env.GITHUB_TOKEN = token;
+  const priorPrompt = process.env.GH_PROMPT_DISABLED;
+  const priorGhConfigDir = process.env.GH_CONFIG_DIR;
+
+  if (typeof opts.token === "string" && opts.token.trim()) {
+    process.env.GH_TOKEN = opts.token;
+    process.env.GITHUB_TOKEN = opts.token;
+  }
+  process.env.GH_PROMPT_DISABLED = "1";
+  process.env.GH_CONFIG_DIR = opts.ghConfigDir;
+
   return () => {
     if (priorGh === undefined) delete process.env.GH_TOKEN;
     else process.env.GH_TOKEN = priorGh;
+
     if (priorGithub === undefined) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = priorGithub;
+
+    if (priorPrompt === undefined) delete process.env.GH_PROMPT_DISABLED;
+    else process.env.GH_PROMPT_DISABLED = priorPrompt;
+
+    if (priorGhConfigDir === undefined) delete process.env.GH_CONFIG_DIR;
+    else process.env.GH_CONFIG_DIR = priorGhConfigDir;
   };
 }
 
@@ -92,6 +119,7 @@ function classifyGhCommand(command: string): "read" | "write" | "unknown" {
   if (/\bgh\s+pr\s+(create|merge|edit|ready|review|update-branch|close|reopen)\b/i.test(normalized)) return "write";
   if (/\bgh\s+issue\s+(comment|close|reopen|edit|lock|unlock)\b/i.test(normalized)) return "write";
   if (/\bgh\s+repo\s+(create|delete|fork)\b/i.test(normalized)) return "write";
+  if (/\bgh\s+repo\s+clone\b/i.test(normalized)) return "read";
 
   if (/\bgh\s+pr\s+(list|view|status)\b/i.test(normalized)) return "read";
   if (/\bgh\s+issue\s+view\b/i.test(normalized)) return "read";
@@ -151,8 +179,9 @@ export function createGhRunner(params: { repo: string; mode: "read" | "write" })
       },
       quiet: async () => {
         const token = await resolveGhTokenEnv();
+        const ghConfigDir = ensureGhConfigDirExists();
         return await withGhEnvLock(async () => {
-          const restore = applyGhEnv(token);
+          const restore = applyGhEnv({ token, ghConfigDir });
           try {
             const proc = getDefaultGhRunner()(strings, ...values);
             const configured = cwdPath ? proc.cwd(cwdPath) : proc;

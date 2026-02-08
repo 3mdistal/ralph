@@ -1,5 +1,6 @@
 export const BLOCKED_SOURCES = [
   "deps",
+  "auth",
   "allowlist",
   "opencode-config-invalid",
   "dirty-repo",
