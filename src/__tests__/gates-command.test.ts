@@ -106,6 +106,7 @@ describe("gates command output", () => {
           status: "pending",
           command: null,
           skipReason: null,
+          reason: null,
           url: null,
           prNumber: null,
           prUrl: null,
