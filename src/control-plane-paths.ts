@@ -24,13 +24,13 @@ function resolveCanonicalHome(opts?: { homeDir?: string }): string | undefined {
   return resolveHomeDirFallback();
 }
 
-export function resolveCanonicalControlRoot(opts?: { homeDir?: string }): string {
+function resolveCanonicalControlRoot(opts?: { homeDir?: string }): string {
   const home = resolveCanonicalHome(opts);
   if (home) return join(home, ".local", "state", "ralph");
   return resolveTmpControlRoot();
 }
 
-export function resolveLegacyXdgControlRoot(opts?: { xdgStateHome?: string }): string | null {
+function resolveLegacyXdgControlRoot(opts?: { xdgStateHome?: string }): string | null {
   const raw = opts?.xdgStateHome?.trim() ?? process.env.XDG_STATE_HOME?.trim();
   if (!raw) return null;
   return join(raw, "ralph");
