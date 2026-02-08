@@ -4,6 +4,7 @@ import {
   buildMergeConflictCommentLines,
   buildMergeConflictEscalationDetails,
   buildMergeConflictSignature,
+  classifyMergeConflictFailure,
   computeMergeConflictDecision,
 } from "../merge-conflict-recovery";
 
@@ -22,13 +23,54 @@ describe("merge-conflict recovery helpers", () => {
     expect(a).toBe(b);
   });
 
-  test("computeMergeConflictDecision stops on repeated signature", () => {
+  test("computeMergeConflictDecision stops on repeated signature for merge-content failures", () => {
+    const attempts: MergeConflictAttempt[] = [
+      { attempt: 1, signature: "sig", startedAt: "now", status: "failed", failureClass: "merge-content" },
+    ];
+    const decision = computeMergeConflictDecision({ attempts, maxAttempts: 3, nextSignature: "sig" });
+    expect(decision.stop).toBe(true);
+    expect(decision.repeated).toBe(true);
+    expect(decision.stopKind).toBe("loop-protection");
+  });
+
+  test("computeMergeConflictDecision allows one grace retry for non-merge-progress failures", () => {
+    const attempts: MergeConflictAttempt[] = [
+      { attempt: 1, signature: "sig", startedAt: "now", status: "failed", failureClass: "runtime" },
+    ];
+    const decision = computeMergeConflictDecision({ attempts, maxAttempts: 3, nextSignature: "sig" });
+    expect(decision.stop).toBe(false);
+    expect(decision.repeated).toBe(true);
+    expect(decision.graceApplied).toBe(true);
+  });
+
+  test("computeMergeConflictDecision stops when grace is exhausted", () => {
+    const attempts: MergeConflictAttempt[] = [
+      { attempt: 1, signature: "sig", startedAt: "now", status: "failed", failureClass: "runtime" },
+      { attempt: 2, signature: "sig", startedAt: "later", status: "failed", failureClass: "runtime" },
+    ];
+    const decision = computeMergeConflictDecision({ attempts, maxAttempts: 4, nextSignature: "sig" });
+    expect(decision.stop).toBe(true);
+    expect(decision.stopKind).toBe("grace-exhausted");
+  });
+
+  test("computeMergeConflictDecision defaults legacy attempts to loop protection", () => {
     const attempts: MergeConflictAttempt[] = [
       { attempt: 1, signature: "sig", startedAt: "now", status: "failed" },
     ];
     const decision = computeMergeConflictDecision({ attempts, maxAttempts: 3, nextSignature: "sig" });
     expect(decision.stop).toBe(true);
-    expect(decision.repeated).toBe(true);
+    expect(decision.stopKind).toBe("loop-protection");
+  });
+
+  test("computeMergeConflictDecision uses consecutive tail failures for grace", () => {
+    const attempts: MergeConflictAttempt[] = [
+      { attempt: 1, signature: "sig", startedAt: "now", status: "failed", failureClass: "runtime" },
+      { attempt: 2, signature: "other", startedAt: "later", status: "failed", failureClass: "runtime" },
+    ];
+    const decision = computeMergeConflictDecision({ attempts, maxAttempts: 4, nextSignature: "sig" });
+    expect(decision.repeated).toBe(false);
+    expect(decision.graceApplied).toBe(false);
+    expect(decision.stop).toBe(false);
   });
 
   test("computeMergeConflictDecision stops on max attempts", () => {
@@ -39,6 +81,14 @@ describe("merge-conflict recovery helpers", () => {
     const decision = computeMergeConflictDecision({ attempts, maxAttempts: 2, nextSignature: "sig3" });
     expect(decision.stop).toBe(true);
     expect(decision.attemptsExhausted).toBe(true);
+    expect(decision.stopKind).toBe("attempts-exhausted");
+  });
+
+  test("classifyMergeConflictFailure detects permission/tooling/runtime and defaults merge-content", () => {
+    expect(classifyMergeConflictFailure({ reason: "fatal: Permission denied (publickey)" })).toBe("permission");
+    expect(classifyMergeConflictFailure({ reason: "bash: bun: command not found" })).toBe("tooling");
+    expect(classifyMergeConflictFailure({ reason: "request timed out" })).toBe("runtime");
+    expect(classifyMergeConflictFailure({ reason: "conflicts remain in src/app.ts" })).toBe("merge-content");
   });
 
   test("buildMergeConflictCommentLines includes action and attempts", () => {

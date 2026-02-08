@@ -209,7 +209,7 @@ Behavior:
 - Comment: post a single canonical GitHub **issue** comment with PR/base/head refs, conflict file count/sample, and the action statement. Edit the same comment as state changes (no duplicates).
 - Run: spawn a dedicated merge-conflict recovery run with a fresh worktree and fresh OpenCode session (no planning phase). Merge base into head (no rebase / no force-push), resolve conflicts, run tests/typecheck/build/knip, then push updates.
 - Wait: after pushing, wait for `mergeStateStatus != DIRTY` and for required checks to appear for the new head SHA before resuming merge-gate logic.
-- Retries: bounded attempts (2–3). If the same conflict signature repeats across attempts, stop early and escalate.
+- Retries: bounded attempts (2–3). If the same conflict signature repeats across attempts, stop early and escalate. Exception: allow one bounded grace retry when the prior repeated-signature failure class is non-merge-progress (`permission|tooling|runtime`); if the signature repeats again after that grace retry, stop early and escalate with a clear "grace exhausted" reason.
 
 Retries are per-lane configurable; do not assume a default count.
 
