@@ -9,6 +9,7 @@ import { isExplicitBlockerReason, isImplementationTaskFromIssue, shouldConsultDe
 import { summarizeForNote } from "../run-notes";
 import { parseIssueRef } from "../../github/issue-ref";
 import { classifyOpencodeFailure } from "../../opencode-error-classifier";
+import { derivePrCreateEscalationReason } from "../pr-create-escalation-reason";
 import { deleteIdempotencyKey } from "../../state";
 import { writeDxSurveyToGitHubIssues } from "../../github/dx-survey-writeback";
 import { applyTaskPatch } from "../task-patch";
@@ -582,6 +583,13 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
         );
         let prRecoveryDiagnostics = "";
 
+        const prCreateEvidence: string[] = [];
+        const addPrCreateEvidence = (output: unknown): void => {
+          const normalized = summarizeForNote(String(output ?? ""), 1600).trim();
+          if (normalized) prCreateEvidence.push(normalized);
+        };
+        addPrCreateEvidence(buildResult.output);
+
         if (!prUrl) {
           const recovered = await this.tryEnsurePrFromWorktree({
             task,
@@ -789,23 +797,25 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
           const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue", "in-progress");
 
-          buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
-            repo: this.repo,
-            cacheKey,
-            runLogPath: buildContinueRunLogPath,
-            timeoutMs: 10 * 60_000,
-            introspection: {
+            buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
               repo: this.repo,
-              issue: task.issue,
-              taskName: task.name,
-              step: 4,
-              stepTitle: "build continue",
-            },
-            ...this.buildWatchdogOptions(task, "build-continue"),
-            ...this.buildStallOptions(task, "build-continue"),
-            ...this.buildLoopDetectionOptions(task, "build-continue"),
-            ...opencodeSessionOptions,
-          });
+              cacheKey,
+              runLogPath: buildContinueRunLogPath,
+              timeoutMs: 10 * 60_000,
+              introspection: {
+                repo: this.repo,
+                issue: task.issue,
+                taskName: task.name,
+                step: 4,
+                stepTitle: "build continue",
+              },
+              ...this.buildWatchdogOptions(task, "build-continue"),
+              ...this.buildStallOptions(task, "build-continue"),
+              ...this.buildLoopDetectionOptions(task, "build-continue"),
+              ...opencodeSessionOptions,
+            });
+
+            addPrCreateEvidence(buildResult.output);
 
           await this.recordImplementationCheckpoint(task, buildResult.sessionId);
 
@@ -830,6 +840,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               issueTitle: issueMeta.title || task.name,
               botBranch,
             });
+
             prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
             prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
 
@@ -861,7 +872,8 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
         }
 
         if (!prUrl) {
-          const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
+          const derived = derivePrCreateEscalationReason({ continueAttempts, evidence: prCreateEvidence });
+          const reason = derived.reason;
           console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
           const wasEscalated = task.status === "escalated";

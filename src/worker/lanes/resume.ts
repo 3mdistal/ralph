@@ -10,6 +10,7 @@ import type { AgentTask } from "../../queue-backend";
 import { applyTaskPatch } from "../task-patch";
 import { readLiveAnomalyCount } from "../introspection";
 import type { AgentRun } from "../repo-worker";
+import { derivePrCreateEscalationReason } from "../pr-create-escalation-reason";
 
 type ResumeTaskOptions = { resumeMessage?: string; repoSlot?: number | null };
 
@@ -247,6 +248,13 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
         );
         let prRecoveryDiagnostics = "";
 
+        const prCreateEvidence: string[] = [];
+        const addPrCreateEvidence = (output: unknown): void => {
+          const normalized = String(output ?? "").trim();
+          if (normalized) prCreateEvidence.push(normalized);
+        };
+        addPrCreateEvidence(buildResult.output);
+
         if (!prUrl) {
           const recovered = await this.tryEnsurePrFromWorktree({
             task,
@@ -477,6 +485,8 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             ...opencodeSessionOptions,
           });
 
+          addPrCreateEvidence(buildResult.output);
+
           await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
 
           const pausedContinueAfter = await this.pauseIfHardThrottled(
@@ -535,7 +545,8 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
         }
 
         if (!prUrl) {
-          const reason = `Agent completed but did not create a PR after ${continueAttempts} continue attempts`;
+          const derived = derivePrCreateEscalationReason({ continueAttempts, evidence: prCreateEvidence });
+          const reason = derived.reason;
           console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
 
           const wasEscalated = task.status === "escalated";
