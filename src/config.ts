@@ -37,8 +37,8 @@ export type RepoVerificationConfig = {
 };
 
 export interface RepoConfig {
-  name: string;      // "3mdistal/bwrb"
-  path: string;      // "/Users/alicemoore/Developer/bwrb"
+  name: string;      // "3mdistal/ralph"
+  path: string;      // "/Users/alicemoore/Developer/ralph"
   botBranch: string; // "bot/integration"
   /**
    * Optional deterministic preflight commands run in the task worktree before Ralph opens a PR.
@@ -265,7 +265,7 @@ export interface DashboardControlPlaneConfig {
   replayLastMax?: number;
 }
 
-export type QueueBackend = "github" | "bwrb" | "none";
+export type QueueBackend = "github" | "none";
 
 export interface RalphConfig {
   repos: RepoConfig[];
@@ -281,7 +281,6 @@ export interface RalphConfig {
   ownershipTtlMs: number;
   /** Queue backend selection (default: "github"). */
   queueBackend?: QueueBackend;
-  bwrbVault: string;       // path to bwrb vault for queue
   owner: string;           // default GitHub owner (default: "3mdistal")
 
   /** Runtime profile for safety rails (default: "prod"). */
@@ -361,66 +360,6 @@ const DEFAULT_CONTROL_PLANE_REPLAY_MAX = 250;
 const DEFAULT_SANDBOX_KEEP_LAST = 10;
 const DEFAULT_SANDBOX_KEEP_FAILED_DAYS = 14;
 
-function detectDefaultBwrbVault(): string {
-  const start = process.cwd();
-  let dir = start;
-
-  for (;;) {
-    if (existsSync(join(dir, ".bwrb", "schema.json"))) return dir;
-    const parent = dirname(dir);
-    if (parent === dir) return start;
-    dir = parent;
-  }
-}
-
-export function checkBwrbVaultLayout(vault: string): { ok: boolean; error?: string } {
-  if (!vault || !existsSync(vault)) {
-    return {
-      ok: false,
-      error:
-        `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}. ` +
-        `Set it in ~/.ralph/config.toml or ~/.ralph/config.json (key: bwrbVault).`,
-    };
-  }
-
-  const schemaPath = join(vault, ".bwrb", "schema.json");
-  if (!existsSync(schemaPath)) {
-    return {
-      ok: false,
-      error:
-        `[ralph] bwrbVault does not contain a bwrb schema: ${JSON.stringify(vault)} (missing ${schemaPath}). ` +
-        `Point bwrbVault at a directory that contains .bwrb/schema.json.`,
-    };
-  }
-
-  return { ok: true };
-}
-
-export function ensureBwrbVaultLayout(vault: string): boolean {
-  const check = checkBwrbVaultLayout(vault);
-  if (!check.ok) {
-    console.error(check.error ?? `[ralph] bwrbVault is missing or invalid: ${JSON.stringify(vault)}.`);
-    return false;
-  }
-
-  const dirs = [
-    "orchestration/tasks",
-    "orchestration/runs",
-    "orchestration/escalations",
-    "orchestration/notifications",
-  ];
-
-  try {
-    for (const rel of dirs) {
-      mkdirSync(join(vault, rel), { recursive: true });
-    }
-    return true;
-  } catch (e) {
-    console.error(`[ralph] Failed to create orchestration directories in ${vault}:`, e);
-    return false;
-  }
-}
-
 const DEFAULT_CONFIG: RalphConfig = {
   repos: [],
   maxWorkers: DEFAULT_GLOBAL_MAX_WORKERS,
@@ -430,7 +369,6 @@ const DEFAULT_CONFIG: RalphConfig = {
   labelReconcileIntervalMs: DEFAULT_LABEL_RECONCILE_INTERVAL_MS,
   ownershipTtlMs: DEFAULT_OWNERSHIP_TTL_MS,
   queueBackend: "github",
-  bwrbVault: detectDefaultBwrbVault(),
   owner: "3mdistal",
   devDir: join(homedir(), "Developer"),
   profile: "prod",
@@ -453,7 +391,7 @@ export type ConfigLoadResult = {
 let configResult: ConfigLoadResult | null = null;
 
 function isQueueBackendValue(value: unknown): value is QueueBackend {
-  return value === "github" || value === "bwrb" || value === "none";
+  return value === "github" || value === "none";
 }
 
 function toPositiveIntOrNull(value: unknown): number | null {
