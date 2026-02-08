@@ -1,46 +1,4 @@
-import { $ } from "bun";
-import { readFile } from "fs/promises";
-
-export interface AgentEscalationNote {
-  _path: string;
-  _name: string;
-  type: "agent-escalation";
-  "creation-date"?: string;
-  status: string;
-  repo?: string;
-  issue?: string;
-  "task-path"?: string;
-  "session-id"?: string;
-  "escalation-type"?: string;
-  "resume-status"?: string;
-  "resume-attempted-at"?: string;
-  "resume-deferred-at"?: string;
-  "resume-error"?: string;
-}
-
-export type EditEscalationResult =
-  | { ok: true }
-  | {
-      ok: false;
-      kind: "unsupported";
-      error: string;
-    };
-
-export async function getEscalationsByStatus(status: string): Promise<AgentEscalationNote[]> {
-  void status;
-  return [];
-}
-
-export async function editEscalation(
-  escalationPath: string,
-  fields: Record<string, string>
-): Promise<EditEscalationResult> {
-  void escalationPath;
-  void fields;
-  return { ok: false, kind: "unsupported", error: "Escalation note editing is disabled." };
-}
-
-export function extractResolutionSection(markdown: string): string | null {
+function extractResolutionSection(markdown: string): string | null {
   const lines = markdown.split(/\r?\n/);
 
   const headerRe = /^##\s+resolution\s*$/i;
@@ -144,14 +102,4 @@ export function patchResolutionSection(markdown: string, resolutionText: string)
   ];
 
   return { changed: true, markdown: updatedLines.join("\n"), reason: "updated" };
-}
-
-export async function readResolutionMessage(notePath: string): Promise<string | null> {
-  try {
-    const md = await readFile(notePath, "utf8");
-    return extractResolutionSection(md);
-  } catch (e: any) {
-    console.warn(`[ralph:escalations] Failed to read escalation note ${notePath}: ${e?.message ?? String(e)}`);
-    return null;
-  }
 }
