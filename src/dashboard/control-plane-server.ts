@@ -27,7 +27,19 @@ export type ControlPlaneCommandHandlers = {
     | { id?: string }
     | void;
   setTaskPriority: (params: { taskId: string; priority: string }) => Promise<void> | void;
+  setTaskStatus: (params: { taskId: string; status: string }) => Promise<void> | void;
 };
+
+export class ControlPlaneCommandError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
 
 export type ControlPlaneServerOptions<TSnapshot> = {
   bus: RalphEventBus;
@@ -264,11 +276,28 @@ export function startControlPlaneServer<TSnapshot>(
             return jsonResponse(200, { ok: true });
           }
 
+          if (path === "/v1/commands/task/status") {
+            const parsed = await parseJsonBody(request);
+            if (!parsed.ok) return parsed.error;
+            const body = parsed.value;
+
+            const taskId = typeof body?.taskId === "string" ? body.taskId : "";
+            const status = typeof body?.status === "string" ? body.status : "";
+            if (!taskId.trim()) return jsonError(400, "bad_request", "Missing taskId");
+            if (!status.trim()) return jsonError(400, "bad_request", "Missing status");
+
+            await commands.setTaskStatus({ taskId, status });
+            return jsonResponse(200, { ok: true });
+          }
+
           return jsonError(404, "not_found", "Not found");
         }
 
         return jsonError(404, "not_found", "Not found");
       } catch (error: any) {
+        if (error instanceof ControlPlaneCommandError) {
+          return jsonError(error.status, error.code, error.message);
+        }
         const message = error?.message ?? String(error);
         console.warn(`${LOG_PREFIX} Request failed: ${message}`);
         publishInternalError(options.bus, `Control plane request failed: ${message}`);

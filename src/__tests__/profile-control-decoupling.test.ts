@@ -80,11 +80,14 @@ describe("opencode profile/runtime decoupling", () => {
     await writeConfig("apple");
 
     const controlPathBefore = resolveControlFilePath();
+    const startedAt = new Date().toISOString();
     writeDaemonRecord({
       version: 1,
       daemonId: "d_stable",
       pid: process.pid,
-      startedAt: new Date().toISOString(),
+      startedAt,
+      heartbeatAt: startedAt,
+      controlRoot: dirname(controlPathBefore),
       ralphVersion: "test",
       command: ["bun", "run", "start"],
       cwd: homeDir,
