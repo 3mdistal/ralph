@@ -467,23 +467,24 @@ export async function mergePrWithRequiredChecks(params: {
           return await recurse({ prUrl, sessionId });
         }
 
-        const reason = `Merge blocked: required checks not green for ${prUrl}`;
-        const details = [
-          formatRequiredChecksForHumans(summary),
-          "",
-          "Merge attempt would be rejected by branch protection.",
-        ].join("\n");
-        await params.markTaskBlocked(params.task, "ci-failure", { reason, details, sessionId });
-        return {
-          ok: false,
-          run: {
-            taskName: params.task.name,
-            repo: params.repo,
-            outcome: "failed",
-            sessionId,
-            escalationReason: reason,
-          },
-        };
+        log(`[ralph:worker:${params.repo}] Required checks failing at merge time; entering CI remediation for ${prUrl}`);
+        const ciDebug = await params.runCiFailureTriage({
+          task: params.task,
+          issueNumber: params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey,
+          cacheKey: params.cacheKey,
+          prUrl,
+          requiredChecks: REQUIRED_CHECKS,
+          issueMeta: params.issueMeta,
+          botBranch: params.botBranch,
+          timedOut: false,
+          repoPath: params.repoPath,
+          sessionId,
+          opencodeXdg: params.opencodeXdg,
+          opencodeSessionOptions: params.opencodeXdg ? { opencodeXdg: params.opencodeXdg } : {},
+        });
+        if (ciDebug.status !== "success") return { ok: false, run: ciDebug.run };
+        sessionId = ciDebug.sessionId || sessionId;
+        return await mergeWhenReady(ciDebug.headSha);
       }
 
       headSha = status.headSha;
