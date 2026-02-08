@@ -16,6 +16,7 @@ import { computeDaemonGate } from "../daemon-gate";
 import { parseIssueRef } from "../github/issue-ref";
 import { formatDuration } from "../logging";
 import { isHeartbeatStale, parseHeartbeatMs } from "../ownership";
+import { auditQueueParityForRepo } from "../github/queue-parity-audit";
 import {
   formatActiveOpencodeProfileLine,
   formatBlockedIdleSuffix,
@@ -42,6 +43,16 @@ async function withEnv<T>(name: string, value: string, fn: () => Promise<T>): Pr
     if (prior === undefined) delete process.env[name];
     else process.env[name] = prior;
   }
+}
+
+function buildQueueParitySnapshot(repos: string[]) {
+  const perRepo = repos.map((repo) => auditQueueParityForRepo(repo));
+  return {
+    ghQueuedLocalBlocked: perRepo.reduce((sum, repo) => sum + repo.ghQueuedLocalBlocked, 0),
+    multiStatusLabels: perRepo.reduce((sum, repo) => sum + repo.multiStatusLabels, 0),
+    missingStatusWithOpState: perRepo.reduce((sum, repo) => sum + repo.missingStatusWithOpState, 0),
+    repos: perRepo,
+  };
 }
 
 export type StatusDrainState = {
@@ -78,6 +89,7 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
     via: row.via,
   }));
   const queueState = getQueueBackendStateWithLabelHealth();
+  const parity = buildQueueParitySnapshot(config.repos.map((repo) => repo.name));
 
   const daemonRecord = readDaemonRecord();
   const daemon = daemonRecord
@@ -197,6 +209,7 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
       fallback: queueState.fallback,
       diagnostics: queueState.diagnostics ?? null,
     },
+    parity,
     daemon,
     controlProfile: controlProfile || null,
     activeProfile: resolvedProfile ?? null,
@@ -287,6 +300,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   }));
 
   const queueState = getQueueBackendStateWithLabelHealth();
+  const parity = buildQueueParitySnapshot(config.repos.map((repo) => repo.name));
 
   const daemonRecord = readDaemonRecord();
   const daemon = daemonRecord
@@ -423,6 +437,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
         fallback: queueState.fallback,
         diagnostics: queueState.diagnostics ?? null,
       },
+      parity,
       daemon,
       controlProfile: controlProfile || null,
       activeProfile: resolvedProfile ?? null,
@@ -508,6 +523,15 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   console.log(`Queue backend: ${queueState.backend}${statusSuffix}`);
   if (queueState.diagnostics) {
     console.log(`Queue diagnostics: ${queueState.diagnostics}`);
+  }
+  console.log(
+    `Queue parity: ghQueued/localBlocked=${parity.ghQueuedLocalBlocked} multiStatus=${parity.multiStatusLabels} missingStatus=${parity.missingStatusWithOpState}`
+  );
+  if (parity.ghQueuedLocalBlocked > 0) {
+    const samples = parity.repos.flatMap((repo) => repo.sampleGhQueuedLocalBlocked).slice(0, 5);
+    if (samples.length > 0) {
+      console.log(`Queue parity samples: ${samples.join(", ")}`);
+    }
   }
 
   if (daemon) {
