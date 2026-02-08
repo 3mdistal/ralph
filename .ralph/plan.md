@@ -1,58 +1,45 @@
-# Plan: Remove legacy queue integration (#327)
+# Plan: Remove bwrb integration + remaining codepaths (#327)
 
 ## Goal
 
-- Remove the legacy vault-backed integration so only GitHub + SQLite are required to run Ralph.
-- Ensure the repo contains no references to the removed integration in code or docs.
+- Ralph runs with GitHub + SQLite only; no bwrb/vault integration is required.
+- Repo contains no references to bwrb integration in code/docs (aside from historical notes in closed issues).
 
 ## Product Guidance (canonical)
 
-- GitHub issues/labels/comments are the operator UX + queue truth; SQLite is durable machine state (`docs/product/orchestration-contract.md`).
-- Degraded mode applies to GitHub label *writes* (rate limits/abuse), not to missing GitHub auth.
+- GitHub issues/labels/comments are the operator UX and queue truth; SQLite is durable internal state (`docs/product/orchestration-contract.md`).
+- Escalations resume via `ralph:cmd:queue` (no implicit local auto-resume lane).
+- Escalation “consultant decision packet” must still be attached deterministically (prefer GitHub writeback, not filesystem notes).
 
 ## Assumptions
 
-- GitHub queue backend is the default and the only supported backend.
-- Legacy config keys may still exist in user config files; Ralph should ignore unknown keys best-effort and surface actionable errors only for required GitHub auth/config.
+- Dependency #326 is closed; proceed with deletion.
+- Any remaining vault-backed escalation-note plumbing is effectively disabled today (e.g. `getVaultPath() -> null`), so deleting it is a net simplification.
+- Maintain CLI/status output stability where reasonable (contract-surface): keep the notion of “pending escalations”, but derive it from GitHub task state (e.g. tasks with status `escalated`).
 
 ## Checklist
 
-- [x] Inventory current references (code + docs) and define deletion set; track remaining count until zero.
-- [x] Add/adjust focused tests that lock GitHub-only behavior before deleting modules (queue mode decisions, notify paths, daemon startup branches).
-- [x] Refactor boundaries: split queue-mode policy (pure) from driver construction (I/O) and isolate optional artifact sinks.
-- [x] Remove legacy queue backend driver and any filesystem/vault watching.
-- [x] Remove legacy config keys/types/defaults and any vault layout checks; keep config parsing permissive for unknown keys.
-- [x] Remove legacy notification + run-note artifact creation; keep GitHub writeback + SQLite alerts + desktop notifications.
-- [x] Remove legacy escalation note tracking + auto-resume scheduler; ensure re-queue flows rely on GitHub command labels + SQLite op-state.
-- [x] Update/replace tests that asserted legacy fallback/diagnostics.
-- [x] Update docs/help text to remove mentions; keep operator guidance GitHub+SQLite-first.
-- [x] Verify no legacy integration references remain.
-- [x] Run repo gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
-
-## Execution Steps
-
-- [ ] Baseline: list all current legacy-integration references and capture the file list as the working deletion checklist.
-- [ ] Queue-mode boundary refactor:
-  - [ ] Extract a pure queue-mode decision helper (config + auth state + label-write health -> {backend, health, diagnostics}).
-  - [ ] Keep driver construction in the I/O layer; remove legacy fallback branches only after tests cover GitHub auth-missing behavior.
-- [ ] Artifact sink boundary refactor:
-  - [ ] Introduce a narrow interface for optional “write run artifacts” behavior with a noop implementation.
-  - [ ] Rewire `src/worker/repo-worker.ts` to depend on the interface, not on any legacy artifacts module.
-- [ ] Notifications:
-  - [ ] Refactor `src/notify.ts` to remove local note creation; keep GitHub escalation writeback + SQLite alerts + desktop notifications.
-  - [ ] Remove task/escalation note resolution logic tied to local storage.
-- [ ] Escalation/resume:
-  - [ ] Remove `src/escalation-notes.ts` and `src/escalation-resume-scheduler.ts` usage from `src/index.ts`.
-  - [ ] Ensure escalation guidance is captured on the GitHub escalation comment (consultant packet already attaches there).
-  - [ ] Ensure re-queue via `ralph:cmd:queue` leads to a fresh attempt using SQLite op-state (session id/worktree pointers) without any vault dependency.
-- [ ] Queue backend deletion:
-  - [ ] Remove legacy queue driver module(s) and any exports/symbols referencing it.
-  - [ ] Simplify `src/queue-backend.ts` to support only GitHub and disabled/no-queue.
-- [ ] Config surface cleanup:
-  - [ ] Remove legacy config keys and helpers from `src/config.ts` (types, defaults, validation).
-  - [ ] Update status/diagnostics strings to remove legacy mention while keeping actionable guidance.
-- [ ] Docs + CLI help text cleanup: remove references across `README.md`, docs, and inline CLI help.
-- [ ] Tests:
-  - [ ] Update/remove unit tests that cover legacy backend fallback and vault layouts.
-  - [ ] Add/adjust tests for GitHub-only queue mode, escalation writeback path, and daemon startup paths (github vs none).
-- [ ] Final verification: repository search must return zero legacy-integration matches.
+- [x] Inventory remaining bwrb-era references (expected: vault/escalation-note codepaths + tests) and define the deletion set.
+- [x] Migrate “pending escalations” to GitHub task state:
+- [x] Add a tiny shared helper used by all status surfaces to derive pending escalation count (from `getTasksByStatus("escalated")`).
+- [x] Update `src/commands/status.ts` to use the helper (both JSON + text paths); remove `getEscalationsByStatus` usage.
+- [x] Add/adjust tests for status output to lock this behavior (cover JSON + text).
+- [x] Remove daemon wiring first (reduce runtime behavior surface):
+- [x] Remove resolved-escalation auto-resume loop wiring from `src/index.ts`.
+- [x] Remove vault-backed escalation consultant scheduler wiring from `src/index.ts` (GitHub writeback remains the sole packet attach path).
+- [x] Delete bwrb/vault-era escalation modules:
+- [x] Delete `src/escalation-notes.ts`, `src/escalation-resume.ts`, and `src/escalation-resume-scheduler.ts`.
+- [x] Delete `src/escalation-consultant/scheduler.ts`.
+- [x] Clean up escalation consultant I/O:
+- [x] If `appendConsultantPacket()` becomes unused, remove the file-mutation path and keep only `generateConsultantPacket()` for GitHub writeback.
+- [x] Update/remove tests accordingly to keep `knip` clean.
+- [x] Update tests to match the new surfaces:
+- [x] Remove tests for escalation note resolution parsing / auto-resume policy / resume scheduler.
+- [x] Update scheduler tests to remove `getVaultPathForLogs` usage and any “vault” wording.
+- [x] Keep/extend tests that ensure GitHub escalation comment writeback includes the consultant packet.
+- [x] Terminology + docs sweep (contract-surface):
+- [x] Update label descriptions (`src/github-labels.ts`) and docs to replace “see escalation note” with “see escalation comment/thread”.
+- [x] Update `docs/escalation-policy.md` wording to avoid implying filesystem notes; keep policy centralized.
+- [x] Docs/help text sweep: remove “vault”/bwrb-era wording (including comments) and ensure operator guidance remains GitHub+SQLite-first.
+- [x] Final verification searches: zero matches for `bwrb`, `bitwarden`, `vault`, `escalation note`, `auto-resume`, and `getEscalationsByStatus`.
+- [x] Run repo gates: `bun run typecheck`, `bun run build`, `bun run knip`, and `bun test` (fails in current workspace due pre-existing dist fixture/auth test environment issues).

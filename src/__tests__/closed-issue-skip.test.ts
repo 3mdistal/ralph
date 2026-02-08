@@ -1,6 +1,6 @@
 import { describe, expect, mock, test, beforeEach } from "bun:test";
 
-// Mock queue updates so tests don't touch the real vault.
+// Mock queue updates so tests do not touch persistent state.
 const updateTaskStatusMock = mock(async () => true);
 
 const queueAdapter = {

@@ -88,13 +88,6 @@ import {
   classifyActivity,
 } from "./activity-classifier";
 import type { ActivityLabel } from "./activity-classifier";
-import { editEscalation, getEscalationsByStatus, readResolutionMessage } from "./escalation-notes";
-import {
-  buildWaitingResolutionUpdate,
-  DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
-  shouldDeferWaitingResolutionCheck,
-} from "./escalation-resume";
-import { attemptResumeResolvedEscalations as attemptResumeResolvedEscalationsImpl } from "./escalation-resume-scheduler";
 import { computeDaemonGate } from "./daemon-gate";
 import { runGatesCommand } from "./commands/gates";
 import { runRunsCommand } from "./commands/runs";
@@ -104,7 +97,6 @@ import { runWorktreesCommand } from "./commands/worktrees";
 import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
-import { createEscalationConsultantScheduler } from "./escalation-consultant/scheduler";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 import { isLoopbackHost, startControlPlaneServer, type ControlPlaneServer } from "./dashboard/control-plane-server";
 import { toControlPlaneStateV1 } from "./dashboard/control-plane-state";
@@ -146,7 +138,6 @@ const daemonVersion = getRalphVersion();
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
-const ESCALATION_CONSULTANT_INTERVAL_MS = 60_000;
 
 const idleState = new Map<
   string,
@@ -608,60 +599,6 @@ function scheduleQueuedTasksSoon(): void {
 
 function scheduleResumeTasksSoon(): void {
   schedulerController.scheduleResumeTasksSoon();
-}
-
-const resumeAttemptedThisRun = new Set<string>();
-let resumeDisabledUntil = 0;
-
-const RESUME_DISABLE_MS = 60_000;
-
-async function attemptResumeResolvedEscalations(): Promise<void> {
-  return attemptResumeResolvedEscalationsImpl({
-    isShuttingDown: () => isShuttingDown,
-    now: () => Date.now(),
-
-    resumeAttemptedThisRun,
-    getResumeDisabledUntil: () => resumeDisabledUntil,
-    setResumeDisabledUntil: (ts) => {
-      resumeDisabledUntil = ts;
-    },
-    resumeDisableMs: RESUME_DISABLE_MS,
-    getVaultPathForLogs: () => "<disabled>",
-
-    ensureSemaphores,
-    getGlobalSemaphore: () => globalSemaphore,
-    getRepoSemaphore,
-
-    getTaskKey,
-    inFlightTasks,
-    tryClaimTask,
-    recordOwnedTask,
-    forgetOwnedTask,
-    daemonId,
-
-    getEscalationsByStatus,
-    editEscalation,
-    readResolutionMessage,
-
-    getTaskByPath,
-    updateTaskStatus,
-
-    shouldDeferWaitingResolutionCheck,
-    buildWaitingResolutionUpdate,
-    resolutionRecheckIntervalMs: DEFAULT_RESOLUTION_RECHECK_INTERVAL_MS,
-
-    getOrCreateWorker,
-    recordMerge: async (repo, prUrl) => {
-      try {
-        recordPrSnapshot({ repo, issue: "", prUrl, state: PR_STATE_MERGED });
-      } catch {
-        // best-effort
-      }
-
-      await rollupMonitor.recordMerge(repo, prUrl);
-    },
-    scheduleQueuedTasksSoon,
-  });
 }
 
 async function attemptResumeThrottledTasks(defaults: Partial<ControlConfig>): Promise<void> {
@@ -1783,33 +1720,12 @@ async function main(): Promise<void> {
     });
 
     void resumeTasksOnStartup({ awaitCompletion: false });
-    void attemptResumeResolvedEscalations();
     void attemptResumeThrottledTasks(config.control ?? {});
   } else {
     const detail = queueState.diagnostics ? ` ${queueState.diagnostics}` : "";
     console.log(`[ralph] Queue backend disabled; running without queued tasks.${detail}`);
     resetIdleState([]);
   }
-
-  const escalationConsultantScheduler = createEscalationConsultantScheduler({
-    getEscalationsByStatus,
-    getVaultPath: () => null,
-    isShuttingDown: () => isShuttingDown,
-    allowModelSend: async () => {
-      const requestedProfile = getRequestedOpencodeProfileName(null);
-      const selection = await resolveOpencodeProfileForNewWork(Date.now(), requestedProfile);
-      const gate = computeDaemonGate({ mode: getDaemonMode(config.control), throttle: selection.decision, isShuttingDown });
-      return gate.allowModelSend;
-    },
-    repoPath: () => ".",
-    log: (message) => console.log(message),
-  });
-  void escalationConsultantScheduler.tick();
-  const escalationConsultantTimer = setInterval(() => {
-    escalationConsultantScheduler.tick().catch(() => {
-      // ignore
-    });
-  }, ESCALATION_CONSULTANT_INTERVAL_MS);
 
   const ownershipTtlMs = getConfig().ownershipTtlMs;
   const heartbeatIntervalMs = computeHeartbeatIntervalMs(ownershipTtlMs);
