@@ -3,7 +3,7 @@ import { describe, expect, mock, test } from "bun:test";
 import { Semaphore } from "../semaphore";
 import { createSchedulerController, startQueuedTasks } from "../scheduler";
 import { attemptResumeResolvedEscalations } from "../escalation-resume-scheduler";
-import type { AgentTask } from "../queue";
+import type { AgentTask } from "../queue/types";
 
 type TestTask = { repo: string; _path: string; name: string };
 

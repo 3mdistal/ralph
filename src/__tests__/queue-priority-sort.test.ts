@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { groupByRepo } from "../queue";
+import { groupByRepo } from "../queue-backend";
 import type { AgentTask } from "../queue/types";
 
 const BASE_TASK = {

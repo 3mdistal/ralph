@@ -6,7 +6,6 @@ import { join } from "path";
 
 import { __resetConfigForTests } from "../config";
 import { __resetQueueBackendStateForTests } from "../queue-backend";
-import { __resetBwrbRunnerForTests, __setBwrbRunnerForTests } from "../queue";
 import { closeStateDbForTests, initStateDb, recordIdempotencyKey } from "../state";
 import { runStatusCommand } from "../commands/status";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
@@ -16,16 +15,6 @@ let priorHome: string | undefined;
 let priorStateDb: string | undefined;
 let releaseLock: (() => void) | null = null;
 
-function createMockBwrbRunner() {
-  return (_strings: TemplateStringsArray, ..._values: unknown[]) => {
-    const runner = {
-      cwd: () => runner,
-      quiet: async () => ({ stdout: Buffer.from("[]") }),
-    };
-    return runner;
-  };
-}
-
 async function setupEnv(): Promise<void> {
   priorHome = process.env.HOME;
   priorStateDb = process.env.RALPH_STATE_DB_PATH;
@@ -34,22 +23,16 @@ async function setupEnv(): Promise<void> {
   process.env.HOME = homeDir;
   process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
 
-  const vaultDir = join(homeDir, "vault");
-  await mkdir(join(vaultDir, ".bwrb"), { recursive: true });
-  await writeFile(join(vaultDir, ".bwrb", "schema.json"), "{}", "utf8");
-
   await mkdir(join(homeDir, ".ralph"), { recursive: true });
-  await writeFile(join(homeDir, ".ralph", "config.json"), JSON.stringify({ queueBackend: "bwrb", bwrbVault: vaultDir }), "utf8");
+  await writeFile(join(homeDir, ".ralph", "config.json"), JSON.stringify({ queueBackend: "none" }), "utf8");
 
   __resetConfigForTests();
   __resetQueueBackendStateForTests();
-  __resetBwrbRunnerForTests();
   closeStateDbForTests();
   initStateDb();
 }
 
 async function teardownEnv(): Promise<void> {
-  __resetBwrbRunnerForTests();
   __resetQueueBackendStateForTests();
   __resetConfigForTests();
   closeStateDbForTests();
@@ -77,7 +60,6 @@ afterEach(async () => {
 });
 
 test("status --json includes dependency satisfaction overrides", async () => {
-  __setBwrbRunnerForTests(createMockBwrbRunner());
   recordIdempotencyKey({
     key: "ralph:satisfy:v1:3mdistal/ralph#535",
     scope: "dependency-satisfaction",

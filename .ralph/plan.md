@@ -56,7 +56,7 @@
     - [x] Delete `src/bwrb/**` and remove bwrb subprocess calls
     - [x] Remove bwrb queue backend implementation and any vault layout checks
     - [x] Remove bwrb-only tests/fixtures and update snapshots
-    - [ ] Update canonical docs and README to remove bwrb setup/control-plane references (at minimum: `README.md`, `docs/product/*`, `docs/ops/*`)
+    - [x] Update canonical docs and README to remove bwrb setup/control-plane references (at minimum: `README.md`, `docs/product/*`, `docs/ops/*`)
     - [ ] File a follow-up issue to remove the legacy config shim and remaining `bwrb` tokens after a bounded compatibility window
 
 - [ ] Verification
@@ -64,6 +64,6 @@
   - [x] Legacy config smoke: `queueBackend="bwrb"` does not crash; resolves to GitHub/none deterministically
   - [x] No bwrb subprocess calls remain (no `bwrb ...` invocations)
   - [ ] Scoped reference check:
-    - [ ] No bwrb references in canonical/operator docs and README
+    - [x] No bwrb references in canonical/operator docs and README
     - [ ] Track remaining `bwrb` tokens in code as compatibility-only; remove in follow-up if required
   - [x] Run full preflight gate commands (`bun test`, `bun run typecheck`, `bun run build`, `bun run knip`)

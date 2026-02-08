@@ -76,13 +76,8 @@ describe("queue backend selection", () => {
   });
 
   test("does not use legacy backend when GitHub auth is missing", async () => {
-    const vaultPath = join(homeDir, "vault");
-    await mkdir(join(vaultPath, ".bwrb"), { recursive: true });
-    await writeFile(join(vaultPath, ".bwrb", "schema.json"), "{}", "utf8");
-
     const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {
-      bwrbVault: vaultPath,
       repos: [],
     });
 
@@ -142,14 +137,9 @@ describe("queue backend selection", () => {
   });
 
   test("invalid queueBackend is treated as explicit and unavailable", async () => {
-    const vaultPath = join(homeDir, "vault-invalid");
-    await mkdir(join(vaultPath, ".bwrb"), { recursive: true });
-    await writeFile(join(vaultPath, ".bwrb", "schema.json"), "{}", "utf8");
-
     const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {
       queueBackend: "githb",
-      bwrbVault: vaultPath,
       repos: [],
     });
 

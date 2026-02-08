@@ -10,8 +10,10 @@ import {
 import { shouldLog } from "./logging";
 import type { QueueChangeHandler, QueueTask, QueueTaskStatus } from "./queue/types";
 import type { TaskPriority } from "./queue/priority";
+import { priorityRank } from "./queue/priority";
 import { createGitHubQueueDriver } from "./github-queue";
 import { isStateDbInitialized, listRepoLabelSchemeStates, listRepoLabelWriteStates } from "./state";
+import { parseIssueRef } from "./github/issue-ref";
 
 export type QueueBackendHealth = "ok" | "degraded" | "unavailable";
 
@@ -274,6 +276,27 @@ export function groupByRepo<T extends Pick<QueueTask, "repo">>(tasks: T[]): Map<
     existing.push(task);
     byRepo.set(task.repo, existing);
   }
+
+  for (const [repo, repoTasks] of byRepo) {
+    repoTasks.sort((a, b) => {
+      const aTask = a as unknown as Partial<QueueTask>;
+      const bTask = b as unknown as Partial<QueueTask>;
+      const aPriority = aTask.priority as TaskPriority | undefined;
+      const bPriority = bTask.priority as TaskPriority | undefined;
+      const rankDelta = priorityRank(aPriority) - priorityRank(bPriority);
+      if (rankDelta !== 0) return rankDelta;
+
+      const aIssue = parseIssueRef(aTask.issue ?? "", aTask.repo ?? "")?.number ?? Number.POSITIVE_INFINITY;
+      const bIssue = parseIssueRef(bTask.issue ?? "", bTask.repo ?? "")?.number ?? Number.POSITIVE_INFINITY;
+      if (aIssue !== bIssue) return aIssue - bIssue;
+
+      const aPath = aTask._path ?? "";
+      const bPath = bTask._path ?? "";
+      return aPath.localeCompare(bPath);
+    });
+    byRepo.set(repo, repoTasks);
+  }
+
   return byRepo;
 }
 
