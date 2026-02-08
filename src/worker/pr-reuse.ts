@@ -9,12 +9,24 @@ export type ResolvedIssuePr = {
   diagnostics: string[];
 };
 
+type IssuePrResolutionCacheEntry = {
+  createdAtMs: number;
+  promise: Promise<ResolvedIssuePr>;
+};
+
+export const DEFAULT_ISSUE_PR_RESOLUTION_CACHE_TTL_MS = 30_000;
+
 export function createIssuePrResolver(params: {
   repo: string;
   formatGhError: (error: unknown) => string;
   recordOpenPrSnapshot: (issueRef: string, prUrl: string) => void;
+  cacheTtlMs?: number;
 }) {
-  const cache = new Map<string, Promise<ResolvedIssuePr>>();
+  const cache = new Map<string, IssuePrResolutionCacheEntry>();
+  const cacheTtlMs =
+    Number.isFinite(params.cacheTtlMs) && (params.cacheTtlMs ?? 0) >= 0
+      ? Math.floor(params.cacheTtlMs ?? 0)
+      : DEFAULT_ISSUE_PR_RESOLUTION_CACHE_TTL_MS;
 
   const recordResolvedPrSnapshots = (
     issueNumber: string,
@@ -141,20 +153,38 @@ export function createIssuePrResolver(params: {
     return { selectedUrl: null, duplicates: [], source: null, diagnostics };
   };
 
-  const getIssuePrResolution = (issueNumber: string): Promise<ResolvedIssuePr> => {
+  const getIssuePrResolution = (
+    issueNumber: string,
+    opts: { fresh?: boolean } = {}
+  ): Promise<ResolvedIssuePr> => {
     const cacheKey = `${params.repo}#${issueNumber}`;
-    const cached = cache.get(cacheKey);
-    if (cached) return cached;
+    if (opts.fresh) {
+      cache.delete(cacheKey);
+    } else {
+      const cached = cache.get(cacheKey);
+      if (cached) {
+        if (Date.now() - cached.createdAtMs <= cacheTtlMs) {
+          return cached.promise;
+        }
+        cache.delete(cacheKey);
+      }
+    }
 
     const promise = findExistingOpenPrForIssue(issueNumber).catch((error) => {
       cache.delete(cacheKey);
       throw error;
     });
-    cache.set(cacheKey, promise);
+    cache.set(cacheKey, { createdAtMs: Date.now(), promise });
     return promise;
+  };
+
+  const invalidateIssuePrResolution = (issueNumber: string): void => {
+    const cacheKey = `${params.repo}#${issueNumber}`;
+    cache.delete(cacheKey);
   };
 
   return {
     getIssuePrResolution,
+    invalidateIssuePrResolution,
   };
 }
