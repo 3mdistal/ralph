@@ -47,7 +47,11 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:status:queued", color: "0366D6", description: "In queue; claimable when unblocked" },
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
-      { name: "ralph:status:escalated", color: "000000", description: "Needs human intervention; see escalation note" },
+      {
+        name: "ralph:status:escalated",
+        color: "000000",
+        description: "Needs human intervention; see escalation comment thread",
+      },
       { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
@@ -64,7 +68,11 @@ describe("computeRalphLabelSync", () => {
       { name: "Ralph:Status:Queued", color: "0366D6", description: "Queued" },
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
-      { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
+      {
+        name: "ralph:status:escalated",
+        color: "D73A4A",
+        description: "Needs human intervention; see escalation comment thread",
+      },
       { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
@@ -92,7 +100,11 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:status:queued", color: "0366D6", description: "In queue; claimable when unblocked" },
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
-      { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
+      {
+        name: "ralph:status:escalated",
+        color: "D73A4A",
+        description: "Needs human intervention; see escalation comment thread",
+      },
       { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);
@@ -104,7 +116,11 @@ describe("computeRalphLabelSync", () => {
       { name: "ralph:status:queued", color: "0366D6", description: null },
       { name: "ralph:status:in-progress", color: "FBCA04", description: "Ralph is actively working" },
       { name: "ralph:status:in-bot", color: "0E8A16", description: "Task PR merged to bot/integration" },
-      { name: "ralph:status:escalated", color: "D73A4A", description: "Needs human intervention; see escalation note" },
+      {
+        name: "ralph:status:escalated",
+        color: "D73A4A",
+        description: "Needs human intervention; see escalation comment thread",
+      },
       { name: "ralph:status:done", color: "1A7F37", description: "Task merged to default branch" },
     ];
     const { toUpdate } = computeRalphLabelSync(existing);

@@ -2,7 +2,7 @@ import { redactSensitiveText } from "../redaction";
 import type { EscalationType } from "../github/escalation-constants";
 import { hasProductGap } from "../product-gap";
 
-export const CONSULTANT_SCHEMA_VERSION = 2;
+const CONSULTANT_SCHEMA_VERSION = 2;
 export const CONSULTANT_MARKER = "<!-- ralph-consultant:v2 -->";
 const CONSULTANT_BRIEF_HEADING = "## Consultant Brief";
 const CONSULTANT_DECISION_HEADING = "## Consultant Decision (machine)";
@@ -88,7 +88,7 @@ function truncateText(input: string, maxChars: number): string {
   return `${trimmed.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
 }
 
-export function sanitizeEscalationText(
+function sanitizeEscalationText(
   input: string | null | undefined,
   maxChars: number,
   opts?: { homeDir?: string }

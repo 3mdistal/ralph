@@ -58,9 +58,7 @@ describe("queue backend selection", () => {
 
   test("falls back to none when GitHub auth is missing", async () => {
     const configPath = getRalphConfigJsonPath();
-    const missingVault = join(homeDir, "missing-vault");
     await writeJson(configPath, {
-      bwrbVault: missingVault,
       repos: [],
     });
 
@@ -75,33 +73,10 @@ describe("queue backend selection", () => {
     expect(state.diagnostics ?? "").toContain("auth is not configured");
   });
 
-  test("falls back to bwrb when GitHub auth is missing but vault is available", async () => {
-    const vaultPath = join(homeDir, "vault");
-    await mkdir(join(vaultPath, ".bwrb"), { recursive: true });
-    await writeFile(join(vaultPath, ".bwrb", "schema.json"), "{}", "utf8");
-
-    const configPath = getRalphConfigJsonPath();
-    await writeJson(configPath, {
-      bwrbVault: vaultPath,
-      repos: [],
-    });
-
-    __resetConfigForTests();
-    __resetQueueBackendStateForTests();
-
-    const state = getQueueBackendState();
-    expect(state.desiredBackend).toBe("github");
-    expect(state.backend).toBe("bwrb");
-    expect(state.health).toBe("ok");
-    expect(state.fallback).toBe(true);
-    expect(state.diagnostics ?? "").toContain("auth is not configured");
-  });
-
   test("explicit github is unavailable when auth is missing", async () => {
     const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {
       queueBackend: "github",
-      bwrbVault: "/tmp",
       repos: [],
     });
 
@@ -142,14 +117,9 @@ describe("queue backend selection", () => {
   });
 
   test("invalid queueBackend is treated as explicit and unavailable", async () => {
-    const vaultPath = join(homeDir, "vault-invalid");
-    await mkdir(join(vaultPath, ".bwrb"), { recursive: true });
-    await writeFile(join(vaultPath, ".bwrb", "schema.json"), "{}", "utf8");
-
     const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {
       queueBackend: "githb",
-      bwrbVault: vaultPath,
       repos: [],
     });
 

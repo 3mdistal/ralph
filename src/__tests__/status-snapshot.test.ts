@@ -6,7 +6,7 @@ describe("buildStatusSnapshot", () => {
   test("normalizes optional blocked/throttled fields", () => {
     const snapshot = buildStatusSnapshot({
       mode: "running",
-      queue: { backend: "bwrb", health: "ok", fallback: false, diagnostics: null },
+      queue: { backend: "github", health: "ok", fallback: false, diagnostics: null },
       daemon: null,
       controlProfile: null,
       activeProfile: null,
@@ -55,7 +55,7 @@ describe("buildStatusSnapshot", () => {
   test("preserves in-progress token fields", () => {
     const snapshot = buildStatusSnapshot({
       mode: "running",
-      queue: { backend: "bwrb", health: "ok", fallback: false, diagnostics: null },
+      queue: { backend: "github", health: "ok", fallback: false, diagnostics: null },
       daemon: null,
       controlProfile: null,
       activeProfile: null,

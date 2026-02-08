@@ -7,9 +7,5 @@ dist/
 src/ralph.json
 
 # Local orchestration scratch
-# (Ralph + bwrb may traverse this directory; ignoring only affects git)
+# (Ralph may traverse this directory; ignoring only affects git)
 orchestration/
-
-# bwrb local state
-.bwrb/*
-!.bwrb/schema.json

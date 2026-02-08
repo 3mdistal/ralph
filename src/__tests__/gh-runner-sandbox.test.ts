@@ -33,7 +33,6 @@ describe("gh runner sandbox guard", () => {
       maxWorkers: 1,
       batchSize: 10,
       pollInterval: 30_000,
-      bwrbVault: "/tmp",
       owner: "3mdistal",
       allowedOwners: ["3mdistal"],
       devDir: "/tmp",
