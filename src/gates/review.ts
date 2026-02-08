@@ -28,7 +28,7 @@ export type ReviewDiffArtifacts = {
   headRef: string;
   diffPath: string;
   diffStat: string;
-  diffExcerpt: string;
+  diffExcerpt?: string;
 };
 
 export type ReviewGateResult = {
@@ -213,16 +213,16 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
 function buildReviewPrompt(params: {
   repo: string;
   issueRef: string;
-  prUrl: string;
+  prUrl?: string;
   baseRef: string;
   headRef: string;
   diffPath: string;
   diffStat: string;
-  diffExcerpt: string;
+  diffExcerpt?: string;
   issueContext?: string;
 }): string {
-  const stat = params.diffStat.trim() || "(no changes)";
-  const excerpt = params.diffExcerpt.trim() || "(diff excerpt unavailable)";
+  const stat = (typeof params.diffStat === "string" ? params.diffStat : "").trim() || "(no changes)";
+  const excerpt = (typeof params.diffExcerpt === "string" ? params.diffExcerpt : "").trim() || "(diff excerpt unavailable)";
   const issueContext = params.issueContext?.trim();
 
   const lines = [
@@ -231,9 +231,24 @@ function buildReviewPrompt(params: {
     "If uncertain, return fail with a concise actionable reason.",
     `Repo: ${params.repo}`,
     `Issue: ${params.issueRef}`,
-    `PR: ${params.prUrl}`,
+    params.prUrl?.trim() ? `PR: ${params.prUrl.trim()}` : "PR: (not created yet)",
     `Base: ${params.baseRef}`,
     `Head: ${params.headRef}`,
+    "",
+    "Intent (required):",
+    "- Describe the user-facing behavior change.",
+    "",
+    "Risk (required):",
+    "- Describe what could break and where.",
+    "",
+    "Testing notes (required):",
+    "- Note tests added/updated and why they matter.",
+    "",
+    "Consistency/reuse (required):",
+    "- Explain which existing modules/patterns this follows (or why divergence is necessary).",
+    "",
+    "Full diff artifact (read this file; do NOT request pasted diff chunks; do NOT paste full diff back verbatim):",
+    params.diffPath,
     "",
     "git diff --stat:",
     stat,
@@ -282,15 +297,33 @@ function buildDiffExcerpt(diffText: string): string {
 }
 
 function buildDiffArtifactNote(params: ReviewDiffArtifacts): string {
-  const stat = params.diffStat.trim() || "(no changes)";
+  const stat = (typeof params.diffStat === "string" ? params.diffStat : "").trim() || "(no changes)";
+  const base = params.baseRef.trim();
+  const head = params.headRef.trim();
+  const range = base && head ? `origin/${base}...${head}` : "(unresolved)";
   return [
     "Review diff artifact:",
     `Path: ${params.diffPath}`,
     `Base: ${params.baseRef}`,
     `Head: ${params.headRef}`,
+    `Range: ${range}`,
     "git diff --stat:",
     stat,
   ].join("\n");
+}
+
+function isCommitSha(value: string): boolean {
+  return /^[0-9a-f]{7,40}$/i.test(value.trim());
+}
+
+function resolveHeadForDiff(headRef: string): string {
+  const head = headRef.trim();
+  if (!head) return "";
+  if (head === "HEAD") return "HEAD";
+  if (isCommitSha(head)) return head;
+  if (head.startsWith("origin/")) return head;
+  if (head.startsWith("refs/")) return head;
+  return head;
 }
 
 async function execGitCommand(params: { cwd: string; args: string[] }): Promise<string> {
@@ -334,13 +367,10 @@ export async function prepareReviewDiffArtifacts(params: {
 
   const diffPath = join(artifactsDir, "review-diff.patch");
   const baseRef = params.baseRef.trim();
-  const headRef = params.headRef.trim();
+  const headRef = resolveHeadForDiff(params.headRef);
 
   if (baseRef) {
     await execGit(["fetch", "origin", baseRef]);
-  }
-  if (headRef) {
-    await execGit(["fetch", "origin", headRef]);
   }
 
   const baseForDiff = baseRef ? `origin/${baseRef}` : "";
@@ -349,8 +379,8 @@ export async function prepareReviewDiffArtifacts(params: {
     throw new Error("Missing base/head refs for review diff");
   }
 
-  const diffStat = (await execGit(["diff", "--stat", range])).trim();
-  const diffText = await execGit(["diff", range]);
+  const diffStat = (await execGit(["diff", "--no-color", "--stat", range])).trim();
+  const diffText = await execGit(["diff", "--no-color", range]);
   await writeFile(diffPath, diffText, "utf8");
 
   return {
