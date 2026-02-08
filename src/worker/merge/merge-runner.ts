@@ -125,6 +125,7 @@ export async function mergePrWithRequiredChecks(params: {
 
   updatePullRequestBranch: (prUrl: string, cwd: string) => Promise<void>;
   formatGhError: (error: unknown) => string;
+  isAuthError: (error: unknown) => boolean;
 
   mergePullRequest: (prUrl: string, headSha: string, cwd: string) => Promise<void>;
   recordPrSnapshotBestEffort: (input: { issue: string; prUrl: string; state: string }) => void;
@@ -197,7 +198,30 @@ export async function mergePrWithRequiredChecks(params: {
   const isCiIssue = isCiRelatedIssue(params.issueMeta.labels ?? []);
   const issueNumber = params.task.issue.match(/#(\d+)$/)?.[1] ?? params.cacheKey;
 
-  const baseBranch = await params.getPullRequestBaseBranch(prUrl);
+  const blockOnAuthFailure = async (error: unknown, context: string) => {
+    const reason = `Blocked: GitHub auth failed (${context})`;
+    const details = params.formatGhError(error);
+    await params.markTaskBlocked(params.task, "auth", { reason, details, sessionId });
+    return {
+      ok: false as const,
+      run: {
+        taskName: params.task.name,
+        repo: params.repo,
+        outcome: "failed" as const,
+        pr: prUrl ?? undefined,
+        sessionId,
+        escalationReason: reason,
+      },
+    };
+  };
+
+  let baseBranch: string | null = null;
+  try {
+    baseBranch = await params.getPullRequestBaseBranch(prUrl);
+  } catch (error: any) {
+    if (params.isAuthError(error)) return await blockOnAuthFailure(error, "reading PR base branch");
+    throw error;
+  }
   if (!params.isMainMergeAllowed(baseBranch, params.botBranch, params.issueMeta.labels ?? [])) {
     const completed = new Date();
     const completedAt = completed.toISOString().split("T")[0];
@@ -307,6 +331,9 @@ export async function mergePrWithRequiredChecks(params: {
         headRef: prStatus.headSha,
       });
     } catch (error: any) {
+      if (params.isAuthError(error)) {
+        return await blockOnAuthFailure(error, "preparing review diff artifacts");
+      }
       const reason = `Review gate skipped: could not prepare diff artifacts (${error?.message ?? String(error)})`;
       warn(`[ralph:worker:${params.repo}] ${reason}`);
       recordReviewGateSkipped({ runId: reviewRunId, gate: "product_review", reason });
@@ -488,6 +515,9 @@ export async function mergePrWithRequiredChecks(params: {
 
       headSha = status.headSha;
     } catch (error: any) {
+      if (params.isAuthError(error)) {
+        return await blockOnAuthFailure(error, "pre-merge guard (reading PR checks/state)");
+      }
       warn(`[ralph:worker:${params.repo}] Pre-merge guard failed (continuing): ${params.formatGhError(error)}`);
     }
 

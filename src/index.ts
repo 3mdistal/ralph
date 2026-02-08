@@ -79,6 +79,7 @@ import { startGitHubLabelReconciler } from "./github/label-reconciler";
 import { startGitHubCmdProcessor } from "./github/cmd-processor";
 import { resolveGitHubToken } from "./github-auth";
 import { GitHubClient } from "./github/client";
+import { createGhRunner } from "./github/gh-runner";
 import { parseIssueRef } from "./github/issue-ref";
 import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
 import { ensureRalphWorkflowLabelsOnce } from "./github/ensure-ralph-workflow-labels";
@@ -1371,6 +1372,29 @@ async function main(): Promise<void> {
   // Initialize durable local state (SQLite)
   initStateDb();
   const queueState = getQueueBackendStateWithLabelHealth();
+
+  if (queueState.backend === "github") {
+    const probeRepo = config.repos?.[0]?.name;
+    if (probeRepo) {
+      try {
+        await createGhRunner({ repo: probeRepo, mode: "read" })`gh api /user`.quiet();
+      } catch (e: any) {
+        const command = String(e?.ghCommand ?? e?.command ?? "").trim();
+        const message = String(e?.message ?? "").trim();
+        const stderr = typeof e?.stderr?.toString === "function" ? String(e.stderr.toString()).trim() : "";
+
+        const lines = [
+          "[ralph] GitHub auth validation failed for gh CLI (daemon mode).",
+          command ? `Command: ${command}` : "",
+          message ? `Message: ${message}` : "",
+          stderr ? `stderr: ${stderr.slice(0, 1600)}` : "",
+        ].filter(Boolean);
+
+        console.error(lines.join("\n"));
+        process.exit(1);
+      }
+    }
+  }
 
   if (queueState.health === "unavailable") {
     const reason = queueState.diagnostics ? ` ${queueState.diagnostics}` : "";

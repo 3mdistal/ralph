@@ -2458,6 +2458,13 @@ export class RepoWorker {
     return /required status checks are expected/i.test(message);
   }
 
+  private isGhAuthError(error: any): boolean {
+    if (error?.ralphAuthError) return true;
+    const message = this.getGhErrorSearchText(error);
+    if (!message) return false;
+    return /HTTP\s+401|HTTP\s+403|Missing\s+GH_TOKEN|authentication required|unauthorized|forbidden|bad credentials/i.test(message);
+  }
+
   private getGhErrorSearchText(error: any): string {
     const parts: string[] = [];
     const message = String(error?.message ?? "").trim();
@@ -4260,6 +4267,7 @@ export class RepoWorker {
       runMergeConflictRecovery: async (input) => await this.runMergeConflictRecovery(input as any),
       updatePullRequestBranch: async (url, cwd) => await this.updatePullRequestBranch(url, cwd),
       formatGhError: (err) => this.formatGhError(err),
+      isAuthError: (err) => this.isGhAuthError(err as any),
       mergePullRequest: async (url, sha, cwd) => await this.mergePullRequest(url, sha, cwd),
       recordPrSnapshotBestEffort: (input) => this.recordPrSnapshotBestEffort(input as any),
       applyMidpointLabelsBestEffort: async (input) => await this.applyMidpointLabelsBestEffort(input as any),

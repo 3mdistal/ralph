@@ -57,6 +57,7 @@ function buildParams(overrides: Record<string, unknown> = {}) {
       updateCalls.push(pr);
     },
     formatGhError: (error: any) => String(error?.message ?? error),
+    isAuthError: () => false,
     mergePullRequest: async (_pr: string, sha: string) => {
       mergeCalls.push(sha);
     },
@@ -179,5 +180,22 @@ describe("mergePrWithRequiredChecks 405 handling", () => {
     expect(markTaskBlockedCalls[0]?.source).toBe("auto-update");
     expect(markTaskBlockedCalls[0]?.reason).toContain("base branch changed");
     expect(markTaskBlockedCalls[0]?.reason).not.toContain("required checks not green");
+  });
+
+  test("blocks with auth when PR base branch read fails due to auth", async () => {
+    const { params, markTaskBlockedCalls, mergeCalls } = buildParams({
+      isAuthError: () => true,
+      getPullRequestBaseBranch: async () => {
+        throw new Error("HTTP 401: Bad credentials");
+      },
+    });
+
+    const result = await mergePrWithRequiredChecks(params);
+
+    expect(result.ok).toBe(false);
+    expect(markTaskBlockedCalls).toHaveLength(1);
+    expect(markTaskBlockedCalls[0]?.source).toBe("auth");
+    expect(markTaskBlockedCalls[0]?.reason).toContain("auth");
+    expect(mergeCalls).toHaveLength(0);
   });
 });
