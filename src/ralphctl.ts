@@ -1,11 +1,12 @@
 #!/usr/bin/env bun
 
 import { spawn } from "child_process";
-import { readDaemonRecord, resolveDaemonRecordPath, type DaemonRecord } from "./daemon-record";
+import { readDaemonRecord, resolveDaemonRecordPathCandidates, type DaemonRecord } from "./daemon-record";
 import { updateControlFile } from "./control-file";
 import { getStatusSnapshot } from "./commands/status";
 import type { StatusSnapshot } from "./status-snapshot";
 import { startDashboardTui } from "./dashboard/client/ui-blessed";
+import { formatDaemonLivenessLine } from "./daemon-liveness";
 
 const DEFAULT_GRACE_MS = 5 * 60_000;
 const DRAIN_POLL_INTERVAL_MS = 1000;
@@ -323,8 +324,8 @@ async function restartFlow(opts: {
 
   const daemonRecord = readDaemonRecord();
   if (!daemonRecord) {
-    const recordPath = resolveDaemonRecordPath();
-    throw new Error(`Daemon record not found at ${recordPath}`);
+    const candidates = resolveDaemonRecordPathCandidates();
+    throw new Error(`Daemon record not found (checked: ${candidates.join(", ")})`);
   }
 
   await stopDaemon(daemonRecord, opts.force);
@@ -385,12 +386,17 @@ async function run(): Promise<void> {
       process.exit(0);
     }
     console.log(`Mode: ${snapshot.mode}`);
+    if (snapshot.desiredMode && snapshot.desiredMode !== snapshot.mode) {
+      console.log(`Desired mode: ${snapshot.desiredMode}`);
+    }
     console.log(`Queue backend: ${snapshot.queue.backend}`);
     if (snapshot.daemon) {
       console.log(
         `Daemon: id=${snapshot.daemon.daemonId ?? "unknown"} pid=${snapshot.daemon.pid ?? "unknown"}`
       );
     }
+    const daemonLivenessLine = snapshot.daemonLiveness ? formatDaemonLivenessLine(snapshot.daemonLiveness) : null;
+    if (daemonLivenessLine) console.log(daemonLivenessLine);
     console.log(`In-progress tasks: ${snapshot.inProgress.length}`);
     console.log(`Queued tasks: ${snapshot.queued.length}`);
     process.exit(0);

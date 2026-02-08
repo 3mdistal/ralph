@@ -40,7 +40,7 @@ These are intentionally separate and must not be conflated.
 
 ## Escalation consultant decision packet (machine JSON)
 
-When an escalation note is created, the consultant appends a machine-parseable decision packet.
+When an escalation comment is created, the consultant appends a machine-parseable decision packet.
 This packet is the human-facing decision summary and must be deterministic and bounded.
 
 Required fields:

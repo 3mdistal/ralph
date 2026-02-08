@@ -66,6 +66,11 @@ describe("gh runner sandbox guard", () => {
     expect(() => ghRead`gh magic unknown`).toThrow(/SANDBOX TRIPWIRE/i);
   });
 
+  test("ghRead allows repo clone in sandbox", () => {
+    const ghRead = createGhRunner({ repo: "3mdistal/ralph-sandbox-demo", mode: "read" });
+    expect(() => ghRead`gh repo clone 3mdistal/ralph-sandbox-demo /tmp/ralph-sandbox-demo`).not.toThrow();
+  });
+
   test("ghWrite blocks writes outside sandbox boundary", () => {
     const ghWrite = createGhRunner({ repo: "3mdistal/prod-repo", mode: "write" });
     expect(() => ghWrite`gh issue comment 1 --repo 3mdistal/prod-repo --body test`).toThrow(/SANDBOX TRIPWIRE/i);

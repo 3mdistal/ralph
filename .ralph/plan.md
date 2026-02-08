@@ -1,67 +1,66 @@
----
-# Plan: Deprecate and remove bwrb (GitHub + SQLite) (#323)
+# Plan: Dashboard Control Plane Task Edit Endpoints (#37)
 
-## Product intent
+## Goal
 
-- Stop using bwrb/Obsidian notes as part of Ralph's core state + control loop.
-- Target model:
-  - GitHub issues/labels/comments = operator interface + shared state
-  - SQLite (local) = canonical machine state (runs/tasks/events/alerts) + pointers to artifacts
-  - Optional JSONL trace files referenced from SQLite
+- Add control-plane support for operator task edits: priority and status, for GitHub-first orchestration.
+- Keep bwrb legacy/output-only: do not introduce new behavior that depends on bwrb being writable.
+- Ensure behavior is testable, token-authenticated, and emits structured dashboard events.
 
-Policy (immediate): bwrb is legacy output-only (best-effort mirror). No new features should depend on bwrb.
+## Product Assumptions (from issue comments + canonical docs)
 
-## Current status (as of 2026-02-08)
+- Canonical task model is GitHub issues/labels + SQLite (durable internal state). bwrb is legacy output-only.
+- Priority is operator input via `ralph:priority:p0..p4` and must not change `ralph:status:*`.
+- “Status edits” are operator intent via `ralph:cmd:*` labels; status labels (`ralph:status:*`) are bot-owned and must not be set directly.
 
-- Child issues #324, #325, #326 are closed.
-- Child issue #327 implementation is now complete in this worktree:
-  - Removed repo artifacts `.bwrb/schema.json`, `.bwrbignore`, and `.gitignore` bwrb rules.
-  - Removed legacy `bwrbVault` fixture keys from affected tests.
-  - Added a tracked-file regression guard script and wired it into `npm test`.
+## Checklist
 
-## Done criteria (epic)
+- [x] Confirm current control-plane command surface for task edits
+- [x] Implement `POST /v1/commands/task/status` endpoint with auth + validation
+- [x] Wire server handler in daemon (`src/index.ts`) to apply GitHub `ralph:cmd:*` labels
+- [x] Add typed command errors so validation returns 4xx (not 500)
+- [x] Define deterministic cmd-label replacement semantics (avoid multiple cmd labels)
+- [x] Emit operator-visible structured events (`log.ralph` + existing `github.request` telemetry)
+- [x] Add/extend unit tests for the new endpoint and handler wiring
+- [x] Run verification gates (at least `bun test`; add `bun run typecheck` if types change)
 
-- Operator control is exclusively via GitHub (`ralph:cmd:*`, `ralph:status:*`, `ralph:priority:*` labels + normal comments).
-- Canonical machine state is exclusively in `~/.ralph/state.sqlite` (runs/tasks/events/alerts + artifact pointers).
-- bwrb is not required to run Ralph.
-- No in-repo references to bwrb remain (code/tests/docs), except historical notes in closed GitHub issues.
+## Steps
 
-## Checklist (execute in order)
+- [x] Confirm current control-plane command surface
+  - [x] Inspect `src/dashboard/control-plane-server.ts` routes and `ControlPlaneCommandHandlers`.
+  - [x] Confirm `POST /v1/commands/task/priority` already supports GitHub issue refs (`github:owner/repo#123`).
 
-- [x] Verify child #324 complete (freeze + deprecation; output-only posture)
-- [x] Verify child #325 complete (replace bwrb notify paths with SQLite + GitHub pointers)
-- [x] Verify child #326 complete (priority/status controls via GitHub labels + SQLite)
+- [x] Implement `POST /v1/commands/task/status`
+  - [x] Add `setTaskStatus` to `ControlPlaneCommandHandlers`.
+  - [x] Add route `POST /v1/commands/task/status` with JSON body `{ taskId, status }`.
+  - [x] Validate: non-empty `taskId`, non-empty `status`; otherwise `400` with `bad_request`.
 
-- [x] Complete child #327: remove remaining bwrb artifacts + strings
+- [x] Add typed command errors (so operator mistakes are 4xx)
+  - [x] Introduce a small error type (e.g. `ControlPlaneCommandError`) with `{ status, code, message }`.
+  - [x] In `startControlPlaneServer(...)`, treat this error type as a pass-through to `jsonError(status, code, message)`.
+  - [x] Use this for: invalid status, invalid taskId format, non-GitHub task ids, missing GitHub auth.
 
-- [x] Baseline tracked-file search (deterministic)
-  - `git grep -nI -E 'bwrb|bwrbVault' -- . ':(exclude).ralph/plan.md'` (capture current hits)
+- [x] Wire handler in `src/index.ts`
+  - [x] Extract a pure helper module (functional core) for deterministic parsing/mapping:
+    - [x] `parseGitHubTaskId("github:owner/repo#123") -> { repo, issueNumber } | ControlPlaneCommandError`
+    - [x] `mapTaskStatusInputToCmdLabel(status) -> ralph:cmd:* | ControlPlaneCommandError` (case/whitespace tolerant + aliases)
+  - [x] Only support GitHub taskIds; for non-GitHub ids return `400 unsupported_task_id` (no new bwrb write path).
+  - [x] Define cmd-label replacement semantics to avoid ambiguity:
+    - [x] When applying a cmd label, also remove other `ralph:cmd:*` labels (`queue|pause|stop|satisfy`) so only one is present.
+  - [x] Apply the command label via existing GitHub label write helpers:
+    - [x] Ensure `ralph:*` workflow labels exist (`ensureRalphWorkflowLabelsOnce`).
+    - [x] Apply `planIssueLabelOps({ add: [targetCmd], remove: otherCmds })`; do not edit `ralph:status:*` directly.
+  - [x] Publish a `log.ralph` dashboard event describing what was requested (repo + issue + cmd label).
 
-- [x] Remove bwrb repo artifacts
-  - Delete `.bwrb/` (including `.bwrb/schema.json`) and `.bwrbignore`
-  - Update `.gitignore` to remove `.bwrb/*` rules/comments and any exception allowing `.bwrb/schema.json`
+- [x] Tests
+  - [x] Extend `src/__tests__/control-plane-server.test.ts` to cover:
+    - [x] happy-path request hits `setTaskStatus` handler
+    - [x] missing/empty `status` returns `400`
+    - [x] handler-thrown `ControlPlaneCommandError` returns the expected `4xx` (not `500`)
+  - [x] Add focused unit tests for the pure helper module:
+    - [x] status alias + normalization mapping
+    - [x] rejects unknown status deterministically
+    - [x] parses `github:` task ids; rejects malformed/unsupported ids
 
-- [x] Remove `bwrbVault` from test fixtures (mechanical across all matches)
-  - Known touchpoints (not exhaustive):
-    - `src/__tests__/queue-backend.test.ts`
-    - `src/__tests__/sandbox-config.test.ts`
-    - `src/__tests__/github-client-auth.test.ts`
-    - `src/__tests__/gh-runner-env.test.ts`
-    - `src/__tests__/allowlist-guardrail.test.ts`
-    - `src/__tests__/github-app-auth.test.ts`
-    - `src/__tests__/integration-harness.test.ts`
-    - `src/__tests__/merge-pull-request-api.test.ts`
-    - (and any remaining `src/__tests__/*.test.ts` matches)
-
-- [x] Add a regression guard that fails if tracked code/docs/tests reintroduce bwrb tokens
-  - Implement as a small script driven by `git ls-files` + token scan and wire into preflight (preferred over unit tests that depend on `.git` internals)
-  - Exclusions should be explicit and minimal (e.g. allow `.ralph/plan.md`)
-
-- [x] Final tracked-file search (deterministic)
-  - `git grep -nI -E 'bwrb|bwrbVault' -- . ':(exclude).ralph/plan.md'` returns no matches
-
-- [ ] Run deterministic gates: `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`
-  - `bun run typecheck` passed.
-  - `bun run build` passed.
-  - `bun test` currently fails in existing pre-existing suites (`dist/__tests__/opencode-fixtures.test.js`, `dist/__tests__/required-checks.test.js`).
-  - `bun run knip` currently fails with broad pre-existing unused-file/export reports.
+- [x] Verification
+  - [x] `bun test`
+  - [x] `bun run typecheck` (if required by changes)
