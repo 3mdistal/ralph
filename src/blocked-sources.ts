@@ -2,6 +2,7 @@ export const BLOCKED_SOURCES = [
   "deps",
   "allowlist",
   "opencode-config-invalid",
+  "profile-unresolvable",
   "dirty-repo",
   "merge-target",
   "ci-only",

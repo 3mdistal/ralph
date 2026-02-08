@@ -72,4 +72,33 @@ describe("OpenCode config env", () => {
     const env = __buildOpencodeEnvForTests({ repo: "demo", cacheKey: "789" });
     expect(env.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
   });
+
+  test("mixed-profile runs keep shared managed OPENCODE_CONFIG_DIR", () => {
+    const appleData = join(homeDir, ".opencode-profiles", "apple", "data");
+    const appleState = join(homeDir, ".opencode-profiles", "apple", "state");
+    const appleCache = join(homeDir, ".opencode-profiles", "apple", "cache");
+
+    const googleData = join(homeDir, ".opencode-profiles", "google", "data");
+    const googleState = join(homeDir, ".opencode-profiles", "google", "state");
+    const googleCache = join(homeDir, ".opencode-profiles", "google", "cache");
+
+    const firstEnv = __buildOpencodeEnvForTests({
+      repo: "demo",
+      cacheKey: "profile-apple",
+      opencodeXdg: { dataHome: appleData, stateHome: appleState, cacheHome: appleCache },
+    });
+    const secondEnv = __buildOpencodeEnvForTests({
+      repo: "demo",
+      cacheKey: "profile-google",
+      opencodeXdg: { dataHome: googleData, stateHome: googleState, cacheHome: googleCache },
+    });
+
+    expect(firstEnv.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
+    expect(secondEnv.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
+    expect(firstEnv.XDG_DATA_HOME).toBe(appleData);
+    expect(secondEnv.XDG_DATA_HOME).toBe(googleData);
+    expect(firstEnv.XDG_STATE_HOME).toBe(appleState);
+    expect(secondEnv.XDG_STATE_HOME).toBe(googleState);
+    expect(firstEnv.XDG_CACHE_HOME).not.toBe(secondEnv.XDG_CACHE_HOME);
+  });
 });

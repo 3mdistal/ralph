@@ -108,9 +108,40 @@ test("resume does not auto-switch profiles when session cannot be found", async 
 
   const resolved = await (worker as any).resolveOpencodeXdgForTask(task, "resume", sessionId);
   expect(resolved.profileName).toBe(null);
-  expect(resolved.opencodeXdg?.dataHome).toBe(join(homeDir, ".local", "share"));
-  expect(resolved.opencodeXdg?.stateHome).toBe(join(homeDir, ".local", "state"));
-  expect(resolved.opencodeXdg?.configHome).toBeUndefined();
+  expect(resolved.opencodeXdg).toBeUndefined();
+  expect(resolved.error?.code).toBe("profile-unresolvable");
+  expect(resolved.error?.reasonCode).toBe("resume-session-not-found");
+  expect(resolved.error?.message).toContain("No ambient fallback is allowed");
+});
+
+test("start fails closed when task is pinned to an unknown profile", async () => {
+  await writeJson(getRalphConfigJsonPath(), {
+    opencode: {
+      enabled: true,
+      defaultProfile: "apple",
+      profiles: {
+        apple: { xdgDataHome: "/tmp", xdgConfigHome: "/tmp", xdgStateHome: "/tmp" },
+      },
+    },
+  });
+
+  __resetConfigForTests();
+
+  const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+  const task: any = {
+    repo: "3mdistal/ralph",
+    issue: "3mdistal/ralph#556",
+    name: "issue 556",
+    status: "queued",
+    _path: "orchestration/tasks/556.md",
+    "opencode-profile": "ghost",
+  };
+
+  const resolved = await (worker as any).resolveOpencodeXdgForTask(task, "start");
+  expect(resolved.profileName).toBe("ghost");
+  expect(resolved.opencodeXdg).toBeUndefined();
+  expect(resolved.error?.code).toBe("profile-unresolvable");
+  expect(resolved.error?.reasonCode).toBe("pinned-profile-missing");
 });
 
 test("writes config to the expected path", async () => {

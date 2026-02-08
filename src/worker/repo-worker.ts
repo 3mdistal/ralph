@@ -52,7 +52,11 @@ import { runPreflightGate } from "../gates/preflight";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
 
-import { getPinnedOpencodeProfileName as getPinnedOpencodeProfileNameCore, resolveOpencodeXdgForTask as resolveOpencodeXdgForTaskCore } from "./opencode-profiles";
+import {
+  getPinnedOpencodeProfileName as getPinnedOpencodeProfileNameCore,
+  resolveOpencodeXdgForTask as resolveOpencodeXdgForTaskCore,
+  type OpencodeProfileResolutionError,
+} from "./opencode-profiles";
 import { readControlStateSnapshot } from "../drain";
 import { createPauseControl, recordCheckpoint } from "./pause-control";
 import { hasProductGap, parseRoutingDecision, selectPrUrl, type RoutingDecision } from "../routing";
@@ -4489,7 +4493,7 @@ export class RepoWorker {
   ): Promise<{
     profileName: string | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
-    error?: string;
+    error?: OpencodeProfileResolutionError;
   }> {
     return resolveOpencodeXdgForTaskCore({
       task,
@@ -4502,6 +4506,37 @@ export class RepoWorker {
       warn: (message: string) => console.warn(message),
       envHome: process.env.HOME,
     });
+  }
+
+  private describeUnresolvableProfile(error: OpencodeProfileResolutionError): { reason: string; details: string } {
+    const label = `Profile resolution failed (${error.reasonCode})`;
+    return {
+      reason: error.message,
+      details: `${label}. ${error.message}`,
+    };
+  }
+
+  private async handleUnresolvableProfile(
+    task: AgentTask,
+    phase: "start" | "resume",
+    error: OpencodeProfileResolutionError,
+    sessionId?: string
+  ): Promise<AgentRun> {
+    const described = this.describeUnresolvableProfile(error);
+    console.warn(`[ralph:worker:${this.repo}] ${described.details} (phase=${phase})`);
+    await this.markTaskBlocked(task, "profile-unresolvable", {
+      reason: described.reason,
+      details: described.details,
+      sessionId,
+    });
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "failed",
+      sessionId,
+      escalationReason: described.reason,
+    };
   }
 
   private getPauseControl() {
@@ -5130,7 +5165,9 @@ export class RepoWorker {
 
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume", existingSessionId);
 
-      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
+      if (resolvedOpencode.error) {
+        return await this.handleUnresolvableProfile(task, "resume", resolvedOpencode.error, existingSessionId);
+      }
 
       const opencodeProfileName = resolvedOpencode.profileName;
       const opencodeXdg = resolvedOpencode.opencodeXdg;
@@ -6019,7 +6056,9 @@ export class RepoWorker {
       if (pausedPreStart) return pausedPreStart;
 
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "start");
-      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
+      if (resolvedOpencode.error) {
+        return await this.handleUnresolvableProfile(task, "start", resolvedOpencode.error);
+      }
 
       const opencodeProfileName = resolvedOpencode.profileName;
       const opencodeXdg = resolvedOpencode.opencodeXdg;

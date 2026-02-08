@@ -1,80 +1,39 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: Issue #610 - Profiles fail-closed + shared managed config semantics
 
-## Goal
-
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
-
-## Assumptions
-
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+Assumptions (non-interactive defaults):
+- Dependency `3mdistal/ralph#608` will land first; this work is implemented/rebased on top of it.
+- "Fail closed" means: when `opencode.enabled=true`, *both* start and resume must not proceed if a profile cannot be deterministically resolved; no ambient XDG fallback.
 
 ## Checklist
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+- [x] Sync with `3mdistal/ralph#608` changes (rebase/adjust call sites as needed).
 
-## Steps
+- [x] Add an explicit blocked classification for unresolvable profiles.
+  - [x] Extend `src/blocked-sources.ts` with `profile-unresolvable` (or chosen equivalent string).
+  - [x] Ensure any worker-failure/blocked reporting paths surface `blocked:profile-unresolvable`.
 
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
+- [x] Fail closed in profile resolution core.
+  - [x] Update `src/worker/opencode-profiles.ts` so that when profiles are enabled:
+    - [x] start: if requested/auto/default profile cannot resolve to a configured profile, return a deterministic error (no ambient).
+    - [x] resume: if the session id is missing or cannot be found under any configured profile storage, return a deterministic error (no ambient).
+    - [x] keep `xdgConfigHome` intentionally *not* applied to worker runs.
+  - [x] Replace string-only errors with typed error codes (e.g. `errorCode: "profile-unresolvable"` + `reasonCode` enum) so `RepoWorker` can deterministically map to `blocked-source=profile-unresolvable`.
+  - [x] Enforce invariant: when `opencode.enabled=true`, start selection must never yield an "ambient"/null profile; if it does, return the typed unresolvable error immediately.
+  - [x] (Maintainability) Split pure decision logic from filesystem scanning (session lookup) to keep a functional-core/imperative-shell boundary and reduce fs mocking in tests.
 
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
+- [x] Handle unresolvable profile errors at worker entry points.
+  - [x] In `src/worker/repo-worker.ts`, for both start and resume paths:
+    - [x] Add explicit pre-session guard branches: if profile resolution returns a typed unresolvable error, mark the task `blocked` with `blocked-source=profile-unresolvable` and an actionable `blocked-reason`.
+    - [x] Structurally guarantee no OpenCode spawn/continue occurs when blocked (avoid relying on generic catch classification).
 
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
+- [x] Enforce shared managed config semantics across profile switches.
+  - [x] Verify `src/session.ts` always uses the single Ralph-managed `OPENCODE_CONFIG_DIR` regardless of selected profile.
+  - [x] Add/adjust tests to assert only usage/account routing inputs (XDG data/state/cache) vary across profiles.
 
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
+- [x] Regression tests.
+  - [x] Update `src/__tests__/worker-resume-opencode-profile-detection.test.ts` to expect fail-closed behavior when the session cannot be found.
+  - [x] Add a test covering start failure when `opencode.enabled=true` but the default/requested profile is unresolvable.
+  - [x] Add a test covering mixed-profile sequential runs (different profile XDG, same managed `OPENCODE_CONFIG_DIR`).
+  - [x] Add a worker-level test asserting that on unresolvable profiles, the task is marked blocked with `blocked-source=profile-unresolvable` and that `runAgent`/`continueSession` are never invoked.
 
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
-
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
-
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
-
-- [x] Run verification gates
-  - [x] `bun test`
-  - [x] `bun run typecheck`
+- [x] Run deterministic gates locally (as applicable): `bun test`, `bun run typecheck`, `bun run build`, `bun run knip`.
