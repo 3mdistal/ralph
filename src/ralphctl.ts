@@ -1,7 +1,13 @@
 #!/usr/bin/env bun
 
 import { spawn } from "child_process";
-import { readDaemonRecord, resolveDaemonRecordPath, type DaemonRecord } from "./daemon-record";
+import {
+  isDaemonRecordFresh,
+  readDaemonRecord,
+  resolveCanonicalDaemonPath,
+  resolveDaemonRecordPath,
+  type DaemonRecord,
+} from "./daemon-record";
 import { updateControlFile } from "./control-file";
 import { getStatusSnapshot } from "./commands/status";
 import type { StatusSnapshot } from "./status-snapshot";
@@ -254,6 +260,9 @@ async function stopDaemon(record: DaemonRecord, force: boolean): Promise<void> {
   if (!force && !record.daemonId) {
     throw new Error("Refusing to stop daemon without daemonId; use --force to override.");
   }
+  if (!force && !isDaemonRecordFresh(record)) {
+    throw new Error("Refusing to stop daemon with stale registry heartbeat; use --force to override.");
+  }
 
   try {
     process.kill(record.pid, "SIGTERM");
@@ -323,8 +332,9 @@ async function restartFlow(opts: {
 
   const daemonRecord = readDaemonRecord();
   if (!daemonRecord) {
+    const canonicalPath = resolveCanonicalDaemonPath();
     const recordPath = resolveDaemonRecordPath();
-    throw new Error(`Daemon record not found at ${recordPath}`);
+    throw new Error(`Daemon record not found (checked canonical ${canonicalPath} then legacy ${recordPath})`);
   }
 
   await stopDaemon(daemonRecord, opts.force);

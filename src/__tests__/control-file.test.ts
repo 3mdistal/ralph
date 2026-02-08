@@ -43,6 +43,7 @@ describe("control file", () => {
     });
 
     const controlPath = resolveControlFilePath();
+    expect(controlPath).toBe(join(base, ".ralph", "control", "control.json"));
     const parsed = JSON.parse(readFileSync(controlPath, "utf8")) as Record<string, unknown>;
     expect(parsed.mode).toBe("draining");
     expect(parsed.pause_requested).toBe(true);

@@ -1,80 +1,45 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: Issue #604 - Canonical daemon registry + control root
 
-## Goal
+Assumptions (non-interactive defaults):
+- Canonical control root is `$HOME/.ralph/control` (profile-agnostic; does not depend on `XDG_STATE_HOME`).
+- Canonical registry file is `$HOME/.ralph/control/daemon-registry.json`.
+- Canonical registry is authoritative only when it is readable, schema-valid, and “fresh” by deterministic liveness rules; otherwise `ralphctl` falls back to legacy discovery.
+- Legacy discovery remains supported during a defined migration window (documented + logged): `$XDG_STATE_HOME/ralph/daemon.json`, then `~/.local/state/ralph/daemon.json`, then `/tmp/ralph/<uid>/daemon.json`.
 
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
+Deterministic validity/liveness rules (to implement + document):
+- Registry schema versioned (`version: 1`); unknown versions are treated as invalid (fallback, not fatal).
+- A registry record is considered “live” only if:
+  - PID liveness probe succeeds, and
+  - `heartbeatAt` is present and newer than `now - HEARTBEAT_TTL_MS`.
+- Safety bias: if heartbeat is stale or missing, `ralphctl restart/upgrade` refuses to signal/kill unless `--force`.
 
-## Assumptions
+Locking contract:
+- Singleton daemon lock (held for daemon lifetime): `$HOME/.ralph/control/daemon.lock` (prevents two daemons writing competing control-plane state).
+- Short-lived registry write lock (held only while writing/rotating files): `$HOME/.ralph/control/registry.lock`.
+- Never hold locks while performing liveness probes, sleeps, or waiting loops.
 
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+## Plan checklist
 
-## Checklist
-
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
-
-## Steps
-
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
-
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
-
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
-
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
-
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
-
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
-
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
-
-- [x] Run verification gates
-  - [x] `bun test`
-  - [x] `bun run typecheck`
+- [x] Centralize path resolution in a pure module (`src/control-root.ts`)
+- [x] Implement registry functional core vs IO shell
+- [x] Implement atomic JSON write helper (temp + rename; best-effort fsync) and symlink-safe checks
+- [x] Implement singleton daemon lock (stale-lock reclamation) and short-lived registry write lock
+- [x] Update daemon startup/shutdown to:
+  - acquire singleton lock
+  - publish canonical registry (daemonId, pid, startedAt, ralphVersion, controlRoot, heartbeatAt)
+  - run heartbeat timer updating `heartbeatAt` under registry write lock
+  - remove/mark registry entry on shutdown
+- [x] Update control file location to canonical root (`$HOME/.ralph/control/control.json`) with legacy import fallback
+- [x] Update `ralphctl` discovery to be canonical-first-when-valid, legacy fallback when invalid/stale
+- [x] Add/adjust tests:
+  - canonical selection vs fallback when canonical invalid/corrupt
+  - stale heartbeat handling + `--force` safety behavior
+  - singleton lock prevents second daemon
+  - profile-agnostic discovery (ambient `XDG_STATE_HOME` changes do not affect)
+  - legacy window compatibility (no canonical file)
+- [x] Update docs (README + relevant product docs) to document:
+  - canonical root + files
+  - liveness rules (PID + heartbeat TTL)
+  - deterministic discovery precedence + migration window
+- [x] Add lightweight observability: log discovery source (`canonical|legacy-xdg|legacy-home|legacy-tmp`) and invalid/stale reasons
+- [x] Run `bun test` and `bun run typecheck`

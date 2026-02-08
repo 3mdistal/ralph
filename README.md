@@ -548,7 +548,8 @@ Ralph supports an operator-controlled "draining" mode that stops scheduling/dequ
 
 Control file:
 
-- `$XDG_STATE_HOME/ralph/control.json`
+- Canonical (authoritative): `~/.ralph/control/control.json`
+- Fallback read path (for compatibility): `$XDG_STATE_HOME/ralph/control.json`
 - Fallback: `~/.local/state/ralph/control.json`
 - Last resort: `/tmp/ralph/<uid>/control.json`
 
@@ -580,13 +581,17 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 - `ralphctl restart [--grace 5m] [--start-cmd "<command>"]`
 - `ralphctl upgrade [--grace 5m] [--start-cmd "<command>"] [--upgrade-cmd "<command>"]`
 
-Daemon discovery for restart/upgrade uses a lease record at:
+Daemon discovery for restart/upgrade uses a registry record at:
 
-- `$XDG_STATE_HOME/ralph/daemon.json`
+- Canonical (authoritative when valid/fresh): `~/.ralph/control/daemon-registry.json`
+- Fallback read path (for compatibility): `$XDG_STATE_HOME/ralph/daemon.json`
 - Fallback: `~/.local/state/ralph/daemon.json`
 - Last resort: `/tmp/ralph/<uid>/daemon.json`
 
-The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
+Registry fields include daemon identity/control-plane state (`daemonId`, `pid`, `startedAt`, `heartbeatAt`, `controlRoot`, `ralphVersion`).
+`ralphctl` reads canonical first, then falls back to legacy records when canonical is missing/invalid/stale.
+Registry writes and heartbeat updates are lock-protected and atomic (`temp` + `rename`) to avoid torn records.
+Use `--start-cmd` to override start command when needed.
 
 ## Managed OpenCode config (daemon runs)
 

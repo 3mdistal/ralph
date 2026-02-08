@@ -3,7 +3,7 @@ import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 
-import { readDaemonRecord, resolveDaemonRecordPath, writeDaemonRecord } from "../daemon-record";
+import { readDaemonRecord, resolveCanonicalDaemonPath, resolveDaemonRecordPath, writeDaemonRecord } from "../daemon-record";
 
 describe("daemon record", () => {
   let priorXdgStateHome: string | undefined;
@@ -30,6 +30,7 @@ describe("daemon record", () => {
     const base = mkdtempSync(join(tmpdir(), "ralph-daemon-"));
     tempDirs.push(base);
     process.env.XDG_STATE_HOME = base;
+    process.env.HOME = base;
 
     writeDaemonRecord({
       version: 1,
@@ -46,6 +47,7 @@ describe("daemon record", () => {
     expect(record?.daemonId).toBe("d_test");
     expect(record?.pid).toBe(1234);
     expect(record?.command).toEqual(["bun", "src/index.ts"]);
+    expect(record?.controlRoot).toBe(join(base, ".ralph", "control"));
   });
 
   test("returns null for invalid record", () => {
@@ -85,5 +87,37 @@ describe("daemon record", () => {
 
     const record = readDaemonRecord();
     expect(record?.daemonId).toBe("d_home");
+  });
+
+  test("falls back to legacy record when canonical registry is invalid", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-daemon-home-"));
+    const xdg = mkdtempSync(join(tmpdir(), "ralph-daemon-xdg-"));
+    tempDirs.push(home, xdg);
+    process.env.HOME = home;
+    process.env.XDG_STATE_HOME = xdg;
+
+    const canonicalPath = resolveCanonicalDaemonPath();
+    mkdirSync(dirname(canonicalPath), { recursive: true });
+    writeFileSync(canonicalPath, "{invalid json");
+
+    writeDaemonRecord(
+      {
+        version: 1,
+        daemonId: "d_legacy",
+        pid: 1234,
+        startedAt: new Date().toISOString(),
+        ralphVersion: "0.1.0",
+        command: ["bun", "src/index.ts"],
+        cwd: "/tmp",
+        controlFilePath: "/tmp/control.json",
+      },
+      { homeDir: home, xdgStateHome: "" }
+    );
+
+    rmSync(canonicalPath, { force: true });
+    writeFileSync(canonicalPath, "{invalid json");
+
+    const record = readDaemonRecord();
+    expect(record?.daemonId).toBe("d_legacy");
   });
 });

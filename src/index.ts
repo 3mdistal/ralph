@@ -62,7 +62,14 @@ import { formatDuration, shouldLog } from "./logging";
 import { getThrottleDecision, type ThrottleDecision } from "./throttle";
 import { resolveAutoOpencodeProfileName, resolveOpencodeProfileForNewWork } from "./opencode-auto-profile";
 import { getRalphSandboxManifestPath, getRalphSandboxManifestsDir, getRalphSessionLockPath } from "./paths";
-import { removeDaemonRecord, writeDaemonRecord } from "./daemon-record";
+import {
+  acquireDaemonLock,
+  DAEMON_HEARTBEAT_INTERVAL_MS,
+  removeDaemonRecord,
+  writeDaemonHeartbeat,
+  writeDaemonRecord,
+} from "./daemon-record";
+import { resolveCanonicalControlRoot } from "./control-root";
 import { getRalphVersion } from "./version";
 import { computeHeartbeatIntervalMs, parseHeartbeatMs } from "./ownership";
 import { getRepoLabelSchemeState, initStateDb, recordPrSnapshot, PR_STATE_MERGED } from "./state";
@@ -145,6 +152,8 @@ const daemonId = `d_${crypto.randomUUID()}`;
 const daemonStartedAt = new Date().toISOString();
 const daemonCommand = [process.execPath, ...process.argv.slice(1)];
 const daemonVersion = getRalphVersion();
+let daemonLockRelease: (() => void) | null = null;
+let daemonHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
 const IDLE_ROLLUP_CHECK_MS = 15_000;
 const IDLE_ROLLUP_THRESHOLD_MS = 5 * 60_000;
@@ -1467,19 +1476,33 @@ async function main(): Promise<void> {
     if (!ensureBwrbVaultLayout(config.bwrbVault)) process.exit(1);
   }
 
+  const daemonRecord = {
+    version: 1 as const,
+    daemonId,
+    pid: process.pid,
+    startedAt: daemonStartedAt,
+    heartbeatAt: daemonStartedAt,
+    ralphVersion: daemonVersion,
+    command: daemonCommand,
+    cwd: process.cwd(),
+    controlRoot: resolveCanonicalControlRoot(),
+    controlFilePath: resolveControlFilePath(),
+  };
+
   try {
-    writeDaemonRecord({
-      version: 1,
-      daemonId,
-      pid: process.pid,
-      startedAt: daemonStartedAt,
-      ralphVersion: daemonVersion,
-      command: daemonCommand,
-      cwd: process.cwd(),
-      controlFilePath: resolveControlFilePath(),
-    });
+    const daemonLock = acquireDaemonLock();
+    daemonLockRelease = daemonLock.release;
+    writeDaemonRecord(daemonRecord);
+    daemonHeartbeatTimer = setInterval(() => {
+      try {
+        writeDaemonHeartbeat(daemonRecord);
+      } catch (e: any) {
+        console.warn(`[ralph] Failed to write daemon heartbeat: ${e?.message ?? String(e)}`);
+      }
+    }, DAEMON_HEARTBEAT_INTERVAL_MS);
+    daemonHeartbeatTimer.unref?.();
   } catch (e: any) {
-    console.warn(`[ralph] Failed to write daemon record: ${e?.message ?? String(e)}`);
+    console.warn(`[ralph] Failed to initialize canonical daemon registry: ${e?.message ?? String(e)}`);
   }
   if (queueState.backend !== "none") {
     await seedRepoSlotReservations();
@@ -2033,7 +2056,18 @@ async function main(): Promise<void> {
     }
 
     try {
+      if (daemonHeartbeatTimer) {
+        clearInterval(daemonHeartbeatTimer);
+        daemonHeartbeatTimer = null;
+      }
       removeDaemonRecord();
+    } catch {
+      // ignore
+    }
+
+    try {
+      daemonLockRelease?.();
+      daemonLockRelease = null;
     } catch {
       // ignore
     }
@@ -2079,7 +2113,7 @@ function printGlobalHelp(): void {
       "  -h, --help                         Show help (also: ralph help [command])",
       "",
       "Notes:",
-      "  Control file: set version=1 and mode=running|draining|paused in $XDG_STATE_HOME/ralph/control.json (fallback ~/.local/state/ralph/control.json; last resort /tmp/ralph/<uid>/control.json).",
+      "  Control file (canonical): ~/.ralph/control/control.json (fallback read-only: $XDG_STATE_HOME/ralph/control.json, ~/.local/state/ralph/control.json, /tmp/ralph/<uid>/control.json).",
       "  OpenCode profile: set [opencode].defaultProfile in ~/.ralph/config.toml (affects new tasks).",
       "  Reload control file immediately with SIGUSR1 (otherwise polled ~1s).",
     ].join("\n")

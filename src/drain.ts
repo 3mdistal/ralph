@@ -1,7 +1,12 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
-import { homedir } from "os";
 import { dirname, join } from "path";
 import { readDaemonRecord } from "./daemon-record";
+import {
+  resolveCanonicalControlFilePath,
+  resolveCanonicalControlRoot,
+  resolveLegacyControlFileCandidates,
+  resolveLegacyControlFilePath,
+} from "./control-root";
 
 export type DaemonMode = "running" | "draining" | "paused";
 
@@ -24,26 +29,11 @@ const DEFAULT_CONTROL_DEFAULTS: ControlDefaults = {
   suppressMissingWarnings: true,
 };
 
-function resolveTmpControlDir(): string {
-  const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
-  return join("/tmp", "ralph", String(uid));
-}
-
 function getControlDefaults(opts?: { defaults?: Partial<ControlDefaults> }): ControlDefaults {
   return {
     autoCreate: opts?.defaults?.autoCreate ?? DEFAULT_CONTROL_DEFAULTS.autoCreate,
     suppressMissingWarnings: opts?.defaults?.suppressMissingWarnings ?? DEFAULT_CONTROL_DEFAULTS.suppressMissingWarnings,
   };
-}
-
-function resolveHomeDirFallback(): string | undefined {
-  const homeEnv = process.env.HOME?.trim();
-  if (homeEnv) return homeEnv;
-  try {
-    return homedir();
-  } catch {
-    return undefined;
-  }
 }
 
 function isPidAlive(pid: number): boolean {
@@ -60,20 +50,25 @@ function resolveEffectiveControlFilePath(opts?: { homeDir?: string; xdgStateHome
   const record = readDaemonRecord({ homeDir: opts?.homeDir, xdgStateHome: opts?.xdgStateHome, log: opts?.log });
   const daemonControlPath =
     record && isPidAlive(record.pid) && record.controlFilePath.trim() ? record.controlFilePath.trim() : null;
-  return daemonControlPath ?? resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
+  if (daemonControlPath) return daemonControlPath;
+
+  const canonical = resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
+  if (existsSync(canonical)) return canonical;
+
+  const legacyCandidates = resolveLegacyControlFileCandidates({ homeDir: opts?.homeDir, xdgStateHome: opts?.xdgStateHome });
+  for (const candidate of legacyCandidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+
+  return canonical;
 }
 
 export function resolveControlFilePath(
   homeDir?: string,
   xdgStateHome: string | undefined = process.env.XDG_STATE_HOME
 ): string {
-  const trimmedStateHome = xdgStateHome?.trim();
-  if (trimmedStateHome) return join(trimmedStateHome, "ralph", "control.json");
-
-  const resolvedHome = homeDir?.trim() ?? resolveHomeDirFallback();
-  if (resolvedHome) return join(resolvedHome, ".local", "state", "ralph", "control.json");
-
-  return join(resolveTmpControlDir(), "control.json");
+  void xdgStateHome;
+  return resolveCanonicalControlFilePath({ homeDir });
 }
 
 function parseControlStateJson(raw: string): ControlState {
