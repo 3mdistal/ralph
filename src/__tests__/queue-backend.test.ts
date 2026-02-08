@@ -60,7 +60,6 @@ describe("queue backend selection", () => {
     const configPath = getRalphConfigJsonPath();
     const missingVault = join(homeDir, "missing-vault");
     await writeJson(configPath, {
-      bwrbVault: missingVault,
       repos: [],
     });
 
@@ -96,7 +95,6 @@ describe("queue backend selection", () => {
     const configPath = getRalphConfigJsonPath();
     await writeJson(configPath, {
       queueBackend: "github",
-      bwrbVault: "/tmp",
       repos: [],
     });
 
