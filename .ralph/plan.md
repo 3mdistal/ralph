@@ -1,80 +1,101 @@
-# Plan: Fix Escalation Misclassification After PR-Create Retries (#600)
+# Plan: Deterministic gates PR readiness + review packaging (#235)
 
 ## Goal
 
-- When PR creation retries fail (or repeatedly emit hard failure signals), escalate with the dominant underlying failure reason.
-- Use `Agent completed but did not create a PR after N continue attempts` only as a fallback when there is no stronger signal.
-- Keep escalation surfaces aligned: GitHub escalation comment reason, notify alert reason, and returned run metadata use the same reason string.
+- Make PR submission readiness deterministic and orchestrator-owned.
+- Make Product + DevEx review requests deterministic (fixed template; diff artifact + `git diff --stat`; machine marker required).
+- Persist structured gate state so Ralph can enforce: PRs are not opened unless required gates are satisfied.
+
+## Product decisions (authoritative)
+
+- Do not paste full diffs into prompts; store full diff as an artifact and pass only `git diff --stat` + artifact path.
+- Review outputs must end with exactly one `RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}` marker on the final line.
+- Ralph-generated PRs target `bot/integration` by default.
 
 ## Assumptions
 
-- RepoWorker already has a deterministic hard-failure classifier: `src/opencode-error-classifier.ts` (`classifyOpencodeFailure`).
-- This change is internal and should not introduce new contract surfaces; keep reason strings short/bounded and avoid local paths.
-- Do not change escalation marker/idempotency semantics unnecessarily (escalationType affects marker id).
+- Gate persistence + preflight config + review marker parsing are already implemented (blocked-by deps #232/#233/#234 are closed).
+- Existing merge-time review gating in `src/worker/merge/merge-runner.ts` remains as a safety net, but PR creation must be gated earlier.
+- In degraded mode (missing runId / artifact write failure), fail closed for PR creation to preserve determinism.
+
+## DevEx must-fix notes (addressed by this plan)
+
+- Lock down a single shared contract for: review marker parsing, readiness decision statuses, degraded-mode mappings, and retry/escalation budgets.
+- Avoid readiness-vs-merge drift by extracting shared diff-prep + review protocol helpers (functional-core/imperative-shell split).
+- Add explicit artifact size/retention bounds for diff artifacts.
 
 ## Checklist
 
-- [x] Confirm current behavior + repro path
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-- [x] Add regression test (continueSession retries with hard failure output)
-- [x] Add focused unit tests for reason derivation helper
-- [x] Run verification gates (`bun test`, plus `bun run typecheck` if touched types)
+- [ ] Lock down gate/result/marker contracts + retry budgets (shared, typed)
+- [x] Fix diff artifact generation to work with head SHAs and be `--no-color`
+- [x] Expand review prompt into a fixed, consistent template (intent/risk/tests/reuse placeholders + artifact reference)
+- [x] Add a deterministic PR-readiness gate before PR creation (preflight + Product + DevEx)
+- [ ] Make RepoWorker create PRs (not the coding agent) once gates pass; remove reliance on “agent must open PR” loops
+- [x] Persist gate results/artifacts for all readiness outcomes (pass/fail/skip)
+- [x] Add tests for diff artifact prep + readiness gating behavior
+- [x] Run verification (`bun test` and `bun run typecheck`)
 
 ## Steps
 
-- [x] Confirm current behavior + repro path
-  - [x] Inspect the two PR-create retry loops in `src/worker/repo-worker.ts` (build path and resume path).
-  - [x] Verify current escalation uses the no-PR-after-retries reason even when `buildResult.output` contains hard-failure signals.
+- [ ] Contracts + shared helpers (do first)
+  - [ ] Add typed readiness decision model (new module, e.g. `src/worker/pr-readiness-contract.ts`):
+    - [ ] `PrReadinessStatus = ready | not_ready | degraded` (or equivalent)
+    - [ ] `PrReadinessDecision` includes: `status`, `blockingGate?`, `reason` (bounded), and `evidenceVersion`.
+  - [ ] Centralize review protocol helpers (new module, e.g. `src/gates/review-protocol.ts`):
+    - [ ] Prompt template builder (versioned, `review_prompt_v1`).
+    - [ ] Marker parser (already in `src/gates/review.ts` today) is re-exported or relocated so both readiness + merge paths share it.
+  - [ ] Centralize retry budget knobs (env or config; deterministic defaults):
+    - [ ] max readiness remediation attempts
+    - [ ] max PR-create attempts
+    - [ ] backoff/throttle policy for PR-create lease conflicts
+  - [ ] Document degraded-mode mapping as explicit gate results/artifacts (not implicit logs).
 
-- [x] Factor shared functional-core helpers (reason derivation + evidence aggregation)
-  - [x] Add a small IO-free helper module (e.g. `src/worker/pr-create-escalation-reason.ts`) that:
-    - [x] accepts accumulated evidence strings + attempt count
-    - [x] returns `{ reason, details?, classification? }`
-    - [x] uses `classifyOpencodeFailure(...)` deterministically
-    - [x] keeps the classified `reason` exactly `classification.reason` (no suffixes)
-  - [x] Keep output bounded (cap details length) and avoid embedding local paths in returned strings.
+- [x] Fix diff artifact generation (functional core)
+  - [x] Update `src/gates/review.ts` `prepareReviewDiffArtifacts(...)`:
+    - [x] Support `headRef` as a raw SHA or `HEAD` without attempting `git fetch origin <sha>`.
+    - [x] Fetch only the base branch ref (e.g. `git fetch origin <base>`), then diff `origin/<base>...<head>`.
+    - [x] Use `git diff --no-color` for patch and `git diff --no-color --stat` for the stat.
+    - [x] Record base/head/range used in the artifact note for traceability.
+    - [ ] Add size bounds for diff artifacts (max bytes/lines) and record truncation metadata.
+  - [x] Add unit tests covering SHA head + base branch inputs.
 
-- [x] Factor shared imperative-shell escalation side effects (avoid build/resume drift)
-  - [x] Extract a single RepoWorker method/helper for the common escalation block:
-    - [x] update task status to escalated
-    - [x] write escalation writeback
-    - [x] notify escalation
-    - [x] record escalated run note
-    - [x] return the `AgentRun` shape
-  - [x] Call the shared helper from both build and resume PR-create escalation sites.
+- [x] Fixed, deterministic review packaging
+  - [x] Update `src/gates/review.ts` `buildReviewPrompt(...)` to a stable template including:
+    - [x] Repo / Issue / (optional) PR
+    - [x] Intent (placeholder), Risk (placeholder), Testing notes (placeholder), Consistency/Reuse (placeholder)
+    - [x] Diff artifact path (explicitly: “read this file; do not request pasted chunks”)
+    - [x] `git diff --stat` output
+    - [x] Marker instruction (final line must be `RALPH_REVIEW: ...`)
+  - [x] Add unit tests asserting the prompt includes artifact path + stat and does not embed the full diff.
 
-- [x] Add dominant failure classification to PR-create retry escalation (build + resume paths)
-  - [x] During PR-create retries, capture/aggregate continue outputs (even when `success=true`).
-  - [x] Apply `classifyOpencodeFailure(...)` to accumulated evidence (initial build output + all continue outputs).
-  - [x] Compute a single `reason`:
-    - [x] If classification exists: use `classification.reason` as the headline reason.
-    - [x] Else: use the existing fallback `Agent completed but did not create a PR after N continue attempts`.
-  - [x] Keep classified `reason` stable: do not append attempt counts/excerpts to it.
-  - [x] Optionally include attempt count + short excerpt in `details` (bounded/sanitized); avoid local file paths.
-  - [x] Apply the same logic in both duplicated sites (around ~5445 and ~6715).
+- [x] PR readiness gate (imperative shell)
+  - [ ] Introduce a PR-readiness helper (new module, e.g. `src/worker/pr-readiness.ts`) that:
+    - [x] Verifies the worktree is clean and on a named branch.
+    - [x] Runs `runPreflightGate(...)` and refuses to proceed on `fail` (records gate result + artifacts).
+    - [x] Prepares diff artifacts against the PR base (default `bot/integration`) with `head=HEAD`.
+    - [x] Runs Product then DevEx review agents via `runReviewGate(...)` using the fixed prompt template.
+    - [x] Returns a structured decision: `ready|not_ready` plus a short reason for rework.
 
-- [x] Keep escalation writeback/notify/run metadata aligned on the same reason
-  - [x] Ensure the computed `reason` is passed consistently to:
-    - [x] `writeEscalationWriteback(task, { reason, ... })`
-    - [x] `notify.notifyEscalation({ reason, ... })`
-    - [x] `recordEscalatedRunNote({ reason, ... })`
-    - [x] the returned `{ escalationReason: reason }`.
+- [ ] Orchestrator-owned PR creation
+  - [ ] Update `src/worker/repo-worker.ts` `tryEnsurePrFromWorktree(...)` to:
+    - [x] Call PR-readiness first; do not run `git push` / `gh pr create` unless readiness returns `ready`.
+    - [ ] Keep idempotency lease behavior for PR creation.
+    - [x] When readiness fails, route into the internal rework loop (resume/spawn) rather than escalating immediately.
+  - [ ] Reduce/remove the “continue N times to get the agent to open a PR” loops:
+    - [ ] Prefer: orchestrator retries readiness + PR creation, and only nudges the agent when it needs a clean commit/branch.
+    - [ ] Escalate only after bounded readiness remediation attempts with clear diagnostics persisted to gate artifacts.
 
-- [x] Add regression test (continueSession retries with hard failure output)
-  - [x] Extend `src/__tests__/integration-harness.test.ts` with a case where `continueSession` returns no PR URL for 5 attempts and outputs:
-    - [x] `Invalid schema for function '...': ...` + `code: invalid_function_parameters`.
-  - [x] Assert the run escalates with reason containing the classifier headline (e.g. `OpenCode config invalid: tool schema rejected ...`).
-  - [x] Assert `writeEscalationWriteback` and `notifyEscalation` receive the same `reason` (no fallback string).
+- [ ] Merge-time safety net alignment
+  - [ ] Ensure `src/worker/merge/merge-runner.ts` review diff prep uses the updated SHA-safe diff artifact logic.
+  - [ ] (Optional) Skip rerunning review gates at merge time only when evidence freshness matches:
+    - [ ] same head SHA, same base ref, same prompt version.
 
-- [x] Add focused unit tests for reason derivation helper
-  - [x] Add `src/__tests__/pr-create-escalation-reason.test.ts` covering:
-    - [x] classification wins over no-PR fallback
-    - [x] fallback used only when classifier returns null
-    - [x] accumulated evidence (classification present only in a later continue output still wins)
-
-- [x] Run verification gates
-  - [x] `bun test`
-  - [x] `bun run typecheck`
+- [ ] Tests + verification
+  - [ ] Add integration tests that:
+    - [ ] Refuse PR creation when preflight fails.
+    - [ ] Refuse PR creation when Product/DevEx review fails (missing marker treated as fail).
+    - [ ] Create PR only after all readiness gates pass.
+    - [ ] Assert idempotency: repeated calls do not duplicate PRs, diff artifacts, or review runs.
+    - [ ] Assert degraded mode (missing runId / diff artifact failure) fails closed with persisted diagnostics.
+  - [x] Run `bun test`.
+  - [x] Run `bun run typecheck`.
