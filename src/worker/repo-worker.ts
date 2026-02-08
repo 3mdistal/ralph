@@ -124,6 +124,8 @@ import { buildLoopTripDetails } from "../loop-detection/format";
 import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
 import { classifyOpencodeFailure } from "../opencode-error-classifier";
 import { derivePrCreateEscalationReason } from "./pr-create-escalation-reason";
+import { runResumeLane } from "./lanes/resume";
+import { runStartLane } from "./lanes/start";
 import { computeBlockedDecision, type RelationshipSignal } from "../github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "../github/issue-ref";
 import {
@@ -5060,6 +5062,17 @@ export class RepoWorker {
   }
 
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string; repoSlot?: number | null }): Promise<AgentRun> {
+    return await runResumeLane({
+      task,
+      opts,
+      run: () => this.resumeTaskOrchestration(task, opts),
+    });
+  }
+
+  private async resumeTaskOrchestration(
+    task: AgentTask,
+    opts?: { resumeMessage?: string; repoSlot?: number | null }
+  ): Promise<AgentRun> {
     const startTime = new Date();
 
     if (!isRepoAllowed(task.repo)) {
@@ -5989,7 +6002,19 @@ export class RepoWorker {
     }
   }
 
+  async startTask(task: AgentTask, opts?: { repoSlot?: number | null }): Promise<AgentRun> {
+    return await runStartLane({
+      task,
+      opts,
+      run: () => this.startTaskOrchestration(task, opts),
+    });
+  }
+
   async processTask(task: AgentTask, opts?: { repoSlot?: number | null }): Promise<AgentRun> {
+    return await this.startTask(task, opts);
+  }
+
+  private async startTaskOrchestration(task: AgentTask, opts?: { repoSlot?: number | null }): Promise<AgentRun> {
     const startTime = new Date();
 
     let workerId: string | undefined;
