@@ -28,7 +28,7 @@ export type ReviewDiffArtifacts = {
   headRef: string;
   diffPath: string;
   diffStat: string;
-  diffExcerpt: string;
+  diffExcerpt?: string;
 };
 
 export type ReviewGateResult = {
@@ -218,7 +218,7 @@ function buildReviewPrompt(params: {
   headRef: string;
   diffPath: string;
   diffStat: string;
-  diffExcerpt: string;
+  diffExcerpt?: string;
   issueContext?: string;
 }): string {
   const stat = (typeof params.diffStat === "string" ? params.diffStat : "").trim() || "(no changes)";
