@@ -21,7 +21,18 @@ export function createIssuePrResolver(params: {
   formatGhError: (error: unknown) => string;
   recordOpenPrSnapshot: (issueRef: string, prUrl: string) => void;
   cacheTtlMs?: number;
+  deps?: {
+    listOpenPrCandidatesForIssue?: typeof listOpenPrCandidatesForIssue;
+    normalizePrUrl?: typeof normalizePrUrl;
+    searchOpenPullRequestsByIssueLink?: typeof searchOpenPullRequestsByIssueLink;
+    viewPullRequest?: typeof viewPullRequest;
+  };
 }) {
+  const listOpenPrCandidates = params.deps?.listOpenPrCandidatesForIssue ?? listOpenPrCandidatesForIssue;
+  const normalize = params.deps?.normalizePrUrl ?? normalizePrUrl;
+  const searchOpenPrs = params.deps?.searchOpenPullRequestsByIssueLink ?? searchOpenPullRequestsByIssueLink;
+  const viewPr = params.deps?.viewPullRequest ?? viewPullRequest;
+
   const cache = new Map<string, IssuePrResolutionCacheEntry>();
   const cacheTtlMs =
     Number.isFinite(params.cacheTtlMs) && (params.cacheTtlMs ?? 0) >= 0
@@ -62,7 +73,7 @@ export function createIssuePrResolver(params: {
   };
 
   const resolveDbPrCandidates = async (issueNumber: number, diagnostics: string[]): Promise<ResolvedPrCandidate[]> => {
-    const rows = listOpenPrCandidatesForIssue(params.repo, issueNumber);
+    const rows = listOpenPrCandidates(params.repo, issueNumber);
     if (rows.length === 0) return [];
     diagnostics.push(`- DB PR candidates: ${rows.length}`);
 
@@ -70,12 +81,12 @@ export function createIssuePrResolver(params: {
     const seen = new Set<string>();
 
     for (const row of rows) {
-      const normalized = normalizePrUrl(row.url);
+      const normalized = normalize(row.url);
       if (seen.has(normalized)) continue;
       seen.add(normalized);
 
       try {
-        const view = await viewPullRequest(params.repo, row.url);
+        const view = await viewPr(params.repo, row.url);
         if (!view) continue;
         const state = String(view.state ?? "").toUpperCase();
         if (state !== "OPEN") continue;
@@ -100,7 +111,7 @@ export function createIssuePrResolver(params: {
   const resolveSearchPrCandidates = async (issueNumber: string, diagnostics: string[]): Promise<ResolvedPrCandidate[]> => {
     let searchResults: PullRequestSearchResult[] = [];
     try {
-      searchResults = await searchOpenPullRequestsByIssueLink(params.repo, issueNumber);
+      searchResults = await searchOpenPrs(params.repo, issueNumber);
     } catch (error: any) {
       diagnostics.push(`- GitHub PR search failed: ${params.formatGhError(error)}`);
       return [];
@@ -112,7 +123,7 @@ export function createIssuePrResolver(params: {
     const results: ResolvedPrCandidate[] = [];
     const seen = new Set<string>();
     for (const result of searchResults) {
-      const normalized = normalizePrUrl(result.url);
+      const normalized = normalize(result.url);
       if (seen.has(normalized)) continue;
       seen.add(normalized);
       results.push({
