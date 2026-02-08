@@ -97,7 +97,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
       if (workerId) task["worker-id"] = workerId;
       if (typeof allocatedSlot === "number") task["repo-slot"] = String(allocatedSlot);
       if (!markedStarting) {
-        throw new Error("Failed to mark task starting (bwrb edit failed)");
+        throw new Error("Failed to mark task starting (queue update failed)");
       }
 
       await this.ensureBranchProtectionOnce();
