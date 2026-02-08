@@ -39,6 +39,7 @@ import {
 } from "../session";
 import { buildPlannerPrompt } from "../planner-prompt";
 import { maybeRunParentVerificationLane } from "./parent-verification-lane";
+import type { ParentVerificationMarker } from "../parent-verification";
 import { appendChildDossierToIssueContext } from "../child-dossier/core";
 import { collectChildCompletionDossier } from "../child-dossier/io";
 import { getThrottleDecision } from "../throttle";
@@ -89,7 +90,7 @@ import {
   parseParentVerificationOutput,
 } from "../parent-verification/core";
 import { collectParentVerificationEvidence } from "../parent-verification/io";
-import { writeParentVerificationToGitHub } from "../github/parent-verification-writeback";
+import { writeParentVerificationNoPrCompletion, writeParentVerificationToGitHub } from "../github/parent-verification-writeback";
 import {
   buildCiDebugCommentBody,
   createCiDebugComment,
@@ -121,6 +122,7 @@ import {
 import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "../github/watchdog-writeback";
 import { buildLoopTripDetails } from "../loop-detection/format";
 import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
+import { classifyOpencodeFailure } from "../opencode-error-classifier";
 import { computeBlockedDecision, type RelationshipSignal } from "../github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "../github/issue-ref";
 import {
@@ -163,6 +165,7 @@ import {
   deleteIdempotencyKey,
   recordParentVerificationAttemptFailure,
   recordRalphRunGateArtifact,
+  recordRalphRunTracePointer,
   upsertIdempotencyKey,
   recordIssueSnapshot,
   PR_STATE_MERGED,
@@ -629,6 +632,13 @@ export class RepoWorker {
     const updated = await this.queue.updateTaskStatus(task, status, { "run-log-path": runLogPath });
     if (!updated) {
       console.warn(`[ralph:worker:${this.repo}] Failed to persist run-log-path (continuing): ${runLogPath}`);
+    }
+    if (this.activeRunId) {
+      recordRalphRunTracePointer({
+        runId: this.activeRunId,
+        kind: "run_log_path",
+        path: runLogPath,
+      });
     }
     return runLogPath;
   }
@@ -1387,6 +1397,30 @@ export class RepoWorker {
         }`
       );
     }
+  }
+
+  private async parkTaskWaitingOnOpenPr(task: AgentTask, issueNumber: string, prUrl: string): Promise<AgentRun> {
+    const patch: Record<string, string> = {
+      "session-id": "",
+      "worktree-path": "",
+      "worker-id": "",
+      "repo-slot": "",
+      "daemon-id": "",
+      "heartbeat-at": "",
+    };
+    const updated = await this.queue.updateTaskStatus(task, "waiting-on-pr", patch);
+    if (updated) {
+      applyTaskPatch(task, "waiting-on-pr", patch);
+    }
+    this.updateOpenPrSnapshot(task, null, prUrl);
+    console.log(
+      `[ralph:worker:${this.repo}] Parking ${task.issue} in waiting-on-pr for open PR ${prUrl} (issue ${issueNumber})`
+    );
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "success",
+    };
   }
 
   /**
@@ -2290,6 +2324,12 @@ export class RepoWorker {
     const message = this.getGhErrorSearchText(error);
     if (!message) return false;
     return /not up to date with the base branch/i.test(message);
+  }
+
+  private isBaseBranchModifiedMergeError(error: any): boolean {
+    const message = this.getGhErrorSearchText(error);
+    if (!message) return false;
+    return /base branch was modified/i.test(message);
   }
 
   private isRequiredChecksExpectedMergeError(error: any): boolean {
@@ -4098,6 +4138,7 @@ export class RepoWorker {
       deleteMergedPrHeadBranchBestEffort: async (input) => await this.deleteMergedPrHeadBranchBestEffort(input as any),
       normalizeGitRef: (ref) => this.normalizeGitRef(ref),
       isOutOfDateMergeError: (err) => this.isOutOfDateMergeError(err as any),
+      isBaseBranchModifiedMergeError: (err) => this.isBaseBranchModifiedMergeError(err as any),
       isRequiredChecksExpectedMergeError: (err) => this.isRequiredChecksExpectedMergeError(err as any),
       waitForRequiredChecks: async (url, checks, opts) => await this.waitForRequiredChecks(url, checks, opts),
       runCiFailureTriage: async (input) => await this.runCiFailureTriage(input as any),
@@ -4163,6 +4204,10 @@ export class RepoWorker {
     task: AgentTask;
     issueNumber: string;
     issueMeta: IssueMetadata;
+    startTime: Date;
+    cacheKey: string;
+    workerId?: string;
+    allocatedSlot?: number | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
     opencodeSessionOptions?: RunSessionOptionsBase;
   }): Promise<AgentRun | null> {
@@ -4191,6 +4236,69 @@ export class RepoWorker {
       writeEscalationWriteback: this.writeEscalationWriteback.bind(this),
       notifyEscalation: this.notify.notifyEscalation.bind(this.notify),
       recordEscalatedRunNote: this.recordEscalatedRunNote.bind(this),
+      finalizeVerifiedNoPrCompletion: async ({ task, issueNumber, marker, sessionId, output }) => {
+        return await this.finalizeVerifiedNoPrCompletion({
+          task,
+          issueNumber,
+          marker,
+          startTime: params.startTime,
+          cacheKey: params.cacheKey,
+          sessionId,
+          output,
+          opencodeXdg: params.opencodeXdg,
+          workerId: params.workerId,
+          repoSlot: params.allocatedSlot,
+        });
+      },
+    });
+  }
+
+  private async finalizeVerifiedNoPrCompletion(params: {
+    task: AgentTask;
+    issueNumber: number;
+    marker: ParentVerificationMarker;
+    startTime: Date;
+    cacheKey: string;
+    sessionId?: string;
+    output?: string;
+    opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    workerId?: string;
+    repoSlot?: number | null;
+  }): Promise<AgentRun> {
+    const writeback = await writeParentVerificationNoPrCompletion(
+      {
+        repo: this.repo,
+        issueNumber: params.issueNumber,
+        marker: params.marker,
+      },
+      { github: this.github }
+    );
+
+    if (!writeback.ok) {
+      throw new Error(writeback.error ?? "Parent verification writeback failed");
+    }
+
+    const issueUrl = `https://github.com/${this.repo}/issues/${params.issueNumber}`;
+    recordIssueSnapshot({
+      repo: this.repo,
+      issue: params.task.issue,
+      state: "CLOSED",
+      url: issueUrl,
+    });
+
+    return await this.finalizeTaskSuccess({
+      task: params.task,
+      prUrl: null,
+      completionKind: "verified",
+      sessionId: params.sessionId || params.task["session-id"]?.trim() || "parent-verify-no-pr",
+      startTime: params.startTime,
+      cacheKey: `parent-verify-${params.cacheKey}`,
+      opencodeXdg: params.opencodeXdg,
+      workerId: params.workerId,
+      repoSlot: typeof params.repoSlot === "number" ? String(params.repoSlot) : undefined,
+      notify: true,
+      logMessage: `Task verified via comment-only completion: ${params.task.name}`,
+      surveyResults: params.output,
     });
   }
 
@@ -5561,7 +5669,11 @@ export class RepoWorker {
 
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
-        await this.markTaskBlocked(task, "runtime-error", { reason, details });
+        const classification = classifyOpencodeFailure(`${reason}\n${details}`);
+        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
+          reason: classification?.reason ?? reason,
+          details,
+        });
       }
 
       return {
@@ -5818,6 +5930,10 @@ export class RepoWorker {
         task,
         issueNumber,
         issueMeta,
+        startTime,
+        cacheKey,
+        workerId,
+        allocatedSlot,
         opencodeXdg,
         opencodeSessionOptions,
       });
@@ -5920,6 +6036,18 @@ export class RepoWorker {
       });
       if (ciFailureRun) return ciFailureRun;
 
+      const existingPrForQueue = await this.getIssuePrResolution(issueNumber);
+      if (existingPrForQueue.selectedUrl) {
+        if (existingPrForQueue.duplicates.length > 0) {
+          console.log(
+            `[ralph:worker:${this.repo}] Duplicate PRs detected for ${task.issue}: ${existingPrForQueue.duplicates.join(
+              ", "
+            )}`
+          );
+        }
+        return await this.parkTaskWaitingOnOpenPr(task, issueNumber, existingPrForQueue.selectedUrl);
+      }
+
       // 4. Determine whether this is an implementation-ish task
       const isImplementationTask = isImplementationTaskFromIssue(issueMeta);
 
@@ -6014,10 +6142,11 @@ export class RepoWorker {
           return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
         }
 
-        const reason = `planner failed: ${planResult.output}`;
+        const classification = classifyOpencodeFailure(planResult.output);
+        const reason = classification?.reason ?? `planner failed: ${planResult.output}`;
         const details = planResult.output;
 
-        await this.markTaskBlocked(task, "runtime-error", {
+        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
           reason,
           details,
           sessionId: planResult.sessionId,
@@ -6817,7 +6946,11 @@ export class RepoWorker {
 
         const reason = error?.message ?? String(error);
         const details = error?.stack ?? reason;
-        await this.markTaskBlocked(task, "runtime-error", { reason, details });
+        const classification = classifyOpencodeFailure(`${reason}\n${details}`);
+        await this.markTaskBlocked(task, classification?.blockedSource ?? "runtime-error", {
+          reason: classification?.reason ?? reason,
+          details,
+        });
       }
 
       return {

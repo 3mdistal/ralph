@@ -3,6 +3,7 @@ import { existsSync, statSync } from "fs";
 
 import { formatDuration } from "../logging";
 import { getRalphEventsDayLogPath, getRalphEventsDir } from "../paths";
+import { parseTimestampMs, resolveTimeRange } from "../time-range";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_SINCE_MS = 24 * 60 * 60 * 1000;
@@ -191,41 +192,6 @@ function listUtcDaysBetweenInclusive(sinceMs: number, untilMs: number): string[]
     days.push(msToUtcDay(cursor));
   }
   return days;
-}
-
-function parseDurationMs(value: string | null): number | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  if (/^\d+$/.test(trimmed)) return Number(trimmed);
-  const match = trimmed.match(/^(\d+(?:\.\d+)?)(ms|s|m|h)$/);
-  if (!match) return null;
-  const amount = Number(match[1]);
-  if (!Number.isFinite(amount)) return null;
-  switch (match[2]) {
-    case "ms":
-      return amount;
-    case "s":
-      return amount * 1000;
-    case "m":
-      return amount * 60_000;
-    case "h":
-      return amount * 60 * 60_000;
-    default:
-      return null;
-  }
-}
-
-function parseTimestampMs(value: string | null): number | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  if (/^\d+$/.test(trimmed)) {
-    const ms = Number(trimmed);
-    return Number.isFinite(ms) ? ms : null;
-  }
-  const ms = Date.parse(trimmed);
-  return Number.isFinite(ms) ? ms : null;
 }
 
 function getFlagValue(args: string[], flag: string): string | null {
@@ -785,17 +751,14 @@ export async function runGithubUsageCommand(opts: { args: string[] }): Promise<v
     sinceMs = dayMs;
     untilMs = dayMs + DAY_MS - 1;
   } else {
-    const untilRaw = getFlagValue(args, "--until");
-    untilMs = parseTimestampMs(untilRaw) ?? nowMs;
-
-    const sinceRaw = getFlagValue(args, "--since");
-    const absSince = parseTimestampMs(sinceRaw);
-    if (absSince != null) {
-      sinceMs = absSince;
-    } else {
-      const dur = parseDurationMs(sinceRaw) ?? DEFAULT_SINCE_MS;
-      sinceMs = untilMs - dur;
-    }
+    const { sinceMs: resolvedSince, untilMs: resolvedUntil } = resolveTimeRange({
+      sinceRaw: getFlagValue(args, "--since"),
+      untilRaw: getFlagValue(args, "--until"),
+      defaultSinceMs: DEFAULT_SINCE_MS,
+      nowMs,
+    });
+    sinceMs = resolvedSince;
+    untilMs = resolvedUntil;
   }
 
   if (!Number.isFinite(sinceMs) || !Number.isFinite(untilMs)) {

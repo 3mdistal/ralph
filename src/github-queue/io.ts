@@ -18,8 +18,10 @@ import {
 } from "../github/issue-label-io";
 import {
   getIssueLabels,
+  getIssueStatusTransitionRecord,
   getIssueSnapshotByNumber,
   getTaskOpStateByPath,
+  recordIssueStatusTransition,
   getRepoLabelSchemeState,
   listIssueSnapshotsWithRalphLabels,
   listOpenPrCandidatesForIssue,
@@ -34,6 +36,7 @@ import {
 } from "../state";
 import type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "../queue/types";
 import { computeStaleInProgressRecovery, deriveTaskView, planClaim, statusToRalphLabelDelta, type LabelOp } from "./core";
+import { deriveRalphStatus, shouldDebounceOppositeStatusTransition, type LabelTransitionState } from "./core";
 import {
   RALPH_LABEL_STATUS_ESCALATED,
   RALPH_LABEL_STATUS_IN_PROGRESS,
@@ -51,6 +54,8 @@ const DEFAULT_LIVE_LABELS_ERROR_COOLDOWN_MS = 60_000;
 const LIVE_LABELS_TELEMETRY_SOURCE = "queue:claim:labels";
 
 const DEFAULT_MISSING_SESSION_GRACE_MS = 2 * 60_000;
+const DEFAULT_OPEN_PR_SNAPSHOT_FRESHNESS_MS = 60 * 60_000;
+const DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS = 5 * 60_000;
 
 const DISABLE_SWEEPS_ENV = "RALPH_GITHUB_QUEUE_DISABLE_SWEEPS";
 
@@ -92,6 +97,8 @@ type GitHubQueueDeps = {
   io?: GitHubQueueIO;
   relationshipsProviderFactory?: (repo: string) => IssueRelationshipProvider;
 };
+
+const recentStatusTransitions = new Map<string, LabelTransitionState>();
 
 type GitHubQueueIO = {
   ensureWorkflowLabels: (repo: string) => Promise<EnsureOutcome>;
@@ -293,6 +300,80 @@ function normalizeTaskExtraFields(extraFields?: Record<string, string | number>)
     }
   }
   return normalized;
+}
+
+function buildTransitionKey(repo: string, issueNumber: number): string {
+  return `${repo}#${issueNumber}`;
+}
+
+function toTransitionState(record: { fromStatus: string | null; toStatus: string; reason: string; updatedAtMs: number }): LabelTransitionState {
+  return {
+    fromStatus: record.fromStatus as QueueTaskStatus | null,
+    toStatus: record.toStatus as QueueTaskStatus,
+    reason: record.reason,
+    atMs: record.updatedAtMs,
+  };
+}
+
+function hasFreshOpenPrSnapshot(repo: string, issueNumber: number, nowMs: number, freshnessMs: number): boolean {
+  const candidates = listOpenPrCandidatesForIssue(repo, issueNumber);
+  if (candidates.length === 0) return false;
+  if (freshnessMs <= 0) return true;
+  return candidates.some((candidate) => {
+    const updatedAtMs = Date.parse(candidate.updatedAt);
+    if (!Number.isFinite(updatedAtMs)) return false;
+    return nowMs - updatedAtMs <= freshnessMs;
+  });
+}
+
+function shouldSuppressStatusTransition(params: {
+  repo: string;
+  issueNumber: number;
+  fromStatus: QueueTaskStatus | null;
+  toStatus: QueueTaskStatus;
+  reason: string;
+  nowMs: number;
+  windowMs: number;
+}): { suppress: boolean; reason?: string } {
+  const key = buildTransitionKey(params.repo, params.issueNumber);
+  const cached = recentStatusTransitions.get(key) ?? null;
+  const stored = cached ? null : getIssueStatusTransitionRecord(params.repo, params.issueNumber);
+  const previous = cached ?? (stored ? toTransitionState(stored) : null);
+
+  return shouldDebounceOppositeStatusTransition({
+    fromStatus: params.fromStatus,
+    toStatus: params.toStatus,
+    reason: params.reason,
+    nowMs: params.nowMs,
+    windowMs: params.windowMs,
+    previous,
+  });
+}
+
+function recordStatusTransition(params: {
+  repo: string;
+  issueNumber: number;
+  fromStatus: QueueTaskStatus | null;
+  toStatus: QueueTaskStatus;
+  reason: string;
+  nowMs: number;
+}): void {
+  const key = buildTransitionKey(params.repo, params.issueNumber);
+  const state: LabelTransitionState = {
+    fromStatus: params.fromStatus,
+    toStatus: params.toStatus,
+    reason: params.reason,
+    atMs: params.nowMs,
+  };
+  recentStatusTransitions.set(key, state);
+  recordIssueStatusTransition({
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    fromStatus: params.fromStatus,
+    toStatus: params.toStatus,
+    reason: params.reason,
+    updatedAtMs: params.nowMs,
+  });
 }
 
 function parseIssueFetchResult(raw: unknown): IssueFetchResult | null {
@@ -505,6 +586,14 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_MISSING_SESSION_GRACE_MS", DEFAULT_MISSING_SESSION_GRACE_MS),
       DEFAULT_MISSING_SESSION_GRACE_MS
     );
+    const openPrFreshnessMs = clampNonNegativeInt(
+      readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_OPEN_PR_SNAPSHOT_FRESHNESS_MS", DEFAULT_OPEN_PR_SNAPSHOT_FRESHNESS_MS),
+      DEFAULT_OPEN_PR_SNAPSHOT_FRESHNESS_MS
+    );
+    const debounceWindowMs = clampNonNegativeInt(
+      readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_STATUS_DEBOUNCE_MS", DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS),
+      DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS
+    );
     const nowIso = getNowIso(deps);
 
     for (const repo of getConfig().repos.map((entry) => entry.name)) {
@@ -528,6 +617,35 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           graceMs: missingSessionGraceMs,
         });
         if (!recovery.shouldRecover) continue;
+
+        const currentStatus = deriveRalphStatus(issue.labels, issue.state);
+        const waitingOnPr = (opState?.status ?? "").trim() === "waiting-on-pr";
+        if (waitingOnPr && hasFreshOpenPrSnapshot(repo, issue.number, nowMs, openPrFreshnessMs)) {
+          if (shouldLog(`queue:stale-sweep:waiting-on-pr:${repo}#${issue.number}`, 60_000)) {
+            console.warn(
+              `[ralph:queue:github] Skipping stale recovery for ${repo}#${issue.number}; waiting-on-pr with fresh open PR snapshot`
+            );
+          }
+          continue;
+        }
+
+        const transitionGuard = shouldSuppressStatusTransition({
+          repo,
+          issueNumber: issue.number,
+          fromStatus: currentStatus,
+          toStatus: "queued",
+          reason: recovery.reason ?? "stale-in-progress",
+          nowMs,
+          windowMs: debounceWindowMs,
+        });
+        if (transitionGuard.suppress) {
+          console.warn(
+            `[ralph:queue:github] Suppressed stale recovery transition for ${repo}#${issue.number}: ${
+              transitionGuard.reason ?? "debounced"
+            }`
+          );
+          continue;
+        }
 
         try {
           releaseTaskSlot({
@@ -565,11 +683,27 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
 
             if (labelOps.ok) {
               applyLabelDelta({ repo, issueNumber: issue.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+              recordStatusTransition({
+                repo,
+                issueNumber: issue.number,
+                fromStatus: currentStatus,
+                toStatus: "queued",
+                reason: recovery.reason ?? "stale-in-progress",
+                nowMs,
+              });
             } else if (labelOps.kind !== "transient") {
               throw labelOps.error;
             }
           } else {
             applyLabelDelta({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
+            recordStatusTransition({
+              repo,
+              issueNumber: issue.number,
+              fromStatus: currentStatus,
+              toStatus: "queued",
+              reason: recovery.reason ?? "stale-in-progress",
+              nowMs,
+            });
           }
 
           const reason = recovery.reason ? ` reason=${recovery.reason}` : "";
@@ -759,6 +893,31 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
 
         const nowIso = new Date(opts.nowMs).toISOString();
         const taskPath = opState.taskPath || `github:${issueRef.repo}#${issueRef.number}`;
+        const debounceWindowMs = clampNonNegativeInt(
+          readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_STATUS_DEBOUNCE_MS", DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS),
+          DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS
+        );
+        const currentStatus = deriveRalphStatus(issue.labels, issue.state);
+
+        const transitionGuard = shouldSuppressStatusTransition({
+          repo: issueRef.repo,
+          issueNumber: issueRef.number,
+          fromStatus: currentStatus,
+          toStatus: "in-progress",
+          reason: "claim-task",
+          nowMs: opts.nowMs,
+          windowMs: debounceWindowMs,
+        });
+        if (transitionGuard.suppress) {
+          if (shouldLog(`queue:claim:debounced:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+            console.warn(
+              `[ralph:queue:github] Suppressed claim transition for ${issueRef.repo}#${issueRef.number}: ${
+                transitionGuard.reason ?? "debounced"
+              }`
+            );
+          }
+          return { claimed: false, task: opts.task, reason: transitionGuard.reason ?? "Debounced status transition" };
+        }
 
         try {
           await io.ensureWorkflowLabels(issueRef.repo);
@@ -799,6 +958,14 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               remove: labelOps.remove,
               nowIso,
             });
+            recordStatusTransition({
+              repo: issueRef.repo,
+              issueNumber: issueRef.number,
+              fromStatus: currentStatus,
+              toStatus: "in-progress",
+              reason: "claim-task",
+              nowMs: opts.nowMs,
+            });
           }
         } else {
           applyLabelDelta({
@@ -807,6 +974,14 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             add: claimDelta.add,
             remove: claimDelta.remove,
             nowIso,
+          });
+          recordStatusTransition({
+            repo: issueRef.repo,
+            issueNumber: issueRef.number,
+            fromStatus: currentStatus,
+            toStatus: "in-progress",
+            reason: "claim-task",
+            nowMs: opts.nowMs,
           });
         }
 
@@ -830,6 +1005,17 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         });
 
         return { claimed: true, task: view };
+      }
+
+      const waitingOnPr = (opState.status ?? "").trim() === "waiting-on-pr";
+      if (waitingOnPr) {
+        const openPrFreshnessMs = clampNonNegativeInt(
+          readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_OPEN_PR_SNAPSHOT_FRESHNESS_MS", DEFAULT_OPEN_PR_SNAPSHOT_FRESHNESS_MS),
+          DEFAULT_OPEN_PR_SNAPSHOT_FRESHNESS_MS
+        );
+        if (hasFreshOpenPrSnapshot(issueRef.repo, issueRef.number, opts.nowMs, openPrFreshnessMs)) {
+          return { claimed: false, task: opts.task, reason: "Waiting on open PR" };
+        }
       }
 
       // Stop switch: if paused label is present, do not claim or heartbeat.
@@ -983,6 +1169,11 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       const preserveStoppedLabel =
         Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_STOPPED)) && status !== "stopped" && status !== "done";
       const shouldPreserveLabel = preservePausedLabel || preserveEscalatedLabel || preserveStoppedLabel;
+      const currentStatus = issue ? deriveRalphStatus(issue.labels, issue.state) : null;
+      const debounceWindowMs = clampNonNegativeInt(
+        readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_STATUS_DEBOUNCE_MS", DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS),
+        DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS
+      );
       const delta = shouldPreserveLabel
         ? { add: [], remove: [] }
         : (issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] });
@@ -994,7 +1185,25 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         add: steps.filter((step) => step.action === "add").map((step) => step.label),
         remove: steps.filter((step) => step.action === "remove").map((step) => step.label),
       };
-      if (issue && (updateDelta.add.length > 0 || updateDelta.remove.length > 0)) {
+      const transitionGuard = shouldSuppressStatusTransition({
+        repo: issueRef.repo,
+        issueNumber: issueRef.number,
+        fromStatus: currentStatus,
+        toStatus: status,
+        reason: `update-task-status:${status}`,
+        nowMs: Date.parse(nowIso),
+        windowMs: debounceWindowMs,
+      });
+      if (transitionGuard.suppress && updateDelta.add.length + updateDelta.remove.length > 0) {
+        if (shouldLog(`queue:update-status:debounced:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+          console.warn(
+            `[ralph:queue:github] Suppressed status transition for ${issueRef.repo}#${issueRef.number}: ${
+              transitionGuard.reason ?? "debounced"
+            }`
+          );
+        }
+      }
+      if (issue && (updateDelta.add.length > 0 || updateDelta.remove.length > 0) && !transitionGuard.suppress) {
         const didMutate = await io.mutateIssueLabels({
           repo: issueRef.repo,
           issueNumber: issueRef.number,
@@ -1014,6 +1223,14 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           });
           if (labelOps.ok) {
             applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: labelOps.add, remove: labelOps.remove, nowIso });
+            recordStatusTransition({
+              repo: issueRef.repo,
+              issueNumber: issueRef.number,
+              fromStatus: currentStatus,
+              toStatus: status,
+              reason: `update-task-status:${status}`,
+              nowMs: Date.parse(nowIso),
+            });
           } else if (labelOps.kind !== "transient") {
             if (shouldLog(`ralph:queue:github:label-ops:${issueRef.repo}#${issueRef.number}`, 60_000)) {
               console.warn(
@@ -1023,6 +1240,14 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           }
         } else {
           applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: updateDelta.add, remove: updateDelta.remove, nowIso });
+          recordStatusTransition({
+            repo: issueRef.repo,
+            issueNumber: issueRef.number,
+            fromStatus: currentStatus,
+            toStatus: status,
+            reason: `update-task-status:${status}`,
+            nowMs: Date.parse(nowIso),
+          });
         }
       }
 
