@@ -58,6 +58,20 @@ type CmdRecord = {
   reason?: string;
 };
 
+type IssueTimelineLabelEvent = {
+  id?: number | string | null;
+  event?: string | null;
+  label?: { name?: string | null } | null;
+};
+
+type LabelEventSummary = {
+  latestLabeledEventId: string | null;
+  latestUnlabeledEventId: string | null;
+  activeLabeledEventId: string | null;
+};
+
+type QueueOnEscalatedDecision = { outcome: "apply" | "refuse" | "unknown"; reason?: string };
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -101,53 +115,115 @@ function applyLabelDeltaSnapshot(params: {
   });
 }
 
-async function fetchLatestCmdLabelEventId(params: {
-  github: GitHubClient;
-  repo: string;
-  issueNumber: number;
-  label: string;
-}): Promise<string | null> {
-  const { owner, name } = splitRepoFullName(params.repo);
+function parseEventIdBigInt(value: string | null | undefined): bigint | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!/^\d+$/.test(trimmed)) return null;
   try {
-    const perPage = 100;
-    const maxPages = 10;
-    const target = params.label.toLowerCase();
-
-    let lastLabeled: number | null = null;
-    let lastUnlabeled: number | null = null;
-
-    for (let page = 1; page <= maxPages; page += 1) {
-      const response = await params.github.request<
-        Array<{
-          id?: number | null;
-          event?: string | null;
-          created_at?: string | null;
-          label?: { name?: string | null } | null;
-        }>
-      >(`/repos/${owner}/${name}/issues/${params.issueNumber}/events?per_page=${perPage}&page=${page}`);
-      const events = response.data ?? [];
-      if (events.length === 0) break;
-
-      for (const ev of events) {
-        const name = (ev?.label?.name ?? "").toLowerCase();
-        if (!name || name !== target) continue;
-        const id = typeof ev?.id === "number" ? ev.id : Number(ev?.id ?? 0);
-        if (!id) continue;
-        const kind = (ev?.event ?? "").toLowerCase();
-        if (kind === "labeled") {
-          if (!lastLabeled || id > lastLabeled) lastLabeled = id;
-        } else if (kind === "unlabeled") {
-          if (!lastUnlabeled || id > lastUnlabeled) lastUnlabeled = id;
-        }
-      }
-
-    }
-
-    if (lastLabeled && (!lastUnlabeled || lastLabeled > lastUnlabeled)) return String(lastLabeled);
-    return lastLabeled ? String(lastLabeled) : null;
+    return BigInt(trimmed);
   } catch {
     return null;
   }
+}
+
+function toEventIdString(value: number | string | null | undefined): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const normalized = Math.trunc(value);
+    return normalized > 0 ? String(normalized) : null;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  return null;
+}
+
+function summarizeLabelEvents(events: IssueTimelineLabelEvent[], label: string): LabelEventSummary {
+  const target = label.toLowerCase();
+  let lastLabeled: bigint | null = null;
+  let lastUnlabeled: bigint | null = null;
+  let latestLabeledEventId: string | null = null;
+  let latestUnlabeledEventId: string | null = null;
+
+  for (const ev of events) {
+    const name = (ev?.label?.name ?? "").toLowerCase();
+    if (!name || name !== target) continue;
+    const rawId = toEventIdString(ev?.id ?? null);
+    const eventId = parseEventIdBigInt(rawId);
+    if (!eventId || !rawId) continue;
+    const kind = (ev?.event ?? "").toLowerCase();
+    if (kind === "labeled") {
+      if (!lastLabeled || eventId > lastLabeled) {
+        lastLabeled = eventId;
+        latestLabeledEventId = rawId;
+      }
+    } else if (kind === "unlabeled") {
+      if (!lastUnlabeled || eventId > lastUnlabeled) {
+        lastUnlabeled = eventId;
+        latestUnlabeledEventId = rawId;
+      }
+    }
+  }
+
+  const activeLabeledEventId =
+    lastLabeled && (!lastUnlabeled || lastLabeled > lastUnlabeled) ? latestLabeledEventId : null;
+
+  return {
+    latestLabeledEventId,
+    latestUnlabeledEventId,
+    activeLabeledEventId,
+  };
+}
+
+function decideQueueOnEscalated(params: {
+  hasEscalatedLabel: boolean;
+  cmdEventId: string | null;
+  escalatedEventId: string | null;
+}): QueueOnEscalatedDecision {
+  if (!params.hasEscalatedLabel) return { outcome: "apply" };
+  const queueEventId = parseEventIdBigInt(params.cmdEventId);
+  const escalatedEventId = parseEventIdBigInt(params.escalatedEventId);
+  if (!queueEventId || !escalatedEventId) {
+    return { outcome: "unknown" };
+  }
+  if (queueEventId <= escalatedEventId) {
+    return {
+      outcome: "refuse",
+      reason:
+        "Queue command predates the active escalation. Apply `ralph:cmd:queue` again after reviewing the escalation note.",
+    };
+  }
+  return { outcome: "apply" };
+}
+
+async function fetchIssueLabelEventSummaries(params: {
+  github: GitHubClient;
+  repo: string;
+  issueNumber: number;
+  labels: string[];
+}): Promise<Map<string, LabelEventSummary>> {
+  const { owner, name } = splitRepoFullName(params.repo);
+  const out = new Map<string, LabelEventSummary>();
+  const targets = new Set(params.labels.map((label) => label.toLowerCase()));
+  try {
+    const response = await params.github.request<IssueTimelineLabelEvent[]>(
+      `/repos/${owner}/${name}/issues/${params.issueNumber}/events?per_page=100`
+    );
+    const events = response.data ?? [];
+    for (const label of targets) {
+      out.set(label, summarizeLabelEvents(events, label));
+    }
+  } catch {
+    for (const label of targets) {
+      out.set(label, {
+        latestLabeledEventId: null,
+        latestUnlabeledEventId: null,
+        activeLabeledEventId: null,
+      });
+    }
+  }
+  return out;
 }
 
 function parseCmdRecord(payload: string | null): CmdRecord | null {
@@ -199,12 +275,16 @@ export async function processOneCommand(
   const at = nowIso();
   const issueRef = `${params.repo}#${params.issueNumber}`;
 
-  const eventId = await fetchLatestCmdLabelEventId({
+  const eventSummaries = await fetchIssueLabelEventSummaries({
     github,
     repo: params.repo,
     issueNumber: params.issueNumber,
-    label: params.cmdLabel,
+    labels: [params.cmdLabel, RALPH_LABEL_STATUS_ESCALATED],
   });
+  const cmdSummary = eventSummaries.get(params.cmdLabel.toLowerCase());
+  const escalationSummary = eventSummaries.get(RALPH_LABEL_STATUS_ESCALATED.toLowerCase());
+  const eventId = cmdSummary?.activeLabeledEventId ?? cmdSummary?.latestLabeledEventId ?? null;
+  const escalatedEventId = escalationSummary?.activeLabeledEventId ?? null;
   const key = buildCmdEventKey({ repo: params.repo, issueNumber: params.issueNumber, cmdLabel: params.cmdLabel, eventId });
 
   const existingPayload = getIdempotencyPayload(key);
@@ -350,25 +430,45 @@ export async function processOneCommand(
             ? "paused"
             : "stopped";
 
-      releaseTaskSlot({
-        repo: params.repo,
-        issueNumber: params.issueNumber,
-        status: desiredStatus,
-        releasedReason: `cmd:${params.cmdLabel}`,
-      });
+      if (params.cmdLabel === RALPH_LABEL_CMD_QUEUE) {
+        const queueDecision = decideQueueOnEscalated({
+          hasEscalatedLabel: params.currentLabels.includes(RALPH_LABEL_STATUS_ESCALATED),
+          cmdEventId: eventId,
+          escalatedEventId,
+        });
+        if (queueDecision.outcome === "refuse") {
+          decision = "refused";
+          reason = queueDecision.reason;
+          addLabels = [];
+          removeLabels = [params.cmdLabel];
+        } else if (queueDecision.outcome === "unknown") {
+          console.warn(
+            `${TELEMETRY_PREFIX} ${issueRef} queue-causality-unknown cmdEventId=${eventId ?? "none"} escalatedEventId=${escalatedEventId ?? "none"}`
+          );
+        }
+      }
 
-      const delta =
-        desiredStatus === "queued"
-          ? buildQueueLabelDelta(params.currentLabels)
-          : statusToRalphLabelDelta(desiredStatus as any, params.currentLabels);
-      addLabels = delta.add;
-      removeLabels = [...delta.remove, params.cmdLabel];
-      reason =
-        desiredStatus === "queued"
-          ? "Re-queued."
-          : desiredStatus === "paused"
-            ? "Paused."
-            : "Stopped (operator cancel).";
+      if (decision !== "refused") {
+        releaseTaskSlot({
+          repo: params.repo,
+          issueNumber: params.issueNumber,
+          status: desiredStatus,
+          releasedReason: `cmd:${params.cmdLabel}`,
+        });
+
+        const delta =
+          desiredStatus === "queued"
+            ? buildQueueLabelDelta(params.currentLabels)
+            : statusToRalphLabelDelta(desiredStatus as any, params.currentLabels);
+        addLabels = delta.add;
+        removeLabels = [...delta.remove, params.cmdLabel];
+        reason =
+          desiredStatus === "queued"
+            ? "Re-queued."
+            : desiredStatus === "paused"
+              ? "Paused."
+              : "Stopped (operator cancel).";
+      }
     }
 
     const ops = planIssueLabelOps({ add: addLabels, remove: removeLabels });
@@ -403,7 +503,9 @@ export async function processOneCommand(
   };
 
   const statusLine =
-    params.cmdLabel === RALPH_LABEL_CMD_QUEUE
+    decision === "refused"
+      ? "Refused: stale `ralph:cmd:queue` command did not clear escalation."
+      : params.cmdLabel === RALPH_LABEL_CMD_QUEUE
       ? `Applied: set ${RALPH_LABEL_STATUS_QUEUED}.`
       : params.cmdLabel === RALPH_LABEL_CMD_PAUSE
         ? `Applied: set ${RALPH_LABEL_STATUS_PAUSED}.`
