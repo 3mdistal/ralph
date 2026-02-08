@@ -2531,6 +2531,7 @@ export class RepoWorker {
       `This issue already has an open PR with merge conflicts blocking CI: ${prUrl}.`,
       `Resolve merge conflicts by merging '${baseName}' into the PR branch (no rebase or force-push).`,
       "The base branch has already been merged into the PR branch in this worktree; finish the merge and resolve conflicts if present.",
+      "Do not use /tmp or any external-directory path; keep temporary files inside this worktree (for example ./.ralph-tmp/).",
       "Do NOT create a new PR.",
       "After resolving conflicts, run tests/typecheck/build/knip and push updates on the PR branch.",
       "",
