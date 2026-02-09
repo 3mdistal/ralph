@@ -554,6 +554,7 @@ Schema: `{ "version": 1, "mode": "running"|"draining"|"paused", "pause_requested
 `ralphctl` wraps the control file and restart flow:
 
 - `ralphctl status [--json]`
+- `ralphctl doctor [--json] [--repair] [--dry-run]`
 - `ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]`
 - `ralphctl resume`
 - `ralphctl restart [--grace 5m] [--start-cmd "<command>"]`
@@ -566,6 +567,25 @@ Daemon discovery for restart/upgrade uses a lease record at:
 - Last resort: `/tmp/ralph/<uid>/daemon.json`
 
 The daemon writes this file on startup (PID, daemonId, and start command). Use `--start-cmd` to override when needed.
+
+`ralphctl doctor` audits daemon record and control file consistency across canonical and legacy roots, reports stale/conflicting records, and recommends safe repairs.
+
+- Default mode is read-only (no state changes).
+- Use `--repair` to apply safe, explicit repairs only.
+- Use `--dry-run` with `--repair` to preview applied actions without mutation.
+
+Exit codes:
+
+- `0`: healthy (`overall_status = "ok"`)
+- `1`: findings present (`overall_status = "warn" | "error"`)
+- `2`: usage error or unexpected internal failure
+
+`ralphctl doctor --json` contract (schema v1, additive-only evolution):
+
+- Top-level required fields: `schema_version`, `timestamp`, `overall_status`, `ok`
+- Candidate arrays: `daemon_candidates[]`, `control_candidates[]`, `roots[]`
+- Decision arrays: `findings[]`, `recommended_repairs[]`, `applied_repairs[]`
+- Stable identifiers: each finding includes `code`; each repair includes `id` and `code`
 
 ## Managed OpenCode config (daemon runs)
 
