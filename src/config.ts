@@ -1598,14 +1598,17 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
     } else if (defaultProfile && profiles[defaultProfile]) {
       loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
+    } else if (defaultProfile) {
+      // Keep the invalid value so downstream profile resolution can fail closed.
+      // (Avoid silently selecting a different profile when the user explicitly configured one.)
+      console.warn(
+        `[ralph] Invalid config opencode.defaultProfile=${JSON.stringify(defaultProfile)}; keeping value (will fail closed if unresolvable)`
+      );
+      loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
     } else {
+      // No default specified; pick a stable fallback so callers have a deterministic default.
       const fallback = profileNames[0] ?? "";
       if (fallback) {
-        if (defaultProfile) {
-          console.warn(
-            `[ralph] Invalid config opencode.defaultProfile=${JSON.stringify(defaultProfile)}; falling back to ${JSON.stringify(fallback)}`
-          );
-        }
         loaded.opencode = attachManaged({ enabled: true, defaultProfile: fallback, profiles });
       } else {
         loaded.opencode = attachManaged({ enabled: false });

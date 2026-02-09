@@ -73,6 +73,28 @@ describe("OpenCode config env", () => {
     expect(env.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
   });
 
+  test("keeps managed OPENCODE_CONFIG_DIR shared across profile switches", () => {
+    const appleDataHome = join(homeDir, ".opencode-profiles", "apple", "data");
+    const googleDataHome = join(homeDir, ".opencode-profiles", "google", "data");
+
+    const appleEnv = __buildOpencodeEnvForTests({
+      repo: "demo",
+      cacheKey: "shared-managed-config",
+      opencodeXdg: { dataHome: appleDataHome },
+    });
+    const googleEnv = __buildOpencodeEnvForTests({
+      repo: "demo",
+      cacheKey: "shared-managed-config",
+      opencodeXdg: { dataHome: googleDataHome },
+    });
+
+    expect(appleEnv.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
+    expect(googleEnv.OPENCODE_CONFIG_DIR).toBe(getRalphOpencodeConfigDir());
+    expect(appleEnv.OPENCODE_CONFIG_DIR).toBe(googleEnv.OPENCODE_CONFIG_DIR);
+    expect(appleEnv.XDG_DATA_HOME).toBe(appleDataHome);
+    expect(googleEnv.XDG_DATA_HOME).toBe(googleDataHome);
+  });
+
   test("sets temp environment variables when tempDir is provided", () => {
     const tempDir = join(homeDir, "worktree", ".ralph-tmp");
     const env = __buildOpencodeEnvForTests({ repo: "demo", cacheKey: "tmp", tempDir });

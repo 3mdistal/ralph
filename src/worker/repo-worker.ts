@@ -4643,7 +4643,6 @@ export class RepoWorker {
       getThrottleDecision: this.throttle.getThrottleDecision,
       log: (message: string) => console.log(message),
       warn: (message: string) => console.warn(message),
-      envHome: process.env.HOME,
     });
   }
 

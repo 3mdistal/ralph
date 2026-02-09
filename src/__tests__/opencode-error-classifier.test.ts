@@ -42,6 +42,16 @@ describe("classifyOpencodeFailure", () => {
     expect(classification).toBeNull();
   });
 
+  test("classifies fail-closed unresolved profile errors", () => {
+    const output =
+      "blocked:profile-unresolvable: Resume requires a session ID to resolve the OpenCode profile. OpenCode profiles are enabled, so Ralph refuses ambient fallback.";
+    const classification = classifyOpencodeFailure(output);
+
+    expect(classification?.code).toBe("profile-unresolvable");
+    expect(classification?.blockedSource).toBe("profile-unresolvable");
+    expect(classification?.reason).toContain("blocked:profile-unresolvable");
+  });
+
   test("returns null for unrelated failures", () => {
     const classification = classifyOpencodeFailure("Build failed: test suite had 2 failures");
     expect(classification).toBeNull();
