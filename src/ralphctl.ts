@@ -9,6 +9,7 @@ import { getStatusSnapshot } from "./commands/status";
 import type { StatusSnapshot } from "./status-snapshot";
 import { startDashboardTui } from "./dashboard/client/ui-blessed";
 import { formatDaemonLivenessLine } from "./daemon-liveness";
+import { runDoctor } from "./doctor";
 
 const DEFAULT_GRACE_MS = 5 * 60_000;
 const DRAIN_POLL_INTERVAL_MS = 1000;
@@ -24,6 +25,7 @@ function printGlobalHelp(): void {
       "",
       "Usage:",
       "  ralphctl status [--json]",
+      "  ralphctl doctor [--json] [--repair] [--dry-run]",
       "  ralphctl dashboard [--url <url>] [--host <host>] [--port <port>] [--token <token>] [--replay-last <n>]",
       "  ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]",
       "  ralphctl resume",
@@ -35,6 +37,8 @@ function printGlobalHelp(): void {
       "  --json           Emit machine-readable JSON output",
       "  --timeout <dur>  Drain timeout (e.g. 30s, 5m)",
       "  --grace <dur>    Restart grace period (e.g. 30s, 5m)",
+      "  --repair         Apply safe repair actions",
+      "  --dry-run        Preview repair actions without changes",
       "  --pause-at-checkpoint <name>  Pause workers at checkpoint while draining",
       "  --start-cmd <cmd>             Override daemon start command",
       "  --upgrade-cmd <cmd>           Command to run before restart",
@@ -47,6 +51,9 @@ function printCommandHelp(command: string): void {
   switch (command) {
     case "status":
       console.log(["Usage:", "  ralphctl status [--json]"].join("\n"));
+      return;
+    case "doctor":
+      console.log(["Usage:", "  ralphctl doctor [--json] [--repair] [--dry-run]"].join("\n"));
       return;
     case "dashboard":
       console.log(
@@ -476,6 +483,35 @@ async function run(): Promise<void> {
     console.log(`In-progress tasks: ${snapshot.inProgress.length}`);
     console.log(`Queued tasks: ${snapshot.queued.length}`);
     process.exit(0);
+  }
+
+  if (cmd === "doctor") {
+    const doctorArgs = args.slice(1);
+    const allowedFlags = new Set(["--json", "--repair", "--apply", "--dry-run"]);
+    const unknown = doctorArgs.filter((arg) => arg.startsWith("-") && !allowedFlags.has(arg));
+    if (unknown.length > 0 || doctorArgs.some((arg) => !arg.startsWith("-"))) {
+      console.error(`Unknown doctor argument(s): ${doctorArgs.join(" ")}`);
+      printCommandHelp("doctor");
+      process.exit(2);
+    }
+    const json = hasFlag(args, "--json");
+    const repair = hasFlag(args, "--repair") || hasFlag(args, "--apply");
+    const dryRun = hasFlag(args, "--dry-run");
+    try {
+      if (process.env.RALPH_DOCTOR_FORCE_INTERNAL_ERROR === "1") {
+        throw new Error("Forced doctor internal error for contract tests.");
+      }
+      const result = runDoctor({ repair, dryRun });
+      if (json) {
+        console.log(JSON.stringify(result.report, null, 2));
+      } else {
+        process.stdout.write(result.text);
+      }
+      process.exit(result.exitCode);
+    } catch (error: any) {
+      console.error(error?.message ?? String(error));
+      process.exit(2);
+    }
   }
 
   if (cmd === "dashboard") {

@@ -6,6 +6,7 @@ export type MergeConflictAttempt = {
   startedAt: string;
   completedAt?: string;
   status?: "running" | "failed" | "succeeded";
+  failureClass?: "merge-content" | "permission" | "tooling" | "runtime";
   conflictCount?: number;
   conflictPaths?: string[];
 };
