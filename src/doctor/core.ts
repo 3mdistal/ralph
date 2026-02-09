@@ -1,5 +1,6 @@
 import { resolveCanonicalControlFilePath, resolveCanonicalControlRoot, resolveLegacyControlFilePathCandidates } from "../control-root";
 import { resolveDaemonRecordPath } from "../daemon-record";
+import { analyzeLiveDaemonCandidates } from "../daemon-identity-core";
 import type {
   DoctorAppliedRepair,
   DoctorControlCandidate,
@@ -29,10 +30,13 @@ function sameControlShape(a: NonNullable<DoctorControlCandidate["control"]>, b: 
 }
 
 function computeRecommendedRepairs(input: {
+  canonicalDaemonPath: string;
   staleDaemonPaths: string[];
   unreadableDaemonPaths: string[];
   liveLegacyDaemonPath: string | null;
+  duplicateDaemonPaths: string[];
   controlMismatchPaths: string[];
+  cleanupLegacyControlPaths: string[];
   hasLiveConflict: boolean;
 }): DoctorRepairRecommendation[] {
   const repairs: DoctorRepairRecommendation[] = [];
@@ -61,6 +65,18 @@ function computeRecommendedRepairs(input: {
     });
   }
 
+  if (input.duplicateDaemonPaths.length > 0) {
+    repairs.push({
+      id: "quarantine-duplicate-daemon-records",
+      code: "QUARANTINE_DUPLICATE_DAEMON_RECORDS",
+      title: "Quarantine duplicate daemon records",
+      description: "Rename duplicate live daemon record files so one canonical record remains authoritative.",
+      risk: "safe",
+      applies_by_default: false,
+      paths: compactPaths(input.duplicateDaemonPaths),
+    });
+  }
+
   if (input.liveLegacyDaemonPath) {
     repairs.push({
       id: "promote-live-daemon-record-to-canonical",
@@ -69,7 +85,19 @@ function computeRecommendedRepairs(input: {
       description: "Copy the live legacy daemon record into the canonical registry path.",
       risk: "safe",
       applies_by_default: false,
-      paths: [input.liveLegacyDaemonPath, resolveDaemonRecordPath()],
+      paths: [input.liveLegacyDaemonPath, input.canonicalDaemonPath],
+    });
+  }
+
+  if (input.cleanupLegacyControlPaths.length > 0) {
+    repairs.push({
+      id: "cleanup-legacy-control-files",
+      code: "CLEANUP_LEGACY_CONTROL_FILES",
+      title: "Quarantine legacy control files",
+      description: "Rename safe legacy control file duplicates that match canonical control state.",
+      risk: "safe",
+      applies_by_default: false,
+      paths: compactPaths(input.cleanupLegacyControlPaths),
     });
   }
 
@@ -111,6 +139,9 @@ export function buildDoctorReport(input: {
   const findings: DoctorFinding[] = [];
   const daemonCandidates = snapshot.daemonCandidates;
   const controlCandidates = snapshot.controlCandidates;
+  const canonicalDaemonPath = resolveDaemonRecordPath();
+  const canonicalControlPath = resolveCanonicalControlFilePath();
+  const legacyControlPaths = resolveLegacyControlFilePathCandidates();
 
   const liveDaemons = daemonCandidates.filter((candidate) => candidate.state === "live" && candidate.record);
   const staleDaemons = daemonCandidates.filter((candidate) => candidate.state === "stale");
@@ -118,13 +149,38 @@ export function buildDoctorReport(input: {
   const canonicalDaemon = daemonCandidates.find((candidate) => candidate.is_canonical) ?? null;
   const canonicalControl = controlCandidates.find((candidate) => candidate.is_canonical) ?? null;
   const readableControls = controlCandidates.filter((candidate) => candidate.state === "readable" && candidate.control);
+  const liveAnalysis = analyzeLiveDaemonCandidates(
+    liveDaemons.map((candidate) => ({
+      path: candidate.path,
+      isCanonical: candidate.is_canonical,
+      alive: true,
+      record: {
+        daemonId: candidate.record!.daemonId,
+        pid: candidate.record!.pid,
+        startedAt: candidate.record!.startedAt,
+      },
+      candidate,
+    }))
+  );
 
-  if (liveDaemons.length > 1) {
+  if (liveAnalysis.hasConflict) {
     addFinding(findings, {
       code: "MULTIPLE_LIVE_DAEMON_RECORDS",
       severity: "error",
       message: "Multiple live daemon records were detected across known roots.",
       paths: compactPaths(liveDaemons.map((candidate) => candidate.path)),
+    });
+  }
+
+  const duplicateLivePaths = compactPaths(
+    liveAnalysis.duplicateGroups.flatMap((group) => group.candidates.map((candidate) => candidate.path))
+  );
+  if (duplicateLivePaths.length > 0) {
+    addFinding(findings, {
+      code: "DUPLICATE_LIVE_DAEMON_RECORDS",
+      severity: "warn",
+      message: "Duplicate live daemon records point to the same daemon identity across multiple roots.",
+      paths: duplicateLivePaths,
     });
   }
 
@@ -151,7 +207,7 @@ export function buildDoctorReport(input: {
       code: "CANONICAL_DAEMON_RECORD_MISSING",
       severity: "warn",
       message: "Canonical daemon record is missing.",
-      paths: [resolveDaemonRecordPath()],
+      paths: [canonicalDaemonPath],
     });
   } else if (canonicalDaemon.state === "unreadable") {
     addFinding(findings, {
@@ -168,7 +224,7 @@ export function buildDoctorReport(input: {
       code: "LIVE_DAEMON_RECORD_IN_LEGACY_ROOT",
       severity: "warn",
       message: "Live daemon record is in a legacy root and should be promoted to canonical path.",
-      paths: [liveLegacy.path, resolveDaemonRecordPath()],
+      paths: [liveLegacy.path, canonicalDaemonPath],
     });
   }
 
@@ -215,11 +271,10 @@ export function buildDoctorReport(input: {
       code: "CANONICAL_CONTROL_FILE_MISSING",
       severity: "warn",
       message: "Canonical control file is missing.",
-      paths: [resolveCanonicalControlFilePath()],
+      paths: [canonicalControlPath],
     });
   }
 
-  const legacyControlPaths = resolveLegacyControlFilePathCandidates();
   const legacyReadableControls = readableControls.filter((candidate) => legacyControlPaths.includes(candidate.path));
   if (legacyReadableControls.length > 0) {
     addFinding(findings, {
@@ -251,6 +306,32 @@ export function buildDoctorReport(input: {
     });
   }
 
+  const liveControlRefs = new Set(
+    liveDaemons.map((candidate) => candidate.record?.controlFilePath?.trim() ?? "").filter(Boolean)
+  );
+  const canonicalReadableControl =
+    canonicalControl && canonicalControl.state === "readable" && canonicalControl.control ? canonicalControl : null;
+  const cleanupLegacyControlPaths = canonicalReadableControl
+    ? legacyReadableControls
+        .filter((candidate) => candidate.control)
+        .filter((candidate) => !liveControlRefs.has(candidate.path))
+        .filter((candidate) => sameControlShape(canonicalReadableControl.control!, candidate.control!))
+        .map((candidate) => candidate.path)
+    : [];
+
+  const duplicateDaemonQuarantinePaths = compactPaths(
+    liveAnalysis.duplicateGroups.flatMap((group) => {
+      const keepPath = group.representative.path;
+      return group.candidates.filter((candidate) => candidate.path !== keepPath).map((candidate) => candidate.path);
+    })
+  );
+
+  const canonicalLive = liveDaemons.some((candidate) => candidate.is_canonical);
+  const promotableLiveLegacyPath =
+    !liveAnalysis.hasConflict && !canonicalLive && liveAnalysis.primaryLiveCandidate && !liveAnalysis.primaryLiveCandidate.isCanonical
+      ? liveAnalysis.primaryLiveCandidate.path
+      : null;
+
   const expectedRoot = resolveCanonicalControlRoot();
   for (const candidate of liveDaemons) {
     if (candidate.record && candidate.record.controlRoot !== expectedRoot) {
@@ -264,11 +345,14 @@ export function buildDoctorReport(input: {
   }
 
   const recommendations = computeRecommendedRepairs({
+    canonicalDaemonPath,
     staleDaemonPaths: staleDaemons.map((candidate) => candidate.path),
     unreadableDaemonPaths: unreadableDaemons.map((candidate) => candidate.path),
-    liveLegacyDaemonPath: liveLegacy?.path ?? null,
+    liveLegacyDaemonPath: promotableLiveLegacyPath,
+    duplicateDaemonPaths: duplicateDaemonQuarantinePaths,
     controlMismatchPaths: mismatchPaths,
-    hasLiveConflict: liveDaemons.length > 1,
+    cleanupLegacyControlPaths,
+    hasLiveConflict: liveAnalysis.hasConflict,
   });
 
   const hasError = findings.some((finding) => finding.severity === "error");
