@@ -478,7 +478,12 @@ export async function processOneCommand(
 
       if (params.cmdLabel === RALPH_LABEL_CMD_QUEUE) {
         const queueDecision = decideQueueOnEscalated({
-          hasEscalatedLabel: labelsForPlan.includes(RALPH_LABEL_STATUS_ESCALATED),
+          // Fail closed if any snapshot indicates escalation.
+          // Live label fetches are best-effort and may be stale/incomplete; do not accidentally
+          // treat an escalated issue as non-escalated.
+          hasEscalatedLabel:
+            labelsForPlan.includes(RALPH_LABEL_STATUS_ESCALATED) ||
+            params.currentLabels.includes(RALPH_LABEL_STATUS_ESCALATED),
           cmdEventId: eventId,
           escalatedEventId,
         });
