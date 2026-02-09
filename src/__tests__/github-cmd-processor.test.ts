@@ -95,6 +95,9 @@ describe("github cmd-processor", () => {
     expect(first.processed).toBe(true);
     expect(first.removedCmdLabel).toBe(true);
 
+    const labelPost = requests.find((req) => req.method === "POST" && req.path.endsWith("/issues/42/labels"));
+    expect(labelPost?.body?.labels ?? []).toContain("ralph:status:queued");
+
     const commentPostsAfterFirst = requests.filter(
       (req) => req.method === "POST" && req.path.endsWith("/issues/42/comments")
     );
@@ -106,6 +109,61 @@ describe("github cmd-processor", () => {
       (req) => req.method === "POST" && req.path.endsWith("/issues/42/comments")
     );
     expect(commentPostsAfterSecond).toHaveLength(1);
+  });
+
+  test("queue command always force-adds ralph:status:queued even when snapshot claims it exists", async () => {
+    const requests: Array<{ path: string; method: string; body?: any }> = [];
+    originalRequest = GitHubClient.prototype.request;
+    const requestStub: GitHubClient["request"] = async (path: string, opts: { method?: string; body?: any } = {}) => {
+      const method = (opts.method ?? "GET").toUpperCase();
+      requests.push({ path, method, body: opts.body });
+
+      if (path.includes("/issues/45/events")) {
+        return {
+          data: [
+            {
+              id: 888,
+              event: "labeled",
+              label: { name: RALPH_LABEL_CMD_QUEUE },
+            },
+          ],
+          status: 200,
+          etag: null,
+        } as any;
+      }
+
+      if (path.includes("/labels?")) {
+        // Simulate live GitHub labels missing queued even if snapshot includes it.
+        return { data: [], status: 200, etag: null } as any;
+      }
+
+      if (path.includes("/issues/45/comments") && method === "GET") {
+        return { data: [], status: 200, etag: null } as any;
+      }
+
+      if (path.includes("/issues/45/comments") && method === "POST") {
+        return { data: { id: 1005 }, status: 201, etag: null } as any;
+      }
+
+      return { data: {}, status: 200, etag: null } as any;
+    };
+    GitHubClient.prototype.request = requestStub;
+
+    const result = await __processOneCommandForTests({
+      repo: "3mdistal/ralph",
+      issueNumber: 45,
+      cmdLabel: RALPH_LABEL_CMD_QUEUE as any,
+      // Stale snapshot claims queued already exists.
+      currentLabels: [RALPH_LABEL_CMD_QUEUE, "ralph:status:queued"],
+      issueState: "OPEN",
+    });
+
+    expect(result.processed).toBe(true);
+    expect(result.removedCmdLabel).toBe(true);
+
+    const labelPosts = requests.filter((req) => req.method === "POST" && req.path.endsWith("/issues/45/labels"));
+    expect(labelPosts.length).toBeGreaterThan(0);
+    expect(labelPosts.some((req) => (req.body?.labels ?? []).includes("ralph:status:queued"))).toBe(true);
   });
 
   test("queue command removes paused even when snapshot labels are stale", async () => {

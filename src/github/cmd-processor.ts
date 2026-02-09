@@ -72,6 +72,8 @@ type LabelEventSummary = {
 
 type QueueOnEscalatedDecision = { outcome: "apply" | "refuse" | "unknown"; reason?: string };
 
+const CMD_LIVE_LABELS_TELEMETRY_SOURCE = "cmd-live-labels";
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -94,6 +96,31 @@ function buildQueueLabelDelta(currentLabels: string[]): { add: string[]; remove:
     RALPH_LABEL_STATUS_STOPPED,
   ];
   return statusToRalphLabelDelta("queued", withForcedRemovals);
+}
+
+async function fetchLiveIssueLabelsBestEffort(params: {
+  github: GitHubClient;
+  repo: string;
+  issueNumber: number;
+  fallback: string[];
+}): Promise<string[]> {
+  const { owner, name } = splitRepoFullName(params.repo);
+  try {
+    const response = await params.github.request<Array<{ name?: string | null }>>(
+      `/repos/${owner}/${name}/issues/${params.issueNumber}/labels?per_page=100`,
+      { source: CMD_LIVE_LABELS_TELEMETRY_SOURCE }
+    );
+    const labels = (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+    return labels;
+  } catch (error: any) {
+    if (shouldLog(`ralph:cmd:live-labels:${params.repo}#${params.issueNumber}`, 60_000)) {
+      const message = error?.message ?? String(error);
+      console.warn(
+        `${TELEMETRY_PREFIX} ${params.repo}#${params.issueNumber} live-label-fetch-failed: ${message} (falling back to snapshot)`
+      );
+    }
+    return [...params.fallback];
+  }
 }
 
 function applyLabelDeltaSnapshot(params: {
@@ -423,6 +450,18 @@ export async function processOneCommand(
       }
       reason = "Recorded dependency satisfaction (internal override).";
     } else {
+      let labelsForPlan = params.currentLabels;
+      if (params.cmdLabel === RALPH_LABEL_CMD_QUEUE) {
+        // Harden cmd:queue against stale local label snapshots.
+        // We rely on status labels as the queue source-of-truth, so use live GitHub labels when possible.
+        labelsForPlan = await fetchLiveIssueLabelsBestEffort({
+          github,
+          repo: params.repo,
+          issueNumber: params.issueNumber,
+          fallback: params.currentLabels,
+        });
+      }
+
       const desiredStatus =
         params.cmdLabel === RALPH_LABEL_CMD_QUEUE
           ? "queued"
@@ -432,7 +471,7 @@ export async function processOneCommand(
 
       if (params.cmdLabel === RALPH_LABEL_CMD_QUEUE) {
         const queueDecision = decideQueueOnEscalated({
-          hasEscalatedLabel: params.currentLabels.includes(RALPH_LABEL_STATUS_ESCALATED),
+          hasEscalatedLabel: labelsForPlan.includes(RALPH_LABEL_STATUS_ESCALATED),
           cmdEventId: eventId,
           escalatedEventId,
         });
@@ -458,8 +497,8 @@ export async function processOneCommand(
 
         const delta =
           desiredStatus === "queued"
-            ? buildQueueLabelDelta(params.currentLabels)
-            : statusToRalphLabelDelta(desiredStatus as any, params.currentLabels);
+            ? buildQueueLabelDelta(labelsForPlan)
+            : statusToRalphLabelDelta(desiredStatus as any, labelsForPlan);
         addLabels = delta.add;
         removeLabels = [...delta.remove, params.cmdLabel];
         reason =
