@@ -113,7 +113,11 @@ async function fetchLiveIssueLabelsBestEffort(params: {
       `/repos/${owner}/${name}/issues/${params.issueNumber}/labels?per_page=100`,
       { source: CMD_LIVE_LABELS_TELEMETRY_SOURCE }
     );
-    const labels = (response.data ?? []).map((label) => label?.name ?? "").filter(Boolean);
+    if (!Array.isArray(response.data)) {
+      throw new Error("Unexpected GitHub label list response");
+    }
+    const rows = response.data;
+    const labels = rows.map((label) => label?.name ?? "").filter(Boolean);
     return labels;
   } catch (error: any) {
     if (shouldLog(`ralph:cmd:live-labels:${params.repo}#${params.issueNumber}`, 60_000)) {
