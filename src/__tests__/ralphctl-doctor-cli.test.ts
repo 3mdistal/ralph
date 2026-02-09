@@ -208,6 +208,46 @@ describe("ralphctl doctor CLI contract", () => {
     }
   });
 
+  test("duplicate live records for same identity report warning without conflict error", async () => {
+    const fixture = await createDoctorFixture({ liveCanonicalDaemonPid: process.pid, includeCanonicalControl: true });
+    try {
+      const legacyDir = join(fixture.xdgStateHome, "ralph");
+      await mkdir(legacyDir, { recursive: true });
+      const legacyDaemonPath = join(legacyDir, "daemon.json");
+      const nowIso = "2026-02-08T20:00:00.000Z";
+      await writeFile(
+        legacyDaemonPath,
+        `${JSON.stringify(
+          {
+            version: 1,
+            daemonId: "live-daemon",
+            pid: process.pid,
+            startedAt: nowIso,
+            heartbeatAt: nowIso,
+            controlRoot: join(fixture.homeDir, ".ralph", "control"),
+            controlFilePath: join(legacyDir, "control.json"),
+            ralphVersion: "test",
+            command: ["bun"],
+            cwd: REPO_ROOT,
+          },
+          null,
+          2
+        )}\n`
+      );
+
+      const result = runRalphctl(["doctor", "--json"], buildIsolatedEnv(fixture.homeDir, fixture.xdgStateHome));
+      expect(result.status).toBe(1);
+      const parsed = JSON.parse(result.stdout.trim());
+      assertDoctorJsonV1(parsed);
+      const findings = parsed.findings as Array<{ code?: string }>;
+      expect(findings.some((finding) => finding.code === "DUPLICATE_LIVE_DAEMON_RECORDS")).toBeTrue();
+      expect(findings.some((finding) => finding.code === "MULTIPLE_LIVE_DAEMON_RECORDS")).toBeFalse();
+    } finally {
+      await rm(fixture.homeDir, { recursive: true, force: true });
+      await rm(fixture.xdgStateHome, { recursive: true, force: true });
+    }
+  });
+
   test("returns exit 2 for unknown doctor flags", async () => {
     const fixture = await createDoctorFixture({ staleCanonicalDaemon: true, includeCanonicalControl: false });
     try {
