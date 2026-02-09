@@ -236,6 +236,14 @@ describe("github cmd-processor", () => {
         return { data: { id: 1005 }, status: 201, etag: null } as any;
       }
 
+      if (path.includes("/issues/45/labels") && method === "GET") {
+        return {
+          data: [{ name: "ralph:status:queued" }],
+          status: 200,
+          etag: null,
+        } as any;
+      }
+
       return { data: {}, status: 200, etag: null } as any;
     };
     GitHubClient.prototype.request = requestStub;
