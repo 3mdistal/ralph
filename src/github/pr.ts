@@ -35,6 +35,7 @@ export type PullRequestSearchResult = {
   createdAt?: string;
   updatedAt?: string;
   number?: number;
+  baseRefName?: string;
 };
 
 export function normalizePrUrl(url: string): string {
@@ -91,18 +92,19 @@ function parseSearchOutput(output: string): PullRequestSearchResult[] {
       createdAt: item?.createdAt ? String(item.createdAt) : undefined,
       updatedAt: item?.updatedAt ? String(item.updatedAt) : undefined,
       number: typeof item?.number === "number" ? item.number : undefined,
+      baseRefName: item?.baseRefName ? String(item.baseRefName) : undefined,
     });
   }
   return results;
 }
 
 async function runSearch(repo: string, search: string): Promise<PullRequestSearchResult[]> {
-  const response = await ghRead(repo)`gh pr list --repo ${repo} --state open --search ${search} --json url,createdAt,updatedAt,number`.quiet();
+  const response = await ghRead(repo)`gh pr list --repo ${repo} --state open --search ${search} --json url,createdAt,updatedAt,number,baseRefName`.quiet();
   return parseSearchOutput(response.stdout.toString());
 }
 
 async function runMergedSearch(repo: string, search: string): Promise<PullRequestSearchResult[]> {
-  const response = await ghRead(repo)`gh pr list --repo ${repo} --state merged --search ${search} --json url,createdAt,updatedAt,number`.quiet();
+  const response = await ghRead(repo)`gh pr list --repo ${repo} --state merged --search ${search} --json url,createdAt,updatedAt,number,baseRefName`.quiet();
   return parseSearchOutput(response.stdout.toString());
 }
 

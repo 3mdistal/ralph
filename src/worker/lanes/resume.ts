@@ -261,7 +261,9 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             issueNumber,
             issueTitle: issueMeta.title || task.name,
             botBranch,
+            started: startTime,
           });
+          if (recovered.terminalRun) return recovered.terminalRun;
           prRecoveryDiagnostics = recovered.diagnostics;
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
@@ -513,7 +515,9 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
               issueNumber,
               issueTitle: issueMeta.title || task.name,
               botBranch,
+              started: startTime,
             });
+            if (recovered.terminalRun) return recovered.terminalRun;
             prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
             prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
 
@@ -539,7 +543,9 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             issueNumber,
             issueTitle: issueMeta.title || task.name,
             botBranch,
+            started: startTime,
           });
+          if (recovered.terminalRun) return recovered.terminalRun;
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
