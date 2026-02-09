@@ -79,6 +79,10 @@ import { GitHubClient } from "../github/client";
 import { computeGitHubRateLimitPause } from "../github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "../github/dx-survey-writeback";
 import { createGhRunner } from "../github/gh-runner";
+import {
+  searchMergedPullRequestsByIssueLink as searchMergedPullRequestsByIssueLinkImpl,
+  type PullRequestSearchResult,
+} from "../github/pr";
 import type { ResolvedRequiredChecks } from "../github/required-checks";
 import { createRalphWorkflowLabelsEnsurer } from "../github/ensure-ralph-workflow-labels";
 import { resolveRelationshipSignals } from "../github/relationship-signals";
@@ -2002,12 +2006,117 @@ export class RepoWorker {
     return { ok: true, diagnostics };
   }
 
+  private async searchMergedPullRequestsByIssueLink(issueNumber: string): Promise<PullRequestSearchResult[]> {
+    return await searchMergedPullRequestsByIssueLinkImpl(this.repo, issueNumber);
+  }
+
+  private async maybeSkipIssueForPrRecovery(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    started: Date;
+  }): Promise<AgentRun | null> {
+    let issueMeta: IssueMetadata;
+    try {
+      issueMeta = await this.getIssueMetadata(params.task.issue);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to refresh issue metadata during PR recovery: ${this.formatGhError(error)}`
+      );
+      return null;
+    }
+
+    if (issueMeta.state === "CLOSED") {
+      return await this.skipClosedIssue(params.task, issueMeta, params.started);
+    }
+
+    const issueNumber = params.issueNumber?.trim();
+    if (!issueNumber) return null;
+
+    let merged: PullRequestSearchResult[] = [];
+    try {
+      merged = await this.searchMergedPullRequestsByIssueLink(issueNumber);
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to list merged PRs for issue ${issueNumber}: ${this.formatGhError(error)}`
+      );
+      return null;
+    }
+
+    if (merged.length === 0) return null;
+
+    const normalizedBot = normalizeGitRef(params.botBranch);
+    const mergedOnBot = merged.find((candidate) => {
+      const base = candidate.baseRefName?.trim();
+      if (!base) return false;
+      return normalizeGitRef(base) === normalizedBot;
+    });
+
+    if (!mergedOnBot) return null;
+
+    return await this.skipIssueAlreadyHasMergedFixPr({
+      task: params.task,
+      started: params.started,
+      issueNumber,
+      botBranch: params.botBranch,
+      prUrl: mergedOnBot.url,
+    });
+  }
+
+  private async skipIssueAlreadyHasMergedFixPr(params: {
+    task: AgentTask;
+    started: Date;
+    issueNumber: string;
+    botBranch: string;
+    prUrl: string;
+  }): Promise<AgentRun> {
+    const completed = new Date();
+    const completedAt = completed.toISOString().split("T")[0];
+    const normalizedBot = params.botBranch || getRepoBotBranch(this.repo);
+
+    console.log(
+      `[ralph:worker:${this.repo}] RALPH_SKIP_MERGED_FIX issue=${params.task.issue} pr=${params.prUrl} base=${normalizedBot} task=${params.task.name}`
+    );
+
+    await this.createAgentRun(params.task, {
+      outcome: "success",
+      started: params.started,
+      completed,
+      sessionId: params.task["session-id"]?.trim() || undefined,
+      bodyPrefix: [
+        "Skipped: issue already has a merged fix PR on the bot branch",
+        "",
+        `Issue: ${params.task.issue}`,
+        `PR: ${params.prUrl}`,
+        `Base: ${normalizedBot}`,
+        `Fixes: #${params.issueNumber}`,
+      ].join("\n"),
+    });
+
+    await this.queue.updateTaskStatus(params.task, "done", {
+      "completed-at": completedAt,
+      "session-id": "",
+      "watchdog-retries": "",
+      "stall-retries": "",
+      ...(params.task["worktree-path"] ? { "worktree-path": "" } : {}),
+      ...(params.task["worker-id"] ? { "worker-id": "" } : {}),
+      ...(params.task["repo-slot"] ? { "repo-slot": "" } : {}),
+    });
+
+    return {
+      taskName: params.task.name,
+      repo: this.repo,
+      outcome: "success",
+    };
+  }
+
   private async tryEnsurePrFromWorktree(params: {
     task: AgentTask;
     issueNumber: string;
     issueTitle: string;
     botBranch: string;
-  }): Promise<{ prUrl: string | null; diagnostics: string }> {
+    started: Date;
+  }): Promise<{ prUrl: string | null; diagnostics: string; terminalRun?: AgentRun }> {
     const { task, issueNumber, issueTitle, botBranch } = params;
 
     const diagnostics: string[] = [
@@ -2017,6 +2126,18 @@ export class RepoWorker {
       `- Issue: ${task.issue}`,
       `- Base: ${botBranch}`,
     ];
+
+    const terminal = await this.maybeSkipIssueForPrRecovery({
+      task,
+      issueNumber,
+      botBranch,
+      started: params.started,
+    });
+
+    if (terminal) {
+      diagnostics.push("- Terminal: issue closed or already fixed upstream; skipping PR recovery");
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), terminalRun: terminal };
+    }
 
     if (!issueNumber) {
       diagnostics.push("- No issue number detected; skipping auto PR recovery");
