@@ -95,7 +95,10 @@ function buildQueueLabelDelta(currentLabels: string[]): { add: string[]; remove:
     RALPH_LABEL_STATUS_ESCALATED,
     RALPH_LABEL_STATUS_STOPPED,
   ];
-  return statusToRalphLabelDelta("queued", withForcedRemovals);
+  // Force-add queued even if local snapshots claim it already exists.
+  // This prevents a cmd:queue from being "processed" while leaving the issue without any status label.
+  const labelsForDelta = withForcedRemovals.filter((label) => label !== RALPH_LABEL_STATUS_QUEUED);
+  return statusToRalphLabelDelta("queued", labelsForDelta);
 }
 
 async function fetchLiveIssueLabelsBestEffort(params: {

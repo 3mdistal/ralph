@@ -78,10 +78,8 @@ export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: 
 } {
   const labelSet = new Set(currentLabels);
   const target = RALPH_STATUS_LABELS[status] ?? resolveFallbackStatusLabel(currentLabels) ?? RALPH_LABEL_STATUS_QUEUED;
-  // Force-add the target label even when local snapshots claim it already exists.
-  // GitHub-first orchestration relies on status labels being durable; stale snapshots or
-  // near-concurrent transitions can otherwise remove the last status label.
-  const add: string[] = [target];
+  const add: string[] = [];
+  if (!labelSet.has(target)) add.push(target);
   const remove = KNOWN_RALPH_STATUS_LABELS.filter((label) => label !== target && labelSet.has(label));
   return { add, remove };
 }
