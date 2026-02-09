@@ -1,6 +1,6 @@
 # Plan: Trace bundle exporter for sandbox runs (#254)
 
-Assumption (based on prefetched dossier + GitHub state): sub-issues #561-#565 are already implemented and closed; remaining work is admin closeout with deterministic evidence.
+Goal: add a stable `ralphctl doctor` audit surface for stale discovery/control records, with an explicit, safe, non-destructive repair mode and machine-readable JSON output.
 
 - Persist a run-scoped trace directory keyed by `runId` with worker/tool timeline and GitHub request ids.
 - Add `sandbox:collect` to package logs + manifest + key links into one folder.

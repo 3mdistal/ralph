@@ -1,0 +1,296 @@
+import { resolveCanonicalControlFilePath, resolveCanonicalControlRoot, resolveLegacyControlFilePathCandidates } from "../control-root";
+import { resolveDaemonRecordPath } from "../daemon-record";
+import type {
+  DoctorAppliedRepair,
+  DoctorControlCandidate,
+  DoctorDaemonCandidate,
+  DoctorFinding,
+  DoctorOverallStatus,
+  DoctorRepairRecommendation,
+  DoctorReport,
+  DoctorSnapshot,
+} from "./types";
+
+function addFinding(findings: DoctorFinding[], finding: DoctorFinding): void {
+  findings.push(finding);
+}
+
+function compactPaths(paths: string[]): string[] {
+  return Array.from(new Set(paths.filter(Boolean)));
+}
+
+function sameControlShape(a: NonNullable<DoctorControlCandidate["control"]>, b: NonNullable<DoctorControlCandidate["control"]>): boolean {
+  return (
+    a.mode === b.mode &&
+    a.pause_requested === b.pause_requested &&
+    a.pause_at_checkpoint === b.pause_at_checkpoint &&
+    a.drain_timeout_ms === b.drain_timeout_ms
+  );
+}
+
+function computeRecommendedRepairs(input: {
+  staleDaemonPaths: string[];
+  unreadableDaemonPaths: string[];
+  liveLegacyDaemonPath: string | null;
+  controlMismatchPaths: string[];
+  hasLiveConflict: boolean;
+}): DoctorRepairRecommendation[] {
+  const repairs: DoctorRepairRecommendation[] = [];
+
+  if (input.staleDaemonPaths.length > 0) {
+    repairs.push({
+      id: "quarantine-stale-daemon-records",
+      code: "QUARANTINE_STALE_DAEMON_RECORDS",
+      title: "Quarantine stale daemon records",
+      description: "Rename stale daemon record files to .stale-<timestamp>-<pid> backups.",
+      risk: "safe",
+      applies_by_default: false,
+      paths: compactPaths(input.staleDaemonPaths),
+    });
+  }
+
+  if (input.unreadableDaemonPaths.length > 0) {
+    repairs.push({
+      id: "quarantine-unreadable-daemon-records",
+      code: "QUARANTINE_UNREADABLE_DAEMON_RECORDS",
+      title: "Quarantine unreadable daemon records",
+      description: "Rename unreadable daemon record files to .corrupt-<timestamp>-<pid> backups.",
+      risk: "safe",
+      applies_by_default: false,
+      paths: compactPaths(input.unreadableDaemonPaths),
+    });
+  }
+
+  if (input.liveLegacyDaemonPath) {
+    repairs.push({
+      id: "promote-live-daemon-record-to-canonical",
+      code: "PROMOTE_LIVE_DAEMON_RECORD_TO_CANONICAL",
+      title: "Promote live daemon record to canonical path",
+      description: "Copy the live legacy daemon record into the canonical registry path.",
+      risk: "safe",
+      applies_by_default: false,
+      paths: [input.liveLegacyDaemonPath, resolveDaemonRecordPath()],
+    });
+  }
+
+  if (input.controlMismatchPaths.length > 0) {
+    repairs.push({
+      id: "review-control-file-mismatches",
+      code: "REVIEW_CONTROL_FILE_MISMATCHES",
+      title: "Review control file mismatches",
+      description: "Multiple readable control files disagree; choose one canonical state before applying changes.",
+      risk: "needs-human",
+      applies_by_default: false,
+      paths: compactPaths(input.controlMismatchPaths),
+    });
+  }
+
+  if (input.hasLiveConflict) {
+    repairs.push({
+      id: "resolve-multiple-live-daemons",
+      code: "RESOLVE_MULTIPLE_LIVE_DAEMONS",
+      title: "Resolve multiple live daemon records",
+      description: "Multiple live daemon PIDs were detected. Stop extra daemons manually, then rerun doctor.",
+      risk: "needs-human",
+      applies_by_default: false,
+      paths: [],
+    });
+  }
+
+  return repairs;
+}
+
+export function buildDoctorReport(input: {
+  snapshot: DoctorSnapshot;
+  timestamp: string;
+  repairMode: boolean;
+  dryRun: boolean;
+  appliedRepairs: DoctorAppliedRepair[];
+}): DoctorReport {
+  const { snapshot } = input;
+  const findings: DoctorFinding[] = [];
+  const daemonCandidates = snapshot.daemonCandidates;
+  const controlCandidates = snapshot.controlCandidates;
+
+  const liveDaemons = daemonCandidates.filter((candidate) => candidate.state === "live" && candidate.record);
+  const staleDaemons = daemonCandidates.filter((candidate) => candidate.state === "stale");
+  const unreadableDaemons = daemonCandidates.filter((candidate) => candidate.state === "unreadable");
+  const canonicalDaemon = daemonCandidates.find((candidate) => candidate.is_canonical) ?? null;
+  const canonicalControl = controlCandidates.find((candidate) => candidate.is_canonical) ?? null;
+  const readableControls = controlCandidates.filter((candidate) => candidate.state === "readable" && candidate.control);
+
+  if (liveDaemons.length > 1) {
+    addFinding(findings, {
+      code: "MULTIPLE_LIVE_DAEMON_RECORDS",
+      severity: "error",
+      message: "Multiple live daemon records were detected across known roots.",
+      paths: compactPaths(liveDaemons.map((candidate) => candidate.path)),
+    });
+  }
+
+  for (const candidate of unreadableDaemons) {
+    addFinding(findings, {
+      code: "UNREADABLE_DAEMON_RECORD",
+      severity: "warn",
+      message: `Unreadable daemon record at ${candidate.path}.`,
+      paths: [candidate.path],
+    });
+  }
+
+  if (staleDaemons.length > 0) {
+    addFinding(findings, {
+      code: "STALE_DAEMON_RECORD",
+      severity: "warn",
+      message: "Stale daemon records were found (PID not live).",
+      paths: compactPaths(staleDaemons.map((candidate) => candidate.path)),
+    });
+  }
+
+  if (!canonicalDaemon || canonicalDaemon.state === "missing") {
+    addFinding(findings, {
+      code: "CANONICAL_DAEMON_RECORD_MISSING",
+      severity: "warn",
+      message: "Canonical daemon record is missing.",
+      paths: [resolveDaemonRecordPath()],
+    });
+  } else if (canonicalDaemon.state === "unreadable") {
+    addFinding(findings, {
+      code: "CANONICAL_DAEMON_RECORD_UNREADABLE",
+      severity: "warn",
+      message: "Canonical daemon record exists but is unreadable.",
+      paths: [canonicalDaemon.path],
+    });
+  }
+
+  const liveLegacy = liveDaemons.find((candidate) => !candidate.is_canonical) ?? null;
+  if (liveLegacy) {
+    addFinding(findings, {
+      code: "LIVE_DAEMON_RECORD_IN_LEGACY_ROOT",
+      severity: "warn",
+      message: "Live daemon record is in a legacy root and should be promoted to canonical path.",
+      paths: [liveLegacy.path, resolveDaemonRecordPath()],
+    });
+  }
+
+  for (const candidate of liveDaemons) {
+    if (candidate.identity && !candidate.identity.ok) {
+      addFinding(findings, {
+        code: "LIVE_DAEMON_IDENTITY_MISMATCH",
+        severity: "warn",
+        message: `Live daemon PID at ${candidate.path} failed identity check: ${candidate.identity.reason ?? "unknown"}`,
+        paths: [candidate.path],
+      });
+    }
+    if (candidate.record && candidate.record.controlFilePath) {
+      const matchingControl = controlCandidates.find((control) => control.path === candidate.record?.controlFilePath);
+      if (!matchingControl || matchingControl.state === "missing") {
+        addFinding(findings, {
+          code: "DAEMON_CONTROL_PATH_MISSING",
+          severity: "warn",
+          message: "Daemon record points to a missing control file path.",
+          paths: [candidate.path, candidate.record.controlFilePath],
+        });
+      } else if (matchingControl.state === "unreadable") {
+        addFinding(findings, {
+          code: "DAEMON_CONTROL_PATH_UNREADABLE",
+          severity: "warn",
+          message: "Daemon record points to an unreadable control file path.",
+          paths: [candidate.path, candidate.record.controlFilePath],
+        });
+      }
+    }
+  }
+
+  for (const candidate of controlCandidates.filter((candidate) => candidate.state === "unreadable")) {
+    addFinding(findings, {
+      code: "UNREADABLE_CONTROL_FILE",
+      severity: "warn",
+      message: `Unreadable control file at ${candidate.path}.`,
+      paths: [candidate.path],
+    });
+  }
+
+  if (!canonicalControl || canonicalControl.state === "missing") {
+    addFinding(findings, {
+      code: "CANONICAL_CONTROL_FILE_MISSING",
+      severity: "warn",
+      message: "Canonical control file is missing.",
+      paths: [resolveCanonicalControlFilePath()],
+    });
+  }
+
+  const legacyControlPaths = resolveLegacyControlFilePathCandidates();
+  const legacyReadableControls = readableControls.filter((candidate) => legacyControlPaths.includes(candidate.path));
+  if (legacyReadableControls.length > 0) {
+    addFinding(findings, {
+      code: "LEGACY_CONTROL_FILE_PRESENT",
+      severity: "warn",
+      message: "Readable legacy control file(s) detected; prefer canonical control root.",
+      paths: compactPaths(legacyReadableControls.map((candidate) => candidate.path)),
+    });
+  }
+
+  const mismatchPaths: string[] = [];
+  if (readableControls.length > 1) {
+    const base = readableControls[0]?.control;
+    if (base) {
+      for (const candidate of readableControls.slice(1)) {
+        const control = candidate.control;
+        if (!control || !sameControlShape(base, control)) mismatchPaths.push(candidate.path);
+      }
+      if (mismatchPaths.length > 0) mismatchPaths.push(readableControls[0]?.path ?? "");
+    }
+  }
+
+  if (mismatchPaths.length > 0) {
+    addFinding(findings, {
+      code: "CONTROL_FILE_MISMATCH",
+      severity: "warn",
+      message: "Multiple readable control files disagree on control state.",
+      paths: compactPaths(mismatchPaths),
+    });
+  }
+
+  const expectedRoot = resolveCanonicalControlRoot();
+  for (const candidate of liveDaemons) {
+    if (candidate.record && candidate.record.controlRoot !== expectedRoot) {
+      addFinding(findings, {
+        code: "DAEMON_CONTROL_ROOT_MISMATCH",
+        severity: "warn",
+        message: "Live daemon record references a non-canonical control root.",
+        paths: [candidate.path],
+      });
+    }
+  }
+
+  const recommendations = computeRecommendedRepairs({
+    staleDaemonPaths: staleDaemons.map((candidate) => candidate.path),
+    unreadableDaemonPaths: unreadableDaemons.map((candidate) => candidate.path),
+    liveLegacyDaemonPath: liveLegacy?.path ?? null,
+    controlMismatchPaths: mismatchPaths,
+    hasLiveConflict: liveDaemons.length > 1,
+  });
+
+  const hasError = findings.some((finding) => finding.severity === "error");
+  const hasWarn = findings.some((finding) => finding.severity === "warn");
+  const overallStatus: DoctorOverallStatus = hasError ? "error" : hasWarn ? "warn" : "ok";
+
+  return {
+    schema_version: 1,
+    timestamp: input.timestamp,
+    overall_status: overallStatus,
+    ok: overallStatus === "ok",
+    repair_mode: input.repairMode,
+    dry_run: input.dryRun,
+    daemon_candidates: daemonCandidates,
+    control_candidates: controlCandidates,
+    roots: snapshot.roots,
+    findings,
+    recommended_repairs: recommendations,
+    applied_repairs: input.appliedRepairs,
+  };
+}
+
+export function resolveDoctorExitCode(report: DoctorReport): number {
+  return report.overall_status === "ok" ? 0 : 1;
+}
