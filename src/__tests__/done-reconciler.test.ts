@@ -99,6 +99,14 @@ describe("done reconciler", () => {
         throw new Error("Unexpected label mutation for non-Ralph issue");
       }
 
+      if (path === "/repos/3mdistal/ralph/issues/317/labels" && method === "GET") {
+        return {
+          data: [{ name: "ralph:status:done" }],
+          etag: null,
+          status: 200,
+        };
+      }
+
       return { data: null, etag: null, status: 200 };
     };
 
