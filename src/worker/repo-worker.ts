@@ -17,6 +17,7 @@ import {
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
   getConfig,
+  getProfile,
 } from "../config";
 import { normalizeGitRef } from "../midpoint-labels";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "../midpoint-labeler";
@@ -186,6 +187,7 @@ import {
 } from "../state";
 import { refreshRalphRunTokenTotals } from "../run-token-accounting";
 import { computeAndStoreRunMetrics } from "../metrics/compute-and-store";
+import { collectSandboxTraceBundle } from "../sandbox/collect";
 import {
   isPathUnderDir,
   parseGitWorktreeListPorcelain,
@@ -749,9 +751,19 @@ export class RepoWorker {
         appendFile,
         existsSync,
         computeAndStoreRunMetrics: (params) => computeAndStoreRunMetrics(params),
+        shouldCollectTraceBundle: () => this.shouldCollectTraceBundle(),
+        collectTraceBundle: async ({ runId }) => {
+          await collectSandboxTraceBundle({ runId });
+        },
         warn: (message) => console.warn(message),
       },
     });
+  }
+
+  private shouldCollectTraceBundle(): boolean {
+    if (getProfile() === "sandbox") return true;
+    const raw = (process.env.RALPH_TRACE_BUNDLE ?? "").trim().toLowerCase();
+    return raw === "1" || raw === "true" || raw === "yes";
   }
 
   private formatSetupFailureReason(failure: SetupFailure): string {

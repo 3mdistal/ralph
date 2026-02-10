@@ -21,6 +21,7 @@ function printGlobalHelp(): void {
       "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
+      "  ralph sandbox:collect --run-id <id> Export a run trace bundle",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "  ralph sandbox seed                 Seed sandbox edge-case issues",
@@ -186,6 +187,17 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox:collect":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:collect --run-id <id> [--out <path>] [--json]",
+          "",
+          "Exports a run-scoped trace bundle (timeline + GitHub request ids + artifacts).",
+        ].join("\n")
+      );
+      return;
+
     case "rollup":
       console.log(
         [
@@ -272,6 +284,7 @@ if (
     cmd === "repos" ||
     cmd === "watch" ||
     cmd === "nudge" ||
+    cmd === "sandbox:collect" ||
     cmd === "sandbox" ||
     cmd === "worktrees" ||
     cmd === "rollup") &&
