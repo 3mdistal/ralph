@@ -1,6 +1,9 @@
 import { GitHubApiError, splitRepoFullName, type GitHubClient, type GitHubResponse } from "./client";
 import type { EnsureOutcome } from "./ensure-ralph-workflow-labels";
 import { canAttemptLabelWrite, recordLabelWriteFailure, recordLabelWriteSuccess } from "./label-write-backoff";
+import { withIssueLabelLock } from "./issue-label-lock";
+import { enforceSingleStatusLabelInvariant } from "./status-label-invariant";
+import { RALPH_STATUS_LABEL_PREFIX } from "../github-labels";
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
@@ -37,7 +40,38 @@ type ApplyIssueLabelOpsParams = {
   ensureLabels?: () => Promise<EnsureOutcome>;
   retryMissingLabelOnce?: boolean;
   ensureBefore?: boolean;
+  issueNumber?: number;
+  skipIssueLock?: boolean;
 };
+
+function isStatusLabel(label: string): boolean {
+  return label.toLowerCase().startsWith(RALPH_STATUS_LABEL_PREFIX);
+}
+
+function firstStatusLabel(labels: string[]): string | null {
+  for (const label of labels) {
+    if (isStatusLabel(label)) return label;
+  }
+  return null;
+}
+
+export async function listIssueLabels(params: {
+  github: GitHubRequester;
+  repo: string;
+  issueNumber: number;
+}): Promise<string[]> {
+  const { owner, name } = splitRepoFullName(params.repo);
+  const response: GitHubResponse<Array<{ name?: string }>> = await params.github.request(
+    `/repos/${owner}/${name}/issues/${params.issueNumber}/labels`,
+    {
+      method: "GET",
+    }
+  );
+  const labels = Array.isArray(response.data) ? response.data : [];
+  return labels
+    .map((entry) => normalizeLabel(entry?.name ?? ""))
+    .filter((label): label is string => Boolean(label));
+}
 
 export function normalizeLabel(label: string): string | null {
   if (typeof label !== "string") return null;
@@ -181,46 +215,97 @@ export async function executeIssueLabelOps(params: {
   retryMissingLabelOnce?: boolean;
   ensureBefore?: boolean;
 }): Promise<ApplyIssueLabelOpsResult> {
-  return await applyIssueLabelOps({
-    ops: params.ops,
-    io: {
-      addLabels: async (labels) =>
-        await addIssueLabels({
-          github: params.github,
-          repo: params.repo,
-          issueNumber: params.issueNumber,
-          labels,
-          allowNonRalph: params.allowNonRalph,
-        }),
-      addLabel: async (label) =>
-        await addIssueLabel({
-          github: params.github,
-          repo: params.repo,
-          issueNumber: params.issueNumber,
-          label,
-          allowNonRalph: params.allowNonRalph,
-        }),
-      removeLabel: async (label) =>
-        await removeIssueLabel({
-          github: params.github,
-          repo: params.repo,
-          issueNumber: params.issueNumber,
-          label,
-          allowNotFound: true,
-          allowNonRalph: params.allowNonRalph,
-        }),
-    },
-    log: params.log,
-    logLabel: params.logLabel ?? `${params.repo}#${params.issueNumber}`,
+  return await withIssueLabelLock({
     repo: params.repo,
-    allowNonRalph: params.allowNonRalph,
-    ensureLabels: params.ensureLabels,
-    retryMissingLabelOnce: params.retryMissingLabelOnce,
-    ensureBefore: params.ensureBefore,
+    issueNumber: params.issueNumber,
+    run: async () => {
+      const result = await applyIssueLabelOps({
+        ops: params.ops,
+        io: {
+          addLabels: async (labels) =>
+            await addIssueLabels({
+              github: params.github,
+              repo: params.repo,
+              issueNumber: params.issueNumber,
+              labels,
+              allowNonRalph: params.allowNonRalph,
+            }),
+          addLabel: async (label) =>
+            await addIssueLabel({
+              github: params.github,
+              repo: params.repo,
+              issueNumber: params.issueNumber,
+              label,
+              allowNonRalph: params.allowNonRalph,
+            }),
+          removeLabel: async (label) =>
+            await removeIssueLabel({
+              github: params.github,
+              repo: params.repo,
+              issueNumber: params.issueNumber,
+              label,
+              allowNotFound: true,
+              allowNonRalph: params.allowNonRalph,
+            }),
+        },
+        log: params.log,
+        logLabel: params.logLabel ?? `${params.repo}#${params.issueNumber}`,
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        allowNonRalph: params.allowNonRalph,
+        ensureLabels: params.ensureLabels,
+        retryMissingLabelOnce: params.retryMissingLabelOnce,
+        ensureBefore: params.ensureBefore,
+        skipIssueLock: true,
+      });
+
+      if (!result.ok) return result;
+
+      const statusTouched = params.ops.some((op) => isStatusLabel(op.label));
+      if (!statusTouched) return result;
+
+      await enforceSingleStatusLabelInvariant({
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        desiredHint: firstStatusLabel(result.add),
+        logPrefix: "[ralph:github:labels]",
+        io: {
+          listLabels: async () => await listIssueLabels({ github: params.github, repo: params.repo, issueNumber: params.issueNumber }),
+          addLabels: async (labels) =>
+            await addIssueLabels({
+              github: params.github,
+              repo: params.repo,
+              issueNumber: params.issueNumber,
+              labels,
+              allowNonRalph: params.allowNonRalph,
+            }),
+          removeLabel: async (label) => {
+            await removeIssueLabel({
+              github: params.github,
+              repo: params.repo,
+              issueNumber: params.issueNumber,
+              label,
+              allowNotFound: true,
+              allowNonRalph: params.allowNonRalph,
+            });
+          },
+        },
+      });
+
+      return result;
+    },
   });
 }
 
 export async function applyIssueLabelOps(params: ApplyIssueLabelOpsParams): Promise<ApplyIssueLabelOpsResult> {
+  if (!params.skipIssueLock && params.repo && typeof params.issueNumber === "number") {
+    return await withIssueLabelLock({
+      repo: params.repo,
+      issueNumber: params.issueNumber,
+      run: async () => await applyIssueLabelOps({ ...params, skipIssueLock: true }),
+    });
+  }
+
   const added: string[] = [];
   const removed: string[] = [];
   const applied: LabelOp[] = [];

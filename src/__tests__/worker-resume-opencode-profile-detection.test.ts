@@ -108,9 +108,9 @@ test("resume does not auto-switch profiles when session cannot be found", async 
 
   const resolved = await (worker as any).resolveOpencodeXdgForTask(task, "resume", sessionId);
   expect(resolved.profileName).toBe(null);
-  expect(resolved.opencodeXdg?.dataHome).toBe(join(homeDir, ".local", "share"));
-  expect(resolved.opencodeXdg?.stateHome).toBe(join(homeDir, ".local", "state"));
-  expect(resolved.opencodeXdg?.configHome).toBeUndefined();
+  expect(resolved.opencodeXdg).toBeUndefined();
+  expect(resolved.error).toContain("blocked:profile-unresolvable");
+  expect(resolved.error).toContain(sessionId);
 });
 
 test("writes config to the expected path", async () => {

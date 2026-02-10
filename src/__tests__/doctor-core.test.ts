@@ -168,4 +168,94 @@ describe("doctor core", () => {
     });
     expect(resolveDoctorExitCode(warnReport)).toBe(1);
   });
+
+  test("duplicate live records for same identity are warnings, not conflict errors", () => {
+    const report = buildDoctorReport({
+      snapshot: {
+        daemonCandidates: [
+          {
+            path: "/home/test/.ralph/control/daemon-registry.json",
+            root: "/home/test/.ralph/control",
+            is_canonical: true,
+            exists: true,
+            state: "live",
+            parse_error: null,
+            record: {
+              daemonId: "d-dup",
+              pid: process.pid,
+              startedAt: "2026-02-08T00:00:00.000Z",
+              heartbeatAt: "2026-02-08T00:00:01.000Z",
+              controlRoot: "/home/test/.ralph/control",
+              controlFilePath: "/home/test/.ralph/control/control.json",
+              cwd: process.cwd(),
+              command: ["bun", "src/index.ts"],
+              ralphVersion: "test",
+            },
+            pid_alive: true,
+            identity: { ok: true, reason: null },
+          },
+          {
+            path: "/tmp/ralph/1000/daemon.json",
+            root: "/tmp/ralph/1000",
+            is_canonical: false,
+            exists: true,
+            state: "live",
+            parse_error: null,
+            record: {
+              daemonId: "d-dup",
+              pid: process.pid,
+              startedAt: "2026-02-08T00:00:00.000Z",
+              heartbeatAt: "2026-02-08T00:00:01.000Z",
+              controlRoot: "/home/test/.ralph/control",
+              controlFilePath: "/tmp/ralph/1000/control.json",
+              cwd: process.cwd(),
+              command: ["bun", "src/index.ts"],
+              ralphVersion: "test",
+            },
+            pid_alive: true,
+            identity: { ok: true, reason: null },
+          },
+        ],
+        controlCandidates: [
+          {
+            path: "/home/test/.ralph/control/control.json",
+            root: "/home/test/.ralph/control",
+            is_canonical: true,
+            exists: true,
+            state: "readable",
+            parse_error: null,
+            control: {
+              mode: "running",
+              pause_requested: null,
+              pause_at_checkpoint: null,
+              drain_timeout_ms: null,
+            },
+          },
+          {
+            path: "/tmp/ralph/1000/control.json",
+            root: "/tmp/ralph/1000",
+            is_canonical: false,
+            exists: true,
+            state: "readable",
+            parse_error: null,
+            control: {
+              mode: "running",
+              pause_requested: null,
+              pause_at_checkpoint: null,
+              drain_timeout_ms: null,
+            },
+          },
+        ],
+        roots: [],
+      },
+      timestamp: "2026-02-08T00:00:00.000Z",
+      repairMode: false,
+      dryRun: false,
+      appliedRepairs: [],
+    });
+
+    expect(report.findings.some((finding) => finding.code === "MULTIPLE_LIVE_DAEMON_RECORDS")).toBeFalse();
+    expect(report.findings.some((finding) => finding.code === "DUPLICATE_LIVE_DAEMON_RECORDS")).toBeTrue();
+    expect(report.recommended_repairs.some((repair) => repair.code === "QUARANTINE_DUPLICATE_DAEMON_RECORDS")).toBeTrue();
+  });
 });

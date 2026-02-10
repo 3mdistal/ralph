@@ -8,3 +8,6 @@ src/ralph.json
 
 # Local orchestration scratch
 orchestration/
+
+# Ralph worktree artifacts
+.ralph/

@@ -1,6 +1,12 @@
 import { existsSync, readFileSync, renameSync } from "fs";
 import { basename } from "path";
-import { readDaemonRecordAtPath, resolveDaemonRecordPath, writeDaemonRecord } from "../daemon-record";
+import {
+  readDaemonRecordAtPath,
+  resolveDaemonRecordPath,
+  resolveDaemonRecordPathCandidates,
+  writeDaemonRecord,
+} from "../daemon-record";
+import { analyzeLiveDaemonCandidates, buildDaemonIdentityKey } from "../daemon-identity-core";
 import type { DoctorAppliedRepair, DoctorRepairRecommendation, DoctorSnapshot } from "./types";
 
 function isPidAlive(pid: number): boolean {
@@ -13,7 +19,7 @@ function isPidAlive(pid: number): boolean {
   }
 }
 
-function buildSuffix(kind: "stale" | "corrupt", nowIso: string): string {
+function buildSuffix(kind: "stale" | "corrupt" | "duplicate" | "legacy", nowIso: string): string {
   const compact = nowIso.replace(/[-:.TZ]/g, "");
   return `.${kind}-${compact}-${process.pid}`;
 }
@@ -55,6 +61,72 @@ function sameRecordShape(a: {
   );
 }
 
+type ControlShape = {
+  mode: "running" | "draining" | "paused";
+  pauseRequested: boolean | null;
+  pauseAtCheckpoint: string | null;
+  drainTimeoutMs: number | null;
+};
+
+function parseControlShape(path: string): ControlShape | null {
+  try {
+    const raw = readFileSync(path, "utf8");
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const versionRaw = parsed.version;
+    const version = versionRaw === undefined ? 0 : versionRaw;
+    if (version !== 0 && version !== 1) return null;
+    const mode = parsed.mode;
+    if (mode !== "running" && mode !== "draining" && mode !== "paused") return null;
+    const pauseRequested = typeof parsed.pause_requested === "boolean" ? parsed.pause_requested : null;
+    const pauseAtCheckpoint =
+      typeof parsed.pause_at_checkpoint === "string" && parsed.pause_at_checkpoint.trim()
+        ? parsed.pause_at_checkpoint.trim()
+        : null;
+    const drainTimeoutMs =
+      typeof parsed.drain_timeout_ms === "number" && Number.isFinite(parsed.drain_timeout_ms)
+        ? Math.max(0, Math.floor(parsed.drain_timeout_ms))
+        : null;
+    return {
+      mode,
+      pauseRequested,
+      pauseAtCheckpoint,
+      drainTimeoutMs,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function sameControlShape(a: ControlShape, b: ControlShape): boolean {
+  return (
+    a.mode === b.mode &&
+    a.pauseRequested === b.pauseRequested &&
+    a.pauseAtCheckpoint === b.pauseAtCheckpoint &&
+    a.drainTimeoutMs === b.drainTimeoutMs
+  );
+}
+
+function collectCurrentLiveIdentityCounts(): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const path of resolveDaemonRecordPathCandidates()) {
+    const record = readDaemonRecordAtPath(path);
+    if (!record || !isPidAlive(record.pid)) continue;
+    const key = buildDaemonIdentityKey(record);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+function hasLiveDaemonReferencingControl(path: string): boolean {
+  for (const daemonPath of resolveDaemonRecordPathCandidates()) {
+    const record = readDaemonRecordAtPath(daemonPath);
+    if (!record || !isPidAlive(record.pid)) continue;
+    if (record.controlFilePath.trim() === path) return true;
+  }
+  return false;
+}
+
 export function applyDoctorRepairs(input: {
   snapshot: DoctorSnapshot;
   recommendations: DoctorRepairRecommendation[];
@@ -63,6 +135,22 @@ export function applyDoctorRepairs(input: {
 }): DoctorAppliedRepair[] {
   const byId = new Map(input.recommendations.map((item) => [item.id, item]));
   const applied: DoctorAppliedRepair[] = [];
+
+  const liveAnalysis = analyzeLiveDaemonCandidates(
+    input.snapshot.daemonCandidates
+      .filter((candidate) => candidate.state === "live" && candidate.record)
+      .map((candidate) => ({
+        path: candidate.path,
+        isCanonical: candidate.is_canonical,
+        alive: true,
+        record: {
+          daemonId: candidate.record!.daemonId,
+          pid: candidate.record!.pid,
+          startedAt: candidate.record!.startedAt,
+        },
+      }))
+  );
+  const preferredByIdentity = new Map(liveAnalysis.groups.map((group) => [group.key, group.representative.path]));
 
   const staleRepair = byId.get("quarantine-stale-daemon-records");
   if (staleRepair) {
@@ -155,6 +243,191 @@ export function applyDoctorRepairs(input: {
     }
   }
 
+  const duplicateRepair = byId.get("quarantine-duplicate-daemon-records");
+  if (duplicateRepair) {
+    for (const path of duplicateRepair.paths) {
+      if (path === resolveDaemonRecordPath()) {
+        applied.push({
+          id: duplicateRepair.id,
+          code: duplicateRepair.code,
+          status: "skipped",
+          details: `Skipped ${path}: canonical daemon record is kept as authoritative.`,
+          paths: [path],
+        });
+        continue;
+      }
+
+      if (input.dryRun) {
+        applied.push({
+          id: duplicateRepair.id,
+          code: duplicateRepair.code,
+          status: "skipped",
+          details: `Dry run: would rename ${path}.`,
+          paths: [path],
+        });
+        continue;
+      }
+
+      try {
+        const record = readDaemonRecordAtPath(path);
+        if (!record) {
+          applied.push({
+            id: duplicateRepair.id,
+            code: duplicateRepair.code,
+            status: "skipped",
+            details: `Skipped ${path}: daemon record is unreadable or missing.`,
+            paths: [path],
+          });
+          continue;
+        }
+        if (!isPidAlive(record.pid)) {
+          applied.push({
+            id: duplicateRepair.id,
+            code: duplicateRepair.code,
+            status: "skipped",
+            details: `Skipped ${path}: pid ${record.pid} is no longer live.`,
+            paths: [path],
+          });
+          continue;
+        }
+
+        const identityKey = buildDaemonIdentityKey(record);
+        const preferredPath = preferredByIdentity.get(identityKey) ?? null;
+        if (preferredPath === path) {
+          applied.push({
+            id: duplicateRepair.id,
+            code: duplicateRepair.code,
+            status: "skipped",
+            details: `Skipped ${path}: selected as preferred record for identity ${identityKey}.`,
+            paths: [path],
+          });
+          continue;
+        }
+
+        const currentCounts = collectCurrentLiveIdentityCounts();
+        if ((currentCounts.get(identityKey) ?? 0) <= 1) {
+          applied.push({
+            id: duplicateRepair.id,
+            code: duplicateRepair.code,
+            status: "skipped",
+            details: `Skipped ${path}: identity ${identityKey} is no longer duplicated.`,
+            paths: [path],
+          });
+          continue;
+        }
+
+        if (!existsSync(path)) {
+          applied.push({
+            id: duplicateRepair.id,
+            code: duplicateRepair.code,
+            status: "skipped",
+            details: `Skipped ${path}: file no longer exists.`,
+            paths: [path],
+          });
+          continue;
+        }
+
+        const renamed = renameWithSuffix(path, buildSuffix("duplicate", input.nowIso));
+        applied.push({
+          id: duplicateRepair.id,
+          code: duplicateRepair.code,
+          status: "applied",
+          details: `Renamed ${basename(path)} -> ${basename(renamed)}.`,
+          paths: [path, renamed],
+        });
+      } catch (error: any) {
+        applied.push({
+          id: duplicateRepair.id,
+          code: duplicateRepair.code,
+          status: "failed",
+          details: `Failed to quarantine duplicate daemon record ${path}: ${error?.message ?? String(error)}`,
+          paths: [path],
+        });
+      }
+    }
+  }
+
+  const cleanupLegacyControlRepair = byId.get("cleanup-legacy-control-files");
+  if (cleanupLegacyControlRepair) {
+    const canonicalControlPath =
+      input.snapshot.controlCandidates.find((candidate) => candidate.is_canonical)?.path ?? null;
+    if (!canonicalControlPath) {
+      applied.push({
+        id: cleanupLegacyControlRepair.id,
+        code: cleanupLegacyControlRepair.code,
+        status: "skipped",
+        details: "Skipped cleanup: canonical control file path is unavailable.",
+        paths: cleanupLegacyControlRepair.paths,
+      });
+    } else {
+      for (const path of cleanupLegacyControlRepair.paths) {
+        if (input.dryRun) {
+          applied.push({
+            id: cleanupLegacyControlRepair.id,
+            code: cleanupLegacyControlRepair.code,
+            status: "skipped",
+            details: `Dry run: would rename ${path}.`,
+            paths: [path],
+          });
+          continue;
+        }
+
+        try {
+          if (!existsSync(path)) {
+            applied.push({
+              id: cleanupLegacyControlRepair.id,
+              code: cleanupLegacyControlRepair.code,
+              status: "skipped",
+              details: `Skipped ${path}: file no longer exists.`,
+              paths: [path],
+            });
+            continue;
+          }
+          if (hasLiveDaemonReferencingControl(path)) {
+            applied.push({
+              id: cleanupLegacyControlRepair.id,
+              code: cleanupLegacyControlRepair.code,
+              status: "skipped",
+              details: `Skipped ${path}: referenced by a live daemon record.`,
+              paths: [path],
+            });
+            continue;
+          }
+
+          const canonicalShape = parseControlShape(canonicalControlPath);
+          const legacyShape = parseControlShape(path);
+          if (!canonicalShape || !legacyShape || !sameControlShape(canonicalShape, legacyShape)) {
+            applied.push({
+              id: cleanupLegacyControlRepair.id,
+              code: cleanupLegacyControlRepair.code,
+              status: "skipped",
+              details: `Skipped ${path}: control content no longer matches canonical state.`,
+              paths: [path, canonicalControlPath],
+            });
+            continue;
+          }
+
+          const renamed = renameWithSuffix(path, buildSuffix("legacy", input.nowIso));
+          applied.push({
+            id: cleanupLegacyControlRepair.id,
+            code: cleanupLegacyControlRepair.code,
+            status: "applied",
+            details: `Renamed ${basename(path)} -> ${basename(renamed)}.`,
+            paths: [path, renamed],
+          });
+        } catch (error: any) {
+          applied.push({
+            id: cleanupLegacyControlRepair.id,
+            code: cleanupLegacyControlRepair.code,
+            status: "failed",
+            details: `Failed to quarantine legacy control file ${path}: ${error?.message ?? String(error)}`,
+            paths: [path],
+          });
+        }
+      }
+    }
+  }
+
   const promoteRepair = byId.get("promote-live-daemon-record-to-canonical");
   if (promoteRepair) {
     const candidate = input.snapshot.daemonCandidates.find((entry) => entry.state === "live" && !entry.is_canonical && entry.record) ?? null;
@@ -168,7 +441,7 @@ export function applyDoctorRepairs(input: {
         details: "Skipped promotion: no live legacy daemon record candidate available.",
         paths: promoteRepair.paths,
       });
-    } else if (input.snapshot.daemonCandidates.filter((entry) => entry.state === "live").length > 1) {
+    } else if (liveAnalysis.distinctLiveIdentities > 1) {
       applied.push({
         id: promoteRepair.id,
         code: promoteRepair.code,

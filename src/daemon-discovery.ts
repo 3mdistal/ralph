@@ -8,6 +8,7 @@ import {
   type DaemonRecord,
   writeDaemonRecord,
 } from "./daemon-record";
+import { analyzeLiveDaemonCandidates } from "./daemon-identity-core";
 
 export type DaemonDiscoveryState = "live" | "missing" | "stale" | "conflict";
 
@@ -32,9 +33,16 @@ export function classifyDaemonCandidates(input: {
   candidates: DaemonRecordCandidate[];
 }): Omit<DaemonDiscoveryResult, "healedPaths"> {
   const sorted = [...input.candidates].sort(compareCandidates);
-  const live = sorted.filter((entry) => entry.alive);
+  const live = analyzeLiveDaemonCandidates(
+    sorted.map((entry) => ({
+      ...entry,
+      isCanonical: entry.isCanonical,
+      alive: entry.alive,
+      record: entry.record,
+    }))
+  );
 
-  if (live.length > 1) {
+  if (live.hasConflict) {
     return {
       state: "conflict",
       canonicalPath: input.canonicalPath,
@@ -44,13 +52,13 @@ export function classifyDaemonCandidates(input: {
     };
   }
 
-  if (live.length === 1) {
+  if (live.primaryLiveCandidate) {
     return {
       state: "live",
       canonicalPath: input.canonicalPath,
-      live: live[0] ?? null,
+      live: live.primaryLiveCandidate,
       candidates: sorted,
-      latestRecord: live[0]?.record ?? sorted[0]?.record ?? null,
+      latestRecord: live.primaryLiveCandidate.record ?? sorted[0]?.record ?? null,
     };
   }
 
