@@ -373,4 +373,195 @@ describe("doctor repair", () => {
 
     expect(applied.some((item) => item.status === "skipped" && item.details.includes("refusing to overwrite"))).toBeTrue();
   });
+
+  test("quarantines duplicate live daemon record while keeping canonical", () => {
+    const canonicalPath = join(homeDir, ".ralph", "control", "daemon-registry.json");
+    const legacyPath = join(xdgDir, "ralph", "daemon.json");
+    mkdirSync(join(homeDir, ".ralph", "control"), { recursive: true });
+    mkdirSync(join(xdgDir, "ralph"), { recursive: true });
+
+    const payload = {
+      version: 1,
+      daemonId: "dup-daemon",
+      pid: process.pid,
+      startedAt: "2026-02-08T20:00:00.000Z",
+      heartbeatAt: "2026-02-08T20:10:00.000Z",
+      controlRoot: join(homeDir, ".ralph", "control"),
+      controlFilePath: join(homeDir, ".ralph", "control", "control.json"),
+      ralphVersion: "test",
+      command: ["bun", "src/index.ts"],
+      cwd: process.cwd(),
+    };
+    writeFileSync(canonicalPath, `${JSON.stringify(payload, null, 2)}\n`);
+    writeFileSync(legacyPath, `${JSON.stringify(payload, null, 2)}\n`);
+
+    const snapshot: DoctorSnapshot = {
+      daemonCandidates: [
+        {
+          path: canonicalPath,
+          root: join(homeDir, ".ralph", "control"),
+          is_canonical: true,
+          exists: true,
+          state: "live",
+          parse_error: null,
+          record: {
+            daemonId: "dup-daemon",
+            pid: process.pid,
+            startedAt: "2026-02-08T20:00:00.000Z",
+            heartbeatAt: "2026-02-08T20:10:00.000Z",
+            controlRoot: join(homeDir, ".ralph", "control"),
+            controlFilePath: join(homeDir, ".ralph", "control", "control.json"),
+            cwd: process.cwd(),
+            command: ["bun", "src/index.ts"],
+            ralphVersion: "test",
+          },
+          pid_alive: true,
+          identity: { ok: true, reason: null },
+        },
+        {
+          path: legacyPath,
+          root: join(xdgDir, "ralph"),
+          is_canonical: false,
+          exists: true,
+          state: "live",
+          parse_error: null,
+          record: {
+            daemonId: "dup-daemon",
+            pid: process.pid,
+            startedAt: "2026-02-08T20:00:00.000Z",
+            heartbeatAt: "2026-02-08T20:10:00.000Z",
+            controlRoot: join(homeDir, ".ralph", "control"),
+            controlFilePath: join(homeDir, ".ralph", "control", "control.json"),
+            cwd: process.cwd(),
+            command: ["bun", "src/index.ts"],
+            ralphVersion: "test",
+          },
+          pid_alive: true,
+          identity: { ok: true, reason: null },
+        },
+      ],
+      controlCandidates: [],
+      roots: [],
+    };
+
+    const applied = applyDoctorRepairs({
+      snapshot,
+      recommendations: [
+        {
+          id: "quarantine-duplicate-daemon-records",
+          code: "QUARANTINE_DUPLICATE_DAEMON_RECORDS",
+          title: "Quarantine duplicate daemon records",
+          description: "",
+          risk: "safe",
+          applies_by_default: false,
+          paths: [legacyPath],
+        },
+      ],
+      dryRun: false,
+      nowIso: "2026-02-08T20:00:00.000Z",
+    });
+
+    expect(applied.some((item) => item.status === "applied")).toBeTrue();
+    expect(existsSync(canonicalPath)).toBeTrue();
+    expect(existsSync(legacyPath)).toBeFalse();
+    const files = readdirSync(join(xdgDir, "ralph"));
+    expect(files.some((file) => file.startsWith("daemon.json.duplicate-"))).toBeTrue();
+  });
+
+  test("quarantines safe legacy control file duplicates", () => {
+    const canonicalControlPath = join(homeDir, ".ralph", "control", "control.json");
+    const legacyControlPath = join(xdgDir, "ralph", "control.json");
+    mkdirSync(join(homeDir, ".ralph", "control"), { recursive: true });
+    mkdirSync(join(xdgDir, "ralph"), { recursive: true });
+
+    const controlPayload = {
+      version: 1,
+      mode: "running",
+      pause_requested: false,
+      pause_at_checkpoint: null,
+      drain_timeout_ms: null,
+    };
+    writeFileSync(canonicalControlPath, `${JSON.stringify(controlPayload, null, 2)}\n`);
+    writeFileSync(legacyControlPath, `${JSON.stringify(controlPayload, null, 2)}\n`);
+
+    const snapshot: DoctorSnapshot = {
+      daemonCandidates: [
+        {
+          path: join(homeDir, ".ralph", "control", "daemon-registry.json"),
+          root: join(homeDir, ".ralph", "control"),
+          is_canonical: true,
+          exists: true,
+          state: "live",
+          parse_error: null,
+          record: {
+            daemonId: "d-control",
+            pid: process.pid,
+            startedAt: "2026-02-08T20:00:00.000Z",
+            heartbeatAt: "2026-02-08T20:10:00.000Z",
+            controlRoot: join(homeDir, ".ralph", "control"),
+            controlFilePath: canonicalControlPath,
+            cwd: process.cwd(),
+            command: ["bun", "src/index.ts"],
+            ralphVersion: "test",
+          },
+          pid_alive: true,
+          identity: { ok: true, reason: null },
+        },
+      ],
+      controlCandidates: [
+        {
+          path: canonicalControlPath,
+          root: join(homeDir, ".ralph", "control"),
+          is_canonical: true,
+          exists: true,
+          state: "readable",
+          parse_error: null,
+          control: {
+            mode: "running",
+            pause_requested: false,
+            pause_at_checkpoint: null,
+            drain_timeout_ms: null,
+          },
+        },
+        {
+          path: legacyControlPath,
+          root: join(xdgDir, "ralph"),
+          is_canonical: false,
+          exists: true,
+          state: "readable",
+          parse_error: null,
+          control: {
+            mode: "running",
+            pause_requested: false,
+            pause_at_checkpoint: null,
+            drain_timeout_ms: null,
+          },
+        },
+      ],
+      roots: [],
+    };
+
+    const applied = applyDoctorRepairs({
+      snapshot,
+      recommendations: [
+        {
+          id: "cleanup-legacy-control-files",
+          code: "CLEANUP_LEGACY_CONTROL_FILES",
+          title: "Quarantine legacy control files",
+          description: "",
+          risk: "safe",
+          applies_by_default: false,
+          paths: [legacyControlPath],
+        },
+      ],
+      dryRun: false,
+      nowIso: "2026-02-08T20:00:00.000Z",
+    });
+
+    expect(applied.some((item) => item.status === "applied")).toBeTrue();
+    expect(existsSync(canonicalControlPath)).toBeTrue();
+    expect(existsSync(legacyControlPath)).toBeFalse();
+    const files = readdirSync(join(xdgDir, "ralph"));
+    expect(files.some((file) => file.startsWith("control.json.legacy-"))).toBeTrue();
+  });
 });

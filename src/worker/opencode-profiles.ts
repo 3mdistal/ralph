@@ -1,7 +1,6 @@
 import { readdir as readdirFs } from "fs/promises";
 import { existsSync as existsSyncFs } from "fs";
 import { join } from "path";
-import { homedir as homedirFs } from "os";
 
 import type { AgentTask } from "../queue-backend";
 import {
@@ -26,6 +25,38 @@ export type ResolveOpencodeXdgResult = {
   error?: string;
 };
 
+const PROFILE_UNRESOLVABLE_PREFIX = "blocked:profile-unresolvable";
+
+function buildProfileUnresolvableError(params: {
+  phase: "start" | "resume";
+  taskIssue: string;
+  reason: string;
+  configuredProfiles: string[];
+  requestedProfile?: string | null;
+  pinnedProfile?: string | null;
+  sessionId?: string;
+}): string {
+  const configured = params.configuredProfiles.length > 0 ? params.configuredProfiles.join(", ") : "(none)";
+  const details = [
+    `phase=${params.phase}`,
+    `task=${params.taskIssue}`,
+    `requestedProfile=${params.requestedProfile ?? "(none)"}`,
+    `pinnedProfile=${params.pinnedProfile ?? "(none)"}`,
+    params.sessionId ? `sessionId=${params.sessionId}` : null,
+    `configuredProfiles=${configured}`,
+  ]
+    .filter(Boolean)
+    .join("; ");
+
+  return (
+    `${PROFILE_UNRESOLVABLE_PREFIX}: ${params.reason}. ` +
+    `OpenCode profiles are enabled, so Ralph refuses ambient fallback. ` +
+    `${details}. ` +
+    "Configure a valid profile under [opencode.profiles.<name>] in ~/.ralph/config.toml " +
+    "(paths must be absolute; no '~' expansion)."
+  );
+}
+
 export type ResolveOpencodeXdgForTaskOptions = {
   task: AgentTask;
   phase: "start" | "resume";
@@ -33,10 +64,8 @@ export type ResolveOpencodeXdgForTaskOptions = {
   repo: string;
   getThrottleDecision: typeof getThrottleDecision;
   nowMs?: number;
-  envHome?: string;
   log?: (message: string) => void;
   warn?: (message: string) => void;
-  homedir?: () => string;
   readdir?: typeof readdirFs;
   existsSync?: typeof existsSyncFs;
 };
@@ -53,19 +82,10 @@ export async function resolveOpencodeXdgForTask(
   if (!isOpencodeProfilesEnabled()) return { profileName: null };
 
   const nowMs = opts.nowMs ?? Date.now();
-  const envHome = opts.envHome ?? process.env.HOME;
-  const homedir = opts.homedir ?? homedirFs;
   const readdir = opts.readdir ?? readdirFs;
   const existsSync = opts.existsSync ?? existsSyncFs;
   const log = opts.log ?? ((message: string) => console.log(message));
   const warn = opts.warn ?? ((message: string) => console.warn(message));
-
-  const home = envHome ?? homedir();
-  const ambientXdg = {
-    dataHome: join(home, ".local", "share"),
-    stateHome: join(home, ".local", "state"),
-    cacheHome: join(home, ".cache"),
-  };
 
   const pinned = getPinnedOpencodeProfileName(opts.task);
 
@@ -74,9 +94,14 @@ export async function resolveOpencodeXdgForTask(
     if (!resolved) {
       return {
         profileName: pinned,
-        error:
-          `Task is pinned to an unknown OpenCode profile ${JSON.stringify(pinned)} (task ${opts.task.issue}). ` +
-          `Configure it under [opencode.profiles.${pinned}] in ~/.ralph/config.toml (paths must be absolute; no '~' expansion).`,
+        error: buildProfileUnresolvableError({
+          phase: opts.phase,
+          taskIssue: opts.task.issue,
+          reason: `Task is pinned to unknown OpenCode profile ${JSON.stringify(pinned)}`,
+          configuredProfiles: listOpencodeProfileNames(),
+          pinnedProfile: pinned,
+          sessionId: opts.phase === "resume" ? opts.sessionId : undefined,
+        }),
       };
     }
 
@@ -92,7 +117,15 @@ export async function resolveOpencodeXdgForTask(
 
   if (opts.phase === "resume") {
     if (!opts.sessionId) {
-      return { profileName: null, opencodeXdg: ambientXdg };
+      return {
+        profileName: null,
+        error: buildProfileUnresolvableError({
+          phase: "resume",
+          taskIssue: opts.task.issue,
+          reason: "Resume requires a session ID to resolve the OpenCode profile",
+          configuredProfiles: listOpencodeProfileNames(),
+        }),
+      };
     }
 
     const candidates = listOpencodeProfileNames();
@@ -122,7 +155,16 @@ export async function resolveOpencodeXdgForTask(
       }
     }
 
-    return { profileName: null, opencodeXdg: ambientXdg };
+    return {
+      profileName: null,
+      error: buildProfileUnresolvableError({
+        phase: "resume",
+        taskIssue: opts.task.issue,
+        reason: `Could not find session ${JSON.stringify(opts.sessionId)} under any configured profile`,
+        configuredProfiles: candidates,
+        sessionId: opts.sessionId,
+      }),
+    };
   }
 
   // Source of truth is config (opencode.defaultProfile). The control file no longer controls profile.
@@ -157,10 +199,26 @@ export async function resolveOpencodeXdgForTask(
   }
 
   if (!resolved) {
-    if (opts.phase === "start" && requested) {
-      warn(`[ralph:worker:${opts.repo}] Unable to resolve OpenCode profile for new task; running with ambient XDG dirs`);
-    }
-    return { profileName: null };
+    const requestedProfile = requested || null;
+    const reason =
+      requested === "auto"
+        ? "Auto profile selection did not resolve to a configured OpenCode profile"
+        : requestedProfile
+          ? `Requested/default OpenCode profile ${JSON.stringify(requestedProfile)} is not configured`
+          : "No OpenCode profile could be resolved for new work";
+    warn(
+      `[ralph:worker:${opts.repo}] ${PROFILE_UNRESOLVABLE_PREFIX}: ${reason}; refusing ambient fallback while profiles are enabled`
+    );
+    return {
+      profileName: null,
+      error: buildProfileUnresolvableError({
+        phase: "start",
+        taskIssue: opts.task.issue,
+        reason,
+        configuredProfiles: listOpencodeProfileNames(),
+        requestedProfile,
+      }),
+    };
   }
 
   return {

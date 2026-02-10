@@ -2,6 +2,7 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
+import { spawn } from "child_process";
 
 import { classifyDaemonCandidates, discoverDaemon } from "../daemon-discovery";
 import { resolveDaemonRecordPath } from "../daemon-record";
@@ -48,19 +49,51 @@ describe("daemon discovery", () => {
     tempDirs.length = 0;
   });
 
-  test("multiple live records fail closed as conflict", () => {
+  test("duplicate live records for same daemon identity are allowed", () => {
     const home = mkdtempSync(join(tmpdir(), "ralph-discovery-home-"));
     const xdg = mkdtempSync(join(tmpdir(), "ralph-discovery-xdg-"));
     tempDirs.push(home, xdg);
     process.env.HOME = home;
     process.env.XDG_STATE_HOME = xdg;
 
-    writeRecord(resolveDaemonRecordPath(), { daemonId: "d_canonical", pid: process.pid });
-    writeRecord(join(xdg, "ralph", "daemon.json"), { daemonId: "d_legacy", pid: process.pid });
+    writeRecord(resolveDaemonRecordPath(), { daemonId: "d_same", pid: process.pid });
+    writeRecord(join(xdg, "ralph", "daemon.json"), { daemonId: "d_same", pid: process.pid });
 
     const result = discoverDaemon({ healStale: false });
-    expect(result.state).toBe("conflict");
-    expect(result.candidates[0]?.isCanonical).toBe(true);
+    expect(result.state).toBe("live");
+    expect(result.live?.isCanonical).toBe(true);
+  });
+
+  test("multiple distinct live daemon identities fail closed as conflict", () => {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    if (typeof child.pid !== "number") {
+      throw new Error("Failed to start long-lived child process for conflict test.");
+    }
+
+    const home = mkdtempSync(join(tmpdir(), "ralph-discovery-home-"));
+    const xdg = mkdtempSync(join(tmpdir(), "ralph-discovery-xdg-"));
+    tempDirs.push(home, xdg);
+    process.env.HOME = home;
+    process.env.XDG_STATE_HOME = xdg;
+
+    try {
+      writeRecord(resolveDaemonRecordPath(), { daemonId: "d_one", pid: process.pid });
+      writeRecord(join(xdg, "ralph", "daemon.json"), { daemonId: "d_two", pid: child.pid });
+
+      const result = discoverDaemon({ healStale: false });
+      expect(result.state).toBe("conflict");
+      expect(result.candidates[0]?.isCanonical).toBe(true);
+    } finally {
+      try {
+        process.kill(child.pid, "SIGKILL");
+      } catch {
+        // best effort
+      }
+    }
   });
 
   test("stale record is detected and heal renames file", () => {
