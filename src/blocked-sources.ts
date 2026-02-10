@@ -15,6 +15,7 @@ export const BLOCKED_SOURCES = [
   "auto-update",
   "ci-failure",
   "runtime-error",
+  "profile-unresolvable",
 ] as const;
 
 export type BlockedSource = (typeof BLOCKED_SOURCES)[number];

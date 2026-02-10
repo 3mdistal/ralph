@@ -81,6 +81,11 @@ export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: 
   const add: string[] = [];
   if (!labelSet.has(target)) add.push(target);
   const remove = KNOWN_RALPH_STATUS_LABELS.filter((label) => label !== target && labelSet.has(label));
+  if (add.length === 0 && remove.length > 0) {
+    // Guard against remove-only transitions during queued/in-progress churn.
+    // Re-adding the target is idempotent and ensures we never remove the last status label without replacement.
+    add.push(target);
+  }
   return { add, remove };
 }
 
