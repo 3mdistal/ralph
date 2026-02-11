@@ -31,7 +31,7 @@ export function resolveDaemonAuthProbe(config: RalphConfig, probeRepo: string): 
   return { kind: "user", command: "gh api /user" };
 }
 
-export function formatDaemonGhAuthValidationError(error: any): string {
+function formatDaemonGhAuthValidationError(error: any): string {
   const command = String(error?.ghCommand ?? error?.command ?? "").trim();
   const message = String(error?.message ?? "").trim();
   const stderr = typeof error?.stderr?.toString === "function" ? String(error.stderr.toString()).trim() : "";
