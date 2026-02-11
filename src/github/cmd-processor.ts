@@ -240,11 +240,20 @@ async function fetchIssueLabelEventSummaries(params: {
   const { owner, name } = splitRepoFullName(params.repo);
   const out = new Map<string, LabelEventSummary>();
   const targets = new Set(params.labels.map((label) => label.toLowerCase()));
+  const perPage = 100;
+  const maxPages = 10;
   try {
-    const response = await params.github.request<IssueTimelineLabelEvent[]>(
-      `/repos/${owner}/${name}/issues/${params.issueNumber}/events?per_page=100`
-    );
-    const events = response.data ?? [];
+    const events: IssueTimelineLabelEvent[] = [];
+    let page = 1;
+    while (page <= maxPages) {
+      const response = await params.github.request<IssueTimelineLabelEvent[]>(
+        `/repos/${owner}/${name}/issues/${params.issueNumber}/events?per_page=${perPage}&page=${page}`
+      );
+      const rows = Array.isArray(response.data) ? response.data : [];
+      events.push(...rows);
+      if (rows.length < perPage) break;
+      page += 1;
+    }
     for (const label of targets) {
       out.set(label, summarizeLabelEvents(events, label));
     }
