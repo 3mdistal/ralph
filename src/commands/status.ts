@@ -9,7 +9,14 @@ import { buildStatusSnapshot, type StatusSnapshot } from "../status-snapshot";
 import { collectStatusUsageRows, formatStatusUsageSection } from "../status-usage";
 import { readRunTokenTotals } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
-import { initStateDb, listDependencySatisfactionOverrides, listIssueAlertSummaries, listTopRalphRunTriages } from "../state";
+import {
+  classifyDurableStateInitError,
+  initStateDb,
+  listDependencySatisfactionOverrides,
+  listIssueAlertSummaries,
+  listTopRalphRunTriages,
+  probeDurableState,
+} from "../state";
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
 import { parseIssueRef } from "../github/issue-ref";
@@ -371,6 +378,69 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
       };
     }),
   });
+}
+
+function buildDegradedStatusSnapshot(reason: ReturnType<typeof classifyDurableStateInitError>): StatusSnapshot {
+  const config = getConfig();
+  const queueState = getQueueBackendStateWithLabelHealth();
+  const daemonRecord = readDaemonRecord();
+  const daemon = daemonRecord
+    ? {
+        daemonId: daemonRecord.daemonId ?? null,
+        pid: typeof daemonRecord.pid === "number" ? daemonRecord.pid : null,
+        startedAt: daemonRecord.startedAt ?? null,
+        version: daemonRecord.ralphVersion ?? null,
+        controlFilePath: daemonRecord.controlFilePath ?? null,
+        command: Array.isArray(daemonRecord.command) ? daemonRecord.command : null,
+      }
+    : null;
+  const control = readControlStateSnapshot({ log: (message) => console.warn(message), defaults: config.control });
+
+  return buildStatusSnapshot({
+    mode: control.mode,
+    desiredMode: control.mode,
+    durableState: {
+      ok: false,
+      code: reason.code,
+      message: reason.message,
+      schemaVersion: reason.schemaVersion,
+      supportedRange: reason.supportedRange,
+    },
+    queue: {
+      backend: queueState.backend,
+      health: queueState.health,
+      fallback: queueState.fallback,
+      diagnostics: queueState.diagnostics ?? null,
+    },
+    daemon,
+    controlProfile: null,
+    activeProfile: null,
+    throttle: {},
+    escalations: { pending: 0 },
+    inProgress: [],
+    starting: [],
+    queued: [],
+    throttled: [],
+    blocked: [],
+    drain: {
+      requestedAt: null,
+      timeoutMs: control.drainTimeoutMs ?? null,
+      pauseRequested: control.pauseRequested === true,
+      pauseAtCheckpoint: control.pauseAtCheckpoint ?? null,
+    },
+  });
+}
+
+export async function getStatusSnapshotBestEffort(): Promise<StatusSnapshot> {
+  const probe = probeDurableState();
+  if (!probe.ok) return buildDegradedStatusSnapshot(probe);
+
+  try {
+    return await getStatusSnapshot();
+  } catch (error) {
+    const reason = classifyDurableStateInitError(error);
+    return buildDegradedStatusSnapshot(reason);
+  }
 }
 
 export async function runStatusCommand(opts: { args: string[]; drain: StatusDrainState }): Promise<void> {
