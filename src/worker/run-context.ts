@@ -67,6 +67,8 @@ type WithRunContextPorts<TResult extends { outcome?: string }> = {
   appendFile: (path: string, data: string, encoding: "utf8") => Promise<void>;
   existsSync: (path: string) => boolean;
   computeAndStoreRunMetrics: (params: { runId: string }) => Promise<void>;
+  shouldCollectTraceBundle?: (task: AgentTask) => boolean;
+  collectTraceBundle?: (params: { runId: string; task: AgentTask }) => Promise<void>;
   warn: (message: string) => void;
 };
 
@@ -379,6 +381,17 @@ export async function withRunContext<TResult extends { outcome?: string }>(param
       await params.ports.computeAndStoreRunMetrics({ runId });
     } catch {
       // best-effort metrics persistence
+    }
+
+    try {
+      const shouldCollect = params.ports.shouldCollectTraceBundle?.(params.task) ?? false;
+      if (shouldCollect) {
+        await params.ports.collectTraceBundle?.({ runId, task: params.task });
+      }
+    } catch (error: any) {
+      params.ports.warn(
+        `[ralph:worker:${params.ports.repo}] Failed to collect trace bundle for ${params.task.name}: ${error?.message ?? String(error)}`
+      );
     }
 
     params.ports.setActiveRunId(previousRunId);

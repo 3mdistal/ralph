@@ -138,7 +138,12 @@ describe("github queue core", () => {
 
   test("statusToRalphLabelDelta removes other status labels when blocked", () => {
     const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued", "ralph:status:in-progress"]);
-    expect(delta).toEqual({ add: [], remove: ["ralph:status:queued"] });
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
+  });
+
+  test("statusToRalphLabelDelta guards against remove-only status mutation", () => {
+    const delta = statusToRalphLabelDelta("in-progress", ["ralph:status:queued", "ralph:status:in-progress"]);
+    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
   test("statusToRalphLabelDelta preserves non-ralph labels when blocked", () => {
@@ -149,7 +154,7 @@ describe("github queue core", () => {
       "ralph:status:in-progress",
     ]);
     expect(delta).toEqual({
-      add: [],
+      add: ["ralph:status:in-progress"],
       remove: ["ralph:status:queued"],
     });
   });
@@ -393,7 +398,7 @@ describe("issue label io", () => {
   test("executeIssueLabelOps preserves non-ralph labels", async () => {
     const labels = new Set(["bug", "p1-high", "ralph:status:in-progress"]);
     const calls: Array<{ method: string; path: string }> = [];
-    const request = async (path: string, opts: { method?: string; body?: unknown; allowNotFound?: boolean } = {}) => {
+    const request = async <T>(path: string, opts: { method?: string; body?: unknown; allowNotFound?: boolean } = {}) => {
       const method = (opts.method ?? "GET").toUpperCase();
       calls.push({ method, path });
       if (method === "POST" && /\/issues\/\d+\/labels$/.test(path)) {
@@ -401,15 +406,22 @@ describe("issue label io", () => {
         for (const label of body?.labels ?? []) {
           labels.add(label);
         }
-        return { data: null, etag: null, status: 200 };
+        return { data: null, etag: null, status: 200 } as any;
       }
       if (method === "DELETE") {
         const match = path.match(/\/labels\/([^/]+)$/);
         const label = match ? decodeURIComponent(match[1]) : "";
         const removed = labels.delete(label);
-        return { data: null, etag: null, status: removed ? 204 : 404 };
+        return { data: null, etag: null, status: removed ? 204 : 404 } as any;
       }
-      return { data: null, etag: null, status: 200 };
+      if (method === "GET" && /\/issues\/\d+\/labels$/.test(path)) {
+        return {
+          data: Array.from(labels).map((name) => ({ name })),
+          etag: null,
+          status: 200,
+        } as any;
+      }
+      return { data: null, etag: null, status: 200 } as any;
     };
 
     const ops = planIssueLabelOps({ add: ["ralph:status:escalated"], remove: ["ralph:status:in-progress"] });
@@ -425,7 +437,7 @@ describe("issue label io", () => {
     expect(labels.has("p1-high")).toBe(true);
     expect(labels.has("ralph:status:escalated")).toBe(true);
     expect(labels.has("ralph:status:in-progress")).toBe(false);
-    expect(calls.map((call) => call.method)).toEqual(["POST", "DELETE"]);
+    expect(calls.map((call) => call.method)).toEqual(["POST", "DELETE", "GET"]);
   });
 
   test("planIssueLabelOps refuses non-ralph labels", () => {

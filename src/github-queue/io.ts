@@ -501,6 +501,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
                 logLabel: `${repo}#${issue.number}`,
                 log: (message) => console.warn(`[ralph:queue:github] ${message}`),
                 repo,
+                issueNumber: issue.number,
                 ensureLabels: async () => await io.ensureWorkflowLabels(repo),
                 retryMissingLabelOnce: true,
               });
@@ -555,6 +556,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               logLabel: `${repo}#${issue.number}`,
               log: (message) => console.warn(`[ralph:queue:github] ${message}`),
               repo,
+              issueNumber: issue.number,
               ensureLabels: async () => await io.ensureWorkflowLabels(repo),
               retryMissingLabelOnce: true,
             });
@@ -677,6 +679,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               logLabel: `${repo}#${issue.number}`,
               log: (message) => console.warn(`[ralph:queue:github] ${message}`),
               repo,
+              issueNumber: issue.number,
               ensureLabels: async () => await io.ensureWorkflowLabels(repo),
               retryMissingLabelOnce: true,
             });
@@ -943,6 +946,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             logLabel: `${issueRef.repo}#${issueRef.number}`,
             log: (message) => console.warn(`[ralph:queue:github] ${message}`),
             repo: issueRef.repo,
+            issueNumber: issueRef.number,
             ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
             retryMissingLabelOnce: true,
           });
@@ -1218,6 +1222,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             logLabel: `${issueRef.repo}#${issueRef.number}`,
             log: (message) => console.warn(`[ralph:queue:github] ${message}`),
             repo: issueRef.repo,
+            issueNumber: issueRef.number,
             ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
             retryMissingLabelOnce: true,
           });

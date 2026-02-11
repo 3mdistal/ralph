@@ -53,6 +53,30 @@ async function ensureExcludeEntry(excludePath: string, entry: string): Promise<v
   await appendFile(excludePath, `${prefix}${entry}\n`, "utf8");
 }
 
+async function listTrackedPaths(worktreePath: string, pathspec: string): Promise<string[]> {
+  try {
+    const result = await $`git -C ${worktreePath} ls-files -z -- ${pathspec}`.quiet();
+    const raw = result.stdout.toString();
+    if (!raw) return [];
+    return raw
+      .split("\0")
+      .map((value: string) => value.trim())
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function markSkipWorktree(worktreePath: string, paths: string[]): Promise<void> {
+  for (const path of paths) {
+    try {
+      await $`git -C ${worktreePath} update-index --skip-worktree -- ${path}`.quiet();
+    } catch {
+      // Best-effort. If this fails, Ralph should still be able to run.
+    }
+  }
+}
+
 export async function ensureRalphWorktreeArtifacts(worktreePath: string): Promise<{ planPath: string }> {
   const artifactsDir = join(worktreePath, RALPH_ARTIFACT_DIR);
   await mkdir(artifactsDir, { recursive: true });
@@ -65,6 +89,14 @@ export async function ensureRalphWorktreeArtifacts(worktreePath: string): Promis
   const excludePath = await getGitExcludePath(worktreePath);
   if (excludePath) {
     await ensureExcludeEntry(excludePath, `${RALPH_ARTIFACT_DIR}/`);
+  }
+
+  // If any `.ralph/*` files are tracked in the repo, ignore rules will not prevent them from
+  // showing up as dirty changes. Mark them `skip-worktree` so plan updates don't get committed
+  // and cause noisy PR merge conflicts.
+  const trackedRalphFiles = await listTrackedPaths(worktreePath, `${RALPH_ARTIFACT_DIR}/`);
+  if (trackedRalphFiles.length) {
+    await markSkipWorktree(worktreePath, trackedRalphFiles);
   }
 
   return { planPath };

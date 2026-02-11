@@ -20,7 +20,9 @@ function printGlobalHelp(): void {
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:run [--no-seed]       Provision+seed a sandbox repo and run the daemon",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
+      "  ralph sandbox:collect --run-id <id> Export a run trace bundle",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
       "  ralph rollup <repo>                (stub) Rollup helpers",
       "  ralph sandbox seed                 Seed sandbox edge-case issues",
@@ -175,6 +177,24 @@ function printCommandHelp(command: string): void {
       );
       return;
 
+    case "sandbox:run":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:run [--no-seed] [--no-daemon] [--detach] [--tail <n>] [--json]",
+          "",
+          "Provision a fresh sandbox repo, optionally seed it, and then run the daemon against it.",
+          "",
+          "Options:",
+          "  --no-seed     Skip seeding",
+          "  --no-daemon   Provision/seed only (print next command)",
+          "  --detach      Spawn daemon and return immediately",
+          "  --tail <n>    When daemon exits, print up to N trace bundle paths (default: 20)",
+          "  --json        Emit machine-readable output",
+        ].join("\n")
+      );
+      return;
+
     case "sandbox:seed":
       console.log(
         [
@@ -182,6 +202,17 @@ function printCommandHelp(command: string): void {
           "  ralph sandbox:seed [--run-id <id>]",
           "",
           "Seeds a sandbox repo based on the manifest (defaults to newest manifest if omitted).",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:collect":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:collect --run-id <id> [--out <path>] [--json]",
+          "",
+          "Exports a run-scoped trace bundle (timeline + GitHub request ids + artifacts).",
         ].join("\n")
       );
       return;
@@ -272,6 +303,8 @@ if (
     cmd === "repos" ||
     cmd === "watch" ||
     cmd === "nudge" ||
+    cmd === "sandbox:run" ||
+    cmd === "sandbox:collect" ||
     cmd === "sandbox" ||
     cmd === "worktrees" ||
     cmd === "rollup") &&

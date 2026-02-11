@@ -211,6 +211,8 @@ async function runAutoQueueOnce(params: {
         log: (message) => console.warn(`[ralph:auto-queue:${issue.repo}] ${message}`),
         ensureLabels: async () => await labelEnsurer.ensure(issue.repo),
         retryMissingLabelOnce: true,
+        repo: issue.repo,
+        issueNumber: issue.number,
       });
 
       if (!result.ok) {
