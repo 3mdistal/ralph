@@ -122,7 +122,7 @@ describe("prepareReviewDiffArtifacts", () => {
       gate: "product_review",
       repo: "3mdistal/ralph",
       issueRef: "3mdistal/ralph#235",
-      prUrl: "",
+      prUrl: "https://github.com/3mdistal/ralph/pull/235",
       issueContext: "Issue context text",
       diff: {
         baseRef: "bot/integration",
@@ -150,5 +150,70 @@ describe("prepareReviewDiffArtifacts", () => {
     const state = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 235 });
     const gate = state?.results.find((entry) => entry.gate === "product_review");
     expect(gate?.status).toBe("pass");
+    expect(gate?.prUrl).toBe("https://github.com/3mdistal/ralph/pull/235");
+    expect(gate?.prNumber).toBe(235);
+
+    const commandOutputArtifact = state?.artifacts.find(
+      (entry) => entry.gate === "product_review" && entry.kind === "command_output"
+    );
+    expect(commandOutputArtifact?.content).toContain('RALPH_REVIEW: {"status":"pass","reason":"ok"}');
+  });
+
+  test("persists raw output and marker parse failure for invalid response", async () => {
+    initStateDb();
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#236",
+      taskPath: "github:3mdistal/ralph#236",
+      attemptKind: "process",
+    });
+    ensureRalphRunGateRows({ runId });
+
+    const result = await runReviewGate({
+      runId,
+      gate: "product_review",
+      repo: "3mdistal/ralph",
+      issueRef: "3mdistal/ralph#236",
+      prUrl: "https://github.com/3mdistal/ralph/pull/236",
+      issueContext: "Issue context text",
+      diff: {
+        baseRef: "bot/integration",
+        headRef: "HEAD",
+        diffPath: "/tmp/ralph-review.diff",
+        diffStat: " src/app.ts | 2 +-",
+      },
+      runAgent: async () => ({
+        sessionId: "ses_test_fail",
+        success: true,
+        output: "missing marker output",
+      }),
+      runRepairAgent: async () => ({
+        sessionId: "ses_test_fail",
+        success: true,
+        output: "still missing marker",
+      }),
+    });
+
+    expect(result.status).toBe("fail");
+    const state = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 236 });
+    const gate = state?.results.find((entry) => entry.gate === "product_review");
+    expect(gate?.status).toBe("fail");
+    expect(gate?.prUrl).toBe("https://github.com/3mdistal/ralph/pull/236");
+    expect(gate?.prNumber).toBe(236);
+
+    const commandOutputs = state?.artifacts.filter(
+      (entry) => entry.gate === "product_review" && entry.kind === "command_output"
+    );
+    expect(commandOutputs?.some((entry) => entry.content.includes("missing marker output"))).toBe(true);
+
+    const parseArtifacts = state?.artifacts.filter(
+      (entry) => entry.gate === "product_review" && entry.kind === "failure_excerpt"
+    );
+    expect(Boolean(parseArtifacts && parseArtifacts.length > 0)).toBe(true);
+    const parsedPayload = JSON.parse(parseArtifacts?.[0]?.content ?? "{}");
+    expect(parsedPayload).toHaveProperty("version", 1);
+    expect(parsedPayload).toHaveProperty("ok", false);
+    expect(parsedPayload).toHaveProperty("failure");
+    expect(parsedPayload).toHaveProperty("reason");
   });
 });

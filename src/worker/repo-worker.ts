@@ -1986,7 +1986,7 @@ export class RepoWorker {
 
     const runReviewAgent = async (
       gate: "product_review" | "devex_review",
-      agent: "product" | "devex",
+      agent: "product-review" | "devex-review",
       stage: string
     ) => {
       return await runReviewGate({
@@ -2018,7 +2018,7 @@ export class RepoWorker {
       });
     };
 
-    const productReview = await runReviewAgent("product_review", "product", "pr readiness product review");
+    const productReview = await runReviewAgent("product_review", "product-review", "pr readiness product review");
     if (productReview.status !== "pass") {
       diagnostics.push(`- Review failed: product (${productReview.reason})`);
       recordReviewGateSkipped({
@@ -2030,7 +2030,7 @@ export class RepoWorker {
     }
     diagnostics.push("- Review passed: product");
 
-    const devexReview = await runReviewAgent("devex_review", "devex", "pr readiness devex review");
+    const devexReview = await runReviewAgent("devex_review", "devex-review", "pr readiness devex review");
     if (devexReview.status !== "pass") {
       diagnostics.push(`- Review failed: devex (${devexReview.reason})`);
       return { ok: false, diagnostics };

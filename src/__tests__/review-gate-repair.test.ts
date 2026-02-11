@@ -67,7 +67,7 @@ describe("runReviewGate marker repair", () => {
     const { runId } = createRun();
     const diff = createDiff();
 
-    let repairContinueSessionId: string | undefined;
+    let repairPrompt = "";
     let repairCalls = 0;
 
     const result = await runReviewGate({
@@ -82,9 +82,9 @@ describe("runReviewGate marker repair", () => {
         success: true,
         output: "product review ok (missing marker)",
       }),
-      runRepairAgent: async (_prompt: string, continueSessionId?: string) => {
+      runRepairAgent: async (prompt: string) => {
         repairCalls += 1;
-        repairContinueSessionId = continueSessionId;
+        repairPrompt = prompt;
         return {
           sessionId: "ses_product",
           success: true,
@@ -95,7 +95,8 @@ describe("runReviewGate marker repair", () => {
 
     expect(result.status).toBe("pass");
     expect(repairCalls).toBe(1);
-    expect(repairContinueSessionId).toBe("ses_product");
+    expect(repairPrompt).toContain("Prior response (verbatim):");
+    expect(repairPrompt).toContain("product review ok (missing marker)");
   });
 
   test("stops after exhausting repair attempts", async () => {

@@ -9,7 +9,7 @@ Ralph daemon runs use a Ralph-managed OpenCode config directory instead of any u
 ## Defaults
 
 - Config dir: `$HOME/.ralph/opencode`
-- Agents: `agent/build.md`, `agent/ralph-plan.md`, `agent/ralph-parent-verify.md`, `agent/product.md`, `agent/devex.md`, `agent/loop-triage.md`
+- Agents: `agent/build.md`, `agent/ralph-plan.md`, `agent/ralph-parent-verify.md`, `agent/product.md`, `agent/devex.md`, `agent/loop-triage.md` (plus tool-disabled review variants for product/devex gate runs)
 - Minimal `opencode.json` containing the required agent IDs
 
 ## Overrides
