@@ -31,7 +31,7 @@ describe("ralphctl core helpers", () => {
     const degraded = makeSnapshot({ durableState: { ok: false, code: "forward_incompatible" } });
     expect(shouldUseGraceDrainFallback(degraded)).toBeTrue();
 
-    const readonly = makeSnapshot({ durableState: { ok: true, verdict: "readable_readonly_forward_newer" } });
+    const readonly = makeSnapshot({ durableState: { ok: true, verdict: "readable_readonly_forward_newer", canWriteState: false } });
     expect(shouldUseGraceDrainFallback(readonly)).toBeTrue();
   });
 
@@ -61,7 +61,7 @@ describe("ralphctl core helpers", () => {
     const healthy = makeSnapshot();
     const degradedBefore = makeSnapshot({ durableState: { ok: false, code: "forward_incompatible" } });
     const degradedAfter = makeSnapshot({ durableState: { ok: false, code: "lock_timeout" } });
-    const readonlyAfter = makeSnapshot({ durableState: { ok: true, verdict: "readable_readonly_forward_newer" } });
+    const readonlyAfter = makeSnapshot({ durableState: { ok: true, verdict: "readable_readonly_forward_newer", canWriteState: false } });
     expect(getResumptionVerificationSkipReason(degradedBefore, healthy)).toContain("before restart");
     expect(getResumptionVerificationSkipReason(healthy, degradedAfter)).toContain("after restart");
     expect(getResumptionVerificationSkipReason(healthy, readonlyAfter)).toContain("after restart");

@@ -4,6 +4,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { spawnSync } from "child_process";
 import { Database } from "bun:sqlite";
+import { getDurableStateSchemaWindow } from "../state";
 
 const REPO_ROOT = process.cwd();
 
@@ -45,6 +46,9 @@ describe("ralphctl status degraded mode", () => {
       const parsed = JSON.parse(result.stdout.slice(jsonStart)) as Record<string, any>;
       expect(parsed.durableState?.ok).toBeTrue();
       expect(parsed.durableState?.verdict).toBe("readable_writable");
+      expect(parsed.durableState?.canReadState).toBeTrue();
+      expect(parsed.durableState?.canWriteState).toBeTrue();
+      expect(parsed.durableState?.requiresMigration).toBeFalse();
       expect(parsed.durableState?.minReadableSchema).toBeNumber();
       expect(parsed.durableState?.maxReadableSchema).toBeNumber();
       expect(parsed.durableState?.maxWritableSchema).toBeNumber();
@@ -78,6 +82,9 @@ describe("ralphctl status degraded mode", () => {
       expect(parsed.durableState?.ok).toBeFalse();
       expect(parsed.durableState?.code).toBe("forward_incompatible");
       expect(parsed.durableState?.verdict).toBe("unreadable_forward_incompatible");
+      expect(parsed.durableState?.canReadState).toBeFalse();
+      expect(parsed.durableState?.canWriteState).toBeFalse();
+      expect(parsed.durableState?.requiresMigration).toBeTrue();
       expect(parsed.durableState?.schemaVersion).toBe(999);
       expect(typeof parsed.durableState?.supportedRange).toBe("string");
       expect(typeof parsed.durableState?.writableRange).toBe("string");
@@ -91,12 +98,14 @@ describe("ralphctl status degraded mode", () => {
     const homeDir = await mkdtemp(join(tmpdir(), "ralph-status-cli-home-"));
     const xdgStateHome = await mkdtemp(join(tmpdir(), "ralph-status-cli-xdg-"));
     const stateDbPath = join(homeDir, ".ralph", "state.sqlite");
+    const writableSchema = getDurableStateSchemaWindow().maxWritableSchema;
+    const forwardNewerSchema = writableSchema + 1;
     await mkdir(join(homeDir, ".ralph"), { recursive: true });
 
     const db = new Database(stateDbPath);
     try {
       db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '20')");
+      db.exec(`INSERT INTO meta(key, value) VALUES ('schema_version', '${forwardNewerSchema}')`);
     } finally {
       db.close();
     }
@@ -104,11 +113,16 @@ describe("ralphctl status degraded mode", () => {
     try {
       const result = runRalphctl(["status", "--json"], buildIsolatedEnv(homeDir, xdgStateHome));
       expect(result.status).toBe(0);
-      const parsed = JSON.parse(result.stdout.trim()) as Record<string, any>;
+      const jsonStart = result.stdout.indexOf("{");
+      expect(jsonStart).toBeGreaterThanOrEqual(0);
+      const parsed = JSON.parse(result.stdout.slice(jsonStart)) as Record<string, any>;
       expect(parsed.mode).toBeString();
       expect(parsed.durableState?.ok).toBeTrue();
       expect(parsed.durableState?.verdict).toBe("readable_readonly_forward_newer");
-      expect(parsed.durableState?.schemaVersion).toBe(20);
+      expect(parsed.durableState?.canReadState).toBeTrue();
+      expect(parsed.durableState?.canWriteState).toBeFalse();
+      expect(parsed.durableState?.requiresMigration).toBeTrue();
+      expect(parsed.durableState?.schemaVersion).toBe(forwardNewerSchema);
       expect(parsed.durableState?.maxWritableSchema).toBeNumber();
       expect(parsed.durableState?.maxReadableSchema).toBeNumber();
     } finally {

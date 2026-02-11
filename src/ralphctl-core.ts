@@ -3,6 +3,7 @@ import type { StatusSnapshot } from "./status-snapshot";
 function isDurableStateWritable(snapshot: StatusSnapshot): boolean {
   const durableState = snapshot.durableState;
   if (!durableState) return true;
+  if (typeof durableState.canWriteState === "boolean") return durableState.canWriteState;
   if (durableState.ok === false) return false;
   return durableState.verdict !== "readable_readonly_forward_newer";
 }

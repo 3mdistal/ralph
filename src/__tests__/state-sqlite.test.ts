@@ -137,6 +137,9 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     if (!probe.ok) {
       expect(probe.code).toBe("forward_incompatible");
       expect(probe.verdict).toBe("unreadable_forward_incompatible");
+      expect(probe.canReadState).toBeFalse();
+      expect(probe.canWriteState).toBeFalse();
+      expect(probe.requiresMigration).toBeTrue();
       expect(probe.schemaVersion).toBe(999);
       expect(probe.supportedRange).toBe(`1..${getDurableStateSchemaWindow().maxReadableSchema}`);
       expect(probe.writableRange).toBe(`1..${getDurableStateSchemaWindow().maxWritableSchema}`);
@@ -159,6 +162,9 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(probe.ok).toBeTrue();
     if (probe.ok) {
       expect(probe.verdict).toBe("readable_readonly_forward_newer");
+      expect(probe.canReadState).toBeTrue();
+      expect(probe.canWriteState).toBeFalse();
+      expect(probe.requiresMigration).toBeTrue();
       expect(probe.schemaVersion).toBe(window.maxWritableSchema + 1);
       expect(probe.maxReadableSchema).toBe(window.maxReadableSchema);
       expect(probe.maxWritableSchema).toBe(window.maxWritableSchema);

@@ -24,6 +24,12 @@ Ralph defines an explicit durable-state compatibility window shared by daemon st
 - `maxReadableSchema`
 - `maxWritableSchema`
 
+Capability flags are published alongside verdicts:
+
+- `canReadState`
+- `canWriteState`
+- `requiresMigration`
+
 Verdicts are typed and stable:
 
 - `readable_writable`
@@ -37,6 +43,12 @@ Forward-newer durable state is allowed in read-only mode when:
 - and `schemaVersion <= maxReadableSchema`
 
 If `schemaVersion > maxReadableSchema`, Ralph fails closed.
+
+Operational contract:
+
+- `status`: allowed when `canReadState=true`.
+- `restart`: allowed only via deterministic safe path; no unsafe durable-state writes when `canWriteState=false`.
+- Mutation/write paths: require `canWriteState=true`; otherwise block with explicit diagnostics and migration guidance.
 
 ## Startup compatibility behavior
 
