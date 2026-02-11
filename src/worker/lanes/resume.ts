@@ -12,6 +12,7 @@ import { readLiveAnomalyCount } from "../introspection";
 import type { AgentRun } from "../repo-worker";
 import { derivePrCreateEscalationReason } from "../pr-create-escalation-reason";
 import { classifyPrCreateFailurePolicy, computePrCreateRetryBackoffMs } from "../pr-create-policy";
+import type { PrEvidenceCauseCode } from "../../gates/pr-evidence-gate";
 
 type ResumeTaskOptions = { resumeMessage?: string; repoSlot?: number | null };
 
@@ -249,6 +250,7 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
           selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
         );
         let prRecoveryDiagnostics = "";
+        let prRecoveryCauseCode: PrEvidenceCauseCode | null = null;
 
         const prCreateEvidence: string[] = [];
         const addPrCreateEvidence = (output: unknown): void => {
@@ -281,6 +283,7 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
           });
           if (recovered.terminalRun) return recovered.terminalRun;
           prRecoveryDiagnostics = recovered.diagnostics;
+          prRecoveryCauseCode = recovered.causeCode ?? prRecoveryCauseCode;
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
 
@@ -608,6 +611,7 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             });
             if (recovered.terminalRun) return recovered.terminalRun;
             prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+            prRecoveryCauseCode = recovered.causeCode ?? prRecoveryCauseCode;
             prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
 
             if (!prUrl) {
@@ -636,13 +640,20 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
           });
           if (recovered.terminalRun) return recovered.terminalRun;
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+          prRecoveryCauseCode = recovered.causeCode ?? prRecoveryCauseCode;
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
 
         if (!prUrl) {
-          const derived = derivePrCreateEscalationReason({ continueAttempts, evidence: prCreateEvidence });
+          const derived = derivePrCreateEscalationReason({
+            continueAttempts,
+            evidence: prCreateEvidence,
+            fallbackCauseCode: prRecoveryCauseCode,
+          });
           const reason = derived.reason;
           console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+
+          const escalationDetails = [derived.details, buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
 
           const wasEscalated = task.status === "escalated";
           const escalated = await this.queue.updateTaskStatus(task, "escalated");
@@ -651,7 +662,7 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
           }
           await this.writeEscalationWriteback(task, {
             reason,
-            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+            details: escalationDetails,
             escalationType: "other",
           });
           await this.notify.notifyEscalation({
@@ -663,14 +674,14 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
             reason,
             escalationType: "other",
-            planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+            planOutput: escalationDetails,
           });
 
           if (escalated && !wasEscalated) {
             await this.recordEscalatedRunNote(task, {
               reason,
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-              details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+              details: escalationDetails,
             });
           }
 
@@ -680,6 +691,7 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             outcome: "escalated",
             sessionId: buildResult.sessionId,
             escalationReason: reason,
+            prEvidenceCauseCode: derived.causeCode,
           };
         }
 

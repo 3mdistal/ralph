@@ -15,10 +15,25 @@ describe("evaluatePrEvidenceCompletion", () => {
       finalOutcome: "escalated",
       reasonCode: "missing_pr_url",
       missingPrEvidence: true,
+      causeCode: "UNKNOWN",
     });
   });
 
-  test("allows verified success without PR evidence", () => {
+  test("allows success with explicit no-PR terminal reason", () => {
+    const decision = evaluatePrEvidenceCompletion({
+      attemptedOutcome: "success",
+      completionKind: "verified",
+      issueLinked: true,
+      prUrl: null,
+      noPrTerminalReason: "PARENT_VERIFICATION_NO_PR",
+    });
+
+    expect(decision.finalOutcome).toBe("success");
+    expect(decision.missingPrEvidence).toBe(false);
+    expect(decision.causeCode).toBeNull();
+  });
+
+  test("does not allow implicit verified completion without terminal reason", () => {
     const decision = evaluatePrEvidenceCompletion({
       attemptedOutcome: "success",
       completionKind: "verified",
@@ -26,8 +41,9 @@ describe("evaluatePrEvidenceCompletion", () => {
       prUrl: null,
     });
 
-    expect(decision.finalOutcome).toBe("success");
-    expect(decision.missingPrEvidence).toBe(false);
+    expect(decision.finalOutcome).toBe("escalated");
+    expect(decision.reasonCode).toBe("missing_pr_url");
+    expect(decision.causeCode).toBe("UNKNOWN");
   });
 
   test("allows success when PR URL exists", () => {
@@ -40,6 +56,7 @@ describe("evaluatePrEvidenceCompletion", () => {
 
     expect(decision.finalOutcome).toBe("success");
     expect(decision.missingPrEvidence).toBe(false);
+    expect(decision.causeCode).toBeNull();
   });
 
   test("does not alter non-success outcomes", () => {
@@ -52,5 +69,6 @@ describe("evaluatePrEvidenceCompletion", () => {
 
     expect(decision.finalOutcome).toBe("failed");
     expect(decision.missingPrEvidence).toBe(false);
+    expect(decision.causeCode).toBeNull();
   });
 });
