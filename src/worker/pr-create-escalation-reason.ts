@@ -37,7 +37,7 @@ export function derivePrCreateEscalationReason(params: {
   if (classification) {
     const details = toBoundedText(
       [
-        `No PR URL observed after ${params.continueAttempts} continue attempts. Root-cause classification detected from run output.`,
+        `No PR URL observed after ${params.continueAttempts} orchestrator PR-recovery attempts. Root-cause classification detected from run output.`,
         formatPrEvidenceCauseCodeLine(causeCode),
       ].join("\n")
     );
@@ -66,7 +66,7 @@ export function derivePrCreateEscalationReason(params: {
   }
 
   return {
-    reason: `Agent completed but did not create a PR after ${params.continueAttempts} continue attempts`,
+    reason: `No PR URL recovered after ${params.continueAttempts} orchestrator PR-recovery attempts`,
     classification: null,
     details: formatPrEvidenceCauseCodeLine(causeCode),
     causeCode,

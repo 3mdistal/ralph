@@ -520,9 +520,9 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
               "Do NOT create a new PR.",
               "Fix any failing checks and push updates to the existing PR branch.",
-              "Only paste a PR URL if it changes.",
+              "Ralph orchestrator will keep using the existing PR.",
             ].join(" ")
-          : `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
+          : `Proceed with implementation. Do NOT create a PR; Ralph orchestrator creates PRs targeting '${botBranch}'.`;
 
         if (existingPr.selectedUrl) {
           console.log(
@@ -874,13 +874,17 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
 
           continueAttempts++;
           console.log(
-            `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
+            `[ralph:worker:${this.repo}] No PR URL found; requesting branch-evidence refresh (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
           );
 
           const pausedBuildContinue = await this.pauseIfHardThrottled(task, "build continue", buildResult.sessionId);
           if (pausedBuildContinue) return pausedBuildContinue;
 
-          const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+          const nudge = this.buildPrRecoveryNudge({
+            botBranch,
+            issueRef: task.issue,
+            latestOutput: buildResult.output,
+          });
           const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue", "in-progress");
 
             buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {

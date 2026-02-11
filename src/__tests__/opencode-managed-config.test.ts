@@ -84,4 +84,16 @@ describe("Managed OpenCode config", () => {
     expect(productReview?.permission?.question).toBe("deny");
     expect(devexReview?.permission?.question).toBe("deny");
   });
+
+  test("build agent template requires branch evidence and forbids PR creation", async () => {
+    const managedDir = getRalphOpencodeConfigDir();
+    const manifest = getManagedOpencodeConfigManifest(managedDir);
+    const buildTemplate = manifest.files.find((file) => file.path.endsWith("/agent/build.md"));
+
+    expect(buildTemplate).toBeDefined();
+    const text = buildTemplate?.contents ?? "";
+    expect(text).toContain("Do NOT create/edit/merge/close GitHub PRs.");
+    expect(text).toContain("RALPH_BUILD_EVIDENCE");
+    expect(text).toContain("Do NOT ask Ralph/operator to paste a PR URL");
+  });
 });

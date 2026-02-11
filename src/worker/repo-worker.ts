@@ -54,6 +54,7 @@ import {
   type PrEvidenceCauseCode,
   formatPrEvidenceCauseCodeLine,
 } from "../gates/pr-evidence-gate";
+import { parseRalphBuildEvidenceMarker } from "../gates/build-evidence";
 import { prepareReviewDiffArtifacts, recordReviewGateFailure, recordReviewGateSkipped, runReviewGate } from "../gates/review";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
@@ -1890,8 +1891,6 @@ export class RepoWorker {
 
     this.recordMissingPrEvidence({
       task: params.task,
-      issueNumber: params.issueNumber,
-      botBranch: params.botBranch,
       reason: derived.reason,
       blockedSource: derived.classification?.blockedSource,
       diagnostics: planOutput,
@@ -1920,8 +1919,6 @@ export class RepoWorker {
     const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
     this.recordMissingPrEvidence({
       task: params.task,
-      issueNumber: params.issueNumber,
-      botBranch: params.botBranch,
       reason: params.reason,
       blockedSource: params.blockedSource,
       diagnostics: planOutput,
@@ -2028,31 +2025,36 @@ export class RepoWorker {
     }
   }
 
-  private buildPrCreationNudge(botBranch: string, issueNumber: string, issueRef: string): string {
-    const fixes = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${issueRef}`;
+  private buildPrRecoveryNudge(params: {
+    botBranch: string;
+    issueRef: string;
+    latestOutput: string;
+  }): string {
     const preflight = getRepoPreflightCommands(this.repo);
-    const preflightLines = preflight.commands.length > 0
-      ? ["# Preflight (must pass before PR)", ...preflight.commands]
-      : [];
+    const preflightLines = preflight.commands.length > 0 ? preflight.commands : ["(no repo preflight configured)"];
+    const buildEvidence = parseRalphBuildEvidenceMarker(params.latestOutput);
+    const markerHint = buildEvidence.ok
+      ? `Last marker accepted: branch=${buildEvidence.evidence.branch}, head_sha=${buildEvidence.evidence.head_sha}, ready_for_pr_create=${buildEvidence.evidence.ready_for_pr_create}`
+      : `Missing/invalid RALPH_BUILD_EVIDENCE marker: ${buildEvidence.error}`;
 
     return [
-      `No PR URL found. Create a PR targeting '${botBranch}' and paste the PR URL.`,
-      "IMPORTANT: Before creating a new PR, check if one already exists for this issue.",
+      `No PR URL found yet for ${params.issueRef}. Do NOT create a PR. Ralph orchestrator owns PR creation for branch '${params.botBranch}'.`,
+      "Prepare branch/worktree evidence so Ralph can create or reuse the PR deterministically.",
+      markerHint,
       "",
-      "Commands (run in the task worktree):",
+      "Do now:",
+      "- Ensure your implementation changes are committed to your current branch.",
+      "- Ensure the worktree is clean (`git status` should show no pending changes).",
+      "- Run preflight (if configured) and report a concise summary.",
+      "- End your response with exactly one final-line marker:",
+      "  RALPH_BUILD_EVIDENCE: {\"version\":1,\"branch\":\"...\",\"base\":\"bot/integration\",\"head_sha\":\"...\",\"worktree_clean\":true,\"preflight\":{\"status\":\"pass|fail|skipped\",\"command\":\"...\",\"summary\":\"...\"},\"ready_for_pr_create\":true}",
+      "",
+      "Helpful local commands (no gh write commands):",
       "```bash",
       "git status",
+      "git branch --show-current",
+      "git rev-parse HEAD",
       ...preflightLines,
-      "git push -u origin HEAD",
-      issueNumber
-        ? `gh pr list --state open --search "fixes #${issueNumber} OR closes #${issueNumber} OR resolves #${issueNumber}" --json url,baseRefName,headRefName --limit 10`
-        : "",
-      `gh pr create --base ${botBranch} --fill --body \"${fixes}\"`,
-      "```",
-      "",
-      "If a PR already exists:",
-      "```bash",
-      "gh pr list --head $(git branch --show-current) --json url,baseRefName,headRefName --limit 10",
       "```",
     ].join("\n");
   }
@@ -2888,8 +2890,6 @@ export class RepoWorker {
 
   private recordMissingPrEvidence(params: {
     task: AgentTask;
-    issueNumber: string;
-    botBranch: string;
     reason: string;
     blockedSource?: string;
     diagnostics?: string;
@@ -2919,11 +2919,11 @@ export class RepoWorker {
         `Issue: ${params.task.issue}`,
         `Worktree: ${worktreePath}`,
         "",
-        "Suggested recovery commands:",
+        "Orchestrator recovery checks:",
         `git -C \"${worktreePath}\" status`,
         `git -C \"${worktreePath}\" branch --show-current`,
-        `git -C \"${worktreePath}\" push -u origin HEAD`,
-        `gh pr create --base ${params.botBranch} --fill --body \"Fixes #${params.issueNumber}\"`,
+        `git -C \"${worktreePath}\" rev-parse HEAD`,
+        "Ralph orchestrator then pushes the branch and creates/reuses the PR.",
         params.diagnostics ? "" : null,
         params.diagnostics ? "Diagnostics:" : null,
         params.diagnostics ?? null,

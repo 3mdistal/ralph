@@ -129,8 +129,8 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
       const defaultResumeMessage =
         "Ralph restarted while this task was in progress. " +
         "Resume from where you left off. " +
-        "If you already created a PR, paste the PR URL. " +
-        `Otherwise continue implementing and create a PR targeting the '${botBranch}' branch.`;
+        "Do NOT create a pull request; Ralph orchestrator creates and manages PRs. " +
+        `Continue implementation on your current branch targeting '${botBranch}' and finish with branch evidence.`;
 
       const resumeMessage = opts?.resumeMessage?.trim();
       const baseResumeMessage = resumeMessage || defaultResumeMessage;
@@ -141,7 +141,7 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             "Do NOT create a new PR.",
             "Continue work on the existing PR branch and push updates as needed.",
             resumeMessage ?? "",
-            "Only paste a PR URL if it changes.",
+            "Ralph orchestrator will keep using the existing PR.",
           ]
             .filter(Boolean)
             .join(" ")
@@ -535,13 +535,17 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
 
           continueAttempts++;
           console.log(
-            `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
+            `[ralph:worker:${this.repo}] No PR URL found; requesting branch-evidence refresh (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
           );
 
           const pausedContinue = await this.pauseIfHardThrottled(task, "resume continue", buildResult.sessionId || existingSessionId);
           if (pausedContinue) return pausedContinue;
 
-          const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+          const nudge = this.buildPrRecoveryNudge({
+            botBranch,
+            issueRef: task.issue,
+            latestOutput: buildResult.output,
+          });
           const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue", "in-progress");
 
           buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
