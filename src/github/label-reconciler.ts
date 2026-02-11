@@ -13,6 +13,7 @@ import { createRalphWorkflowLabelsEnsurer } from "./ensure-ralph-workflow-labels
 import { executeIssueLabelOps } from "./issue-label-io";
 import { mutateIssueLabels } from "./label-mutation";
 import { canAttemptLabelWrite } from "./label-write-backoff";
+import { countStatusLabels } from "./status-label-invariant";
 import {
   deriveRalphStatus,
   shouldDebounceOppositeStatusTransition,
@@ -136,10 +137,16 @@ async function reconcileRepo(
         : null,
     });
     if (suppress.suppress) {
+      const statusCount = countStatusLabels(issue.labels);
+      if (statusCount === 1) {
+        console.warn(
+          `[ralph:labels:reconcile:${repo}] Suppressed transition for ${repo}#${issue.number}: ${suppress.reason ?? "debounced"}`
+        );
+        continue;
+      }
       console.warn(
-        `[ralph:labels:reconcile:${repo}] Suppressed transition for ${repo}#${issue.number}: ${suppress.reason ?? "debounced"}`
+        `[ralph:labels:reconcile:${repo}] Ignoring debounce for ${repo}#${issue.number}; status labels drifted (count=${statusCount})`
       );
-      continue;
     }
 
     const ops: LabelOp[] = [

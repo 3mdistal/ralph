@@ -154,6 +154,16 @@ describe("Session Persistence", () => {
 
       expect(newStatus).toBe("in-progress");
     });
+
+    test("starting task without session should reset to queued on startup", () => {
+      const task = createMockTask({ status: "starting", "session-id": "" });
+
+      // Simulate startup normalization for half-open starting tasks.
+      const hasSession = task["session-id"]?.trim();
+      const newStatus = hasSession ? "starting" : "queued";
+
+      expect(newStatus).toBe("queued");
+    });
   });
 
   describe("Session ID clearing", () => {

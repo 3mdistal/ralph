@@ -52,6 +52,8 @@ export interface QueueTask {
   "watchdog-retries"?: string;
   /** Stall recovery attempts (string in frontmatter) */
   "stall-retries"?: string;
+  /** Planner bootstrap timeout recovery attempts (string in frontmatter) */
+  "planner-bootstrap-retries"?: string;
   /** Long-run guardrail recovery attempts (string in frontmatter) */
   "guardrail-retries"?: string;
   /** Escalation autopilot loop ledger JSON (signature -> attempts metadata). */
