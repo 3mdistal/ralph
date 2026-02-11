@@ -43,4 +43,14 @@ describe("derivePrCreateEscalationReason", () => {
     expect(derived.classification?.blockedSource).toBe("opencode-config-invalid");
     expect(derived.reason).toContain("tool schema rejected");
   });
+
+  test("uses non-retriable policy reason when gh permission denial is detected", () => {
+    const derived = derivePrCreateEscalationReason({
+      continueAttempts: 2,
+      evidence: ["gh pr create failed: Resource not accessible by integration (HTTP 403)"],
+    });
+
+    expect(derived.reason).toContain("Blocked: PR-create capability denied");
+    expect(derived.classification).toBeNull();
+  });
 });

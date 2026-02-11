@@ -1,4 +1,5 @@
 import { classifyOpencodeFailure, type OpencodeFailureClassification } from "../opencode-error-classifier";
+import { classifyPrCreateFailure } from "./pr-create-failure-policy";
 
 const MAX_DETAILS_CHARS = 400;
 
@@ -31,6 +32,18 @@ export function derivePrCreateEscalationReason(params: {
       reason: classification.reason,
       details,
       classification,
+    };
+  }
+
+  const prCreateDecision = classifyPrCreateFailure(normalizedEvidence.join("\n\n"));
+  if (prCreateDecision.classification === "non-retriable") {
+    const details = toBoundedText(
+      `No PR URL observed after ${params.continueAttempts} continue attempts. Non-retriable PR-create failure detected from run output.`
+    );
+    return {
+      reason: prCreateDecision.reason,
+      details,
+      classification: null,
     };
   }
 

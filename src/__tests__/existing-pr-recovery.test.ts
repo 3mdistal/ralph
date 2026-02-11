@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "fs/promises";
+import { tmpdir } from "os";
+import { join } from "path";
+
 import { RepoWorker } from "../worker";
+import { getIdempotencyRecord, initStateDb, recordIdempotencyKey } from "../state";
 
 const baseTask = {
   _path: "github:3mdistal/ralph#1",
@@ -164,5 +169,114 @@ describe("existing PR recovery", () => {
 
     expect(resolved?.selectedUrl).toBe("https://github.com/3mdistal/ralph/pull/624");
     expect(freshFlags).toEqual([true, true]);
+  });
+
+  test("reclaims stale lease after bounded conflict wait when no PR appears", async () => {
+    const tempRoot = await mkdtemp(join(tmpdir(), "ralph-pr-lease-reclaim-"));
+    const priorDb = process.env.RALPH_STATE_DB_PATH;
+    try {
+      process.env.RALPH_STATE_DB_PATH = join(tempRoot, "state.sqlite");
+      initStateDb();
+
+      const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+      const leaseKey = (worker as any).buildPrCreateLeaseKey("707", "bot/integration");
+      const createdAt = new Date(Date.now() - 10 * 60_000).toISOString();
+      const payloadJson = JSON.stringify({ holder: "worker-a" });
+      recordIdempotencyKey({ key: leaseKey, scope: "pr-create", createdAt, payloadJson });
+
+      (worker as any).getIssuePrResolution = async () => ({
+        selectedUrl: null,
+        duplicates: [],
+        source: null,
+        diagnostics: [],
+      });
+
+      const reclaimed = await (worker as any).tryReclaimPrCreateLeaseAfterConflict({
+        issueNumber: "707",
+        leaseKey,
+        observedCreatedAt: createdAt,
+        observedPayloadJson: payloadJson,
+      });
+
+      expect(reclaimed.reclaimed).toBe(true);
+      expect(getIdempotencyRecord(leaseKey)).toBeNull();
+    } finally {
+      if (priorDb === undefined) delete process.env.RALPH_STATE_DB_PATH;
+      else process.env.RALPH_STATE_DB_PATH = priorDb;
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("retries transient PR-create operations within bounded policy", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const waits: number[] = [];
+    (worker as any).sleepMs = async (ms: number) => {
+      waits.push(ms);
+    };
+
+    let calls = 0;
+    const result = await (worker as any).withPrCreateTransientRetries({
+      label: "test-transient",
+      operation: async () => {
+        calls += 1;
+        if (calls < 3) {
+          const error: any = new Error("HTTP 429 secondary rate limit");
+          error.stderr = "Retry-After: 1";
+          throw error;
+        }
+        return "ok";
+      },
+    });
+
+    expect(result).toBe("ok");
+    expect(calls).toBe(3);
+    expect(waits.length).toBe(2);
+    expect(waits[0]).toBe(1000);
+    expect(waits[1]).toBe(1000);
+  });
+
+  test("does not retry non-retriable PR-create policy denial", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const waits: number[] = [];
+    (worker as any).sleepMs = async (ms: number) => {
+      waits.push(ms);
+    };
+
+    let calls = 0;
+    await expect(
+      (worker as any).withPrCreateTransientRetries({
+        label: "test-non-retriable",
+        operation: async () => {
+          calls += 1;
+          const error: any = new Error("Resource not accessible by integration (HTTP 403)");
+          error.stderr = "HTTP 403";
+          throw error;
+        },
+      })
+    ).rejects.toThrow(/403/);
+
+    expect(calls).toBe(1);
+    expect(waits).toEqual([]);
+  });
+
+  test("capability check blocks immediately on policy denial evidence", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+    const task = { ...baseTask, status: "in-progress", "session-id": "ses_policy" };
+
+    let blockedCalled = 0;
+    (worker as any).markTaskBlocked = async () => {
+      blockedCalled += 1;
+      return true;
+    };
+
+    const run = await (worker as any).blockOnPrCreateCapabilityIfMissing({
+      task,
+      stage: "test",
+      sessionId: "ses_policy",
+      evidence: ["Resource not accessible by integration (HTTP 403)"],
+    });
+
+    expect(blockedCalled).toBe(1);
+    expect(run?.outcome).toBe("failed");
   });
 });
