@@ -309,7 +309,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("18");
+      expect(meta.value).toBe("19");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -429,7 +429,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("18");
+      expect(meta.value).toBe("19");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -543,7 +543,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '18')");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '19')");
       db.exec(`
         CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
           run_id TEXT NOT NULL,
@@ -597,7 +597,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '18')");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '19')");
       db.exec("CREATE VIEW ralph_run_gate_results AS SELECT 'run-1' AS run_id");
     } finally {
       db.close();
@@ -912,7 +912,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("18");
+      expect(meta.value).toBe("19");
 
       migrated
         .query(
@@ -928,6 +928,120 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT gate FROM ralph_run_gate_results WHERE run_id = 'run_v15' AND gate = 'pr_evidence'")
         .get() as { gate?: string } | undefined;
       expect(row?.gate).toBe("pr_evidence");
+    } finally {
+      migrated.close();
+    }
+  });
+
+  test("migrates v18 gate CHECK constraints to support pr_evidence", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '18')");
+      db.exec(`
+        CREATE TABLE repos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO repos(name, created_at, updated_at)
+        VALUES ('3mdistal/ralph', '2026-01-20T12:00:00.000Z', '2026-01-20T12:00:00.000Z');
+
+        CREATE TABLE ralph_runs (
+          run_id TEXT PRIMARY KEY,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT,
+          attempt_kind TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          outcome TEXT,
+          details_json TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+        INSERT INTO ralph_runs(
+          run_id, repo_id, issue_number, task_path, attempt_kind, started_at, created_at, updated_at
+        ) VALUES (
+          'run_v18', 1, 1, 'github:3mdistal/ralph#1', 'process',
+          '2026-01-20T12:00:01.000Z', '2026-01-20T12:00:01.000Z', '2026-01-20T12:00:01.000Z'
+        );
+
+        CREATE TABLE ralph_run_gate_results (
+          run_id TEXT NOT NULL,
+          gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+          status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
+          command TEXT,
+          skip_reason TEXT,
+          reason TEXT,
+          url TEXT,
+          pr_number INTEGER,
+          pr_url TEXT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          PRIMARY KEY(run_id, gate),
+          FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE,
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE ralph_run_gate_artifacts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci')),
+          kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
+          content TEXT NOT NULL,
+          truncated INTEGER NOT NULL DEFAULT 0,
+          original_chars INTEGER,
+          original_lines INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+        );
+
+        INSERT INTO ralph_run_gate_results(
+          run_id, gate, status, reason, repo_id, issue_number, task_path, created_at, updated_at
+        ) VALUES (
+          'run_v18', 'ci', 'pending', 'old constraint', 1, 1, 'github:3mdistal/ralph#1', '2026-01-20T12:00:02.000Z', '2026-01-20T12:00:02.000Z'
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const migrated = new Database(dbPath);
+    try {
+      const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
+      expect(meta.value).toBe("19");
+
+      const row = migrated
+        .query("SELECT reason FROM ralph_run_gate_results WHERE run_id = 'run_v18' AND gate = 'ci'")
+        .get() as { reason?: string } | undefined;
+      expect(row?.reason).toBe("old constraint");
+
+      migrated
+        .query(
+          `INSERT INTO ralph_run_gate_results(
+             run_id, gate, status, repo_id, issue_number, task_path, created_at, updated_at
+           ) VALUES (
+             'run_v18', 'pr_evidence', 'pending', 1, 1, 'github:3mdistal/ralph#1', '2026-01-20T12:00:03.000Z', '2026-01-20T12:00:03.000Z'
+           )`
+        )
+        .run();
+
+      const inserted = migrated
+        .query("SELECT gate FROM ralph_run_gate_results WHERE run_id = 'run_v18' AND gate = 'pr_evidence'")
+        .get() as { gate?: string } | undefined;
+      expect(inserted?.gate).toBe("pr_evidence");
     } finally {
       migrated.close();
     }
@@ -1175,7 +1289,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("18");
+      expect(meta.value).toBe("19");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);

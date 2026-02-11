@@ -8,7 +8,7 @@ import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 
-const SCHEMA_VERSION = 18;
+const SCHEMA_VERSION = 19;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
 
@@ -260,6 +260,13 @@ function schemaObjectType(database: Database, name: string): string | null {
     .query("SELECT type FROM sqlite_master WHERE name = $name")
     .get({ $name: name }) as { type?: string } | undefined;
   return row?.type ?? null;
+}
+
+function tableCreateSql(database: Database, name: string): string | null {
+  const row = database
+    .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = $name")
+    .get({ $name: name }) as { sql?: string } | undefined;
+  return row?.sql ?? null;
 }
 
 function indexExists(database: Database, name: string): boolean {
@@ -905,6 +912,96 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             "CREATE INDEX IF NOT EXISTS idx_loop_triage_attempts_repo_issue_updated " +
               "ON loop_triage_attempts(repo_id, issue_number, last_updated_at_ms)"
           );
+        }
+
+        if (existingVersion < 19) {
+          const gateResultsSql = tableCreateSql(database, "ralph_run_gate_results");
+          const gateArtifactsSql = tableCreateSql(database, "ralph_run_gate_artifacts");
+          const needsGateResultsRepair =
+            Boolean(gateResultsSql) && !gateResultsSql!.includes("pr_evidence");
+          const needsGateArtifactsRepair =
+            Boolean(gateArtifactsSql) && !gateArtifactsSql!.includes("pr_evidence");
+
+          if (
+            (needsGateResultsRepair || needsGateArtifactsRepair) &&
+            tableExists(database, "ralph_run_gate_results") &&
+            tableExists(database, "ralph_run_gate_artifacts") &&
+            tableExists(database, "ralph_runs") &&
+            tableExists(database, "repos")
+          ) {
+            const hasReason = columnExists(database, "ralph_run_gate_results", "reason");
+            const resultsInsert = hasReason
+              ? `
+                INSERT INTO ralph_run_gate_results_repaired(
+                  run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                )
+                SELECT
+                  run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                FROM ralph_run_gate_results;
+              `
+              : `
+                INSERT INTO ralph_run_gate_results_repaired(
+                  run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                )
+                SELECT
+                  run_id, gate, status, command, skip_reason, NULL, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                FROM ralph_run_gate_results;
+              `;
+
+            database.exec(`
+              CREATE TABLE ralph_run_gate_results_repaired (
+                run_id TEXT NOT NULL,
+                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
+                command TEXT,
+                skip_reason TEXT,
+                reason TEXT,
+                url TEXT,
+                pr_number INTEGER,
+                pr_url TEXT,
+                repo_id INTEGER NOT NULL,
+                issue_number INTEGER,
+                task_path TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(run_id, gate),
+                FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE,
+                FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+              );
+              ${resultsInsert}
+              DROP TABLE ralph_run_gate_results;
+              ALTER TABLE ralph_run_gate_results_repaired RENAME TO ralph_run_gate_results;
+
+              CREATE TABLE ralph_run_gate_artifacts_repaired (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
+                content TEXT NOT NULL,
+                truncated INTEGER NOT NULL DEFAULT 0,
+                original_chars INTEGER,
+                original_lines INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+              );
+              INSERT INTO ralph_run_gate_artifacts_repaired(
+                id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+              )
+              SELECT
+                id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+              FROM ralph_run_gate_artifacts;
+              DROP TABLE ralph_run_gate_artifacts;
+              ALTER TABLE ralph_run_gate_artifacts_repaired RENAME TO ralph_run_gate_artifacts;
+
+              CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
+                ON ralph_run_gate_results(repo_id, issue_number, updated_at);
+              CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr
+                ON ralph_run_gate_results(repo_id, pr_number);
+              CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_artifacts_run
+                ON ralph_run_gate_artifacts(run_id);
+            `);
+          }
         }
 
         database.exec(
