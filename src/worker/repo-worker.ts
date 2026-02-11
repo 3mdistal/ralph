@@ -1929,9 +1929,11 @@ export class RepoWorker {
     worktreePath: string;
     botBranch: string;
     runId: string;
+    mode?: "enforce" | "recovery";
   }): Promise<{ ok: true; diagnostics: string[] } | { ok: false; diagnostics: string[] }> {
     const diagnostics: string[] = [];
     const issueContextParts: string[] = [];
+    const mode = params.mode ?? "enforce";
 
     try {
       const issueContext = await this.buildIssueContextForAgent({
@@ -1957,9 +1959,29 @@ export class RepoWorker {
     } catch (error: any) {
       const reason = `Review readiness failed: could not prepare diff artifacts (${error?.message ?? String(error)})`;
       diagnostics.push(`- ${reason}`);
+
+      if (mode === "recovery") {
+        const skipReason = `PR recovery: review gates skipped because diff artifacts could not be prepared (${error?.message ?? String(
+          error
+        )})`;
+        recordReviewGateSkipped({ runId: params.runId, gate: "product_review", reason: skipReason });
+        recordReviewGateSkipped({ runId: params.runId, gate: "devex_review", reason: skipReason });
+        diagnostics.push(`- Review gates skipped: ${skipReason}`);
+        return { ok: true, diagnostics };
+      }
+
       recordReviewGateFailure({ runId: params.runId, gate: "product_review", reason });
       recordReviewGateFailure({ runId: params.runId, gate: "devex_review", reason });
       return { ok: false, diagnostics };
+    }
+
+    if (mode === "recovery") {
+      const skipReason =
+        "PR recovery: skipping PR-readiness product/devex reviews to unblock deterministic PR creation; merge lane enforces review gates";
+      recordReviewGateSkipped({ runId: params.runId, gate: "product_review", reason: skipReason });
+      recordReviewGateSkipped({ runId: params.runId, gate: "devex_review", reason: skipReason });
+      diagnostics.push(`- Review gates skipped: ${skipReason}`);
+      return { ok: true, diagnostics };
     }
 
     const runReviewAgent = async (
@@ -2247,6 +2269,7 @@ export class RepoWorker {
       worktreePath: candidate.worktreePath,
       botBranch,
       runId,
+      mode: "recovery",
     });
     diagnostics.push(...readiness.diagnostics);
     if (!readiness.ok) {
@@ -4710,6 +4733,12 @@ export class RepoWorker {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
   }
 
+  private getPlannerBootstrapRetryCount(task: AgentTask): number {
+    const raw = task["planner-bootstrap-retries"];
+    const parsed = Number.parseInt(String(raw ?? "0"), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+
   private buildWatchdogOptions(task: AgentTask, stage: string) {
     const cfg = getConfig().watchdog;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
@@ -4729,11 +4758,17 @@ export class RepoWorker {
     const cfg = getConfig().stall;
     const context = `[${this.repo}] ${task.name} (${task.issue}) stage=${stage}`;
     const idleMs = cfg?.nudgeAfterMs ?? cfg?.idleMs ?? 5 * 60_000;
+    const sessionBootstrapTimeoutMs = Number.parseInt(process.env.RALPH_SESSION_BOOTSTRAP_TIMEOUT_MS ?? "", 10);
+    const sessionBootstrapMs =
+      Number.isFinite(sessionBootstrapTimeoutMs) && sessionBootstrapTimeoutMs > 0
+        ? sessionBootstrapTimeoutMs
+        : Math.max(60_000, idleMs);
 
     return {
       stall: {
         enabled: cfg?.enabled ?? true,
         idleMs,
+        sessionBootstrapMs,
         context,
       },
     };
@@ -5123,6 +5158,95 @@ export class RepoWorker {
       outcome: "escalated",
       sessionId: result.sessionId || undefined,
       escalationReason: escalationReason,
+    };
+  }
+
+  private async handlePlannerBootstrapTimeout(task: AgentTask, stage: string, result: SessionResult): Promise<AgentRun> {
+    const cfg = getConfig().stall;
+    const maxRestarts = cfg?.maxRestarts ?? 1;
+
+    const timeout = result.sessionBootstrapTimeout;
+    const retryCount = this.getPlannerBootstrapRetryCount(task);
+    const nextRetryCount = retryCount + 1;
+
+    const elapsedSeconds = timeout ? Math.max(1, Math.round(timeout.elapsedMs / 1000)) : 0;
+    const reason = timeout
+      ? `Planner session bootstrap timed out after ${elapsedSeconds}s without session ID (${stage})`
+      : `Planner session bootstrap timed out (${stage})`;
+
+    if (retryCount <= maxRestarts) {
+      console.warn(`[ralph:worker:${this.repo}] Planner bootstrap timeout; resetting to queued: ${reason}`);
+      await this.queue.updateTaskStatus(task, "queued", {
+        "session-id": "",
+        "planner-bootstrap-retries": String(nextRetryCount),
+        "blocked-source": "stall",
+        "blocked-reason": reason,
+        "blocked-details": timeout?.context ? `Context: ${timeout.context}` : "",
+        "blocked-at": new Date().toISOString(),
+        "blocked-checked-at": new Date().toISOString(),
+        "daemon-id": "",
+        "heartbeat-at": "",
+        "worker-id": "",
+        "repo-slot": "",
+      });
+
+      return {
+        taskName: task.name,
+        repo: this.repo,
+        outcome: "failed",
+        escalationReason: reason,
+      };
+    }
+
+    console.log(`[ralph:worker:${this.repo}] Planner bootstrap timeout repeated; escalating: ${reason}`);
+    const escalationFields: Record<string, string> = {
+      "planner-bootstrap-retries": String(nextRetryCount),
+    };
+
+    const wasEscalated = task.status === "escalated";
+    const escalated = await this.queue.updateTaskStatus(task, "escalated", escalationFields);
+    if (escalated) {
+      applyTaskPatch(task, "escalated", escalationFields);
+    }
+
+    const details = [
+      timeout?.context ? `Context: ${timeout.context}` : null,
+      task["run-log-path"]?.trim() ? `Run log: ${task["run-log-path"]?.trim()}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const githubCommentUrl = await this.writeEscalationWriteback(task, {
+      reason,
+      details: details || undefined,
+      escalationType: "other",
+    });
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      reason,
+      escalationType: "other",
+      githubCommentUrl: githubCommentUrl ?? undefined,
+      planOutput: result.output,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        details: result.output,
+      });
+    }
+
+    return {
+      taskName: task.name,
+      repo: this.repo,
+      outcome: "escalated",
+      escalationReason: reason,
     };
   }
 

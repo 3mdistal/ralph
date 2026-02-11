@@ -227,6 +227,10 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
         }
 
+        if (!planResult.success && planResult.sessionBootstrapTimeout) {
+          return await this.handlePlannerBootstrapTimeout(task, "plan", planResult);
+        }
+
         if (!planResult.success && planResult.stallTimeout) {
           return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
         }
@@ -266,6 +270,10 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
             return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
           }
 
+          if (planResult.sessionBootstrapTimeout) {
+            return await this.handlePlannerBootstrapTimeout(task, "plan", planResult);
+          }
+
           if (planResult.stallTimeout) {
             return await this.handleStallTimeout(task, cacheKey, "plan", planResult);
           }
@@ -292,6 +300,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
         if (planResult.sessionId) {
           await this.queue.updateTaskStatus(task, "in-progress", {
             "session-id": planResult.sessionId,
+            "planner-bootstrap-retries": "",
             ...(workerId ? { "worker-id": workerId } : {}),
             ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
           });
@@ -631,7 +640,11 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               if (escalated) {
                 applyTaskPatch(task, "escalated", {});
               }
-              await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+              await this.writeEscalationWriteback(task, {
+                reason,
+                details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+                escalationType: "other",
+              });
               await this.notify.notifyEscalation({
                 taskName: task.name,
                 taskFileName: task._name,
@@ -887,7 +900,11 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           if (escalated) {
             applyTaskPatch(task, "escalated", {});
           }
-          await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+          await this.writeEscalationWriteback(task, {
+            reason,
+            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+            escalationType: "other",
+          });
           await this.notify.notifyEscalation({
             taskName: task.name,
             taskFileName: task._name,

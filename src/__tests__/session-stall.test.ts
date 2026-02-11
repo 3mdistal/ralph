@@ -108,4 +108,48 @@ describe("stall detection", () => {
     expect(result.stallTimeout?.kind).toBe("stall-timeout");
     expect(killed.length).toBeGreaterThan(0);
   });
+
+  test("fails fast when session bootstrap never yields a session id", async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), "ralph-bootstrap-timeout-test-"));
+
+    const scheduler = createFakeScheduler(0);
+    const proc = new EventEmitter() as any;
+    proc.pid = 456;
+    proc.stdout = new EventEmitter();
+    proc.stderr = new EventEmitter();
+    proc.on = proc.addListener.bind(proc);
+
+    const spawn = () => proc;
+    const processKill = () => {
+      proc.emit("close", 124);
+      return true as any;
+    };
+
+    const promise = runAgent(
+      "/tmp",
+      "general",
+      "hello",
+      {
+        watchdog: { enabled: false },
+        stall: { enabled: true, idleMs: 60_000, sessionBootstrapMs: 1000 },
+        timeoutMs: 60_000,
+      },
+      {
+        scheduler: scheduler as any,
+        sessionsDir,
+        spawn: spawn as any,
+        processKill: processKill as any,
+      }
+    );
+
+    scheduler.advance(400);
+    proc.stdout.emit("data", Buffer.from('{"type":"heartbeat"}\n'));
+    scheduler.advance(700);
+
+    const result = await promise;
+
+    expect(result.success).toBe(false);
+    expect(result.sessionBootstrapTimeout?.kind).toBe("session-bootstrap-timeout");
+    expect(result.stallTimeout).toBeUndefined();
+  });
 });
