@@ -1929,9 +1929,11 @@ export class RepoWorker {
     worktreePath: string;
     botBranch: string;
     runId: string;
+    mode?: "enforce" | "recovery";
   }): Promise<{ ok: true; diagnostics: string[] } | { ok: false; diagnostics: string[] }> {
     const diagnostics: string[] = [];
     const issueContextParts: string[] = [];
+    const mode = params.mode ?? "enforce";
 
     try {
       const issueContext = await this.buildIssueContextForAgent({
@@ -1957,9 +1959,29 @@ export class RepoWorker {
     } catch (error: any) {
       const reason = `Review readiness failed: could not prepare diff artifacts (${error?.message ?? String(error)})`;
       diagnostics.push(`- ${reason}`);
+
+      if (mode === "recovery") {
+        const skipReason = `PR recovery: review gates skipped because diff artifacts could not be prepared (${error?.message ?? String(
+          error
+        )})`;
+        recordReviewGateSkipped({ runId: params.runId, gate: "product_review", reason: skipReason });
+        recordReviewGateSkipped({ runId: params.runId, gate: "devex_review", reason: skipReason });
+        diagnostics.push(`- Review gates skipped: ${skipReason}`);
+        return { ok: true, diagnostics };
+      }
+
       recordReviewGateFailure({ runId: params.runId, gate: "product_review", reason });
       recordReviewGateFailure({ runId: params.runId, gate: "devex_review", reason });
       return { ok: false, diagnostics };
+    }
+
+    if (mode === "recovery") {
+      const skipReason =
+        "PR recovery: skipping PR-readiness product/devex reviews to unblock deterministic PR creation; merge lane enforces review gates";
+      recordReviewGateSkipped({ runId: params.runId, gate: "product_review", reason: skipReason });
+      recordReviewGateSkipped({ runId: params.runId, gate: "devex_review", reason: skipReason });
+      diagnostics.push(`- Review gates skipped: ${skipReason}`);
+      return { ok: true, diagnostics };
     }
 
     const runReviewAgent = async (
@@ -2247,6 +2269,7 @@ export class RepoWorker {
       worktreePath: candidate.worktreePath,
       botBranch,
       runId,
+      mode: "recovery",
     });
     diagnostics.push(...readiness.diagnostics);
     if (!readiness.ok) {
