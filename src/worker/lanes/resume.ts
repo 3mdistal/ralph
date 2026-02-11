@@ -11,6 +11,7 @@ import { applyTaskPatch } from "../task-patch";
 import { readLiveAnomalyCount } from "../introspection";
 import type { AgentRun } from "../repo-worker";
 import { derivePrCreateEscalationReason } from "../pr-create-escalation-reason";
+import { classifyPrCreateFailurePolicy, computePrCreateRetryBackoffMs } from "../pr-create-policy";
 
 type ResumeTaskOptions = { resumeMessage?: string; repoSlot?: number | null };
 
@@ -18,6 +19,8 @@ export type ResumeLaneDeps = any;
 
 const ANOMALY_BURST_THRESHOLD = 50;
 const MAX_ANOMALY_ABORTS = 3;
+const PR_CREATE_CONFLICT_WAIT_MS = 2 * 60_000;
+const PR_CREATE_RETRY_CAP_MS = 60_000;
 
 export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?: ResumeTaskOptions): Promise<AgentRun> {
   return await (async function (this: ResumeLaneDeps): Promise<AgentRun> {
@@ -255,6 +258,20 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
         addPrCreateEvidence(buildResult.output);
 
         if (!prUrl) {
+          const capabilityBlocked = await this.checkPrCreateCapability({
+            task,
+            stage: "resume",
+            issueNumber,
+            botBranch,
+            sessionId: buildResult.sessionId || existingSessionId,
+            latestOutput: String(buildResult.output ?? ""),
+            prRecoveryDiagnostics,
+            repoPath: taskRepoPath,
+          });
+          if (capabilityBlocked) return capabilityBlocked;
+        }
+
+        if (!prUrl) {
           const recovered = await this.tryEnsurePrFromWorktree({
             task,
             issueNumber,
@@ -265,16 +282,6 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
           if (recovered.terminalRun) return recovered.terminalRun;
           prRecoveryDiagnostics = recovered.diagnostics;
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
-        }
-
-        if (!prUrl) {
-          const blockedCapability = await this.blockOnPrCreateCapabilityIfMissing({
-            task,
-            stage: "resume:pre-pr-required-lane",
-            sessionId: buildResult.sessionId,
-            evidence: [buildResult.output, prRecoveryDiagnostics],
-          });
-          if (blockedCapability) return blockedCapability;
         }
 
         let continueAttempts = 0;
@@ -436,38 +443,91 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
                 `[ralph:worker:${this.repo}] PR-create lease already held; waiting instead of creating duplicate (lease=${lease.key})`
               );
 
-              const conflict = await this.resolvePrCreateLeaseConflict({
+              const waited = await this.waitForExistingPrDuringPrCreateConflict({
+                issueNumber,
+                maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
+              });
+
+              if (waited?.selectedUrl) {
+                await this.markIssueInProgressForOpenPrBestEffort(task, waited.selectedUrl);
+                prRecoveryDiagnostics = [prRecoveryDiagnostics, waited.diagnostics.join("\n")].filter(Boolean).join("\n\n");
+                prUrl = this.updateOpenPrSnapshot(task, prUrl, waited.selectedUrl);
+                break;
+              }
+
+              const selfHealed = await this.trySelfHealPrCreateLeaseAfterConflict({
+                task,
+                issueNumber,
+                botBranch,
+                sessionId: buildResult.sessionId || existingSessionId,
+                existingCreatedAt: lease.existingCreatedAt,
+                stage: "resume",
+              });
+              prRecoveryDiagnostics = [prRecoveryDiagnostics, `PR-create lease self-heal: ${selfHealed.note}`]
+                .filter(Boolean)
+                .join("\n\n");
+              if (selfHealed.claimed) {
+                prCreateLeaseKey = selfHealed.key;
+                continue;
+              }
+
+              const throttled = await this.throttleForPrCreateConflict({
                 task,
                 issueNumber,
                 sessionId: buildResult.sessionId,
                 leaseKey: lease.key,
                 existingCreatedAt: lease.existingCreatedAt,
-                existingPayloadJson: lease.existingPayloadJson,
                 stage: "resume",
               });
+              if (throttled) return throttled;
 
-              prRecoveryDiagnostics = [prRecoveryDiagnostics, conflict.diagnostics.join("\n")].filter(Boolean).join("\n\n");
-
-              if (conflict.action === "use-existing-pr") {
-                const selectedUrl = conflict.resolved.selectedUrl;
-                if (selectedUrl) {
-                  await this.markIssueInProgressForOpenPrBestEffort(task, selectedUrl);
-                  prUrl = this.updateOpenPrSnapshot(task, prUrl, selectedUrl);
-                }
-                break;
-              }
-
-              if (conflict.action === "retry-claim") {
-                continue;
-              }
-
-              if (conflict.run) return conflict.run;
-
+              prRecoveryDiagnostics = [
+                prRecoveryDiagnostics,
+                `PR-create conflict: lease=${lease.key} (createdAt=${lease.existingCreatedAt ?? "unknown"})`,
+              ]
+                .filter(Boolean)
+                .join("\n\n");
               break;
             }
 
             prCreateLeaseKey = lease.key;
             console.log(`[ralph:worker:${this.repo}] pr_mode=create lease=${lease.key}`);
+          }
+
+          const policy = classifyPrCreateFailurePolicy({
+            evidence: [buildResult.output, ...prCreateEvidence],
+            opencodeClassification: classifyOpencodeFailure(buildResult.output),
+          });
+          await this.markPrCreatePolicyState(task, {
+            "pr-create-last-class": policy.classification,
+            "pr-create-last-at": new Date().toISOString(),
+            "pr-create-attempts": String(continueAttempts),
+            "pr-create-first-at":
+              ((task as unknown as Record<string, string | undefined>)["pr-create-first-at"]?.trim() ||
+                new Date().toISOString()),
+          });
+          if (policy.classification === "non-retriable") {
+            return await this.escalateMissingPrWithPolicyReason({
+              task,
+              issueNumber,
+              botBranch,
+              reason: policy.reason,
+              blockedSource: policy.blockedSource,
+              latestOutput: String(buildResult.output ?? ""),
+              prRecoveryDiagnostics,
+              sessionId: buildResult.sessionId || existingSessionId,
+            });
+          }
+
+          if (policy.classification === "transient") {
+            const backoffMs = computePrCreateRetryBackoffMs({ attempt: continueAttempts + 1, capMs: PR_CREATE_RETRY_CAP_MS });
+            prRecoveryDiagnostics = [
+              prRecoveryDiagnostics,
+              `Transient PR-create failure classified; backing off ${Math.round(backoffMs / 1000)}s before retry`,
+            ]
+              .filter(Boolean)
+              .join("\n\n");
+            if (backoffMs > 0) await this.sleepMs(backoffMs);
           }
 
           continueAttempts++;
@@ -501,14 +561,6 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
 
           addPrCreateEvidence(buildResult.output);
 
-          const blockedAfterContinue = await this.blockOnPrCreateCapabilityIfMissing({
-            task,
-            stage: "resume:continue",
-            sessionId: buildResult.sessionId,
-            evidence: [buildResult.output, prRecoveryDiagnostics],
-          });
-          if (blockedAfterContinue) return blockedAfterContinue;
-
           await this.recordImplementationCheckpoint(task, buildResult.sessionId || existingSessionId);
 
           const pausedContinueAfter = await this.pauseIfHardThrottled(
@@ -530,6 +582,23 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
               return await this.handleStallTimeout(task, cacheKey, "resume-continue", buildResult);
             }
 
+            const failedPolicy = classifyPrCreateFailurePolicy({
+              evidence: [buildResult.output, ...prCreateEvidence],
+              opencodeClassification: classifyOpencodeFailure(buildResult.output),
+            });
+            if (failedPolicy.classification === "non-retriable") {
+              return await this.escalateMissingPrWithPolicyReason({
+                task,
+                issueNumber,
+                botBranch,
+                reason: failedPolicy.reason,
+                blockedSource: failedPolicy.blockedSource,
+                latestOutput: String(buildResult.output ?? ""),
+                prRecoveryDiagnostics,
+                sessionId: buildResult.sessionId || existingSessionId,
+              });
+            }
+
             const recovered = await this.tryEnsurePrFromWorktree({
               task,
               issueNumber,
@@ -540,16 +609,6 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             if (recovered.terminalRun) return recovered.terminalRun;
             prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
             prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
-
-            if (!prUrl) {
-              const blockedAfterRecovery = await this.blockOnPrCreateCapabilityIfMissing({
-                task,
-                stage: "resume:continue-recovery",
-                sessionId: buildResult.sessionId,
-                evidence: [buildResult.output, prRecoveryDiagnostics],
-              });
-              if (blockedAfterRecovery) return blockedAfterRecovery;
-            }
 
             if (!prUrl) {
               console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
