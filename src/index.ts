@@ -80,6 +80,7 @@ import { resolveMessageSessionId } from "./dashboard/message-targeting";
 import { startGitHubIssuePollers } from "./github-issues-sync";
 import { createAutoQueueRunner } from "./github/auto-queue";
 import { startGitHubDoneReconciler } from "./github/done-reconciler";
+import { startGitHubInBotReconciler } from "./github/in-bot-reconciler";
 import { startGitHubLabelReconciler } from "./github/label-reconciler";
 import { startGitHubCmdProcessor } from "./github/cmd-processor";
 import { resolveGitHubToken } from "./github-auth";
@@ -148,6 +149,7 @@ let pauseRequestedByControl = false;
 let pauseAtCheckpoint: RalphCheckpoint | null = null;
 let githubIssuePollers: { stop: () => void } | null = null;
 let githubDoneReconciler: { stop: () => void } | null = null;
+let githubInBotReconciler: { stop: () => void } | null = null;
 let githubLabelReconciler: { stop: () => void } | null = null;
 let githubCmdProcessor: { stop: () => void } | null = null;
 let autoQueueRunner: ReturnType<typeof createAutoQueueRunner> | null = null;
@@ -1853,6 +1855,13 @@ async function main(): Promise<void> {
     warn: (message) => console.warn(message),
   });
 
+  githubInBotReconciler = startGitHubInBotReconciler({
+    repos: config.repos,
+    baseIntervalMs: config.doneReconcileIntervalMs,
+    log: (message) => console.log(message),
+    warn: (message) => console.warn(message),
+  });
+
   if (queueState.backend === "github") {
     githubLabelReconciler = startGitHubLabelReconciler({
       intervalMs: config.labelReconcileIntervalMs,
@@ -2018,6 +2027,8 @@ async function main(): Promise<void> {
     githubIssuePollers = null;
     githubDoneReconciler?.stop();
     githubDoneReconciler = null;
+    githubInBotReconciler?.stop();
+    githubInBotReconciler = null;
     githubLabelReconciler?.stop();
     githubLabelReconciler = null;
     githubCmdProcessor?.stop();
