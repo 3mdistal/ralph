@@ -24,7 +24,6 @@ export type StartLaneDeps = any;
 
 const ANOMALY_BURST_THRESHOLD = 50;
 const MAX_ANOMALY_ABORTS = 3;
-const PR_CREATE_CONFLICT_WAIT_MS = 2 * 60_000;
 
 export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: StartTaskOptions): Promise<AgentRun> {
   return await (async function (this: StartLaneDeps): Promise<AgentRun> {
@@ -612,6 +611,16 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
 
+        if (!prUrl) {
+          const blockedCapability = await this.blockOnPrCreateCapabilityIfMissing({
+            task,
+            stage: "start:pre-pr-required-lane",
+            sessionId: buildResult.sessionId,
+            evidence: [buildResult.output, prRecoveryDiagnostics],
+          });
+          if (blockedCapability) return blockedCapability;
+        }
+
         let continueAttempts = 0;
         let anomalyAborts = 0;
         let lastAnomalyCount = 0;
@@ -766,34 +775,33 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
                 `[ralph:worker:${this.repo}] PR-create lease already held; waiting instead of creating duplicate (lease=${lease.key})`
               );
 
-              const waited = await this.waitForExistingPrDuringPrCreateConflict({
-                issueNumber,
-                maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
-              });
-
-              if (waited?.selectedUrl) {
-                await this.markIssueInProgressForOpenPrBestEffort(task, waited.selectedUrl);
-                prRecoveryDiagnostics = [prRecoveryDiagnostics, waited.diagnostics.join("\n")].filter(Boolean).join("\n\n");
-                prUrl = this.updateOpenPrSnapshot(task, prUrl, waited.selectedUrl);
-                break;
-              }
-
-              const throttled = await this.throttleForPrCreateConflict({
+              const conflict = await this.resolvePrCreateLeaseConflict({
                 task,
                 issueNumber,
                 sessionId: buildResult.sessionId,
                 leaseKey: lease.key,
                 existingCreatedAt: lease.existingCreatedAt,
+                existingPayloadJson: lease.existingPayloadJson,
                 stage: "build",
               });
-              if (throttled) return throttled;
 
-              prRecoveryDiagnostics = [
-                prRecoveryDiagnostics,
-                `PR-create conflict: lease=${lease.key} (createdAt=${lease.existingCreatedAt ?? "unknown"})`,
-              ]
-                .filter(Boolean)
-                .join("\n\n");
+              prRecoveryDiagnostics = [prRecoveryDiagnostics, conflict.diagnostics.join("\n")].filter(Boolean).join("\n\n");
+
+              if (conflict.action === "use-existing-pr") {
+                const selectedUrl = conflict.resolved.selectedUrl;
+                if (selectedUrl) {
+                  await this.markIssueInProgressForOpenPrBestEffort(task, selectedUrl);
+                  prUrl = this.updateOpenPrSnapshot(task, prUrl, selectedUrl);
+                }
+                break;
+              }
+
+              if (conflict.action === "retry-claim") {
+                continue;
+              }
+
+              if (conflict.run) return conflict.run;
+
               break;
             }
 
@@ -832,6 +840,14 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
 
             addPrCreateEvidence(buildResult.output);
 
+            const blockedAfterContinue = await this.blockOnPrCreateCapabilityIfMissing({
+              task,
+              stage: "start:build-continue",
+              sessionId: buildResult.sessionId,
+              evidence: [buildResult.output, prRecoveryDiagnostics],
+            });
+            if (blockedAfterContinue) return blockedAfterContinue;
+
           await this.recordImplementationCheckpoint(task, buildResult.sessionId);
 
           const pausedBuildContinueAfter = await this.pauseIfHardThrottled(task, "build continue (post)", buildResult.sessionId);
@@ -860,6 +876,16 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
 
             prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
             prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
+
+            if (!prUrl) {
+              const blockedAfterRecovery = await this.blockOnPrCreateCapabilityIfMissing({
+                task,
+                stage: "start:build-continue-recovery",
+                sessionId: buildResult.sessionId,
+                evidence: [buildResult.output, prRecoveryDiagnostics],
+              });
+              if (blockedAfterRecovery) return blockedAfterRecovery;
+            }
 
             if (!prUrl) {
               console.warn(`[ralph:worker:${this.repo}] Continue attempt failed: ${buildResult.output}`);
