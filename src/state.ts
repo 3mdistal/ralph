@@ -22,7 +22,7 @@ const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
 
-export const DURABLE_STATE_SCHEMA_WINDOW: DurableStateSchemaWindow = normalizeSchemaWindow({
+const DURABLE_STATE_SCHEMA_WINDOW: DurableStateSchemaWindow = normalizeSchemaWindow({
   minReadableSchema: MIN_SUPPORTED_SCHEMA_VERSION,
   maxReadableSchema: MAX_READABLE_SCHEMA_VERSION,
   maxWritableSchema: SCHEMA_VERSION,
