@@ -1,9 +1,10 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 
 import {
+  acquireDaemonSingletonLock,
   readDaemonRecord,
   resolveDaemonRecordPath,
   resolveDaemonRecordPathCandidates,
@@ -97,5 +98,75 @@ describe("daemon record", () => {
     const recordPath = resolveDaemonRecordPath();
     expect(recordPath).toBe(join(home, ".ralph", "control", "daemon-registry.json"));
     expect(resolveDaemonRecordPathCandidates()[0]).toBe(recordPath);
+  });
+
+  test("resolveDaemonRecordPath ignores XDG_STATE_HOME when HOME is set", () => {
+    const xdg = mkdtempSync(join(tmpdir(), "ralph-daemon-xdg-"));
+    const home = mkdtempSync(join(tmpdir(), "ralph-daemon-home-"));
+    tempDirs.push(xdg, home);
+
+    process.env.XDG_STATE_HOME = xdg;
+    process.env.HOME = home;
+
+    expect(resolveDaemonRecordPath()).toBe(join(home, ".ralph", "control", "daemon-registry.json"));
+    expect(resolveDaemonRecordPathCandidates()[0]).toBe(join(home, ".ralph", "control", "daemon-registry.json"));
+    expect(resolveDaemonRecordPathCandidates()).toContain(join(xdg, "ralph", "daemon.json"));
+  });
+
+  test("acquireDaemonSingletonLock rejects second live owner", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-daemon-home-"));
+    tempDirs.push(home);
+
+    const lockA = acquireDaemonSingletonLock({
+      daemonId: "d_one",
+      startedAt: "2026-02-08T00:00:00.000Z",
+      homeDir: home,
+    });
+
+    expect(() =>
+      acquireDaemonSingletonLock({
+        daemonId: "d_two",
+        startedAt: "2026-02-08T00:01:00.000Z",
+        homeDir: home,
+      })
+    ).toThrow("Another daemon already owns");
+
+    lockA.release();
+    expect(existsSync(lockA.path)).toBeFalse();
+  });
+
+  test("acquireDaemonSingletonLock reclaims stale owner pid", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-daemon-home-"));
+    tempDirs.push(home);
+
+    const lockPath = join(home, ".ralph", "control", "daemon.lock");
+    mkdirSync(dirname(lockPath), { recursive: true });
+    writeFileSync(
+      lockPath,
+      `${JSON.stringify(
+        {
+          daemonId: "d_stale",
+          pid: 999_999_991,
+          startedAt: "2026-02-08T00:00:00.000Z",
+          acquiredAt: "2026-02-08T00:00:00.000Z",
+          token: "stale-token",
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const lock = acquireDaemonSingletonLock({
+      daemonId: "d_new",
+      startedAt: "2026-02-08T00:01:00.000Z",
+      homeDir: home,
+    });
+
+    const current = JSON.parse(readFileSync(lockPath, "utf8")) as { daemonId: string; pid: number };
+    expect(current.daemonId).toBe("d_new");
+    expect(current.pid).toBe(process.pid);
+
+    lock.release();
+    expect(existsSync(lockPath)).toBeFalse();
   });
 });

@@ -4,6 +4,7 @@ import { spawn } from "child_process";
 
 import { recordRalphRunGateArtifact, upsertRalphRunGateResult } from "../state";
 import { getRalphRunArtifactsDir } from "../paths";
+import { extractPullRequestNumber } from "../worker/lanes/required-checks";
 
 import type { SessionResult } from "../session";
 
@@ -22,6 +23,14 @@ type ReviewMarkerParseFailure =
 type ReviewMarkerParseResult =
   | { ok: true; status: "pass" | "fail"; reason: string; markerLine: string }
   | { ok: false; failure: ReviewMarkerParseFailure; reason: string };
+
+type ReviewMarkerParseArtifact = {
+  version: 1;
+  ok: boolean;
+  failure: ReviewMarkerParseFailure | null;
+  reason: string;
+  markerLine: string | null;
+};
 
 export type ReviewDiffArtifacts = {
   baseRef: string;
@@ -273,11 +282,16 @@ function buildReviewPrompt(params: {
   return lines.join("\n");
 }
 
-function buildReviewRepairPrompt(reason: string): string {
+function buildReviewRepairPrompt(reason: string, priorOutput: string): string {
+  const prior = String(priorOutput ?? "");
   return [
     "Your prior review response failed deterministic marker parsing.",
     `Parser error: ${reason}`,
     "Do not call tools.",
+    "Prior response (verbatim):",
+    "```",
+    prior,
+    "```",
     "Do not change your decision; only fix the marker formatting.",
     "Re-emit your decision as exactly one final line with valid JSON:",
     'RALPH_REVIEW: {"status":"pass"|"fail","reason":"..."}',
@@ -310,6 +324,33 @@ function buildDiffArtifactNote(params: ReviewDiffArtifacts): string {
     "git diff --stat:",
     stat,
   ].join("\n");
+}
+
+function buildReviewParseArtifact(parsed: ReviewMarkerParseResult): string {
+  const payload: ReviewMarkerParseArtifact = parsed.ok
+    ? {
+        version: 1,
+        ok: true,
+        failure: null,
+        reason: parsed.reason,
+        markerLine: parsed.markerLine,
+      }
+    : {
+        version: 1,
+        ok: false,
+        failure: parsed.failure,
+        reason: parsed.reason,
+        markerLine: null,
+      };
+  return JSON.stringify(payload, null, 2);
+}
+
+function deriveGatePrEvidence(prUrl: string): { prUrl?: string; prNumber?: number } {
+  const normalized = String(prUrl ?? "").trim();
+  if (!normalized) return {};
+  const prNumber = extractPullRequestNumber(normalized);
+  if (prNumber === null) return {};
+  return { prUrl: normalized, prNumber };
 }
 
 function isCommitSha(value: string): boolean {
@@ -419,10 +460,11 @@ export async function runReviewGate(params: {
   issueContext?: string;
   diff: ReviewDiffArtifacts;
   runAgent: (prompt: string) => Promise<SessionResult>;
-  runRepairAgent?: (prompt: string, continueSessionId?: string) => Promise<SessionResult>;
+  runRepairAgent?: (prompt: string) => Promise<SessionResult>;
 }): Promise<ReviewGateResult> {
   const { runId, gate, diff } = params;
-  upsertRalphRunGateResult({ runId, gate, status: "pending" });
+  const gatePrEvidence = deriveGatePrEvidence(params.prUrl);
+  upsertRalphRunGateResult({ runId, gate, status: "pending", ...gatePrEvidence });
   recordRalphRunGateArtifact({ runId, gate, kind: "note", content: buildDiffArtifactNote(diff) });
 
   const prompt = buildReviewPrompt({
@@ -442,7 +484,7 @@ export async function runReviewGate(params: {
     result = await params.runAgent(prompt);
   } catch (error: any) {
     const reason = `Review agent failed: ${error?.message ?? String(error)}`;
-    upsertRalphRunGateResult({ runId, gate, status: "fail", reason });
+    upsertRalphRunGateResult({ runId, gate, status: "fail", reason, ...gatePrEvidence });
     recordRalphRunGateArtifact({
       runId,
       gate,
@@ -456,22 +498,29 @@ export async function runReviewGate(params: {
   recordRalphRunGateArtifact({
     runId,
     gate,
-    kind: "note",
-    content: ["Review output:", output].join("\n").trim(),
+    kind: "command_output",
+    content: output,
   });
 
   if (!result.success) {
     const reason = "Review agent did not complete successfully";
-    upsertRalphRunGateResult({ runId, gate, status: "fail", reason });
+    upsertRalphRunGateResult({ runId, gate, status: "fail", reason, ...gatePrEvidence });
     return { status: "fail", reason, sessionId: result.sessionId };
   }
 
   let parsed = parseRalphReviewMarker(output);
+  recordRalphRunGateArtifact({
+    runId,
+    gate,
+    kind: "failure_excerpt",
+    content: buildReviewParseArtifact(parsed),
+  });
   let finalSessionId = result.sessionId;
   let lastParseReason = parsed.ok ? "" : parsed.reason;
+  let latestOutput = output;
 
   for (let attempt = 1; !parsed.ok && attempt <= MAX_REPAIR_ATTEMPTS; attempt += 1) {
-    const repairPrompt = buildReviewRepairPrompt(lastParseReason);
+    const repairPrompt = buildReviewRepairPrompt(lastParseReason, latestOutput);
     recordRalphRunGateArtifact({
       runId,
       gate,
@@ -481,14 +530,15 @@ export async function runReviewGate(params: {
 
     try {
       const repairRunner = params.runRepairAgent ?? ((prompt: string) => params.runAgent(prompt));
-      const repair = await repairRunner(repairPrompt, finalSessionId);
+      const repair = await repairRunner(repairPrompt);
       finalSessionId = repair.sessionId ?? finalSessionId;
       const repairedOutput = repair.output ?? "";
+      latestOutput = repairedOutput;
       recordRalphRunGateArtifact({
         runId,
         gate,
-        kind: "note",
-        content: [`Review repair output (attempt ${attempt}):`, repairedOutput].join("\n").trim(),
+        kind: "command_output",
+        content: repairedOutput,
       });
 
       if (!repair.success) {
@@ -497,6 +547,12 @@ export async function runReviewGate(params: {
       }
 
       parsed = parseRalphReviewMarker(repairedOutput);
+      recordRalphRunGateArtifact({
+        runId,
+        gate,
+        kind: "failure_excerpt",
+        content: buildReviewParseArtifact(parsed),
+      });
       if (!parsed.ok) {
         lastParseReason = parsed.reason;
       }
@@ -506,10 +562,10 @@ export async function runReviewGate(params: {
   }
 
   if (!parsed.ok) {
-    upsertRalphRunGateResult({ runId, gate, status: "fail", reason: parsed.reason });
+    upsertRalphRunGateResult({ runId, gate, status: "fail", reason: parsed.reason, ...gatePrEvidence });
     return { status: "fail", reason: parsed.reason, sessionId: finalSessionId };
   }
 
-  upsertRalphRunGateResult({ runId, gate, status: parsed.status, reason: parsed.reason });
+  upsertRalphRunGateResult({ runId, gate, status: parsed.status, reason: parsed.reason, ...gatePrEvidence });
   return { status: parsed.status, reason: parsed.reason, sessionId: finalSessionId };
 }

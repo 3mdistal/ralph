@@ -23,6 +23,13 @@ It also stores deterministic gate state for each run (`ralph_run_gate_results`) 
   - upgrade Ralph to a compatible/newer binary, or
   - perform safe reset by deleting `~/.ralph/state.sqlite` (local durable state loss).
 
+## Degraded control-plane behavior
+
+- Daemon startup behavior remains fail-closed for forward-incompatible schemas (no downgrades).
+- `ralphctl` lifecycle operations (`status`, `drain`, `restart`, `stop`) are designed to remain usable even when durable state is unavailable or forward-incompatible.
+- In degraded mode, `ralphctl status` returns minimal control-plane visibility (daemon/control/queue shape) and surfaces explicit durable-state diagnostics.
+- Recovery guidance order remains: upgrade to a compatible/newer Ralph binary first; use safe reset (`~/.ralph/state.sqlite`) only as a last resort when local durable state loss is acceptable.
+
 ## Startup schema invariants
 
 - Startup verifies required schema shape for critical tables in addition to `meta.schema_version`.

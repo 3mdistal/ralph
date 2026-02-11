@@ -66,4 +66,22 @@ describe("Managed OpenCode config", () => {
     const marker = await readFile(markerPath, "utf8");
     expect(marker).toContain("managed by ralph");
   });
+
+  test("includes tool-disabled review agents in managed config", async () => {
+    const managedDir = getRalphOpencodeConfigDir();
+    const manifest = getManagedOpencodeConfigManifest(managedDir);
+    const opencodeConfig = manifest.files.find((file) => file.path.endsWith("/opencode.json"));
+    expect(opencodeConfig).toBeDefined();
+
+    const parsed = JSON.parse(opencodeConfig?.contents ?? "{}");
+    const productReview = parsed?.agent?.["product-review"];
+    const devexReview = parsed?.agent?.["devex-review"];
+
+    expect(productReview?.prompt).toBe("agent/product.md");
+    expect(devexReview?.prompt).toBe("agent/devex.md");
+    expect(productReview?.permission?.tool).toBe("deny");
+    expect(devexReview?.permission?.tool).toBe("deny");
+    expect(productReview?.permission?.question).toBe("deny");
+    expect(devexReview?.permission?.question).toBe("deny");
+  });
 });
