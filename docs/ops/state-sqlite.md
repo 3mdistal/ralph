@@ -79,6 +79,8 @@ Operational contract:
 - Optional output dir override: `RALPH_STATE_DB_BACKUP_DIR=/path/to/backups`
 - Migration lock timeout override (milliseconds):
   - `RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS=3000`
+- Readonly durable-state probe timeout override (milliseconds):
+  - `RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS=250`
 
 ## Rollout runbook
 
