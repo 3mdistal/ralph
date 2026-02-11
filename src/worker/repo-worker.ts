@@ -1258,6 +1258,76 @@ export class RepoWorker {
     return { key, claimed, staleDeleted, existingCreatedAt };
   }
 
+  private async tryReclaimPrCreateLeaseAfterConflict(params: {
+    issueNumber: string;
+    leaseKey: string;
+    observedCreatedAt?: string | null;
+    observedPayloadJson?: string | null;
+  }): Promise<{ reclaimed: boolean }> {
+    const record = getIdempotencyRecord(params.leaseKey);
+    if (!record?.createdAt) return { reclaimed: false };
+    const observedCreatedAt = String(params.observedCreatedAt ?? "").trim();
+    if (observedCreatedAt && record.createdAt !== observedCreatedAt) return { reclaimed: false };
+    const observedPayload = String(params.observedPayloadJson ?? "").trim();
+    if (observedPayload && (record.payloadJson ?? "") !== observedPayload) return { reclaimed: false };
+
+    const resolution = await this.getIssuePrResolution(params.issueNumber, { fresh: true });
+    if (resolution.selectedUrl) return { reclaimed: false };
+
+    deleteIdempotencyKey(params.leaseKey);
+    return { reclaimed: true };
+  }
+
+  private async withPrCreateTransientRetries<T>(params: {
+    label: string;
+    operation: () => Promise<T>;
+    maxAttempts?: number;
+  }): Promise<T> {
+    const maxAttempts = Number.isFinite(params.maxAttempts) ? Math.max(1, Math.floor(params.maxAttempts ?? 3)) : 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await params.operation();
+      } catch (error: any) {
+        const message = error?.message ?? String(error);
+        const stderr = String(error?.stderr ?? "");
+        const policy = classifyPrCreateFailurePolicy({ evidence: [message, stderr] });
+        if (policy.classification !== "transient" || attempt >= maxAttempts) throw error;
+
+        const retryAfterMatch = /retry-after\s*:\s*(\d+)/i.exec(`${message}\n${stderr}`);
+        const retryAfterMs = retryAfterMatch ? Math.max(0, Number.parseInt(retryAfterMatch[1], 10) * 1000) : null;
+        const backoffMs = retryAfterMs ?? computePrCreateRetryBackoffMs({ attempt, capMs: 60_000 });
+        if (backoffMs > 0) await this.sleepMs(backoffMs);
+      }
+    }
+
+    throw new Error(`PR-create retry exhausted for ${params.label}`);
+  }
+
+  private async blockOnPrCreateCapabilityIfMissing(params: {
+    task: AgentTask;
+    stage: string;
+    sessionId?: string;
+    evidence: Array<string | null | undefined>;
+  }): Promise<AgentRun | null> {
+    const policy = classifyPrCreateFailurePolicy({ evidence: params.evidence });
+    if (policy.classification !== "non-retriable") return null;
+
+    await this.markTaskBlocked(params.task, policy.blockedSource ?? "permission", {
+      reason: policy.reason,
+      details: `PR-create capability check failed at stage '${params.stage}'.`,
+      sessionId: params.sessionId,
+    });
+
+    return {
+      outcome: "failed",
+      taskName: params.task.name,
+      repo: params.task.repo,
+      reason: policy.reason,
+      blockedSource: policy.blockedSource,
+      sessionId: params.sessionId,
+    } as AgentRun;
+  }
+
   private async markPrCreatePolicyState(task: AgentTask, patch: Record<string, string>): Promise<void> {
     try {
       const updated = await this.queue.updateTaskStatus(task, task.status, patch);
