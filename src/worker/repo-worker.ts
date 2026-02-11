@@ -76,7 +76,7 @@ import { buildWorkerFailureAlert, type WorkerFailureKind } from "../alerts/worke
 import { buildNudgePreview, drainQueuedNudges, type NudgeDeliveryOutcome } from "../nudge";
 import { redactSensitiveText } from "../redaction";
 import { RALPH_LABEL_STATUS_IN_PROGRESS, RALPH_LABEL_STATUS_QUEUED } from "../github-labels";
-import { GitHubClient } from "../github/client";
+import { GitHubClient, splitRepoFullName } from "../github/client";
 import { computeGitHubRateLimitPause } from "../github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "../github/dx-survey-writeback";
 import { createGhRunner } from "../github/gh-runner";
@@ -129,11 +129,10 @@ import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
 import { classifyOpencodeFailure } from "../opencode-error-classifier";
 import { derivePrCreateEscalationReason } from "./pr-create-escalation-reason";
 import {
-  classifyPrCreateFailure,
-  computePrCreateRetryDelayMs,
-  extractRetryAfterMs,
-  type PrCreateFailureDecision,
-} from "./pr-create-failure-policy";
+  classifyPrCreateFailurePolicy,
+  computePrCreateRetryBackoffMs,
+  shouldAttemptPrCreateLeaseSelfHeal,
+} from "./pr-create-policy";
 import { computeBlockedDecision, type RelationshipSignal } from "../github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "../github/issue-ref";
 import {
@@ -326,8 +325,7 @@ const PR_CREATE_LEASE_TTL_MS = 20 * 60_000;
 const PR_CREATE_CONFLICT_WAIT_MS = 2 * 60_000;
 const PR_CREATE_CONFLICT_POLL_MS = 15_000;
 const PR_CREATE_CONFLICT_THROTTLE_MS = 5 * 60_000;
-const PR_CREATE_TRANSIENT_RETRY_MAX_ATTEMPTS = 3;
-const PR_CREATE_TRANSIENT_RETRY_MAX_TOTAL_WAIT_MS = 45_000;
+const PR_CREATE_RECOVERY_MAX_RETRIES = 3;
 
 type PullRequestMergeState = {
   number: number;
@@ -1222,18 +1220,11 @@ export class RepoWorker {
     botBranch: string;
     sessionId?: string | null;
     stage: string;
-  }): {
-    key: string;
-    claimed: boolean;
-    staleDeleted: boolean;
-    existingCreatedAt: string | null;
-    existingPayloadJson: string | null;
-  } {
+  }): { key: string; claimed: boolean; staleDeleted: boolean; existingCreatedAt: string | null } {
     const key = this.buildPrCreateLeaseKey(params.issueNumber, params.botBranch);
     const nowMs = Date.now();
     const existing = getIdempotencyRecord(key);
     const existingCreatedAt = existing?.createdAt ?? null;
-    const existingPayloadJson = existing?.payloadJson ?? null;
     let staleDeleted = false;
 
     if (
@@ -1264,7 +1255,144 @@ export class RepoWorker {
     });
 
     const claimed = recordIdempotencyKey({ key, scope: PR_CREATE_LEASE_SCOPE, payloadJson });
-    return { key, claimed, staleDeleted, existingCreatedAt, existingPayloadJson };
+    return { key, claimed, staleDeleted, existingCreatedAt };
+  }
+
+  private async markPrCreatePolicyState(task: AgentTask, patch: Record<string, string>): Promise<void> {
+    try {
+      const updated = await this.queue.updateTaskStatus(task, task.status, patch);
+      if (updated) applyTaskPatch(task, task.status, patch);
+    } catch {
+      // best-effort metadata for diagnostics only
+    }
+  }
+
+  private async checkPrCreateCapability(params: {
+    task: AgentTask;
+    stage: string;
+    issueNumber: string;
+    botBranch: string;
+    sessionId?: string | null;
+    latestOutput?: string;
+    prRecoveryDiagnostics?: string;
+    repoPath: string;
+  }): Promise<null | AgentRun> {
+    try {
+      const { owner, name } = splitRepoFullName(this.repo);
+      const query = [
+        "query($owner:String!, $name:String!) {",
+        "  repository(owner:$owner, name:$name) {",
+        "    viewerPermission",
+        "    viewerCanPush",
+        "  }",
+        "}",
+      ].join("\n");
+      const response = await ghRead(this.repo)`gh api graphql -f query=${query} -f owner=${owner} -f name=${name}`
+        .cwd(params.repoPath)
+        .quiet();
+
+      const parsed = JSON.parse(response.stdout.toString()) as {
+        data?: { repository?: { viewerPermission?: string | null; viewerCanPush?: boolean | null } | null } | null;
+      };
+      const permission = String(parsed?.data?.repository?.viewerPermission ?? "").trim().toUpperCase();
+      const canPush = parsed?.data?.repository?.viewerCanPush;
+      const denied = canPush === false || permission === "READ" || permission === "TRIAGE";
+      if (!denied) return null;
+
+      const reason = `blocked:permission: PR-create capability missing for ${this.repo} (viewerPermission=${
+        permission || "unknown"
+      }, viewerCanPush=${canPush === null || canPush === undefined ? "unknown" : String(canPush)}).`;
+      const details = `PR-create capability gate failed before stage '${params.stage}'.`;
+
+      await this.markTaskBlocked(params.task, "permission", {
+        reason,
+        details,
+        sessionId: params.sessionId || undefined,
+      });
+
+      return await this.escalateMissingPrWithPolicyReason({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        botBranch: params.botBranch,
+        reason,
+        blockedSource: "permission",
+        latestOutput: params.latestOutput ?? "",
+        prRecoveryDiagnostics: [params.prRecoveryDiagnostics, details].filter(Boolean).join("\n\n"),
+        sessionId: params.sessionId || undefined,
+      });
+    } catch (error: any) {
+      const message = this.formatGhError(error);
+      const policy = classifyPrCreateFailurePolicy({ evidence: [message] });
+      if (policy.classification !== "non-retriable") return null;
+
+      await this.markTaskBlocked(params.task, policy.blockedSource ?? "permission", {
+        reason: policy.reason,
+        details: `PR-create capability check failed: ${message}`,
+        sessionId: params.sessionId || undefined,
+      });
+
+      return await this.escalateMissingPrWithPolicyReason({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        botBranch: params.botBranch,
+        reason: policy.reason,
+        blockedSource: policy.blockedSource,
+        latestOutput: params.latestOutput ?? "",
+        prRecoveryDiagnostics: [params.prRecoveryDiagnostics, message].filter(Boolean).join("\n\n"),
+        sessionId: params.sessionId || undefined,
+      });
+    }
+  }
+
+  private async trySelfHealPrCreateLeaseAfterConflict(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    sessionId?: string | null;
+    existingCreatedAt?: string | null;
+    stage: string;
+  }): Promise<{ claimed: boolean; key: string; note: string }> {
+    const key = this.buildPrCreateLeaseKey(params.issueNumber, params.botBranch);
+    const taskFields = params.task as unknown as Record<string, string | undefined>;
+    const alreadyAttempted = taskFields["pr-create-self-heal-attempted"]?.trim() === "1";
+    const nowMs = Date.now();
+    if (
+      !shouldAttemptPrCreateLeaseSelfHeal({
+        existingCreatedAtIso: params.existingCreatedAt,
+        nowMs,
+        minAgeMs: PR_CREATE_CONFLICT_WAIT_MS,
+        alreadyAttempted,
+      })
+    ) {
+      return { claimed: false, key, note: "lease self-heal skipped" };
+    }
+
+    const current = getIdempotencyRecord(key);
+    if (!current?.createdAt || current.createdAt !== (params.existingCreatedAt ?? null)) {
+      return { claimed: false, key, note: "lease changed while waiting" };
+    }
+
+    try {
+      deleteIdempotencyKey(key);
+    } catch {
+      return { claimed: false, key, note: "failed to reclaim lease" };
+    }
+
+    await this.markPrCreatePolicyState(params.task, {
+      "pr-create-self-heal-attempted": "1",
+      "pr-create-self-heal-at": new Date(nowMs).toISOString(),
+    });
+
+    const claimed = this.tryClaimPrCreateLease({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      botBranch: params.botBranch,
+      sessionId: params.sessionId,
+      stage: `${params.stage}:self-heal`,
+    });
+
+    if (!claimed.claimed) return { claimed: false, key, note: "lease reclaim raced with another worker" };
+    return { claimed: true, key: claimed.key, note: "reclaimed stale lease after no-PR bounded wait" };
   }
 
   private async waitForExistingPrDuringPrCreateConflict(params: {
@@ -1278,192 +1406,6 @@ export class RepoWorker {
       await this.sleepMs(PR_CREATE_CONFLICT_POLL_MS);
     }
     return null;
-  }
-
-  private classifyPrCreateFailureFromText(text: string | null | undefined): PrCreateFailureDecision {
-    return classifyPrCreateFailure(text);
-  }
-
-  private classifyPrCreateFailureFromError(error: unknown): PrCreateFailureDecision {
-    const formatted = this.formatGhError(error as any);
-    const searchable = this.getGhErrorSearchText(error as any);
-    return this.classifyPrCreateFailureFromText([formatted, searchable].filter(Boolean).join("\n"));
-  }
-
-  private async withPrCreateTransientRetries<T>(params: { label: string; operation: () => Promise<T> }): Promise<T> {
-    let totalWaitMs = 0;
-
-    for (let attempt = 1; attempt <= PR_CREATE_TRANSIENT_RETRY_MAX_ATTEMPTS; attempt += 1) {
-      try {
-        return await params.operation();
-      } catch (error: any) {
-        const decision = this.classifyPrCreateFailureFromError(error);
-        if (decision.classification !== "transient") throw error;
-        if (attempt >= PR_CREATE_TRANSIENT_RETRY_MAX_ATTEMPTS) throw error;
-
-        const text = this.getGhErrorSearchText(error);
-        const retryAfterMs = extractRetryAfterMs(text);
-        const waitMs = computePrCreateRetryDelayMs({
-          attempt,
-          retryAfterMs,
-        });
-        if (totalWaitMs + waitMs > PR_CREATE_TRANSIENT_RETRY_MAX_TOTAL_WAIT_MS) {
-          throw error;
-        }
-
-        totalWaitMs += waitMs;
-        console.warn(
-          `[ralph:worker:${this.repo}] Transient PR-create error (${params.label}); retrying in ${waitMs}ms (attempt ${attempt + 1}/${PR_CREATE_TRANSIENT_RETRY_MAX_ATTEMPTS})`
-        );
-        await this.sleepMs(waitMs);
-      }
-    }
-
-    throw new Error(`Transient PR-create retry loop exhausted unexpectedly (${params.label})`);
-  }
-
-  private async tryReclaimPrCreateLeaseAfterConflict(params: {
-    issueNumber: string;
-    leaseKey: string;
-    observedCreatedAt?: string | null;
-    observedPayloadJson?: string | null;
-  }): Promise<{ reclaimed: boolean; reason: string; resolved?: ResolvedIssuePr }> {
-    const current = getIdempotencyRecord(params.leaseKey);
-    if (!current) {
-      return { reclaimed: false, reason: "lease-missing" };
-    }
-
-    const observedCreatedAt = params.observedCreatedAt ?? null;
-    const observedPayloadJson = params.observedPayloadJson ?? null;
-    if (observedCreatedAt && current.createdAt !== observedCreatedAt) {
-      return { reclaimed: false, reason: "lease-changed-created-at" };
-    }
-    if ((observedPayloadJson ?? "") !== (current.payloadJson ?? "")) {
-      return { reclaimed: false, reason: "lease-changed-payload" };
-    }
-
-    const nowMs = Date.now();
-    if (
-      !isLeaseStale({
-        createdAtIso: current.createdAt,
-        nowMs,
-        ttlMs: PR_CREATE_CONFLICT_WAIT_MS,
-      })
-    ) {
-      return { reclaimed: false, reason: "lease-not-old-enough" };
-    }
-
-    const resolved = await this.getIssuePrResolution(params.issueNumber, { fresh: true });
-    if (resolved.selectedUrl) {
-      return { reclaimed: false, reason: "pr-appeared", resolved };
-    }
-
-    try {
-      deleteIdempotencyKey(params.leaseKey);
-      return { reclaimed: true, reason: "reclaimed" };
-    } catch {
-      return { reclaimed: false, reason: "delete-failed" };
-    }
-  }
-
-  private async resolvePrCreateLeaseConflict(params: {
-    task: AgentTask;
-    issueNumber: string;
-    sessionId?: string | null;
-    leaseKey: string;
-    existingCreatedAt?: string | null;
-    existingPayloadJson?: string | null;
-    stage: string;
-  }): Promise<
-    | { action: "use-existing-pr"; resolved: ResolvedIssuePr; diagnostics: string[] }
-    | { action: "retry-claim"; diagnostics: string[] }
-    | { action: "throttled"; run: AgentRun | null; diagnostics: string[] }
-  > {
-    const diagnostics: string[] = [];
-
-    const waited = await this.waitForExistingPrDuringPrCreateConflict({
-      issueNumber: params.issueNumber,
-      maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
-    });
-    if (waited?.selectedUrl) {
-      diagnostics.push(...waited.diagnostics);
-      return {
-        action: "use-existing-pr",
-        resolved: waited,
-        diagnostics,
-      };
-    }
-
-    const reclaimed = await this.tryReclaimPrCreateLeaseAfterConflict({
-      issueNumber: params.issueNumber,
-      leaseKey: params.leaseKey,
-      observedCreatedAt: params.existingCreatedAt,
-      observedPayloadJson: params.existingPayloadJson,
-    });
-
-    if (reclaimed.resolved?.selectedUrl) {
-      diagnostics.push(...reclaimed.resolved.diagnostics);
-      return {
-        action: "use-existing-pr",
-        resolved: reclaimed.resolved,
-        diagnostics,
-      };
-    }
-
-    if (reclaimed.reclaimed) {
-      diagnostics.push(`PR-create conflict auto-healed: reclaimed stale lease ${params.leaseKey}`);
-      return {
-        action: "retry-claim",
-        diagnostics,
-      };
-    }
-
-    diagnostics.push(`PR-create conflict unresolved: ${reclaimed.reason} (lease=${params.leaseKey})`);
-
-    const throttled = await this.throttleForPrCreateConflict({
-      task: params.task,
-      issueNumber: params.issueNumber,
-      sessionId: params.sessionId,
-      leaseKey: params.leaseKey,
-      existingCreatedAt: params.existingCreatedAt,
-      stage: params.stage,
-    });
-
-    return {
-      action: "throttled",
-      run: throttled,
-      diagnostics,
-    };
-  }
-
-  private async blockOnPrCreateCapabilityIfMissing(params: {
-    task: AgentTask;
-    stage: string;
-    sessionId?: string | null;
-    evidence: Array<string | null | undefined>;
-  }): Promise<AgentRun | null> {
-    const joined = params.evidence.map((entry) => String(entry ?? "").trim()).filter(Boolean).join("\n\n");
-    if (!joined) return null;
-
-    const decision = this.classifyPrCreateFailureFromText(joined);
-    if (decision.classification !== "non-retriable") return null;
-
-    const blockedSource = decision.blockedSource ?? "permission";
-    const reason = `${decision.reason} (stage=${params.stage})`;
-    await this.markTaskBlocked(params.task, blockedSource, {
-      reason,
-      details: summarizeForNote(joined, 2000),
-      sessionId: params.sessionId?.trim() || params.task["session-id"]?.trim() || undefined,
-      runLogPath: params.task["run-log-path"]?.trim() || undefined,
-    });
-
-    return {
-      taskName: params.task.name,
-      repo: this.repo,
-      outcome: "failed",
-      sessionId: params.sessionId?.trim() || params.task["session-id"]?.trim() || undefined,
-      escalationReason: reason,
-    };
   }
 
   private async throttleForPrCreateConflict(params: {
@@ -1872,6 +1814,35 @@ export class RepoWorker {
       task: params.task,
       reason: derived.reason,
       details: derived.details,
+      planOutput,
+      sessionId: params.sessionId,
+    });
+  }
+
+  private async escalateMissingPrWithPolicyReason(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    reason: string;
+    blockedSource?: BlockedSource;
+    latestOutput: string;
+    prRecoveryDiagnostics: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+    this.recordMissingPrEvidence({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      botBranch: params.botBranch,
+      reason: params.reason,
+      blockedSource: params.blockedSource,
+      diagnostics: planOutput,
+    });
+
+    return await this.escalateNoPrAfterRetries({
+      task: params.task,
+      reason: params.reason,
+      details: "PR-create policy denied retry; escalating immediately.",
       planOutput,
       sessionId: params.sessionId,
     });
@@ -2351,7 +2322,6 @@ export class RepoWorker {
     issueTitle: string;
     botBranch: string;
     started: Date;
-    allowLeaseReclaim?: boolean;
   }): Promise<{ prUrl: string | null; diagnostics: string; terminalRun?: AgentRun }> {
     const { task, issueNumber, issueTitle, botBranch } = params;
 
@@ -2409,10 +2379,7 @@ export class RepoWorker {
     }
 
     try {
-      const list = await this.withPrCreateTransientRetries({
-        label: `pr-list:head:${branch}`,
-        operation: async () => await ghRead(this.repo)`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet(),
-      });
+      const list = await ghRead(this.repo)`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
       const data = JSON.parse(list.stdout.toString());
       const existingUrl = data?.[0]?.url as string | undefined;
       if (existingUrl) {
@@ -2512,6 +2479,21 @@ export class RepoWorker {
       return { prUrl: canonicalBeforeCreate.selectedUrl, diagnostics: diagnostics.join("\n") };
     }
 
+    const capabilityBlocked = await this.checkPrCreateCapability({
+      task,
+      stage: "recovery",
+      issueNumber,
+      botBranch,
+      sessionId: task["session-id"]?.trim() || null,
+      latestOutput: "",
+      prRecoveryDiagnostics: diagnostics.join("\n"),
+      repoPath: candidate.worktreePath,
+    });
+    if (capabilityBlocked) {
+      diagnostics.push("- PR-create capability gate blocked recovery path");
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), terminalRun: capabilityBlocked };
+    }
+
     const lease = this.tryClaimPrCreateLease({
       task,
       issueNumber,
@@ -2522,69 +2504,113 @@ export class RepoWorker {
 
     if (!lease.claimed) {
       diagnostics.push(`- PR-create lease already held; skipping auto-create (lease=${lease.key})`);
-      const conflict = await this.resolvePrCreateLeaseConflict({
+      const waited = await this.waitForExistingPrDuringPrCreateConflict({
+        issueNumber,
+        maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
+      });
+      if (waited?.selectedUrl) {
+        diagnostics.push(...waited.diagnostics);
+        return { prUrl: waited.selectedUrl, diagnostics: diagnostics.join("\n") };
+      }
+      const selfHealed = await this.trySelfHealPrCreateLeaseAfterConflict({
         task,
         issueNumber,
+        botBranch,
         sessionId: task["session-id"]?.trim() || null,
-        leaseKey: lease.key,
         existingCreatedAt: lease.existingCreatedAt,
-        existingPayloadJson: lease.existingPayloadJson,
         stage: "recovery",
       });
-      diagnostics.push(...conflict.diagnostics);
-      if (conflict.action === "use-existing-pr") {
-        return { prUrl: conflict.resolved.selectedUrl, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(`- ${selfHealed.note}`);
+      if (!selfHealed.claimed) {
+        return { prUrl: null, diagnostics: diagnostics.join("\n") };
       }
-      if (conflict.action === "retry-claim" && (params.allowLeaseReclaim ?? true)) {
-        diagnostics.push("- Reclaimed stale lease; retrying auto-create once");
-        return await this.tryEnsurePrFromWorktree({ ...params, allowLeaseReclaim: false });
-      }
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
     }
 
-    diagnostics.push(`- Acquired PR-create lease: ${lease.key}`);
+    const claimedLeaseKey = lease.key;
+    diagnostics.push(`- Acquired PR-create lease: ${claimedLeaseKey}`);
 
-    try {
-      const created = await this.withPrCreateTransientRetries({
-        label: `pr-create:head:${branch}`,
-        operation: async () =>
-          await ghWrite(
-            this.repo
-          )`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
-            .cwd(candidate.worktreePath)
-            .quiet(),
-      });
+    for (let attempt = 1; attempt <= PR_CREATE_RECOVERY_MAX_RETRIES; attempt += 1) {
+      if (attempt > 1) {
+        const backoffMs = computePrCreateRetryBackoffMs({ attempt });
+        diagnostics.push(
+          `- Retrying gh pr create after transient failure (attempt ${attempt}/${PR_CREATE_RECOVERY_MAX_RETRIES}, backoff=${Math.round(backoffMs / 1000)}s)`
+        );
+        if (backoffMs > 0) await this.sleepMs(backoffMs);
+      }
 
-      const prUrl = selectPrUrl({ output: created.stdout.toString(), repo: this.repo }) ?? null;
-      diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
+      try {
+        const created = await ghWrite(this.repo)`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
+          .cwd(candidate.worktreePath)
+          .quiet();
 
-      if (prUrl) {
-        try {
-          deleteIdempotencyKey(lease.key);
-        } catch {
-          // ignore
+        const prUrl = selectPrUrl({ output: created.stdout.toString(), repo: this.repo }) ?? null;
+        diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
+
+        if (prUrl) {
+          try {
+            deleteIdempotencyKey(claimedLeaseKey);
+          } catch {
+            // ignore
+          }
+          this.invalidateIssuePrResolution(issueNumber);
+          return { prUrl, diagnostics: diagnostics.join("\n") };
         }
-        this.invalidateIssuePrResolution(issueNumber);
-        return { prUrl, diagnostics: diagnostics.join("\n") };
+      } catch (e: any) {
+        const failureText = e?.message ?? String(e);
+        diagnostics.push(`- gh pr create failed: ${failureText}`);
+        const policy = classifyPrCreateFailurePolicy({ evidence: [failureText] });
+        if (policy.classification === "non-retriable") {
+          try {
+            deleteIdempotencyKey(claimedLeaseKey);
+          } catch {
+            // ignore
+          }
+          const terminalRun = await this.escalateMissingPrWithPolicyReason({
+            task,
+            issueNumber,
+            botBranch,
+            reason: policy.reason,
+            blockedSource: policy.blockedSource,
+            latestOutput: failureText,
+            prRecoveryDiagnostics: diagnostics.join("\n"),
+            sessionId: task["session-id"]?.trim() || undefined,
+          });
+          return { prUrl: null, diagnostics: diagnostics.join("\n"), terminalRun };
+        }
+        if (policy.classification !== "transient") break;
       }
-    } catch (e: any) {
-      diagnostics.push(`- gh pr create failed: ${e?.message ?? String(e)}`);
+
+      try {
+        const list = await ghRead(this.repo)`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
+        const data = JSON.parse(list.stdout.toString());
+        const url = data?.[0]?.url as string | undefined;
+        if (url) {
+          diagnostics.push(`- Found PR after create attempt: ${url}`);
+          this.invalidateIssuePrResolution(issueNumber);
+          return { prUrl: url, diagnostics: diagnostics.join("\n") };
+        }
+      } catch (e: any) {
+        diagnostics.push(`- Post-attempt gh pr list failed: ${e?.message ?? String(e)}`);
+      }
     }
 
     try {
-      const list = await this.withPrCreateTransientRetries({
-        label: `pr-list:post-create:${branch}`,
-        operation: async () => await ghRead(this.repo)`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet(),
-      });
+      const list = await ghRead(this.repo)`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
       const data = JSON.parse(list.stdout.toString());
       const url = data?.[0]?.url as string | undefined;
       if (url) {
-        diagnostics.push(`- Found PR after create attempt: ${url}`);
+        diagnostics.push(`- Found PR after recovery retries: ${url}`);
         this.invalidateIssuePrResolution(issueNumber);
         return { prUrl: url, diagnostics: diagnostics.join("\n") };
       }
     } catch (e: any) {
       diagnostics.push(`- Final gh pr list failed: ${e?.message ?? String(e)}`);
+    }
+
+    try {
+      deleteIdempotencyKey(claimedLeaseKey);
+    } catch {
+      // ignore
     }
 
     diagnostics.push("- No PR URL recovered");
