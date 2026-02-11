@@ -93,10 +93,7 @@ function buildMissingPrEvidenceNote(params: {
   runId: string;
   causeCode: string;
 }): string {
-  const issueRef = parseIssueRef(params.task.issue, params.repo);
-  const issueNumber = issueRef?.number ?? null;
   const worktreePath = params.task["worktree-path"]?.trim() || "(unknown)";
-  const fixesLine = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${params.task.issue}`;
   return [
     "Missing PR evidence for issue-linked success completion.",
     `run_id: ${params.runId}`,
@@ -104,11 +101,11 @@ function buildMissingPrEvidenceNote(params: {
     `worktree: ${worktreePath}`,
     formatPrEvidenceCauseCodeLine(params.causeCode),
     "",
-    "Suggested recovery:",
+    "Orchestrator recovery checks:",
     `- git -C \"${worktreePath}\" status`,
     `- git -C \"${worktreePath}\" branch --show-current`,
-    `- git -C \"${worktreePath}\" push -u origin HEAD`,
-    `- gh pr create --base bot/integration --fill --body \"${fixesLine}\"`,
+    `- git -C \"${worktreePath}\" rev-parse HEAD`,
+    "- Ralph orchestrator then pushes the branch and creates/reuses the PR.",
   ].join("\n");
 }
 

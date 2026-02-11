@@ -94,7 +94,7 @@ const defaultRunAgentImpl = async (...args: unknown[]) => {
 
 const runAgentMock = mock(defaultRunAgentImpl);
 
-const continueSessionMock = mock(async (_repoPath: string, _sessionId: string, message: string) => {
+const defaultContinueSessionImpl = async (_repoPath: string, _sessionId: string, message: string) => {
   if (message.includes("Proceed with implementation")) {
     return {
       sessionId: "ses_build",
@@ -112,7 +112,9 @@ const continueSessionMock = mock(async (_repoPath: string, _sessionId: string, m
     success: true,
     output: "Merged.",
   };
-});
+};
+
+const continueSessionMock = mock(defaultContinueSessionImpl);
 
 const continueCommandMock = mock(async () => ({
   sessionId: "ses_build",
@@ -189,6 +191,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     notifyTaskCompleteMock.mockClear();
     runAgentMock.mockClear();
     continueSessionMock.mockClear();
+    continueSessionMock.mockImplementation(defaultContinueSessionImpl);
     continueCommandMock.mockClear();
     getThrottleDecisionMock.mockClear();
     autoUpdateEnabled = false;
@@ -425,6 +428,91 @@ describe("integration-ish harness: full task lifecycle", () => {
       expect.objectContaining({ repo: "3mdistal/ralph", number: 102 }),
       "ralph:status:in-progress"
     );
+  }, lifecycleTimeoutMs);
+
+  test("orchestrator recovers PR when build succeeds without PR URL", async () => {
+    continueSessionMock.mockImplementation(async (_repoPath: string, _sessionId: string, message: string) => {
+      if (message.includes("Proceed with implementation")) {
+        return {
+          sessionId: "ses_build",
+          success: true,
+          output: [
+            "Implementation complete but PR URL not available yet.",
+            "RALPH_BUILD_EVIDENCE: {\"version\":1,\"branch\":\"ralph/706-single-writer\",\"base\":\"bot/integration\",\"head_sha\":\"2f3c6d0d9b5e2a1c8d4f0a6c2a9f0b1c3d4e5f6a\",\"worktree_clean\":true,\"preflight\":{\"status\":\"pass\",\"command\":\"bun test\",\"summary\":\"pass\"},\"ready_for_pr_create\":true}",
+          ].join("\n"),
+        };
+      }
+
+      return {
+        sessionId: "ses_build",
+        success: true,
+        output: "Merged.",
+      };
+    });
+
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", {
+      session: sessionAdapter,
+      queue: queueAdapter,
+      notify: notifyAdapter,
+      throttle: throttleAdapter,
+    });
+
+    (worker as any).resolveTaskRepoPath = async () => ({ kind: "ok", repoPath: "/tmp", worktreePath: "/tmp" });
+    (worker as any).assertRepoRootClean = async () => {};
+    (worker as any).drainNudges = async () => {};
+    (worker as any).ensureRalphWorkflowLabelsOnce = async () => {};
+    (worker as any).ensureBranchProtectionOnce = async () => {};
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Test issue",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/102",
+      closedAt: null,
+      stateReason: null,
+    });
+    const tryEnsurePrFromWorktreeMock = mock(async () => ({
+      prUrl: "https://github.com/3mdistal/ralph/pull/999",
+      diagnostics: "orchestrator recovered PR",
+    }));
+    (worker as any).tryEnsurePrFromWorktree = tryEnsurePrFromWorktreeMock;
+    (worker as any).getPullRequestMergeState = mock(async () => ({
+      number: 999,
+      url: "https://github.com/3mdistal/ralph/pull/999",
+      mergeStateStatus: "CLEAN",
+      isCrossRepository: false,
+      headRefName: "feature-branch",
+      headRepoFullName: "3mdistal/ralph",
+      baseRefName: "bot/integration",
+      labels: [],
+    }));
+    (worker as any).getPullRequestFiles = async () => ["src/index.ts"];
+    (worker as any).getPullRequestBaseBranch = async () => "bot/integration";
+    (worker as any).waitForRequiredChecks = mock(async () => ({
+      headSha: "deadbeef",
+      mergeStateStatus: "CLEAN",
+      baseRefName: "bot/integration",
+      summary: {
+        status: "success",
+        required: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+        available: ["ci"],
+      },
+      checks: [{ name: "ci", state: "SUCCESS", rawState: "SUCCESS" }],
+      timedOut: false,
+    }));
+    (worker as any).mergePullRequest = mock(async () => {});
+    (worker as any).isPrBehind = mock(async () => false);
+    (worker as any).deleteMergedPrHeadBranchBestEffort = mock(async () => {});
+    (worker as any).createAgentRun = async () => {};
+
+    const result = await worker.processTask(createMockTask());
+
+    expect(result.outcome).toBe("success");
+    expect(result.pr).toBe("https://github.com/3mdistal/ralph/pull/999");
+    expect(tryEnsurePrFromWorktreeMock).toHaveBeenCalled();
+
+    const messages = continueSessionMock.mock.calls.map((call: any[]) => String(call?.[2] ?? ""));
+    expect(messages.some((message: string) => message.includes("gh pr create"))).toBe(false);
+    expect(messages.some((message: string) => message.includes("paste the PR URL"))).toBe(false);
   }, lifecycleTimeoutMs);
 
   test("runs parent verification before planning", async () => {
