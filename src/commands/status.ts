@@ -17,6 +17,7 @@ import {
   listIssueAlertSummaries,
   listTopRalphRunTriages,
   probeDurableState,
+  listOrphanedTasksWithOpState,
 } from "../state";
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
@@ -127,6 +128,18 @@ type StatusBaseData = {
   queued: Awaited<ReturnType<typeof getQueuedTasks>>;
   throttled: Awaited<ReturnType<typeof getTasksByStatus>>;
   blockedSorted: Awaited<ReturnType<typeof getTasksByStatus>>;
+  orphans: Array<{
+    repo: string;
+    issue: string;
+    taskPath: string;
+    reason: "closed" | "no-ralph-labels";
+    issueState: string | null;
+    labels: string[];
+    heartbeatAt: string | null;
+    daemonId: string | null;
+    repoSlot: string | null;
+    worktreePath: string | null;
+  }>;
   pendingEscalationsCount: number;
   triageRuns: ReturnType<typeof listTopRalphRunTriages>;
   getAlertSummary: (task: { repo: string; issue: string }) =>
@@ -196,6 +209,20 @@ async function collectBaseStatusData(opts?: { disableGitHubQueueSweeps?: boolean
   });
 
   const tasksForAlerts = [...starting, ...inProgress, ...queued, ...throttled, ...blocked];
+  const orphans = config.repos.flatMap((repo) =>
+    listOrphanedTasksWithOpState(repo.name).map((orphan) => ({
+      repo: orphan.repo,
+      issue: `${orphan.repo}#${orphan.issueNumber ?? "?"}`,
+      taskPath: orphan.taskPath,
+      reason: orphan.orphanReason,
+      issueState: orphan.issueState,
+      labels: orphan.issueLabels,
+      heartbeatAt: orphan.heartbeatAt ?? null,
+      daemonId: orphan.daemonId ?? null,
+      repoSlot: orphan.repoSlot ?? null,
+      worktreePath: orphan.worktreePath ?? null,
+    }))
+  );
   const issuesByRepo = new Map<string, Set<number>>();
   for (const task of tasksForAlerts) {
     const ref = parseIssueRef(task.issue, task.repo);
@@ -247,6 +274,7 @@ async function collectBaseStatusData(opts?: { disableGitHubQueueSweeps?: boolean
     queued,
     throttled,
     blockedSorted,
+    orphans,
     pendingEscalationsCount,
     triageRuns,
     getAlertSummary,
@@ -379,6 +407,18 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
         alerts: base.getAlertSummary(t),
       };
     }),
+    orphans: base.orphans.map((orphan) => ({
+      repo: orphan.repo,
+      issue: orphan.issue,
+      taskPath: orphan.taskPath,
+      reason: orphan.reason,
+      issueState: orphan.issueState,
+      labels: orphan.labels,
+      heartbeatAt: orphan.heartbeatAt,
+      daemonId: orphan.daemonId,
+      repoSlot: orphan.repoSlot,
+      worktreePath: orphan.worktreePath,
+    })),
   });
 }
 
@@ -496,6 +536,7 @@ export async function getStatusSnapshotBestEffort(): Promise<StatusSnapshot> {
 
 export async function runStatusCommand(opts: { args: string[]; drain: StatusDrainState }): Promise<void> {
   const json = opts.args.includes("--json");
+  const debug = opts.args.includes("--debug");
 
   // Status reads from the durable SQLite state DB (GitHub issue snapshots, task op
   // state, idempotency). The daemon initializes this during startup, but CLI
@@ -625,6 +666,18 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
           alerts: base.getAlertSummary(t),
         };
       }),
+      orphans: base.orphans.map((orphan) => ({
+        repo: orphan.repo,
+        issue: orphan.issue,
+        taskPath: orphan.taskPath,
+        reason: orphan.reason,
+        issueState: orphan.issueState,
+        labels: orphan.labels,
+        heartbeatAt: orphan.heartbeatAt,
+        daemonId: orphan.daemonId,
+        repoSlot: orphan.repoSlot,
+        worktreePath: orphan.worktreePath,
+      })),
     });
 
     console.log(JSON.stringify(snapshot, null, 2));
@@ -747,6 +800,20 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     console.log(
       `  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}] reason=${reason}${sourceSuffix}${idleSuffix}${alertSuffix}`
     );
+  }
+
+  if (debug || base.orphans.length > 0) {
+    console.log(`Orphans: ${base.orphans.length}`);
+    for (const orphan of base.orphans) {
+      const labelSuffix = orphan.labels.length > 0 ? ` labels=${orphan.labels.join(",")}` : " labels=(none)";
+      const heartbeatSuffix = orphan.heartbeatAt ? ` heartbeat=${orphan.heartbeatAt}` : " heartbeat=(none)";
+      const daemonSuffix = orphan.daemonId ? ` daemon=${orphan.daemonId}` : "";
+      const slotSuffix = orphan.repoSlot ? ` slot=${orphan.repoSlot}` : "";
+      const worktreeSuffix = orphan.worktreePath ? ` worktree=${orphan.worktreePath}` : "";
+      console.log(
+        `  - ${orphan.issue} reason=${orphan.reason} state=${orphan.issueState ?? "unknown"}${labelSuffix}${heartbeatSuffix}${daemonSuffix}${slotSuffix}${worktreeSuffix}`
+      );
+    }
   }
 
   console.log(`Queued tasks: ${base.queued.length}`);

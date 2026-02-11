@@ -4577,6 +4577,26 @@ export type TaskOpState = {
   releasedReason?: string | null;
 };
 
+export type OrphanedTaskOpState = TaskOpState & {
+  issueState: string | null;
+  issueLabels: string[];
+  orphanReason: "closed" | "no-ralph-labels";
+};
+
+export function hasDurableOpState(opState: TaskOpState | null | undefined): boolean {
+  if (!opState) return false;
+  const hasNonEmpty = (value: string | null | undefined): boolean => typeof value === "string" && value.trim().length > 0;
+  return (
+    hasNonEmpty(opState.sessionId) ||
+    hasNonEmpty(opState.sessionEventsPath) ||
+    hasNonEmpty(opState.worktreePath) ||
+    hasNonEmpty(opState.workerId) ||
+    hasNonEmpty(opState.repoSlot) ||
+    hasNonEmpty(opState.daemonId) ||
+    hasNonEmpty(opState.heartbeatAt)
+  );
+}
+
 export type IssueStatusTransitionRecord = {
   repo: string;
   issueNumber: number;
@@ -5125,6 +5145,154 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
   };
+}
+
+export function clearTaskOpState(params: {
+  repo: string;
+  taskPath: string;
+  releasedAtMs?: number;
+  releasedReason?: string | null;
+  status?: string | null;
+  expectedDaemonId?: string | null;
+  expectedHeartbeatAt?: string | null;
+}): { cleared: boolean; raceSkipped: boolean } {
+  const database = requireDb();
+  const atIso = nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const releasedAtMs = typeof params.releasedAtMs === "number" ? params.releasedAtMs : Date.now();
+
+  const result = database
+    .query(
+      `UPDATE tasks
+         SET status = COALESCE($status, status),
+             session_id = NULL,
+             session_events_path = NULL,
+             worktree_path = NULL,
+             worker_id = NULL,
+             repo_slot = NULL,
+             daemon_id = NULL,
+             heartbeat_at = NULL,
+             released_at_ms = $released_at_ms,
+             released_reason = $released_reason,
+             updated_at = $updated_at
+       WHERE repo_id = $repo_id
+         AND task_path = $task_path
+         AND (
+           session_id IS NOT NULL OR
+           session_events_path IS NOT NULL OR
+           worktree_path IS NOT NULL OR
+           worker_id IS NOT NULL OR
+           repo_slot IS NOT NULL OR
+           daemon_id IS NOT NULL OR
+           heartbeat_at IS NOT NULL
+         )
+         AND (
+           ($expected_daemon_id IS NULL AND daemon_id IS NULL) OR
+           daemon_id = $expected_daemon_id
+         )
+         AND (
+           ($expected_heartbeat_at IS NULL AND heartbeat_at IS NULL) OR
+           heartbeat_at = $expected_heartbeat_at
+         )`
+    )
+    .run({
+      $repo_id: repoId,
+      $task_path: params.taskPath,
+      $status: params.status ?? null,
+      $released_at_ms: releasedAtMs,
+      $released_reason: params.releasedReason ?? null,
+      $updated_at: atIso,
+      $expected_daemon_id: params.expectedDaemonId ?? null,
+      $expected_heartbeat_at: params.expectedHeartbeatAt ?? null,
+    });
+
+  if (result.changes > 0) return { cleared: true, raceSkipped: false };
+
+  const row = database
+    .query("SELECT task_path as task_path FROM tasks WHERE repo_id = $repo_id AND task_path = $task_path")
+    .get({ $repo_id: repoId, $task_path: params.taskPath }) as { task_path?: string } | undefined;
+
+  return { cleared: false, raceSkipped: Boolean(row?.task_path) };
+}
+
+export function listOrphanedTasksWithOpState(repo: string): OrphanedTaskOpState[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT t.task_path as task_path,
+              t.issue_number as issue_number,
+              t.status as status,
+              t.session_id as session_id,
+              t.session_events_path as session_events_path,
+              t.worktree_path as worktree_path,
+              t.worker_id as worker_id,
+              t.repo_slot as repo_slot,
+              t.daemon_id as daemon_id,
+              t.heartbeat_at as heartbeat_at,
+              t.released_at_ms as released_at_ms,
+              t.released_reason as released_reason,
+              i.state as issue_state,
+              GROUP_CONCAT(l.name, '${LABEL_SEPARATOR}') as labels
+       FROM tasks t
+       JOIN repos r ON r.id = t.repo_id
+       JOIN issues i ON i.repo_id = t.repo_id AND i.number = t.issue_number
+       LEFT JOIN issue_labels l ON l.issue_id = i.id
+       WHERE r.name = $name
+         AND t.issue_number IS NOT NULL
+         AND t.task_path LIKE 'github:%'
+       GROUP BY t.id, i.id
+       ORDER BY t.updated_at DESC`
+    )
+    .all({ $name: repo }) as Array<{
+    task_path: string;
+    issue_number: number | null;
+    status?: string | null;
+    session_id?: string | null;
+    session_events_path?: string | null;
+    worktree_path?: string | null;
+    worker_id?: string | null;
+    repo_slot?: string | null;
+    daemon_id?: string | null;
+    heartbeat_at?: string | null;
+    released_at_ms?: number | null;
+    released_reason?: string | null;
+    issue_state?: string | null;
+    labels?: string | null;
+  }>;
+
+  const out: OrphanedTaskOpState[] = [];
+  for (const row of rows) {
+    const base: TaskOpState = {
+      repo,
+      issueNumber: row.issue_number ?? null,
+      taskPath: row.task_path,
+      status: row.status ?? null,
+      sessionId: row.session_id ?? null,
+      sessionEventsPath: row.session_events_path ?? null,
+      worktreePath: row.worktree_path ?? null,
+      workerId: row.worker_id ?? null,
+      repoSlot: row.repo_slot ?? null,
+      daemonId: row.daemon_id ?? null,
+      heartbeatAt: row.heartbeat_at ?? null,
+      releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
+      releasedReason: row.released_reason ?? null,
+    };
+    if (!hasDurableOpState(base)) continue;
+
+    const labels = parseLabelList(row.labels);
+    const issueState = row.issue_state?.trim().toUpperCase() ?? null;
+    if (issueState === "CLOSED") {
+      out.push({ ...base, issueState, issueLabels: labels, orphanReason: "closed" });
+      continue;
+    }
+
+    const hasRalphLabel = labels.some((label) => label.toLowerCase().startsWith("ralph:"));
+    if (!hasRalphLabel) {
+      out.push({ ...base, issueState, issueLabels: labels, orphanReason: "no-ralph-labels" });
+    }
+  }
+
+  return out;
 }
 
 export function getIssueStatusTransitionRecord(repo: string, issueNumber: number): IssueStatusTransitionRecord | null {
