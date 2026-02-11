@@ -5,11 +5,12 @@ import { readFileSync } from "fs";
 import { resolveDaemonRecordPathCandidates, type DaemonRecord } from "./daemon-record";
 import { discoverDaemon } from "./daemon-discovery";
 import { updateControlFile } from "./control-file";
-import { getStatusSnapshot } from "./commands/status";
+import { getStatusSnapshotBestEffort } from "./commands/status";
 import type { StatusSnapshot } from "./status-snapshot";
 import { startDashboardTui } from "./dashboard/client/ui-blessed";
 import { formatDaemonLivenessLine } from "./daemon-liveness";
 import { runDoctor } from "./doctor";
+import { getResumptionVerificationSkipReason, isSnapshotDrained, shouldUseGraceDrainFallback } from "./ralphctl-core";
 
 const DEFAULT_GRACE_MS = 5 * 60_000;
 const DRAIN_POLL_INTERVAL_MS = 1000;
@@ -28,6 +29,7 @@ function printGlobalHelp(): void {
       "  ralphctl doctor [--json] [--repair] [--dry-run]",
       "  ralphctl dashboard [--url <url>] [--host <host>] [--port <port>] [--token <token>] [--replay-last <n>]",
       "  ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]",
+      "  ralphctl stop [--force]",
       "  ralphctl resume",
       "  ralphctl restart [--grace 5m] [--force] [--start-cmd \"<command>\"]",
       "  ralphctl upgrade [--grace 5m] [--force] [--start-cmd \"<command>\"] [--upgrade-cmd \"<command>\"]",
@@ -75,6 +77,9 @@ function printCommandHelp(command: string): void {
         "Usage:",
         "  ralphctl drain [--timeout 5m] [--pause-at-checkpoint <checkpoint>]",
       ].join("\n"));
+      return;
+    case "stop":
+      console.log(["Usage:", "  ralphctl stop [--force]"].join("\n"));
       return;
     case "resume":
       console.log(["Usage:", "  ralphctl resume"].join("\n"));
@@ -253,11 +258,16 @@ function sleep(ms: number): Promise<void> {
 
 async function waitForDrained(timeoutMs: number): Promise<StatusSnapshot> {
   const deadline = Date.now() + timeoutMs;
-  let lastSnapshot: StatusSnapshot = await getStatusSnapshot();
+  let lastSnapshot: StatusSnapshot = await getStatusSnapshotBestEffort();
   while (Date.now() < deadline) {
-    if (lastSnapshot.starting.length === 0 && lastSnapshot.inProgress.length === 0) return lastSnapshot;
+    if (isSnapshotDrained(lastSnapshot)) return lastSnapshot;
+    if (shouldUseGraceDrainFallback(lastSnapshot)) {
+      const remainingMs = Math.max(0, deadline - Date.now());
+      if (remainingMs > 0) await sleep(remainingMs);
+      return lastSnapshot;
+    }
     await sleep(DRAIN_POLL_INTERVAL_MS);
-    lastSnapshot = await getStatusSnapshot();
+    lastSnapshot = await getStatusSnapshotBestEffort();
   }
   return lastSnapshot;
 }
@@ -374,7 +384,7 @@ async function restartFlow(opts: {
   startCmd: string[] | null;
   upgradeCmd: string[] | null;
 }): Promise<void> {
-  const beforeSnapshot = await getStatusSnapshot();
+  const beforeSnapshot = await getStatusSnapshotBestEffort();
 
   updateControlFile({
     patch: {
@@ -384,8 +394,10 @@ async function restartFlow(opts: {
   });
 
   const drainedSnapshot = await waitForDrained(opts.graceMs);
-  if (drainedSnapshot.starting.length > 0 || drainedSnapshot.inProgress.length > 0) {
+  if (!isSnapshotDrained(drainedSnapshot)) {
     console.warn("Drain timeout reached; proceeding with restart.");
+  } else if (shouldUseGraceDrainFallback(drainedSnapshot)) {
+    console.warn("Durable state is degraded; used grace-based drain wait fallback.");
   }
 
   const daemonDiscovery = discoverDaemon({ healStale: true });
@@ -425,11 +437,16 @@ async function restartFlow(opts: {
   spawnDetached(command, daemonRecord.cwd || process.cwd());
 
   const newRecord = await waitForDaemonRecordChange(daemonDiscovery.state === "live" ? daemonRecord : null, DAEMON_START_TIMEOUT_MS);
-  const afterSnapshot = await getStatusSnapshot();
+  const afterSnapshot = await getStatusSnapshotBestEffort();
   if (afterSnapshot.mode === "draining") {
     console.warn("Daemon still in draining mode after restart.");
   }
-  verifyResumption(beforeSnapshot, afterSnapshot);
+  const skipReason = getResumptionVerificationSkipReason(beforeSnapshot, afterSnapshot);
+  if (skipReason) {
+    console.warn(`Skipped resumption verification: ${skipReason}.`);
+  } else {
+    verifyResumption(beforeSnapshot, afterSnapshot);
+  }
   console.log(`Daemon restarted (pid=${newRecord.pid}, id=${newRecord.daemonId}).`);
 }
 
@@ -461,7 +478,7 @@ async function run(): Promise<void> {
 
   if (cmd === "status") {
     const json = hasFlag(args, "--json");
-    const snapshot = await getStatusSnapshot();
+    const snapshot = await getStatusSnapshotBestEffort();
     if (json) {
       console.log(JSON.stringify(snapshot, null, 2));
       process.exit(0);
@@ -471,6 +488,10 @@ async function run(): Promise<void> {
       console.log(`Desired mode: ${snapshot.desiredMode}`);
     }
     console.log(`Queue backend: ${snapshot.queue.backend}`);
+    if (snapshot.durableState?.ok === false) {
+      const reason = snapshot.durableState.code ?? "unknown";
+      console.warn(`Durable state degraded (${reason}): ${snapshot.durableState.message ?? "no details"}`);
+    }
     if (snapshot.daemon) {
       console.log(
         `Daemon: id=${snapshot.daemon.daemonId ?? "unknown"} pid=${snapshot.daemon.pid ?? "unknown"}`
@@ -554,6 +575,33 @@ async function run(): Promise<void> {
       console.log(`Healed stale daemon record(s): ${discovery.healedPaths.join(", ")}`);
     }
     console.log(`Drain requested (control file: ${path}).`);
+    process.exit(0);
+  }
+
+  if (cmd === "stop") {
+    const force = hasFlag(args, "--force");
+    const daemonDiscovery = discoverDaemon({ healStale: true });
+    if (daemonDiscovery.healedPaths.length > 0) {
+      console.log(`Healed stale daemon record(s): ${daemonDiscovery.healedPaths.join(", ")}`);
+    }
+    if (daemonDiscovery.state === "conflict") {
+      throw new Error("Multiple live daemon records detected; stop extra daemons or use --force.");
+    }
+
+    const daemonRecord = daemonDiscovery.state === "live"
+      ? daemonDiscovery.live?.record ?? null
+      : daemonDiscovery.latestRecord;
+    if (!daemonRecord) {
+      const candidates = resolveDaemonRecordPathCandidates();
+      throw new Error(`Daemon record not found (checked: ${candidates.join(", ")})`);
+    }
+
+    if (daemonDiscovery.state === "live") {
+      await stopDaemon(daemonRecord, force);
+      console.log("Daemon stopped.");
+    } else {
+      console.log("No live daemon PID found; nothing to stop.");
+    }
     process.exit(0);
   }
 

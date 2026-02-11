@@ -1,4 +1,4 @@
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync } from "fs";
 import { dirname, join } from "path";
 import { randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
@@ -11,6 +11,18 @@ import type { AlertKind, AlertTargetType } from "./alerts/core";
 const SCHEMA_VERSION = 19;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
+
+export type DurableStateIssueCode = "forward_incompatible" | "lock_timeout" | "invariant_failure" | "unknown";
+
+export type DurableStateStatus =
+  | { ok: true }
+  | {
+      ok: false;
+      code: DurableStateIssueCode;
+      message: string;
+      schemaVersion?: number;
+      supportedRange?: string;
+    };
 
 function parsePositiveIntEnv(name: string): number | null {
   const raw = process.env[name]?.trim();
@@ -413,6 +425,87 @@ function formatSchemaCompatibilityError(version: number): string {
     "Upgrade Ralph to a compatible/newer binary before restarting. " +
     "If recovery is required and local durable state can be discarded, delete ~/.ralph/state.sqlite to rebuild from scratch."
   );
+}
+
+function parseSchemaCompatibilityFromMessage(message: string): {
+  schemaVersion?: number;
+  supportedRange?: string;
+} {
+  const match = message.match(/schema_version=(\d+);\s*supported range=(\d+\.\.\d+)/i);
+  if (!match) return {};
+  const schemaVersion = Number.parseInt(match[1], 10);
+  return {
+    schemaVersion: Number.isFinite(schemaVersion) ? schemaVersion : undefined,
+    supportedRange: match[2],
+  };
+}
+
+export function classifyDurableStateInitError(error: unknown): Extract<DurableStateStatus, { ok: false }> {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  if (normalized.includes("unsupported state.sqlite schema_version=")) {
+    const details = parseSchemaCompatibilityFromMessage(message);
+    return {
+      ok: false,
+      code: "forward_incompatible",
+      message,
+      schemaVersion: details.schemaVersion,
+      supportedRange: details.supportedRange,
+    };
+  }
+  if (normalized.includes("schema invariant failed")) {
+    return {
+      ok: false,
+      code: "invariant_failure",
+      message,
+    };
+  }
+  if (normalized.includes("migration lock timeout") || normalized.includes("database is locked")) {
+    return {
+      ok: false,
+      code: "lock_timeout",
+      message,
+    };
+  }
+  return {
+    ok: false,
+    code: "unknown",
+    message,
+  };
+}
+
+export function probeDurableState(): DurableStateStatus {
+  const stateDbPath = getRalphStateDbPath();
+  if (!existsSync(stateDbPath)) return { ok: true };
+
+  let probeDb: Database | null = null;
+  try {
+    probeDb = new Database(stateDbPath, { readonly: true });
+    const hasMeta = tableExists(probeDb, "meta");
+    if (!hasMeta) return { ok: true };
+
+    const schemaVersion = readSchemaVersion(probeDb);
+    if (schemaVersion && schemaVersion > SCHEMA_VERSION) {
+      return {
+        ok: false,
+        code: "forward_incompatible",
+        message: formatSchemaCompatibilityError(schemaVersion),
+        schemaVersion,
+        supportedRange: `${MIN_SUPPORTED_SCHEMA_VERSION}..${SCHEMA_VERSION}`,
+      };
+    }
+
+    ensureSchemaInvariantObjectTypes(probeDb);
+    return { ok: true };
+  } catch (error) {
+    return classifyDurableStateInitError(error);
+  } finally {
+    try {
+      probeDb?.close();
+    } catch {
+      // Best effort close for probe connections.
+    }
+  }
 }
 
 function runIntegrityCheck(database: Database): void {

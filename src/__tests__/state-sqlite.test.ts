@@ -10,6 +10,7 @@ import {
   completeRalphRun,
   createRalphRun,
   createNewRollupBatch,
+  classifyDurableStateInitError,
   deleteIdempotencyKey,
   ensureRalphRunGateRows,
   getIdempotencyPayload,
@@ -26,6 +27,7 @@ import {
   listRalphRunSessionIds,
   listRollupBatchEntries,
   markRollupBatchRolledUp,
+  probeDurableState,
   recordRalphRunGateArtifact,
   recordIdempotencyKey,
   hasIdempotencyKey,
@@ -116,6 +118,43 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     closeStateDbForTests();
     expect(() => initStateDb()).toThrow(/supported range=1\.\.\d+/);
     expect(() => initStateDb()).toThrow(/delete ~\/\.ralph\/state\.sqlite/);
+  });
+
+  test("probeDurableState classifies forward-incompatible schema", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '999')");
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    const probe = probeDurableState();
+    expect(probe.ok).toBeFalse();
+    if (!probe.ok) {
+      expect(probe.code).toBe("forward_incompatible");
+      expect(probe.schemaVersion).toBe(999);
+      expect(probe.supportedRange).toMatch(/^1\.\.\d+$/);
+    }
+  });
+
+  test("classifyDurableStateInitError maps known failure classes", () => {
+    const forward = classifyDurableStateInitError(
+      new Error("Unsupported state.sqlite schema_version=20; supported range=1..19.")
+    );
+    expect(forward.code).toBe("forward_incompatible");
+    expect(forward.schemaVersion).toBe(20);
+    expect(forward.supportedRange).toBe("1..19");
+
+    const invariant = classifyDurableStateInitError(
+      new Error("state.sqlite schema invariant failed: table=x has incompatible object type=view")
+    );
+    expect(invariant.code).toBe("invariant_failure");
+
+    const locked = classifyDurableStateInitError(new Error("state.sqlite migration lock timeout after 3000ms."));
+    expect(locked.code).toBe("lock_timeout");
   });
 
   test("backs up state.sqlite before migration when enabled", async () => {
