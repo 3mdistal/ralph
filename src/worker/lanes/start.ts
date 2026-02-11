@@ -631,7 +631,11 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               if (escalated) {
                 applyTaskPatch(task, "escalated", {});
               }
-              await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+              await this.writeEscalationWriteback(task, {
+                reason,
+                details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+                escalationType: "other",
+              });
               await this.notify.notifyEscalation({
                 taskName: task.name,
                 taskFileName: task._name,
@@ -887,7 +891,11 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           if (escalated) {
             applyTaskPatch(task, "escalated", {});
           }
-          await this.writeEscalationWriteback(task, { reason, escalationType: "other" });
+          await this.writeEscalationWriteback(task, {
+            reason,
+            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+            escalationType: "other",
+          });
           await this.notify.notifyEscalation({
             taskName: task.name,
             taskFileName: task._name,
