@@ -833,7 +833,10 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
             console.log(`[ralph:worker:${this.repo}] pr_mode=create lease=${lease.key}`);
           }
 
-          const policy = classifyPrCreateFailurePolicy({ evidence: [buildResult.output, ...prCreateEvidence] });
+          const policy = classifyPrCreateFailurePolicy({
+            evidence: [buildResult.output, ...prCreateEvidence],
+            opencodeClassification: classifyOpencodeFailure(buildResult.output),
+          });
           await this.markPrCreatePolicyState(task, {
             "pr-create-last-class": policy.classification,
             "pr-create-last-at": new Date().toISOString(),
@@ -914,7 +917,10 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               return await this.handleStallTimeout(task, cacheKey, "build-continue", buildResult);
             }
 
-            const failedPolicy = classifyPrCreateFailurePolicy({ evidence: [buildResult.output, ...prCreateEvidence] });
+            const failedPolicy = classifyPrCreateFailurePolicy({
+              evidence: [buildResult.output, ...prCreateEvidence],
+              opencodeClassification: classifyOpencodeFailure(buildResult.output),
+            });
             if (failedPolicy.classification === "non-retriable") {
               return await this.escalateMissingPrWithPolicyReason({
                 task,
