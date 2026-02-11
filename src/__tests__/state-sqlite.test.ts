@@ -57,7 +57,6 @@ import { acquireGlobalTestLock } from "./helpers/test-lock";
 let homeDir: string;
 let priorStateDbPath: string | undefined;
 let priorMigrationBusyTimeoutMs: string | undefined;
-let priorBackupBeforeMigrate: string | undefined;
 let priorBackupDir: string | undefined;
 let releaseLock: (() => void) | null = null;
 
@@ -65,13 +64,11 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
   beforeEach(async () => {
     priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
     priorMigrationBusyTimeoutMs = process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
-    priorBackupBeforeMigrate = process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
     priorBackupDir = process.env.RALPH_STATE_DB_BACKUP_DIR;
     releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
     delete process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
-    delete process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
     delete process.env.RALPH_STATE_DB_BACKUP_DIR;
     closeStateDbForTests();
   });
@@ -90,11 +87,6 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         delete process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
       } else {
         process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS = priorMigrationBusyTimeoutMs;
-      }
-      if (priorBackupBeforeMigrate === undefined) {
-        delete process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
-      } else {
-        process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE = priorBackupBeforeMigrate;
       }
       if (priorBackupDir === undefined) {
         delete process.env.RALPH_STATE_DB_BACKUP_DIR;
@@ -118,7 +110,8 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     closeStateDbForTests();
     expect(() => initStateDb()).toThrow(/writable range=1\.\.\d+/);
-    expect(() => initStateDb()).toThrow(/delete ~\/\.ralph\/state\.sqlite/);
+    expect(() => initStateDb()).toThrow(/restore a compatible state\.sqlite backup/);
+    expect(() => initStateDb()).not.toThrow(/delete ~\/\.ralph\/state\.sqlite/);
   });
 
   test("probeDurableState classifies forward-incompatible schema", () => {
@@ -189,7 +182,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(locked.code).toBe("lock_timeout");
   });
 
-  test("backs up state.sqlite before migration when enabled", async () => {
+  test("backs up state.sqlite before migration", async () => {
     const dbPath = getRalphStateDbPath();
     const db = new Database(dbPath);
     try {
@@ -218,7 +211,6 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       db.close();
     }
 
-    process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE = "1";
     process.env.RALPH_STATE_DB_BACKUP_DIR = join(homeDir, "backups");
 
     closeStateDbForTests();
@@ -226,6 +218,119 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     const backupFiles = await readdir(process.env.RALPH_STATE_DB_BACKUP_DIR);
     expect(backupFiles.some((name) => name.startsWith("state.schema-v7."))).toBe(true);
+  });
+
+  test("aborts migration when backup creation fails before first schema write", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '7')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT NOT NULL,
+          task_name TEXT,
+          status TEXT,
+          session_id TEXT,
+          worktree_path TEXT,
+          worker_id TEXT,
+          repo_slot TEXT,
+          daemon_id TEXT,
+          heartbeat_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, task_path)
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    const blockedBackupPath = join(homeDir, "backup-target-is-file");
+    const blocked = new Database(blockedBackupPath);
+    blocked.close();
+    process.env.RALPH_STATE_DB_BACKUP_DIR = blockedBackupPath;
+
+    closeStateDbForTests();
+    expect(() => initStateDb()).toThrow();
+
+    const verify = new Database(dbPath, { readonly: true });
+    try {
+      const meta = verify.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
+      expect(meta.value).toBe("7");
+    } finally {
+      verify.close();
+    }
+  });
+
+  test("records migration backup and ledger metadata", async () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '7')");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT NOT NULL,
+          task_name TEXT,
+          status TEXT,
+          session_id TEXT,
+          worktree_path TEXT,
+          worker_id TEXT,
+          repo_slot TEXT,
+          daemon_id TEXT,
+          heartbeat_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(repo_id, task_path)
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    process.env.RALPH_STATE_DB_BACKUP_DIR = join(homeDir, "backups");
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const verify = new Database(dbPath, { readonly: true });
+    try {
+      const backupRow = verify.query(
+        "SELECT from_schema_version, to_schema_version, backup_sha256, backup_size_bytes, integrity_check_result FROM state_migration_backups ORDER BY id DESC LIMIT 1"
+      ).get() as {
+        from_schema_version?: number;
+        to_schema_version?: number;
+        backup_sha256?: string;
+        backup_size_bytes?: number;
+        integrity_check_result?: string;
+      };
+      expect(backupRow.from_schema_version).toBe(7);
+      expect(backupRow.to_schema_version).toBe(20);
+      expect(backupRow.integrity_check_result).toBe("ok");
+      expect(backupRow.backup_size_bytes).toBeGreaterThan(0);
+      expect(backupRow.backup_sha256).toMatch(/^[a-f0-9]{64}$/);
+
+      const attemptRow = verify.query(
+        "SELECT from_schema_version, to_schema_version, completed_at FROM state_migration_attempts ORDER BY id DESC LIMIT 1"
+      ).get() as { from_schema_version?: number; to_schema_version?: number; completed_at?: string | null };
+      expect(attemptRow.from_schema_version).toBe(7);
+      expect(attemptRow.to_schema_version).toBe(20);
+      expect(attemptRow.completed_at).toBeString();
+
+      const completionCheckpoint = verify.query(
+        "SELECT checkpoint FROM state_migration_ledger WHERE checkpoint = 'schema-v20-complete' LIMIT 1"
+      ).get() as { checkpoint?: string } | undefined;
+      expect(completionCheckpoint?.checkpoint).toBe("schema-v20-complete");
+    } finally {
+      verify.close();
+    }
   });
 
   test("fails deterministically when migration lock times out", () => {

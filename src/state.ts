@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "fs";
 import { dirname, join } from "path";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
@@ -70,14 +70,12 @@ function parsePositiveIntEnv(name: string): number | null {
   return normalized;
 }
 
-function isTruthyEnv(name: string): boolean {
-  const raw = process.env[name]?.trim().toLowerCase();
-  if (!raw) return false;
-  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
-}
-
 function quoteSqlLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+function sha256Hex(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 export type PrState = "open" | "merged";
@@ -384,7 +382,7 @@ function formatSchemaInvariantError(message: string): Error {
   return new Error(
     `state.sqlite schema invariant failed: ${message}. ` +
       `Expected durable-state shape for schema_version=${SCHEMA_VERSION}. ` +
-      "If this persists after restarting the latest Ralph binary, restore from backup or reset ~/.ralph/state.sqlite."
+      "If this persists after restarting the latest Ralph binary, restore from backup and retry."
   );
 }
 
@@ -441,6 +439,19 @@ function applySchemaInvariants(database: Database): void {
       );
     }
   }
+}
+
+function requiresSchemaInvariantRepair(database: Database): boolean {
+  for (const invariant of SCHEMA_INVARIANTS) {
+    if (!tableExists(database, invariant.tableName)) continue;
+    if (invariant.kind === "column" && !columnExists(database, invariant.tableName, invariant.columnName)) {
+      return true;
+    }
+    if (invariant.kind === "index" && !indexExists(database, invariant.indexName)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function readSchemaVersion(database: Database): number | null {
@@ -503,7 +514,7 @@ function formatSchemaCompatibilityError(capability: DurableStateCapability): str
     `Unsupported state.sqlite schema_version=${capability.schemaVersion}; ` +
     `supported range=${formatReadableSchemaRange(capability)} writable range=${formatWritableSchemaRange(capability)}. ` +
     "Upgrade Ralph to a compatible/newer binary before restarting. " +
-    "If recovery is required and local durable state can be discarded, delete ~/.ralph/state.sqlite to rebuild from scratch."
+    "If you must run an older binary, restore a compatible state.sqlite backup first."
   );
 }
 
@@ -625,19 +636,165 @@ function runIntegrityCheck(database: Database): void {
     const details = rows.map((row) => row.integrity_check ?? "unknown").join("; ");
     throw new Error(
       `state.sqlite integrity_check failed before migration: ${details || "unknown"}. ` +
-        "Restore from backup or reset ~/.ralph/state.sqlite if local state can be recreated."
+        "Restore from backup and retry with a compatible/newer Ralph binary."
     );
   }
 }
 
-function maybeBackupBeforeMigration(database: Database, stateDbPath: string, fromVersion: number): void {
-  if (!isTruthyEnv("RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE")) return;
+function validateBackupIntegrity(backupPath: string): void {
+  const backupDb = new Database(backupPath, { readonly: true });
+  try {
+    const rows = backupDb.query("PRAGMA integrity_check").all() as Array<{ integrity_check?: string }>;
+    if (rows.length !== 1 || rows[0]?.integrity_check !== "ok") {
+      const details = rows.map((row) => row.integrity_check ?? "unknown").join("; ");
+      throw new Error(`Backup integrity_check failed: ${details || "unknown"}`);
+    }
+  } finally {
+    backupDb.close();
+  }
+}
+
+type StateBackupMetadata = {
+  backupPath: string;
+  createdAt: string;
+  fromVersion: number;
+  sha256: string;
+  sizeBytes: number;
+};
+
+function createBackupBeforeSchemaMutation(database: Database, stateDbPath: string, fromVersion: number): StateBackupMetadata {
   const configuredDir = process.env.RALPH_STATE_DB_BACKUP_DIR?.trim();
   const backupDir = configuredDir || dirname(stateDbPath);
   mkdirSync(backupDir, { recursive: true });
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const createdAt = nowIso();
+  const timestamp = createdAt.replace(/[:.]/g, "-");
   const backupPath = join(backupDir, `state.schema-v${fromVersion}.${timestamp}.backup.sqlite`);
   database.exec(`VACUUM INTO ${quoteSqlLiteral(backupPath)}`);
+  validateBackupIntegrity(backupPath);
+  const sizeBytes = statSync(backupPath).size;
+  const sha256 = sha256Hex(readFileSync(backupPath));
+  return {
+    backupPath,
+    createdAt,
+    fromVersion,
+    sha256,
+    sizeBytes,
+  };
+}
+
+const MIGRATION_CHECKPOINT_INVARIANT_REPAIR = "invariant-repair";
+const MIGRATION_CHECKSUM_INVARIANT_REPAIR = sha256Hex("state:invariant-repair:v20");
+
+function ensureStateMigrationTables(database: Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS state_migration_backups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      backup_path TEXT NOT NULL,
+      backup_sha256 TEXT,
+      backup_size_bytes INTEGER,
+      backup_created_at TEXT NOT NULL,
+      integrity_check_result TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_state_migration_backups_path ON state_migration_backups(backup_path);
+
+    CREATE TABLE IF NOT EXISTS state_migration_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      checkpoint TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      backup_id INTEGER,
+      applied_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(backup_id) REFERENCES state_migration_backups(id) ON DELETE SET NULL,
+      UNIQUE(from_schema_version, to_schema_version, checkpoint, checksum)
+    );
+
+    CREATE TABLE IF NOT EXISTS state_migration_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      backup_id INTEGER,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(backup_id) REFERENCES state_migration_backups(id) ON DELETE SET NULL
+    );
+  `);
+}
+
+function recordStateMigrationBackup(database: Database, metadata: StateBackupMetadata, toVersion: number): number {
+  database
+    .query(
+      `INSERT INTO state_migration_backups(
+         from_schema_version,
+         to_schema_version,
+         backup_path,
+         backup_sha256,
+         backup_size_bytes,
+         backup_created_at,
+         integrity_check_result,
+         created_at
+       )
+       VALUES($from_schema_version, $to_schema_version, $backup_path, $backup_sha256, $backup_size_bytes, $backup_created_at, 'ok', $created_at)`
+    )
+    .run({
+      $from_schema_version: metadata.fromVersion,
+      $to_schema_version: toVersion,
+      $backup_path: metadata.backupPath,
+      $backup_sha256: metadata.sha256,
+      $backup_size_bytes: metadata.sizeBytes,
+      $backup_created_at: metadata.createdAt,
+      $created_at: metadata.createdAt,
+    });
+
+  const row = database
+    .query("SELECT id FROM state_migration_backups WHERE backup_path = $backup_path")
+    .get({ $backup_path: metadata.backupPath }) as { id?: number } | undefined;
+  if (!row?.id) {
+    throw new Error(`Failed to record migration backup metadata for ${metadata.backupPath}`);
+  }
+  return row.id;
+}
+
+function recordStateMigrationCheckpoint(
+  database: Database,
+  params: {
+    fromVersion: number;
+    toVersion: number;
+    checkpoint: string;
+    checksum: string;
+    backupId: number | null;
+    appliedAt: string;
+  }
+): void {
+  database
+    .query(
+      `INSERT INTO state_migration_ledger(
+         from_schema_version,
+         to_schema_version,
+         checkpoint,
+         checksum,
+         backup_id,
+         applied_at,
+         created_at
+       )
+       VALUES($from_schema_version, $to_schema_version, $checkpoint, $checksum, $backup_id, $applied_at, $created_at)
+       ON CONFLICT(from_schema_version, to_schema_version, checkpoint, checksum) DO NOTHING`
+    )
+    .run({
+      $from_schema_version: params.fromVersion,
+      $to_schema_version: params.toVersion,
+      $checkpoint: params.checkpoint,
+      $checksum: params.checksum,
+      $backup_id: params.backupId,
+      $applied_at: params.appliedAt,
+      $created_at: params.appliedAt,
+    });
 }
 
 function runMigrationsWithLock(database: Database, migrate: () => void): void {
@@ -688,17 +845,11 @@ function toMigrationLockError(error: unknown, busyTimeoutMs: number): Error {
 function ensureSchema(database: Database, stateDbPath: string): void {
   const busyTimeoutMs =
     parsePositiveIntEnv("RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS") ?? DEFAULT_MIGRATION_BUSY_TIMEOUT_MS;
-  database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
-  try {
-    database.exec("PRAGMA journal_mode = WAL;");
-  database.exec("PRAGMA synchronous = NORMAL;");
-  database.exec("PRAGMA foreign_keys = ON;");
+  const hasMetaTable = tableExists(database, "meta");
+  const existingVersion = hasMetaTable ? readSchemaVersion(database) : null;
+  const needsVersionMigration = Boolean(existingVersion && existingVersion < SCHEMA_VERSION);
+  const needsInvariantRepair = !needsVersionMigration && requiresSchemaInvariantRepair(database);
 
-  database.exec(
-    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-  );
-
-  const existingVersion = readSchemaVersion(database);
   if (existingVersion) {
     const capability = evaluateDurableStateCapability({
       schemaVersion: existingVersion,
@@ -709,8 +860,24 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     }
   }
 
-  if (existingVersion && existingVersion < SCHEMA_VERSION) {
-    maybeBackupBeforeMigration(database, stateDbPath, existingVersion);
+  let backupMetadata: StateBackupMetadata | null = null;
+  let recordedBackupId: number | null = null;
+  if ((needsVersionMigration || needsInvariantRepair) && existsSync(stateDbPath)) {
+    const fromVersion = existingVersion ?? SCHEMA_VERSION;
+    backupMetadata = createBackupBeforeSchemaMutation(database, stateDbPath, fromVersion);
+  }
+
+  database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+  try {
+    database.exec("PRAGMA journal_mode = WAL;");
+    database.exec("PRAGMA synchronous = NORMAL;");
+    database.exec("PRAGMA foreign_keys = ON;");
+
+    database.exec(
+      "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    );
+
+  if (needsVersionMigration && existingVersion) {
     runMigrationsWithLock(database, () => {
       const lockedVersion = readSchemaVersion(database);
       if (!lockedVersion || lockedVersion >= SCHEMA_VERSION) return;
@@ -727,18 +894,69 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       const fromVersion = lockedVersion;
       database.transaction(() => {
         const existingVersion = fromVersion;
+        ensureStateMigrationTables(database);
+        const backupId = backupMetadata ? recordStateMigrationBackup(database, backupMetadata, SCHEMA_VERSION) : null;
+        recordedBackupId = backupId;
+        const attemptAt = nowIso();
+        database
+          .query(
+            `INSERT INTO state_migration_attempts(
+               from_schema_version,
+               to_schema_version,
+               backup_id,
+               started_at,
+               completed_at,
+               created_at,
+               updated_at
+             )
+             VALUES($from_schema_version, $to_schema_version, $backup_id, $started_at, $completed_at, $created_at, $updated_at)`
+          )
+          .run({
+            $from_schema_version: existingVersion,
+            $to_schema_version: SCHEMA_VERSION,
+            $backup_id: backupId,
+            $started_at: attemptAt,
+            $completed_at: attemptAt,
+            $created_at: attemptAt,
+            $updated_at: attemptAt,
+          });
+
         if (existingVersion < 3) {
           addColumnIfMissing(database, "tasks", "worker_id", "TEXT");
           addColumnIfMissing(database, "tasks", "repo_slot", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 3,
+            checkpoint: "v3-tasks-worker-slot",
+            checksum: sha256Hex("state:migration:v3-tasks-worker-slot"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 4) {
           addColumnIfMissing(database, "issues", "github_node_id", "TEXT");
           addColumnIfMissing(database, "issues", "github_updated_at", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 4,
+            checkpoint: "v4-issues-github-columns",
+            checksum: sha256Hex("state:migration:v4-issues-github-columns"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 5) {
           database.exec(
             "CREATE TABLE IF NOT EXISTS repo_github_issue_sync (repo_id INTEGER PRIMARY KEY, last_sync_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
           );
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 5,
+            checkpoint: "v5-repo-github-issue-sync",
+            checksum: sha256Hex("state:migration:v5-repo-github-issue-sync"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 6) {
           addColumnIfMissing(database, "tasks", "daemon_id", "TEXT");
@@ -752,17 +970,49 @@ function ensureSchema(database: Database, stateDbPath: string): void {
               "SELECT MAX(rowid) FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL GROUP BY repo_id, issue_number" +
               ")"
           );
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 6,
+            checkpoint: "v6-task-daemon-heartbeat-path-dedupe",
+            checksum: sha256Hex("state:migration:v6-task-daemon-heartbeat-path-dedupe"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 7) {
           database.exec(
-            "CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (repo_id INTEGER PRIMARY KEY, last_merged_at TEXT NOT NULL, last_pr_number INTEGER NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
+              "CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (repo_id INTEGER PRIMARY KEY, last_merged_at TEXT NOT NULL, last_pr_number INTEGER NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
           );
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 7,
+            checkpoint: "v7-done-reconcile-cursor",
+            checksum: sha256Hex("state:migration:v7-done-reconcile-cursor"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 8) {
           addColumnIfMissing(database, "tasks", "session_events_path", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 8,
+            checkpoint: "v8-tasks-session-events-path",
+            checksum: sha256Hex("state:migration:v8-tasks-session-events-path"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 16) {
           addColumnIfMissing(database, "ralph_run_gate_results", "reason", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 16,
+            checkpoint: "v16-run-gate-reason-column",
+            checksum: sha256Hex("state:migration:v16-run-gate-reason-column"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 9) {
           database.exec(
@@ -1249,6 +1499,14 @@ function ensureSchema(database: Database, stateDbPath: string): void {
               "ON repo_github_in_bot_pending(repo_id, updated_at)"
           );
         }
+        recordStateMigrationCheckpoint(database, {
+          fromVersion: existingVersion,
+          toVersion: SCHEMA_VERSION,
+          checkpoint: `schema-v${SCHEMA_VERSION}-complete`,
+          checksum: sha256Hex(`state:migration:schema-v${SCHEMA_VERSION}-complete`),
+          backupId,
+          appliedAt: nowIso(),
+        });
 
         database.exec(
           `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
@@ -1658,6 +1916,43 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS state_migration_backups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      backup_path TEXT NOT NULL,
+      backup_sha256 TEXT,
+      backup_size_bytes INTEGER,
+      backup_created_at TEXT NOT NULL,
+      integrity_check_result TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS state_migration_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      checkpoint TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      backup_id INTEGER,
+      applied_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(backup_id) REFERENCES state_migration_backups(id) ON DELETE SET NULL,
+      UNIQUE(from_schema_version, to_schema_version, checkpoint, checksum)
+    );
+
+    CREATE TABLE IF NOT EXISTS state_migration_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      backup_id INTEGER,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(backup_id) REFERENCES state_migration_backups(id) ON DELETE SET NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -1687,11 +1982,27 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       ON issue_status_transition_guard(repo_id, updated_at_ms);
     CREATE INDEX IF NOT EXISTS idx_loop_triage_attempts_repo_issue_updated
       ON loop_triage_attempts(repo_id, issue_number, last_updated_at_ms);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_state_migration_backups_path ON state_migration_backups(backup_path);
   `);
 
     runMigrationsWithLock(database, () => {
       database.transaction(() => {
+        const neededInvariantRepair = requiresSchemaInvariantRepair(database);
         applySchemaInvariants(database);
+        if (!neededInvariantRepair) return;
+
+        ensureStateMigrationTables(database);
+        if (backupMetadata && recordedBackupId === null) {
+          recordedBackupId = recordStateMigrationBackup(database, backupMetadata, SCHEMA_VERSION);
+        }
+        recordStateMigrationCheckpoint(database, {
+          fromVersion: existingVersion ?? SCHEMA_VERSION,
+          toVersion: SCHEMA_VERSION,
+          checkpoint: MIGRATION_CHECKPOINT_INVARIANT_REPAIR,
+          checksum: MIGRATION_CHECKSUM_INVARIANT_REPAIR,
+          backupId: recordedBackupId,
+          appliedAt: nowIso(),
+        });
       })();
     });
   } catch (error) {
