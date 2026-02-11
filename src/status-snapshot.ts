@@ -1,3 +1,5 @@
+import type { DurableStateCapabilityVerdict } from "./durable-state-capability";
+
 export type StatusQueueSnapshot = {
   backend: string;
   health: string;
@@ -110,9 +112,14 @@ export type StatusSnapshot = {
   durableState?: {
     ok: boolean;
     code?: string;
+    verdict?: DurableStateCapabilityVerdict;
     message?: string;
     schemaVersion?: number;
+    minReadableSchema?: number;
+    maxReadableSchema?: number;
+    maxWritableSchema?: number;
     supportedRange?: string;
+    writableRange?: string;
   };
   queue: StatusQueueSnapshot;
   parity?: StatusQueueParitySnapshot;
@@ -194,12 +201,32 @@ export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
     ? {
         ok: input.durableState.ok === true,
         code: normalizeOptionalString(input.durableState.code) ?? undefined,
+        verdict:
+          input.durableState.verdict === "readable_writable" ||
+          input.durableState.verdict === "readable_readonly_forward_newer" ||
+          input.durableState.verdict === "unreadable_forward_incompatible" ||
+          input.durableState.verdict === "unreadable_invariant_failure"
+            ? input.durableState.verdict
+            : undefined,
         message: normalizeOptionalString(input.durableState.message) ?? undefined,
         schemaVersion:
           typeof input.durableState.schemaVersion === "number" && Number.isFinite(input.durableState.schemaVersion)
             ? Math.floor(input.durableState.schemaVersion)
             : undefined,
+        minReadableSchema:
+          typeof input.durableState.minReadableSchema === "number" && Number.isFinite(input.durableState.minReadableSchema)
+            ? Math.floor(input.durableState.minReadableSchema)
+            : undefined,
+        maxReadableSchema:
+          typeof input.durableState.maxReadableSchema === "number" && Number.isFinite(input.durableState.maxReadableSchema)
+            ? Math.floor(input.durableState.maxReadableSchema)
+            : undefined,
+        maxWritableSchema:
+          typeof input.durableState.maxWritableSchema === "number" && Number.isFinite(input.durableState.maxWritableSchema)
+            ? Math.floor(input.durableState.maxWritableSchema)
+            : undefined,
         supportedRange: normalizeOptionalString(input.durableState.supportedRange) ?? undefined,
+        writableRange: normalizeOptionalString(input.durableState.writableRange) ?? undefined,
       }
     : undefined;
   return {

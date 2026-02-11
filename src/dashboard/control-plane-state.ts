@@ -11,6 +11,7 @@ import type { StatusUsageSnapshot } from "../status-usage";
 
 export type ControlPlaneStateV1 = {
   mode: string;
+  durableState?: StatusSnapshot["durableState"];
   queue: StatusQueueSnapshot;
   controlProfile: string | null;
   activeProfile: string | null;

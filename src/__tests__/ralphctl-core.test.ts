@@ -30,6 +30,9 @@ describe("ralphctl core helpers", () => {
   test("uses grace drain fallback when durable state is degraded", () => {
     const degraded = makeSnapshot({ durableState: { ok: false, code: "forward_incompatible" } });
     expect(shouldUseGraceDrainFallback(degraded)).toBeTrue();
+
+    const readonly = makeSnapshot({ durableState: { ok: true, verdict: "readable_readonly_forward_newer" } });
+    expect(shouldUseGraceDrainFallback(readonly)).toBeTrue();
   });
 
   test("detects drained snapshots from task arrays", () => {
@@ -58,8 +61,10 @@ describe("ralphctl core helpers", () => {
     const healthy = makeSnapshot();
     const degradedBefore = makeSnapshot({ durableState: { ok: false, code: "forward_incompatible" } });
     const degradedAfter = makeSnapshot({ durableState: { ok: false, code: "lock_timeout" } });
+    const readonlyAfter = makeSnapshot({ durableState: { ok: true, verdict: "readable_readonly_forward_newer" } });
     expect(getResumptionVerificationSkipReason(degradedBefore, healthy)).toContain("before restart");
     expect(getResumptionVerificationSkipReason(healthy, degradedAfter)).toContain("after restart");
+    expect(getResumptionVerificationSkipReason(healthy, readonlyAfter)).toContain("after restart");
     expect(getResumptionVerificationSkipReason(healthy, healthy)).toBeNull();
   });
 });

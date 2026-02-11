@@ -11,6 +11,7 @@ import { readRunTokenTotals } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
 import {
   classifyDurableStateInitError,
+  getDurableStateSchemaWindow,
   initStateDb,
   listDependencySatisfactionOverrides,
   listIssueAlertSummaries,
@@ -300,6 +301,7 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
   return buildStatusSnapshot({
     mode: base.mode,
     desiredMode: base.desiredMode,
+    durableState: buildWritableDurableStateSnapshot(),
     queue: {
       backend: base.queueState.backend,
       health: base.queueState.health,
@@ -380,7 +382,47 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
   });
 }
 
-function buildDegradedStatusSnapshot(reason: ReturnType<typeof classifyDurableStateInitError>): StatusSnapshot {
+function buildDurableStateStatus(reason: ReturnType<typeof probeDurableState>): StatusSnapshot["durableState"] {
+  if (reason.ok) {
+    return {
+      ok: true,
+      verdict: reason.verdict,
+      schemaVersion: reason.schemaVersion,
+      minReadableSchema: reason.minReadableSchema,
+      maxReadableSchema: reason.maxReadableSchema,
+      maxWritableSchema: reason.maxWritableSchema,
+      supportedRange: reason.supportedRange,
+      writableRange: reason.writableRange,
+    };
+  }
+  return {
+    ok: false,
+    code: reason.code,
+    verdict: reason.verdict,
+    message: reason.message,
+    schemaVersion: reason.schemaVersion,
+    minReadableSchema: reason.minReadableSchema,
+    maxReadableSchema: reason.maxReadableSchema,
+    maxWritableSchema: reason.maxWritableSchema,
+    supportedRange: reason.supportedRange,
+    writableRange: reason.writableRange,
+  };
+}
+
+function buildWritableDurableStateSnapshot(): StatusSnapshot["durableState"] {
+  const window = getDurableStateSchemaWindow();
+  return {
+    ok: true,
+    verdict: "readable_writable",
+    minReadableSchema: window.minReadableSchema,
+    maxReadableSchema: window.maxReadableSchema,
+    maxWritableSchema: window.maxWritableSchema,
+    supportedRange: `${window.minReadableSchema}..${window.maxReadableSchema}`,
+    writableRange: `${window.minReadableSchema}..${window.maxWritableSchema}`,
+  };
+}
+
+function buildDegradedStatusSnapshot(reason: ReturnType<typeof probeDurableState>): StatusSnapshot {
   const config = getConfig();
   const queueState = getQueueBackendStateWithLabelHealth();
   const daemonRecord = readDaemonRecord();
@@ -399,13 +441,7 @@ function buildDegradedStatusSnapshot(reason: ReturnType<typeof classifyDurableSt
   return buildStatusSnapshot({
     mode: control.mode,
     desiredMode: control.mode,
-    durableState: {
-      ok: false,
-      code: reason.code,
-      message: reason.message,
-      schemaVersion: reason.schemaVersion,
-      supportedRange: reason.supportedRange,
-    },
+    durableState: buildDurableStateStatus(reason),
     queue: {
       backend: queueState.backend,
       health: queueState.health,
@@ -433,10 +469,16 @@ function buildDegradedStatusSnapshot(reason: ReturnType<typeof classifyDurableSt
 
 export async function getStatusSnapshotBestEffort(): Promise<StatusSnapshot> {
   const probe = probeDurableState();
-  if (!probe.ok) return buildDegradedStatusSnapshot(probe);
+  if (!probe.ok || probe.verdict !== "readable_writable") {
+    return buildDegradedStatusSnapshot(probe);
+  }
 
   try {
-    return await getStatusSnapshot();
+    const snapshot = await getStatusSnapshot();
+    return buildStatusSnapshot({
+      ...snapshot,
+      durableState: buildWritableDurableStateSnapshot(),
+    });
   } catch (error) {
     const reason = classifyDurableStateInitError(error);
     return buildDegradedStatusSnapshot(reason);
@@ -495,6 +537,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     const snapshot = buildStatusSnapshot({
       mode: base.mode,
       desiredMode: base.desiredMode,
+      durableState: buildWritableDurableStateSnapshot(),
       queue: {
         backend: base.queueState.backend,
         health: base.queueState.health,
