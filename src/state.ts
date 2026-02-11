@@ -17,7 +17,7 @@ import {
   type DurableStateSchemaWindow,
 } from "./durable-state-capability";
 
-const SCHEMA_VERSION = 19;
+const SCHEMA_VERSION = 20;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
@@ -1194,6 +1194,40 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           }
         }
 
+        if (existingVersion < 20) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS repo_github_in_bot_reconcile_cursor (" +
+              "repo_id INTEGER PRIMARY KEY, " +
+              "bot_branch TEXT NOT NULL, " +
+              "last_merged_at TEXT NOT NULL, " +
+              "last_pr_number INTEGER NOT NULL, " +
+              "updated_at TEXT NOT NULL, " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE" +
+              ")"
+          );
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS repo_github_in_bot_pending (" +
+              "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+              "repo_id INTEGER NOT NULL, " +
+              "issue_number INTEGER NOT NULL, " +
+              "pr_number INTEGER NOT NULL, " +
+              "pr_url TEXT NOT NULL, " +
+              "merged_at TEXT NOT NULL, " +
+              "attempt_count INTEGER NOT NULL DEFAULT 0, " +
+              "last_attempt_at TEXT NOT NULL, " +
+              "last_error TEXT, " +
+              "created_at TEXT NOT NULL, " +
+              "updated_at TEXT NOT NULL, " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE, " +
+              "UNIQUE(repo_id, issue_number, pr_number)" +
+              ")"
+          );
+          database.exec(
+            "CREATE INDEX IF NOT EXISTS idx_repo_github_in_bot_pending_repo_updated " +
+              "ON repo_github_in_bot_pending(repo_id, updated_at)"
+          );
+        }
+
         database.exec(
           `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
            ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
@@ -1335,6 +1369,33 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       updated_at TEXT NOT NULL,
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS repo_github_in_bot_reconcile_cursor (
+      repo_id INTEGER PRIMARY KEY,
+      bot_branch TEXT NOT NULL,
+      last_merged_at TEXT NOT NULL,
+      last_pr_number INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS repo_github_in_bot_pending (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER NOT NULL,
+      pr_number INTEGER NOT NULL,
+      pr_url TEXT NOT NULL,
+      merged_at TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+      UNIQUE(repo_id, issue_number, pr_number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_repo_github_in_bot_pending_repo_updated
+      ON repo_github_in_bot_pending(repo_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS idempotency (
       key TEXT PRIMARY KEY,
@@ -1805,6 +1866,25 @@ export function clearRepoGithubIssueBootstrapCursor(params: { repo: string }): v
 
 export type RepoGithubDoneCursor = { lastMergedAt: string; lastPrNumber: number };
 
+export type RepoGithubInBotCursor = {
+  botBranch: string;
+  lastMergedAt: string;
+  lastPrNumber: number;
+};
+
+export type RepoGithubInBotPendingIssue = {
+  repo: string;
+  issueNumber: number;
+  prNumber: number;
+  prUrl: string;
+  mergedAt: string;
+  attemptCount: number;
+  lastAttemptAt: string;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export function getRepoGithubDoneReconcileCursor(repo: string): RepoGithubDoneCursor | null {
   const database = requireDb();
   const row = database
@@ -1846,6 +1926,195 @@ export function recordRepoGithubDoneReconcileCursor(params: {
       $last_merged_at: params.lastMergedAt,
       $last_pr_number: params.lastPrNumber,
       $updated_at: at,
+    });
+}
+
+export function getRepoGithubInBotReconcileCursor(repo: string): RepoGithubInBotCursor | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT c.bot_branch as bot_branch, c.last_merged_at as last_merged_at, c.last_pr_number as last_pr_number
+       FROM repo_github_in_bot_reconcile_cursor c
+       JOIN repos r ON r.id = c.repo_id
+       WHERE r.name = $name`
+    )
+    .get({ $name: repo }) as
+    | { bot_branch?: string; last_merged_at?: string; last_pr_number?: number }
+    | undefined;
+
+  if (!row?.bot_branch || !row.last_merged_at || typeof row.last_pr_number !== "number") return null;
+  return {
+    botBranch: row.bot_branch,
+    lastMergedAt: row.last_merged_at,
+    lastPrNumber: row.last_pr_number,
+  };
+}
+
+export function recordRepoGithubInBotReconcileCursor(params: {
+  repo: string;
+  repoPath?: string;
+  botBranch: string;
+  lastMergedAt: string;
+  lastPrNumber: number;
+  updatedAt?: string;
+}): void {
+  const database = requireDb();
+  const at = params.updatedAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, repoPath: params.repoPath, botBranch: params.botBranch, at });
+
+  database
+    .query(
+      `INSERT INTO repo_github_in_bot_reconcile_cursor(repo_id, bot_branch, last_merged_at, last_pr_number, updated_at)
+       VALUES ($repo_id, $bot_branch, $last_merged_at, $last_pr_number, $updated_at)
+       ON CONFLICT(repo_id) DO UPDATE SET
+         bot_branch = excluded.bot_branch,
+         last_merged_at = excluded.last_merged_at,
+         last_pr_number = excluded.last_pr_number,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $bot_branch: params.botBranch,
+      $last_merged_at: params.lastMergedAt,
+      $last_pr_number: params.lastPrNumber,
+      $updated_at: at,
+    });
+}
+
+export function clearRepoGithubInBotPendingIssues(repo: string): void {
+  const database = requireDb();
+  database
+    .query(
+      `DELETE FROM repo_github_in_bot_pending
+       WHERE repo_id = (SELECT id FROM repos WHERE name = $name)`
+    )
+    .run({ $name: repo });
+}
+
+export function upsertRepoGithubInBotPendingIssue(params: {
+  repo: string;
+  repoPath?: string;
+  botBranch?: string;
+  issueNumber: number;
+  prNumber: number;
+  prUrl: string;
+  mergedAt: string;
+  attemptError?: string | null;
+  attemptedAt?: string;
+}): void {
+  const database = requireDb();
+  const at = params.attemptedAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, repoPath: params.repoPath, botBranch: params.botBranch, at });
+  const errorText = sanitizeOptionalText(params.attemptError ?? null, 500) ?? null;
+
+  database
+    .query(
+      `INSERT INTO repo_github_in_bot_pending(
+         repo_id, issue_number, pr_number, pr_url, merged_at, attempt_count, last_attempt_at, last_error, created_at, updated_at
+       ) VALUES (
+         $repo_id, $issue_number, $pr_number, $pr_url, $merged_at, 1, $last_attempt_at, $last_error, $created_at, $updated_at
+       )
+       ON CONFLICT(repo_id, issue_number, pr_number) DO UPDATE SET
+         pr_url = excluded.pr_url,
+         merged_at = excluded.merged_at,
+         attempt_count = repo_github_in_bot_pending.attempt_count + 1,
+         last_attempt_at = excluded.last_attempt_at,
+         last_error = excluded.last_error,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $pr_number: params.prNumber,
+      $pr_url: params.prUrl,
+      $merged_at: params.mergedAt,
+      $last_attempt_at: at,
+      $last_error: errorText,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function listRepoGithubInBotPendingIssues(repo: string, limit = 50): RepoGithubInBotPendingIssue[] {
+  const database = requireDb();
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 50;
+  const rows = database
+    .query(
+      `SELECT r.name as repo,
+              p.issue_number as issue_number,
+              p.pr_number as pr_number,
+              p.pr_url as pr_url,
+              p.merged_at as merged_at,
+              p.attempt_count as attempt_count,
+              p.last_attempt_at as last_attempt_at,
+              p.last_error as last_error,
+              p.created_at as created_at,
+              p.updated_at as updated_at
+       FROM repo_github_in_bot_pending p
+       JOIN repos r ON r.id = p.repo_id
+       WHERE r.name = $name
+       ORDER BY p.updated_at ASC
+       LIMIT $limit`
+    )
+    .all({ $name: repo, $limit: safeLimit }) as Array<{
+    repo?: string;
+    issue_number?: number;
+    pr_number?: number;
+    pr_url?: string;
+    merged_at?: string;
+    attempt_count?: number;
+    last_attempt_at?: string;
+    last_error?: string | null;
+    created_at?: string;
+    updated_at?: string;
+  }>;
+
+  return rows
+    .map((row) => {
+      if (
+        !row.repo ||
+        typeof row.issue_number !== "number" ||
+        typeof row.pr_number !== "number" ||
+        !row.pr_url ||
+        !row.merged_at ||
+        !row.last_attempt_at ||
+        !row.created_at ||
+        !row.updated_at
+      ) {
+        return null;
+      }
+      return {
+        repo: row.repo,
+        issueNumber: row.issue_number,
+        prNumber: row.pr_number,
+        prUrl: row.pr_url,
+        mergedAt: row.merged_at,
+        attemptCount: typeof row.attempt_count === "number" ? row.attempt_count : 0,
+        lastAttemptAt: row.last_attempt_at,
+        lastError: row.last_error ?? null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      } satisfies RepoGithubInBotPendingIssue;
+    })
+    .filter((row): row is RepoGithubInBotPendingIssue => Boolean(row));
+}
+
+export function deleteRepoGithubInBotPendingIssue(params: { repo: string; issueNumber: number; prNumber: number }): void {
+  const database = requireDb();
+  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: params.repo,
+  }) as { id?: number } | undefined;
+  if (!repoRow?.id) return;
+
+  database
+    .query(
+      `DELETE FROM repo_github_in_bot_pending
+       WHERE repo_id = $repo_id AND issue_number = $issue_number AND pr_number = $pr_number`
+    )
+    .run({
+      $repo_id: repoRow.id,
+      $issue_number: params.issueNumber,
+      $pr_number: params.prNumber,
     });
 }
 
@@ -2446,6 +2715,63 @@ export function releaseTaskSlot(params: {
     });
 
   return result.changes > 0;
+}
+
+export function clearTaskExecutionStateForIssue(params: {
+  repo: string;
+  issueNumber: number;
+  reason?: string | null;
+  status?: string;
+  at?: string;
+}): { updated: boolean; hadActiveOwner: boolean } {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+  const nextStatus = (params.status ?? "done").trim() || "done";
+  const reason = sanitizeOptionalText(params.reason ?? null, 300) ?? null;
+
+  const active = database
+    .query(
+      `SELECT COUNT(*) as n
+       FROM tasks
+       WHERE repo_id = $repo_id
+         AND issue_number = $issue_number
+         AND task_path LIKE 'github:%'
+         AND ((COALESCE(TRIM(daemon_id), '') <> '') OR (COALESCE(TRIM(heartbeat_at), '') <> ''))`
+    )
+    .get({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+    }) as { n?: number } | undefined;
+  const hadActiveOwner = Number(active?.n ?? 0) > 0;
+
+  const result = database
+    .query(
+      `UPDATE tasks
+          SET status = $status,
+              session_id = NULL,
+              session_events_path = NULL,
+              worktree_path = NULL,
+              worker_id = NULL,
+              repo_slot = NULL,
+              daemon_id = NULL,
+              heartbeat_at = NULL,
+              released_at_ms = NULL,
+              released_reason = $reason,
+              updated_at = $updated_at
+        WHERE repo_id = $repo_id
+          AND issue_number = $issue_number
+          AND task_path LIKE 'github:%'`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $status: nextStatus,
+      $reason: reason,
+      $updated_at: at,
+    });
+
+  return { updated: result.changes > 0, hadActiveOwner };
 }
 
 export type RepoLabelWriteState = {
