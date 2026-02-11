@@ -2,6 +2,7 @@ import { getConfig, getRepoAutoQueueConfig } from "../config";
 import { resolveGitHubToken } from "../github-auth";
 import { GitHubClient, splitRepoFullName } from "../github/client";
 import { mutateIssueLabels } from "../github/label-mutation";
+import { countStatusLabels } from "../github/status-label-invariant";
 import { createRalphWorkflowLabelsEnsurer, type EnsureOutcome } from "../github/ensure-ralph-workflow-labels";
 import { computeBlockedDecision } from "../github/issue-blocking-core";
 import { parseIssueRef, type IssueRef } from "../github/issue-ref";
@@ -641,12 +642,20 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           windowMs: debounceWindowMs,
         });
         if (transitionGuard.suppress) {
-          console.warn(
-            `[ralph:queue:github] Suppressed stale recovery transition for ${repo}#${issue.number}: ${
-              transitionGuard.reason ?? "debounced"
-            }`
-          );
-          continue;
+          const statusCount = countStatusLabels(issue.labels);
+          if (statusCount === 1) {
+            console.warn(
+              `[ralph:queue:github] Suppressed stale recovery transition for ${repo}#${issue.number}: ${
+                transitionGuard.reason ?? "debounced"
+              }`
+            );
+            continue;
+          }
+          if (shouldLog(`queue:stale-sweep:override-debounce:${repo}#${issue.number}`, 60_000)) {
+            console.warn(
+              `[ralph:queue:github] Ignoring stale recovery debounce for ${repo}#${issue.number}; status labels drifted (count=${statusCount})`
+            );
+          }
         }
 
         try {
@@ -912,14 +921,22 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           windowMs: debounceWindowMs,
         });
         if (transitionGuard.suppress) {
-          if (shouldLog(`queue:claim:debounced:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+          const statusCount = countStatusLabels(issue.labels);
+          if (statusCount === 1) {
+            if (shouldLog(`queue:claim:debounced:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+              console.warn(
+                `[ralph:queue:github] Suppressed claim transition for ${issueRef.repo}#${issueRef.number}: ${
+                  transitionGuard.reason ?? "debounced"
+                }`
+              );
+            }
+            return { claimed: false, task: opts.task, reason: transitionGuard.reason ?? "Debounced status transition" };
+          }
+          if (shouldLog(`queue:claim:override-debounce:${issueRef.repo}#${issueRef.number}`, 60_000)) {
             console.warn(
-              `[ralph:queue:github] Suppressed claim transition for ${issueRef.repo}#${issueRef.number}: ${
-                transitionGuard.reason ?? "debounced"
-              }`
+              `[ralph:queue:github] Ignoring claim debounce for ${issueRef.repo}#${issueRef.number}; status labels drifted (count=${statusCount})`
             );
           }
-          return { claimed: false, task: opts.task, reason: transitionGuard.reason ?? "Debounced status transition" };
         }
 
         try {
@@ -1198,8 +1215,16 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         nowMs: Date.parse(nowIso),
         windowMs: debounceWindowMs,
       });
+      const statusCount = issue ? countStatusLabels(issue.labels) : 1;
+      const shouldApplyUpdate = !transitionGuard.suppress || statusCount !== 1;
       if (transitionGuard.suppress && updateDelta.add.length + updateDelta.remove.length > 0) {
-        if (shouldLog(`queue:update-status:debounced:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+        if (statusCount !== 1) {
+          if (shouldLog(`queue:update-status:override-debounce:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+            console.warn(
+              `[ralph:queue:github] Ignoring status transition debounce for ${issueRef.repo}#${issueRef.number}; status labels drifted (count=${statusCount})`
+            );
+          }
+        } else if (shouldLog(`queue:update-status:debounced:${issueRef.repo}#${issueRef.number}`, 60_000)) {
           console.warn(
             `[ralph:queue:github] Suppressed status transition for ${issueRef.repo}#${issueRef.number}: ${
               transitionGuard.reason ?? "debounced"
@@ -1207,7 +1232,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           );
         }
       }
-      if (issue && (updateDelta.add.length > 0 || updateDelta.remove.length > 0) && !transitionGuard.suppress) {
+      if (issue && (updateDelta.add.length > 0 || updateDelta.remove.length > 0) && shouldApplyUpdate) {
         const didMutate = await io.mutateIssueLabels({
           repo: issueRef.repo,
           issueNumber: issueRef.number,

@@ -1339,6 +1339,19 @@ async function resumeTasksOnStartup(opts?: {
   const awaitCompletion = opts?.awaitCompletion ?? true;
   const schedulingMode = opts?.schedulingMode ?? resumeSchedulingMode;
 
+  const starting = await getTasksByStatus("starting");
+  for (const task of starting) {
+    if (task["session-id"]?.trim()) continue;
+    console.warn(`[ralph] Startup recovery: resetting stale starting task to queued: ${task.name}`);
+    await updateTaskStatus(task, "queued", {
+      "session-id": "",
+      "daemon-id": "",
+      "heartbeat-at": "",
+      "worker-id": "",
+      "repo-slot": "",
+    });
+  }
+
   const inProgress = await getTasksByStatus("in-progress");
 
   if (inProgress.length > 0) {

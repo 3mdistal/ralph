@@ -78,6 +78,14 @@ export interface StallTimeoutInfo {
   recentEvents?: string[];
 }
 
+export interface SessionBootstrapTimeoutInfo {
+  kind: "session-bootstrap-timeout";
+  elapsedMs: number;
+  timeoutMs: number;
+  context?: string;
+  recentEvents?: string[];
+}
+
 export type GuardrailTripReason = "wall-time" | "tool-churn";
 
 export interface GuardrailTimeoutInfo {
@@ -98,6 +106,7 @@ export interface SessionResult {
   exitCode?: number;
   watchdogTimeout?: WatchdogTimeoutInfo;
   stallTimeout?: StallTimeoutInfo;
+  sessionBootstrapTimeout?: SessionBootstrapTimeoutInfo;
   guardrailTimeout?: GuardrailTimeoutInfo;
   loopTrip?: LoopTripInfo;
   /** Best-effort PR URL discovered from structured JSON events. */
@@ -1231,6 +1240,8 @@ async function runSession(
   const stallEnabled = options?.stall?.enabled ?? false;
   const stallIdleMs = options?.stall?.idleMs ?? 5 * 60_000;
   const stallContext = options?.stall?.context ?? context;
+  const sessionBootstrapTimeoutMs = options?.stall?.sessionBootstrapMs ?? 0;
+  const sessionBootstrapEnabled = !options?.continueSession && sessionBootstrapTimeoutMs > 0;
 
   const fallbackTimeoutCandidateMs = options?.timeoutMs ?? thresholds.bash.hardMs + 60_000;
 
@@ -1405,8 +1416,11 @@ async function runSession(
 
   let watchdogTimeout: WatchdogTimeoutInfo | undefined;
   let stallTimeout: StallTimeoutInfo | undefined;
+  let sessionBootstrapTimeout: SessionBootstrapTimeoutInfo | undefined;
   let guardrailTimeout: GuardrailTimeoutInfo | undefined;
   let loopTrip: LoopTripInfo | undefined;
+
+  const runStartedAt = scheduler.now();
 
   const loopDetector = loopDetectionConfig ? createLoopDetector({ config: loopDetectionConfig, startTs: scheduler.now() }) : null;
 
@@ -1568,10 +1582,34 @@ async function runSession(
   });
 
   let stallInterval: ReturnType<typeof setInterval> | undefined;
-  if (stallEnabled && stallIdleMs > 0) {
+  if ((stallEnabled && stallIdleMs > 0) || sessionBootstrapEnabled) {
     stallInterval = scheduler.setInterval(() => {
-      if (stallTimeout) return;
+      if (stallTimeout || sessionBootstrapTimeout) return;
       const now = scheduler.now();
+
+      if (sessionBootstrapEnabled && !sessionId) {
+        const elapsedMs = now - runStartedAt;
+        if (elapsedMs >= sessionBootstrapTimeoutMs) {
+          sessionBootstrapTimeout = {
+            kind: "session-bootstrap-timeout",
+            elapsedMs,
+            timeoutMs: sessionBootstrapTimeoutMs,
+            context: stallContext ?? undefined,
+            recentEvents,
+          };
+
+          const ctx = stallContext ? ` ${stallContext}` : "";
+          console.warn(
+            `[ralph:stall] Session bootstrap timeout${ctx}: no session id after ${Math.round(elapsedMs / 1000)}s; killing opencode process`
+          );
+
+          requestKill();
+          return;
+        }
+      }
+
+      if (!(stallEnabled && stallIdleMs > 0)) return;
+
       const idleFor = now - lastActivityTs;
       if (idleFor < stallIdleMs) return;
 
@@ -1824,6 +1862,46 @@ async function runSession(
     return { sessionId, output: enriched, success: false, exitCode, stallTimeout, prUrl: prUrlFromEvents ?? undefined };
   }
 
+  if (sessionBootstrapTimeout) {
+    const header = [
+      `Session bootstrap timed out: no session id after ${Math.round(sessionBootstrapTimeout.elapsedMs / 1000)}s`,
+      `Bootstrap threshold: ${Math.round(sessionBootstrapTimeout.timeoutMs / 1000)}s`,
+      sessionBootstrapTimeout.context ? `Context: ${sessionBootstrapTimeout.context}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const recent = sessionBootstrapTimeout.recentEvents?.length
+      ? ["Recent OpenCode events (bounded):", ...sessionBootstrapTimeout.recentEvents.map((l) => `- ${l}`)].join("\n")
+      : "";
+
+    const combined = [header, recent].filter(Boolean).join("\n\n");
+    const enriched = await appendOpencodeLogTail(combined);
+
+    if (sessionId) {
+      ensureEventStream(sessionId);
+      writeEvent({ type: "run-end", ts: scheduler.now(), success: false, exitCode, sessionBootstrapTimeout: true });
+      try {
+        await closeEventStream();
+      } catch {
+        // ignore
+      }
+    }
+
+    if (sessionId) {
+      await enforceToolOutputBudgetInStorage(sessionId, { xdgDataHome: opencodeXdg?.dataHome });
+    }
+
+    return {
+      sessionId,
+      output: enriched,
+      success: false,
+      exitCode,
+      sessionBootstrapTimeout,
+      prUrl: prUrlFromEvents ?? undefined,
+    };
+  }
+
   if (watchdogTimeout) {
     const header = [
       `Tool call timed out: ${watchdogTimeout.toolName} ${watchdogTimeout.callId} after ${Math.round(watchdogTimeout.elapsedMs / 1000)}s`,
@@ -2000,6 +2078,8 @@ export type RunSessionOptionsBase = {
     enabled?: boolean;
     /** Kill the run if there is no stdout/stderr activity for this long. */
     idleMs?: number;
+    /** Kill the run if no session ID is observed during bootstrap. */
+    sessionBootstrapMs?: number;
     context?: string;
   };
   /**
