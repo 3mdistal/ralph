@@ -34,6 +34,9 @@ export type DurableStateStatus =
   | {
       ok: true;
       verdict: "readable_writable" | "readable_readonly_forward_newer";
+      canReadState: true;
+      canWriteState: boolean;
+      requiresMigration: boolean;
       schemaVersion?: number;
       minReadableSchema: number;
       maxReadableSchema: number;
@@ -46,6 +49,9 @@ export type DurableStateStatus =
       code: DurableStateIssueCode;
       message: string;
       verdict?: DurableStateCapabilityVerdict;
+      canReadState?: boolean;
+      canWriteState?: boolean;
+      requiresMigration?: boolean;
       schemaVersion?: number;
       supportedRange?: string;
       writableRange?: string;
@@ -466,9 +472,13 @@ function buildReadableDurableStateStatus(
   verdict: "readable_writable" | "readable_readonly_forward_newer",
   schemaVersion?: number
 ): Extract<DurableStateStatus, { ok: true }> {
+  const writable = verdict === "readable_writable";
   return {
     ok: true,
     verdict,
+    canReadState: true,
+    canWriteState: writable,
+    requiresMigration: !writable,
     schemaVersion,
     ...getSchemaWindowDetails(),
   };
@@ -508,6 +518,9 @@ function buildForwardCompatibilityFailure(capability: DurableStateCapability): E
     code: "forward_incompatible",
     message: formatSchemaCompatibilityError(capability),
     verdict: capability.verdict,
+    canReadState: capability.canReadState,
+    canWriteState: capability.canWriteState,
+    requiresMigration: capability.requiresMigration,
     schemaVersion: capability.schemaVersion,
     ...details,
   };
@@ -536,13 +549,16 @@ export function classifyDurableStateInitError(error: unknown): Extract<DurableSt
     };
   }
   if (normalized.includes("schema invariant failed")) {
-    return {
-      ok: false,
-      code: "invariant_failure",
-      message,
-      verdict: "unreadable_invariant_failure",
-      ...getSchemaWindowDetails(),
-    };
+      return {
+        ok: false,
+        code: "invariant_failure",
+        message,
+        verdict: "unreadable_invariant_failure",
+        canReadState: false,
+        canWriteState: false,
+        requiresMigration: false,
+        ...getSchemaWindowDetails(),
+      };
   }
   if (normalized.includes("migration lock timeout") || normalized.includes("database is locked")) {
     return {
@@ -574,7 +590,7 @@ export function probeDurableState(): DurableStateStatus {
         schemaVersion,
         window: DURABLE_STATE_SCHEMA_WINDOW,
       });
-      if (!capability.readable) {
+      if (!capability.canReadState) {
         return buildForwardCompatibilityFailure(capability);
       }
       if (capability.verdict === "readable_readonly_forward_newer") {
@@ -682,7 +698,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       schemaVersion: existingVersion,
       window: DURABLE_STATE_SCHEMA_WINDOW,
     });
-    if (!capability.writable) {
+    if (!capability.canWriteState) {
       throwForwardCompatibilityFailure(capability);
     }
   }
@@ -696,7 +712,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
         schemaVersion: lockedVersion,
         window: DURABLE_STATE_SCHEMA_WINDOW,
       });
-      if (!lockedCapability.writable) {
+      if (!lockedCapability.canWriteState) {
         throwForwardCompatibilityFailure(lockedCapability);
       }
 

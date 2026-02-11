@@ -15,6 +15,10 @@ export type DurableStateCapability = {
   minReadableSchema: number;
   maxReadableSchema: number;
   maxWritableSchema: number;
+  canReadState: boolean;
+  canWriteState: boolean;
+  requiresMigration: boolean;
+  // Legacy aliases; prefer canReadState/canWriteState.
   readable: boolean;
   writable: boolean;
   verdict: DurableStateCapabilityVerdict;
@@ -59,6 +63,9 @@ export function evaluateDurableStateCapability(params: {
     return {
       schemaVersion,
       ...window,
+      canReadState: false,
+      canWriteState: false,
+      requiresMigration: true,
       readable: false,
       writable: false,
       verdict: "unreadable_forward_incompatible",
@@ -69,6 +76,9 @@ export function evaluateDurableStateCapability(params: {
     return {
       schemaVersion,
       ...window,
+      canReadState: true,
+      canWriteState: false,
+      requiresMigration: true,
       readable: true,
       writable: false,
       verdict: "readable_readonly_forward_newer",
@@ -78,6 +88,9 @@ export function evaluateDurableStateCapability(params: {
   return {
     schemaVersion,
     ...window,
+    canReadState: true,
+    canWriteState: true,
+    requiresMigration: false,
     readable: true,
     writable: true,
     verdict: "readable_writable",

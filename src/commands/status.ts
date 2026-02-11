@@ -387,6 +387,9 @@ function buildDurableStateStatus(reason: ReturnType<typeof probeDurableState>): 
     return {
       ok: true,
       verdict: reason.verdict,
+      canReadState: reason.canReadState,
+      canWriteState: reason.canWriteState,
+      requiresMigration: reason.requiresMigration,
       schemaVersion: reason.schemaVersion,
       minReadableSchema: reason.minReadableSchema,
       maxReadableSchema: reason.maxReadableSchema,
@@ -399,6 +402,9 @@ function buildDurableStateStatus(reason: ReturnType<typeof probeDurableState>): 
     ok: false,
     code: reason.code,
     verdict: reason.verdict,
+    canReadState: reason.canReadState,
+    canWriteState: reason.canWriteState,
+    requiresMigration: reason.requiresMigration,
     message: reason.message,
     schemaVersion: reason.schemaVersion,
     minReadableSchema: reason.minReadableSchema,
@@ -414,6 +420,9 @@ function buildWritableDurableStateSnapshot(): StatusSnapshot["durableState"] {
   return {
     ok: true,
     verdict: "readable_writable",
+    canReadState: true,
+    canWriteState: true,
+    requiresMigration: false,
     minReadableSchema: window.minReadableSchema,
     maxReadableSchema: window.maxReadableSchema,
     maxWritableSchema: window.maxWritableSchema,
@@ -469,7 +478,7 @@ function buildDegradedStatusSnapshot(reason: ReturnType<typeof probeDurableState
 
 export async function getStatusSnapshotBestEffort(): Promise<StatusSnapshot> {
   const probe = probeDurableState();
-  if (!probe.ok || probe.verdict !== "readable_writable") {
+  if (!probe.ok || probe.canWriteState === false) {
     return buildDegradedStatusSnapshot(probe);
   }
 

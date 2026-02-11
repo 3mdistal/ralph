@@ -113,6 +113,9 @@ export type StatusSnapshot = {
     ok: boolean;
     code?: string;
     verdict?: DurableStateCapabilityVerdict;
+    canReadState?: boolean;
+    canWriteState?: boolean;
+    requiresMigration?: boolean;
     message?: string;
     schemaVersion?: number;
     minReadableSchema?: number;
@@ -198,17 +201,35 @@ const normalizeInProgressTask = (task: StatusInProgressTask): StatusInProgressTa
 export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
   const desiredMode = normalizeOptionalString(input.desiredMode);
   const durableState = input.durableState
-    ? {
-        ok: input.durableState.ok === true,
-        code: normalizeOptionalString(input.durableState.code) ?? undefined,
-        verdict:
+    ? (() => {
+        const verdict =
           input.durableState.verdict === "readable_writable" ||
           input.durableState.verdict === "readable_readonly_forward_newer" ||
           input.durableState.verdict === "unreadable_forward_incompatible" ||
           input.durableState.verdict === "unreadable_invariant_failure"
             ? input.durableState.verdict
-            : undefined,
+            : undefined;
+        const canReadState =
+          typeof input.durableState.canReadState === "boolean"
+            ? input.durableState.canReadState
+            : input.durableState.ok === true;
+        const canWriteState =
+          typeof input.durableState.canWriteState === "boolean"
+            ? input.durableState.canWriteState
+            : input.durableState.ok === true && verdict !== "readable_readonly_forward_newer";
+        const requiresMigration =
+          typeof input.durableState.requiresMigration === "boolean"
+            ? input.durableState.requiresMigration
+            : !canWriteState;
+
+        return {
+        ok: input.durableState.ok === true,
+        code: normalizeOptionalString(input.durableState.code) ?? undefined,
+        verdict,
         message: normalizeOptionalString(input.durableState.message) ?? undefined,
+        canReadState,
+        canWriteState,
+        requiresMigration,
         schemaVersion:
           typeof input.durableState.schemaVersion === "number" && Number.isFinite(input.durableState.schemaVersion)
             ? Math.floor(input.durableState.schemaVersion)
@@ -227,7 +248,8 @@ export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
             : undefined,
         supportedRange: normalizeOptionalString(input.durableState.supportedRange) ?? undefined,
         writableRange: normalizeOptionalString(input.durableState.writableRange) ?? undefined,
-      }
+      };
+      })()
     : undefined;
   return {
     ...input,

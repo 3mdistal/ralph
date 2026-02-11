@@ -493,7 +493,7 @@ async function run(): Promise<void> {
       if (snapshot.durableState.ok === false) {
         const reason = snapshot.durableState.code ?? "unknown";
         console.warn(`Durable state degraded (${reason}, verdict=${verdict}): ${snapshot.durableState.message ?? "no details"}`);
-      } else if (snapshot.durableState.verdict === "readable_readonly_forward_newer") {
+      } else if (snapshot.durableState.canWriteState === false || snapshot.durableState.verdict === "readable_readonly_forward_newer") {
         console.warn(
           `Durable state is readable-only (verdict=${verdict}): ` +
             `${snapshot.durableState.message ?? "upgrade Ralph for writable operations"}`
