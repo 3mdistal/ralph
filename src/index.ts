@@ -103,6 +103,7 @@ import { runWorktreesCommand } from "./commands/worktrees";
 import { runSandboxCommand } from "./commands/sandbox";
 import { runSandboxSeedCommand } from "./commands/sandbox-seed";
 import { runSandboxCollectCommand } from "./commands/sandbox-collect";
+import { runSandboxRunCommand } from "./commands/sandbox-run";
 import { getTaskNowDoingLine, getTaskOpencodeProfileName } from "./status-utils";
 import { RepoSlotManager, parseRepoSlot, parseRepoSlotFromWorktreePath } from "./repo-slot-manager";
 import {
@@ -2107,10 +2108,12 @@ function printGlobalHelp(): void {
       "  ralph nudge <taskRef> \"<message>\"    Queue an operator message for an in-flight task",
       "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:run [--no-seed]       Provision+seed a sandbox repo and run the daemon",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph sandbox:collect --run-id <id> Export a run trace bundle",
       "  ralph sandbox <tag|teardown|prune> Sandbox repo lifecycle helpers",
       "  ralph sandbox:init [--no-seed]      Provision a sandbox repo from template",
+      "  ralph sandbox:run [--no-seed]       Provision+seed a sandbox repo and run the daemon",
       "  ralph sandbox:seed [--run-id <id>]  Seed a sandbox repo from manifest",
       "  ralph sandbox:collect --run-id <id> Export a run trace bundle",
       "  ralph worktrees legacy ...         Manage legacy worktrees",
@@ -2264,6 +2267,24 @@ function printCommandHelp(command: string): void {
           "",
           "Creates a new sandbox repo from the configured template and writes a manifest.",
           "Runs seeding unless --no-seed is provided.",
+        ].join("\n")
+      );
+      return;
+
+    case "sandbox:run":
+      console.log(
+        [
+          "Usage:",
+          "  ralph sandbox:run [--no-seed] [--no-daemon] [--detach] [--tail <n>] [--json]",
+          "",
+          "Provision a fresh sandbox repo, optionally seed it, and then run the daemon against it.",
+          "",
+          "Options:",
+          "  --no-seed     Skip seeding",
+          "  --no-daemon   Provision/seed only (print next command)",
+          "  --detach      Spawn daemon and return immediately",
+          "  --tail <n>    When daemon exits, print up to N trace bundle paths (default: 20)",
+          "  --json        Emit machine-readable output",
         ].join("\n")
       );
       return;
@@ -2735,6 +2756,16 @@ if (args[0] === "sandbox:init") {
 
   console.log(`[ralph:sandbox] Provisioned ${plan.repoFullName}`);
   console.log(`[ralph:sandbox] Manifest: ${getRalphSandboxManifestPath(plan.runId)}`);
+  process.exit(0);
+}
+
+if (args[0] === "sandbox:run") {
+  if (hasHelpFlag) {
+    printCommandHelp("sandbox:run");
+    process.exit(0);
+  }
+
+  await runSandboxRunCommand(args.slice(1));
   process.exit(0);
 }
 
