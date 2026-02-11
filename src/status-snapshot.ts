@@ -107,6 +107,13 @@ import type { StatusUsageSnapshot } from "./status-usage";
 export type StatusSnapshot = {
   mode: string;
   desiredMode?: string;
+  durableState?: {
+    ok: boolean;
+    code?: string;
+    message?: string;
+    schemaVersion?: number;
+    supportedRange?: string;
+  };
   queue: StatusQueueSnapshot;
   parity?: StatusQueueParitySnapshot;
   daemon: StatusDaemonSnapshot | null;
@@ -183,9 +190,22 @@ const normalizeInProgressTask = (task: StatusInProgressTask): StatusInProgressTa
 
 export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
   const desiredMode = normalizeOptionalString(input.desiredMode);
+  const durableState = input.durableState
+    ? {
+        ok: input.durableState.ok === true,
+        code: normalizeOptionalString(input.durableState.code) ?? undefined,
+        message: normalizeOptionalString(input.durableState.message) ?? undefined,
+        schemaVersion:
+          typeof input.durableState.schemaVersion === "number" && Number.isFinite(input.durableState.schemaVersion)
+            ? Math.floor(input.durableState.schemaVersion)
+            : undefined,
+        supportedRange: normalizeOptionalString(input.durableState.supportedRange) ?? undefined,
+      }
+    : undefined;
   return {
     ...input,
     desiredMode: desiredMode ?? undefined,
+    durableState,
     daemonLiveness: normalizeDaemonLiveness(input.daemonLiveness),
     blocked: input.blocked.map(normalizeBlockedTask),
     inProgress: input.inProgress.map(normalizeInProgressTask),
