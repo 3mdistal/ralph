@@ -85,6 +85,7 @@ import { startGitHubCmdProcessor } from "./github/cmd-processor";
 import { resolveGitHubToken } from "./github-auth";
 import { GitHubClient } from "./github/client";
 import { createGhRunner } from "./github/gh-runner";
+import { validateDaemonGhAuth } from "./github/daemon-auth-probe";
 import { parseIssueRef } from "./github/issue-ref";
 import { createRalphWorkflowLabelsEnsurer, ensureRalphWorkflowLabelsOnce } from "./github/ensure-ralph-workflow-labels";
 import { executeIssueLabelOps, planIssueLabelOps } from "./github/issue-label-io";
@@ -1476,20 +1477,10 @@ async function main(): Promise<void> {
     const probeRepo = config.repos?.[0]?.name;
     if (probeRepo) {
       try {
-        await createGhRunner({ repo: probeRepo, mode: "read" })`gh api /user`.quiet();
+        await validateDaemonGhAuth({ config, probeRepo });
       } catch (e: any) {
-        const command = String(e?.ghCommand ?? e?.command ?? "").trim();
-        const message = String(e?.message ?? "").trim();
-        const stderr = typeof e?.stderr?.toString === "function" ? String(e.stderr.toString()).trim() : "";
-
-        const lines = [
-          "[ralph] GitHub auth validation failed for gh CLI (daemon mode).",
-          command ? `Command: ${command}` : "",
-          message ? `Message: ${message}` : "",
-          stderr ? `stderr: ${stderr.slice(0, 1600)}` : "",
-        ].filter(Boolean);
-
-        console.error(lines.join("\n"));
+        const message = String(e?.message ?? e ?? "").trim();
+        console.error(message || "[ralph] GitHub auth validation failed for gh CLI (daemon mode).");
         process.exit(1);
       }
     }
