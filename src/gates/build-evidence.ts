@@ -1,7 +1,7 @@
 import { parseStrictFinalLineJsonMarker, type StrictJsonMarkerParseFailure } from "../markers";
 
-export const RALPH_BUILD_EVIDENCE_MARKER_PREFIX = "RALPH_BUILD_EVIDENCE";
-export const RALPH_BUILD_EVIDENCE_VERSION = 1;
+const RALPH_BUILD_EVIDENCE_MARKER_PREFIX = "RALPH_BUILD_EVIDENCE";
+const RALPH_BUILD_EVIDENCE_VERSION = 1;
 
 type BuildPreflightStatus = "pass" | "fail" | "skipped";
 
