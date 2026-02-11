@@ -13,20 +13,54 @@ It also stores deterministic gate state for each run (`ralph_run_gate_results`) 
 - Forward-only, additive migrations on startup.
 - Bump `SCHEMA_VERSION` in `src/state.ts` for each change.
 - Apply migrations inside a single transaction.
-- No downgrades. If `meta.schema_version` is newer than the running binary, fail closed.
+- No downgrades. Writable operations are blocked when `meta.schema_version` is newer than the binary's writable window.
 - Safe reset: deleting `state.sqlite` recreates a fresh database on next startup.
+
+## Compatibility capability window
+
+Ralph defines an explicit durable-state compatibility window shared by daemon startup, `ralphctl`, and status snapshots:
+
+- `minReadableSchema`
+- `maxReadableSchema`
+- `maxWritableSchema`
+
+Capability flags are published alongside verdicts:
+
+- `canReadState`
+- `canWriteState`
+- `requiresMigration`
+
+Verdicts are typed and stable:
+
+- `readable_writable`
+- `readable_readonly_forward_newer`
+- `unreadable_forward_incompatible`
+- `unreadable_invariant_failure`
+
+Forward-newer durable state is allowed in read-only mode when:
+
+- `schemaVersion > maxWritableSchema`
+- and `schemaVersion <= maxReadableSchema`
+
+If `schemaVersion > maxReadableSchema`, Ralph fails closed.
+
+Operational contract:
+
+- `status`: allowed when `canReadState=true`.
+- `restart`: allowed only via deterministic safe path; no unsafe durable-state writes when `canWriteState=false`.
+- Mutation/write paths: require `canWriteState=true`; otherwise block with explicit diagnostics and migration guidance.
 
 ## Startup compatibility behavior
 
 - If `meta.schema_version` is older than the binary schema, Ralph migrates forward on startup.
-- If `meta.schema_version` is newer than the binary schema, Ralph refuses startup with an actionable message:
+- If `meta.schema_version` is newer than the writable window, daemon startup refuses writable initialization with an actionable message:
   - upgrade Ralph to a compatible/newer binary, or
   - perform safe reset by deleting `~/.ralph/state.sqlite` (local durable state loss).
 
 ## Degraded control-plane behavior
 
 - Daemon startup behavior remains fail-closed for forward-incompatible schemas (no downgrades).
-- `ralphctl` lifecycle operations (`status`, `drain`, `restart`, `stop`) are designed to remain usable even when durable state is unavailable or forward-incompatible.
+- `ralphctl` lifecycle operations (`status`, `drain`, `restart`, `stop`) are designed to remain usable even when durable state is unavailable, forward-incompatible, or readable-only.
 - In degraded mode, `ralphctl status` returns minimal control-plane visibility (daemon/control/queue shape) and surfaces explicit durable-state diagnostics.
 - Recovery guidance order remains: upgrade to a compatible/newer Ralph binary first; use safe reset (`~/.ralph/state.sqlite`) only as a last resort when local durable state loss is acceptable.
 

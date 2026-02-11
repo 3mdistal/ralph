@@ -15,6 +15,7 @@ import {
   ensureRalphRunGateRows,
   getIdempotencyPayload,
   getLoopTriageAttempt,
+  getDurableStateSchemaWindow,
   getLatestRunGateStateForIssue,
   getLatestRunGateStateForPr,
   getRalphRunGateState,
@@ -116,7 +117,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     }
 
     closeStateDbForTests();
-    expect(() => initStateDb()).toThrow(/supported range=1\.\.\d+/);
+    expect(() => initStateDb()).toThrow(/writable range=1\.\.\d+/);
     expect(() => initStateDb()).toThrow(/delete ~\/\.ralph\/state\.sqlite/);
   });
 
@@ -135,23 +136,54 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(probe.ok).toBeFalse();
     if (!probe.ok) {
       expect(probe.code).toBe("forward_incompatible");
+      expect(probe.verdict).toBe("unreadable_forward_incompatible");
+      expect(probe.canReadState).toBeFalse();
+      expect(probe.canWriteState).toBeFalse();
+      expect(probe.requiresMigration).toBeTrue();
       expect(probe.schemaVersion).toBe(999);
-      expect(probe.supportedRange).toMatch(/^1\.\.\d+$/);
+      expect(probe.supportedRange).toBe(`1..${getDurableStateSchemaWindow().maxReadableSchema}`);
+      expect(probe.writableRange).toBe(`1..${getDurableStateSchemaWindow().maxWritableSchema}`);
+    }
+  });
+
+  test("probeDurableState returns readable readonly for forward-newer within readable window", () => {
+    const window = getDurableStateSchemaWindow();
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec(`INSERT INTO meta(key, value) VALUES ('schema_version', '${window.maxWritableSchema + 1}')`);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    const probe = probeDurableState();
+    expect(probe.ok).toBeTrue();
+    if (probe.ok) {
+      expect(probe.verdict).toBe("readable_readonly_forward_newer");
+      expect(probe.canReadState).toBeTrue();
+      expect(probe.canWriteState).toBeFalse();
+      expect(probe.requiresMigration).toBeTrue();
+      expect(probe.schemaVersion).toBe(window.maxWritableSchema + 1);
+      expect(probe.maxReadableSchema).toBe(window.maxReadableSchema);
+      expect(probe.maxWritableSchema).toBe(window.maxWritableSchema);
     }
   });
 
   test("classifyDurableStateInitError maps known failure classes", () => {
     const forward = classifyDurableStateInitError(
-      new Error("Unsupported state.sqlite schema_version=20; supported range=1..19.")
+      new Error("Unsupported state.sqlite schema_version=20; supported range=1..20 writable range=1..19.")
     );
     expect(forward.code).toBe("forward_incompatible");
-    expect(forward.schemaVersion).toBe(20);
-    expect(forward.supportedRange).toBe("1..19");
+    expect(forward.supportedRange).toBe(`1..${getDurableStateSchemaWindow().maxReadableSchema}`);
+    expect(forward.writableRange).toBe(`1..${getDurableStateSchemaWindow().maxWritableSchema}`);
 
     const invariant = classifyDurableStateInitError(
       new Error("state.sqlite schema invariant failed: table=x has incompatible object type=view")
     );
     expect(invariant.code).toBe("invariant_failure");
+    expect(invariant.verdict).toBe("unreadable_invariant_failure");
 
     const locked = classifyDurableStateInitError(new Error("state.sqlite migration lock timeout after 3000ms."));
     expect(locked.code).toBe("lock_timeout");
