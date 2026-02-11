@@ -1,9 +1,9 @@
 import type { RalphRunOutcome } from "../state";
 
-export const PR_EVIDENCE_CAUSE_CODES = ["POLICY_DENIED", "LEASE_STALE", "NO_WORKTREE_BRANCH", "UNKNOWN"] as const;
+const PR_EVIDENCE_CAUSE_CODES = ["POLICY_DENIED", "LEASE_STALE", "NO_WORKTREE_BRANCH", "UNKNOWN"] as const;
 export type PrEvidenceCauseCode = (typeof PR_EVIDENCE_CAUSE_CODES)[number];
 
-export const NO_PR_TERMINAL_REASONS = ["PARENT_VERIFICATION_NO_PR", "ISSUE_CLOSED_UPSTREAM"] as const;
+const NO_PR_TERMINAL_REASONS = ["PARENT_VERIFICATION_NO_PR", "ISSUE_CLOSED_UPSTREAM"] as const;
 export type NoPrTerminalReason = (typeof NO_PR_TERMINAL_REASONS)[number];
 
 export function isNoPrTerminalReason(value: string | null | undefined): value is NoPrTerminalReason {
