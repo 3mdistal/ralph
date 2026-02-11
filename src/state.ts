@@ -98,6 +98,8 @@ export type RalphRunDetails = {
   escalationType?: string;
   prUrl?: string;
   completionKind?: "pr" | "verified";
+  noPrTerminalReason?: string;
+  prEvidenceCauseCode?: string;
   watchdogTimeout?: boolean;
 };
 
@@ -215,12 +217,16 @@ function sanitizeRalphRunDetails(details?: RalphRunDetails | null): RalphRunDeta
   const escalationType = sanitizeRunDetailString(details.escalationType, 120);
   const prUrl = sanitizeRunDetailString(details.prUrl, 500);
   const completionKind = details.completionKind === "verified" ? "verified" : details.completionKind === "pr" ? "pr" : undefined;
+  const noPrTerminalReason = sanitizeRunDetailString(details.noPrTerminalReason, 120);
+  const prEvidenceCauseCode = sanitizeRunDetailString(details.prEvidenceCauseCode, 64);
 
   if (reasonCode) sanitized.reasonCode = reasonCode;
   if (errorCode) sanitized.errorCode = errorCode;
   if (escalationType) sanitized.escalationType = escalationType;
   if (prUrl) sanitized.prUrl = prUrl;
   if (completionKind) sanitized.completionKind = completionKind;
+  if (noPrTerminalReason) sanitized.noPrTerminalReason = noPrTerminalReason;
+  if (prEvidenceCauseCode) sanitized.prEvidenceCauseCode = prEvidenceCauseCode;
   if (details.watchdogTimeout) sanitized.watchdogTimeout = true;
 
   return Object.keys(sanitized).length ? sanitized : null;

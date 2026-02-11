@@ -49,6 +49,11 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import {
+  type NoPrTerminalReason,
+  type PrEvidenceCauseCode,
+  formatPrEvidenceCauseCodeLine,
+} from "../gates/pr-evidence-gate";
 import { prepareReviewDiffArtifacts, recordReviewGateFailure, recordReviewGateSkipped, runReviewGate } from "../gates/review";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
@@ -441,6 +446,8 @@ export interface AgentRun {
   outcome: "success" | "throttled" | "escalated" | "failed";
   pr?: string;
   completionKind?: "pr" | "verified";
+  noPrTerminalReason?: NoPrTerminalReason;
+  prEvidenceCauseCode?: PrEvidenceCauseCode;
   sessionId?: string;
   escalationReason?: string;
   surveyResults?: string;
@@ -456,6 +463,14 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 
   if (result.completionKind) {
     details.completionKind = result.completionKind;
+  }
+
+  if (result.noPrTerminalReason) {
+    details.noPrTerminalReason = result.noPrTerminalReason;
+  }
+
+  if (result.prEvidenceCauseCode) {
+    details.prEvidenceCauseCode = result.prEvidenceCauseCode;
   }
 
   if (result.outcome === "escalated") {
@@ -1663,6 +1678,8 @@ export class RepoWorker {
       taskName: task.name,
       repo: this.repo,
       outcome: "success",
+      pr: prUrl,
+      completionKind: "pr",
     };
   }
 
@@ -1869,7 +1886,7 @@ export class RepoWorker {
       continueAttempts: params.continueAttempts,
       evidence: params.evidence,
     });
-    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+    const planOutput = [derived.details, params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
 
     this.recordMissingPrEvidence({
       task: params.task,
@@ -1880,13 +1897,14 @@ export class RepoWorker {
       diagnostics: planOutput,
     });
 
-    return await this.escalateNoPrAfterRetries({
+    const run = await this.escalateNoPrAfterRetries({
       task: params.task,
       reason: derived.reason,
       details: derived.details,
       planOutput,
       sessionId: params.sessionId,
     });
+    return { ...run, prEvidenceCauseCode: derived.causeCode };
   }
 
   private async escalateMissingPrWithPolicyReason(params: {
@@ -2383,7 +2401,17 @@ export class RepoWorker {
       taskName: params.task.name,
       repo: this.repo,
       outcome: "success",
+      pr: params.prUrl,
+      completionKind: "pr",
     };
+  }
+
+  private classifyPrEvidenceCauseFromText(text: string | null | undefined): PrEvidenceCauseCode {
+    const normalized = String(text ?? "").toLowerCase();
+    if (normalized.includes("permission") || normalized.includes("denied") || normalized.includes("forbidden")) {
+      return "POLICY_DENIED";
+    }
+    return "UNKNOWN";
   }
 
   private async tryEnsurePrFromWorktree(params: {
@@ -2392,7 +2420,7 @@ export class RepoWorker {
     issueTitle: string;
     botBranch: string;
     started: Date;
-  }): Promise<{ prUrl: string | null; diagnostics: string; terminalRun?: AgentRun }> {
+  }): Promise<{ prUrl: string | null; diagnostics: string; causeCode?: PrEvidenceCauseCode; terminalRun?: AgentRun }> {
     const { task, issueNumber, issueTitle, botBranch } = params;
 
     const diagnostics: string[] = [
@@ -2417,7 +2445,8 @@ export class RepoWorker {
 
     if (!issueNumber) {
       diagnostics.push("- No issue number detected; skipping auto PR recovery");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("NO_WORKTREE_BRANCH"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
     }
 
     const existingPr = await this.getIssuePrResolution(issueNumber);
@@ -2436,7 +2465,8 @@ export class RepoWorker {
     if (!candidate) {
       diagnostics.push(`- No worktree matched issue ${issueNumber}`);
       diagnostics.push("- Manual: run `git worktree list` in the repo root to locate the task worktree");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("NO_WORKTREE_BRANCH"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
     }
 
     const branch = stripHeadsRef(candidate.branch);
@@ -2445,7 +2475,8 @@ export class RepoWorker {
 
     if (!branch || candidate.detached) {
       diagnostics.push("- Cannot auto-create PR: detached HEAD or unknown branch");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("NO_WORKTREE_BRANCH"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
     }
 
     try {
@@ -2475,7 +2506,8 @@ export class RepoWorker {
     const runId = this.activeRunId;
     if (!runId) {
       diagnostics.push("- Missing runId; refusing PR creation because deterministic gates cannot be persisted");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("LEASE_STALE"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "LEASE_STALE" };
     }
 
     const preflightConfig = getRepoPreflightCommands(this.repo);
@@ -2496,7 +2528,8 @@ export class RepoWorker {
     if (preflightResult.status === "fail") {
       diagnostics.push("- Preflight failed; refusing to create PR");
       diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("UNKNOWN"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "UNKNOWN" };
     }
 
     if (preflightResult.status === "skipped") {
@@ -2516,16 +2549,19 @@ export class RepoWorker {
     diagnostics.push(...readiness.diagnostics);
     if (!readiness.ok) {
       diagnostics.push("- PR readiness failed; refusing to create PR");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("POLICY_DENIED"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "POLICY_DENIED" };
     }
 
     try {
       await $`git push -u origin HEAD`.cwd(candidate.worktreePath).quiet();
       diagnostics.push("- Pushed branch to origin");
     } catch (e: any) {
+      const causeCode = this.classifyPrEvidenceCauseFromText(e?.message ?? String(e));
       diagnostics.push(`- git push failed: ${e?.message ?? String(e)}`);
       diagnostics.push(`- Manual: cd ${candidate.worktreePath} && git push -u origin ${branch}`);
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine(causeCode));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode };
     }
 
     const title = issueTitle?.trim() ? issueTitle.trim() : `Fixes #${issueNumber}`;
@@ -2574,6 +2610,7 @@ export class RepoWorker {
 
     if (!lease.claimed) {
       diagnostics.push(`- PR-create lease already held; skipping auto-create (lease=${lease.key})`);
+      diagnostics.push(formatPrEvidenceCauseCodeLine("LEASE_STALE"));
       const waited = await this.waitForExistingPrDuringPrCreateConflict({
         issueNumber,
         maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
@@ -2592,7 +2629,8 @@ export class RepoWorker {
       });
       diagnostics.push(`- ${selfHealed.note}`);
       if (!selfHealed.claimed) {
-        return { prUrl: null, diagnostics: diagnostics.join("\n") };
+        diagnostics.push(formatPrEvidenceCauseCodeLine("LEASE_STALE"));
+        return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "LEASE_STALE" };
       }
     }
 
@@ -2684,7 +2722,8 @@ export class RepoWorker {
     }
 
     diagnostics.push("- No PR URL recovered");
-    return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    diagnostics.push(formatPrEvidenceCauseCodeLine("UNKNOWN"));
+    return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "UNKNOWN" };
   }
 
   private async getPullRequestChecks(
@@ -4238,6 +4277,8 @@ export class RepoWorker {
       repo: this.repo,
       outcome: "success",
       sessionId: mergeGate.sessionId,
+      pr: mergeGate.prUrl,
+      completionKind: "pr",
       surveyResults: surveyResult.output,
     };
   }
@@ -4384,6 +4425,8 @@ export class RepoWorker {
       repo: this.repo,
       outcome: "success",
       sessionId: mergeGate.sessionId,
+      pr: mergeGate.prUrl,
+      completionKind: "pr",
       surveyResults: surveyResult.output,
     };
   }
@@ -4594,6 +4637,7 @@ export class RepoWorker {
     task: AgentTask;
     prUrl?: string | null;
     completionKind?: "pr" | "verified";
+    noPrTerminalReason?: NoPrTerminalReason;
     sessionId: string;
     startTime: Date;
     surveyResults?: string;
@@ -4610,6 +4654,7 @@ export class RepoWorker {
       task,
       prUrl,
       completionKind,
+      noPrTerminalReason,
       sessionId,
       startTime,
       surveyResults,
@@ -4623,7 +4668,16 @@ export class RepoWorker {
       logMessage,
     } = params;
     const resolvedPrUrl = prUrl ?? undefined;
-    const resolvedCompletionKind = completionKind ?? (resolvedPrUrl ? "pr" : "verified");
+    const resolvedCompletionKind = completionKind ?? (resolvedPrUrl ? "pr" : undefined);
+    if (!resolvedCompletionKind) {
+      throw new Error("finalizeTaskSuccess requires explicit completionKind when prUrl is absent");
+    }
+    if (resolvedCompletionKind === "pr" && !resolvedPrUrl) {
+      throw new Error("finalizeTaskSuccess completionKind=pr requires prUrl");
+    }
+    if (resolvedCompletionKind === "verified" && !noPrTerminalReason) {
+      throw new Error("finalizeTaskSuccess completionKind=verified requires explicit noPrTerminalReason");
+    }
     const resolvedWorktreePath = worktreePath ?? task["worktree-path"]?.trim();
     const resolvedWorkerId = workerId ?? task["worker-id"]?.trim();
     const resolvedRepoSlot = repoSlot ?? task["repo-slot"]?.trim();
@@ -4679,6 +4733,7 @@ export class RepoWorker {
       sessionId,
       pr: resolvedPrUrl,
       completionKind: resolvedCompletionKind,
+      noPrTerminalReason,
     };
   }
 
@@ -4923,6 +4978,8 @@ export class RepoWorker {
       taskName: task.name,
       repo: this.repo,
       outcome: "success",
+      completionKind: "verified",
+      noPrTerminalReason: "ISSUE_CLOSED_UPSTREAM",
     };
   }
 
@@ -5016,6 +5073,7 @@ export class RepoWorker {
       task: params.task,
       prUrl: null,
       completionKind: "verified",
+      noPrTerminalReason: "PARENT_VERIFICATION_NO_PR",
       sessionId: params.sessionId || params.task["session-id"]?.trim() || "parent-verify-no-pr",
       startTime: params.startTime,
       cacheKey: `parent-verify-${params.cacheKey}`,

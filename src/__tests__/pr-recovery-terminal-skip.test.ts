@@ -76,6 +76,8 @@ describe("PR recovery terminal skip", () => {
 
     expect(result.prUrl).toBeNull();
     expect(result.terminalRun?.outcome).toBe("success");
+    expect(result.terminalRun?.pr).toBe("https://github.com/3mdistal/ralph/pull/631");
+    expect(result.terminalRun?.completionKind).toBe("pr");
 
     expect(updateTaskStatusMock).toHaveBeenCalled();
     const calls = updateTaskStatusMock.mock.calls;
@@ -117,5 +119,34 @@ describe("PR recovery terminal skip", () => {
 
     expect(result.terminalRun).toBeUndefined();
     expect(result.prUrl).toBe("https://github.com/3mdistal/ralph/pull/123");
+  });
+
+  test("closed issue terminal skip carries explicit no-PR terminal reason", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { queue: queueAdapter });
+
+    (worker as any).getIssueMetadata = async () => ({
+      labels: [],
+      title: "Closed",
+      state: "CLOSED",
+      url: "https://github.com/3mdistal/ralph/issues/319",
+      closedAt: "2026-02-10T00:00:00Z",
+      stateReason: "completed",
+    });
+
+    (worker as any).createAgentRun = async () => {};
+
+    const task = createMockTask({ status: "in-progress", "session-id": "ses_closed" });
+
+    const result = await (worker as any).tryEnsurePrFromWorktree({
+      task,
+      issueNumber: "319",
+      issueTitle: "Closed Task",
+      botBranch: "bot/integration",
+      started: new Date("2026-02-09T00:00:00.000Z"),
+    });
+
+    expect(result.terminalRun?.outcome).toBe("success");
+    expect(result.terminalRun?.completionKind).toBe("verified");
+    expect(result.terminalRun?.noPrTerminalReason).toBe("ISSUE_CLOSED_UPSTREAM");
   });
 });
