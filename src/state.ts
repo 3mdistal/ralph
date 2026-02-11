@@ -7,21 +7,51 @@ import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./pa
 import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
+import {
+  evaluateDurableStateCapability,
+  formatReadableSchemaRange,
+  formatWritableSchemaRange,
+  normalizeSchemaWindow,
+  type DurableStateCapability,
+  type DurableStateCapabilityVerdict,
+  type DurableStateSchemaWindow,
+} from "./durable-state-capability";
 
 const SCHEMA_VERSION = 20;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
+const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
+
+export const DURABLE_STATE_SCHEMA_WINDOW: DurableStateSchemaWindow = normalizeSchemaWindow({
+  minReadableSchema: MIN_SUPPORTED_SCHEMA_VERSION,
+  maxReadableSchema: MAX_READABLE_SCHEMA_VERSION,
+  maxWritableSchema: SCHEMA_VERSION,
+});
 
 export type DurableStateIssueCode = "forward_incompatible" | "lock_timeout" | "invariant_failure" | "unknown";
 
 export type DurableStateStatus =
-  | { ok: true }
+  | {
+      ok: true;
+      verdict: "readable_writable" | "readable_readonly_forward_newer";
+      schemaVersion?: number;
+      minReadableSchema: number;
+      maxReadableSchema: number;
+      maxWritableSchema: number;
+      supportedRange: string;
+      writableRange: string;
+    }
   | {
       ok: false;
       code: DurableStateIssueCode;
       message: string;
+      verdict?: DurableStateCapabilityVerdict;
       schemaVersion?: number;
       supportedRange?: string;
+      writableRange?: string;
+      minReadableSchema?: number;
+      maxReadableSchema?: number;
+      maxWritableSchema?: number;
     };
 
 function parsePositiveIntEnv(name: string): number | null {
@@ -418,39 +448,91 @@ function readSchemaVersion(database: Database): number | null {
   return normalized;
 }
 
-function formatSchemaCompatibilityError(version: number): string {
+export function getDurableStateSchemaWindow(): DurableStateSchemaWindow {
+  return DURABLE_STATE_SCHEMA_WINDOW;
+}
+
+function getSchemaWindowDetails() {
+  return {
+    minReadableSchema: DURABLE_STATE_SCHEMA_WINDOW.minReadableSchema,
+    maxReadableSchema: DURABLE_STATE_SCHEMA_WINDOW.maxReadableSchema,
+    maxWritableSchema: DURABLE_STATE_SCHEMA_WINDOW.maxWritableSchema,
+    supportedRange: formatReadableSchemaRange(DURABLE_STATE_SCHEMA_WINDOW),
+    writableRange: formatWritableSchemaRange(DURABLE_STATE_SCHEMA_WINDOW),
+  };
+}
+
+function buildReadableDurableStateStatus(
+  verdict: "readable_writable" | "readable_readonly_forward_newer",
+  schemaVersion?: number
+): Extract<DurableStateStatus, { ok: true }> {
+  return {
+    ok: true,
+    verdict,
+    schemaVersion,
+    ...getSchemaWindowDetails(),
+  };
+}
+
+function formatSchemaCompatibilityError(capability: DurableStateCapability): string {
+  if (capability.verdict === "readable_readonly_forward_newer") {
+    return (
+      `state.sqlite schema_version=${capability.schemaVersion} is readable but not writable by this Ralph binary; ` +
+      `readable range=${formatReadableSchemaRange(capability)} writable range=${formatWritableSchemaRange(capability)}. ` +
+      "Upgrade Ralph to a compatible/newer binary before restarting daemon write paths. " +
+      "Status-style read-only diagnostics remain available."
+    );
+  }
   return (
-    `Unsupported state.sqlite schema_version=${version}; ` +
-    `supported range=${MIN_SUPPORTED_SCHEMA_VERSION}..${SCHEMA_VERSION}. ` +
+    `Unsupported state.sqlite schema_version=${capability.schemaVersion}; ` +
+    `supported range=${formatReadableSchemaRange(capability)} writable range=${formatWritableSchemaRange(capability)}. ` +
     "Upgrade Ralph to a compatible/newer binary before restarting. " +
     "If recovery is required and local durable state can be discarded, delete ~/.ralph/state.sqlite to rebuild from scratch."
   );
 }
 
-function parseSchemaCompatibilityFromMessage(message: string): {
-  schemaVersion?: number;
-  supportedRange?: string;
-} {
-  const match = message.match(/schema_version=(\d+);\s*supported range=(\d+\.\.\d+)/i);
-  if (!match) return {};
-  const schemaVersion = Number.parseInt(match[1], 10);
+class DurableStateInitError extends Error {
+  readonly status: Extract<DurableStateStatus, { ok: false }>;
+
+  constructor(status: Extract<DurableStateStatus, { ok: false }>) {
+    super(status.message);
+    this.name = "DurableStateInitError";
+    this.status = status;
+  }
+}
+
+function buildForwardCompatibilityFailure(capability: DurableStateCapability): Extract<DurableStateStatus, { ok: false }> {
+  const details = getSchemaWindowDetails();
   return {
-    schemaVersion: Number.isFinite(schemaVersion) ? schemaVersion : undefined,
-    supportedRange: match[2],
+    ok: false,
+    code: "forward_incompatible",
+    message: formatSchemaCompatibilityError(capability),
+    verdict: capability.verdict,
+    schemaVersion: capability.schemaVersion,
+    ...details,
   };
 }
 
+function throwForwardCompatibilityFailure(capability: DurableStateCapability): never {
+  throw new DurableStateInitError(buildForwardCompatibilityFailure(capability));
+}
+
 export function classifyDurableStateInitError(error: unknown): Extract<DurableStateStatus, { ok: false }> {
+  if (error instanceof DurableStateInitError) {
+    return error.status;
+  }
   const message = error instanceof Error ? error.message : String(error);
   const normalized = message.toLowerCase();
-  if (normalized.includes("unsupported state.sqlite schema_version=")) {
-    const details = parseSchemaCompatibilityFromMessage(message);
+  if (
+    normalized.includes("unsupported state.sqlite schema_version=") ||
+    normalized.includes("state.sqlite schema_version=")
+  ) {
+    const details = getSchemaWindowDetails();
     return {
       ok: false,
       code: "forward_incompatible",
       message,
-      schemaVersion: details.schemaVersion,
-      supportedRange: details.supportedRange,
+      ...details,
     };
   }
   if (normalized.includes("schema invariant failed")) {
@@ -458,6 +540,8 @@ export function classifyDurableStateInitError(error: unknown): Extract<DurableSt
       ok: false,
       code: "invariant_failure",
       message,
+      verdict: "unreadable_invariant_failure",
+      ...getSchemaWindowDetails(),
     };
   }
   if (normalized.includes("migration lock timeout") || normalized.includes("database is locked")) {
@@ -476,27 +560,30 @@ export function classifyDurableStateInitError(error: unknown): Extract<DurableSt
 
 export function probeDurableState(): DurableStateStatus {
   const stateDbPath = getRalphStateDbPath();
-  if (!existsSync(stateDbPath)) return { ok: true };
+  if (!existsSync(stateDbPath)) return buildReadableDurableStateStatus("readable_writable");
 
   let probeDb: Database | null = null;
   try {
     probeDb = new Database(stateDbPath, { readonly: true });
     const hasMeta = tableExists(probeDb, "meta");
-    if (!hasMeta) return { ok: true };
+    if (!hasMeta) return buildReadableDurableStateStatus("readable_writable");
 
     const schemaVersion = readSchemaVersion(probeDb);
-    if (schemaVersion && schemaVersion > SCHEMA_VERSION) {
-      return {
-        ok: false,
-        code: "forward_incompatible",
-        message: formatSchemaCompatibilityError(schemaVersion),
+    if (schemaVersion) {
+      const capability = evaluateDurableStateCapability({
         schemaVersion,
-        supportedRange: `${MIN_SUPPORTED_SCHEMA_VERSION}..${SCHEMA_VERSION}`,
-      };
+        window: DURABLE_STATE_SCHEMA_WINDOW,
+      });
+      if (!capability.readable) {
+        return buildForwardCompatibilityFailure(capability);
+      }
+      if (capability.verdict === "readable_readonly_forward_newer") {
+        return buildReadableDurableStateStatus(capability.verdict, capability.schemaVersion);
+      }
     }
 
     ensureSchemaInvariantObjectTypes(probeDb);
-    return { ok: true };
+    return buildReadableDurableStateStatus("readable_writable", schemaVersion ?? undefined);
   } catch (error) {
     return classifyDurableStateInitError(error);
   } finally {
@@ -590,8 +677,14 @@ function ensureSchema(database: Database, stateDbPath: string): void {
   );
 
   const existingVersion = readSchemaVersion(database);
-  if (existingVersion && existingVersion > SCHEMA_VERSION) {
-    throw new Error(formatSchemaCompatibilityError(existingVersion));
+  if (existingVersion) {
+    const capability = evaluateDurableStateCapability({
+      schemaVersion: existingVersion,
+      window: DURABLE_STATE_SCHEMA_WINDOW,
+    });
+    if (!capability.writable) {
+      throwForwardCompatibilityFailure(capability);
+    }
   }
 
   if (existingVersion && existingVersion < SCHEMA_VERSION) {
@@ -599,8 +692,12 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     runMigrationsWithLock(database, () => {
       const lockedVersion = readSchemaVersion(database);
       if (!lockedVersion || lockedVersion >= SCHEMA_VERSION) return;
-      if (lockedVersion > SCHEMA_VERSION) {
-        throw new Error(formatSchemaCompatibilityError(lockedVersion));
+      const lockedCapability = evaluateDurableStateCapability({
+        schemaVersion: lockedVersion,
+        window: DURABLE_STATE_SCHEMA_WINDOW,
+      });
+      if (!lockedCapability.writable) {
+        throwForwardCompatibilityFailure(lockedCapability);
       }
 
       runIntegrityCheck(database);
