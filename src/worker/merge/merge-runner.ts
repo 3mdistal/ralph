@@ -105,7 +105,7 @@ export async function mergePrWithRequiredChecks(params: {
   recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary) => void;
   buildIssueContextForAgent: (params: { repo: string; issueNumber: string }) => Promise<string>;
   runReviewAgent: (params: {
-    agent: "product" | "devex" | "general" | "ralph-plan";
+    agent: "product" | "devex" | "product-review" | "devex-review" | "general" | "ralph-plan";
     prompt: string;
     cacheKey: string;
     stage: string;
@@ -390,7 +390,7 @@ export async function mergePrWithRequiredChecks(params: {
 
     const runReview = async (
       gate: ReviewGateName,
-      agent: "product" | "devex",
+      agent: "product-review" | "devex-review",
       stage: string
     ): Promise<ReviewGateResult> => {
       return await runReviewGate({
@@ -409,19 +409,18 @@ export async function mergePrWithRequiredChecks(params: {
             stage,
             sessionId,
           }),
-        runRepairAgent: (prompt, continueSessionId) =>
+        runRepairAgent: (prompt) =>
           params.runReviewAgent({
             agent,
             prompt,
             cacheKey: `review-${params.cacheKey}-${agent}-repair`,
             stage: `${stage} marker repair`,
             sessionId,
-            continueSessionId,
           }),
       });
     };
 
-      const productReview = await runReview("product_review", "product", "product review");
+      const productReview = await runReview("product_review", "product-review", "product review");
       sessionId = productReview.sessionId || sessionId;
       if (productReview.status !== "pass") {
         const reason = `Review gate failed: product review (${productReview.reason})`;
@@ -442,7 +441,7 @@ export async function mergePrWithRequiredChecks(params: {
         };
       }
 
-      const devexReview = await runReview("devex_review", "devex", "devex review");
+      const devexReview = await runReview("devex_review", "devex-review", "devex review");
       sessionId = devexReview.sessionId || sessionId;
       if (devexReview.status !== "pass") {
         const reason = `Review gate failed: devex review (${devexReview.reason})`;
