@@ -32,6 +32,12 @@ describe("claims/canonical.jsonl statuses", () => {
       "retry-budgets.per-lane-configurable",
       "ci-remediation.on-required-checks-failure",
       "claims.canonical.status-in-sync",
+      "daemon.control-root.canonical",
+      "daemon.discovery.profile-agnostic",
+      "daemon.pid-liveness.required",
+      "profiles.selection-not-identity",
+      "daemon.singleton.locked",
+      "doctor.discovery-repair",
     ];
 
     for (const id of requiredImplemented) {
