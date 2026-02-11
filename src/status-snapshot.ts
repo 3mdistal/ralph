@@ -66,6 +66,19 @@ export type StatusBlockedTask = StatusTaskBase & {
   blockedDetailsSnippet: string | null;
 };
 
+export type StatusOrphanTask = {
+  repo: string;
+  issue: string;
+  taskPath: string;
+  reason: "closed" | "no-ralph-labels";
+  issueState: string | null;
+  labels: string[];
+  heartbeatAt: string | null;
+  daemonId: string | null;
+  repoSlot: string | null;
+  worktreePath: string | null;
+};
+
 export type StatusDaemonSnapshot = {
   daemonId: string | null;
   pid: number | null;
@@ -140,8 +153,19 @@ export type StatusSnapshot = {
   queued: StatusTaskBase[];
   throttled: StatusThrottledTask[];
   blocked: StatusBlockedTask[];
+  orphans?: StatusOrphanTask[];
   drain: StatusDrainSnapshot;
 };
+
+const normalizeOrphanTask = (task: StatusOrphanTask): StatusOrphanTask => ({
+  ...task,
+  issueState: normalizeOptionalString(task.issueState),
+  heartbeatAt: normalizeOptionalString(task.heartbeatAt),
+  daemonId: normalizeOptionalString(task.daemonId),
+  repoSlot: normalizeOptionalString(task.repoSlot),
+  worktreePath: normalizeOptionalString(task.worktreePath),
+  labels: Array.isArray(task.labels) ? task.labels.map((label) => String(label ?? "").trim()).filter(Boolean) : [],
+});
 
 const normalizeOptionalString = (value?: string | null): string | null => {
   if (typeof value !== "string") return null;
@@ -257,6 +281,7 @@ export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
     durableState,
     daemonLiveness: normalizeDaemonLiveness(input.daemonLiveness),
     blocked: input.blocked.map(normalizeBlockedTask),
+    orphans: input.orphans?.map(normalizeOrphanTask),
     inProgress: input.inProgress.map(normalizeInProgressTask),
     starting: input.starting.map(normalizeTaskBase),
     queued: input.queued.map(normalizeTaskBase),
