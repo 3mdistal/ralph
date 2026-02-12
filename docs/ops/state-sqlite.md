@@ -82,12 +82,34 @@ Operational contract:
 - Readonly durable-state probe timeout override (milliseconds):
   - `RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS=250`
 
-## Rollout runbook
+## Zero-loss upgrade playbook (command-by-command)
 
-1. Drain/stop daemon(s) touching the target `state.sqlite`.
-2. Upgrade Ralph binary.
-3. Restart Ralph and allow startup preflight + migration to complete.
-4. Resume normal processing.
+Assumptions:
+
+- Ralph state path is `~/.ralph/state.sqlite`.
+- Control-plane commands are run from the target host/profile.
+
+1. Capture pre-upgrade control-plane state.
+   - `ralphctl status --json > /tmp/ralph-status.before.json`
+2. Request a graceful drain intent before touching binaries.
+   - `ralphctl drain --timeout 10m`
+3. Wait for queue quiescence (or operator timeout policy), while preserving lifecycle visibility.
+   - `ralphctl status --json`
+4. Stop/restart into the new binary.
+   - `ralphctl restart --grace 10m`
+   - or `ralphctl upgrade --grace 10m --upgrade-cmd "<your package upgrade command>"`
+5. Verify post-upgrade durable-state capability and migration verdict.
+   - `ralphctl status --json > /tmp/ralph-status.after.json`
+   - Expect `durableState.ok=true` and `durableState.canWriteState=true` for normal operation.
+6. Resume normal scheduling after verification.
+   - `ralphctl resume`
+
+Zero-loss invariants:
+
+- Drain intent is persisted in control state even if no live daemon PID is found.
+- Mixed-version readable-only windows remain observable in `status` output.
+- Migration lock prevents concurrent schema transitions.
+- Recovery path order is deterministic: upgrade-first, then restore-from-backup if still incompatible.
 
 Schema drift recovery:
 
@@ -99,6 +121,22 @@ Schema drift recovery:
 Rollback caveat:
 
 - After schema migration, older Ralph binaries may refuse startup (no downgrades). To recover to an older binary, restore a compatible DB backup.
+
+## Mixed-version validation matrix
+
+CI coverage includes representative mixed-version lifecycle scenarios:
+
+- old daemon state -> newer ctl (`status` auto-migrates prior schema and remains writable)
+- newer daemon state -> older ctl (`status` remains readable-only when schema is forward-newer but within readable window)
+- interrupted migration resume (`status` reports lock-timeout degraded capability during contention, then resumes/migrates once lock clears)
+- pending drain + migration (`drain` intent remains visible while `status` migrates old schema)
+
+Relevant tests:
+
+- `src/__tests__/ralphctl-status-cli.test.ts`
+- `src/__tests__/state-sqlite.test.ts`
+- `src/__tests__/status-command-degraded.test.ts`
+- `src/__tests__/status-cli-degraded.test.ts`
 
 ## Claims
 
