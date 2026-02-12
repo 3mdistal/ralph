@@ -1,27 +1,64 @@
-import { existsSync, mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, statSync } from "fs";
 import { dirname, join } from "path";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
 import { redactSensitiveText } from "./redaction";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
+import {
+  evaluateDurableStateCapability,
+  formatReadableSchemaRange,
+  formatWritableSchemaRange,
+  normalizeSchemaWindow,
+  type DurableStateCapability,
+  type DurableStateCapabilityVerdict,
+  type DurableStateSchemaWindow,
+} from "./durable-state-capability";
 
-const SCHEMA_VERSION = 19;
+const SCHEMA_VERSION = 20;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
+const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
+const DEFAULT_PROBE_BUSY_TIMEOUT_MS = 250;
+
+const DURABLE_STATE_SCHEMA_WINDOW: DurableStateSchemaWindow = normalizeSchemaWindow({
+  minReadableSchema: MIN_SUPPORTED_SCHEMA_VERSION,
+  maxReadableSchema: MAX_READABLE_SCHEMA_VERSION,
+  maxWritableSchema: SCHEMA_VERSION,
+});
 
 export type DurableStateIssueCode = "forward_incompatible" | "lock_timeout" | "invariant_failure" | "unknown";
 
 export type DurableStateStatus =
-  | { ok: true }
+  | {
+      ok: true;
+      verdict: "readable_writable" | "readable_readonly_forward_newer";
+      canReadState: true;
+      canWriteState: boolean;
+      requiresMigration: boolean;
+      schemaVersion?: number;
+      minReadableSchema: number;
+      maxReadableSchema: number;
+      maxWritableSchema: number;
+      supportedRange: string;
+      writableRange: string;
+    }
   | {
       ok: false;
       code: DurableStateIssueCode;
       message: string;
+      verdict?: DurableStateCapabilityVerdict;
+      canReadState?: boolean;
+      canWriteState?: boolean;
+      requiresMigration?: boolean;
       schemaVersion?: number;
       supportedRange?: string;
+      writableRange?: string;
+      minReadableSchema?: number;
+      maxReadableSchema?: number;
+      maxWritableSchema?: number;
     };
 
 function parsePositiveIntEnv(name: string): number | null {
@@ -34,14 +71,12 @@ function parsePositiveIntEnv(name: string): number | null {
   return normalized;
 }
 
-function isTruthyEnv(name: string): boolean {
-  const raw = process.env[name]?.trim().toLowerCase();
-  if (!raw) return false;
-  return raw === "1" || raw === "true" || raw === "yes" || raw === "on";
-}
-
 function quoteSqlLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+function sha256Hex(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 export type PrState = "open" | "merged";
@@ -62,6 +97,8 @@ export type RalphRunDetails = {
   escalationType?: string;
   prUrl?: string;
   completionKind?: "pr" | "verified";
+  noPrTerminalReason?: string;
+  prEvidenceCauseCode?: string;
   watchdogTimeout?: boolean;
 };
 
@@ -179,12 +216,16 @@ function sanitizeRalphRunDetails(details?: RalphRunDetails | null): RalphRunDeta
   const escalationType = sanitizeRunDetailString(details.escalationType, 120);
   const prUrl = sanitizeRunDetailString(details.prUrl, 500);
   const completionKind = details.completionKind === "verified" ? "verified" : details.completionKind === "pr" ? "pr" : undefined;
+  const noPrTerminalReason = sanitizeRunDetailString(details.noPrTerminalReason, 120);
+  const prEvidenceCauseCode = sanitizeRunDetailString(details.prEvidenceCauseCode, 64);
 
   if (reasonCode) sanitized.reasonCode = reasonCode;
   if (errorCode) sanitized.errorCode = errorCode;
   if (escalationType) sanitized.escalationType = escalationType;
   if (prUrl) sanitized.prUrl = prUrl;
   if (completionKind) sanitized.completionKind = completionKind;
+  if (noPrTerminalReason) sanitized.noPrTerminalReason = noPrTerminalReason;
+  if (prEvidenceCauseCode) sanitized.prEvidenceCauseCode = prEvidenceCauseCode;
   if (details.watchdogTimeout) sanitized.watchdogTimeout = true;
 
   return Object.keys(sanitized).length ? sanitized : null;
@@ -342,7 +383,7 @@ function formatSchemaInvariantError(message: string): Error {
   return new Error(
     `state.sqlite schema invariant failed: ${message}. ` +
       `Expected durable-state shape for schema_version=${SCHEMA_VERSION}. ` +
-      "If this persists after restarting the latest Ralph binary, restore from backup or reset ~/.ralph/state.sqlite."
+      "If this persists after restarting the latest Ralph binary, restore from backup and retry."
   );
 }
 
@@ -401,6 +442,19 @@ function applySchemaInvariants(database: Database): void {
   }
 }
 
+function requiresSchemaInvariantRepair(database: Database): boolean {
+  for (const invariant of SCHEMA_INVARIANTS) {
+    if (!tableExists(database, invariant.tableName)) continue;
+    if (invariant.kind === "column" && !columnExists(database, invariant.tableName, invariant.columnName)) {
+      return true;
+    }
+    if (invariant.kind === "index" && !indexExists(database, invariant.indexName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function readSchemaVersion(database: Database): number | null {
   const existing = database
     .query("SELECT value FROM meta WHERE key = 'schema_version'")
@@ -418,47 +472,111 @@ function readSchemaVersion(database: Database): number | null {
   return normalized;
 }
 
-function formatSchemaCompatibilityError(version: number): string {
-  return (
-    `Unsupported state.sqlite schema_version=${version}; ` +
-    `supported range=${MIN_SUPPORTED_SCHEMA_VERSION}..${SCHEMA_VERSION}. ` +
-    "Upgrade Ralph to a compatible/newer binary before restarting. " +
-    "If recovery is required and local durable state can be discarded, delete ~/.ralph/state.sqlite to rebuild from scratch."
-  );
+export function getDurableStateSchemaWindow(): DurableStateSchemaWindow {
+  return DURABLE_STATE_SCHEMA_WINDOW;
 }
 
-function parseSchemaCompatibilityFromMessage(message: string): {
-  schemaVersion?: number;
-  supportedRange?: string;
-} {
-  const match = message.match(/schema_version=(\d+);\s*supported range=(\d+\.\.\d+)/i);
-  if (!match) return {};
-  const schemaVersion = Number.parseInt(match[1], 10);
+function getSchemaWindowDetails() {
   return {
-    schemaVersion: Number.isFinite(schemaVersion) ? schemaVersion : undefined,
-    supportedRange: match[2],
+    minReadableSchema: DURABLE_STATE_SCHEMA_WINDOW.minReadableSchema,
+    maxReadableSchema: DURABLE_STATE_SCHEMA_WINDOW.maxReadableSchema,
+    maxWritableSchema: DURABLE_STATE_SCHEMA_WINDOW.maxWritableSchema,
+    supportedRange: formatReadableSchemaRange(DURABLE_STATE_SCHEMA_WINDOW),
+    writableRange: formatWritableSchemaRange(DURABLE_STATE_SCHEMA_WINDOW),
   };
 }
 
+function buildReadableDurableStateStatus(
+  verdict: "readable_writable" | "readable_readonly_forward_newer",
+  schemaVersion?: number
+): Extract<DurableStateStatus, { ok: true }> {
+  const writable = verdict === "readable_writable";
+  return {
+    ok: true,
+    verdict,
+    canReadState: true,
+    canWriteState: writable,
+    requiresMigration: !writable,
+    schemaVersion,
+    ...getSchemaWindowDetails(),
+  };
+}
+
+function formatSchemaCompatibilityError(capability: DurableStateCapability): string {
+  if (capability.verdict === "readable_readonly_forward_newer") {
+    return (
+      `state.sqlite schema_version=${capability.schemaVersion} is readable but not writable by this Ralph binary; ` +
+      `readable range=${formatReadableSchemaRange(capability)} writable range=${formatWritableSchemaRange(capability)}. ` +
+      "Upgrade Ralph to a compatible/newer binary before restarting daemon write paths. " +
+      "Status-style read-only diagnostics remain available."
+    );
+  }
+  return (
+    `Unsupported state.sqlite schema_version=${capability.schemaVersion}; ` +
+    `supported range=${formatReadableSchemaRange(capability)} writable range=${formatWritableSchemaRange(capability)}. ` +
+    "Upgrade Ralph to a compatible/newer binary before restarting. " +
+    "If you must run an older binary, restore a compatible state.sqlite backup first."
+  );
+}
+
+class DurableStateInitError extends Error {
+  readonly status: Extract<DurableStateStatus, { ok: false }>;
+
+  constructor(status: Extract<DurableStateStatus, { ok: false }>) {
+    super(status.message);
+    this.name = "DurableStateInitError";
+    this.status = status;
+  }
+}
+
+function buildForwardCompatibilityFailure(capability: DurableStateCapability): Extract<DurableStateStatus, { ok: false }> {
+  const details = getSchemaWindowDetails();
+  return {
+    ok: false,
+    code: "forward_incompatible",
+    message: formatSchemaCompatibilityError(capability),
+    verdict: capability.verdict,
+    canReadState: capability.canReadState,
+    canWriteState: capability.canWriteState,
+    requiresMigration: capability.requiresMigration,
+    schemaVersion: capability.schemaVersion,
+    ...details,
+  };
+}
+
+function throwForwardCompatibilityFailure(capability: DurableStateCapability): never {
+  throw new DurableStateInitError(buildForwardCompatibilityFailure(capability));
+}
+
 export function classifyDurableStateInitError(error: unknown): Extract<DurableStateStatus, { ok: false }> {
+  if (error instanceof DurableStateInitError) {
+    return error.status;
+  }
   const message = error instanceof Error ? error.message : String(error);
   const normalized = message.toLowerCase();
-  if (normalized.includes("unsupported state.sqlite schema_version=")) {
-    const details = parseSchemaCompatibilityFromMessage(message);
+  if (
+    normalized.includes("unsupported state.sqlite schema_version=") ||
+    normalized.includes("state.sqlite schema_version=")
+  ) {
+    const details = getSchemaWindowDetails();
     return {
       ok: false,
       code: "forward_incompatible",
       message,
-      schemaVersion: details.schemaVersion,
-      supportedRange: details.supportedRange,
+      ...details,
     };
   }
   if (normalized.includes("schema invariant failed")) {
-    return {
-      ok: false,
-      code: "invariant_failure",
-      message,
-    };
+      return {
+        ok: false,
+        code: "invariant_failure",
+        message,
+        verdict: "unreadable_invariant_failure",
+        canReadState: false,
+        canWriteState: false,
+        requiresMigration: false,
+        ...getSchemaWindowDetails(),
+      };
   }
   if (normalized.includes("migration lock timeout") || normalized.includes("database is locked")) {
     return {
@@ -474,29 +592,40 @@ export function classifyDurableStateInitError(error: unknown): Extract<DurableSt
   };
 }
 
+export function isDurableStateInitError(error: unknown): boolean {
+  const classified = classifyDurableStateInitError(error);
+  return classified.code !== "unknown";
+}
+
 export function probeDurableState(): DurableStateStatus {
   const stateDbPath = getRalphStateDbPath();
-  if (!existsSync(stateDbPath)) return { ok: true };
+  if (!existsSync(stateDbPath)) return buildReadableDurableStateStatus("readable_writable");
 
   let probeDb: Database | null = null;
   try {
+    const busyTimeoutMs =
+      parsePositiveIntEnv("RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS") ?? DEFAULT_PROBE_BUSY_TIMEOUT_MS;
     probeDb = new Database(stateDbPath, { readonly: true });
+    probeDb.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
     const hasMeta = tableExists(probeDb, "meta");
-    if (!hasMeta) return { ok: true };
+    if (!hasMeta) return buildReadableDurableStateStatus("readable_writable");
 
     const schemaVersion = readSchemaVersion(probeDb);
-    if (schemaVersion && schemaVersion > SCHEMA_VERSION) {
-      return {
-        ok: false,
-        code: "forward_incompatible",
-        message: formatSchemaCompatibilityError(schemaVersion),
+    if (schemaVersion) {
+      const capability = evaluateDurableStateCapability({
         schemaVersion,
-        supportedRange: `${MIN_SUPPORTED_SCHEMA_VERSION}..${SCHEMA_VERSION}`,
-      };
+        window: DURABLE_STATE_SCHEMA_WINDOW,
+      });
+      if (!capability.canReadState) {
+        return buildForwardCompatibilityFailure(capability);
+      }
+      if (capability.verdict === "readable_readonly_forward_newer") {
+        return buildReadableDurableStateStatus(capability.verdict, capability.schemaVersion);
+      }
     }
 
     ensureSchemaInvariantObjectTypes(probeDb);
-    return { ok: true };
+    return buildReadableDurableStateStatus("readable_writable", schemaVersion ?? undefined);
   } catch (error) {
     return classifyDurableStateInitError(error);
   } finally {
@@ -516,19 +645,165 @@ function runIntegrityCheck(database: Database): void {
     const details = rows.map((row) => row.integrity_check ?? "unknown").join("; ");
     throw new Error(
       `state.sqlite integrity_check failed before migration: ${details || "unknown"}. ` +
-        "Restore from backup or reset ~/.ralph/state.sqlite if local state can be recreated."
+        "Restore from backup and retry with a compatible/newer Ralph binary."
     );
   }
 }
 
-function maybeBackupBeforeMigration(database: Database, stateDbPath: string, fromVersion: number): void {
-  if (!isTruthyEnv("RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE")) return;
+function validateBackupIntegrity(backupPath: string): void {
+  const backupDb = new Database(backupPath, { readonly: true });
+  try {
+    const rows = backupDb.query("PRAGMA integrity_check").all() as Array<{ integrity_check?: string }>;
+    if (rows.length !== 1 || rows[0]?.integrity_check !== "ok") {
+      const details = rows.map((row) => row.integrity_check ?? "unknown").join("; ");
+      throw new Error(`Backup integrity_check failed: ${details || "unknown"}`);
+    }
+  } finally {
+    backupDb.close();
+  }
+}
+
+type StateBackupMetadata = {
+  backupPath: string;
+  createdAt: string;
+  fromVersion: number;
+  sha256: string;
+  sizeBytes: number;
+};
+
+function createBackupBeforeSchemaMutation(database: Database, stateDbPath: string, fromVersion: number): StateBackupMetadata {
   const configuredDir = process.env.RALPH_STATE_DB_BACKUP_DIR?.trim();
   const backupDir = configuredDir || dirname(stateDbPath);
   mkdirSync(backupDir, { recursive: true });
-  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const createdAt = nowIso();
+  const timestamp = createdAt.replace(/[:.]/g, "-");
   const backupPath = join(backupDir, `state.schema-v${fromVersion}.${timestamp}.backup.sqlite`);
   database.exec(`VACUUM INTO ${quoteSqlLiteral(backupPath)}`);
+  validateBackupIntegrity(backupPath);
+  const sizeBytes = statSync(backupPath).size;
+  const sha256 = sha256Hex(readFileSync(backupPath));
+  return {
+    backupPath,
+    createdAt,
+    fromVersion,
+    sha256,
+    sizeBytes,
+  };
+}
+
+const MIGRATION_CHECKPOINT_INVARIANT_REPAIR = "invariant-repair";
+const MIGRATION_CHECKSUM_INVARIANT_REPAIR = sha256Hex("state:invariant-repair:v20");
+
+function ensureStateMigrationTables(database: Database): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS state_migration_backups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      backup_path TEXT NOT NULL,
+      backup_sha256 TEXT,
+      backup_size_bytes INTEGER,
+      backup_created_at TEXT NOT NULL,
+      integrity_check_result TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_state_migration_backups_path ON state_migration_backups(backup_path);
+
+    CREATE TABLE IF NOT EXISTS state_migration_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      checkpoint TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      backup_id INTEGER,
+      applied_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(backup_id) REFERENCES state_migration_backups(id) ON DELETE SET NULL,
+      UNIQUE(from_schema_version, to_schema_version, checkpoint, checksum)
+    );
+
+    CREATE TABLE IF NOT EXISTS state_migration_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      backup_id INTEGER,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(backup_id) REFERENCES state_migration_backups(id) ON DELETE SET NULL
+    );
+  `);
+}
+
+function recordStateMigrationBackup(database: Database, metadata: StateBackupMetadata, toVersion: number): number {
+  database
+    .query(
+      `INSERT INTO state_migration_backups(
+         from_schema_version,
+         to_schema_version,
+         backup_path,
+         backup_sha256,
+         backup_size_bytes,
+         backup_created_at,
+         integrity_check_result,
+         created_at
+       )
+       VALUES($from_schema_version, $to_schema_version, $backup_path, $backup_sha256, $backup_size_bytes, $backup_created_at, 'ok', $created_at)`
+    )
+    .run({
+      $from_schema_version: metadata.fromVersion,
+      $to_schema_version: toVersion,
+      $backup_path: metadata.backupPath,
+      $backup_sha256: metadata.sha256,
+      $backup_size_bytes: metadata.sizeBytes,
+      $backup_created_at: metadata.createdAt,
+      $created_at: metadata.createdAt,
+    });
+
+  const row = database
+    .query("SELECT id FROM state_migration_backups WHERE backup_path = $backup_path")
+    .get({ $backup_path: metadata.backupPath }) as { id?: number } | undefined;
+  if (!row?.id) {
+    throw new Error(`Failed to record migration backup metadata for ${metadata.backupPath}`);
+  }
+  return row.id;
+}
+
+function recordStateMigrationCheckpoint(
+  database: Database,
+  params: {
+    fromVersion: number;
+    toVersion: number;
+    checkpoint: string;
+    checksum: string;
+    backupId: number | null;
+    appliedAt: string;
+  }
+): void {
+  database
+    .query(
+      `INSERT INTO state_migration_ledger(
+         from_schema_version,
+         to_schema_version,
+         checkpoint,
+         checksum,
+         backup_id,
+         applied_at,
+         created_at
+       )
+       VALUES($from_schema_version, $to_schema_version, $checkpoint, $checksum, $backup_id, $applied_at, $created_at)
+       ON CONFLICT(from_schema_version, to_schema_version, checkpoint, checksum) DO NOTHING`
+    )
+    .run({
+      $from_schema_version: params.fromVersion,
+      $to_schema_version: params.toVersion,
+      $checkpoint: params.checkpoint,
+      $checksum: params.checksum,
+      $backup_id: params.backupId,
+      $applied_at: params.appliedAt,
+      $created_at: params.appliedAt,
+    });
 }
 
 function runMigrationsWithLock(database: Database, migrate: () => void): void {
@@ -579,28 +854,48 @@ function toMigrationLockError(error: unknown, busyTimeoutMs: number): Error {
 function ensureSchema(database: Database, stateDbPath: string): void {
   const busyTimeoutMs =
     parsePositiveIntEnv("RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS") ?? DEFAULT_MIGRATION_BUSY_TIMEOUT_MS;
+  const hasMetaTable = tableExists(database, "meta");
+  const existingVersion = hasMetaTable ? readSchemaVersion(database) : null;
+  const needsVersionMigration = Boolean(existingVersion && existingVersion < SCHEMA_VERSION);
+  const needsInvariantRepair = !needsVersionMigration && requiresSchemaInvariantRepair(database);
+
+  if (existingVersion) {
+    const capability = evaluateDurableStateCapability({
+      schemaVersion: existingVersion,
+      window: DURABLE_STATE_SCHEMA_WINDOW,
+    });
+    if (!capability.canWriteState) {
+      throwForwardCompatibilityFailure(capability);
+    }
+  }
+
+  let backupMetadata: StateBackupMetadata | null = null;
+  let recordedBackupId: number | null = null;
+  if ((needsVersionMigration || needsInvariantRepair) && existsSync(stateDbPath)) {
+    const fromVersion = existingVersion ?? SCHEMA_VERSION;
+    backupMetadata = createBackupBeforeSchemaMutation(database, stateDbPath, fromVersion);
+  }
+
   database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
   try {
     database.exec("PRAGMA journal_mode = WAL;");
-  database.exec("PRAGMA synchronous = NORMAL;");
-  database.exec("PRAGMA foreign_keys = ON;");
+    database.exec("PRAGMA synchronous = NORMAL;");
+    database.exec("PRAGMA foreign_keys = ON;");
 
-  database.exec(
-    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-  );
+    database.exec(
+      "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+    );
 
-  const existingVersion = readSchemaVersion(database);
-  if (existingVersion && existingVersion > SCHEMA_VERSION) {
-    throw new Error(formatSchemaCompatibilityError(existingVersion));
-  }
-
-  if (existingVersion && existingVersion < SCHEMA_VERSION) {
-    maybeBackupBeforeMigration(database, stateDbPath, existingVersion);
+  if (needsVersionMigration && existingVersion) {
     runMigrationsWithLock(database, () => {
       const lockedVersion = readSchemaVersion(database);
       if (!lockedVersion || lockedVersion >= SCHEMA_VERSION) return;
-      if (lockedVersion > SCHEMA_VERSION) {
-        throw new Error(formatSchemaCompatibilityError(lockedVersion));
+      const lockedCapability = evaluateDurableStateCapability({
+        schemaVersion: lockedVersion,
+        window: DURABLE_STATE_SCHEMA_WINDOW,
+      });
+      if (!lockedCapability.canWriteState) {
+        throwForwardCompatibilityFailure(lockedCapability);
       }
 
       runIntegrityCheck(database);
@@ -608,18 +903,69 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       const fromVersion = lockedVersion;
       database.transaction(() => {
         const existingVersion = fromVersion;
+        ensureStateMigrationTables(database);
+        const backupId = backupMetadata ? recordStateMigrationBackup(database, backupMetadata, SCHEMA_VERSION) : null;
+        recordedBackupId = backupId;
+        const attemptAt = nowIso();
+        database
+          .query(
+            `INSERT INTO state_migration_attempts(
+               from_schema_version,
+               to_schema_version,
+               backup_id,
+               started_at,
+               completed_at,
+               created_at,
+               updated_at
+             )
+             VALUES($from_schema_version, $to_schema_version, $backup_id, $started_at, $completed_at, $created_at, $updated_at)`
+          )
+          .run({
+            $from_schema_version: existingVersion,
+            $to_schema_version: SCHEMA_VERSION,
+            $backup_id: backupId,
+            $started_at: attemptAt,
+            $completed_at: attemptAt,
+            $created_at: attemptAt,
+            $updated_at: attemptAt,
+          });
+
         if (existingVersion < 3) {
           addColumnIfMissing(database, "tasks", "worker_id", "TEXT");
           addColumnIfMissing(database, "tasks", "repo_slot", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 3,
+            checkpoint: "v3-tasks-worker-slot",
+            checksum: sha256Hex("state:migration:v3-tasks-worker-slot"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 4) {
           addColumnIfMissing(database, "issues", "github_node_id", "TEXT");
           addColumnIfMissing(database, "issues", "github_updated_at", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 4,
+            checkpoint: "v4-issues-github-columns",
+            checksum: sha256Hex("state:migration:v4-issues-github-columns"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 5) {
           database.exec(
             "CREATE TABLE IF NOT EXISTS repo_github_issue_sync (repo_id INTEGER PRIMARY KEY, last_sync_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
           );
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 5,
+            checkpoint: "v5-repo-github-issue-sync",
+            checksum: sha256Hex("state:migration:v5-repo-github-issue-sync"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 6) {
           addColumnIfMissing(database, "tasks", "daemon_id", "TEXT");
@@ -633,17 +979,49 @@ function ensureSchema(database: Database, stateDbPath: string): void {
               "SELECT MAX(rowid) FROM tasks WHERE task_path LIKE 'github:%' AND issue_number IS NOT NULL GROUP BY repo_id, issue_number" +
               ")"
           );
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 6,
+            checkpoint: "v6-task-daemon-heartbeat-path-dedupe",
+            checksum: sha256Hex("state:migration:v6-task-daemon-heartbeat-path-dedupe"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 7) {
           database.exec(
-            "CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (repo_id INTEGER PRIMARY KEY, last_merged_at TEXT NOT NULL, last_pr_number INTEGER NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
+              "CREATE TABLE IF NOT EXISTS repo_github_done_reconcile_cursor (repo_id INTEGER PRIMARY KEY, last_merged_at TEXT NOT NULL, last_pr_number INTEGER NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE)"
           );
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 7,
+            checkpoint: "v7-done-reconcile-cursor",
+            checksum: sha256Hex("state:migration:v7-done-reconcile-cursor"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 8) {
           addColumnIfMissing(database, "tasks", "session_events_path", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 8,
+            checkpoint: "v8-tasks-session-events-path",
+            checksum: sha256Hex("state:migration:v8-tasks-session-events-path"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 16) {
           addColumnIfMissing(database, "ralph_run_gate_results", "reason", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 16,
+            checkpoint: "v16-run-gate-reason-column",
+            checksum: sha256Hex("state:migration:v16-run-gate-reason-column"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         if (existingVersion < 9) {
           database.exec(
@@ -1097,6 +1475,48 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           }
         }
 
+        if (existingVersion < 20) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS repo_github_in_bot_reconcile_cursor (" +
+              "repo_id INTEGER PRIMARY KEY, " +
+              "bot_branch TEXT NOT NULL, " +
+              "last_merged_at TEXT NOT NULL, " +
+              "last_pr_number INTEGER NOT NULL, " +
+              "updated_at TEXT NOT NULL, " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE" +
+              ")"
+          );
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS repo_github_in_bot_pending (" +
+              "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+              "repo_id INTEGER NOT NULL, " +
+              "issue_number INTEGER NOT NULL, " +
+              "pr_number INTEGER NOT NULL, " +
+              "pr_url TEXT NOT NULL, " +
+              "merged_at TEXT NOT NULL, " +
+              "attempt_count INTEGER NOT NULL DEFAULT 0, " +
+              "last_attempt_at TEXT NOT NULL, " +
+              "last_error TEXT, " +
+              "created_at TEXT NOT NULL, " +
+              "updated_at TEXT NOT NULL, " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE, " +
+              "UNIQUE(repo_id, issue_number, pr_number)" +
+              ")"
+          );
+          database.exec(
+            "CREATE INDEX IF NOT EXISTS idx_repo_github_in_bot_pending_repo_updated " +
+              "ON repo_github_in_bot_pending(repo_id, updated_at)"
+          );
+        }
+        recordStateMigrationCheckpoint(database, {
+          fromVersion: existingVersion,
+          toVersion: SCHEMA_VERSION,
+          checkpoint: `schema-v${SCHEMA_VERSION}-complete`,
+          checksum: sha256Hex(`state:migration:schema-v${SCHEMA_VERSION}-complete`),
+          backupId,
+          appliedAt: nowIso(),
+        });
+
         database.exec(
           `INSERT INTO meta(key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
            ON CONFLICT(key) DO UPDATE SET value = excluded.value;`
@@ -1238,6 +1658,33 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       updated_at TEXT NOT NULL,
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS repo_github_in_bot_reconcile_cursor (
+      repo_id INTEGER PRIMARY KEY,
+      bot_branch TEXT NOT NULL,
+      last_merged_at TEXT NOT NULL,
+      last_pr_number INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS repo_github_in_bot_pending (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER NOT NULL,
+      pr_number INTEGER NOT NULL,
+      pr_url TEXT NOT NULL,
+      merged_at TEXT NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      last_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE,
+      UNIQUE(repo_id, issue_number, pr_number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_repo_github_in_bot_pending_repo_updated
+      ON repo_github_in_bot_pending(repo_id, updated_at);
 
     CREATE TABLE IF NOT EXISTS idempotency (
       key TEXT PRIMARY KEY,
@@ -1478,6 +1925,43 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS state_migration_backups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      backup_path TEXT NOT NULL,
+      backup_sha256 TEXT,
+      backup_size_bytes INTEGER,
+      backup_created_at TEXT NOT NULL,
+      integrity_check_result TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS state_migration_ledger (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      checkpoint TEXT NOT NULL,
+      checksum TEXT NOT NULL,
+      backup_id INTEGER,
+      applied_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(backup_id) REFERENCES state_migration_backups(id) ON DELETE SET NULL,
+      UNIQUE(from_schema_version, to_schema_version, checkpoint, checksum)
+    );
+
+    CREATE TABLE IF NOT EXISTS state_migration_attempts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_schema_version INTEGER,
+      to_schema_version INTEGER NOT NULL,
+      backup_id INTEGER,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(backup_id) REFERENCES state_migration_backups(id) ON DELETE SET NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_tasks_repo_status ON tasks(repo_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_issue ON tasks(repo_id, issue_number);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_repo_issue_unique
@@ -1507,11 +1991,27 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       ON issue_status_transition_guard(repo_id, updated_at_ms);
     CREATE INDEX IF NOT EXISTS idx_loop_triage_attempts_repo_issue_updated
       ON loop_triage_attempts(repo_id, issue_number, last_updated_at_ms);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_state_migration_backups_path ON state_migration_backups(backup_path);
   `);
 
     runMigrationsWithLock(database, () => {
       database.transaction(() => {
+        const neededInvariantRepair = requiresSchemaInvariantRepair(database);
         applySchemaInvariants(database);
+        if (!neededInvariantRepair) return;
+
+        ensureStateMigrationTables(database);
+        if (backupMetadata && recordedBackupId === null) {
+          recordedBackupId = recordStateMigrationBackup(database, backupMetadata, SCHEMA_VERSION);
+        }
+        recordStateMigrationCheckpoint(database, {
+          fromVersion: existingVersion ?? SCHEMA_VERSION,
+          toVersion: SCHEMA_VERSION,
+          checkpoint: MIGRATION_CHECKPOINT_INVARIANT_REPAIR,
+          checksum: MIGRATION_CHECKSUM_INVARIANT_REPAIR,
+          backupId: recordedBackupId,
+          appliedAt: nowIso(),
+        });
       })();
     });
   } catch (error) {
@@ -1708,6 +2208,25 @@ export function clearRepoGithubIssueBootstrapCursor(params: { repo: string }): v
 
 export type RepoGithubDoneCursor = { lastMergedAt: string; lastPrNumber: number };
 
+export type RepoGithubInBotCursor = {
+  botBranch: string;
+  lastMergedAt: string;
+  lastPrNumber: number;
+};
+
+export type RepoGithubInBotPendingIssue = {
+  repo: string;
+  issueNumber: number;
+  prNumber: number;
+  prUrl: string;
+  mergedAt: string;
+  attemptCount: number;
+  lastAttemptAt: string;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
 export function getRepoGithubDoneReconcileCursor(repo: string): RepoGithubDoneCursor | null {
   const database = requireDb();
   const row = database
@@ -1749,6 +2268,195 @@ export function recordRepoGithubDoneReconcileCursor(params: {
       $last_merged_at: params.lastMergedAt,
       $last_pr_number: params.lastPrNumber,
       $updated_at: at,
+    });
+}
+
+export function getRepoGithubInBotReconcileCursor(repo: string): RepoGithubInBotCursor | null {
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT c.bot_branch as bot_branch, c.last_merged_at as last_merged_at, c.last_pr_number as last_pr_number
+       FROM repo_github_in_bot_reconcile_cursor c
+       JOIN repos r ON r.id = c.repo_id
+       WHERE r.name = $name`
+    )
+    .get({ $name: repo }) as
+    | { bot_branch?: string; last_merged_at?: string; last_pr_number?: number }
+    | undefined;
+
+  if (!row?.bot_branch || !row.last_merged_at || typeof row.last_pr_number !== "number") return null;
+  return {
+    botBranch: row.bot_branch,
+    lastMergedAt: row.last_merged_at,
+    lastPrNumber: row.last_pr_number,
+  };
+}
+
+export function recordRepoGithubInBotReconcileCursor(params: {
+  repo: string;
+  repoPath?: string;
+  botBranch: string;
+  lastMergedAt: string;
+  lastPrNumber: number;
+  updatedAt?: string;
+}): void {
+  const database = requireDb();
+  const at = params.updatedAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, repoPath: params.repoPath, botBranch: params.botBranch, at });
+
+  database
+    .query(
+      `INSERT INTO repo_github_in_bot_reconcile_cursor(repo_id, bot_branch, last_merged_at, last_pr_number, updated_at)
+       VALUES ($repo_id, $bot_branch, $last_merged_at, $last_pr_number, $updated_at)
+       ON CONFLICT(repo_id) DO UPDATE SET
+         bot_branch = excluded.bot_branch,
+         last_merged_at = excluded.last_merged_at,
+         last_pr_number = excluded.last_pr_number,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $bot_branch: params.botBranch,
+      $last_merged_at: params.lastMergedAt,
+      $last_pr_number: params.lastPrNumber,
+      $updated_at: at,
+    });
+}
+
+export function clearRepoGithubInBotPendingIssues(repo: string): void {
+  const database = requireDb();
+  database
+    .query(
+      `DELETE FROM repo_github_in_bot_pending
+       WHERE repo_id = (SELECT id FROM repos WHERE name = $name)`
+    )
+    .run({ $name: repo });
+}
+
+export function upsertRepoGithubInBotPendingIssue(params: {
+  repo: string;
+  repoPath?: string;
+  botBranch?: string;
+  issueNumber: number;
+  prNumber: number;
+  prUrl: string;
+  mergedAt: string;
+  attemptError?: string | null;
+  attemptedAt?: string;
+}): void {
+  const database = requireDb();
+  const at = params.attemptedAt ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, repoPath: params.repoPath, botBranch: params.botBranch, at });
+  const errorText = sanitizeOptionalText(params.attemptError ?? null, 500) ?? null;
+
+  database
+    .query(
+      `INSERT INTO repo_github_in_bot_pending(
+         repo_id, issue_number, pr_number, pr_url, merged_at, attempt_count, last_attempt_at, last_error, created_at, updated_at
+       ) VALUES (
+         $repo_id, $issue_number, $pr_number, $pr_url, $merged_at, 1, $last_attempt_at, $last_error, $created_at, $updated_at
+       )
+       ON CONFLICT(repo_id, issue_number, pr_number) DO UPDATE SET
+         pr_url = excluded.pr_url,
+         merged_at = excluded.merged_at,
+         attempt_count = repo_github_in_bot_pending.attempt_count + 1,
+         last_attempt_at = excluded.last_attempt_at,
+         last_error = excluded.last_error,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $pr_number: params.prNumber,
+      $pr_url: params.prUrl,
+      $merged_at: params.mergedAt,
+      $last_attempt_at: at,
+      $last_error: errorText,
+      $created_at: at,
+      $updated_at: at,
+    });
+}
+
+export function listRepoGithubInBotPendingIssues(repo: string, limit = 50): RepoGithubInBotPendingIssue[] {
+  const database = requireDb();
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : 50;
+  const rows = database
+    .query(
+      `SELECT r.name as repo,
+              p.issue_number as issue_number,
+              p.pr_number as pr_number,
+              p.pr_url as pr_url,
+              p.merged_at as merged_at,
+              p.attempt_count as attempt_count,
+              p.last_attempt_at as last_attempt_at,
+              p.last_error as last_error,
+              p.created_at as created_at,
+              p.updated_at as updated_at
+       FROM repo_github_in_bot_pending p
+       JOIN repos r ON r.id = p.repo_id
+       WHERE r.name = $name
+       ORDER BY p.updated_at ASC
+       LIMIT $limit`
+    )
+    .all({ $name: repo, $limit: safeLimit }) as Array<{
+    repo?: string;
+    issue_number?: number;
+    pr_number?: number;
+    pr_url?: string;
+    merged_at?: string;
+    attempt_count?: number;
+    last_attempt_at?: string;
+    last_error?: string | null;
+    created_at?: string;
+    updated_at?: string;
+  }>;
+
+  return rows
+    .map((row) => {
+      if (
+        !row.repo ||
+        typeof row.issue_number !== "number" ||
+        typeof row.pr_number !== "number" ||
+        !row.pr_url ||
+        !row.merged_at ||
+        !row.last_attempt_at ||
+        !row.created_at ||
+        !row.updated_at
+      ) {
+        return null;
+      }
+      return {
+        repo: row.repo,
+        issueNumber: row.issue_number,
+        prNumber: row.pr_number,
+        prUrl: row.pr_url,
+        mergedAt: row.merged_at,
+        attemptCount: typeof row.attempt_count === "number" ? row.attempt_count : 0,
+        lastAttemptAt: row.last_attempt_at,
+        lastError: row.last_error ?? null,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      } satisfies RepoGithubInBotPendingIssue;
+    })
+    .filter((row): row is RepoGithubInBotPendingIssue => Boolean(row));
+}
+
+export function deleteRepoGithubInBotPendingIssue(params: { repo: string; issueNumber: number; prNumber: number }): void {
+  const database = requireDb();
+  const repoRow = database.query("SELECT id FROM repos WHERE name = $name").get({
+    $name: params.repo,
+  }) as { id?: number } | undefined;
+  if (!repoRow?.id) return;
+
+  database
+    .query(
+      `DELETE FROM repo_github_in_bot_pending
+       WHERE repo_id = $repo_id AND issue_number = $issue_number AND pr_number = $pr_number`
+    )
+    .run({
+      $repo_id: repoRow.id,
+      $issue_number: params.issueNumber,
+      $pr_number: params.prNumber,
     });
 }
 
@@ -2349,6 +3057,63 @@ export function releaseTaskSlot(params: {
     });
 
   return result.changes > 0;
+}
+
+export function clearTaskExecutionStateForIssue(params: {
+  repo: string;
+  issueNumber: number;
+  reason?: string | null;
+  status?: string;
+  at?: string;
+}): { updated: boolean; hadActiveOwner: boolean } {
+  const database = requireDb();
+  const at = params.at ?? nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+  const nextStatus = (params.status ?? "done").trim() || "done";
+  const reason = sanitizeOptionalText(params.reason ?? null, 300) ?? null;
+
+  const active = database
+    .query(
+      `SELECT COUNT(*) as n
+       FROM tasks
+       WHERE repo_id = $repo_id
+         AND issue_number = $issue_number
+         AND task_path LIKE 'github:%'
+         AND ((COALESCE(TRIM(daemon_id), '') <> '') OR (COALESCE(TRIM(heartbeat_at), '') <> ''))`
+    )
+    .get({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+    }) as { n?: number } | undefined;
+  const hadActiveOwner = Number(active?.n ?? 0) > 0;
+
+  const result = database
+    .query(
+      `UPDATE tasks
+          SET status = $status,
+              session_id = NULL,
+              session_events_path = NULL,
+              worktree_path = NULL,
+              worker_id = NULL,
+              repo_slot = NULL,
+              daemon_id = NULL,
+              heartbeat_at = NULL,
+              released_at_ms = NULL,
+              released_reason = $reason,
+              updated_at = $updated_at
+        WHERE repo_id = $repo_id
+          AND issue_number = $issue_number
+          AND task_path LIKE 'github:%'`
+    )
+    .run({
+      $repo_id: repoId,
+      $issue_number: params.issueNumber,
+      $status: nextStatus,
+      $reason: reason,
+      $updated_at: at,
+    });
+
+  return { updated: result.changes > 0, hadActiveOwner };
 }
 
 export type RepoLabelWriteState = {
@@ -3821,6 +4586,26 @@ export type TaskOpState = {
   releasedReason?: string | null;
 };
 
+export type OrphanedTaskOpState = TaskOpState & {
+  issueState: string | null;
+  issueLabels: string[];
+  orphanReason: "closed" | "no-ralph-labels";
+};
+
+export function hasDurableOpState(opState: TaskOpState | null | undefined): boolean {
+  if (!opState) return false;
+  const hasNonEmpty = (value: string | null | undefined): boolean => typeof value === "string" && value.trim().length > 0;
+  return (
+    hasNonEmpty(opState.sessionId) ||
+    hasNonEmpty(opState.sessionEventsPath) ||
+    hasNonEmpty(opState.worktreePath) ||
+    hasNonEmpty(opState.workerId) ||
+    hasNonEmpty(opState.repoSlot) ||
+    hasNonEmpty(opState.daemonId) ||
+    hasNonEmpty(opState.heartbeatAt)
+  );
+}
+
 export type IssueStatusTransitionRecord = {
   repo: string;
   issueNumber: number;
@@ -4369,6 +5154,154 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
   };
+}
+
+export function clearTaskOpState(params: {
+  repo: string;
+  taskPath: string;
+  releasedAtMs?: number;
+  releasedReason?: string | null;
+  status?: string | null;
+  expectedDaemonId?: string | null;
+  expectedHeartbeatAt?: string | null;
+}): { cleared: boolean; raceSkipped: boolean } {
+  const database = requireDb();
+  const atIso = nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const releasedAtMs = typeof params.releasedAtMs === "number" ? params.releasedAtMs : Date.now();
+
+  const result = database
+    .query(
+      `UPDATE tasks
+         SET status = COALESCE($status, status),
+             session_id = NULL,
+             session_events_path = NULL,
+             worktree_path = NULL,
+             worker_id = NULL,
+             repo_slot = NULL,
+             daemon_id = NULL,
+             heartbeat_at = NULL,
+             released_at_ms = $released_at_ms,
+             released_reason = $released_reason,
+             updated_at = $updated_at
+       WHERE repo_id = $repo_id
+         AND task_path = $task_path
+         AND (
+           session_id IS NOT NULL OR
+           session_events_path IS NOT NULL OR
+           worktree_path IS NOT NULL OR
+           worker_id IS NOT NULL OR
+           repo_slot IS NOT NULL OR
+           daemon_id IS NOT NULL OR
+           heartbeat_at IS NOT NULL
+         )
+         AND (
+           ($expected_daemon_id IS NULL AND daemon_id IS NULL) OR
+           daemon_id = $expected_daemon_id
+         )
+         AND (
+           ($expected_heartbeat_at IS NULL AND heartbeat_at IS NULL) OR
+           heartbeat_at = $expected_heartbeat_at
+         )`
+    )
+    .run({
+      $repo_id: repoId,
+      $task_path: params.taskPath,
+      $status: params.status ?? null,
+      $released_at_ms: releasedAtMs,
+      $released_reason: params.releasedReason ?? null,
+      $updated_at: atIso,
+      $expected_daemon_id: params.expectedDaemonId ?? null,
+      $expected_heartbeat_at: params.expectedHeartbeatAt ?? null,
+    });
+
+  if (result.changes > 0) return { cleared: true, raceSkipped: false };
+
+  const row = database
+    .query("SELECT task_path as task_path FROM tasks WHERE repo_id = $repo_id AND task_path = $task_path")
+    .get({ $repo_id: repoId, $task_path: params.taskPath }) as { task_path?: string } | undefined;
+
+  return { cleared: false, raceSkipped: Boolean(row?.task_path) };
+}
+
+export function listOrphanedTasksWithOpState(repo: string): OrphanedTaskOpState[] {
+  const database = requireDb();
+  const rows = database
+    .query(
+      `SELECT t.task_path as task_path,
+              t.issue_number as issue_number,
+              t.status as status,
+              t.session_id as session_id,
+              t.session_events_path as session_events_path,
+              t.worktree_path as worktree_path,
+              t.worker_id as worker_id,
+              t.repo_slot as repo_slot,
+              t.daemon_id as daemon_id,
+              t.heartbeat_at as heartbeat_at,
+              t.released_at_ms as released_at_ms,
+              t.released_reason as released_reason,
+              i.state as issue_state,
+              GROUP_CONCAT(l.name, '${LABEL_SEPARATOR}') as labels
+       FROM tasks t
+       JOIN repos r ON r.id = t.repo_id
+       JOIN issues i ON i.repo_id = t.repo_id AND i.number = t.issue_number
+       LEFT JOIN issue_labels l ON l.issue_id = i.id
+       WHERE r.name = $name
+         AND t.issue_number IS NOT NULL
+         AND t.task_path LIKE 'github:%'
+       GROUP BY t.id, i.id
+       ORDER BY t.updated_at DESC`
+    )
+    .all({ $name: repo }) as Array<{
+    task_path: string;
+    issue_number: number | null;
+    status?: string | null;
+    session_id?: string | null;
+    session_events_path?: string | null;
+    worktree_path?: string | null;
+    worker_id?: string | null;
+    repo_slot?: string | null;
+    daemon_id?: string | null;
+    heartbeat_at?: string | null;
+    released_at_ms?: number | null;
+    released_reason?: string | null;
+    issue_state?: string | null;
+    labels?: string | null;
+  }>;
+
+  const out: OrphanedTaskOpState[] = [];
+  for (const row of rows) {
+    const base: TaskOpState = {
+      repo,
+      issueNumber: row.issue_number ?? null,
+      taskPath: row.task_path,
+      status: row.status ?? null,
+      sessionId: row.session_id ?? null,
+      sessionEventsPath: row.session_events_path ?? null,
+      worktreePath: row.worktree_path ?? null,
+      workerId: row.worker_id ?? null,
+      repoSlot: row.repo_slot ?? null,
+      daemonId: row.daemon_id ?? null,
+      heartbeatAt: row.heartbeat_at ?? null,
+      releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
+      releasedReason: row.released_reason ?? null,
+    };
+    if (!hasDurableOpState(base)) continue;
+
+    const labels = parseLabelList(row.labels);
+    const issueState = row.issue_state?.trim().toUpperCase() ?? null;
+    if (issueState === "CLOSED") {
+      out.push({ ...base, issueState, issueLabels: labels, orphanReason: "closed" });
+      continue;
+    }
+
+    const hasRalphLabel = labels.some((label) => label.toLowerCase().startsWith("ralph:"));
+    if (!hasRalphLabel) {
+      out.push({ ...base, issueState, issueLabels: labels, orphanReason: "no-ralph-labels" });
+    }
+  }
+
+  return out;
 }
 
 export function getIssueStatusTransitionRecord(repo: string, issueNumber: number): IssueStatusTransitionRecord | null {

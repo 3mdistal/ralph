@@ -488,9 +488,17 @@ async function run(): Promise<void> {
       console.log(`Desired mode: ${snapshot.desiredMode}`);
     }
     console.log(`Queue backend: ${snapshot.queue.backend}`);
-    if (snapshot.durableState?.ok === false) {
-      const reason = snapshot.durableState.code ?? "unknown";
-      console.warn(`Durable state degraded (${reason}): ${snapshot.durableState.message ?? "no details"}`);
+    if (snapshot.durableState) {
+      const verdict = snapshot.durableState.verdict ?? "unknown";
+      if (snapshot.durableState.ok === false) {
+        const reason = snapshot.durableState.code ?? "unknown";
+        console.warn(`Durable state degraded (${reason}, verdict=${verdict}): ${snapshot.durableState.message ?? "no details"}`);
+      } else if (snapshot.durableState.canWriteState === false || snapshot.durableState.verdict === "readable_readonly_forward_newer") {
+        console.warn(
+          `Durable state is readable-only (verdict=${verdict}): ` +
+            `${snapshot.durableState.message ?? "upgrade Ralph for writable operations"}`
+        );
+      }
     }
     if (snapshot.daemon) {
       console.log(

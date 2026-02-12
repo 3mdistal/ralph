@@ -49,6 +49,12 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import {
+  type NoPrTerminalReason,
+  type PrEvidenceCauseCode,
+  formatPrEvidenceCauseCodeLine,
+} from "../gates/pr-evidence-gate";
+import { parseRalphBuildEvidenceMarker } from "../gates/build-evidence";
 import { prepareReviewDiffArtifacts, recordReviewGateFailure, recordReviewGateSkipped, runReviewGate } from "../gates/review";
 
 import { PR_CREATE_LEASE_SCOPE, buildPrCreateLeaseKey, isLeaseStale } from "../pr-create-lease";
@@ -76,7 +82,7 @@ import { buildWorkerFailureAlert, type WorkerFailureKind } from "../alerts/worke
 import { buildNudgePreview, drainQueuedNudges, type NudgeDeliveryOutcome } from "../nudge";
 import { redactSensitiveText } from "../redaction";
 import { RALPH_LABEL_STATUS_IN_PROGRESS, RALPH_LABEL_STATUS_QUEUED } from "../github-labels";
-import { GitHubClient } from "../github/client";
+import { GitHubClient, splitRepoFullName } from "../github/client";
 import { computeGitHubRateLimitPause } from "../github/rate-limit-throttle";
 import { writeDxSurveyToGitHubIssues } from "../github/dx-survey-writeback";
 import { createGhRunner } from "../github/gh-runner";
@@ -128,6 +134,11 @@ import { buildWatchdogDiagnostics, writeWatchdogToGitHub } from "../github/watch
 import { BLOCKED_SOURCES, type BlockedSource } from "../blocked-sources";
 import { classifyOpencodeFailure } from "../opencode-error-classifier";
 import { derivePrCreateEscalationReason } from "./pr-create-escalation-reason";
+import {
+  classifyPrCreateFailurePolicy,
+  computePrCreateRetryBackoffMs,
+  shouldAttemptPrCreateLeaseSelfHeal,
+} from "./pr-create-policy";
 import { computeBlockedDecision, type RelationshipSignal } from "../github/issue-blocking-core";
 import { formatIssueRef, parseIssueRef, type IssueRef } from "../github/issue-ref";
 import {
@@ -320,6 +331,7 @@ const PR_CREATE_LEASE_TTL_MS = 20 * 60_000;
 const PR_CREATE_CONFLICT_WAIT_MS = 2 * 60_000;
 const PR_CREATE_CONFLICT_POLL_MS = 15_000;
 const PR_CREATE_CONFLICT_THROTTLE_MS = 5 * 60_000;
+const PR_CREATE_RECOVERY_MAX_RETRIES = 3;
 
 type PullRequestMergeState = {
   number: number;
@@ -435,6 +447,8 @@ export interface AgentRun {
   outcome: "success" | "throttled" | "escalated" | "failed";
   pr?: string;
   completionKind?: "pr" | "verified";
+  noPrTerminalReason?: NoPrTerminalReason;
+  prEvidenceCauseCode?: PrEvidenceCauseCode;
   sessionId?: string;
   escalationReason?: string;
   surveyResults?: string;
@@ -450,6 +464,14 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 
   if (result.completionKind) {
     details.completionKind = result.completionKind;
+  }
+
+  if (result.noPrTerminalReason) {
+    details.noPrTerminalReason = result.noPrTerminalReason;
+  }
+
+  if (result.prEvidenceCauseCode) {
+    details.prEvidenceCauseCode = result.prEvidenceCauseCode;
   }
 
   if (result.outcome === "escalated") {
@@ -1252,6 +1274,213 @@ export class RepoWorker {
     return { key, claimed, staleDeleted, existingCreatedAt };
   }
 
+  private async tryReclaimPrCreateLeaseAfterConflict(params: {
+    issueNumber: string;
+    leaseKey: string;
+    observedCreatedAt?: string | null;
+    observedPayloadJson?: string | null;
+  }): Promise<{ reclaimed: boolean }> {
+    const record = getIdempotencyRecord(params.leaseKey);
+    if (!record?.createdAt) return { reclaimed: false };
+    const observedCreatedAt = String(params.observedCreatedAt ?? "").trim();
+    if (observedCreatedAt && record.createdAt !== observedCreatedAt) return { reclaimed: false };
+    const observedPayload = String(params.observedPayloadJson ?? "").trim();
+    if (observedPayload && (record.payloadJson ?? "") !== observedPayload) return { reclaimed: false };
+
+    const resolution = await this.getIssuePrResolution(params.issueNumber, { fresh: true });
+    if (resolution.selectedUrl) return { reclaimed: false };
+
+    deleteIdempotencyKey(params.leaseKey);
+    return { reclaimed: true };
+  }
+
+  private async withPrCreateTransientRetries<T>(params: {
+    label: string;
+    operation: () => Promise<T>;
+    maxAttempts?: number;
+  }): Promise<T> {
+    const maxAttempts = Number.isFinite(params.maxAttempts) ? Math.max(1, Math.floor(params.maxAttempts ?? 3)) : 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        return await params.operation();
+      } catch (error: any) {
+        const message = error?.message ?? String(error);
+        const stderr = String(error?.stderr ?? "");
+        const policy = classifyPrCreateFailurePolicy({ evidence: [message, stderr] });
+        if (policy.classification !== "transient" || attempt >= maxAttempts) throw error;
+
+        const retryAfterMatch = /retry-after\s*:\s*(\d+)/i.exec(`${message}\n${stderr}`);
+        const retryAfterMs = retryAfterMatch ? Math.max(0, Number.parseInt(retryAfterMatch[1], 10) * 1000) : null;
+        const backoffMs = retryAfterMs ?? computePrCreateRetryBackoffMs({ attempt, capMs: 60_000 });
+        if (backoffMs > 0) await this.sleepMs(backoffMs);
+      }
+    }
+
+    throw new Error(`PR-create retry exhausted for ${params.label}`);
+  }
+
+  private async blockOnPrCreateCapabilityIfMissing(params: {
+    task: AgentTask;
+    stage: string;
+    sessionId?: string;
+    evidence: Array<string | null | undefined>;
+  }): Promise<AgentRun | null> {
+    const policy = classifyPrCreateFailurePolicy({ evidence: params.evidence });
+    if (policy.classification !== "non-retriable") return null;
+
+    await this.markTaskBlocked(params.task, policy.blockedSource ?? "permission", {
+      reason: policy.reason,
+      details: `PR-create capability check failed at stage '${params.stage}'.`,
+      sessionId: params.sessionId,
+    });
+
+    return {
+      outcome: "failed",
+      taskName: params.task.name,
+      repo: params.task.repo,
+      reason: policy.reason,
+      blockedSource: policy.blockedSource,
+      sessionId: params.sessionId,
+    } as AgentRun;
+  }
+
+  private async markPrCreatePolicyState(task: AgentTask, patch: Record<string, string>): Promise<void> {
+    try {
+      const updated = await this.queue.updateTaskStatus(task, task.status, patch);
+      if (updated) applyTaskPatch(task, task.status, patch);
+    } catch {
+      // best-effort metadata for diagnostics only
+    }
+  }
+
+  private async checkPrCreateCapability(params: {
+    task: AgentTask;
+    stage: string;
+    issueNumber: string;
+    botBranch: string;
+    sessionId?: string | null;
+    latestOutput?: string;
+    prRecoveryDiagnostics?: string;
+    repoPath: string;
+  }): Promise<null | AgentRun> {
+    try {
+      const { owner, name } = splitRepoFullName(this.repo);
+      const query = [
+        "query($owner:String!, $name:String!) {",
+        "  repository(owner:$owner, name:$name) {",
+        "    viewerPermission",
+        "    viewerCanPush",
+        "  }",
+        "}",
+      ].join("\n");
+      const response = await ghRead(this.repo)`gh api graphql -f query=${query} -f owner=${owner} -f name=${name}`
+        .cwd(params.repoPath)
+        .quiet();
+
+      const parsed = JSON.parse(response.stdout.toString()) as {
+        data?: { repository?: { viewerPermission?: string | null; viewerCanPush?: boolean | null } | null } | null;
+      };
+      const permission = String(parsed?.data?.repository?.viewerPermission ?? "").trim().toUpperCase();
+      const canPush = parsed?.data?.repository?.viewerCanPush;
+      const denied = canPush === false || permission === "READ" || permission === "TRIAGE";
+      if (!denied) return null;
+
+      const reason = `blocked:permission: PR-create capability missing for ${this.repo} (viewerPermission=${
+        permission || "unknown"
+      }, viewerCanPush=${canPush === null || canPush === undefined ? "unknown" : String(canPush)}).`;
+      const details = `PR-create capability gate failed before stage '${params.stage}'.`;
+
+      await this.markTaskBlocked(params.task, "permission", {
+        reason,
+        details,
+        sessionId: params.sessionId || undefined,
+      });
+
+      return await this.escalateMissingPrWithPolicyReason({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        botBranch: params.botBranch,
+        reason,
+        blockedSource: "permission",
+        latestOutput: params.latestOutput ?? "",
+        prRecoveryDiagnostics: [params.prRecoveryDiagnostics, details].filter(Boolean).join("\n\n"),
+        sessionId: params.sessionId || undefined,
+      });
+    } catch (error: any) {
+      const message = this.formatGhError(error);
+      const policy = classifyPrCreateFailurePolicy({ evidence: [message] });
+      if (policy.classification !== "non-retriable") return null;
+
+      await this.markTaskBlocked(params.task, policy.blockedSource ?? "permission", {
+        reason: policy.reason,
+        details: `PR-create capability check failed: ${message}`,
+        sessionId: params.sessionId || undefined,
+      });
+
+      return await this.escalateMissingPrWithPolicyReason({
+        task: params.task,
+        issueNumber: params.issueNumber,
+        botBranch: params.botBranch,
+        reason: policy.reason,
+        blockedSource: policy.blockedSource,
+        latestOutput: params.latestOutput ?? "",
+        prRecoveryDiagnostics: [params.prRecoveryDiagnostics, message].filter(Boolean).join("\n\n"),
+        sessionId: params.sessionId || undefined,
+      });
+    }
+  }
+
+  private async trySelfHealPrCreateLeaseAfterConflict(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    sessionId?: string | null;
+    existingCreatedAt?: string | null;
+    stage: string;
+  }): Promise<{ claimed: boolean; key: string; note: string }> {
+    const key = this.buildPrCreateLeaseKey(params.issueNumber, params.botBranch);
+    const taskFields = params.task as unknown as Record<string, string | undefined>;
+    const alreadyAttempted = taskFields["pr-create-self-heal-attempted"]?.trim() === "1";
+    const nowMs = Date.now();
+    if (
+      !shouldAttemptPrCreateLeaseSelfHeal({
+        existingCreatedAtIso: params.existingCreatedAt,
+        nowMs,
+        minAgeMs: PR_CREATE_CONFLICT_WAIT_MS,
+        alreadyAttempted,
+      })
+    ) {
+      return { claimed: false, key, note: "lease self-heal skipped" };
+    }
+
+    const current = getIdempotencyRecord(key);
+    if (!current?.createdAt || current.createdAt !== (params.existingCreatedAt ?? null)) {
+      return { claimed: false, key, note: "lease changed while waiting" };
+    }
+
+    try {
+      deleteIdempotencyKey(key);
+    } catch {
+      return { claimed: false, key, note: "failed to reclaim lease" };
+    }
+
+    await this.markPrCreatePolicyState(params.task, {
+      "pr-create-self-heal-attempted": "1",
+      "pr-create-self-heal-at": new Date(nowMs).toISOString(),
+    });
+
+    const claimed = this.tryClaimPrCreateLease({
+      task: params.task,
+      issueNumber: params.issueNumber,
+      botBranch: params.botBranch,
+      sessionId: params.sessionId,
+      stage: `${params.stage}:self-heal`,
+    });
+
+    if (!claimed.claimed) return { claimed: false, key, note: "lease reclaim raced with another worker" };
+    return { claimed: true, key: claimed.key, note: "reclaimed stale lease after no-PR bounded wait" };
+  }
+
   private async waitForExistingPrDuringPrCreateConflict(params: {
     issueNumber: string;
     maxWaitMs: number;
@@ -1450,6 +1679,8 @@ export class RepoWorker {
       taskName: task.name,
       repo: this.repo,
       outcome: "success",
+      pr: prUrl,
+      completionKind: "pr",
     };
   }
 
@@ -1656,21 +1887,47 @@ export class RepoWorker {
       continueAttempts: params.continueAttempts,
       evidence: params.evidence,
     });
-    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+    const planOutput = [derived.details, params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
 
     this.recordMissingPrEvidence({
       task: params.task,
-      issueNumber: params.issueNumber,
-      botBranch: params.botBranch,
       reason: derived.reason,
       blockedSource: derived.classification?.blockedSource,
       diagnostics: planOutput,
     });
 
-    return await this.escalateNoPrAfterRetries({
+    const run = await this.escalateNoPrAfterRetries({
       task: params.task,
       reason: derived.reason,
       details: derived.details,
+      planOutput,
+      sessionId: params.sessionId,
+    });
+    return { ...run, prEvidenceCauseCode: derived.causeCode };
+  }
+
+  private async escalateMissingPrWithPolicyReason(params: {
+    task: AgentTask;
+    issueNumber: string;
+    botBranch: string;
+    reason: string;
+    blockedSource?: BlockedSource;
+    latestOutput: string;
+    prRecoveryDiagnostics: string;
+    sessionId?: string;
+  }): Promise<AgentRun> {
+    const planOutput = [params.latestOutput, params.prRecoveryDiagnostics].filter(Boolean).join("\n\n");
+    this.recordMissingPrEvidence({
+      task: params.task,
+      reason: params.reason,
+      blockedSource: params.blockedSource,
+      diagnostics: planOutput,
+    });
+
+    return await this.escalateNoPrAfterRetries({
+      task: params.task,
+      reason: params.reason,
+      details: "PR-create policy denied retry; escalating immediately.",
       planOutput,
       sessionId: params.sessionId,
     });
@@ -1768,31 +2025,36 @@ export class RepoWorker {
     }
   }
 
-  private buildPrCreationNudge(botBranch: string, issueNumber: string, issueRef: string): string {
-    const fixes = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${issueRef}`;
+  private buildPrRecoveryNudge(params: {
+    botBranch: string;
+    issueRef: string;
+    latestOutput: string;
+  }): string {
     const preflight = getRepoPreflightCommands(this.repo);
-    const preflightLines = preflight.commands.length > 0
-      ? ["# Preflight (must pass before PR)", ...preflight.commands]
-      : [];
+    const preflightLines = preflight.commands.length > 0 ? preflight.commands : ["(no repo preflight configured)"];
+    const buildEvidence = parseRalphBuildEvidenceMarker(params.latestOutput);
+    const markerHint = buildEvidence.ok
+      ? `Last marker accepted: branch=${buildEvidence.evidence.branch}, head_sha=${buildEvidence.evidence.head_sha}, ready_for_pr_create=${buildEvidence.evidence.ready_for_pr_create}`
+      : `Missing/invalid RALPH_BUILD_EVIDENCE marker: ${buildEvidence.error}`;
 
     return [
-      `No PR URL found. Create a PR targeting '${botBranch}' and paste the PR URL.`,
-      "IMPORTANT: Before creating a new PR, check if one already exists for this issue.",
+      `No PR URL found yet for ${params.issueRef}. Do NOT create a PR. Ralph orchestrator owns PR creation for branch '${params.botBranch}'.`,
+      "Prepare branch/worktree evidence so Ralph can create or reuse the PR deterministically.",
+      markerHint,
       "",
-      "Commands (run in the task worktree):",
+      "Do now:",
+      "- Ensure your implementation changes are committed to your current branch.",
+      "- Ensure the worktree is clean (`git status` should show no pending changes).",
+      "- Run preflight (if configured) and report a concise summary.",
+      "- End your response with exactly one final-line marker:",
+      "  RALPH_BUILD_EVIDENCE: {\"version\":1,\"branch\":\"...\",\"base\":\"bot/integration\",\"head_sha\":\"...\",\"worktree_clean\":true,\"preflight\":{\"status\":\"pass|fail|skipped\",\"command\":\"...\",\"summary\":\"...\"},\"ready_for_pr_create\":true}",
+      "",
+      "Helpful local commands (no gh write commands):",
       "```bash",
       "git status",
+      "git branch --show-current",
+      "git rev-parse HEAD",
       ...preflightLines,
-      "git push -u origin HEAD",
-      issueNumber
-        ? `gh pr list --state open --search "fixes #${issueNumber} OR closes #${issueNumber} OR resolves #${issueNumber}" --json url,baseRefName,headRefName --limit 10`
-        : "",
-      `gh pr create --base ${botBranch} --fill --body \"${fixes}\"`,
-      "```",
-      "",
-      "If a PR already exists:",
-      "```bash",
-      "gh pr list --head $(git branch --show-current) --json url,baseRefName,headRefName --limit 10",
       "```",
     ].join("\n");
   }
@@ -2141,7 +2403,17 @@ export class RepoWorker {
       taskName: params.task.name,
       repo: this.repo,
       outcome: "success",
+      pr: params.prUrl,
+      completionKind: "pr",
     };
+  }
+
+  private classifyPrEvidenceCauseFromText(text: string | null | undefined): PrEvidenceCauseCode {
+    const normalized = String(text ?? "").toLowerCase();
+    if (normalized.includes("permission") || normalized.includes("denied") || normalized.includes("forbidden")) {
+      return "POLICY_DENIED";
+    }
+    return "UNKNOWN";
   }
 
   private async tryEnsurePrFromWorktree(params: {
@@ -2150,7 +2422,7 @@ export class RepoWorker {
     issueTitle: string;
     botBranch: string;
     started: Date;
-  }): Promise<{ prUrl: string | null; diagnostics: string; terminalRun?: AgentRun }> {
+  }): Promise<{ prUrl: string | null; diagnostics: string; causeCode?: PrEvidenceCauseCode; terminalRun?: AgentRun }> {
     const { task, issueNumber, issueTitle, botBranch } = params;
 
     const diagnostics: string[] = [
@@ -2175,7 +2447,8 @@ export class RepoWorker {
 
     if (!issueNumber) {
       diagnostics.push("- No issue number detected; skipping auto PR recovery");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("NO_WORKTREE_BRANCH"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
     }
 
     const existingPr = await this.getIssuePrResolution(issueNumber);
@@ -2194,7 +2467,8 @@ export class RepoWorker {
     if (!candidate) {
       diagnostics.push(`- No worktree matched issue ${issueNumber}`);
       diagnostics.push("- Manual: run `git worktree list` in the repo root to locate the task worktree");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("NO_WORKTREE_BRANCH"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
     }
 
     const branch = stripHeadsRef(candidate.branch);
@@ -2203,7 +2477,8 @@ export class RepoWorker {
 
     if (!branch || candidate.detached) {
       diagnostics.push("- Cannot auto-create PR: detached HEAD or unknown branch");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("NO_WORKTREE_BRANCH"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
     }
 
     try {
@@ -2233,7 +2508,8 @@ export class RepoWorker {
     const runId = this.activeRunId;
     if (!runId) {
       diagnostics.push("- Missing runId; refusing PR creation because deterministic gates cannot be persisted");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("LEASE_STALE"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "LEASE_STALE" };
     }
 
     const preflightConfig = getRepoPreflightCommands(this.repo);
@@ -2254,7 +2530,8 @@ export class RepoWorker {
     if (preflightResult.status === "fail") {
       diagnostics.push("- Preflight failed; refusing to create PR");
       diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("UNKNOWN"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "UNKNOWN" };
     }
 
     if (preflightResult.status === "skipped") {
@@ -2274,16 +2551,19 @@ export class RepoWorker {
     diagnostics.push(...readiness.diagnostics);
     if (!readiness.ok) {
       diagnostics.push("- PR readiness failed; refusing to create PR");
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine("POLICY_DENIED"));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "POLICY_DENIED" };
     }
 
     try {
       await $`git push -u origin HEAD`.cwd(candidate.worktreePath).quiet();
       diagnostics.push("- Pushed branch to origin");
     } catch (e: any) {
+      const causeCode = this.classifyPrEvidenceCauseFromText(e?.message ?? String(e));
       diagnostics.push(`- git push failed: ${e?.message ?? String(e)}`);
       diagnostics.push(`- Manual: cd ${candidate.worktreePath} && git push -u origin ${branch}`);
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      diagnostics.push(formatPrEvidenceCauseCodeLine(causeCode));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode };
     }
 
     const title = issueTitle?.trim() ? issueTitle.trim() : `Fixes #${issueNumber}`;
@@ -2307,6 +2587,21 @@ export class RepoWorker {
       return { prUrl: canonicalBeforeCreate.selectedUrl, diagnostics: diagnostics.join("\n") };
     }
 
+    const capabilityBlocked = await this.checkPrCreateCapability({
+      task,
+      stage: "recovery",
+      issueNumber,
+      botBranch,
+      sessionId: task["session-id"]?.trim() || null,
+      latestOutput: "",
+      prRecoveryDiagnostics: diagnostics.join("\n"),
+      repoPath: candidate.worktreePath,
+    });
+    if (capabilityBlocked) {
+      diagnostics.push("- PR-create capability gate blocked recovery path");
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), terminalRun: capabilityBlocked };
+    }
+
     const lease = this.tryClaimPrCreateLease({
       task,
       issueNumber,
@@ -2317,6 +2612,7 @@ export class RepoWorker {
 
     if (!lease.claimed) {
       diagnostics.push(`- PR-create lease already held; skipping auto-create (lease=${lease.key})`);
+      diagnostics.push(formatPrEvidenceCauseCodeLine("LEASE_STALE"));
       const waited = await this.waitForExistingPrDuringPrCreateConflict({
         issueNumber,
         maxWaitMs: PR_CREATE_CONFLICT_WAIT_MS,
@@ -2325,30 +2621,87 @@ export class RepoWorker {
         diagnostics.push(...waited.diagnostics);
         return { prUrl: waited.selectedUrl, diagnostics: diagnostics.join("\n") };
       }
-      return { prUrl: null, diagnostics: diagnostics.join("\n") };
+      const selfHealed = await this.trySelfHealPrCreateLeaseAfterConflict({
+        task,
+        issueNumber,
+        botBranch,
+        sessionId: task["session-id"]?.trim() || null,
+        existingCreatedAt: lease.existingCreatedAt,
+        stage: "recovery",
+      });
+      diagnostics.push(`- ${selfHealed.note}`);
+      if (!selfHealed.claimed) {
+        diagnostics.push(formatPrEvidenceCauseCodeLine("LEASE_STALE"));
+        return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "LEASE_STALE" };
+      }
     }
 
-    diagnostics.push(`- Acquired PR-create lease: ${lease.key}`);
+    const claimedLeaseKey = lease.key;
+    diagnostics.push(`- Acquired PR-create lease: ${claimedLeaseKey}`);
 
-    try {
-      const created = await ghWrite(this.repo)`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
-        .cwd(candidate.worktreePath)
-        .quiet();
-
-      const prUrl = selectPrUrl({ output: created.stdout.toString(), repo: this.repo }) ?? null;
-      diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
-
-      if (prUrl) {
-        try {
-          deleteIdempotencyKey(lease.key);
-        } catch {
-          // ignore
-        }
-        this.invalidateIssuePrResolution(issueNumber);
-        return { prUrl, diagnostics: diagnostics.join("\n") };
+    for (let attempt = 1; attempt <= PR_CREATE_RECOVERY_MAX_RETRIES; attempt += 1) {
+      if (attempt > 1) {
+        const backoffMs = computePrCreateRetryBackoffMs({ attempt });
+        diagnostics.push(
+          `- Retrying gh pr create after transient failure (attempt ${attempt}/${PR_CREATE_RECOVERY_MAX_RETRIES}, backoff=${Math.round(backoffMs / 1000)}s)`
+        );
+        if (backoffMs > 0) await this.sleepMs(backoffMs);
       }
-    } catch (e: any) {
-      diagnostics.push(`- gh pr create failed: ${e?.message ?? String(e)}`);
+
+      try {
+        const created = await ghWrite(this.repo)`gh pr create --repo ${this.repo} --base ${botBranch} --head ${branch} --title ${title} --body ${body}`
+          .cwd(candidate.worktreePath)
+          .quiet();
+
+        const prUrl = selectPrUrl({ output: created.stdout.toString(), repo: this.repo }) ?? null;
+        diagnostics.push(prUrl ? `- Created PR: ${prUrl}` : "- gh pr create succeeded but no URL detected");
+
+        if (prUrl) {
+          try {
+            deleteIdempotencyKey(claimedLeaseKey);
+          } catch {
+            // ignore
+          }
+          this.invalidateIssuePrResolution(issueNumber);
+          return { prUrl, diagnostics: diagnostics.join("\n") };
+        }
+      } catch (e: any) {
+        const failureText = e?.message ?? String(e);
+        diagnostics.push(`- gh pr create failed: ${failureText}`);
+        const policy = classifyPrCreateFailurePolicy({ evidence: [failureText] });
+        if (policy.classification === "non-retriable") {
+          try {
+            deleteIdempotencyKey(claimedLeaseKey);
+          } catch {
+            // ignore
+          }
+          const terminalRun = await this.escalateMissingPrWithPolicyReason({
+            task,
+            issueNumber,
+            botBranch,
+            reason: policy.reason,
+            blockedSource: policy.blockedSource,
+            latestOutput: failureText,
+            prRecoveryDiagnostics: diagnostics.join("\n"),
+            sessionId: task["session-id"]?.trim() || undefined,
+          });
+          return { prUrl: null, diagnostics: diagnostics.join("\n"), terminalRun };
+        }
+        if (policy.classification !== "transient") break;
+      }
+
+      try {
+        const list = await ghRead(this.repo)`gh pr list --repo ${this.repo} --head ${branch} --json url --limit 1`.quiet();
+        const data = JSON.parse(list.stdout.toString());
+        const url = data?.[0]?.url as string | undefined;
+        if (url) {
+          diagnostics.push(`- Found PR after create attempt: ${url}`);
+          this.invalidateIssuePrResolution(issueNumber);
+          return { prUrl: url, diagnostics: diagnostics.join("\n") };
+        }
+      } catch (e: any) {
+        diagnostics.push(`- Post-attempt gh pr list failed: ${e?.message ?? String(e)}`);
+      }
     }
 
     try {
@@ -2356,7 +2709,7 @@ export class RepoWorker {
       const data = JSON.parse(list.stdout.toString());
       const url = data?.[0]?.url as string | undefined;
       if (url) {
-        diagnostics.push(`- Found PR after create attempt: ${url}`);
+        diagnostics.push(`- Found PR after recovery retries: ${url}`);
         this.invalidateIssuePrResolution(issueNumber);
         return { prUrl: url, diagnostics: diagnostics.join("\n") };
       }
@@ -2364,8 +2717,15 @@ export class RepoWorker {
       diagnostics.push(`- Final gh pr list failed: ${e?.message ?? String(e)}`);
     }
 
+    try {
+      deleteIdempotencyKey(claimedLeaseKey);
+    } catch {
+      // ignore
+    }
+
     diagnostics.push("- No PR URL recovered");
-    return { prUrl: null, diagnostics: diagnostics.join("\n") };
+    diagnostics.push(formatPrEvidenceCauseCodeLine("UNKNOWN"));
+    return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "UNKNOWN" };
   }
 
   private async getPullRequestChecks(
@@ -2530,8 +2890,6 @@ export class RepoWorker {
 
   private recordMissingPrEvidence(params: {
     task: AgentTask;
-    issueNumber: string;
-    botBranch: string;
     reason: string;
     blockedSource?: string;
     diagnostics?: string;
@@ -2561,11 +2919,11 @@ export class RepoWorker {
         `Issue: ${params.task.issue}`,
         `Worktree: ${worktreePath}`,
         "",
-        "Suggested recovery commands:",
+        "Orchestrator recovery checks:",
         `git -C \"${worktreePath}\" status`,
         `git -C \"${worktreePath}\" branch --show-current`,
-        `git -C \"${worktreePath}\" push -u origin HEAD`,
-        `gh pr create --base ${params.botBranch} --fill --body \"Fixes #${params.issueNumber}\"`,
+        `git -C \"${worktreePath}\" rev-parse HEAD`,
+        "Ralph orchestrator then pushes the branch and creates/reuses the PR.",
         params.diagnostics ? "" : null,
         params.diagnostics ? "Diagnostics:" : null,
         params.diagnostics ?? null,
@@ -3919,6 +4277,8 @@ export class RepoWorker {
       repo: this.repo,
       outcome: "success",
       sessionId: mergeGate.sessionId,
+      pr: mergeGate.prUrl,
+      completionKind: "pr",
       surveyResults: surveyResult.output,
     };
   }
@@ -4065,6 +4425,8 @@ export class RepoWorker {
       repo: this.repo,
       outcome: "success",
       sessionId: mergeGate.sessionId,
+      pr: mergeGate.prUrl,
+      completionKind: "pr",
       surveyResults: surveyResult.output,
     };
   }
@@ -4275,6 +4637,7 @@ export class RepoWorker {
     task: AgentTask;
     prUrl?: string | null;
     completionKind?: "pr" | "verified";
+    noPrTerminalReason?: NoPrTerminalReason;
     sessionId: string;
     startTime: Date;
     surveyResults?: string;
@@ -4291,6 +4654,7 @@ export class RepoWorker {
       task,
       prUrl,
       completionKind,
+      noPrTerminalReason,
       sessionId,
       startTime,
       surveyResults,
@@ -4304,7 +4668,16 @@ export class RepoWorker {
       logMessage,
     } = params;
     const resolvedPrUrl = prUrl ?? undefined;
-    const resolvedCompletionKind = completionKind ?? (resolvedPrUrl ? "pr" : "verified");
+    const resolvedCompletionKind = completionKind ?? (resolvedPrUrl ? "pr" : undefined);
+    if (!resolvedCompletionKind) {
+      throw new Error("finalizeTaskSuccess requires explicit completionKind when prUrl is absent");
+    }
+    if (resolvedCompletionKind === "pr" && !resolvedPrUrl) {
+      throw new Error("finalizeTaskSuccess completionKind=pr requires prUrl");
+    }
+    if (resolvedCompletionKind === "verified" && !noPrTerminalReason) {
+      throw new Error("finalizeTaskSuccess completionKind=verified requires explicit noPrTerminalReason");
+    }
     const resolvedWorktreePath = worktreePath ?? task["worktree-path"]?.trim();
     const resolvedWorkerId = workerId ?? task["worker-id"]?.trim();
     const resolvedRepoSlot = repoSlot ?? task["repo-slot"]?.trim();
@@ -4360,6 +4733,7 @@ export class RepoWorker {
       sessionId,
       pr: resolvedPrUrl,
       completionKind: resolvedCompletionKind,
+      noPrTerminalReason,
     };
   }
 
@@ -4604,6 +4978,8 @@ export class RepoWorker {
       taskName: task.name,
       repo: this.repo,
       outcome: "success",
+      completionKind: "verified",
+      noPrTerminalReason: "ISSUE_CLOSED_UPSTREAM",
     };
   }
 
@@ -4697,6 +5073,7 @@ export class RepoWorker {
       task: params.task,
       prUrl: null,
       completionKind: "verified",
+      noPrTerminalReason: "PARENT_VERIFICATION_NO_PR",
       sessionId: params.sessionId || params.task["session-id"]?.trim() || "parent-verify-no-pr",
       startTime: params.startTime,
       cacheKey: `parent-verify-${params.cacheKey}`,

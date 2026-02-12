@@ -230,13 +230,15 @@ describe("run context helpers", () => {
         gate: "pr_evidence",
         status: "fail",
         skipReason: "missing pr_url",
+        reason: "cause_code=UNKNOWN",
       },
     ]);
     expect(artifacts.length).toBe(1);
     expect(String(artifacts[0]?.content ?? "")).toContain("Missing PR evidence");
+    expect(String(artifacts[0]?.content ?? "")).toContain("PR_EVIDENCE_CAUSE_CODE=UNKNOWN");
   });
 
-  test("withRunContext allows verified success without PR evidence", async () => {
+  test("withRunContext allows verified success only with explicit terminal reason", async () => {
     let completedOutcome: any = null;
     const gateWrites: Array<any> = [];
 
@@ -266,7 +268,7 @@ describe("run context helpers", () => {
         },
         upsertRunGateResult: (params) => gateWrites.push(params),
         recordRunGateArtifact: () => {},
-        buildRunDetails: () => ({ completionKind: "verified" }),
+        buildRunDetails: () => ({ completionKind: "verified", noPrTerminalReason: "PARENT_VERIFICATION_NO_PR" }),
         getPinnedOpencodeProfileName: () => null,
         refreshRalphRunTokenTotals: async () => {},
         getRalphRunTokenTotals: () => null,
@@ -279,6 +281,58 @@ describe("run context helpers", () => {
     });
 
     expect(completedOutcome).toBe("success");
-    expect(gateWrites).toEqual([]);
+    expect(gateWrites).toEqual([
+      {
+        runId: "run-5",
+        gate: "pr_evidence",
+        status: "skipped",
+        skipReason: "parent_verification_no_pr",
+        reason: "terminal_reason=PARENT_VERIFICATION_NO_PR",
+      },
+    ]);
+  });
+
+  test("withRunContext rejects implicit verified completion with no terminal reason", async () => {
+    let completedOutcome: any = null;
+
+    await withRunContext({
+      task: {
+        _path: "orchestration/tasks/6",
+        name: "Task 6",
+        issue: "3mdistal/ralph#6",
+      } as any,
+      attemptKind: "process" satisfies RalphRunAttemptKind,
+      run: async () => ({ outcome: "success" }),
+      ports: {
+        repo: "3mdistal/ralph",
+        getActiveRunId: () => null,
+        setActiveRunId: () => {},
+        baseSession: makeSessionAdapter(),
+        createRunRecordingSessionAdapter: ({ base }) => base,
+        createContextRecoveryAdapter: (base) => base,
+        withDashboardContext: async (_context, runner) => await runner(),
+        withSessionAdapters: async (_next, runner) => await runner(),
+        buildDashboardContext: () => ({ repo: "3mdistal/ralph" }) as DashboardEventContext,
+        publishDashboardEvent: () => {},
+        createRunRecord: () => "run-6",
+        ensureRunGateRows: () => {},
+        completeRun: (params) => {
+          completedOutcome = params.outcome;
+        },
+        upsertRunGateResult: () => {},
+        recordRunGateArtifact: () => {},
+        buildRunDetails: () => ({ completionKind: "verified" }),
+        getPinnedOpencodeProfileName: () => null,
+        refreshRalphRunTokenTotals: async () => {},
+        getRalphRunTokenTotals: () => null,
+        listRalphRunSessionTokenTotals: () => [],
+        appendFile: async () => {},
+        existsSync: () => false,
+        computeAndStoreRunMetrics: async () => {},
+        warn: () => {},
+      },
+    });
+
+    expect(completedOutcome).toBe("escalated");
   });
 });

@@ -1,4 +1,4 @@
-import { getConfig, getRepoAutoQueueConfig } from "../config";
+import { getConfig, getRepoAutoQueueConfig, getRepoPath } from "../config";
 import { resolveGitHubToken } from "../github-auth";
 import { GitHubClient, splitRepoFullName } from "../github/client";
 import { mutateIssueLabels } from "../github/label-mutation";
@@ -11,6 +11,7 @@ import { resolveRelationshipSignals } from "../github/relationship-signals";
 import { logRelationshipDiagnostics } from "../github/relationship-diagnostics";
 import { canActOnTask, isHeartbeatStale } from "../ownership";
 import { shouldLog } from "../logging";
+import { getRalphWorktreesDir } from "../paths";
 import {
   addIssueLabel as addIssueLabelIo,
   addIssueLabels as addIssueLabelsIo,
@@ -18,10 +19,13 @@ import {
   removeIssueLabel as removeIssueLabelIo,
 } from "../github/issue-label-io";
 import {
+  clearTaskOpState,
   getIssueLabels,
   getIssueStatusTransitionRecord,
   getIssueSnapshotByNumber,
   getTaskOpStateByPath,
+  hasDurableOpState,
+  listOrphanedTasksWithOpState,
   recordIssueStatusTransition,
   getRepoLabelSchemeState,
   listIssueSnapshotsWithRalphLabels,
@@ -35,6 +39,7 @@ import {
   type IssueSnapshot,
   type TaskOpState,
 } from "../state";
+import { computeTaskWorktreeCandidates, pruneManagedWorktreeBestEffort, type WorktreePruneResult } from "../worktree-prune";
 import type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "../queue/types";
 import { computeStaleInProgressRecovery, deriveTaskView, planClaim, statusToRalphLabelDelta, type LabelOp } from "./core";
 import { deriveRalphStatus, shouldDebounceOppositeStatusTransition, type LabelTransitionState } from "./core";
@@ -97,6 +102,11 @@ type GitHubQueueDeps = {
   now?: () => Date;
   io?: GitHubQueueIO;
   relationshipsProviderFactory?: (repo: string) => IssueRelationshipProvider;
+  pruneWorktree?: (params: {
+    repo: string;
+    repoPath: string;
+    worktreePath: string;
+  }) => Promise<WorktreePruneResult>;
 };
 
 const recentStatusTransitions = new Map<string, LabelTransitionState>();
@@ -257,7 +267,12 @@ function buildTaskOpStateMap(repo: string): Map<number, TaskOpState> {
   const map = new Map<number, TaskOpState>();
   for (const state of listTaskOpStatesByRepo(repo)) {
     if (typeof state.issueNumber !== "number") continue;
-    if (!map.has(state.issueNumber)) {
+    const existing = map.get(state.issueNumber);
+    if (!existing) {
+      map.set(state.issueNumber, state);
+      continue;
+    }
+    if (!hasDurableOpState(existing) && hasDurableOpState(state)) {
       map.set(state.issueNumber, state);
     }
   }
@@ -419,6 +434,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     deps?.relationshipsProviderFactory ?? ((repo: string) => new GitHubRelationshipProvider(repo));
   let lastSweepAt = 0;
   let lastClosedSweepAt = 0;
+  let lastOrphanSweepAt = 0;
   let stopRequested = false;
   let watchTimer: ReturnType<typeof setTimeout> | null = null;
   let watchInFlight = false;
@@ -434,6 +450,18 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     const suffix = reason ? ` (${reason})` : "";
     console.warn(`[ralph:queue:github] Repo unschedulable; skipping ${repo}${suffix}`);
   };
+
+  const pruneWorktree =
+    deps?.pruneWorktree ??
+    (async (params: { repo: string; repoPath: string; worktreePath: string }): Promise<WorktreePruneResult> => {
+      const config = getConfig();
+      return await pruneManagedWorktreeBestEffort({
+        repoPath: params.repoPath,
+        worktreePath: params.worktreePath,
+        managedRoot: getRalphWorktreesDir(),
+        devDir: config.devDir,
+      });
+    });
 
 
   const maybeSweepClosedIssues = async (): Promise<void> => {
@@ -729,6 +757,92 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     }
   };
 
+  const maybeSweepOrphanedOpState = async (): Promise<void> => {
+    const nowMs = getNowMs(deps);
+    if (nowMs - lastOrphanSweepAt < SWEEP_INTERVAL_MS) return;
+    lastOrphanSweepAt = nowMs;
+    const ttlMs = getConfig().ownershipTtlMs;
+
+    for (const repo of getConfig().repos.map((entry) => entry.name)) {
+      const skip = shouldSkipRepo(repo);
+      if (skip.skip) {
+        warnSkipRepo(repo, skip.details);
+        continue;
+      }
+
+      const repoPath = getRepoPath(repo);
+      const orphans = listOrphanedTasksWithOpState(repo);
+      if (orphans.length === 0) continue;
+
+      let cleared = 0;
+      let raceSkipped = 0;
+      let skippedFresh = 0;
+      let skippedOpenPr = 0;
+      let pruned = 0;
+      let pruneUnsafe = 0;
+      let pruneFailures = 0;
+
+      for (const orphan of orphans) {
+        if (stopRequested) return;
+
+        if (orphan.orphanReason === "no-ralph-labels" && !isHeartbeatStale(orphan.heartbeatAt ?? undefined, nowMs, ttlMs)) {
+          skippedFresh += 1;
+          continue;
+        }
+
+        if (orphan.orphanReason === "closed" && typeof orphan.issueNumber === "number") {
+          const openPrs = listOpenPrCandidatesForIssue(repo, orphan.issueNumber);
+          if (openPrs.length > 0) {
+            skippedOpenPr += 1;
+            continue;
+          }
+        }
+
+        const candidates = computeTaskWorktreeCandidates({
+          repo,
+          issueNumber: orphan.issueNumber,
+          taskPath: orphan.taskPath,
+          repoSlot: orphan.repoSlot,
+          recordedWorktreePath: orphan.worktreePath,
+        });
+
+        for (const path of candidates) {
+          const pruneResult = await pruneWorktree({ repo, repoPath, worktreePath: path });
+          if (!pruneResult.attempted) {
+            pruneUnsafe += 1;
+            continue;
+          }
+          if (pruneResult.pruned) pruned += 1;
+          else pruneFailures += 1;
+        }
+
+        const clearResult = clearTaskOpState({
+          repo,
+          taskPath: orphan.taskPath,
+          status: "queued",
+          releasedAtMs: nowMs,
+          releasedReason: orphan.orphanReason === "closed" ? "orphan:closed" : "orphan:no-ralph-labels",
+          expectedDaemonId: orphan.daemonId ?? null,
+          expectedHeartbeatAt: orphan.heartbeatAt ?? null,
+        });
+
+        if (clearResult.cleared) {
+          cleared += 1;
+        } else if (clearResult.raceSkipped) {
+          raceSkipped += 1;
+        }
+      }
+
+      if (cleared + raceSkipped + skippedFresh + skippedOpenPr > 0) {
+        console.warn(
+          `[ralph:queue:github] Orphan sweep ${repo}: cleared=${cleared} raceSkipped=${raceSkipped} ` +
+            `skippedFresh=${skippedFresh} skippedOpenPr=${skippedOpenPr} pruned=${pruned} ` +
+            `pruneUnsafe=${pruneUnsafe} pruneFailures=${pruneFailures}`
+        );
+      }
+    }
+  };
+
   const buildTasksForRepo = (repo: string): AgentTask[] => {
     const nowIso = getNowIso(deps);
     const opStateByIssue = buildTaskOpStateMap(repo);
@@ -737,7 +851,8 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     for (const issue of issues) {
       const opState = opStateByIssue.get(issue.number);
       const hasStatusLabel = issue.labels.some((label) => label.toLowerCase().startsWith(RALPH_STATUS_LABEL_PREFIX));
-      if (!hasStatusLabel && !opState) continue;
+      const hasOpState = hasDurableOpState(opState);
+      if (!hasStatusLabel && !hasOpState) continue;
       tasks.push(deriveTaskView({ issue, opState, nowIso }));
     }
     return tasks;
@@ -747,6 +862,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
     if (shouldRunSweeps()) {
       await maybeSweepClosedIssues();
       await maybeSweepStaleInProgress();
+      await maybeSweepOrphanedOpState();
     }
 
     const tasks: AgentTask[] = [];
@@ -774,6 +890,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       }
 
       await maybeSweepStaleInProgress();
+      await maybeSweepOrphanedOpState();
       return await listTasksByStatus("queued");
     },
     startWatching: (onChange: QueueChangeHandler): void => {

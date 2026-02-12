@@ -4,7 +4,12 @@ import type { RunSessionOptionsBase, SessionResult } from "../session";
 import type { SessionAdapter } from "../run-recording-session-adapter";
 import type { RalphRunAttemptKind, RalphRunDetails, RalphRunOutcome } from "../state";
 import { parseIssueRef } from "../github/issue-ref";
-import { evaluatePrEvidenceCompletion } from "../gates/pr-evidence-gate";
+import {
+  evaluatePrEvidenceCompletion,
+  formatPrEvidenceCauseCodeLine,
+  isNoPrTerminalReason,
+  normalizePrEvidenceCauseCode,
+} from "../gates/pr-evidence-gate";
 
 import type { WorkerDashboardEventInput } from "./events";
 
@@ -48,8 +53,9 @@ type WithRunContextPorts<TResult extends { outcome?: string }> = {
   upsertRunGateResult: (params: {
     runId: string;
     gate: "pr_evidence";
-    status: "pass" | "fail";
+    status: "pass" | "fail" | "skipped";
     skipReason?: string | null;
+    reason?: string | null;
     prNumber?: number | null;
     prUrl?: string | null;
   }) => void;
@@ -81,22 +87,38 @@ function extractPrNumber(prUrl: string | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function buildMissingPrEvidenceNote(params: { task: AgentTask; repo: string; runId: string }): string {
-  const issueRef = parseIssueRef(params.task.issue, params.repo);
-  const issueNumber = issueRef?.number ?? null;
+function buildMissingPrEvidenceNote(params: {
+  task: AgentTask;
+  repo: string;
+  runId: string;
+  causeCode: string;
+}): string {
   const worktreePath = params.task["worktree-path"]?.trim() || "(unknown)";
-  const fixesLine = issueNumber ? `Fixes #${issueNumber}` : `Fixes ${params.task.issue}`;
   return [
     "Missing PR evidence for issue-linked success completion.",
     `run_id: ${params.runId}`,
     `issue: ${params.task.issue}`,
     `worktree: ${worktreePath}`,
+    formatPrEvidenceCauseCodeLine(params.causeCode),
     "",
-    "Suggested recovery:",
+    "Orchestrator recovery checks:",
     `- git -C \"${worktreePath}\" status`,
     `- git -C \"${worktreePath}\" branch --show-current`,
-    `- git -C \"${worktreePath}\" push -u origin HEAD`,
-    `- gh pr create --base bot/integration --fill --body \"${fixesLine}\"`,
+    `- git -C \"${worktreePath}\" rev-parse HEAD`,
+    "- Ralph orchestrator then pushes the branch and creates/reuses the PR.",
+  ].join("\n");
+}
+
+function buildNoPrTerminalReasonNote(params: {
+  task: AgentTask;
+  runId: string;
+  terminalReason: string;
+}): string {
+  return [
+    "Issue-linked success completed via explicit no-PR terminal reason.",
+    `run_id: ${params.runId}`,
+    `issue: ${params.task.issue}`,
+    `terminal_reason: ${params.terminalReason}`,
   ].join("\n");
 }
 
@@ -294,6 +316,8 @@ export async function withRunContext<TResult extends { outcome?: string }>(param
       completionKind: runDetails?.completionKind ?? null,
       issueLinked,
       prUrl: runDetails?.prUrl ?? null,
+      noPrTerminalReason: runDetails?.noPrTerminalReason ?? null,
+      causeCode: runDetails?.prEvidenceCauseCode ?? null,
     });
 
     const finalDetails: RalphRunDetails = { ...(runDetails ?? {}) };
@@ -303,8 +327,13 @@ export async function withRunContext<TResult extends { outcome?: string }>(param
       finalDetails.reasonCode = completionDecision.reasonCode;
     }
 
-    if (attemptedOutcome === "success" && issueLinked && runDetails?.completionKind !== "verified") {
+    if (completionDecision.causeCode && !finalDetails.prEvidenceCauseCode) {
+      finalDetails.prEvidenceCauseCode = completionDecision.causeCode;
+    }
+
+    if (attemptedOutcome === "success" && issueLinked) {
       const prUrl = runDetails?.prUrl?.trim() || null;
+      const terminalReason = runDetails?.noPrTerminalReason?.trim() || null;
       try {
         if (prUrl) {
           params.ports.upsertRunGateResult({
@@ -314,18 +343,43 @@ export async function withRunContext<TResult extends { outcome?: string }>(param
             prUrl,
             prNumber: extractPrNumber(prUrl),
           });
-        } else {
+        } else if (terminalReason && isNoPrTerminalReason(terminalReason)) {
           params.ports.upsertRunGateResult({
             runId,
             gate: "pr_evidence",
-            status: "fail",
-            skipReason: "missing pr_url",
+            status: "skipped",
+            skipReason: terminalReason.toLowerCase(),
+            reason: `terminal_reason=${terminalReason}`,
           });
           params.ports.recordRunGateArtifact({
             runId,
             gate: "pr_evidence",
             kind: "note",
-            content: buildMissingPrEvidenceNote({ task: params.task, repo: params.ports.repo, runId }),
+            content: buildNoPrTerminalReasonNote({
+              task: params.task,
+              runId,
+              terminalReason,
+            }),
+          });
+        } else {
+          const causeCode = normalizePrEvidenceCauseCode(runDetails?.prEvidenceCauseCode ?? completionDecision.causeCode ?? null);
+          params.ports.upsertRunGateResult({
+            runId,
+            gate: "pr_evidence",
+            status: "fail",
+            skipReason: "missing pr_url",
+            reason: `cause_code=${causeCode}`,
+          });
+          params.ports.recordRunGateArtifact({
+            runId,
+            gate: "pr_evidence",
+            kind: "note",
+            content: buildMissingPrEvidenceNote({
+              task: params.task,
+              repo: params.ports.repo,
+              runId,
+              causeCode,
+            }),
           });
         }
       } catch (error: any) {

@@ -1,3 +1,5 @@
+import type { DurableStateCapabilityVerdict } from "./durable-state-capability";
+
 export type StatusQueueSnapshot = {
   backend: string;
   health: string;
@@ -64,6 +66,19 @@ export type StatusBlockedTask = StatusTaskBase & {
   blockedDetailsSnippet: string | null;
 };
 
+export type StatusOrphanTask = {
+  repo: string;
+  issue: string;
+  taskPath: string;
+  reason: "closed" | "no-ralph-labels";
+  issueState: string | null;
+  labels: string[];
+  heartbeatAt: string | null;
+  daemonId: string | null;
+  repoSlot: string | null;
+  worktreePath: string | null;
+};
+
 export type StatusDaemonSnapshot = {
   daemonId: string | null;
   pid: number | null;
@@ -110,9 +125,17 @@ export type StatusSnapshot = {
   durableState?: {
     ok: boolean;
     code?: string;
+    verdict?: DurableStateCapabilityVerdict;
+    canReadState?: boolean;
+    canWriteState?: boolean;
+    requiresMigration?: boolean;
     message?: string;
     schemaVersion?: number;
+    minReadableSchema?: number;
+    maxReadableSchema?: number;
+    maxWritableSchema?: number;
     supportedRange?: string;
+    writableRange?: string;
   };
   queue: StatusQueueSnapshot;
   parity?: StatusQueueParitySnapshot;
@@ -130,8 +153,19 @@ export type StatusSnapshot = {
   queued: StatusTaskBase[];
   throttled: StatusThrottledTask[];
   blocked: StatusBlockedTask[];
+  orphans?: StatusOrphanTask[];
   drain: StatusDrainSnapshot;
 };
+
+const normalizeOrphanTask = (task: StatusOrphanTask): StatusOrphanTask => ({
+  ...task,
+  issueState: normalizeOptionalString(task.issueState),
+  heartbeatAt: normalizeOptionalString(task.heartbeatAt),
+  daemonId: normalizeOptionalString(task.daemonId),
+  repoSlot: normalizeOptionalString(task.repoSlot),
+  worktreePath: normalizeOptionalString(task.worktreePath),
+  labels: Array.isArray(task.labels) ? task.labels.map((label) => String(label ?? "").trim()).filter(Boolean) : [],
+});
 
 const normalizeOptionalString = (value?: string | null): string | null => {
   if (typeof value !== "string") return null;
@@ -191,16 +225,55 @@ const normalizeInProgressTask = (task: StatusInProgressTask): StatusInProgressTa
 export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
   const desiredMode = normalizeOptionalString(input.desiredMode);
   const durableState = input.durableState
-    ? {
+    ? (() => {
+        const verdict =
+          input.durableState.verdict === "readable_writable" ||
+          input.durableState.verdict === "readable_readonly_forward_newer" ||
+          input.durableState.verdict === "unreadable_forward_incompatible" ||
+          input.durableState.verdict === "unreadable_invariant_failure"
+            ? input.durableState.verdict
+            : undefined;
+        const canReadState =
+          typeof input.durableState.canReadState === "boolean"
+            ? input.durableState.canReadState
+            : input.durableState.ok === true;
+        const canWriteState =
+          typeof input.durableState.canWriteState === "boolean"
+            ? input.durableState.canWriteState
+            : input.durableState.ok === true && verdict !== "readable_readonly_forward_newer";
+        const requiresMigration =
+          typeof input.durableState.requiresMigration === "boolean"
+            ? input.durableState.requiresMigration
+            : !canWriteState;
+
+        return {
         ok: input.durableState.ok === true,
         code: normalizeOptionalString(input.durableState.code) ?? undefined,
+        verdict,
         message: normalizeOptionalString(input.durableState.message) ?? undefined,
+        canReadState,
+        canWriteState,
+        requiresMigration,
         schemaVersion:
           typeof input.durableState.schemaVersion === "number" && Number.isFinite(input.durableState.schemaVersion)
             ? Math.floor(input.durableState.schemaVersion)
             : undefined,
+        minReadableSchema:
+          typeof input.durableState.minReadableSchema === "number" && Number.isFinite(input.durableState.minReadableSchema)
+            ? Math.floor(input.durableState.minReadableSchema)
+            : undefined,
+        maxReadableSchema:
+          typeof input.durableState.maxReadableSchema === "number" && Number.isFinite(input.durableState.maxReadableSchema)
+            ? Math.floor(input.durableState.maxReadableSchema)
+            : undefined,
+        maxWritableSchema:
+          typeof input.durableState.maxWritableSchema === "number" && Number.isFinite(input.durableState.maxWritableSchema)
+            ? Math.floor(input.durableState.maxWritableSchema)
+            : undefined,
         supportedRange: normalizeOptionalString(input.durableState.supportedRange) ?? undefined,
-      }
+        writableRange: normalizeOptionalString(input.durableState.writableRange) ?? undefined,
+      };
+      })()
     : undefined;
   return {
     ...input,
@@ -208,6 +281,7 @@ export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
     durableState,
     daemonLiveness: normalizeDaemonLiveness(input.daemonLiveness),
     blocked: input.blocked.map(normalizeBlockedTask),
+    orphans: input.orphans?.map(normalizeOrphanTask),
     inProgress: input.inProgress.map(normalizeInProgressTask),
     starting: input.starting.map(normalizeTaskBase),
     queued: input.queued.map(normalizeTaskBase),

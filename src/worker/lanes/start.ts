@@ -10,6 +10,8 @@ import { summarizeForNote } from "../run-notes";
 import { parseIssueRef } from "../../github/issue-ref";
 import { classifyOpencodeFailure } from "../../opencode-error-classifier";
 import { derivePrCreateEscalationReason } from "../pr-create-escalation-reason";
+import { classifyPrCreateFailurePolicy, computePrCreateRetryBackoffMs } from "../pr-create-policy";
+import type { PrEvidenceCauseCode } from "../../gates/pr-evidence-gate";
 import { deleteIdempotencyKey } from "../../state";
 import { writeDxSurveyToGitHubIssues } from "../../github/dx-survey-writeback";
 import { applyTaskPatch } from "../task-patch";
@@ -25,6 +27,7 @@ export type StartLaneDeps = any;
 const ANOMALY_BURST_THRESHOLD = 50;
 const MAX_ANOMALY_ABORTS = 3;
 const PR_CREATE_CONFLICT_WAIT_MS = 2 * 60_000;
+const PR_CREATE_RETRY_CAP_MS = 60_000;
 
 export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: StartTaskOptions): Promise<AgentRun> {
   return await (async function (this: StartLaneDeps): Promise<AgentRun> {
@@ -517,9 +520,9 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               `An open PR already exists for this issue: ${existingPr.selectedUrl}.`,
               "Do NOT create a new PR.",
               "Fix any failing checks and push updates to the existing PR branch.",
-              "Only paste a PR URL if it changes.",
+              "Ralph orchestrator will keep using the existing PR.",
             ].join(" ")
-          : `Proceed with implementation. Target your PR to the \`${botBranch}\` branch.`;
+          : `Proceed with implementation. Do NOT create a PR; Ralph orchestrator creates PRs targeting '${botBranch}'.`;
 
         if (existingPr.selectedUrl) {
           console.log(
@@ -591,6 +594,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           selectPrUrl({ output: buildResult.output, repo: this.repo, prUrl: buildResult.prUrl })
         );
         let prRecoveryDiagnostics = "";
+        let prRecoveryCauseCode: PrEvidenceCauseCode | null = null;
 
         const prCreateEvidence: string[] = [];
         const addPrCreateEvidence = (output: unknown): void => {
@@ -598,6 +602,20 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           if (normalized) prCreateEvidence.push(normalized);
         };
         addPrCreateEvidence(buildResult.output);
+
+        if (!prUrl) {
+          const capabilityBlocked = await this.checkPrCreateCapability({
+            task,
+            stage: "build",
+            issueNumber,
+            botBranch,
+            sessionId: buildResult.sessionId,
+            latestOutput: String(buildResult.output ?? ""),
+            prRecoveryDiagnostics,
+            repoPath: taskRepoPath,
+          });
+          if (capabilityBlocked) return capabilityBlocked;
+        }
 
         if (!prUrl) {
           const recovered = await this.tryEnsurePrFromWorktree({
@@ -609,6 +627,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           });
           if (recovered.terminalRun) return recovered.terminalRun;
           prRecoveryDiagnostics = recovered.diagnostics;
+          prRecoveryCauseCode = recovered.causeCode ?? prRecoveryCauseCode;
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
 
@@ -778,6 +797,22 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
                 break;
               }
 
+              const selfHealed = await this.trySelfHealPrCreateLeaseAfterConflict({
+                task,
+                issueNumber,
+                botBranch,
+                sessionId: buildResult.sessionId,
+                existingCreatedAt: lease.existingCreatedAt,
+                stage: "build",
+              });
+              prRecoveryDiagnostics = [prRecoveryDiagnostics, `PR-create lease self-heal: ${selfHealed.note}`]
+                .filter(Boolean)
+                .join("\n\n");
+              if (selfHealed.claimed) {
+                prCreateLeaseKey = selfHealed.key;
+                continue;
+              }
+
               const throttled = await this.throttleForPrCreateConflict({
                 task,
                 issueNumber,
@@ -801,15 +836,55 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
             console.log(`[ralph:worker:${this.repo}] pr_mode=create lease=${lease.key}`);
           }
 
+          const policy = classifyPrCreateFailurePolicy({
+            evidence: [buildResult.output, ...prCreateEvidence],
+            opencodeClassification: classifyOpencodeFailure(buildResult.output),
+          });
+          await this.markPrCreatePolicyState(task, {
+            "pr-create-last-class": policy.classification,
+            "pr-create-last-at": new Date().toISOString(),
+            "pr-create-attempts": String(continueAttempts),
+            "pr-create-first-at":
+              ((task as unknown as Record<string, string | undefined>)["pr-create-first-at"]?.trim() ||
+                new Date().toISOString()),
+          });
+          if (policy.classification === "non-retriable") {
+            return await this.escalateMissingPrWithPolicyReason({
+              task,
+              issueNumber,
+              botBranch,
+              reason: policy.reason,
+              blockedSource: policy.blockedSource,
+              latestOutput: String(buildResult.output ?? ""),
+              prRecoveryDiagnostics,
+              sessionId: buildResult.sessionId,
+            });
+          }
+
+          if (policy.classification === "transient") {
+            const backoffMs = computePrCreateRetryBackoffMs({ attempt: continueAttempts + 1, capMs: PR_CREATE_RETRY_CAP_MS });
+            prRecoveryDiagnostics = [
+              prRecoveryDiagnostics,
+              `Transient PR-create failure classified; backing off ${Math.round(backoffMs / 1000)}s before retry`,
+            ]
+              .filter(Boolean)
+              .join("\n\n");
+            if (backoffMs > 0) await this.sleepMs(backoffMs);
+          }
+
           continueAttempts++;
           console.log(
-            `[ralph:worker:${this.repo}] No PR URL found; requesting PR creation (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
+            `[ralph:worker:${this.repo}] No PR URL found; requesting branch-evidence refresh (attempt ${continueAttempts}/${MAX_CONTINUE_RETRIES})`
           );
 
           const pausedBuildContinue = await this.pauseIfHardThrottled(task, "build continue", buildResult.sessionId);
           if (pausedBuildContinue) return pausedBuildContinue;
 
-          const nudge = this.buildPrCreationNudge(botBranch, issueNumber, task.issue);
+          const nudge = this.buildPrRecoveryNudge({
+            botBranch,
+            issueRef: task.issue,
+            latestOutput: buildResult.output,
+          });
           const buildContinueRunLogPath = await this.recordRunLogPath(task, issueNumber, "build continue", "in-progress");
 
             buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
@@ -849,6 +924,23 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               return await this.handleStallTimeout(task, cacheKey, "build-continue", buildResult);
             }
 
+            const failedPolicy = classifyPrCreateFailurePolicy({
+              evidence: [buildResult.output, ...prCreateEvidence],
+              opencodeClassification: classifyOpencodeFailure(buildResult.output),
+            });
+            if (failedPolicy.classification === "non-retriable") {
+              return await this.escalateMissingPrWithPolicyReason({
+                task,
+                issueNumber,
+                botBranch,
+                reason: failedPolicy.reason,
+                blockedSource: failedPolicy.blockedSource,
+                latestOutput: String(buildResult.output ?? ""),
+                prRecoveryDiagnostics,
+                sessionId: buildResult.sessionId,
+              });
+            }
+
             const recovered = await this.tryEnsurePrFromWorktree({
               task,
               issueNumber,
@@ -859,6 +951,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
             if (recovered.terminalRun) return recovered.terminalRun;
 
             prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+            prRecoveryCauseCode = recovered.causeCode ?? prRecoveryCauseCode;
             prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
 
             if (!prUrl) {
@@ -887,13 +980,20 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           });
           if (recovered.terminalRun) return recovered.terminalRun;
           prRecoveryDiagnostics = [prRecoveryDiagnostics, recovered.diagnostics].filter(Boolean).join("\n\n");
+          prRecoveryCauseCode = recovered.causeCode ?? prRecoveryCauseCode;
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
 
         if (!prUrl) {
-          const derived = derivePrCreateEscalationReason({ continueAttempts, evidence: prCreateEvidence });
+          const derived = derivePrCreateEscalationReason({
+            continueAttempts,
+            evidence: prCreateEvidence,
+            fallbackCauseCode: prRecoveryCauseCode,
+          });
           const reason = derived.reason;
           console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+
+          const escalationDetails = [derived.details, buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n");
 
           const wasEscalated = task.status === "escalated";
           const escalated = await this.queue.updateTaskStatus(task, "escalated");
@@ -902,7 +1002,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
           }
           await this.writeEscalationWriteback(task, {
             reason,
-            details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+            details: escalationDetails,
             escalationType: "other",
           });
           await this.notify.notifyEscalation({
@@ -914,14 +1014,14 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
             sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
             reason,
             escalationType: "other",
-            planOutput: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+            planOutput: escalationDetails,
           });
 
           if (escalated && !wasEscalated) {
             await this.recordEscalatedRunNote(task, {
               reason,
               sessionId: buildResult.sessionId || task["session-id"]?.trim() || undefined,
-              details: [buildResult.output, prRecoveryDiagnostics].filter(Boolean).join("\n\n"),
+              details: escalationDetails,
             });
           }
 
@@ -931,6 +1031,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
             outcome: "escalated",
             sessionId: buildResult.sessionId,
             escalationReason: reason,
+            prEvidenceCauseCode: derived.causeCode,
           };
         }
 

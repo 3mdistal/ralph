@@ -11,11 +11,14 @@ import { readRunTokenTotals } from "../status-run-tokens";
 import { formatNowDoingLine } from "../live-status";
 import {
   classifyDurableStateInitError,
+  getDurableStateSchemaWindow,
   initStateDb,
+  isDurableStateInitError,
   listDependencySatisfactionOverrides,
   listIssueAlertSummaries,
   listTopRalphRunTriages,
   probeDurableState,
+  listOrphanedTasksWithOpState,
 } from "../state";
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
@@ -126,6 +129,18 @@ type StatusBaseData = {
   queued: Awaited<ReturnType<typeof getQueuedTasks>>;
   throttled: Awaited<ReturnType<typeof getTasksByStatus>>;
   blockedSorted: Awaited<ReturnType<typeof getTasksByStatus>>;
+  orphans: Array<{
+    repo: string;
+    issue: string;
+    taskPath: string;
+    reason: "closed" | "no-ralph-labels";
+    issueState: string | null;
+    labels: string[];
+    heartbeatAt: string | null;
+    daemonId: string | null;
+    repoSlot: string | null;
+    worktreePath: string | null;
+  }>;
   pendingEscalationsCount: number;
   triageRuns: ReturnType<typeof listTopRalphRunTriages>;
   getAlertSummary: (task: { repo: string; issue: string }) =>
@@ -195,6 +210,20 @@ async function collectBaseStatusData(opts?: { disableGitHubQueueSweeps?: boolean
   });
 
   const tasksForAlerts = [...starting, ...inProgress, ...queued, ...throttled, ...blocked];
+  const orphans = config.repos.flatMap((repo) =>
+    listOrphanedTasksWithOpState(repo.name).map((orphan) => ({
+      repo: orphan.repo,
+      issue: `${orphan.repo}#${orphan.issueNumber ?? "?"}`,
+      taskPath: orphan.taskPath,
+      reason: orphan.orphanReason,
+      issueState: orphan.issueState,
+      labels: orphan.issueLabels,
+      heartbeatAt: orphan.heartbeatAt ?? null,
+      daemonId: orphan.daemonId ?? null,
+      repoSlot: orphan.repoSlot ?? null,
+      worktreePath: orphan.worktreePath ?? null,
+    }))
+  );
   const issuesByRepo = new Map<string, Set<number>>();
   for (const task of tasksForAlerts) {
     const ref = parseIssueRef(task.issue, task.repo);
@@ -246,6 +275,7 @@ async function collectBaseStatusData(opts?: { disableGitHubQueueSweeps?: boolean
     queued,
     throttled,
     blockedSorted,
+    orphans,
     pendingEscalationsCount,
     triageRuns,
     getAlertSummary,
@@ -300,6 +330,7 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
   return buildStatusSnapshot({
     mode: base.mode,
     desiredMode: base.desiredMode,
+    durableState: buildWritableDurableStateSnapshot(),
     queue: {
       backend: base.queueState.backend,
       health: base.queueState.health,
@@ -377,10 +408,71 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
         alerts: base.getAlertSummary(t),
       };
     }),
+    orphans: base.orphans.map((orphan) => ({
+      repo: orphan.repo,
+      issue: orphan.issue,
+      taskPath: orphan.taskPath,
+      reason: orphan.reason,
+      issueState: orphan.issueState,
+      labels: orphan.labels,
+      heartbeatAt: orphan.heartbeatAt,
+      daemonId: orphan.daemonId,
+      repoSlot: orphan.repoSlot,
+      worktreePath: orphan.worktreePath,
+    })),
   });
 }
 
-function buildDegradedStatusSnapshot(reason: ReturnType<typeof classifyDurableStateInitError>): StatusSnapshot {
+function buildDurableStateStatus(reason: ReturnType<typeof probeDurableState>): StatusSnapshot["durableState"] {
+  if (reason.ok) {
+    return {
+      ok: true,
+      verdict: reason.verdict,
+      canReadState: reason.canReadState,
+      canWriteState: reason.canWriteState,
+      requiresMigration: reason.requiresMigration,
+      schemaVersion: reason.schemaVersion,
+      minReadableSchema: reason.minReadableSchema,
+      maxReadableSchema: reason.maxReadableSchema,
+      maxWritableSchema: reason.maxWritableSchema,
+      supportedRange: reason.supportedRange,
+      writableRange: reason.writableRange,
+    };
+  }
+  return {
+    ok: false,
+    code: reason.code,
+    verdict: reason.verdict,
+    canReadState: reason.canReadState,
+    canWriteState: reason.canWriteState,
+    requiresMigration: reason.requiresMigration,
+    message: reason.message,
+    schemaVersion: reason.schemaVersion,
+    minReadableSchema: reason.minReadableSchema,
+    maxReadableSchema: reason.maxReadableSchema,
+    maxWritableSchema: reason.maxWritableSchema,
+    supportedRange: reason.supportedRange,
+    writableRange: reason.writableRange,
+  };
+}
+
+function buildWritableDurableStateSnapshot(): StatusSnapshot["durableState"] {
+  const window = getDurableStateSchemaWindow();
+  return {
+    ok: true,
+    verdict: "readable_writable",
+    canReadState: true,
+    canWriteState: true,
+    requiresMigration: false,
+    minReadableSchema: window.minReadableSchema,
+    maxReadableSchema: window.maxReadableSchema,
+    maxWritableSchema: window.maxWritableSchema,
+    supportedRange: `${window.minReadableSchema}..${window.maxReadableSchema}`,
+    writableRange: `${window.minReadableSchema}..${window.maxWritableSchema}`,
+  };
+}
+
+function buildDegradedStatusSnapshot(reason: ReturnType<typeof probeDurableState>): StatusSnapshot {
   const config = getConfig();
   const queueState = getQueueBackendStateWithLabelHealth();
   const daemonRecord = readDaemonRecord();
@@ -399,13 +491,7 @@ function buildDegradedStatusSnapshot(reason: ReturnType<typeof classifyDurableSt
   return buildStatusSnapshot({
     mode: control.mode,
     desiredMode: control.mode,
-    durableState: {
-      ok: false,
-      code: reason.code,
-      message: reason.message,
-      schemaVersion: reason.schemaVersion,
-      supportedRange: reason.supportedRange,
-    },
+    durableState: buildDurableStateStatus(reason),
     queue: {
       backend: queueState.backend,
       health: queueState.health,
@@ -431,13 +517,74 @@ function buildDegradedStatusSnapshot(reason: ReturnType<typeof classifyDurableSt
   });
 }
 
+function buildDegradedStatusSnapshotForCommand(
+  reason: ReturnType<typeof classifyDurableStateInitError>,
+  drain: StatusDrainState
+): StatusSnapshot {
+  const snapshot = buildDegradedStatusSnapshot(reason);
+  return buildStatusSnapshot({
+    ...snapshot,
+    drain: {
+      requestedAt: drain.requestedAt ? new Date(drain.requestedAt).toISOString() : null,
+      timeoutMs: drain.timeoutMs ?? null,
+      pauseRequested: drain.pauseRequested,
+      pauseAtCheckpoint: drain.pauseAtCheckpoint,
+    },
+  });
+}
+
+function printDegradedStatusText(snapshot: StatusSnapshot): void {
+  console.log(`Mode: ${snapshot.mode}`);
+  if (snapshot.desiredMode && snapshot.desiredMode !== snapshot.mode) {
+    console.log(`Desired mode: ${snapshot.desiredMode}`);
+  }
+
+  const statusTags = [
+    snapshot.queue.health === "degraded" ? "degraded" : null,
+    snapshot.queue.fallback ? "fallback" : null,
+  ].filter(Boolean);
+  const statusSuffix = statusTags.length > 0 ? ` (${statusTags.join(", ")})` : "";
+  console.log(`Queue backend: ${snapshot.queue.backend}${statusSuffix}`);
+  if (snapshot.queue.diagnostics) {
+    console.log(`Queue diagnostics: ${snapshot.queue.diagnostics}`);
+  }
+  if (snapshot.daemon) {
+    const version = snapshot.daemon.version ?? "unknown";
+    console.log(`Daemon: id=${snapshot.daemon.daemonId ?? "unknown"} pid=${snapshot.daemon.pid ?? "unknown"} version=${version}`);
+  }
+  const daemonLivenessLine = snapshot.daemonLiveness ? formatDaemonLivenessLine(snapshot.daemonLiveness) : null;
+  if (daemonLivenessLine) console.log(daemonLivenessLine);
+
+  if (snapshot.durableState?.ok === false) {
+    const reason = snapshot.durableState.code ?? "unknown";
+    console.warn(`Durable state degraded (${reason}): ${snapshot.durableState.message ?? "no details"}`);
+  }
+  console.log("Queue parity: unavailable (durable state degraded)");
+  console.log("Escalations: unavailable (durable state degraded)");
+  console.log("Dependency satisfaction overrides: unavailable (durable state degraded)");
+  console.log("Starting tasks: unavailable");
+  console.log("In-progress tasks: unavailable");
+  console.log("Blocked tasks: unavailable");
+  console.log("Queued tasks: unavailable");
+  console.log("Throttled tasks: unavailable");
+}
+
 export async function getStatusSnapshotBestEffort(): Promise<StatusSnapshot> {
   const probe = probeDurableState();
-  if (!probe.ok) return buildDegradedStatusSnapshot(probe);
+  if (!probe.ok || probe.canWriteState === false) {
+    return buildDegradedStatusSnapshot(probe);
+  }
 
   try {
-    return await getStatusSnapshot();
+    const snapshot = await getStatusSnapshot();
+    return buildStatusSnapshot({
+      ...snapshot,
+      durableState: buildWritableDurableStateSnapshot(),
+    });
   } catch (error) {
+    if (!isDurableStateInitError(error)) {
+      throw error;
+    }
     const reason = classifyDurableStateInitError(error);
     return buildDegradedStatusSnapshot(reason);
   }
@@ -445,12 +592,41 @@ export async function getStatusSnapshotBestEffort(): Promise<StatusSnapshot> {
 
 export async function runStatusCommand(opts: { args: string[]; drain: StatusDrainState }): Promise<void> {
   const json = opts.args.includes("--json");
+  const debug = opts.args.includes("--debug");
+
+  const emitDegradedStatus = (reason: ReturnType<typeof classifyDurableStateInitError>) => {
+    const snapshot = buildDegradedStatusSnapshotForCommand(reason, opts.drain);
+    if (json) {
+      console.log(JSON.stringify(snapshot, null, 2));
+    } else {
+      printDegradedStatusText(snapshot);
+    }
+    process.exit(0);
+  };
+
+  const probe = probeDurableState();
+  if (!probe.ok) {
+    emitDegradedStatus(probe);
+    return;
+  }
 
   // Status reads from the durable SQLite state DB (GitHub issue snapshots, task op
   // state, idempotency). The daemon initializes this during startup, but CLI
   // subcommands need to do it explicitly.
-  initStateDb();
-  const base = await collectBaseStatusData();
+  let base: StatusBaseData;
+  try {
+    initStateDb();
+    if (process.env.RALPH_STATUS_FORCE_INTERNAL_ERROR === "1") {
+      throw new Error("Forced status internal error for contract tests.");
+    }
+    base = await collectBaseStatusData();
+  } catch (error) {
+    if (!isDurableStateInitError(error)) {
+      throw error;
+    }
+    emitDegradedStatus(classifyDurableStateInitError(error));
+    return;
+  }
 
   const profileNames = isOpencodeProfilesEnabled() ? listOpencodeProfileNames() : [];
   const usageRows = await collectStatusUsageRows({
@@ -495,6 +671,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     const snapshot = buildStatusSnapshot({
       mode: base.mode,
       desiredMode: base.desiredMode,
+      durableState: buildWritableDurableStateSnapshot(),
       queue: {
         backend: base.queueState.backend,
         health: base.queueState.health,
@@ -573,6 +750,18 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
           alerts: base.getAlertSummary(t),
         };
       }),
+      orphans: base.orphans.map((orphan) => ({
+        repo: orphan.repo,
+        issue: orphan.issue,
+        taskPath: orphan.taskPath,
+        reason: orphan.reason,
+        issueState: orphan.issueState,
+        labels: orphan.labels,
+        heartbeatAt: orphan.heartbeatAt,
+        daemonId: orphan.daemonId,
+        repoSlot: orphan.repoSlot,
+        worktreePath: orphan.worktreePath,
+      })),
     });
 
     console.log(JSON.stringify(snapshot, null, 2));
@@ -695,6 +884,20 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     console.log(
       `  - ${task.name} (${task.repo}) [${task.priority || "p2-medium"}] reason=${reason}${sourceSuffix}${idleSuffix}${alertSuffix}`
     );
+  }
+
+  if (debug || base.orphans.length > 0) {
+    console.log(`Orphans: ${base.orphans.length}`);
+    for (const orphan of base.orphans) {
+      const labelSuffix = orphan.labels.length > 0 ? ` labels=${orphan.labels.join(",")}` : " labels=(none)";
+      const heartbeatSuffix = orphan.heartbeatAt ? ` heartbeat=${orphan.heartbeatAt}` : " heartbeat=(none)";
+      const daemonSuffix = orphan.daemonId ? ` daemon=${orphan.daemonId}` : "";
+      const slotSuffix = orphan.repoSlot ? ` slot=${orphan.repoSlot}` : "";
+      const worktreeSuffix = orphan.worktreePath ? ` worktree=${orphan.worktreePath}` : "";
+      console.log(
+        `  - ${orphan.issue} reason=${orphan.reason} state=${orphan.issueState ?? "unknown"}${labelSuffix}${heartbeatSuffix}${daemonSuffix}${slotSuffix}${worktreeSuffix}`
+      );
+    }
   }
 
   console.log(`Queued tasks: ${base.queued.length}`);

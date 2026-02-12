@@ -16,7 +16,9 @@ describe("derivePrCreateEscalationReason", () => {
     expect(derived.classification?.blockedSource).toBe("opencode-config-invalid");
     expect(derived.reason).toContain("OpenCode config invalid");
     expect(derived.reason).not.toContain("did not create a PR");
-    expect(derived.details).toContain("No PR URL observed after 5 continue attempts");
+    expect(derived.details).toContain("No PR URL observed after 5 orchestrator PR-recovery attempts");
+    expect(derived.details).toContain("PR_EVIDENCE_CAUSE_CODE=UNKNOWN");
+    expect(derived.causeCode).toBe("UNKNOWN");
   });
 
   test("uses no-PR fallback when no classifier signal exists", () => {
@@ -26,8 +28,9 @@ describe("derivePrCreateEscalationReason", () => {
     });
 
     expect(derived.classification).toBeNull();
-    expect(derived.reason).toBe("Agent completed but did not create a PR after 3 continue attempts");
-    expect(derived.details).toBeUndefined();
+    expect(derived.reason).toBe("No PR URL recovered after 3 orchestrator PR-recovery attempts");
+    expect(derived.details).toBe("PR_EVIDENCE_CAUSE_CODE=UNKNOWN");
+    expect(derived.causeCode).toBe("UNKNOWN");
   });
 
   test("classifies from later continue output in accumulated evidence", () => {
@@ -42,5 +45,26 @@ describe("derivePrCreateEscalationReason", () => {
 
     expect(derived.classification?.blockedSource).toBe("opencode-config-invalid");
     expect(derived.reason).toContain("tool schema rejected");
+    expect(derived.causeCode).toBe("UNKNOWN");
+  });
+
+  test("maps permission-denied evidence to POLICY_DENIED cause code", () => {
+    const derived = derivePrCreateEscalationReason({
+      continueAttempts: 1,
+      evidence: ["permission requested: file.write (/tmp/x); auto-rejecting"],
+    });
+
+    expect(derived.causeCode).toBe("POLICY_DENIED");
+    expect(derived.details).toContain("PR_EVIDENCE_CAUSE_CODE=POLICY_DENIED");
+  });
+
+  test("uses non-retriable policy reason when gh permission denial is detected", () => {
+    const derived = derivePrCreateEscalationReason({
+      continueAttempts: 2,
+      evidence: ["gh pr create failed: Resource not accessible by integration (HTTP 403)"],
+    });
+
+    expect(derived.reason).toContain("Blocked: PR-create capability denied");
+    expect(derived.classification).toBeNull();
   });
 });
