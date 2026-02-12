@@ -94,6 +94,16 @@ test("status --json includes dependency satisfaction overrides", async () => {
   });
 
   const parsed = await runStatusJson();
+  expect(parsed.usage).toBeDefined();
+  expect(Array.isArray(parsed.usage?.profiles)).toBe(true);
+  expect(parsed.durableState).toEqual(
+    expect.objectContaining({
+      ok: true,
+      verdict: "readable_writable",
+      canReadState: true,
+      canWriteState: true,
+    })
+  );
   expect(Array.isArray(parsed.dependencySatisfactionOverrides)).toBe(true);
   expect(parsed.dependencySatisfactionOverrides).toEqual(
     expect.arrayContaining([

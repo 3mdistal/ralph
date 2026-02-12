@@ -21,6 +21,7 @@ const SCHEMA_VERSION = 20;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
+const DEFAULT_PROBE_BUSY_TIMEOUT_MS = 250;
 
 const DURABLE_STATE_SCHEMA_WINDOW: DurableStateSchemaWindow = normalizeSchemaWindow({
   minReadableSchema: MIN_SUPPORTED_SCHEMA_VERSION,
@@ -591,13 +592,21 @@ export function classifyDurableStateInitError(error: unknown): Extract<DurableSt
   };
 }
 
+export function isDurableStateInitError(error: unknown): boolean {
+  const classified = classifyDurableStateInitError(error);
+  return classified.code !== "unknown";
+}
+
 export function probeDurableState(): DurableStateStatus {
   const stateDbPath = getRalphStateDbPath();
   if (!existsSync(stateDbPath)) return buildReadableDurableStateStatus("readable_writable");
 
   let probeDb: Database | null = null;
   try {
+    const busyTimeoutMs =
+      parsePositiveIntEnv("RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS") ?? DEFAULT_PROBE_BUSY_TIMEOUT_MS;
     probeDb = new Database(stateDbPath, { readonly: true });
+    probeDb.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
     const hasMeta = tableExists(probeDb, "meta");
     if (!hasMeta) return buildReadableDurableStateStatus("readable_writable");
 

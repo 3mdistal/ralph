@@ -13,6 +13,7 @@ import {
   classifyDurableStateInitError,
   getDurableStateSchemaWindow,
   initStateDb,
+  isDurableStateInitError,
   listDependencySatisfactionOverrides,
   listIssueAlertSummaries,
   listTopRalphRunTriages,
@@ -516,6 +517,58 @@ function buildDegradedStatusSnapshot(reason: ReturnType<typeof probeDurableState
   });
 }
 
+function buildDegradedStatusSnapshotForCommand(
+  reason: ReturnType<typeof classifyDurableStateInitError>,
+  drain: StatusDrainState
+): StatusSnapshot {
+  const snapshot = buildDegradedStatusSnapshot(reason);
+  return buildStatusSnapshot({
+    ...snapshot,
+    drain: {
+      requestedAt: drain.requestedAt ? new Date(drain.requestedAt).toISOString() : null,
+      timeoutMs: drain.timeoutMs ?? null,
+      pauseRequested: drain.pauseRequested,
+      pauseAtCheckpoint: drain.pauseAtCheckpoint,
+    },
+  });
+}
+
+function printDegradedStatusText(snapshot: StatusSnapshot): void {
+  console.log(`Mode: ${snapshot.mode}`);
+  if (snapshot.desiredMode && snapshot.desiredMode !== snapshot.mode) {
+    console.log(`Desired mode: ${snapshot.desiredMode}`);
+  }
+
+  const statusTags = [
+    snapshot.queue.health === "degraded" ? "degraded" : null,
+    snapshot.queue.fallback ? "fallback" : null,
+  ].filter(Boolean);
+  const statusSuffix = statusTags.length > 0 ? ` (${statusTags.join(", ")})` : "";
+  console.log(`Queue backend: ${snapshot.queue.backend}${statusSuffix}`);
+  if (snapshot.queue.diagnostics) {
+    console.log(`Queue diagnostics: ${snapshot.queue.diagnostics}`);
+  }
+  if (snapshot.daemon) {
+    const version = snapshot.daemon.version ?? "unknown";
+    console.log(`Daemon: id=${snapshot.daemon.daemonId ?? "unknown"} pid=${snapshot.daemon.pid ?? "unknown"} version=${version}`);
+  }
+  const daemonLivenessLine = snapshot.daemonLiveness ? formatDaemonLivenessLine(snapshot.daemonLiveness) : null;
+  if (daemonLivenessLine) console.log(daemonLivenessLine);
+
+  if (snapshot.durableState?.ok === false) {
+    const reason = snapshot.durableState.code ?? "unknown";
+    console.warn(`Durable state degraded (${reason}): ${snapshot.durableState.message ?? "no details"}`);
+  }
+  console.log("Queue parity: unavailable (durable state degraded)");
+  console.log("Escalations: unavailable (durable state degraded)");
+  console.log("Dependency satisfaction overrides: unavailable (durable state degraded)");
+  console.log("Starting tasks: unavailable");
+  console.log("In-progress tasks: unavailable");
+  console.log("Blocked tasks: unavailable");
+  console.log("Queued tasks: unavailable");
+  console.log("Throttled tasks: unavailable");
+}
+
 export async function getStatusSnapshotBestEffort(): Promise<StatusSnapshot> {
   const probe = probeDurableState();
   if (!probe.ok || probe.canWriteState === false) {
@@ -529,6 +582,9 @@ export async function getStatusSnapshotBestEffort(): Promise<StatusSnapshot> {
       durableState: buildWritableDurableStateSnapshot(),
     });
   } catch (error) {
+    if (!isDurableStateInitError(error)) {
+      throw error;
+    }
     const reason = classifyDurableStateInitError(error);
     return buildDegradedStatusSnapshot(reason);
   }
@@ -538,11 +594,39 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   const json = opts.args.includes("--json");
   const debug = opts.args.includes("--debug");
 
+  const emitDegradedStatus = (reason: ReturnType<typeof classifyDurableStateInitError>) => {
+    const snapshot = buildDegradedStatusSnapshotForCommand(reason, opts.drain);
+    if (json) {
+      console.log(JSON.stringify(snapshot, null, 2));
+    } else {
+      printDegradedStatusText(snapshot);
+    }
+    process.exit(0);
+  };
+
+  const probe = probeDurableState();
+  if (!probe.ok) {
+    emitDegradedStatus(probe);
+    return;
+  }
+
   // Status reads from the durable SQLite state DB (GitHub issue snapshots, task op
   // state, idempotency). The daemon initializes this during startup, but CLI
   // subcommands need to do it explicitly.
-  initStateDb();
-  const base = await collectBaseStatusData();
+  let base: StatusBaseData;
+  try {
+    initStateDb();
+    if (process.env.RALPH_STATUS_FORCE_INTERNAL_ERROR === "1") {
+      throw new Error("Forced status internal error for contract tests.");
+    }
+    base = await collectBaseStatusData();
+  } catch (error) {
+    if (!isDurableStateInitError(error)) {
+      throw error;
+    }
+    emitDegradedStatus(classifyDurableStateInitError(error));
+    return;
+  }
 
   const profileNames = isOpencodeProfilesEnabled() ? listOpencodeProfileNames() : [];
   const usageRows = await collectStatusUsageRows({

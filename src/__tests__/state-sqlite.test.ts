@@ -11,6 +11,7 @@ import {
   createRalphRun,
   createNewRollupBatch,
   classifyDurableStateInitError,
+  isDurableStateInitError,
   deleteIdempotencyKey,
   ensureRalphRunGateRows,
   getIdempotencyPayload,
@@ -57,6 +58,8 @@ import { acquireGlobalTestLock } from "./helpers/test-lock";
 let homeDir: string;
 let priorStateDbPath: string | undefined;
 let priorMigrationBusyTimeoutMs: string | undefined;
+let priorProbeBusyTimeoutMs: string | undefined;
+let priorBackupBeforeMigrate: string | undefined;
 let priorBackupDir: string | undefined;
 let releaseLock: (() => void) | null = null;
 
@@ -64,11 +67,15 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
   beforeEach(async () => {
     priorStateDbPath = process.env.RALPH_STATE_DB_PATH;
     priorMigrationBusyTimeoutMs = process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
+    priorProbeBusyTimeoutMs = process.env.RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS;
+    priorBackupBeforeMigrate = process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
     priorBackupDir = process.env.RALPH_STATE_DB_BACKUP_DIR;
     releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
     delete process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
+    delete process.env.RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS;
+    delete process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
     delete process.env.RALPH_STATE_DB_BACKUP_DIR;
     closeStateDbForTests();
   });
@@ -87,6 +94,16 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         delete process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS;
       } else {
         process.env.RALPH_STATE_DB_MIGRATION_BUSY_TIMEOUT_MS = priorMigrationBusyTimeoutMs;
+      }
+      if (priorProbeBusyTimeoutMs === undefined) {
+        delete process.env.RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS;
+      } else {
+        process.env.RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS = priorProbeBusyTimeoutMs;
+      }
+      if (priorBackupBeforeMigrate === undefined) {
+        delete process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE;
+      } else {
+        process.env.RALPH_STATE_DB_BACKUP_BEFORE_MIGRATE = priorBackupBeforeMigrate;
       }
       if (priorBackupDir === undefined) {
         delete process.env.RALPH_STATE_DB_BACKUP_DIR;
@@ -180,6 +197,9 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     const locked = classifyDurableStateInitError(new Error("state.sqlite migration lock timeout after 3000ms."));
     expect(locked.code).toBe("lock_timeout");
+
+    expect(isDurableStateInitError(new Error("state.sqlite migration lock timeout after 3000ms."))).toBe(true);
+    expect(isDurableStateInitError(new Error("boom"))).toBe(false);
   });
 
   test("backs up state.sqlite before migration", async () => {
@@ -368,6 +388,32 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     closeStateDbForTests();
     try {
       expect(() => initStateDb()).toThrow(/migration lock timeout/);
+    } finally {
+      lockDb.exec("ROLLBACK");
+      lockDb.close();
+    }
+  });
+
+  test("probeDurableState reports lock timeout under exclusive lock", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '1')");
+    } finally {
+      db.close();
+    }
+
+    const lockDb = new Database(dbPath);
+    lockDb.exec("BEGIN EXCLUSIVE");
+    process.env.RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS = "1";
+
+    try {
+      const probe = probeDurableState();
+      expect(probe.ok).toBeFalse();
+      if (!probe.ok) {
+        expect(probe.code).toBe("lock_timeout");
+      }
     } finally {
       lockDb.exec("ROLLBACK");
       lockDb.close();
