@@ -34,6 +34,37 @@ function runRalphctl(args: string[], env: NodeJS.ProcessEnv): { status: number |
   };
 }
 
+function parseStatusJson(stdout: string): Record<string, any> {
+  const jsonStart = stdout.indexOf("{");
+  if (jsonStart < 0) throw new Error(`status output missing json payload: ${stdout}`);
+  return JSON.parse(stdout.slice(jsonStart)) as Record<string, any>;
+}
+
+function seedSchemaVersion(stateDbPath: string, version: number): void {
+  const db = new Database(stateDbPath);
+  try {
+    db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    db.exec("DELETE FROM meta WHERE key = 'schema_version'");
+    db.exec(`INSERT INTO meta(key, value) VALUES ('schema_version', '${version}')`);
+  } finally {
+    db.close();
+  }
+}
+
+function readSchemaVersion(stateDbPath: string): number | null {
+  const db = new Database(stateDbPath, { readonly: true });
+  try {
+    const row = db
+      .query("SELECT value FROM meta WHERE key = 'schema_version' LIMIT 1")
+      .get() as { value?: string | number | null } | undefined;
+    if (!row || row.value == null) return null;
+    const value = Number(row.value);
+    return Number.isFinite(value) ? value : null;
+  } finally {
+    db.close();
+  }
+}
+
 describe("ralphctl status degraded mode", () => {
   test("status --json exposes writable capability on fresh state", async () => {
     const homeDir = await mkdtemp(join(tmpdir(), "ralph-status-cli-home-"));
@@ -41,9 +72,7 @@ describe("ralphctl status degraded mode", () => {
     try {
       const result = runRalphctl(["status", "--json"], buildIsolatedEnv(homeDir, xdgStateHome));
       expect(result.status).toBe(0);
-      const jsonStart = result.stdout.indexOf("{");
-      expect(jsonStart).toBeGreaterThanOrEqual(0);
-      const parsed = JSON.parse(result.stdout.slice(jsonStart)) as Record<string, any>;
+      const parsed = parseStatusJson(result.stdout);
       expect(parsed.durableState?.ok).toBeTrue();
       expect(parsed.durableState?.verdict).toBe("readable_writable");
       expect(parsed.durableState?.canReadState).toBeTrue();
@@ -75,7 +104,7 @@ describe("ralphctl status degraded mode", () => {
     try {
       const result = runRalphctl(["status", "--json"], buildIsolatedEnv(homeDir, xdgStateHome));
       expect(result.status).toBe(0);
-      const parsed = JSON.parse(result.stdout.trim()) as Record<string, any>;
+      const parsed = parseStatusJson(result.stdout);
       expect(parsed.mode).toBeString();
       expect(parsed.inProgress).toEqual([]);
       expect(parsed.queued).toEqual([]);
@@ -113,9 +142,7 @@ describe("ralphctl status degraded mode", () => {
     try {
       const result = runRalphctl(["status", "--json"], buildIsolatedEnv(homeDir, xdgStateHome));
       expect(result.status).toBe(0);
-      const jsonStart = result.stdout.indexOf("{");
-      expect(jsonStart).toBeGreaterThanOrEqual(0);
-      const parsed = JSON.parse(result.stdout.slice(jsonStart)) as Record<string, any>;
+      const parsed = parseStatusJson(result.stdout);
       expect(parsed.mode).toBeString();
       expect(parsed.durableState?.ok).toBeTrue();
       expect(parsed.durableState?.verdict).toBe("readable_readonly_forward_newer");
@@ -125,6 +152,92 @@ describe("ralphctl status degraded mode", () => {
       expect(parsed.durableState?.schemaVersion).toBe(forwardNewerSchema);
       expect(parsed.durableState?.maxWritableSchema).toBeNumber();
       expect(parsed.durableState?.maxReadableSchema).toBeNumber();
+    } finally {
+      await rm(homeDir, { recursive: true, force: true });
+      await rm(xdgStateHome, { recursive: true, force: true });
+    }
+  });
+
+  test("status migrates older durable state (old daemon -> newer ctl)", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "ralph-status-cli-home-"));
+    const xdgStateHome = await mkdtemp(join(tmpdir(), "ralph-status-cli-xdg-"));
+    const stateDbPath = join(homeDir, ".ralph", "state.sqlite");
+    const writableSchema = getDurableStateSchemaWindow().maxWritableSchema;
+    await mkdir(join(homeDir, ".ralph"), { recursive: true });
+    seedSchemaVersion(stateDbPath, writableSchema - 1);
+
+    try {
+      const result = runRalphctl(["status", "--json"], buildIsolatedEnv(homeDir, xdgStateHome));
+      expect(result.status).toBe(0);
+      const parsed = parseStatusJson(result.stdout);
+      expect(parsed.durableState?.ok).toBeTrue();
+      expect(parsed.durableState?.verdict).toBe("readable_writable");
+      expect(parsed.durableState?.canWriteState).toBeTrue();
+      expect(readSchemaVersion(stateDbPath)).toBe(writableSchema);
+    } finally {
+      await rm(homeDir, { recursive: true, force: true });
+      await rm(xdgStateHome, { recursive: true, force: true });
+    }
+  });
+
+  test("status resumes after migration lock contention is cleared", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "ralph-status-cli-home-"));
+    const xdgStateHome = await mkdtemp(join(tmpdir(), "ralph-status-cli-xdg-"));
+    const stateDbPath = join(homeDir, ".ralph", "state.sqlite");
+    const writableSchema = getDurableStateSchemaWindow().maxWritableSchema;
+    await mkdir(join(homeDir, ".ralph"), { recursive: true });
+    seedSchemaVersion(stateDbPath, writableSchema - 1);
+
+    const lockDb = new Database(stateDbPath);
+    lockDb.exec("BEGIN EXCLUSIVE");
+    try {
+      const lockedEnv = {
+        ...buildIsolatedEnv(homeDir, xdgStateHome),
+        RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS: "25",
+      };
+      const locked = runRalphctl(["status", "--json"], lockedEnv);
+      expect(locked.status).toBe(0);
+      const degraded = parseStatusJson(locked.stdout);
+      expect(degraded.durableState?.ok).toBeFalse();
+      expect(degraded.durableState?.code).toBe("lock_timeout");
+    } finally {
+      lockDb.exec("ROLLBACK");
+      lockDb.close();
+    }
+
+    try {
+      const resumed = runRalphctl(["status", "--json"], buildIsolatedEnv(homeDir, xdgStateHome));
+      expect(resumed.status).toBe(0);
+      const parsed = parseStatusJson(resumed.stdout);
+      expect(parsed.durableState?.ok).toBeTrue();
+      expect(parsed.durableState?.verdict).toBe("readable_writable");
+      expect(readSchemaVersion(stateDbPath)).toBe(writableSchema);
+    } finally {
+      await rm(homeDir, { recursive: true, force: true });
+      await rm(xdgStateHome, { recursive: true, force: true });
+    }
+  });
+
+  test("pending drain intent remains visible while status triggers migration", async () => {
+    const homeDir = await mkdtemp(join(tmpdir(), "ralph-status-cli-home-"));
+    const xdgStateHome = await mkdtemp(join(tmpdir(), "ralph-status-cli-xdg-"));
+    const stateDbPath = join(homeDir, ".ralph", "state.sqlite");
+    const writableSchema = getDurableStateSchemaWindow().maxWritableSchema;
+    await mkdir(join(homeDir, ".ralph"), { recursive: true });
+    seedSchemaVersion(stateDbPath, writableSchema - 1);
+
+    try {
+      const env = buildIsolatedEnv(homeDir, xdgStateHome);
+      const drain = runRalphctl(["drain", "--timeout", "30s"], env);
+      expect(drain.status).toBe(0);
+
+      const status = runRalphctl(["status", "--json"], env);
+      expect(status.status).toBe(0);
+      const parsed = parseStatusJson(status.stdout);
+      expect(parsed.mode).toBe("draining");
+      expect(parsed.durableState?.ok).toBeTrue();
+      expect(parsed.durableState?.canWriteState).toBeTrue();
+      expect(readSchemaVersion(stateDbPath)).toBe(writableSchema);
     } finally {
       await rm(homeDir, { recursive: true, force: true });
       await rm(xdgStateHome, { recursive: true, force: true });
