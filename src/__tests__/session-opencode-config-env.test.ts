@@ -12,6 +12,9 @@ let homeDir: string;
 let priorHome: string | undefined;
 let priorOverride: string | undefined;
 let priorOpencodeConfigDir: string | undefined;
+let priorTmpdir: string | undefined;
+let priorTmp: string | undefined;
+let priorTemp: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 describe("OpenCode config env", () => {
@@ -19,6 +22,9 @@ describe("OpenCode config env", () => {
     priorHome = process.env.HOME;
     priorOverride = process.env.RALPH_OPENCODE_CONFIG_DIR;
     priorOpencodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
+    priorTmpdir = process.env.TMPDIR;
+    priorTmp = process.env.TMP;
+    priorTemp = process.env.TEMP;
     releaseLock = await acquireGlobalTestLock();
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
@@ -33,6 +39,12 @@ describe("OpenCode config env", () => {
     else delete process.env.RALPH_OPENCODE_CONFIG_DIR;
     if (priorOpencodeConfigDir) process.env.OPENCODE_CONFIG_DIR = priorOpencodeConfigDir;
     else delete process.env.OPENCODE_CONFIG_DIR;
+    if (priorTmpdir) process.env.TMPDIR = priorTmpdir;
+    else delete process.env.TMPDIR;
+    if (priorTmp) process.env.TMP = priorTmp;
+    else delete process.env.TMP;
+    if (priorTemp) process.env.TEMP = priorTemp;
+    else delete process.env.TEMP;
     await rm(homeDir, { recursive: true, force: true });
     releaseLock?.();
     releaseLock = null;
