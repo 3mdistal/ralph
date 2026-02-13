@@ -10,7 +10,12 @@ import type { StatusSnapshot } from "./status-snapshot";
 import { startDashboardTui } from "./dashboard/client/ui-blessed";
 import { formatDaemonLivenessLine } from "./daemon-liveness";
 import { runDoctor } from "./doctor";
-import { getResumptionVerificationSkipReason, isSnapshotDrained, shouldUseGraceDrainFallback } from "./ralphctl-core";
+import {
+  getResumptionVerificationSkipReason,
+  isDurableStateWritable,
+  isSnapshotDrained,
+  shouldUseGraceDrainFallback,
+} from "./ralphctl-core";
 
 const DEFAULT_GRACE_MS = 5 * 60_000;
 const DRAIN_POLL_INTERVAL_MS = 1000;
@@ -32,7 +37,7 @@ function printGlobalHelp(): void {
       "  ralphctl stop [--force]",
       "  ralphctl resume",
       "  ralphctl restart [--grace 5m] [--force] [--start-cmd \"<command>\"]",
-      "  ralphctl upgrade [--grace 5m] [--force] [--start-cmd \"<command>\"] [--upgrade-cmd \"<command>\"]",
+      "  ralphctl upgrade [--grace 5m] [--force] [--start-cmd \"<command>\"] [--upgrade-cmd \"<command>\"] [--sync-self]",
       "",
       "Options:",
       "  -h, --help       Show help",
@@ -44,6 +49,7 @@ function printGlobalHelp(): void {
       "  --pause-at-checkpoint <name>  Pause workers at checkpoint while draining",
       "  --start-cmd <cmd>             Override daemon start command",
       "  --upgrade-cmd <cmd>           Command to run before restart",
+      "  --sync-self                   Pull latest Ralph in daemon repo before restart",
       "  --force          Proceed with kill even when safety checks fail",
     ].join("\n")
   );
@@ -93,7 +99,7 @@ function printCommandHelp(command: string): void {
     case "upgrade":
       console.log([
         "Usage:",
-        "  ralphctl upgrade [--grace 5m] [--force] [--start-cmd \"<command>\"] [--upgrade-cmd \"<command>\"]",
+        "  ralphctl upgrade [--grace 5m] [--force] [--start-cmd \"<command>\"] [--upgrade-cmd \"<command>\"] [--sync-self]",
       ].join("\n"));
       return;
     default:
@@ -315,6 +321,50 @@ async function runUpgradeCommand(command: string[]): Promise<void> {
   });
 }
 
+function inferRepoRootFromDaemonRecord(record: DaemonRecord): string | null {
+  const candidates: string[] = [];
+  const commandPaths = Array.isArray(record.command) ? record.command : [];
+
+  for (const token of commandPaths) {
+    const trimmed = String(token ?? "").trim();
+    if (!trimmed || !trimmed.includes("/")) continue;
+    if (!trimmed.endsWith(".ts") && !trimmed.endsWith(".js")) continue;
+    candidates.push(trimmed.replace(/\/src\/(?:index|ralphctl)\.(?:ts|js)$/i, ""));
+  }
+
+  if (record.cwd?.trim()) candidates.push(record.cwd.trim());
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const out = spawnSync("git", ["-C", candidate, "rev-parse", "--show-toplevel"], { encoding: "utf8" });
+    if (out.status === 0) {
+      const root = (out.stdout ?? "").trim();
+      if (root) return root;
+    }
+  }
+
+  return null;
+}
+
+function buildSelfSyncUpgradeCommand(record: DaemonRecord): string[] {
+  const repoRoot = inferRepoRootFromDaemonRecord(record);
+  if (!repoRoot) {
+    throw new Error(
+      "Unable to infer Ralph git repo for --sync-self; pass --upgrade-cmd explicitly."
+    );
+  }
+  return ["git", "-C", repoRoot, "pull", "--ff-only"];
+}
+
+function describeDurableStateFailure(snapshot: StatusSnapshot): string {
+  const durable = snapshot.durableState;
+  if (!durable) return "durable state unavailable";
+  const verdict = durable.verdict ?? "unknown";
+  const reason = durable.code ? `code=${durable.code}` : `verdict=${verdict}`;
+  const message = durable.message ? `: ${durable.message}` : "";
+  return `${reason}${message}`;
+}
+
 async function stopDaemon(record: DaemonRecord, force: boolean): Promise<void> {
   if (!isPidAlive(record.pid)) {
     console.log("Daemon process not running; skipping stop.");
@@ -383,6 +433,7 @@ async function restartFlow(opts: {
   force: boolean;
   startCmd: string[] | null;
   upgradeCmd: string[] | null;
+  syncSelf: boolean;
 }): Promise<void> {
   const beforeSnapshot = await getStatusSnapshotBestEffort();
 
@@ -423,9 +474,11 @@ async function restartFlow(opts: {
     console.log("No live daemon PID found; continuing restart from stale record metadata.");
   }
 
-  if (opts.upgradeCmd) {
+  const upgradeCmd = opts.upgradeCmd ?? (opts.syncSelf ? buildSelfSyncUpgradeCommand(daemonRecord) : null);
+
+  if (upgradeCmd) {
     console.log("Running upgrade command...");
-    await runUpgradeCommand(opts.upgradeCmd);
+    await runUpgradeCommand(upgradeCmd);
   }
 
   const command = opts.startCmd ?? daemonRecord.command;
@@ -438,6 +491,15 @@ async function restartFlow(opts: {
 
   const newRecord = await waitForDaemonRecordChange(daemonDiscovery.state === "live" ? daemonRecord : null, DAEMON_START_TIMEOUT_MS);
   const afterSnapshot = await getStatusSnapshotBestEffort();
+  if (!isDurableStateWritable(afterSnapshot)) {
+    await stopDaemon(newRecord, true).catch(() => {
+      // best effort fail-closed stop
+    });
+    throw new Error(
+      "Restarted daemon entered non-writable durable state; refusing to run. " +
+        `Details: ${describeDurableStateFailure(afterSnapshot)}`
+    );
+  }
   if (afterSnapshot.mode === "draining") {
     console.warn("Daemon still in draining mode after restart.");
   }
@@ -652,11 +714,12 @@ async function run(): Promise<void> {
     const graceMs = parseDuration(getFlagValue(args, "--grace")) ?? DEFAULT_GRACE_MS;
     const force = hasFlag(args, "--force");
     const startCmd = splitCommandLine(getFlagValue(args, "--start-cmd"));
+    const syncSelf = hasFlag(args, "--sync-self");
     const upgradeCmd = cmd === "upgrade" ? splitCommandLine(getFlagValue(args, "--upgrade-cmd")) : null;
-    if (cmd === "upgrade" && !upgradeCmd) {
+    if (cmd === "upgrade" && !upgradeCmd && !syncSelf) {
       console.warn("No upgrade command provided; performing restart only.");
     }
-    await restartFlow({ graceMs, force, startCmd, upgradeCmd });
+    await restartFlow({ graceMs, force, startCmd, upgradeCmd, syncSelf });
     process.exit(0);
   }
 
