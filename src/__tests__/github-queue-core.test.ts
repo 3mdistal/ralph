@@ -372,6 +372,27 @@ describe("github queue core", () => {
     expect(recovery.shouldRecover).toBe(false);
   });
 
+  test("computeStaleInProgressRecovery ignores blocked op-state", () => {
+    const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
+    const ttlMs = 60_000;
+
+    const recovery = computeStaleInProgressRecovery({
+      labels: ["ralph:status:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 65,
+        taskPath: "github:3mdistal/ralph#65",
+        status: "blocked",
+        heartbeatAt: "2026-01-11T00:00:00.000Z",
+        sessionId: "",
+      },
+      nowMs,
+      ttlMs,
+    });
+
+    expect(recovery.shouldRecover).toBe(false);
+  });
+
   test("deriveTaskView treats released tasks as queued", () => {
     const task = deriveTaskView({
       issue: {

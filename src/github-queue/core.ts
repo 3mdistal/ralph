@@ -178,6 +178,9 @@ export function computeStaleInProgressRecovery(params: {
   graceMs?: number;
 }): { shouldRecover: boolean; reason?: StaleInProgressRecoveryReason } {
   if (!params.labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) return { shouldRecover: false };
+  if ((params.opState?.status ?? "").trim() === "blocked") {
+    return { shouldRecover: false };
+  }
   if (typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs)) {
     return { shouldRecover: false };
   }
