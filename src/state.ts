@@ -17,7 +17,7 @@ import {
   type DurableStateSchemaWindow,
 } from "./durable-state-capability";
 
-const SCHEMA_VERSION = 20;
+const SCHEMA_VERSION = 21;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
@@ -143,7 +143,7 @@ export type IssueAlertSummary = {
 export const PR_STATE_OPEN: PrState = "open";
 export const PR_STATE_MERGED: PrState = "merged";
 
-export type GateName = "preflight" | "product_review" | "devex_review" | "ci" | "pr_evidence";
+export type GateName = "preflight" | "plan_review" | "product_review" | "devex_review" | "ci" | "pr_evidence";
 export type GateStatus = "pending" | "pass" | "fail" | "skipped";
 export type GateArtifactKind = "command_output" | "failure_excerpt" | "note";
 
@@ -173,9 +173,10 @@ export type LoopTriageAttemptState = {
   lastUpdatedAtMs: number;
 };
 
-const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci", "pr_evidence"];
+const GATE_NAMES: GateName[] = ["preflight", "plan_review", "product_review", "devex_review", "ci", "pr_evidence"];
 const GATE_STATUSES: GateStatus[] = ["pending", "pass", "fail", "skipped"];
 const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_excerpt", "note"];
+const GATE_NAME_CHECK_CONSTRAINT_SQL = `CHECK (gate IN (${GATE_NAMES.map((gate) => quoteSqlLiteral(gate)).join(", ")}))`;
 
 const ARTIFACT_MAX_LINES = 200;
 const ARTIFACT_MAX_CHARS = 20_000;
@@ -341,6 +342,127 @@ function addColumnIfMissing(database: Database, tableName: string, columnName: s
   if (!tableExists(database, tableName)) return;
   if (columnExists(database, tableName, columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function gateConstraintIncludes(tableSql: string | null, gateName: GateName): boolean {
+  if (!tableSql) return false;
+  return tableSql.includes(quoteSqlLiteral(gateName));
+}
+
+function requiresGateEnumRepair(database: Database): boolean {
+  if (!tableExists(database, "ralph_run_gate_results") || !tableExists(database, "ralph_run_gate_artifacts")) {
+    return false;
+  }
+  const gateResultsSql = tableCreateSql(database, "ralph_run_gate_results");
+  const gateArtifactsSql = tableCreateSql(database, "ralph_run_gate_artifacts");
+  for (const gateName of GATE_NAMES) {
+    if (!gateConstraintIncludes(gateResultsSql, gateName) || !gateConstraintIncludes(gateArtifactsSql, gateName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function rebuildGateTablesForCurrentGateSet(database: Database): void {
+  const hasReason = columnExists(database, "ralph_run_gate_results", "reason");
+  const resultsInsert = hasReason
+    ? `
+      INSERT INTO ralph_run_gate_results_repaired(
+        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+      )
+      SELECT
+        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+      FROM ralph_run_gate_results;
+    `
+    : `
+      INSERT INTO ralph_run_gate_results_repaired(
+        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+      )
+      SELECT
+        run_id, gate, status, command, skip_reason, NULL, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+      FROM ralph_run_gate_results;
+    `;
+
+  database.exec(`
+    CREATE TABLE ralph_run_gate_results_repaired (
+      run_id TEXT NOT NULL,
+      gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
+      status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
+      command TEXT,
+      skip_reason TEXT,
+      reason TEXT,
+      url TEXT,
+      pr_number INTEGER,
+      pr_url TEXT,
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER,
+      task_path TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, gate),
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+    ${resultsInsert}
+    DROP TABLE ralph_run_gate_results;
+    ALTER TABLE ralph_run_gate_results_repaired RENAME TO ralph_run_gate_results;
+
+    CREATE TABLE ralph_run_gate_artifacts_repaired (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
+      kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
+      content TEXT NOT NULL,
+      truncated INTEGER NOT NULL DEFAULT 0,
+      original_chars INTEGER,
+      original_lines INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+    INSERT INTO ralph_run_gate_artifacts_repaired(
+      id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+    )
+    SELECT
+      id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+    FROM ralph_run_gate_artifacts;
+    DROP TABLE ralph_run_gate_artifacts;
+    ALTER TABLE ralph_run_gate_artifacts_repaired RENAME TO ralph_run_gate_artifacts;
+
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
+      ON ralph_run_gate_results(repo_id, issue_number, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr
+      ON ralph_run_gate_results(repo_id, pr_number);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_artifacts_run
+      ON ralph_run_gate_artifacts(run_id);
+
+    INSERT OR IGNORE INTO ralph_run_gate_results(
+      run_id, gate, status, repo_id, issue_number, task_path, created_at, updated_at
+    )
+    SELECT
+      r.run_id,
+      'plan_review',
+      'pending',
+      r.repo_id,
+      r.issue_number,
+      r.task_path,
+      r.started_at,
+      r.started_at
+    FROM ralph_runs r;
+  `);
+}
+
+function applyGateEnumRepair(database: Database): void {
+  if (!requiresGateEnumRepair(database)) return;
+  if (
+    !tableExists(database, "ralph_run_gate_results") ||
+    !tableExists(database, "ralph_run_gate_artifacts") ||
+    !tableExists(database, "ralph_runs") ||
+    !tableExists(database, "repos")
+  ) {
+    throw formatSchemaInvariantError("gate enum drift detected but required tables are missing and cannot be rebuilt safely");
+  }
+  rebuildGateTablesForCurrentGateSet(database);
 }
 
 type SchemaInvariant =
@@ -857,7 +979,9 @@ function ensureSchema(database: Database, stateDbPath: string): void {
   const hasMetaTable = tableExists(database, "meta");
   const existingVersion = hasMetaTable ? readSchemaVersion(database) : null;
   const needsVersionMigration = Boolean(existingVersion && existingVersion < SCHEMA_VERSION);
-  const needsInvariantRepair = !needsVersionMigration && requiresSchemaInvariantRepair(database);
+  const needsSchemaInvariantRepair = !needsVersionMigration && requiresSchemaInvariantRepair(database);
+  const needsGateEnumRepair = !needsVersionMigration && requiresGateEnumRepair(database);
+  const needsInvariantRepair = needsSchemaInvariantRepair || needsGateEnumRepair;
 
   if (existingVersion) {
     const capability = evaluateDurableStateCapability({
@@ -1078,7 +1202,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
         database.exec(`
           CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
             run_id TEXT NOT NULL,
-            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+            gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
             status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
             command TEXT,
             skip_reason TEXT,
@@ -1098,7 +1222,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
-            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+            gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
             kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
             content TEXT NOT NULL,
             truncated INTEGER NOT NULL DEFAULT 0,
@@ -1290,7 +1414,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             database.exec(`
               CREATE TABLE ralph_run_gate_results_new (
                 run_id TEXT NOT NULL,
-                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
                 status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
                 command TEXT,
                 skip_reason TEXT,
@@ -1318,7 +1442,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
               CREATE TABLE ralph_run_gate_artifacts_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
-                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
                 kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
                 content TEXT NOT NULL,
                 truncated INTEGER NOT NULL DEFAULT 0,
@@ -1422,7 +1546,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             database.exec(`
               CREATE TABLE ralph_run_gate_results_repaired (
                 run_id TEXT NOT NULL,
-                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
                 status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
                 command TEXT,
                 skip_reason TEXT,
@@ -1446,7 +1570,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
               CREATE TABLE ralph_run_gate_artifacts_repaired (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
-                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
                 kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
                 content TEXT NOT NULL,
                 truncated INTEGER NOT NULL DEFAULT 0,
@@ -1507,6 +1631,39 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             "CREATE INDEX IF NOT EXISTS idx_repo_github_in_bot_pending_repo_updated " +
               "ON repo_github_in_bot_pending(repo_id, updated_at)"
           );
+        }
+
+        if (existingVersion < 21) {
+          applyGateEnumRepair(database);
+          if (
+            tableExists(database, "ralph_run_gate_results") &&
+            tableExists(database, "ralph_runs") &&
+            tableExists(database, "repos")
+          ) {
+            database.exec(`
+              INSERT OR IGNORE INTO ralph_run_gate_results(
+                run_id, gate, status, repo_id, issue_number, task_path, created_at, updated_at
+              )
+              SELECT
+                r.run_id,
+                'plan_review',
+                'pending',
+                r.repo_id,
+                r.issue_number,
+                r.task_path,
+                r.started_at,
+                r.started_at
+              FROM ralph_runs r;
+            `);
+          }
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 21,
+            checkpoint: "v21-plan-review-gate-record",
+            checksum: sha256Hex("state:migration:v21-plan-review-gate-record"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         recordStateMigrationCheckpoint(database, {
           fromVersion: existingVersion,
@@ -1832,7 +1989,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
 
     CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
       run_id TEXT NOT NULL,
-      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+      gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
       status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
       command TEXT,
       skip_reason TEXT,
@@ -1853,7 +2010,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_id TEXT NOT NULL,
-      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+      gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
       kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
       content TEXT NOT NULL,
       truncated INTEGER NOT NULL DEFAULT 0,
@@ -1996,9 +2153,11 @@ function ensureSchema(database: Database, stateDbPath: string): void {
 
     runMigrationsWithLock(database, () => {
       database.transaction(() => {
-        const neededInvariantRepair = requiresSchemaInvariantRepair(database);
+        const neededSchemaInvariantRepair = requiresSchemaInvariantRepair(database);
+        const neededGateEnumRepair = requiresGateEnumRepair(database);
         applySchemaInvariants(database);
-        if (!neededInvariantRepair) return;
+        applyGateEnumRepair(database);
+        if (!neededSchemaInvariantRepair && !neededGateEnumRepair) return;
 
         ensureStateMigrationTables(database);
         if (backupMetadata && recordedBackupId === null) {
