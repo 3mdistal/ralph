@@ -1,6 +1,6 @@
 import type { StatusSnapshot } from "./status-snapshot";
 
-function isDurableStateWritable(snapshot: StatusSnapshot): boolean {
+export function isDurableStateWritable(snapshot: StatusSnapshot): boolean {
   const durableState = snapshot.durableState;
   if (!durableState) return true;
   if (typeof durableState.canWriteState === "boolean") return durableState.canWriteState;

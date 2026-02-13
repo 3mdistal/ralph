@@ -97,6 +97,7 @@ Assumptions:
    - `ralphctl status --json`
 4. Stop/restart into the new binary.
    - `ralphctl restart --grace 10m`
+   - one-click self-sync + restart: `ralphctl upgrade --grace 10m --sync-self`
    - or `ralphctl upgrade --grace 10m --upgrade-cmd "<your package upgrade command>"`
 5. Verify post-upgrade durable-state capability and migration verdict.
    - `ralphctl status --json > /tmp/ralph-status.after.json`
@@ -108,6 +109,7 @@ Zero-loss invariants:
 
 - Drain intent is persisted in control state even if no live daemon PID is found.
 - Mixed-version readable-only windows remain observable in `status` output.
+- Restart now fails closed if the post-restart daemon cannot write durable state.
 - Migration lock prevents concurrent schema transitions.
 - Recovery path order is deterministic: upgrade-first, then restore-from-backup if still incompatible.
 
