@@ -25,6 +25,8 @@ const lifecycleTimeoutMs = 20_000;
 
 let homeDir: string;
 let priorHome: string | undefined;
+let priorGhToken: string | undefined;
+let priorGithubToken: string | undefined;
 let releaseLock: (() => void) | null = null;
 
 async function writeJson(path: string, obj: unknown): Promise<void> {
@@ -181,8 +183,12 @@ describe("integration-ish harness: full task lifecycle", () => {
   beforeEach(async () => {
     releaseLock = await acquireGlobalTestLock();
     priorHome = process.env.HOME;
+    priorGhToken = process.env.GH_TOKEN;
+    priorGithubToken = process.env.GITHUB_TOKEN;
     homeDir = await mkdtemp(join(tmpdir(), "ralph-home-"));
     process.env.HOME = homeDir;
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
     __resetConfigForTests();
 
     updateTaskStatusMock.mockClear();
@@ -252,6 +258,10 @@ describe("integration-ish harness: full task lifecycle", () => {
 
   afterEach(async () => {
     process.env.HOME = priorHome;
+    if (priorGhToken) process.env.GH_TOKEN = priorGhToken;
+    else delete process.env.GH_TOKEN;
+    if (priorGithubToken) process.env.GITHUB_TOKEN = priorGithubToken;
+    else delete process.env.GITHUB_TOKEN;
     await rm(homeDir, { recursive: true, force: true });
     __resetConfigForTests();
     if (originalGetIssuePrResolution) {
