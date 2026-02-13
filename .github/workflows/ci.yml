@@ -34,7 +34,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Test
-        run: bun test --max-concurrency=1
+        run: bun test src/__tests__/state-sqlite.test.ts && bun test src/__tests__ -t "^(?!.*State SQLite)"
 
       - name: Typecheck
         run: bun run typecheck
