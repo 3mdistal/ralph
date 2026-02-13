@@ -47,6 +47,7 @@ Notes:
 
 - Internal causes (deps blocked, CI failing, merge conflicts, rate limits, etc.) are tracked as internal metadata and surfaced via `bun run status` and/or dashboard, not as multiple GitHub state labels.
 - When local task status is `blocked`, GitHub label reconciliation projects that state as non-queued (currently `ralph:status:in-progress`) so `ralph:status:queued` does not drift against local blocked state.
+- Stale `in-progress` recovery must not auto-requeue tasks whose durable local op-state is `blocked`, even though the projected GitHub label remains `ralph:status:in-progress`.
 
 ### Command labels (operator-owned, ephemeral)
 

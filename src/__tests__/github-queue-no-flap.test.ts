@@ -136,4 +136,74 @@ describe("GitHub queue no-flap stale sweep", () => {
     expect(mutations).toHaveLength(1);
     expect(mutations[0]).toEqual({ add: ["ralph:status:queued"], remove: ["ralph:status:in-progress"] });
   });
+
+  test("keeps in-progress stable for blocked op-state without session id", async () => {
+    await writeJson(getRalphConfigJsonPath(), {
+      queueBackend: "github",
+      ownershipTtlMs: 30_000,
+      repos: [{ name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" }],
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+
+    const stateMod = await import("../state");
+    stateMod.closeStateDbForTests();
+    stateMod.initStateDb();
+
+    const baseNow = new Date("2026-02-03T05:00:00.000Z");
+    const staleHeartbeat = new Date(baseNow.getTime() - 30 * 60_000).toISOString();
+
+    stateMod.recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#711",
+      title: "Blocked Epic",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/711",
+      githubUpdatedAt: baseNow.toISOString(),
+      at: baseNow.toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#711",
+      labels: ["ralph:status:in-progress"],
+      at: baseNow.toISOString(),
+    });
+    stateMod.recordTaskSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#711",
+      taskPath: "github:3mdistal/ralph#711",
+      status: "blocked",
+      sessionId: "",
+      heartbeatAt: staleHeartbeat,
+      at: baseNow.toISOString(),
+    });
+
+    const mutations: Array<{ add: string[]; remove: string[] }> = [];
+
+    const queueMod = await import("../github-queue/io");
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => new Date(baseNow),
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => ["ralph:status:in-progress"],
+        fetchIssue: async () => null,
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async ({ add, remove }) => {
+          mutations.push({ add, remove });
+          return true;
+        },
+      },
+    });
+
+    const queued = await driver.getTasksByStatus("queued");
+    const blocked = await driver.getTasksByStatus("blocked");
+
+    expect(queued).toEqual([]);
+    expect(blocked.map((task) => [task.issue, task.status])).toEqual([["3mdistal/ralph#711", "blocked"]]);
+    expect(mutations).toEqual([]);
+  });
 });
