@@ -457,7 +457,7 @@ export function applyDoctorRepairs(input: {
         details: `Dry run: would write canonical daemon record from ${candidate.path}.`,
         paths: promoteRepair.paths,
       });
-    } else if (canonicalCandidate?.exists) {
+    } else if (canonicalCandidate?.exists && existsSync(canonicalPath)) {
       const canonicalRecord = readDaemonRecordAtPath(canonicalPath);
       if (!canonicalRecord) {
         applied.push({
