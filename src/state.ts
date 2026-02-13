@@ -3745,10 +3745,106 @@ function getRunMeta(runId: string): { repoId: number; issueNumber: number | null
 
 function getRepoIdByName(repo: string): number | null {
   const database = requireDb();
+  return getRepoIdByNameFromDatabase(database, repo);
+}
+
+function getRepoIdByNameFromDatabase(database: Database, repo: string): number | null {
   const row = database.query("SELECT id FROM repos WHERE name = $name").get({
     $name: repo,
   }) as { id?: number } | undefined;
   return row?.id ?? null;
+}
+
+function getRalphRunGateStateFromDatabase(database: Database, runId: string): RalphRunGateState {
+  const results = database
+    .query(
+       `SELECT run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+       FROM ralph_run_gate_results
+       WHERE run_id = $run_id
+       ORDER BY gate ASC`
+    )
+    .all({ $run_id: runId }) as Array<{
+    run_id: string;
+    gate: string;
+    status: string;
+    command?: string | null;
+    skip_reason?: string | null;
+    reason?: string | null;
+    url?: string | null;
+    pr_number?: number | null;
+    pr_url?: string | null;
+    repo_id: number;
+    issue_number?: number | null;
+    task_path?: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+
+  const artifacts = database
+    .query(
+      `SELECT id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+       FROM ralph_run_gate_artifacts
+       WHERE run_id = $run_id
+       ORDER BY id ASC`
+    )
+    .all({ $run_id: runId }) as Array<{
+    id: number;
+    run_id: string;
+    gate: string;
+    kind: string;
+    content: string;
+    truncated: number;
+    original_chars?: number | null;
+    original_lines?: number | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+
+  return {
+    results: results.map((row) => ({
+      runId: row.run_id,
+      gate: assertGateName(row.gate),
+      status: assertGateStatus(row.status),
+      command: row.command ?? null,
+      skipReason: row.skip_reason ?? null,
+      reason: row.reason ?? null,
+      url: row.url ?? null,
+      prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
+      prUrl: row.pr_url ?? null,
+      repoId: row.repo_id,
+      issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
+      taskPath: row.task_path ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+    artifacts: artifacts.map((row) => ({
+      id: row.id,
+      runId: row.run_id,
+      gate: assertGateName(row.gate),
+      kind: assertGateArtifactKind(row.kind),
+      content: row.content,
+      truncated: Boolean(row.truncated),
+      originalChars: typeof row.original_chars === "number" ? row.original_chars : null,
+      originalLines: typeof row.original_lines === "number" ? row.original_lines : null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+  };
+}
+
+function getLatestRunIdForIssueFromDatabase(database: Database, params: { repoId: number; issueNumber: number }): string | null {
+  const row = database
+    .query(
+      `SELECT g.run_id as run_id, MAX(g.updated_at) as updated_at, MAX(r.started_at) as started_at
+       FROM ralph_run_gate_results g
+       JOIN ralph_runs r ON r.run_id = g.run_id
+       WHERE g.repo_id = $repo_id AND g.issue_number = $issue_number
+       GROUP BY g.run_id
+       ORDER BY updated_at DESC, started_at DESC, g.run_id DESC
+       LIMIT 1`
+    )
+    .get({ $repo_id: params.repoId, $issue_number: params.issueNumber }) as { run_id?: string } | undefined;
+  return row?.run_id ?? null;
 }
 
 export function ensureRalphRunGateRows(params: { runId: string; at?: string }): void {
@@ -3939,81 +4035,7 @@ export function recordRalphRunGateArtifact(params: {
 
 export function getRalphRunGateState(runId: string): RalphRunGateState {
   const database = requireDb();
-
-  const results = database
-    .query(
-       `SELECT run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
-       FROM ralph_run_gate_results
-       WHERE run_id = $run_id
-       ORDER BY gate ASC`
-    )
-    .all({ $run_id: runId }) as Array<{
-    run_id: string;
-    gate: string;
-    status: string;
-    command?: string | null;
-    skip_reason?: string | null;
-    reason?: string | null;
-    url?: string | null;
-    pr_number?: number | null;
-    pr_url?: string | null;
-    repo_id: number;
-    issue_number?: number | null;
-    task_path?: string | null;
-    created_at: string;
-    updated_at: string;
-  }>;
-
-  const artifacts = database
-    .query(
-      `SELECT id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
-       FROM ralph_run_gate_artifacts
-       WHERE run_id = $run_id
-       ORDER BY id ASC`
-    )
-    .all({ $run_id: runId }) as Array<{
-    id: number;
-    run_id: string;
-    gate: string;
-    kind: string;
-    content: string;
-    truncated: number;
-    original_chars?: number | null;
-    original_lines?: number | null;
-    created_at: string;
-    updated_at: string;
-  }>;
-
-  return {
-    results: results.map((row) => ({
-      runId: row.run_id,
-      gate: assertGateName(row.gate),
-      status: assertGateStatus(row.status),
-      command: row.command ?? null,
-      skipReason: row.skip_reason ?? null,
-      reason: row.reason ?? null,
-      url: row.url ?? null,
-      prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
-      prUrl: row.pr_url ?? null,
-      repoId: row.repo_id,
-      issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
-      taskPath: row.task_path ?? null,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    })),
-    artifacts: artifacts.map((row) => ({
-      id: row.id,
-      runId: row.run_id,
-      gate: assertGateName(row.gate),
-      kind: assertGateArtifactKind(row.kind),
-      content: row.content,
-      truncated: Boolean(row.truncated),
-      originalChars: typeof row.original_chars === "number" ? row.original_chars : null,
-      originalLines: typeof row.original_lines === "number" ? row.original_lines : null,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    })),
-  };
+  return getRalphRunGateStateFromDatabase(database, runId);
 }
 
 export function getLatestRunGateStateForIssue(params: {
@@ -4023,21 +4045,36 @@ export function getLatestRunGateStateForIssue(params: {
   const database = requireDb();
   const repoId = getRepoIdByName(params.repo);
   if (!repoId) return null;
+  const runId = getLatestRunIdForIssueFromDatabase(database, { repoId, issueNumber: params.issueNumber });
+  if (!runId) return null;
+  return getRalphRunGateStateFromDatabase(database, runId);
+}
 
-  const row = database
-    .query(
-      `SELECT g.run_id as run_id, MAX(g.updated_at) as updated_at, MAX(r.started_at) as started_at
-       FROM ralph_run_gate_results g
-       JOIN ralph_runs r ON r.run_id = g.run_id
-       WHERE g.repo_id = $repo_id AND g.issue_number = $issue_number
-       GROUP BY g.run_id
-       ORDER BY updated_at DESC, started_at DESC, g.run_id DESC
-       LIMIT 1`
-    )
-    .get({ $repo_id: repoId, $issue_number: params.issueNumber }) as { run_id?: string } | undefined;
+export function getLatestRunGateStateForIssueReadonly(params: {
+  repo: string;
+  issueNumber: number;
+}): RalphRunGateState | null {
+  const stateDbPath = getRalphStateDbPath();
+  if (!existsSync(stateDbPath)) return null;
 
-  if (!row?.run_id) return null;
-  return getRalphRunGateState(row.run_id);
+  const database = new Database(stateDbPath, { readonly: true });
+  try {
+    const busyTimeoutMs =
+      parsePositiveIntEnv("RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS") ?? DEFAULT_PROBE_BUSY_TIMEOUT_MS;
+    database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+    if (!tableExists(database, "repos")) return null;
+    if (!tableExists(database, "ralph_run_gate_results")) return null;
+    if (!tableExists(database, "ralph_run_gate_artifacts")) return null;
+    if (!tableExists(database, "ralph_runs")) return null;
+
+    const repoId = getRepoIdByNameFromDatabase(database, params.repo);
+    if (!repoId) return null;
+    const runId = getLatestRunIdForIssueFromDatabase(database, { repoId, issueNumber: params.issueNumber });
+    if (!runId) return null;
+    return getRalphRunGateStateFromDatabase(database, runId);
+  } finally {
+    database.close();
+  }
 }
 
 export function getLatestRunGateStateForPr(params: {
