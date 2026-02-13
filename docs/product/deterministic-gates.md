@@ -104,6 +104,22 @@ Ralph exposes a minimal query surface for the latest persisted gate state:
 
 This reads from `~/.ralph/state.sqlite` and returns the bounded/redacted artifacts stored with the gate records.
 
+JSON contract (`--json`):
+
+- Versioned envelope: `version` (current `2`), `repo`, `issueNumber`, `runId`, `gates`, `artifacts`, `error`.
+- `gates[]` contains latest per-gate state in workflow order (`preflight`, `plan_review`, `product_review`, `devex_review`, `ci`, `pr_evidence`) with:
+  - `name`, `status`, `createdAt`, `updatedAt`, `command`, `skipReason`, `reason`, `url`, `prNumber`, `prUrl`.
+- `artifacts[]` contains bounded artifact records with:
+  - `id`, `gate`, `kind`, `createdAt`, `updatedAt`, `truncated`, `content`.
+- `error` is `null` on success. On durable-state failure, `error` is populated with `code`, `message`, and (when available) schema compatibility fields.
+- Compatibility rule: JSON evolution is additive-only (new optional fields may be added; existing fields and meanings are stable).
+
+Exit behavior:
+
+- `0`: command executed successfully (including "no gate state found").
+- `1`: invalid CLI usage.
+- `2`: durable-state unreadable/degraded for gates query; text mode writes reason to stderr, JSON mode emits a stable envelope with `error` populated.
+
 ## Gate 1: Local Preflight (Fast, Deterministic)
 
 Default: required.
