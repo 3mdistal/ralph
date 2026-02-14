@@ -28,6 +28,17 @@ type GateRow = {
   updatedAt: string;
 };
 
+const EXPECTED_GATES = [
+  "preflight",
+  "plan_review",
+  "product_review",
+  "devex_review",
+  "ci",
+  "pr_evidence",
+] as const satisfies readonly GateName[];
+
+const SORTED_EXPECTED_GATES = [...EXPECTED_GATES].sort();
+
 let homeDir: string;
 let priorStateDbPath: string | undefined;
 let releaseLock: (() => void) | null = null;
@@ -100,7 +111,19 @@ function assertOneRowPerGate(runId: string): void {
       )
       .all({ $run_id: runId }) as Array<{ gate?: string; count?: number }>;
 
-    expect(rows).toHaveLength(6);
+    const totalRow = db
+      .query(
+        `SELECT
+           COUNT(*) as total,
+           COUNT(DISTINCT gate) as distinct_gates
+         FROM ralph_run_gate_results
+         WHERE run_id = $run_id`
+      )
+      .get({ $run_id: runId }) as { total?: number; distinct_gates?: number };
+
+    expect(rows.map((row) => row.gate)).toEqual(SORTED_EXPECTED_GATES);
+    expect(totalRow.total).toBe(EXPECTED_GATES.length);
+    expect(totalRow.distinct_gates).toBe(EXPECTED_GATES.length);
     for (const row of rows) {
       expect(row.count).toBe(1);
     }
@@ -153,8 +176,10 @@ describe("state sqlite restart/recovery gate matrix", () => {
     const ciBefore = beforeRestart.find((row) => row.gate === "ci");
     expect(ciBefore?.status).toBe("fail");
     expect(ciBefore?.reason).toBe("Required checks failed");
+    const createdAtByGate = new Map(beforeRestart.map((row) => [row.gate, row.createdAt]));
 
     restartDb();
+    ensureRalphRunGateRows({ runId, at: "2026-02-14T01:00:03.000Z" });
     upsertRalphRunGateResult(ciPayload);
 
     const afterReplay = readGateRows(runId);
@@ -162,6 +187,17 @@ describe("state sqlite restart/recovery gate matrix", () => {
     expect(ciAfter?.status).toBe("fail");
     expect(ciAfter?.reason).toBe("Required checks failed");
     expect(ciAfter?.url).toContain("actions/runs/7341");
+    expect(ciAfter?.command).toBeNull();
+    expect(ciAfter?.prNumber).toBeNull();
+    expect(ciAfter?.prUrl).toBeNull();
+
+    for (const row of afterReplay) {
+      const beforeCreatedAt = createdAtByGate.get(row.gate);
+      if (!beforeCreatedAt) {
+        throw new Error(`Missing initial created_at for gate ${row.gate}`);
+      }
+      expect(row.createdAt).toBe(beforeCreatedAt);
+    }
 
     assertOneRowPerGate(runId);
   });
