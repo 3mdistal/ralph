@@ -43,6 +43,16 @@ export type DaemonSingletonLock = {
   release: () => void;
 };
 
+export type DaemonIdentitySnapshot = {
+  daemonId: string;
+  pid: number;
+  startedAt: string;
+  command: string[];
+  cwd: string;
+  controlRoot: string;
+  controlFilePath: string;
+};
+
 const DAEMON_RECORD_VERSION = 1;
 const REGISTRY_LOCK_FILE = "daemon-registry.lock";
 const DAEMON_LOCK_FILE = "daemon.lock";
@@ -268,6 +278,36 @@ function normalizeRecord(record: DaemonRecord): DaemonRecord {
   };
 }
 
+function normalizeIdentityText(value: string): string {
+  return value.trim();
+}
+
+function normalizeIdentityPath(value: string): string {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : "";
+}
+
+function normalizeIdentityCommand(command: string[]): string[] {
+  return command.map((token) => token.trim()).filter(Boolean);
+}
+
+export function daemonIdentityMatches(
+  record: Pick<DaemonRecord, "daemonId" | "pid" | "startedAt" | "command" | "cwd" | "controlRoot" | "controlFilePath">,
+  expected: DaemonIdentitySnapshot
+): boolean {
+  if (record.pid !== expected.pid) return false;
+  if (normalizeIdentityText(record.daemonId) !== normalizeIdentityText(expected.daemonId)) return false;
+  if (normalizeIdentityText(record.startedAt) !== normalizeIdentityText(expected.startedAt)) return false;
+  if (normalizeIdentityPath(record.cwd) !== normalizeIdentityPath(expected.cwd)) return false;
+  if (normalizeIdentityPath(record.controlRoot) !== normalizeIdentityPath(expected.controlRoot)) return false;
+  if (normalizeIdentityPath(record.controlFilePath) !== normalizeIdentityPath(expected.controlFilePath)) return false;
+
+  const recordCommand = normalizeIdentityCommand(record.command);
+  const expectedCommand = normalizeIdentityCommand(expected.command);
+  if (recordCommand.length !== expectedCommand.length) return false;
+  return recordCommand.every((token, index) => token === expectedCommand[index]);
+}
+
 export function resolveDaemonRecordPath(opts?: { homeDir?: string; xdgStateHome?: string }): string {
   return resolveCanonicalDaemonRegistryPath({ homeDir: opts?.homeDir });
 }
@@ -328,9 +368,14 @@ export function writeDaemonRecord(
   });
 }
 
-export function touchDaemonRecordHeartbeat(opts?: { homeDir?: string; xdgStateHome?: string }): void {
+export function touchDaemonRecordHeartbeat(opts?: {
+  homeDir?: string;
+  xdgStateHome?: string;
+  expectedIdentity?: DaemonIdentitySnapshot;
+}): boolean {
   const canonicalPath = resolveDaemonRecordPath(opts);
   const nowIso = new Date().toISOString();
+  let updated = false;
   withRegistryWriteLock(canonicalPath, () => {
     if (!existsSync(canonicalPath)) return;
     assertSafeRecordFile(canonicalPath);
@@ -341,11 +386,14 @@ export function touchDaemonRecordHeartbeat(opts?: { homeDir?: string; xdgStateHo
       cwd: process.cwd(),
     });
     if (!current) return;
+    if (opts?.expectedIdentity && !daemonIdentityMatches(current, opts.expectedIdentity)) return;
     writeRecordFile(canonicalPath, {
       ...current,
       heartbeatAt: nowIso,
     });
+    updated = true;
   });
+  return updated;
 }
 
 export function removeDaemonRecord(opts?: { homeDir?: string; xdgStateHome?: string; removeLegacy?: boolean }): void {

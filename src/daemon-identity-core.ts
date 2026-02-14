@@ -2,6 +2,7 @@ export type DaemonIdentityRecord = {
   daemonId: string;
   pid: number;
   startedAt: string;
+  [key: string]: unknown;
 };
 
 export type DaemonIdentityCandidate = {
@@ -26,8 +27,9 @@ export type DaemonIdentityAnalysis<T extends DaemonIdentityCandidate> = {
   primaryLiveCandidate: T | null;
 };
 
-export function buildDaemonIdentityKey(input: { daemonId: string; pid: number }): string {
-  return `${input.daemonId}:${input.pid}`;
+export function buildDaemonIdentityKey(input: { daemonId: string; pid: number; startedAt?: string }): string {
+  const startedAt = typeof input.startedAt === "string" ? input.startedAt.trim() : "";
+  return `${input.daemonId}:${input.pid}:${startedAt}`;
 }
 
 function compareByPreference<T extends DaemonIdentityCandidate>(a: T, b: T): number {
