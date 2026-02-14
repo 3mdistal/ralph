@@ -59,6 +59,8 @@ function buildQueueParitySnapshot(repos: string[]) {
   const perRepo = repos.map((repo) => auditQueueParityForRepo(repo));
   return {
     ghQueuedLocalBlocked: perRepo.reduce((sum, repo) => sum + repo.ghQueuedLocalBlocked, 0),
+    localDepsBlockedGhInProgress: perRepo.reduce((sum, repo) => sum + repo.localDepsBlockedGhInProgress, 0),
+    localDepsBlockedMissingMeta: perRepo.reduce((sum, repo) => sum + repo.localDepsBlockedMissingMeta, 0),
     multiStatusLabels: perRepo.reduce((sum, repo) => sum + repo.multiStatusLabels, 0),
     missingStatusWithOpState: perRepo.reduce((sum, repo) => sum + repo.missingStatusWithOpState, 0),
     repos: perRepo,
@@ -782,7 +784,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
     console.log(`Queue diagnostics: ${base.queueState.diagnostics}`);
   }
   console.log(
-    `Queue parity: ghQueued/localBlocked=${base.parity.ghQueuedLocalBlocked} multiStatus=${base.parity.multiStatusLabels} missingStatus=${base.parity.missingStatusWithOpState}`
+    `Queue parity: ghQueued/localBlocked=${base.parity.ghQueuedLocalBlocked} depsBlockedGhInProgress=${base.parity.localDepsBlockedGhInProgress} depsBlockedMissingMeta=${base.parity.localDepsBlockedMissingMeta} multiStatus=${base.parity.multiStatusLabels} missingStatus=${base.parity.missingStatusWithOpState}`
   );
   if (base.parity.ghQueuedLocalBlocked > 0) {
     const samples = base.parity.repos.flatMap((repo) => repo.sampleGhQueuedLocalBlocked).slice(0, 5);

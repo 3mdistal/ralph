@@ -36,6 +36,7 @@ export const RALPH_LABEL_STATUS_ESCALATED = "ralph:status:escalated";
 export const RALPH_LABEL_STATUS_IN_BOT = "ralph:status:in-bot";
 export const RALPH_LABEL_STATUS_DONE = "ralph:status:done";
 export const RALPH_LABEL_STATUS_STOPPED = "ralph:status:stopped";
+export const RALPH_LABEL_META_BLOCKED = "ralph:meta:blocked";
 
 export const RALPH_LABEL_CMD_QUEUE = `${RALPH_CMD_LABEL_PREFIX}queue`;
 export const RALPH_LABEL_CMD_PAUSE = `${RALPH_CMD_LABEL_PREFIX}pause`;
@@ -51,6 +52,9 @@ export const RALPH_WORKFLOW_LABELS: readonly LabelSpec[] = [
   { name: RALPH_LABEL_STATUS_IN_BOT, color: "0E8A16", description: "Task PR merged to bot/integration" },
   { name: RALPH_LABEL_STATUS_DONE, color: "1A7F37", description: "Task merged to default branch" },
   { name: RALPH_LABEL_STATUS_STOPPED, color: "B60205", description: "Operator cancelled; do not proceed" },
+
+  // Metadata (Ralph-managed, non-status)
+  { name: RALPH_LABEL_META_BLOCKED, color: "C2E0C6", description: "Dependency-blocked; see Ralph blocked status comment" },
 
   // Commands (operator-owned; ephemeral)
   { name: RALPH_LABEL_CMD_QUEUE, color: "C5DEF5", description: "Command: enqueue / re-enqueue" },
