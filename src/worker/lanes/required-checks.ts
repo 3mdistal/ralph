@@ -13,6 +13,16 @@ export type RequiredChecksSummary = {
   available: string[];
 };
 
+export type CiGateEvaluation = {
+  status: "pass" | "pending" | "fail";
+  timedOut: boolean;
+  requiredChecks: string[];
+  required: Array<{ name: string; state: RequiredCheckState; rawState: string; detailsUrl?: string | null }>;
+  missingRequired: string[];
+  availableContexts: string[];
+  representativeUrl: string | null;
+};
+
 export type FailedCheck = {
   name: string;
   state: RequiredCheckState;
@@ -142,6 +152,18 @@ export function __formatRequiredChecksGuidanceForTests(input: RequiredChecksGuid
   return formatRequiredChecksGuidance(input);
 }
 
+export function __evaluateCiGateForTests(params: {
+  allChecks: PrCheck[];
+  requiredChecks: string[];
+  timedOut?: boolean;
+}): CiGateEvaluation {
+  return evaluateCiGate(params);
+}
+
+export function __formatCiGateReasonForTests(evaluation: CiGateEvaluation, maxLen = 400): string {
+  return formatCiGateReason(evaluation, maxLen);
+}
+
 export function __decideBranchProtectionForTests(input: {
   requiredChecks: string[];
   availableChecks: string[];
@@ -249,6 +271,102 @@ export function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: st
   if (allSuccess) return { status: "success", required, available };
 
   return { status: "pending", required, available };
+}
+
+export function evaluateCiGate(params: {
+  allChecks: PrCheck[];
+  requiredChecks: string[];
+  timedOut?: boolean;
+}): CiGateEvaluation {
+  const summary = summarizeRequiredChecks(params.allChecks, params.requiredChecks);
+  const timedOut = Boolean(params.timedOut);
+  const missingRequired = summary.required.filter((check) => check.rawState === "missing").map((check) => check.name);
+  const representativeUrl = summary.required.map((check) => check.detailsUrl).find(Boolean) ?? null;
+
+  let status: CiGateEvaluation["status"];
+  if (summary.status === "success") {
+    status = "pass";
+  } else if (summary.status === "failure") {
+    status = "fail";
+  } else {
+    status = timedOut && params.requiredChecks.length > 0 ? "fail" : "pending";
+  }
+
+  return {
+    status,
+    timedOut,
+    requiredChecks: [...params.requiredChecks],
+    required: summary.required,
+    missingRequired,
+    availableContexts: summary.available,
+    representativeUrl,
+  };
+}
+
+export function evaluateCiGateFromSummary(params: {
+  summary: RequiredChecksSummary;
+  requiredChecks: string[];
+  timedOut?: boolean;
+}): CiGateEvaluation {
+  const timedOut = Boolean(params.timedOut);
+  const missingRequired = params.summary.required
+    .filter((check) => check.rawState === "missing")
+    .map((check) => check.name);
+  const representativeUrl = params.summary.required.map((check) => check.detailsUrl).find(Boolean) ?? null;
+
+  let status: CiGateEvaluation["status"];
+  if (params.summary.status === "success") {
+    status = "pass";
+  } else if (params.summary.status === "failure") {
+    status = "fail";
+  } else {
+    status = timedOut && params.requiredChecks.length > 0 ? "fail" : "pending";
+  }
+
+  return {
+    status,
+    timedOut,
+    requiredChecks: [...params.requiredChecks],
+    required: params.summary.required,
+    missingRequired,
+    availableContexts: params.summary.available,
+    representativeUrl,
+  };
+}
+
+export function formatCiGateReason(evaluation: CiGateEvaluation, maxLen = 400): string {
+  const mapped = evaluation.required.map((check) => `${check.name}:${check.state}`).join(",") || "(none)";
+  const missing = evaluation.missingRequired.join(",") || "(none)";
+  const available = evaluation.availableContexts.join(",") || "(none)";
+  const timedOut = evaluation.timedOut ? "yes" : "no";
+  const reason = `required=${mapped}; status=${evaluation.status}; timed_out=${timedOut}; missing=${missing}; available=${available}`;
+  if (reason.length <= maxLen) return reason;
+  return `${reason.slice(0, Math.max(0, maxLen - 3))}...`;
+}
+
+export function formatCiGateDiagnostics(evaluation: CiGateEvaluation): string {
+  const lines: string[] = [];
+  lines.push("Deterministic CI required-check evaluation");
+  lines.push(`Gate status: ${evaluation.status}`);
+  lines.push(`Timed out: ${evaluation.timedOut ? "yes" : "no"}`);
+  lines.push(`Required checks: ${evaluation.requiredChecks.join(", ") || "(none)"}`);
+
+  lines.push("Required mapping:");
+  if (evaluation.required.length === 0) {
+    lines.push("- (none)");
+  } else {
+    for (const check of evaluation.required) {
+      const details = check.detailsUrl ? ` (${check.detailsUrl})` : "";
+      lines.push(`- ${check.name}: ${check.state} (${check.rawState})${details}`);
+    }
+  }
+
+  lines.push(`Missing required contexts: ${evaluation.missingRequired.join(", ") || "(none)"}`);
+  lines.push(`Available check contexts: ${evaluation.availableContexts.join(", ") || "(none)"}`);
+  lines.push(
+    "Next steps: trigger CI on this branch (push a commit or rerun workflows), or update repos[].requiredChecks (set [] to disable gating)."
+  );
+  return lines.join("\n");
 }
 
 export function applyRequiredChecksJitter(valueMs: number, jitterPct = REQUIRED_CHECKS_JITTER_PCT): number {

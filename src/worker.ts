@@ -8,6 +8,8 @@ export {
   __buildGitRefResponse,
   __buildRepoDefaultBranchResponse,
   __computeRequiredChecksDelayForTests,
+  __evaluateCiGateForTests,
+  __formatCiGateReasonForTests,
   __decideBranchProtectionForTests,
   __formatRequiredChecksGuidanceForTests,
   __isCiOnlyChangeSetForTests,

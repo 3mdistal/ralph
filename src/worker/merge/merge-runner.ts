@@ -102,7 +102,7 @@ export async function mergePrWithRequiredChecks(params: {
   ) => Promise<unknown>;
 
   getPullRequestChecks: (prUrl: string) => Promise<PullRequestChecks>;
-  recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary) => void;
+  recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary, opts?: { timedOut?: boolean }) => void;
   buildIssueContextForAgent: (params: { repo: string; issueNumber: string }) => Promise<string>;
   runReviewAgent: (params: {
     agent: "product" | "devex" | "product-review" | "devex-review" | "general" | "ralph-plan";
@@ -488,7 +488,7 @@ export async function mergePrWithRequiredChecks(params: {
     try {
       const status = await params.getPullRequestChecks(prUrl);
       const summary = summarizeRequiredChecks(status.checks, REQUIRED_CHECKS);
-      params.recordCiGateSummary(prUrl, summary);
+      params.recordCiGateSummary(prUrl, summary, { timedOut: false });
 
       if (status.mergeStateStatus === "DIRTY") {
         const recovery = await params.runMergeConflictRecovery({
@@ -680,7 +680,7 @@ export async function mergePrWithRequiredChecks(params: {
       try {
         const status = await params.getPullRequestChecks(prUrl);
         const summary = summarizeRequiredChecks(status.checks, REQUIRED_CHECKS);
-        params.recordCiGateSummary(prUrl, summary);
+        params.recordCiGateSummary(prUrl, summary, { timedOut: false });
 
         if (status.mergeStateStatus === "DIRTY") {
           source = "merge-conflict";
