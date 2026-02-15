@@ -49,7 +49,7 @@ export async function runCiFailureTriage(
     baseRefName = prStatus.baseRefName;
     const prState = await worker.getPullRequestMergeState(params.prUrl);
     headRefName = prState.headRefName || null;
-    worker.recordCiGateSummary(params.prUrl, summary);
+    worker.recordCiGateSummary(params.prUrl, summary, { timedOut: params.timedOut, requiredChecks: params.requiredChecks });
   } catch (error: any) {
     const reason = `CI triage preflight failed for ${params.prUrl}: ${worker.formatGhError(error)}`;
     console.warn(`[ralph:worker:${worker.repo}] ${reason}`);
@@ -304,7 +304,7 @@ export async function runCiFailureTriage(
     const prStatus = await worker.getPullRequestChecks(params.prUrl);
     summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
     headSha = prStatus.headSha;
-    worker.recordCiGateSummary(params.prUrl, summary);
+    worker.recordCiGateSummary(params.prUrl, summary, { timedOut: false, requiredChecks: params.requiredChecks });
   } catch (error: any) {
     const reason = `Failed to re-check CI status after resume: ${worker.formatGhError(error)}`;
     console.warn(`[ralph:worker:${worker.repo}] ${reason}`);

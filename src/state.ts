@@ -17,7 +17,7 @@ import {
   type DurableStateSchemaWindow,
 } from "./durable-state-capability";
 
-const SCHEMA_VERSION = 21;
+const SCHEMA_VERSION = 22;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
@@ -1665,6 +1665,21 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             appliedAt: nowIso(),
           });
         }
+        if (existingVersion < 22) {
+          addColumnIfMissing(database, "tasks", "blocked_source", "TEXT");
+          addColumnIfMissing(database, "tasks", "blocked_reason", "TEXT");
+          addColumnIfMissing(database, "tasks", "blocked_at", "TEXT");
+          addColumnIfMissing(database, "tasks", "blocked_details", "TEXT");
+          addColumnIfMissing(database, "tasks", "blocked_checked_at", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 22,
+            checkpoint: "v22-tasks-blocked-columns",
+            checksum: sha256Hex("state:migration:v22-tasks-blocked-columns"),
+            backupId,
+            appliedAt: nowIso(),
+          });
+        }
         recordStateMigrationCheckpoint(database, {
           fromVersion: existingVersion,
           toVersion: SCHEMA_VERSION,
@@ -1769,6 +1784,11 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       heartbeat_at TEXT,
       released_at_ms INTEGER,
       released_reason TEXT,
+      blocked_source TEXT,
+      blocked_reason TEXT,
+      blocked_at TEXT,
+      blocked_details TEXT,
+      blocked_checked_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(repo_id, task_path),
@@ -2150,6 +2170,14 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       ON loop_triage_attempts(repo_id, issue_number, last_updated_at_ms);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_state_migration_backups_path ON state_migration_backups(backup_path);
   `);
+
+  // Backstop for mixed/partially-migrated schema 22 states where meta schema_version
+  // may already be 22 but blocked-* columns are still absent on tasks.
+  addColumnIfMissing(database, "tasks", "blocked_source", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_reason", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_at", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_details", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_checked_at", "TEXT");
 
     runMigrationsWithLock(database, () => {
       database.transaction(() => {
@@ -3098,6 +3126,11 @@ export function recordTaskSnapshot(input: {
   heartbeatAt?: string;
   releasedAtMs?: number | null;
   releasedReason?: string | null;
+  blockedSource?: string | null;
+  blockedReason?: string | null;
+  blockedAt?: string | null;
+  blockedDetails?: string | null;
+  blockedCheckedAt?: string | null;
   at?: string;
 }): void {
   const database = requireDb();
@@ -3129,10 +3162,10 @@ export function recordTaskSnapshot(input: {
 
   database
     .query(
-      `INSERT INTO tasks(
-         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, released_at_ms, released_reason, created_at, updated_at
+       `INSERT INTO tasks(
+         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, released_at_ms, released_reason, blocked_source, blocked_reason, blocked_at, blocked_details, blocked_checked_at, created_at, updated_at
        ) VALUES (
-          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $released_at_ms, $released_reason, $created_at, $updated_at
+          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $released_at_ms, $released_reason, $blocked_source, $blocked_reason, $blocked_at, $blocked_details, $blocked_checked_at, $created_at, $updated_at
        )
        ON CONFLICT(repo_id, task_path) DO UPDATE SET
           issue_number = COALESCE(excluded.issue_number, tasks.issue_number),
@@ -3147,6 +3180,11 @@ export function recordTaskSnapshot(input: {
           heartbeat_at = COALESCE(excluded.heartbeat_at, tasks.heartbeat_at),
           released_at_ms = excluded.released_at_ms,
           released_reason = excluded.released_reason,
+          blocked_source = excluded.blocked_source,
+          blocked_reason = excluded.blocked_reason,
+          blocked_at = excluded.blocked_at,
+          blocked_details = excluded.blocked_details,
+          blocked_checked_at = excluded.blocked_checked_at,
           updated_at = excluded.updated_at`
     )
     .run({
@@ -3164,6 +3202,11 @@ export function recordTaskSnapshot(input: {
       $heartbeat_at: input.heartbeatAt ?? null,
       $released_at_ms: typeof input.releasedAtMs === "number" ? input.releasedAtMs : null,
       $released_reason: input.releasedReason ?? null,
+      $blocked_source: input.blockedSource ?? null,
+      $blocked_reason: input.blockedReason ?? null,
+      $blocked_at: input.blockedAt ?? null,
+      $blocked_details: input.blockedDetails ?? null,
+      $blocked_checked_at: input.blockedCheckedAt ?? null,
       $created_at: at,
       $updated_at: at,
     });
@@ -4780,6 +4823,11 @@ export type TaskOpState = {
   heartbeatAt?: string | null;
   releasedAtMs?: number | null;
   releasedReason?: string | null;
+  blockedSource?: string | null;
+  blockedReason?: string | null;
+  blockedAt?: string | null;
+  blockedDetails?: string | null;
+  blockedCheckedAt?: string | null;
 };
 
 export type OrphanedTaskOpState = TaskOpState & {
@@ -5267,7 +5315,9 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
               t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
               t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at,
-              t.released_at_ms as released_at_ms, t.released_reason as released_reason
+              t.released_at_ms as released_at_ms, t.released_reason as released_reason,
+              t.blocked_source as blocked_source, t.blocked_reason as blocked_reason, t.blocked_at as blocked_at,
+              t.blocked_details as blocked_details, t.blocked_checked_at as blocked_checked_at
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
        WHERE r.name = $name AND t.issue_number IS NOT NULL AND t.task_path LIKE 'github:%'
@@ -5286,6 +5336,11 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     heartbeat_at?: string | null;
     released_at_ms?: number | null;
     released_reason?: string | null;
+    blocked_source?: string | null;
+    blocked_reason?: string | null;
+    blocked_at?: string | null;
+    blocked_details?: string | null;
+    blocked_checked_at?: string | null;
   }>;
 
   return rows.map((row) => ({
@@ -5302,6 +5357,11 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     heartbeatAt: row.heartbeat_at ?? null,
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
+    blockedSource: row.blocked_source ?? null,
+    blockedReason: row.blocked_reason ?? null,
+    blockedAt: row.blocked_at ?? null,
+    blockedDetails: row.blocked_details ?? null,
+    blockedCheckedAt: row.blocked_checked_at ?? null,
   }));
 }
 
@@ -5312,7 +5372,9 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
               t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
               t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at,
-              t.released_at_ms as released_at_ms, t.released_reason as released_reason
+              t.released_at_ms as released_at_ms, t.released_reason as released_reason,
+              t.blocked_source as blocked_source, t.blocked_reason as blocked_reason, t.blocked_at as blocked_at,
+              t.blocked_details as blocked_details, t.blocked_checked_at as blocked_checked_at
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
        WHERE r.name = $name AND t.task_path = $task_path`
@@ -5331,6 +5393,11 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
         heartbeat_at?: string | null;
         released_at_ms?: number | null;
         released_reason?: string | null;
+        blocked_source?: string | null;
+        blocked_reason?: string | null;
+        blocked_at?: string | null;
+        blocked_details?: string | null;
+        blocked_checked_at?: string | null;
       }
     | undefined;
 
@@ -5349,6 +5416,11 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     heartbeatAt: row.heartbeat_at ?? null,
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
+    blockedSource: row.blocked_source ?? null,
+    blockedReason: row.blocked_reason ?? null,
+    blockedAt: row.blocked_at ?? null,
+    blockedDetails: row.blocked_details ?? null,
+    blockedCheckedAt: row.blocked_checked_at ?? null,
   };
 }
 

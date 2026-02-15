@@ -41,7 +41,14 @@ import {
 } from "../state";
 import { computeTaskWorktreeCandidates, pruneManagedWorktreeBestEffort, type WorktreePruneResult } from "../worktree-prune";
 import type { AgentTask, QueueChangeHandler, QueueTask, QueueTaskStatus } from "../queue/types";
-import { computeStaleInProgressRecovery, deriveTaskView, planClaim, statusToRalphLabelDelta, type LabelOp } from "./core";
+import {
+  computeStaleInProgressRecovery,
+  deriveTaskView,
+  isDependencyBlocked,
+  planClaim,
+  statusToRalphLabelDelta,
+  type LabelOp,
+} from "./core";
 import { deriveRalphStatus, shouldDebounceOppositeStatusTransition, type LabelTransitionState } from "./core";
 import {
   RALPH_LABEL_STATUS_ESCALATED,
@@ -49,8 +56,10 @@ import {
   RALPH_LABEL_STATUS_PAUSED,
   RALPH_LABEL_STATUS_QUEUED,
   RALPH_LABEL_STATUS_STOPPED,
+  RALPH_LABEL_META_BLOCKED,
   RALPH_STATUS_LABEL_PREFIX,
 } from "../github-labels";
+import { extractDependencyRefs, upsertBlockedComment } from "../github/blocked-comment";
 
 const SWEEP_INTERVAL_MS = 5 * 60_000;
 const WATCH_MIN_INTERVAL_MS = 1000;
@@ -1241,6 +1250,8 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
 
       const nowIso = getNowIso(deps);
       const normalizedExtra = normalizeTaskExtraFields(extraFields);
+      const taskPath = taskObj._path || `github:${issueRef.repo}#${issueRef.number}`;
+      const opState = getTaskOpStateByPath(issueRef.repo, taskPath);
       let issue = resolveIssueSnapshot(issueRef.repo, issueRef.number);
       if (!issue) {
         try {
@@ -1287,7 +1298,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         recordTaskSnapshot({
           repo: issueRef.repo,
           issue: `${issueRef.repo}#${issueRef.number}`,
-          taskPath: taskObj._path || `github:${issueRef.repo}#${issueRef.number}`,
+          taskPath,
           status,
           sessionId: normalizeTaskField(normalizedExtra["session-id"]),
           worktreePath: normalizeTaskField(normalizedExtra["worktree-path"]),
@@ -1295,6 +1306,11 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
           daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
           heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
+          blockedSource: normalizeTaskField(normalizedExtra["blocked-source"]),
+          blockedReason: normalizeTaskField(normalizedExtra["blocked-reason"]),
+          blockedAt: normalizeTaskField(normalizedExtra["blocked-at"]),
+          blockedDetails: normalizeTaskField(normalizedExtra["blocked-details"]),
+          blockedCheckedAt: normalizeTaskField(normalizedExtra["blocked-checked-at"]),
           at: nowIso,
         });
         return true;
@@ -1308,13 +1324,22 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         Boolean(issue?.labels?.includes(RALPH_LABEL_STATUS_STOPPED)) && status !== "stopped" && status !== "done";
       const shouldPreserveLabel = preservePausedLabel || preserveEscalatedLabel || preserveStoppedLabel;
       const currentStatus = issue ? deriveRalphStatus(issue.labels, issue.state) : null;
+      const blockedSource = normalizeTaskField(normalizedExtra["blocked-source"]) ?? opState?.blockedSource?.trim() ?? null;
+      const projectedOpState = { status, blockedSource };
+      const depsBlocked = isDependencyBlocked(projectedOpState);
       const debounceWindowMs = clampNonNegativeInt(
         readEnvNonNegativeInt("RALPH_GITHUB_QUEUE_STATUS_DEBOUNCE_MS", DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS),
         DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS
       );
       const delta = shouldPreserveLabel
         ? { add: [], remove: [] }
-        : (issue ? statusToRalphLabelDelta(status, issue.labels) : { add: [], remove: [] });
+        : (issue ? statusToRalphLabelDelta(status, issue.labels, { opState: projectedOpState }) : { add: [], remove: [] });
+
+      if (issue && !shouldPreserveLabel) {
+        const hasMetaBlocked = issue.labels.includes(RALPH_LABEL_META_BLOCKED);
+        if (depsBlocked && !hasMetaBlocked) delta.add.push(RALPH_LABEL_META_BLOCKED);
+        if (!depsBlocked && hasMetaBlocked) delta.remove.push(RALPH_LABEL_META_BLOCKED);
+      }
       const steps: LabelOp[] = [
         ...delta.add.map((label) => ({ action: "add" as const, label })),
         ...delta.remove.map((label) => ({ action: "remove" as const, label })),
@@ -1401,7 +1426,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       recordTaskSnapshot({
         repo: issueRef.repo,
         issue: `${issueRef.repo}#${issueRef.number}`,
-        taskPath: taskObj._path || `github:${issueRef.repo}#${issueRef.number}`,
+        taskPath,
         status,
         sessionId: normalizeTaskField(normalizedExtra["session-id"]),
         worktreePath: normalizeTaskField(normalizedExtra["worktree-path"]),
@@ -1409,10 +1434,43 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         repoSlot: normalizeTaskField(normalizedExtra["repo-slot"]),
         daemonId: normalizeTaskField(normalizedExtra["daemon-id"]),
         heartbeatAt: normalizeTaskField(normalizedExtra["heartbeat-at"]),
+        blockedSource: normalizeTaskField(normalizedExtra["blocked-source"]),
+        blockedReason: normalizeTaskField(normalizedExtra["blocked-reason"]),
+        blockedAt: normalizeTaskField(normalizedExtra["blocked-at"]),
+        blockedDetails: normalizeTaskField(normalizedExtra["blocked-details"]),
+        blockedCheckedAt: normalizeTaskField(normalizedExtra["blocked-checked-at"]),
         releasedAtMs: status === "in-progress" || status === "starting" || status === "paused" || status === "throttled" ? null : undefined,
         releasedReason: status === "in-progress" || status === "starting" || status === "paused" || status === "throttled" ? null : undefined,
         at: nowIso,
       });
+
+      if (issue && (depsBlocked || issue.labels.includes(RALPH_LABEL_META_BLOCKED))) {
+        try {
+          const reason = normalizeTaskField(normalizedExtra["blocked-reason"]) ?? opState?.blockedReason?.trim() ?? null;
+          const blockedAt = normalizeTaskField(normalizedExtra["blocked-at"]) ?? opState?.blockedAt?.trim() ?? null;
+          const depsRefs = extractDependencyRefs(reason ?? "", issueRef.repo);
+          await upsertBlockedComment({
+            github: await createGitHubClient(issueRef.repo),
+            repo: issueRef.repo,
+            issueNumber: issueRef.number,
+            state: {
+              version: 1,
+              kind: "deps",
+              blocked: depsBlocked,
+              reason,
+              deps: depsRefs,
+              blockedAt,
+              updatedAt: nowIso,
+            },
+          });
+        } catch (error: any) {
+          if (shouldLog(`ralph:queue:github:blocked-comment:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+            console.warn(
+              `[ralph:queue:github] Failed blocked-comment write for ${issueRef.repo}#${issueRef.number}: ${error?.message ?? String(error)}`
+            );
+          }
+        }
+      }
 
       return true;
     },

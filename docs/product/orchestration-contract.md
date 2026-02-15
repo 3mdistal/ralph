@@ -24,7 +24,7 @@ This doc is intended to supersede label/queue semantics in older docs.
 - Ralph never edits non-`ralph:*` labels.
 - Ralph never intentionally sets multiple `ralph:status:*` labels; on any successful reconciliation pass it enforces exactly one status label.
 - Operator intent is expressed only via `ralph:cmd:*` labels + normal GitHub comments.
-- Dependency-blocked is internal-only metadata (not a GitHub-visible status).
+- Dependency-blocked projects as `ralph:status:queued` (not `ralph:status:in-progress`) and is made GitHub-visible via structured blocked metadata (and optional non-status meta label).
 - Ralph scheduling must not depend on GitHub label writes (degraded mode must continue safely).
 - Ralph-generated PRs target `bot/integration`; humans review rollups to `main`.
 - Task work executes in isolated git worktrees (not in the main checkout).
@@ -36,7 +36,7 @@ This doc is intended to supersede label/queue semantics in older docs.
 | Label | Meaning |
 | --- | --- |
 | `ralph:status:queued` | Runnable/claimable work is queued (unless blocked by internal dependency metadata). |
-| `ralph:status:in-progress` | Ralph owns the task and is actively working or waiting on deterministic gates (e.g. CI). |
+| `ralph:status:in-progress` | Ralph owns the task and is actively working or waiting on deterministic gates (e.g. CI). Dependency-wait is not `in-progress`. |
 | `ralph:status:paused` | Ralph will not progress this task beyond safe checkpoints. |
 | `ralph:status:escalated` | Needs human intervention; Ralph will not proceed until re-queued by an operator command. |
 | `ralph:status:in-bot` | Midpoint: task PR merged to the bot branch (`bot/integration`). |
@@ -45,9 +45,13 @@ This doc is intended to supersede label/queue semantics in older docs.
 
 Notes:
 
-- Internal causes (deps blocked, CI failing, merge conflicts, rate limits, etc.) are tracked as internal metadata and surfaced via `bun run status` and/or dashboard, not as multiple GitHub state labels.
-- When local task status is `blocked`, GitHub label reconciliation projects that state as non-queued (currently `ralph:status:in-progress`) so `ralph:status:queued` does not drift against local blocked state.
-- Stale `in-progress` recovery must not auto-requeue tasks whose durable local op-state is `blocked`, even though the projected GitHub label remains `ralph:status:in-progress`.
+- Internal causes (deps blocked, CI failing, merge conflicts, rate limits, etc.) remain internal metadata and do not introduce additional `ralph:status:*` labels.
+- Dependency-blocked tasks project as `ralph:status:queued`; active execution projects as `ralph:status:in-progress`.
+- Ralph maintains one canonical blocked-status issue comment (edit-in-place, no spam) with marker + JSON payload:
+  - `<!-- ralph-blocked:v1 id=ISSUE_MARKER_ID -->`
+  - `<!-- ralph-blocked:state={"version":1,"kind":"deps","blocked":true|false,"reason":"...","deps":[{"repo":"owner/name","issueNumber":123}],"blockedAt":"RFC3339|null","updatedAt":"RFC3339"} -->`
+- `ralph:meta:blocked` is an optional non-status metadata label for fast dependency-blocked filtering.
+- `ralphctl status --json` blocked timestamps/reasons should converge with the durable blocked fields used to build the blocked comment payload.
 
 ### Command labels (operator-owned, ephemeral)
 
@@ -127,6 +131,7 @@ Required set (vNext):
 - Statuses: `ralph:status:queued`, `ralph:status:in-progress`, `ralph:status:paused`, `ralph:status:escalated`, `ralph:status:in-bot`, `ralph:status:done`, `ralph:status:stopped`
 - Commands: `ralph:cmd:queue`, `ralph:cmd:pause`, `ralph:cmd:stop`, `ralph:cmd:satisfy`
 - Priority: `ralph:priority:p0`, `ralph:priority:p1`, `ralph:priority:p2`, `ralph:priority:p3`, `ralph:priority:p4`
+- Optional metadata: `ralph:meta:blocked`
 
 ## Priority (operator input)
 
