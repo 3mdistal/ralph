@@ -189,7 +189,7 @@ async function reconcileRepo(
       labelIdCache,
       telemetrySource: TELEMETRY_SOURCE,
     });
-    if (graphResult.ok) {
+    if (graphResult.ok && graphResult.applied) {
       applyLabelDeltaSnapshot({ repo, issueNumber: issue.number, add: delta.add, remove: delta.remove, nowIso });
       didApply = true;
     }

@@ -263,7 +263,7 @@ function createGitHubQueueIo(): GitHubQueueIO {
         plan: { add, remove },
         labelIdCache: cache,
       });
-      return result.ok;
+      return result.ok && result.applied;
     },
   };
 }
