@@ -18,6 +18,17 @@ describe("worktree prune safety", () => {
     expect(safety.reason).toBe("ok");
   });
 
+  test("allows managed legacy layout path", () => {
+    const safety = evaluateWorktreePruneSafety({
+      worktreePath: "/home/test/.ralph/worktrees/3mdistal-ralph/210/task-a",
+      managedRoot,
+      repoPath,
+      devDir,
+    });
+    expect(safety.safe).toBe(true);
+    expect(safety.reason).toBe("ok");
+  });
+
   test("denies outside managed root and repo root", () => {
     const outside = evaluateWorktreePruneSafety({
       worktreePath: "/tmp/random",
@@ -41,6 +52,17 @@ describe("worktree prune safety", () => {
   test("denies invalid layout under managed root", () => {
     const safety = evaluateWorktreePruneSafety({
       worktreePath: "/home/test/.ralph/worktrees/3mdistal-ralph/not-a-slot",
+      managedRoot,
+      repoPath,
+      devDir,
+    });
+    expect(safety.safe).toBe(false);
+    expect(safety.reason).toBe("invalid-layout");
+  });
+
+  test("denies slot issue parent directory", () => {
+    const safety = evaluateWorktreePruneSafety({
+      worktreePath: "/home/test/.ralph/worktrees/3mdistal-ralph/slot-2/210",
       managedRoot,
       repoPath,
       devDir,

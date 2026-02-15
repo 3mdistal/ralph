@@ -321,12 +321,15 @@ describe("github cmd-processor", () => {
 
       const addRequests = requests.filter((req) => req.method === "POST" && req.path.endsWith("/issues/45/labels"));
       expect(addRequests).toHaveLength(1);
+
+      const commentPost = requests.find((req) => req.method === "POST" && req.path.endsWith("/issues/45/comments"));
+      expect(commentPost?.body?.body).toContain("Command event identity unresolved");
     } finally {
       console.warn = originalWarn;
     }
   });
 
-  test("queue command uses latest active event id for idempotency", async () => {
+  test("queue command uses latest active event id for idempotency with out-of-order rows", async () => {
     const requests: Array<{ path: string; method: string; body?: any }> = [];
     originalRequest = GitHubClient.prototype.request;
     const requestStub: GitHubClient["request"] = async (path: string, opts: { method?: string; body?: any } = {}) => {
@@ -336,8 +339,10 @@ describe("github cmd-processor", () => {
       if (path.includes("/issues/46/events")) {
         return {
           data: [
+            { id: 700, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } },
             { id: 555, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } },
             { id: 999, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } },
+            { id: 600, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } },
           ],
           status: 200,
           etag: null,
@@ -403,30 +408,20 @@ describe("github cmd-processor", () => {
       requests.push({ path, method, body: opts.body });
       const page = Number(new URL(`https://api.github.com${path}`).searchParams.get("page") ?? "1");
 
-      if (path.includes("/issues/47/events") && page === 1) {
+      if (path.includes("/issues/47/events") && page <= 10) {
         const data = Array.from({ length: 100 }, (_, i) => ({
-          id: 1_000 + i,
+          id: page * 10_000 + i,
           event: "labeled",
           label: { name: "other" },
         }));
-        data[10] = { id: 555, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } };
-        data[11] = { id: 556, event: "unlabeled", label: { name: RALPH_LABEL_CMD_QUEUE } };
+        if (page === 1) {
+          data[10] = { id: 555, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } };
+          data[11] = { id: 556, event: "unlabeled", label: { name: RALPH_LABEL_CMD_QUEUE } };
+        }
         return { data, status: 200, etag: null } as any;
       }
 
-      if (path.includes("/issues/47/events") && page === 2) {
-        return {
-          data: Array.from({ length: 100 }, (_, i) => ({
-            id: 2_000 + i,
-            event: "labeled",
-            label: { name: "other" },
-          })),
-          status: 200,
-          etag: null,
-        } as any;
-      }
-
-      if (path.includes("/issues/47/events") && page === 3) {
+      if (path.includes("/issues/47/events") && page === 11) {
         return {
           data: [{ id: 999, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } }],
           status: 200,
@@ -479,12 +474,83 @@ describe("github cmd-processor", () => {
     expect(result.removedCmdLabel).toBe(true);
 
     const eventCalls = requests.filter((req) => req.path.includes("/issues/47/events"));
-    expect(eventCalls).toHaveLength(3);
+    expect(eventCalls).toHaveLength(11);
 
     const commentPosts = requests.filter((req) => req.method === "POST" && req.path.endsWith("/issues/47/comments"));
     expect(commentPosts).toHaveLength(1);
 
     const newPayload = getIdempotencyPayload("ralph:cmd:v1:3mdistal/ralph#47:ralph:cmd:queue:999");
     expect(newPayload).toBeTruthy();
+  });
+
+  test("queue command re-applies when completed key exists but issue is not effectively queued", async () => {
+    const requests: Array<{ path: string; method: string; body?: any }> = [];
+    originalRequest = GitHubClient.prototype.request;
+    const requestStub: GitHubClient["request"] = async (path: string, opts: { method?: string; body?: any } = {}) => {
+      const method = (opts.method ?? "GET").toUpperCase();
+      requests.push({ path, method, body: opts.body });
+
+      if (path.includes("/issues/48/events")) {
+        return {
+          data: [{ id: 555, event: "labeled", label: { name: RALPH_LABEL_CMD_QUEUE } }],
+          status: 200,
+          etag: null,
+        } as any;
+      }
+
+      if (path.includes("/issues/48/labels") && method === "GET") {
+        return {
+          data: [{ name: RALPH_LABEL_CMD_QUEUE }, { name: RALPH_LABEL_STATUS_PAUSED }],
+          status: 200,
+          etag: null,
+        } as any;
+      }
+
+      if (path.includes("/issues/48/comments") && method === "GET") {
+        return { data: [], status: 200, etag: null } as any;
+      }
+
+      if (path.includes("/issues/48/comments") && method === "POST") {
+        return { data: { id: 1008 }, status: 201, etag: null } as any;
+      }
+
+      return { data: {}, status: 200, etag: null } as any;
+    };
+    GitHubClient.prototype.request = requestStub;
+
+    upsertIdempotencyKey({
+      key: "ralph:cmd:v1:3mdistal/ralph#48:ralph:cmd:queue:555",
+      scope: "cmd",
+      payloadJson: JSON.stringify({
+        version: 1,
+        phase: "completed",
+        repo: "3mdistal/ralph",
+        issueNumber: 48,
+        cmdLabel: RALPH_LABEL_CMD_QUEUE,
+        eventId: "555",
+        startedAt: "2026-02-07T00:00:00.000Z",
+        completedAt: "2026-02-07T00:00:01.000Z",
+        decision: "applied",
+      }),
+      createdAt: "2026-02-07T00:00:01.000Z",
+    });
+
+    const result = await __processOneCommandForTests({
+      repo: "3mdistal/ralph",
+      issueNumber: 48,
+      cmdLabel: RALPH_LABEL_CMD_QUEUE as any,
+      currentLabels: [RALPH_LABEL_CMD_QUEUE],
+      issueState: "OPEN",
+    });
+
+    expect(result.processed).toBe(true);
+    expect(result.removedCmdLabel).toBe(true);
+
+    const queuedAdds = requests.filter((req) => req.method === "POST" && req.path.endsWith("/issues/48/labels"));
+    expect(queuedAdds.length).toBeGreaterThan(0);
+    expect(queuedAdds.some((req) => (req.body?.labels ?? []).includes("ralph:status:queued"))).toBe(true);
+
+    const commentPosts = requests.filter((req) => req.method === "POST" && req.path.endsWith("/issues/48/comments"));
+    expect(commentPosts).toHaveLength(1);
   });
 });

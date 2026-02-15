@@ -5511,6 +5511,62 @@ export function clearTaskOpState(params: {
   return { cleared: false, raceSkipped: Boolean(row?.task_path) };
 }
 
+export function updateTaskStatusIfOwnershipUnchanged(params: {
+  repo: string;
+  taskPath: string;
+  status: string;
+  releasedAtMs?: number;
+  releasedReason?: string | null;
+  expectedDaemonId?: string | null;
+  expectedHeartbeatAt?: string | null;
+}): { updated: boolean; raceSkipped: boolean } {
+  const database = requireDb();
+  const atIso = nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at: atIso });
+  const releasedAtMs = typeof params.releasedAtMs === "number" ? params.releasedAtMs : Date.now();
+
+  const result = database
+    .query(
+      `UPDATE tasks
+         SET status = $status,
+             repo_slot = NULL,
+             worker_id = NULL,
+             daemon_id = NULL,
+             heartbeat_at = NULL,
+             released_at_ms = $released_at_ms,
+             released_reason = $released_reason,
+             updated_at = $updated_at
+       WHERE repo_id = $repo_id
+         AND task_path = $task_path
+         AND (
+           ($expected_daemon_id IS NULL AND daemon_id IS NULL) OR
+           daemon_id = $expected_daemon_id
+         )
+         AND (
+           ($expected_heartbeat_at IS NULL AND heartbeat_at IS NULL) OR
+           heartbeat_at = $expected_heartbeat_at
+         )`
+    )
+    .run({
+      $repo_id: repoId,
+      $task_path: params.taskPath,
+      $status: params.status,
+      $released_at_ms: releasedAtMs,
+      $released_reason: params.releasedReason ?? null,
+      $updated_at: atIso,
+      $expected_daemon_id: params.expectedDaemonId ?? null,
+      $expected_heartbeat_at: params.expectedHeartbeatAt ?? null,
+    });
+
+  if (result.changes > 0) return { updated: true, raceSkipped: false };
+
+  const row = database
+    .query("SELECT task_path as task_path FROM tasks WHERE repo_id = $repo_id AND task_path = $task_path")
+    .get({ $repo_id: repoId, $task_path: params.taskPath }) as { task_path?: string } | undefined;
+
+  return { updated: false, raceSkipped: Boolean(row?.task_path) };
+}
+
 export function listOrphanedTasksWithOpState(repo: string): OrphanedTaskOpState[] {
   const database = requireDb();
   const rows = database
