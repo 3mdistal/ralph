@@ -31,6 +31,7 @@ import {
 } from "../github-labels";
 import { auditQueueParityForRepo } from "./queue-parity-audit";
 import { extractDependencyRefs, upsertBlockedComment } from "./blocked-comment";
+import { reconcileLocalStatusDriftForRepo } from "./local-status-drift";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_MAX_ISSUES_PER_TICK = 10;
@@ -89,6 +90,10 @@ async function reconcileRepo(
   cooldownMs: number
 ): Promise<{
   processed: number;
+  localDriftRepaired: number;
+  localDriftUnsafeSkipped: number;
+  localDriftRaceSkipped: number;
+  localDriftObserved: number;
   queuedBlockedBefore: number;
   queuedBlockedAfter: number;
   depsBlockedInProgressBefore: number;
@@ -97,6 +102,11 @@ async function reconcileRepo(
   depsBlockedMissingMetaAfter: number;
 }> {
   const parityBefore = auditQueueParityForRepo(repo);
+  const driftRepair = reconcileLocalStatusDriftForRepo({
+    repo,
+    ttlMs: getConfig().ownershipTtlMs,
+    logPrefix: `[ralph:labels:reconcile:${repo}]`,
+  });
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
   const debounceMsRaw = Number(process.env.RALPH_GITHUB_QUEUE_STATUS_DEBOUNCE_MS ?? DEFAULT_STATUS_TRANSITION_DEBOUNCE_MS);
@@ -112,6 +122,10 @@ async function reconcileRepo(
   if (issues.length === 0) {
     return {
       processed: 0,
+      localDriftRepaired: driftRepair.repaired,
+      localDriftUnsafeSkipped: driftRepair.unsafeSkipped,
+      localDriftRaceSkipped: driftRepair.raceSkipped,
+      localDriftObserved: driftRepair.observedDrift,
       queuedBlockedBefore: parityBefore.ghQueuedLocalBlocked,
       queuedBlockedAfter: parityBefore.ghQueuedLocalBlocked,
       depsBlockedInProgressBefore: parityBefore.localDepsBlockedGhInProgress,
@@ -325,6 +339,10 @@ async function reconcileRepo(
 
   return {
     processed,
+    localDriftRepaired: driftRepair.repaired,
+    localDriftUnsafeSkipped: driftRepair.unsafeSkipped,
+    localDriftRaceSkipped: driftRepair.raceSkipped,
+    localDriftObserved: driftRepair.observedDrift,
     queuedBlockedBefore: parityBefore.ghQueuedLocalBlocked,
     queuedBlockedAfter: parityAfter.ghQueuedLocalBlocked,
     depsBlockedInProgressBefore: parityBefore.localDepsBlockedGhInProgress,
@@ -359,6 +377,10 @@ export function startGitHubLabelReconciler(params?: {
       const repos = getConfig().repos.map((entry) => entry.name);
       let remaining = maxIssuesPerTick;
       let totalProcessed = 0;
+      let localDriftRepaired = 0;
+      let localDriftUnsafeSkipped = 0;
+      let localDriftRaceSkipped = 0;
+      let localDriftObserved = 0;
       let queuedBlockedBefore = 0;
       let queuedBlockedAfter = 0;
       let depsBlockedInProgressBefore = 0;
@@ -370,6 +392,10 @@ export function startGitHubLabelReconciler(params?: {
         const result = await reconcileRepo(repo, remaining, cooldownMs);
         remaining -= result.processed;
         totalProcessed += result.processed;
+        localDriftRepaired += result.localDriftRepaired;
+        localDriftUnsafeSkipped += result.localDriftUnsafeSkipped;
+        localDriftRaceSkipped += result.localDriftRaceSkipped;
+        localDriftObserved += result.localDriftObserved;
         queuedBlockedBefore += result.queuedBlockedBefore;
         queuedBlockedAfter += result.queuedBlockedAfter;
         depsBlockedInProgressBefore += result.depsBlockedInProgressBefore;
@@ -380,6 +406,7 @@ export function startGitHubLabelReconciler(params?: {
       if (shouldLog("labels:reconcile", 5 * 60_000)) {
         log(
           `[ralph:labels] Reconcile tick complete processed=${totalProcessed} queued/local-blocked=${queuedBlockedBefore}->${queuedBlockedAfter} depsBlockedGhInProgress=${depsBlockedInProgressBefore}->${depsBlockedInProgressAfter} depsBlockedMissingMeta=${depsBlockedMissingMetaBefore}->${depsBlockedMissingMetaAfter}`
+            + ` localStatusDriftObserved=${localDriftObserved} repaired=${localDriftRepaired} unsafeSkipped=${localDriftUnsafeSkipped} raceSkipped=${localDriftRaceSkipped}`
         );
       }
     } catch (error: any) {
