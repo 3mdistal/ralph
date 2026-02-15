@@ -26,6 +26,7 @@ export type ResolveOpencodeXdgResult = {
 };
 
 const PROFILE_UNRESOLVABLE_PREFIX = "blocked:profile-unresolvable";
+const SESSION_STORAGE_DIRS = ["session", "session_diff"] as const;
 
 function buildProfileUnresolvableError(params: {
   phase: "start" | "resume";
@@ -132,26 +133,28 @@ export async function resolveOpencodeXdgForTask(
     for (const name of candidates) {
       const resolved = resolveOpencodeProfile(name);
       if (!resolved) continue;
-      const base = join(resolved.xdgDataHome, "opencode", "storage", "session");
-      if (!existsSync(base)) continue;
-      try {
-        const dirs = await readdir(base, { withFileTypes: true });
-        for (const dir of dirs) {
-          if (!dir.isDirectory()) continue;
-          const sessionPath = join(base, dir.name, `${opts.sessionId}.json`);
-          if (existsSync(sessionPath)) {
-            return {
-              profileName: resolved.name,
-              opencodeXdg: {
-                dataHome: resolved.xdgDataHome,
-                stateHome: resolved.xdgStateHome,
-                cacheHome: resolved.xdgCacheHome,
-              },
-            };
+      for (const storageDir of SESSION_STORAGE_DIRS) {
+        const base = join(resolved.xdgDataHome, "opencode", "storage", storageDir);
+        if (!existsSync(base)) continue;
+        try {
+          const dirs = await readdir(base, { withFileTypes: true });
+          for (const dir of dirs) {
+            if (!dir.isDirectory()) continue;
+            const sessionPath = join(base, dir.name, `${opts.sessionId}.json`);
+            if (existsSync(sessionPath)) {
+              return {
+                profileName: resolved.name,
+                opencodeXdg: {
+                  dataHome: resolved.xdgDataHome,
+                  stateHome: resolved.xdgStateHome,
+                  cacheHome: resolved.xdgCacheHome,
+                },
+              };
+            }
           }
+        } catch {
+          // best-effort
         }
-      } catch {
-        // best-effort
       }
     }
 
