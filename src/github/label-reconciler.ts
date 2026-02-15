@@ -16,13 +16,15 @@ import { canAttemptLabelWrite } from "./label-write-backoff";
 import { countStatusLabels } from "./status-label-invariant";
 import {
   deriveRalphStatus,
+  isDependencyBlocked,
   shouldDebounceOppositeStatusTransition,
   statusToRalphLabelDelta,
   type LabelOp,
 } from "../github-queue/core";
 import type { QueueTaskStatus } from "../queue/types";
-import { RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_STOPPED } from "../github-labels";
+import { RALPH_LABEL_META_BLOCKED, RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_STOPPED } from "../github-labels";
 import { auditQueueParityForRepo } from "./queue-parity-audit";
+import { extractDependencyRefs, upsertBlockedComment } from "./blocked-comment";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_MAX_ISSUES_PER_TICK = 10;
@@ -66,7 +68,15 @@ async function reconcileRepo(
   repo: string,
   maxIssues: number,
   cooldownMs: number
-): Promise<{ processed: number; queuedBlockedBefore: number; queuedBlockedAfter: number }> {
+): Promise<{
+  processed: number;
+  queuedBlockedBefore: number;
+  queuedBlockedAfter: number;
+  depsBlockedInProgressBefore: number;
+  depsBlockedInProgressAfter: number;
+  depsBlockedMissingMetaBefore: number;
+  depsBlockedMissingMetaAfter: number;
+}> {
   const parityBefore = auditQueueParityForRepo(repo);
   const nowIso = new Date().toISOString();
   const nowMs = Date.now();
@@ -85,6 +95,10 @@ async function reconcileRepo(
       processed: 0,
       queuedBlockedBefore: parityBefore.ghQueuedLocalBlocked,
       queuedBlockedAfter: parityBefore.ghQueuedLocalBlocked,
+      depsBlockedInProgressBefore: parityBefore.localDepsBlockedGhInProgress,
+      depsBlockedInProgressAfter: parityBefore.localDepsBlockedGhInProgress,
+      depsBlockedMissingMetaBefore: parityBefore.localDepsBlockedMissingMeta,
+      depsBlockedMissingMetaAfter: parityBefore.localDepsBlockedMissingMeta,
     };
   }
 
@@ -109,6 +123,7 @@ async function reconcileRepo(
     const released = typeof opState.releasedAtMs === "number" && Number.isFinite(opState.releasedAtMs);
     const desiredStatus = released ? "queued" : toDesiredStatus(opState.status ?? null);
     if (!desiredStatus) continue;
+    const depsBlocked = isDependencyBlocked(opState);
 
     const cooldownKey = `${repo}#${issue.number}`;
     const cooldown = lastAppliedByIssue.get(cooldownKey);
@@ -116,7 +131,12 @@ async function reconcileRepo(
       continue;
     }
 
-    const delta = statusToRalphLabelDelta(desiredStatus, issue.labels);
+    const delta = statusToRalphLabelDelta(desiredStatus, issue.labels, {
+      opState: { status: opState.status ?? null, blockedSource: opState.blockedSource ?? null },
+    });
+    const hasMetaBlocked = issue.labels.includes(RALPH_LABEL_META_BLOCKED);
+    if (depsBlocked && !hasMetaBlocked) delta.add.push(RALPH_LABEL_META_BLOCKED);
+    if (!depsBlocked && hasMetaBlocked) delta.remove.push(RALPH_LABEL_META_BLOCKED);
     if (delta.add.length === 0 && delta.remove.length === 0) continue;
 
     const fromStatus = deriveRalphStatus(issue.labels, issue.state);
@@ -203,6 +223,34 @@ async function reconcileRepo(
         updatedAtMs: nowMs,
       });
       lastAppliedByIssue.set(cooldownKey, { desiredStatus, appliedAtMs: nowMs });
+
+      if (depsBlocked || hasMetaBlocked) {
+        try {
+          const reason = opState.blockedReason?.trim() || null;
+          const blockedAt = opState.blockedAt?.trim() || null;
+          const deps = extractDependencyRefs(reason ?? "", repo);
+          await upsertBlockedComment({
+            github,
+            repo,
+            issueNumber: issue.number,
+            state: {
+              version: 1,
+              kind: "deps",
+              blocked: depsBlocked,
+              reason,
+              deps,
+              blockedAt,
+              updatedAt: nowIso,
+            },
+          });
+        } catch (error: any) {
+          if (shouldLog(`ralph:labels:reconcile:blocked-comment:${repo}#${issue.number}`, 60_000)) {
+            console.warn(
+              `[ralph:labels:reconcile:${repo}] Failed blocked comment sync for ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+            );
+          }
+        }
+      }
     }
 
     processed += 1;
@@ -210,13 +258,26 @@ async function reconcileRepo(
 
   const parityAfter = auditQueueParityForRepo(repo);
   const shouldReportDrift =
-    parityBefore.ghQueuedLocalBlocked !== parityAfter.ghQueuedLocalBlocked || parityAfter.ghQueuedLocalBlocked > 0;
+    parityBefore.ghQueuedLocalBlocked !== parityAfter.ghQueuedLocalBlocked ||
+    parityBefore.localDepsBlockedGhInProgress !== parityAfter.localDepsBlockedGhInProgress ||
+    parityBefore.localDepsBlockedMissingMeta !== parityAfter.localDepsBlockedMissingMeta ||
+    parityAfter.ghQueuedLocalBlocked > 0 ||
+    parityAfter.localDepsBlockedGhInProgress > 0 ||
+    parityAfter.localDepsBlockedMissingMeta > 0;
   if (shouldReportDrift) {
-    const samples = parityAfter.sampleGhQueuedLocalBlocked.length > 0
-      ? ` samples=${parityAfter.sampleGhQueuedLocalBlocked.join(",")}`
-      : "";
+    const samples: string[] = [];
+    if (parityAfter.sampleGhQueuedLocalBlocked.length > 0) {
+      samples.push(`ghQueuedLocalBlocked=${parityAfter.sampleGhQueuedLocalBlocked.join(",")}`);
+    }
+    if (parityAfter.sampleLocalDepsBlockedGhInProgress.length > 0) {
+      samples.push(`depsBlockedGhInProgress=${parityAfter.sampleLocalDepsBlockedGhInProgress.join(",")}`);
+    }
+    if (parityAfter.sampleLocalDepsBlockedMissingMeta.length > 0) {
+      samples.push(`depsBlockedMissingMeta=${parityAfter.sampleLocalDepsBlockedMissingMeta.join(",")}`);
+    }
+    const sampleSuffix = samples.length > 0 ? ` samples=${samples.join(";")}` : "";
     console.log(
-      `[ralph:labels:reconcile:${repo}] queued/local-blocked drift before=${parityBefore.ghQueuedLocalBlocked} after=${parityAfter.ghQueuedLocalBlocked}${samples}`
+      `[ralph:labels:reconcile:${repo}] parity drift ghQueuedLocalBlocked=${parityBefore.ghQueuedLocalBlocked}->${parityAfter.ghQueuedLocalBlocked} depsBlockedGhInProgress=${parityBefore.localDepsBlockedGhInProgress}->${parityAfter.localDepsBlockedGhInProgress} depsBlockedMissingMeta=${parityBefore.localDepsBlockedMissingMeta}->${parityAfter.localDepsBlockedMissingMeta}${sampleSuffix}`
     );
   }
 
@@ -224,6 +285,10 @@ async function reconcileRepo(
     processed,
     queuedBlockedBefore: parityBefore.ghQueuedLocalBlocked,
     queuedBlockedAfter: parityAfter.ghQueuedLocalBlocked,
+    depsBlockedInProgressBefore: parityBefore.localDepsBlockedGhInProgress,
+    depsBlockedInProgressAfter: parityAfter.localDepsBlockedGhInProgress,
+    depsBlockedMissingMetaBefore: parityBefore.localDepsBlockedMissingMeta,
+    depsBlockedMissingMetaAfter: parityAfter.localDepsBlockedMissingMeta,
   };
 }
 
@@ -254,6 +319,10 @@ export function startGitHubLabelReconciler(params?: {
       let totalProcessed = 0;
       let queuedBlockedBefore = 0;
       let queuedBlockedAfter = 0;
+      let depsBlockedInProgressBefore = 0;
+      let depsBlockedInProgressAfter = 0;
+      let depsBlockedMissingMetaBefore = 0;
+      let depsBlockedMissingMetaAfter = 0;
       for (const repo of repos) {
         if (remaining <= 0) break;
         const result = await reconcileRepo(repo, remaining, cooldownMs);
@@ -261,10 +330,14 @@ export function startGitHubLabelReconciler(params?: {
         totalProcessed += result.processed;
         queuedBlockedBefore += result.queuedBlockedBefore;
         queuedBlockedAfter += result.queuedBlockedAfter;
+        depsBlockedInProgressBefore += result.depsBlockedInProgressBefore;
+        depsBlockedInProgressAfter += result.depsBlockedInProgressAfter;
+        depsBlockedMissingMetaBefore += result.depsBlockedMissingMetaBefore;
+        depsBlockedMissingMetaAfter += result.depsBlockedMissingMetaAfter;
       }
       if (shouldLog("labels:reconcile", 5 * 60_000)) {
         log(
-          `[ralph:labels] Reconcile tick complete processed=${totalProcessed} queued/local-blocked=${queuedBlockedBefore}->${queuedBlockedAfter}`
+          `[ralph:labels] Reconcile tick complete processed=${totalProcessed} queued/local-blocked=${queuedBlockedBefore}->${queuedBlockedAfter} depsBlockedGhInProgress=${depsBlockedInProgressBefore}->${depsBlockedInProgressAfter} depsBlockedMissingMeta=${depsBlockedMissingMetaBefore}->${depsBlockedMissingMetaAfter}`
         );
       }
     } catch (error: any) {

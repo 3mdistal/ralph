@@ -1,4 +1,4 @@
-import { closeSync, openSync, unlinkSync } from "node:fs";
+import { closeSync, openSync, unlinkSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +14,7 @@ export async function acquireGlobalTestLock(params?: {
 
   while (true) {
     try {
+      mkdirSync(tmpdir(), { recursive: true });
       const fd = openSync(LOCK_PATH, "wx");
       return () => {
         try {

@@ -47,7 +47,11 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
     if (!existingSessionId) {
       const reason = "In-progress task has no session-id; cannot resume";
       console.warn(`[ralph:worker:${this.repo}] ${reason}: ${task.name}`);
-      await this.queue.updateTaskStatus(task, "starting", { "session-id": "" });
+      await this.markTaskBlocked(task, "runtime-error", {
+        reason,
+        details: reason,
+        sessionId: "",
+      });
       return { taskName: task.name, repo: this.repo, outcome: "failed", escalationReason: reason };
     }
 

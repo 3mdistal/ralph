@@ -126,9 +126,11 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
-  test("statusToRalphLabelDelta maps blocked to in-progress from queued", () => {
-    const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
-    expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
+  test("statusToRalphLabelDelta maps deps-blocked to queued", () => {
+    const delta = statusToRalphLabelDelta("blocked", ["ralph:status:in-progress"], {
+      opState: { status: "blocked", blockedSource: "deps" },
+    });
+    expect(delta).toEqual({ add: ["ralph:status:queued"], remove: ["ralph:status:in-progress"] });
   });
 
   test("statusToRalphLabelDelta preserves in-progress when blocked", () => {
@@ -136,8 +138,10 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: [], remove: [] });
   });
 
-  test("statusToRalphLabelDelta removes other status labels when blocked", () => {
-    const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued", "ralph:status:in-progress"]);
+  test("statusToRalphLabelDelta removes other status labels when non-deps blocked", () => {
+    const delta = statusToRalphLabelDelta("blocked", ["ralph:status:queued", "ralph:status:in-progress"], {
+      opState: { status: "blocked", blockedSource: "runtime-error" },
+    });
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: ["ralph:status:queued"] });
   });
 
@@ -164,16 +168,13 @@ describe("github queue core", () => {
     expect(delta).toEqual({ add: ["ralph:status:in-progress"], remove: [] });
   });
 
-  test("statusToRalphLabelDelta supports blocked to queued round-trip", () => {
-    const blockedDelta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"]);
+  test("statusToRalphLabelDelta keeps queued for deps-blocked", () => {
+    const blockedDelta = statusToRalphLabelDelta("blocked", ["ralph:status:queued"], {
+      opState: { status: "blocked", blockedSource: "deps" },
+    });
     const blockedLabels = applyDelta(["ralph:status:queued"], blockedDelta);
-    expect(blockedLabels).toContain("ralph:status:in-progress");
-    expect(blockedLabels).not.toContain("ralph:status:queued");
-
-    const queuedDelta = statusToRalphLabelDelta("queued", blockedLabels);
-    const queuedLabels = applyDelta(blockedLabels, queuedDelta);
-    expect(queuedLabels).toContain("ralph:status:queued");
-    expect(queuedLabels).not.toContain("ralph:status:in-progress");
+    expect(blockedLabels).toContain("ralph:status:queued");
+    expect(blockedLabels).not.toContain("ralph:status:in-progress");
   });
 
   test("statusToRalphLabelDelta maps escalated to escalated", () => {
@@ -364,6 +365,27 @@ describe("github queue core", () => {
         taskPath: "github:3mdistal/ralph#64",
         heartbeatAt: "2026-01-11T00:00:00.000Z",
         releasedAtMs: Date.parse("2026-01-11T00:05:00.000Z"),
+      },
+      nowMs,
+      ttlMs,
+    });
+
+    expect(recovery.shouldRecover).toBe(false);
+  });
+
+  test("computeStaleInProgressRecovery ignores blocked op-state", () => {
+    const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
+    const ttlMs = 60_000;
+
+    const recovery = computeStaleInProgressRecovery({
+      labels: ["ralph:status:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 65,
+        taskPath: "github:3mdistal/ralph#65",
+        status: "blocked",
+        heartbeatAt: "2026-01-11T00:00:00.000Z",
+        sessionId: "",
       },
       nowMs,
       ttlMs,

@@ -13,14 +13,24 @@ import {
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
-const BLOCKED_PUBLIC_STATUS_LABEL = RALPH_LABEL_STATUS_IN_PROGRESS;
+export function isDependencyBlocked(opState?: Pick<TaskOpState, "status" | "blockedSource"> | null): boolean {
+  if (!opState) return false;
+  const status = opState.status?.trim() ?? "";
+  if (status !== "blocked") return false;
+  const blockedSource = opState.blockedSource?.trim() ?? "";
+  return blockedSource === "deps";
+}
+
+function resolveBlockedPublicStatusLabel(opState?: Pick<TaskOpState, "status" | "blockedSource"> | null): string {
+  return isDependencyBlocked(opState) ? RALPH_LABEL_STATUS_QUEUED : RALPH_LABEL_STATUS_IN_PROGRESS;
+}
 
 const RALPH_STATUS_LABELS: Record<QueueTaskStatus, string | null> = {
   queued: RALPH_LABEL_STATUS_QUEUED,
   "in-progress": RALPH_LABEL_STATUS_IN_PROGRESS,
   "waiting-on-pr": RALPH_LABEL_STATUS_IN_PROGRESS,
   paused: RALPH_LABEL_STATUS_PAUSED,
-  blocked: BLOCKED_PUBLIC_STATUS_LABEL,
+  blocked: RALPH_LABEL_STATUS_IN_PROGRESS,
   escalated: RALPH_LABEL_STATUS_ESCALATED,
   done: RALPH_LABEL_STATUS_DONE,
   starting: RALPH_LABEL_STATUS_IN_PROGRESS,
@@ -72,12 +82,19 @@ function resolveFallbackStatusLabel(labels: string[]): string | null {
   return null;
 }
 
-export function statusToRalphLabelDelta(status: QueueTaskStatus, currentLabels: string[]): {
+export function statusToRalphLabelDelta(
+  status: QueueTaskStatus,
+  currentLabels: string[],
+  opts?: { opState?: Pick<TaskOpState, "status" | "blockedSource"> | null }
+): {
   add: string[];
   remove: string[];
 } {
   const labelSet = new Set(currentLabels);
-  const target = RALPH_STATUS_LABELS[status] ?? resolveFallbackStatusLabel(currentLabels) ?? RALPH_LABEL_STATUS_QUEUED;
+  const target =
+    status === "blocked"
+      ? resolveBlockedPublicStatusLabel(opts?.opState)
+      : (RALPH_STATUS_LABELS[status] ?? resolveFallbackStatusLabel(currentLabels) ?? RALPH_LABEL_STATUS_QUEUED);
   const add: string[] = [];
   if (!labelSet.has(target)) add.push(target);
   const remove = KNOWN_RALPH_STATUS_LABELS.filter((label) => label !== target && labelSet.has(label));
@@ -178,6 +195,9 @@ export function computeStaleInProgressRecovery(params: {
   graceMs?: number;
 }): { shouldRecover: boolean; reason?: StaleInProgressRecoveryReason } {
   if (!params.labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) return { shouldRecover: false };
+  if ((params.opState?.status ?? "").trim() === "blocked") {
+    return { shouldRecover: false };
+  }
   if (typeof params.opState?.releasedAtMs === "number" && Number.isFinite(params.opState.releasedAtMs)) {
     return { shouldRecover: false };
   }
@@ -261,5 +281,10 @@ export function deriveTaskView(params: {
     "repo-slot": params.opState?.repoSlot ?? undefined,
     "daemon-id": params.opState?.daemonId ?? undefined,
     "heartbeat-at": params.opState?.heartbeatAt ?? undefined,
+    "blocked-source": (params.opState?.blockedSource as AgentTask["blocked-source"] | null) ?? undefined,
+    "blocked-reason": params.opState?.blockedReason ?? undefined,
+    "blocked-at": params.opState?.blockedAt ?? undefined,
+    "blocked-details": params.opState?.blockedDetails ?? undefined,
+    "blocked-checked-at": params.opState?.blockedCheckedAt ?? undefined,
   };
 }

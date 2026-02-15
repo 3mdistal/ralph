@@ -17,7 +17,7 @@ import {
   type DurableStateSchemaWindow,
 } from "./durable-state-capability";
 
-const SCHEMA_VERSION = 20;
+const SCHEMA_VERSION = 22;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
@@ -143,7 +143,7 @@ export type IssueAlertSummary = {
 export const PR_STATE_OPEN: PrState = "open";
 export const PR_STATE_MERGED: PrState = "merged";
 
-export type GateName = "preflight" | "product_review" | "devex_review" | "ci" | "pr_evidence";
+export type GateName = "preflight" | "plan_review" | "product_review" | "devex_review" | "ci" | "pr_evidence";
 export type GateStatus = "pending" | "pass" | "fail" | "skipped";
 export type GateArtifactKind = "command_output" | "failure_excerpt" | "note";
 
@@ -173,9 +173,10 @@ export type LoopTriageAttemptState = {
   lastUpdatedAtMs: number;
 };
 
-const GATE_NAMES: GateName[] = ["preflight", "product_review", "devex_review", "ci", "pr_evidence"];
+const GATE_NAMES: GateName[] = ["preflight", "plan_review", "product_review", "devex_review", "ci", "pr_evidence"];
 const GATE_STATUSES: GateStatus[] = ["pending", "pass", "fail", "skipped"];
 const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_excerpt", "note"];
+const GATE_NAME_CHECK_CONSTRAINT_SQL = `CHECK (gate IN (${GATE_NAMES.map((gate) => quoteSqlLiteral(gate)).join(", ")}))`;
 
 const ARTIFACT_MAX_LINES = 200;
 const ARTIFACT_MAX_CHARS = 20_000;
@@ -341,6 +342,127 @@ function addColumnIfMissing(database: Database, tableName: string, columnName: s
   if (!tableExists(database, tableName)) return;
   if (columnExists(database, tableName, columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
+}
+
+function gateConstraintIncludes(tableSql: string | null, gateName: GateName): boolean {
+  if (!tableSql) return false;
+  return tableSql.includes(quoteSqlLiteral(gateName));
+}
+
+function requiresGateEnumRepair(database: Database): boolean {
+  if (!tableExists(database, "ralph_run_gate_results") || !tableExists(database, "ralph_run_gate_artifacts")) {
+    return false;
+  }
+  const gateResultsSql = tableCreateSql(database, "ralph_run_gate_results");
+  const gateArtifactsSql = tableCreateSql(database, "ralph_run_gate_artifacts");
+  for (const gateName of GATE_NAMES) {
+    if (!gateConstraintIncludes(gateResultsSql, gateName) || !gateConstraintIncludes(gateArtifactsSql, gateName)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function rebuildGateTablesForCurrentGateSet(database: Database): void {
+  const hasReason = columnExists(database, "ralph_run_gate_results", "reason");
+  const resultsInsert = hasReason
+    ? `
+      INSERT INTO ralph_run_gate_results_repaired(
+        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+      )
+      SELECT
+        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+      FROM ralph_run_gate_results;
+    `
+    : `
+      INSERT INTO ralph_run_gate_results_repaired(
+        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+      )
+      SELECT
+        run_id, gate, status, command, skip_reason, NULL, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+      FROM ralph_run_gate_results;
+    `;
+
+  database.exec(`
+    CREATE TABLE ralph_run_gate_results_repaired (
+      run_id TEXT NOT NULL,
+      gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
+      status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
+      command TEXT,
+      skip_reason TEXT,
+      reason TEXT,
+      url TEXT,
+      pr_number INTEGER,
+      pr_url TEXT,
+      repo_id INTEGER NOT NULL,
+      issue_number INTEGER,
+      task_path TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, gate),
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE,
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+    ${resultsInsert}
+    DROP TABLE ralph_run_gate_results;
+    ALTER TABLE ralph_run_gate_results_repaired RENAME TO ralph_run_gate_results;
+
+    CREATE TABLE ralph_run_gate_artifacts_repaired (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
+      kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
+      content TEXT NOT NULL,
+      truncated INTEGER NOT NULL DEFAULT 0,
+      original_chars INTEGER,
+      original_lines INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+    );
+    INSERT INTO ralph_run_gate_artifacts_repaired(
+      id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+    )
+    SELECT
+      id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+    FROM ralph_run_gate_artifacts;
+    DROP TABLE ralph_run_gate_artifacts;
+    ALTER TABLE ralph_run_gate_artifacts_repaired RENAME TO ralph_run_gate_artifacts;
+
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_issue_updated
+      ON ralph_run_gate_results(repo_id, issue_number, updated_at);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_results_repo_pr
+      ON ralph_run_gate_results(repo_id, pr_number);
+    CREATE INDEX IF NOT EXISTS idx_ralph_run_gate_artifacts_run
+      ON ralph_run_gate_artifacts(run_id);
+
+    INSERT OR IGNORE INTO ralph_run_gate_results(
+      run_id, gate, status, repo_id, issue_number, task_path, created_at, updated_at
+    )
+    SELECT
+      r.run_id,
+      'plan_review',
+      'pending',
+      r.repo_id,
+      r.issue_number,
+      r.task_path,
+      r.started_at,
+      r.started_at
+    FROM ralph_runs r;
+  `);
+}
+
+function applyGateEnumRepair(database: Database): void {
+  if (!requiresGateEnumRepair(database)) return;
+  if (
+    !tableExists(database, "ralph_run_gate_results") ||
+    !tableExists(database, "ralph_run_gate_artifacts") ||
+    !tableExists(database, "ralph_runs") ||
+    !tableExists(database, "repos")
+  ) {
+    throw formatSchemaInvariantError("gate enum drift detected but required tables are missing and cannot be rebuilt safely");
+  }
+  rebuildGateTablesForCurrentGateSet(database);
 }
 
 type SchemaInvariant =
@@ -857,7 +979,9 @@ function ensureSchema(database: Database, stateDbPath: string): void {
   const hasMetaTable = tableExists(database, "meta");
   const existingVersion = hasMetaTable ? readSchemaVersion(database) : null;
   const needsVersionMigration = Boolean(existingVersion && existingVersion < SCHEMA_VERSION);
-  const needsInvariantRepair = !needsVersionMigration && requiresSchemaInvariantRepair(database);
+  const needsSchemaInvariantRepair = !needsVersionMigration && requiresSchemaInvariantRepair(database);
+  const needsGateEnumRepair = !needsVersionMigration && requiresGateEnumRepair(database);
+  const needsInvariantRepair = needsSchemaInvariantRepair || needsGateEnumRepair;
 
   if (existingVersion) {
     const capability = evaluateDurableStateCapability({
@@ -1078,7 +1202,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
         database.exec(`
           CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
             run_id TEXT NOT NULL,
-            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+            gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
             status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
             command TEXT,
             skip_reason TEXT,
@@ -1098,7 +1222,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
           CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             run_id TEXT NOT NULL,
-            gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+            gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
             kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
             content TEXT NOT NULL,
             truncated INTEGER NOT NULL DEFAULT 0,
@@ -1290,7 +1414,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             database.exec(`
               CREATE TABLE ralph_run_gate_results_new (
                 run_id TEXT NOT NULL,
-                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
                 status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
                 command TEXT,
                 skip_reason TEXT,
@@ -1318,7 +1442,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
               CREATE TABLE ralph_run_gate_artifacts_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
-                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
                 kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
                 content TEXT NOT NULL,
                 truncated INTEGER NOT NULL DEFAULT 0,
@@ -1422,7 +1546,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             database.exec(`
               CREATE TABLE ralph_run_gate_results_repaired (
                 run_id TEXT NOT NULL,
-                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
                 status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
                 command TEXT,
                 skip_reason TEXT,
@@ -1446,7 +1570,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
               CREATE TABLE ralph_run_gate_artifacts_repaired (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL,
-                gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+                gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
                 kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
                 content TEXT NOT NULL,
                 truncated INTEGER NOT NULL DEFAULT 0,
@@ -1507,6 +1631,54 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             "CREATE INDEX IF NOT EXISTS idx_repo_github_in_bot_pending_repo_updated " +
               "ON repo_github_in_bot_pending(repo_id, updated_at)"
           );
+        }
+
+        if (existingVersion < 21) {
+          applyGateEnumRepair(database);
+          if (
+            tableExists(database, "ralph_run_gate_results") &&
+            tableExists(database, "ralph_runs") &&
+            tableExists(database, "repos")
+          ) {
+            database.exec(`
+              INSERT OR IGNORE INTO ralph_run_gate_results(
+                run_id, gate, status, repo_id, issue_number, task_path, created_at, updated_at
+              )
+              SELECT
+                r.run_id,
+                'plan_review',
+                'pending',
+                r.repo_id,
+                r.issue_number,
+                r.task_path,
+                r.started_at,
+                r.started_at
+              FROM ralph_runs r;
+            `);
+          }
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 21,
+            checkpoint: "v21-plan-review-gate-record",
+            checksum: sha256Hex("state:migration:v21-plan-review-gate-record"),
+            backupId,
+            appliedAt: nowIso(),
+          });
+        }
+        if (existingVersion < 22) {
+          addColumnIfMissing(database, "tasks", "blocked_source", "TEXT");
+          addColumnIfMissing(database, "tasks", "blocked_reason", "TEXT");
+          addColumnIfMissing(database, "tasks", "blocked_at", "TEXT");
+          addColumnIfMissing(database, "tasks", "blocked_details", "TEXT");
+          addColumnIfMissing(database, "tasks", "blocked_checked_at", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 22,
+            checkpoint: "v22-tasks-blocked-columns",
+            checksum: sha256Hex("state:migration:v22-tasks-blocked-columns"),
+            backupId,
+            appliedAt: nowIso(),
+          });
         }
         recordStateMigrationCheckpoint(database, {
           fromVersion: existingVersion,
@@ -1612,6 +1784,11 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       heartbeat_at TEXT,
       released_at_ms INTEGER,
       released_reason TEXT,
+      blocked_source TEXT,
+      blocked_reason TEXT,
+      blocked_at TEXT,
+      blocked_details TEXT,
+      blocked_checked_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE(repo_id, task_path),
@@ -1832,7 +2009,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
 
     CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
       run_id TEXT NOT NULL,
-      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+      gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
       status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
       command TEXT,
       skip_reason TEXT,
@@ -1853,7 +2030,7 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       run_id TEXT NOT NULL,
-      gate TEXT NOT NULL CHECK (gate IN ('preflight', 'product_review', 'devex_review', 'ci', 'pr_evidence')),
+      gate TEXT NOT NULL ${GATE_NAME_CHECK_CONSTRAINT_SQL},
       kind TEXT NOT NULL CHECK (kind IN ('command_output', 'failure_excerpt', 'note')),
       content TEXT NOT NULL,
       truncated INTEGER NOT NULL DEFAULT 0,
@@ -1994,11 +2171,21 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_state_migration_backups_path ON state_migration_backups(backup_path);
   `);
 
+  // Backstop for mixed/partially-migrated schema 22 states where meta schema_version
+  // may already be 22 but blocked-* columns are still absent on tasks.
+  addColumnIfMissing(database, "tasks", "blocked_source", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_reason", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_at", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_details", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_checked_at", "TEXT");
+
     runMigrationsWithLock(database, () => {
       database.transaction(() => {
-        const neededInvariantRepair = requiresSchemaInvariantRepair(database);
+        const neededSchemaInvariantRepair = requiresSchemaInvariantRepair(database);
+        const neededGateEnumRepair = requiresGateEnumRepair(database);
         applySchemaInvariants(database);
-        if (!neededInvariantRepair) return;
+        applyGateEnumRepair(database);
+        if (!neededSchemaInvariantRepair && !neededGateEnumRepair) return;
 
         ensureStateMigrationTables(database);
         if (backupMetadata && recordedBackupId === null) {
@@ -2939,6 +3126,11 @@ export function recordTaskSnapshot(input: {
   heartbeatAt?: string;
   releasedAtMs?: number | null;
   releasedReason?: string | null;
+  blockedSource?: string | null;
+  blockedReason?: string | null;
+  blockedAt?: string | null;
+  blockedDetails?: string | null;
+  blockedCheckedAt?: string | null;
   at?: string;
 }): void {
   const database = requireDb();
@@ -2970,10 +3162,10 @@ export function recordTaskSnapshot(input: {
 
   database
     .query(
-      `INSERT INTO tasks(
-         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, released_at_ms, released_reason, created_at, updated_at
+       `INSERT INTO tasks(
+         repo_id, issue_number, task_path, task_name, status, session_id, session_events_path, worktree_path, worker_id, repo_slot, daemon_id, heartbeat_at, released_at_ms, released_reason, blocked_source, blocked_reason, blocked_at, blocked_details, blocked_checked_at, created_at, updated_at
        ) VALUES (
-          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $released_at_ms, $released_reason, $created_at, $updated_at
+          $repo_id, $issue_number, $task_path, $task_name, $status, $session_id, $session_events_path, $worktree_path, $worker_id, $repo_slot, $daemon_id, $heartbeat_at, $released_at_ms, $released_reason, $blocked_source, $blocked_reason, $blocked_at, $blocked_details, $blocked_checked_at, $created_at, $updated_at
        )
        ON CONFLICT(repo_id, task_path) DO UPDATE SET
           issue_number = COALESCE(excluded.issue_number, tasks.issue_number),
@@ -2988,6 +3180,11 @@ export function recordTaskSnapshot(input: {
           heartbeat_at = COALESCE(excluded.heartbeat_at, tasks.heartbeat_at),
           released_at_ms = excluded.released_at_ms,
           released_reason = excluded.released_reason,
+          blocked_source = excluded.blocked_source,
+          blocked_reason = excluded.blocked_reason,
+          blocked_at = excluded.blocked_at,
+          blocked_details = excluded.blocked_details,
+          blocked_checked_at = excluded.blocked_checked_at,
           updated_at = excluded.updated_at`
     )
     .run({
@@ -3005,6 +3202,11 @@ export function recordTaskSnapshot(input: {
       $heartbeat_at: input.heartbeatAt ?? null,
       $released_at_ms: typeof input.releasedAtMs === "number" ? input.releasedAtMs : null,
       $released_reason: input.releasedReason ?? null,
+      $blocked_source: input.blockedSource ?? null,
+      $blocked_reason: input.blockedReason ?? null,
+      $blocked_at: input.blockedAt ?? null,
+      $blocked_details: input.blockedDetails ?? null,
+      $blocked_checked_at: input.blockedCheckedAt ?? null,
       $created_at: at,
       $updated_at: at,
     });
@@ -3586,10 +3788,106 @@ function getRunMeta(runId: string): { repoId: number; issueNumber: number | null
 
 function getRepoIdByName(repo: string): number | null {
   const database = requireDb();
+  return getRepoIdByNameFromDatabase(database, repo);
+}
+
+function getRepoIdByNameFromDatabase(database: Database, repo: string): number | null {
   const row = database.query("SELECT id FROM repos WHERE name = $name").get({
     $name: repo,
   }) as { id?: number } | undefined;
   return row?.id ?? null;
+}
+
+function getRalphRunGateStateFromDatabase(database: Database, runId: string): RalphRunGateState {
+  const results = database
+    .query(
+       `SELECT run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+       FROM ralph_run_gate_results
+       WHERE run_id = $run_id
+       ORDER BY gate ASC`
+    )
+    .all({ $run_id: runId }) as Array<{
+    run_id: string;
+    gate: string;
+    status: string;
+    command?: string | null;
+    skip_reason?: string | null;
+    reason?: string | null;
+    url?: string | null;
+    pr_number?: number | null;
+    pr_url?: string | null;
+    repo_id: number;
+    issue_number?: number | null;
+    task_path?: string | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+
+  const artifacts = database
+    .query(
+      `SELECT id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+       FROM ralph_run_gate_artifacts
+       WHERE run_id = $run_id
+       ORDER BY id ASC`
+    )
+    .all({ $run_id: runId }) as Array<{
+    id: number;
+    run_id: string;
+    gate: string;
+    kind: string;
+    content: string;
+    truncated: number;
+    original_chars?: number | null;
+    original_lines?: number | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+
+  return {
+    results: results.map((row) => ({
+      runId: row.run_id,
+      gate: assertGateName(row.gate),
+      status: assertGateStatus(row.status),
+      command: row.command ?? null,
+      skipReason: row.skip_reason ?? null,
+      reason: row.reason ?? null,
+      url: row.url ?? null,
+      prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
+      prUrl: row.pr_url ?? null,
+      repoId: row.repo_id,
+      issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
+      taskPath: row.task_path ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+    artifacts: artifacts.map((row) => ({
+      id: row.id,
+      runId: row.run_id,
+      gate: assertGateName(row.gate),
+      kind: assertGateArtifactKind(row.kind),
+      content: row.content,
+      truncated: Boolean(row.truncated),
+      originalChars: typeof row.original_chars === "number" ? row.original_chars : null,
+      originalLines: typeof row.original_lines === "number" ? row.original_lines : null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    })),
+  };
+}
+
+function getLatestRunIdForIssueFromDatabase(database: Database, params: { repoId: number; issueNumber: number }): string | null {
+  const row = database
+    .query(
+      `SELECT g.run_id as run_id, MAX(g.updated_at) as updated_at, MAX(r.started_at) as started_at
+       FROM ralph_run_gate_results g
+       JOIN ralph_runs r ON r.run_id = g.run_id
+       WHERE g.repo_id = $repo_id AND g.issue_number = $issue_number
+       GROUP BY g.run_id
+       ORDER BY updated_at DESC, started_at DESC, g.run_id DESC
+       LIMIT 1`
+    )
+    .get({ $repo_id: params.repoId, $issue_number: params.issueNumber }) as { run_id?: string } | undefined;
+  return row?.run_id ?? null;
 }
 
 export function ensureRalphRunGateRows(params: { runId: string; at?: string }): void {
@@ -3780,81 +4078,7 @@ export function recordRalphRunGateArtifact(params: {
 
 export function getRalphRunGateState(runId: string): RalphRunGateState {
   const database = requireDb();
-
-  const results = database
-    .query(
-       `SELECT run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
-       FROM ralph_run_gate_results
-       WHERE run_id = $run_id
-       ORDER BY gate ASC`
-    )
-    .all({ $run_id: runId }) as Array<{
-    run_id: string;
-    gate: string;
-    status: string;
-    command?: string | null;
-    skip_reason?: string | null;
-    reason?: string | null;
-    url?: string | null;
-    pr_number?: number | null;
-    pr_url?: string | null;
-    repo_id: number;
-    issue_number?: number | null;
-    task_path?: string | null;
-    created_at: string;
-    updated_at: string;
-  }>;
-
-  const artifacts = database
-    .query(
-      `SELECT id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
-       FROM ralph_run_gate_artifacts
-       WHERE run_id = $run_id
-       ORDER BY id ASC`
-    )
-    .all({ $run_id: runId }) as Array<{
-    id: number;
-    run_id: string;
-    gate: string;
-    kind: string;
-    content: string;
-    truncated: number;
-    original_chars?: number | null;
-    original_lines?: number | null;
-    created_at: string;
-    updated_at: string;
-  }>;
-
-  return {
-    results: results.map((row) => ({
-      runId: row.run_id,
-      gate: assertGateName(row.gate),
-      status: assertGateStatus(row.status),
-      command: row.command ?? null,
-      skipReason: row.skip_reason ?? null,
-      reason: row.reason ?? null,
-      url: row.url ?? null,
-      prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
-      prUrl: row.pr_url ?? null,
-      repoId: row.repo_id,
-      issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
-      taskPath: row.task_path ?? null,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    })),
-    artifacts: artifacts.map((row) => ({
-      id: row.id,
-      runId: row.run_id,
-      gate: assertGateName(row.gate),
-      kind: assertGateArtifactKind(row.kind),
-      content: row.content,
-      truncated: Boolean(row.truncated),
-      originalChars: typeof row.original_chars === "number" ? row.original_chars : null,
-      originalLines: typeof row.original_lines === "number" ? row.original_lines : null,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-    })),
-  };
+  return getRalphRunGateStateFromDatabase(database, runId);
 }
 
 export function getLatestRunGateStateForIssue(params: {
@@ -3864,21 +4088,36 @@ export function getLatestRunGateStateForIssue(params: {
   const database = requireDb();
   const repoId = getRepoIdByName(params.repo);
   if (!repoId) return null;
+  const runId = getLatestRunIdForIssueFromDatabase(database, { repoId, issueNumber: params.issueNumber });
+  if (!runId) return null;
+  return getRalphRunGateStateFromDatabase(database, runId);
+}
 
-  const row = database
-    .query(
-      `SELECT g.run_id as run_id, MAX(g.updated_at) as updated_at, MAX(r.started_at) as started_at
-       FROM ralph_run_gate_results g
-       JOIN ralph_runs r ON r.run_id = g.run_id
-       WHERE g.repo_id = $repo_id AND g.issue_number = $issue_number
-       GROUP BY g.run_id
-       ORDER BY updated_at DESC, started_at DESC, g.run_id DESC
-       LIMIT 1`
-    )
-    .get({ $repo_id: repoId, $issue_number: params.issueNumber }) as { run_id?: string } | undefined;
+export function getLatestRunGateStateForIssueReadonly(params: {
+  repo: string;
+  issueNumber: number;
+}): RalphRunGateState | null {
+  const stateDbPath = getRalphStateDbPath();
+  if (!existsSync(stateDbPath)) return null;
 
-  if (!row?.run_id) return null;
-  return getRalphRunGateState(row.run_id);
+  const database = new Database(stateDbPath, { readonly: true });
+  try {
+    const busyTimeoutMs =
+      parsePositiveIntEnv("RALPH_STATE_DB_PROBE_BUSY_TIMEOUT_MS") ?? DEFAULT_PROBE_BUSY_TIMEOUT_MS;
+    database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
+    if (!tableExists(database, "repos")) return null;
+    if (!tableExists(database, "ralph_run_gate_results")) return null;
+    if (!tableExists(database, "ralph_run_gate_artifacts")) return null;
+    if (!tableExists(database, "ralph_runs")) return null;
+
+    const repoId = getRepoIdByNameFromDatabase(database, params.repo);
+    if (!repoId) return null;
+    const runId = getLatestRunIdForIssueFromDatabase(database, { repoId, issueNumber: params.issueNumber });
+    if (!runId) return null;
+    return getRalphRunGateStateFromDatabase(database, runId);
+  } finally {
+    database.close();
+  }
 }
 
 export function getLatestRunGateStateForPr(params: {
@@ -4584,6 +4823,11 @@ export type TaskOpState = {
   heartbeatAt?: string | null;
   releasedAtMs?: number | null;
   releasedReason?: string | null;
+  blockedSource?: string | null;
+  blockedReason?: string | null;
+  blockedAt?: string | null;
+  blockedDetails?: string | null;
+  blockedCheckedAt?: string | null;
 };
 
 export type OrphanedTaskOpState = TaskOpState & {
@@ -5071,7 +5315,9 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
               t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
               t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at,
-              t.released_at_ms as released_at_ms, t.released_reason as released_reason
+              t.released_at_ms as released_at_ms, t.released_reason as released_reason,
+              t.blocked_source as blocked_source, t.blocked_reason as blocked_reason, t.blocked_at as blocked_at,
+              t.blocked_details as blocked_details, t.blocked_checked_at as blocked_checked_at
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
        WHERE r.name = $name AND t.issue_number IS NOT NULL AND t.task_path LIKE 'github:%'
@@ -5090,6 +5336,11 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     heartbeat_at?: string | null;
     released_at_ms?: number | null;
     released_reason?: string | null;
+    blocked_source?: string | null;
+    blocked_reason?: string | null;
+    blocked_at?: string | null;
+    blocked_details?: string | null;
+    blocked_checked_at?: string | null;
   }>;
 
   return rows.map((row) => ({
@@ -5106,6 +5357,11 @@ export function listTaskOpStatesByRepo(repo: string): TaskOpState[] {
     heartbeatAt: row.heartbeat_at ?? null,
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
+    blockedSource: row.blocked_source ?? null,
+    blockedReason: row.blocked_reason ?? null,
+    blockedAt: row.blocked_at ?? null,
+    blockedDetails: row.blocked_details ?? null,
+    blockedCheckedAt: row.blocked_checked_at ?? null,
   }));
 }
 
@@ -5116,7 +5372,9 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
       `SELECT t.task_path as task_path, t.issue_number as issue_number, t.status as status, t.session_id as session_id,
               t.session_events_path as session_events_path, t.worktree_path as worktree_path, t.worker_id as worker_id,
               t.repo_slot as repo_slot, t.daemon_id as daemon_id, t.heartbeat_at as heartbeat_at,
-              t.released_at_ms as released_at_ms, t.released_reason as released_reason
+              t.released_at_ms as released_at_ms, t.released_reason as released_reason,
+              t.blocked_source as blocked_source, t.blocked_reason as blocked_reason, t.blocked_at as blocked_at,
+              t.blocked_details as blocked_details, t.blocked_checked_at as blocked_checked_at
        FROM tasks t
        JOIN repos r ON r.id = t.repo_id
        WHERE r.name = $name AND t.task_path = $task_path`
@@ -5135,6 +5393,11 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
         heartbeat_at?: string | null;
         released_at_ms?: number | null;
         released_reason?: string | null;
+        blocked_source?: string | null;
+        blocked_reason?: string | null;
+        blocked_at?: string | null;
+        blocked_details?: string | null;
+        blocked_checked_at?: string | null;
       }
     | undefined;
 
@@ -5153,6 +5416,11 @@ export function getTaskOpStateByPath(repo: string, taskPath: string): TaskOpStat
     heartbeatAt: row.heartbeat_at ?? null,
     releasedAtMs: typeof row.released_at_ms === "number" ? row.released_at_ms : null,
     releasedReason: row.released_reason ?? null,
+    blockedSource: row.blocked_source ?? null,
+    blockedReason: row.blocked_reason ?? null,
+    blockedAt: row.blocked_at ?? null,
+    blockedDetails: row.blocked_details ?? null,
+    blockedCheckedAt: row.blocked_checked_at ?? null,
   };
 }
 

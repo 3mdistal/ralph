@@ -133,7 +133,7 @@ function resolveEventSessionId(
   context: DashboardEventContext,
   event: any
 ): { sessionId?: string; eventSessionId?: string } {
-  const eventSessionId = event?.sessionID ?? event?.sessionId;
+  const eventSessionId = event?.sessionId;
   const resolved = typeof eventSessionId === "string" ? eventSessionId : context.sessionId;
   return { sessionId: resolved, eventSessionId };
 }
