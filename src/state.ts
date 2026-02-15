@@ -2171,6 +2171,14 @@ function ensureSchema(database: Database, stateDbPath: string): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_state_migration_backups_path ON state_migration_backups(backup_path);
   `);
 
+  // Backstop for mixed/partially-migrated schema 22 states where meta schema_version
+  // may already be 22 but blocked-* columns are still absent on tasks.
+  addColumnIfMissing(database, "tasks", "blocked_source", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_reason", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_at", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_details", "TEXT");
+  addColumnIfMissing(database, "tasks", "blocked_checked_at", "TEXT");
+
     runMigrationsWithLock(database, () => {
       database.transaction(() => {
         const neededSchemaInvariantRepair = requiresSchemaInvariantRepair(database);
