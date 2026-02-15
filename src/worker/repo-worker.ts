@@ -221,7 +221,10 @@ import {
   buildRequiredChecksSignature,
   computeRequiredChecksDelay,
   decideBranchProtection,
+  evaluateCiGateFromSummary,
   extractPullRequestNumber,
+  formatCiGateDiagnostics,
+  formatCiGateReason,
   formatRequiredChecksForHumans,
   formatRequiredChecksGuidance,
   hasBypassAllowances,
@@ -582,6 +585,7 @@ export class RepoWorker {
   private checkpointEvents = new CheckpointEventDeduper();
   private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
+  private ciDiagnosticsSignatureByPr = new Map<string, string>();
 
   // Keep thin wrapper methods on RepoWorker for test hooks.
   // Tests frequently monkeypatch these via `(worker as any)`.
@@ -2819,7 +2823,7 @@ export class RepoWorker {
       requiredChecks,
       opts,
       getPullRequestChecks: async (url) => await this.getPullRequestChecks(url),
-      recordCiGateSummary: (url, summary) => this.recordCiGateSummary(url, summary),
+      recordCiGateSummary: (url, summary, resultOpts) => this.recordCiGateSummary(url, summary, { ...resultOpts, requiredChecks }),
       shouldLogBackoff: (key) => this.requiredChecksLogLimiter.shouldLog(key, REQUIRED_CHECKS_LOG_INTERVAL_MS),
       log: (message) => console.log(message),
     });
@@ -2853,25 +2857,64 @@ export class RepoWorker {
     return parseCiFixAttempts(process.env.RALPH_MERGE_CONFLICT_MAX_ATTEMPTS) ?? 2;
   }
 
-  private recordCiGateSummary(prUrl: string, summary: RequiredChecksSummary): void {
+  private recordCiGateSummary(
+    prUrl: string,
+    summary: RequiredChecksSummary,
+    opts?: { timedOut?: boolean; requiredChecks?: string[] }
+  ): void {
     const runId = this.activeRunId;
     if (!runId) return;
-    const status = summary.status === "success" ? "pass" : summary.status === "failure" ? "fail" : "pending";
     const prNumber = extractPullRequestNumber(prUrl);
-    const ciUrl = summary.required.map((check) => check.detailsUrl).find(Boolean) ?? null;
+    const requiredChecks = opts?.requiredChecks ?? summary.required.map((check) => check.name);
+    const evaluation = evaluateCiGateFromSummary({ summary, requiredChecks, timedOut: opts?.timedOut });
+    const reason = formatCiGateReason(evaluation);
 
     try {
       upsertRalphRunGateResult({
         runId,
         gate: "ci",
-        status,
-        url: ciUrl,
+        status: evaluation.status,
+        reason,
+        url: evaluation.representativeUrl,
         prNumber: prNumber ?? null,
         prUrl,
       });
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to persist CI gate status for ${prUrl}: ${error?.message ?? String(error)}`
+      );
+    }
+
+    if (evaluation.status !== "fail") return;
+
+    const signature = JSON.stringify({
+      status: evaluation.status,
+      timedOut: evaluation.timedOut,
+      required: evaluation.required.map((check) => ({
+        name: check.name,
+        state: check.state,
+        rawState: check.rawState,
+      })),
+      missingRequired: evaluation.missingRequired,
+      availableContexts: evaluation.availableContexts,
+    });
+
+    if (this.ciDiagnosticsSignatureByPr.get(prUrl) === signature) {
+      return;
+    }
+
+    this.ciDiagnosticsSignatureByPr.set(prUrl, signature);
+
+    try {
+      recordRalphRunGateArtifact({
+        runId,
+        gate: "ci",
+        kind: "note",
+        content: formatCiGateDiagnostics(evaluation),
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist CI gate diagnostics for ${prUrl}: ${error?.message ?? String(error)}`
       );
     }
   }
@@ -3890,7 +3933,7 @@ export class RepoWorker {
       baseRefName = prStatus.baseRefName;
       const prState = await this.getPullRequestMergeState(params.prUrl);
       headRefName = prState.headRefName || null;
-      this.recordCiGateSummary(params.prUrl, summary);
+      this.recordCiGateSummary(params.prUrl, summary, { timedOut: params.timedOut, requiredChecks: params.requiredChecks });
     } catch (error: any) {
       const reason = `CI-debug preflight failed for ${params.prUrl}: ${this.formatGhError(error)}`;
       console.warn(`[ralph:worker:${this.repo}] ${reason}`);
@@ -4058,7 +4101,7 @@ export class RepoWorker {
       const prStatus = await this.getPullRequestChecks(params.prUrl);
       summary = summarizeRequiredChecks(prStatus.checks, params.requiredChecks);
       headSha = prStatus.headSha;
-      this.recordCiGateSummary(params.prUrl, summary);
+      this.recordCiGateSummary(params.prUrl, summary, { timedOut: false, requiredChecks: params.requiredChecks });
       attempt.headShaAfter = headSha;
       attempt.signatureAfter = this.formatCiDebugSignature(summary, false);
     } catch (error: any) {
@@ -4925,7 +4968,7 @@ export class RepoWorker {
       createAgentRun: async (task, opts) => await this.createAgentRun(task, opts as any),
       markTaskBlocked: async (task, source, opts) => await this.markTaskBlocked(task, source as any, opts as any),
       getPullRequestChecks: async (url) => await this.getPullRequestChecks(url),
-      recordCiGateSummary: (url, summary) => this.recordCiGateSummary(url, summary),
+      recordCiGateSummary: (url, summary, resultOpts) => this.recordCiGateSummary(url, summary, resultOpts),
       buildIssueContextForAgent: async (input) => await this.buildIssueContextForAgent(input),
       runReviewAgent: async (input) => {
         const runLogPath = await this.recordRunLogPath(params.task, issueNumber, input.stage, "in-progress");
