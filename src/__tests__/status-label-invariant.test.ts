@@ -33,6 +33,28 @@ describe("status label invariant", () => {
     ).toBe("ralph:status:queued");
   });
 
+  test("chooses queued when dependency blocked even if actively owned", () => {
+    expect(
+      chooseStatusHealTarget({
+        repo: "3mdistal/ralph",
+        issueNumber: 2,
+        activeOwnership: true,
+        dependencyBlocked: true,
+      })
+    ).toBe("ralph:status:queued");
+  });
+
+  test("dependency blocked overrides in-progress desired hint", () => {
+    expect(
+      chooseStatusHealTarget({
+        repo: "3mdistal/ralph",
+        issueNumber: 3,
+        desiredHint: "ralph:status:in-progress",
+        dependencyBlocked: true,
+      })
+    ).toBe("ralph:status:queued");
+  });
+
   test("heals empty status label set", async () => {
     const labels = createLabelIo(["bug"]);
     await enforceSingleStatusLabelInvariant({

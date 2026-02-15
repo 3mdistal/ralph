@@ -3,7 +3,12 @@ import type { EnsureOutcome } from "./ensure-ralph-workflow-labels";
 import { canAttemptLabelWrite, recordLabelWriteFailure, recordLabelWriteSuccess } from "./label-write-backoff";
 import { withIssueLabelLock } from "./issue-label-lock";
 import { enforceSingleStatusLabelInvariant } from "./status-label-invariant";
-import { RALPH_STATUS_LABEL_PREFIX } from "../github-labels";
+import {
+  RALPH_LABEL_STATUS_DONE,
+  RALPH_LABEL_STATUS_IN_BOT,
+  RALPH_STATUS_LABEL_PREFIX,
+} from "../github-labels";
+import { coalesceIssueLabelWrite } from "./write-coalescer";
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
@@ -215,10 +220,29 @@ export async function executeIssueLabelOps(params: {
   retryMissingLabelOnce?: boolean;
   ensureBefore?: boolean;
 }): Promise<ApplyIssueLabelOpsResult> {
-  return await withIssueLabelLock({
-    repo: params.repo,
-    issueNumber: params.issueNumber,
-    run: async () => {
+  const add = params.ops.filter((op) => op.action === "add").map((op) => op.label);
+  const remove = params.ops.filter((op) => op.action === "remove").map((op) => op.label);
+  if (add.length === 0 && remove.length === 0) {
+    console.log(
+      `[ralph:telemetry:${params.repo}] github.write.dropped ${JSON.stringify({
+        kind: "labels",
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        reason: "noop",
+        source: params.logLabel ?? null,
+      })}`
+    );
+    return { ok: true, add: [], remove: [], didRetry: false };
+  }
+
+  const containsCmdLabel = params.ops.some((op) => op.label.toLowerCase().startsWith("ralph:cmd:"));
+  const critical = add.includes(RALPH_LABEL_STATUS_IN_BOT) || add.includes(RALPH_LABEL_STATUS_DONE);
+
+  const run = async () =>
+    await withIssueLabelLock({
+      repo: params.repo,
+      issueNumber: params.issueNumber,
+      run: async () => {
       const result = await applyIssueLabelOps({
         ops: params.ops,
         io: {
@@ -294,6 +318,20 @@ export async function executeIssueLabelOps(params: {
 
       return result;
     },
+    });
+
+  if (containsCmdLabel) {
+    return await run();
+  }
+
+  return await coalesceIssueLabelWrite({
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    add,
+    remove,
+    source: params.logLabel,
+    critical,
+    run,
   });
 }
 
