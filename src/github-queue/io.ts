@@ -31,6 +31,7 @@ import {
   listIssueSnapshotsWithRalphLabels,
   listOpenPrCandidatesForIssue,
   listTaskOpStatesByRepo,
+  getLatestSessionSeenAt,
   recordIssueLabelsSnapshot,
   recordIssueSnapshot,
   recordTaskSnapshot,
@@ -644,18 +645,51 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
       }
       const opStateByIssue = buildTaskOpStateMap(repo);
       const issues = listIssueSnapshotsWithRalphLabels(repo);
+      const sessionActivityCache = new Map<string, number | null>();
+
+      const resolveSessionActivityMs = (sessionId: string | null | undefined): number | null => {
+        const sid = sessionId?.trim() ?? "";
+        if (!sid) return null;
+        if (sessionActivityCache.has(sid)) {
+          return sessionActivityCache.get(sid) ?? null;
+        }
+
+        const seenAt = getLatestSessionSeenAt(sid);
+        const seenAtMs = seenAt ? Date.parse(seenAt) : NaN;
+        const value = Number.isFinite(seenAtMs) ? seenAtMs : null;
+        sessionActivityCache.set(sid, value);
+        return value;
+      };
 
       for (const issue of issues) {
         if (stopRequested) return;
         if (!issue.labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) continue;
         const opState = opStateByIssue.get(issue.number) ?? null;
-        const recovery = computeStaleInProgressRecovery({
+        const authoritativeActivityAtMs = resolveSessionActivityMs(opState?.sessionId);
+        const baselineRecovery = computeStaleInProgressRecovery({
           labels: issue.labels,
           opState,
           nowMs,
           ttlMs,
           graceMs: missingSessionGraceMs,
         });
+        const recovery = computeStaleInProgressRecovery({
+          labels: issue.labels,
+          opState,
+          nowMs,
+          ttlMs,
+          graceMs: missingSessionGraceMs,
+          authoritativeActivityAtMs,
+        });
+        if (baselineRecovery.shouldRecover && !recovery.shouldRecover && authoritativeActivityAtMs !== null) {
+          if (shouldLog(`queue:stale-sweep:authoritative-activity:${repo}#${issue.number}`, 60_000)) {
+            console.warn(
+              `[ralph:queue:github] Skipping stale recovery for ${repo}#${issue.number}; active session heartbeat at ${new Date(
+                authoritativeActivityAtMs
+              ).toISOString()}`
+            );
+          }
+        }
         if (!recovery.shouldRecover) continue;
 
         const currentStatus = deriveRalphStatus(issue.labels, issue.state);

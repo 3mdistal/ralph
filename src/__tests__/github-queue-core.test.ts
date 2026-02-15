@@ -353,6 +353,48 @@ describe("github queue core", () => {
     expect(recovery.shouldRecover).toBe(false);
   });
 
+  test("computeStaleInProgressRecovery keeps in-progress when authoritative activity is fresh", () => {
+    const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
+    const ttlMs = 60_000;
+
+    const recovery = computeStaleInProgressRecovery({
+      labels: ["ralph:status:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 63,
+        taskPath: "github:3mdistal/ralph#63",
+        heartbeatAt: "2026-01-11T00:00:00.000Z",
+        sessionId: "opencode-session-123",
+      },
+      nowMs,
+      ttlMs,
+      authoritativeActivityAtMs: Date.parse("2026-01-11T00:09:30.000Z"),
+    });
+
+    expect(recovery.shouldRecover).toBe(false);
+  });
+
+  test("computeStaleInProgressRecovery still recovers when authoritative activity is stale", () => {
+    const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
+    const ttlMs = 60_000;
+
+    const recovery = computeStaleInProgressRecovery({
+      labels: ["ralph:status:in-progress"],
+      opState: {
+        repo: "3mdistal/ralph",
+        issueNumber: 63,
+        taskPath: "github:3mdistal/ralph#63",
+        heartbeatAt: "2026-01-11T00:00:00.000Z",
+        sessionId: "opencode-session-123",
+      },
+      nowMs,
+      ttlMs,
+      authoritativeActivityAtMs: Date.parse("2026-01-11T00:01:00.000Z"),
+    });
+
+    expect(recovery).toEqual({ shouldRecover: true, reason: "stale-heartbeat" });
+  });
+
   test("computeStaleInProgressRecovery ignores released tasks", () => {
     const nowMs = Date.parse("2026-01-11T00:10:00.000Z");
     const ttlMs = 60_000;
