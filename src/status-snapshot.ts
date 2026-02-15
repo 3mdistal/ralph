@@ -10,13 +10,19 @@ export type StatusQueueSnapshot = {
 export type StatusQueueParityRepo = {
   repo: string;
   ghQueuedLocalBlocked: number;
+  localDepsBlockedGhInProgress: number;
+  localDepsBlockedMissingMeta: number;
   multiStatusLabels: number;
   missingStatusWithOpState: number;
   sampleGhQueuedLocalBlocked: string[];
+  sampleLocalDepsBlockedGhInProgress: string[];
+  sampleLocalDepsBlockedMissingMeta: string[];
 };
 
 export type StatusQueueParitySnapshot = {
   ghQueuedLocalBlocked: number;
+  localDepsBlockedGhInProgress: number;
+  localDepsBlockedMissingMeta: number;
   multiStatusLabels: number;
   missingStatusWithOpState: number;
   repos: StatusQueueParityRepo[];

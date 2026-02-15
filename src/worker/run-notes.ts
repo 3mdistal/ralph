@@ -53,10 +53,8 @@ export function computeBlockedPatch(
   const detailsSource = opts.details ?? opts.reason ?? "";
   const detailsSummary = detailsSource ? summarizeBlockedDetails(detailsSource) : "";
 
-  // NOTE: GitHub-backed tasks do not currently persist blocked-* metadata in durable op-state.
-  // That means we can repeatedly rebuild AgentTask objects that have status=blocked but empty
-  // blocked-source/reason fields. Treating that as a "signature change" causes noisy re-entry
-  // notifications (blocked-deps spam) even though nothing changed.
+  // Guard against legacy rows that may still miss blocked-* metadata after migration.
+  // Without this, status-only blocked rows can cause noisy duplicate blocked notifications.
   const priorBlockedSource = typeof task["blocked-source"] === "string" ? task["blocked-source"].trim() : "";
   const priorBlockedReason = typeof task["blocked-reason"] === "string" ? task["blocked-reason"].trim() : "";
   const hasPriorBlockedSignature = Boolean(priorBlockedSource || priorBlockedReason);

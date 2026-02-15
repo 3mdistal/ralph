@@ -1,13 +1,17 @@
-import { RALPH_LABEL_STATUS_QUEUED, RALPH_STATUS_LABEL_PREFIX } from "../github-labels";
+import { RALPH_LABEL_META_BLOCKED, RALPH_LABEL_STATUS_IN_PROGRESS, RALPH_LABEL_STATUS_QUEUED, RALPH_STATUS_LABEL_PREFIX } from "../github-labels";
 import { listIssueSnapshotsWithRalphLabels, listTaskOpStatesByRepo, type IssueSnapshot, type TaskOpState } from "../state";
 import type { QueueTaskStatus } from "../queue/types";
 
 export type QueueParityRepoAudit = {
   repo: string;
   ghQueuedLocalBlocked: number;
+  localDepsBlockedGhInProgress: number;
+  localDepsBlockedMissingMeta: number;
   multiStatusLabels: number;
   missingStatusWithOpState: number;
   sampleGhQueuedLocalBlocked: string[];
+  sampleLocalDepsBlockedGhInProgress: string[];
+  sampleLocalDepsBlockedMissingMeta: string[];
 };
 
 function normalizeLocalStatus(opState: TaskOpState | null | undefined): QueueTaskStatus | null {
@@ -35,9 +39,13 @@ export function computeQueueParityAudit(params: {
   }
 
   let ghQueuedLocalBlocked = 0;
+  let localDepsBlockedGhInProgress = 0;
+  let localDepsBlockedMissingMeta = 0;
   let multiStatusLabels = 0;
   let missingStatusWithOpState = 0;
   const sampleGhQueuedLocalBlocked: string[] = [];
+  const sampleLocalDepsBlockedGhInProgress: string[] = [];
+  const sampleLocalDepsBlockedMissingMeta: string[] = [];
 
   for (const issue of params.issues) {
     if ((issue.state ?? "").toUpperCase() === "CLOSED") continue;
@@ -61,14 +69,32 @@ export function computeQueueParityAudit(params: {
         sampleGhQueuedLocalBlocked.push(`${params.repo}#${issue.number}`);
       }
     }
+    const blockedSource = opState.blockedSource?.trim() ?? "";
+    const depsBlocked = localStatus === "blocked" && blockedSource === "deps";
+    if (depsBlocked && labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) {
+      localDepsBlockedGhInProgress += 1;
+      if (sampleLocalDepsBlockedGhInProgress.length < sampleLimit) {
+        sampleLocalDepsBlockedGhInProgress.push(`${params.repo}#${issue.number}`);
+      }
+    }
+    if (depsBlocked && !labels.includes(RALPH_LABEL_META_BLOCKED)) {
+      localDepsBlockedMissingMeta += 1;
+      if (sampleLocalDepsBlockedMissingMeta.length < sampleLimit) {
+        sampleLocalDepsBlockedMissingMeta.push(`${params.repo}#${issue.number}`);
+      }
+    }
   }
 
   return {
     repo: params.repo,
     ghQueuedLocalBlocked,
+    localDepsBlockedGhInProgress,
+    localDepsBlockedMissingMeta,
     multiStatusLabels,
     missingStatusWithOpState,
     sampleGhQueuedLocalBlocked,
+    sampleLocalDepsBlockedGhInProgress,
+    sampleLocalDepsBlockedMissingMeta,
   };
 }
 
