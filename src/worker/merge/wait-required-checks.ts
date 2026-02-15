@@ -22,7 +22,7 @@ export async function waitForRequiredChecks(params: {
     baseRefName: string;
     checks: PrCheck[];
   }>;
-  recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary) => void;
+  recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary, opts?: { timedOut?: boolean }) => void;
   shouldLogBackoff?: (logKey: string) => boolean;
   log?: (message: string) => void;
 }): Promise<{
@@ -54,7 +54,7 @@ export async function waitForRequiredChecks(params: {
     last = { headSha, mergeStateStatus, baseRefName, summary, checks };
 
     if (mergeStateStatus === "DIRTY") {
-      params.recordCiGateSummary(params.prUrl, summary);
+      params.recordCiGateSummary(params.prUrl, summary, { timedOut: false });
       return {
         headSha,
         mergeStateStatus,
@@ -67,7 +67,7 @@ export async function waitForRequiredChecks(params: {
     }
 
     if (summary.status === "success" || summary.status === "failure") {
-      params.recordCiGateSummary(params.prUrl, summary);
+      params.recordCiGateSummary(params.prUrl, summary, { timedOut: false });
       return { headSha, mergeStateStatus, baseRefName, summary, checks, timedOut: false };
     }
 
@@ -96,14 +96,14 @@ export async function waitForRequiredChecks(params: {
   }
 
   if (last) {
-    params.recordCiGateSummary(params.prUrl, last.summary);
+    params.recordCiGateSummary(params.prUrl, last.summary, { timedOut: true });
     return { ...last, timedOut: true };
   }
 
   // Should be unreachable, but keep types happy.
   const fallback = await params.getPullRequestChecks(params.prUrl);
   const fallbackSummary = summarizeRequiredChecks(fallback.checks, params.requiredChecks);
-  params.recordCiGateSummary(params.prUrl, fallbackSummary);
+  params.recordCiGateSummary(params.prUrl, fallbackSummary, { timedOut: true });
   return {
     headSha: fallback.headSha,
     mergeStateStatus: fallback.mergeStateStatus,

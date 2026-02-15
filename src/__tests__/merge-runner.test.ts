@@ -78,6 +78,7 @@ function buildParams(overrides: Record<string, unknown> = {}) {
     }),
     runCiFailureTriage: async () => ({ status: "failed", run: { taskName: "x", repo: "x", outcome: "failed" } }),
     recordMergeFailureArtifact: () => {},
+    pauseIfGitHubRateLimited: async () => null,
     pauseIfHardThrottled: async () => null,
     shouldAttemptProactiveUpdate: () => ({ ok: false }),
     shouldRateLimitAutoUpdate: () => false,
@@ -198,9 +199,55 @@ describe("mergePrWithRequiredChecks 405 handling", () => {
     expect(markTaskBlockedCalls[0]?.reason).toContain("auth");
     expect(mergeCalls).toHaveLength(0);
   });
+
+  test("pauses instead of blocking when merge hits GitHub rate limit", async () => {
+    let pauseCalls = 0;
+    const { params, mergeCalls, markTaskBlockedCalls } = buildParams({
+      mergePullRequest: async () => {
+        throw new Error("HTTP 403: API rate limit exceeded for installation ID 123");
+      },
+      pauseIfGitHubRateLimited: async () => {
+        pauseCalls += 1;
+        return { taskName: "Issue 611", repo: "3mdistal/ralph", outcome: "throttled", sessionId: "ses_611" };
+      },
+    });
+
+    const result = await mergePrWithRequiredChecks(params);
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.run.outcome).toBe("throttled");
+    }
+    expect(pauseCalls).toBe(1);
+    expect(markTaskBlockedCalls).toHaveLength(0);
+    expect(mergeCalls).toHaveLength(0);
+  });
 });
 
 describe("mergePrWithRequiredChecks pre-merge CI remediation", () => {
+  test("does not merge when only non-required checks are green", async () => {
+    let recurseCalls = 0;
+
+    const { params, mergeCalls } = buildParams({
+      getPullRequestChecks: async () => ({
+        headSha: "sha-initial",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "bot/integration",
+        checks: [{ name: "Other", state: "SUCCESS", rawState: "SUCCESS", detailsUrl: null }],
+      }),
+      recurse: async () => {
+        recurseCalls += 1;
+        return { ok: false as const, run: { taskName: "x", repo: "x", outcome: "failed" } };
+      },
+    });
+
+    const result = await mergePrWithRequiredChecks(params);
+
+    expect(result.ok).toBe(false);
+    expect(recurseCalls).toBe(1);
+    expect(mergeCalls).toHaveLength(0);
+  });
+
   test("enters CI triage when required checks fail at merge time", async () => {
     let statusCall = 0;
     let triageCalls = 0;

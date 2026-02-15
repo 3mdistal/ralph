@@ -27,12 +27,27 @@ function inferActiveOwnership(repo: string, issueNumber: number): boolean {
   }
 }
 
+function inferDependencyBlocked(repo: string, issueNumber: number): boolean {
+  try {
+    const opState = listTaskOpStatesByRepo(repo).find((entry) => entry.issueNumber === issueNumber);
+    if (!opState) return false;
+    const status = opState.status?.trim() ?? "";
+    const blockedSource = opState.blockedSource?.trim() ?? "";
+    return status === "blocked" && blockedSource === "deps";
+  } catch {
+    return false;
+  }
+}
+
 export function chooseStatusHealTarget(params: {
   repo: string;
   issueNumber: number;
   desiredHint?: string | null;
   activeOwnership?: boolean;
+  dependencyBlocked?: boolean;
 }): string {
+  const depsBlocked = params.dependencyBlocked ?? inferDependencyBlocked(params.repo, params.issueNumber);
+  if (depsBlocked) return RALPH_LABEL_STATUS_QUEUED;
   const hint = params.desiredHint?.trim();
   if (hint && isStatusLabel(hint)) return hint;
   const activeOwnership = params.activeOwnership ?? inferActiveOwnership(params.repo, params.issueNumber);

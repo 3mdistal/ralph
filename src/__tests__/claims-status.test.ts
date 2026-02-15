@@ -38,6 +38,7 @@ describe("claims/canonical.jsonl statuses", () => {
       "profiles.selection-not-identity",
       "daemon.singleton.locked",
       "doctor.discovery-repair",
+      "gates.restart.replay-deterministic",
     ];
 
     for (const id of requiredImplemented) {
