@@ -2420,6 +2420,43 @@ export class RepoWorker {
     return "UNKNOWN";
   }
 
+  private normalizeRecoveryBranchIssueSegment(issueNumber: string): string {
+    const normalized = String(issueNumber ?? "").trim().replace(/[^0-9A-Za-z._-]+/g, "-");
+    return normalized.length > 0 ? normalized : "unknown";
+  }
+
+  private async materializeDetachedHeadRecoveryBranch(params: {
+    worktreePath: string;
+    issueNumber: string;
+  }): Promise<{ branch: string | null; diagnostics: string[] }> {
+    const diagnostics: string[] = [];
+    const issueSegment = this.normalizeRecoveryBranchIssueSegment(params.issueNumber);
+
+    let headSha = "";
+    try {
+      const headOut = await $`git rev-parse --short=12 HEAD`.cwd(params.worktreePath).quiet();
+      headSha = headOut.stdout.toString().trim();
+    } catch (error: any) {
+      diagnostics.push(`- Unable to resolve HEAD SHA for detached branch recovery: ${error?.message ?? String(error)}`);
+      return { branch: null, diagnostics };
+    }
+
+    if (!headSha) {
+      diagnostics.push("- Unable to resolve HEAD SHA for detached branch recovery");
+      return { branch: null, diagnostics };
+    }
+
+    const recoveryBranch = `ralph/recovery-${issueSegment}-${headSha}`;
+    try {
+      await $`git checkout -B ${recoveryBranch} HEAD`.cwd(params.worktreePath).quiet();
+      diagnostics.push(`- Materialized recovery branch from detached HEAD: ${recoveryBranch}`);
+      return { branch: recoveryBranch, diagnostics };
+    } catch (error: any) {
+      diagnostics.push(`- Failed to materialize recovery branch ${recoveryBranch}: ${error?.message ?? String(error)}`);
+      return { branch: null, diagnostics };
+    }
+  }
+
   private async tryEnsurePrFromWorktree(params: {
     task: AgentTask;
     issueNumber: string;
@@ -2475,14 +2512,22 @@ export class RepoWorker {
       return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
     }
 
-    const branch = stripHeadsRef(candidate.branch);
+    let branch = stripHeadsRef(candidate.branch);
     diagnostics.push(`- Worktree: ${candidate.worktreePath}`);
     diagnostics.push(`- Branch: ${branch ?? "(unknown)"}`);
 
     if (!branch || candidate.detached) {
-      diagnostics.push("- Cannot auto-create PR: detached HEAD or unknown branch");
-      diagnostics.push(formatPrEvidenceCauseCodeLine("NO_WORKTREE_BRANCH"));
-      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
+      const recovered = await this.materializeDetachedHeadRecoveryBranch({
+        worktreePath: candidate.worktreePath,
+        issueNumber,
+      });
+      diagnostics.push(...recovered.diagnostics);
+      branch = recovered.branch;
+      if (!branch) {
+        diagnostics.push("- Cannot auto-create PR: detached HEAD or unknown branch");
+        diagnostics.push(formatPrEvidenceCauseCodeLine("NO_WORKTREE_BRANCH"));
+        return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "NO_WORKTREE_BRANCH" };
+      }
     }
 
     try {
