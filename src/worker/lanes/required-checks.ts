@@ -273,7 +273,7 @@ export function summarizeRequiredChecks(allChecks: PrCheck[], requiredChecks: st
   return { status: "pending", required, available };
 }
 
-export function evaluateCiGate(params: {
+function evaluateCiGate(params: {
   allChecks: PrCheck[];
   requiredChecks: string[];
   timedOut?: boolean;
