@@ -114,6 +114,62 @@ export interface SessionResult {
   errorCode?: "context_length_exceeded";
 }
 
+export type OpenCodeBackendCapabilities = {
+  ensureOrAttachServer: boolean;
+  createOrResumeSession: boolean;
+  sendStageMessage: boolean;
+  subscribeEvents: boolean;
+  abort: boolean;
+  fetchMessages: boolean;
+  fetchStatus: boolean;
+  fetchDiff: boolean;
+};
+
+export type OpenCodeRunRequest =
+  | {
+      kind: "agent";
+      repoPath: string;
+      agent: string;
+      message: string;
+      options?: RunSessionOptionsBase;
+      testOverrides?: RunSessionTestOverrides;
+    }
+  | {
+      kind: "continue";
+      repoPath: string;
+      sessionId: string;
+      message: string;
+      options?: RunSessionOptionsBase & { agent?: string };
+      testOverrides?: RunSessionTestOverrides;
+    }
+  | {
+      kind: "command";
+      repoPath: string;
+      command: string;
+      args?: string[];
+      options?: RunSessionOptionsBase;
+      testOverrides?: RunSessionTestOverrides;
+    }
+  | {
+      kind: "continue-command";
+      repoPath: string;
+      sessionId: string;
+      command: string;
+      args?: string[];
+      options?: RunSessionOptionsBase;
+      testOverrides?: RunSessionTestOverrides;
+    };
+
+export interface OpenCodeBackend {
+  readonly capabilities: OpenCodeBackendCapabilities;
+  run(request: OpenCodeRunRequest): Promise<SessionResult>;
+  ensureOrAttachServer?(repoPath: string): Promise<ServerHandle>;
+  abortSession?(repoPath: string, sessionId: string): Promise<{ ok: boolean; reason?: string }>;
+  fetchMessages?(repoPath: string, sessionId: string): Promise<unknown[]>;
+  fetchStatus?(repoPath: string, sessionId: string): Promise<unknown>;
+  fetchDiff?(repoPath: string, sessionId: string): Promise<unknown>;
+}
+
 
 /**
  * Spawn an OpenCode server for a specific repo directory.
@@ -693,6 +749,13 @@ function argsFromMessage(message: string): string[] {
   if (parts.length === 0) return [];
   if (parts[0].startsWith("/")) return parts.slice(1);
   return parts;
+}
+
+function normalizeOpenCodeEvent(event: any): any {
+  if (!event || typeof event !== "object") return event;
+  if (typeof event.sessionId === "string") return event;
+  if (typeof event.sessionID !== "string") return event;
+  return { ...event, sessionId: event.sessionID };
 }
 
 /**
@@ -1443,7 +1506,7 @@ async function runSession(
       if (recentEvents.length > recentEventLimit) recentEvents = recentEvents.slice(-recentEventLimit);
 
       try {
-        const event = JSON.parse(trimmed);
+        const event = normalizeOpenCodeEvent(JSON.parse(trimmed));
         if (typeof options?.onEvent === "function") {
           try {
             options.onEvent(event);
@@ -1451,7 +1514,7 @@ async function runSession(
             // ignore
           }
         }
-        const eventSessionId = event.sessionID ?? event.sessionId;
+        const eventSessionId = event.sessionId;
         if (eventSessionId && !sessionId) {
           sessionId = String(eventSessionId);
           if (runMeta) updateOpencodeRun(runMeta.pgid, { sessionId });
@@ -2118,6 +2181,63 @@ export type RunSessionTestOverrides = {
   resolveGhTokenEnv?: () => Promise<string | null>;
 };
 
+const CLI_OPENCODE_BACKEND_CAPABILITIES: OpenCodeBackendCapabilities = {
+  ensureOrAttachServer: true,
+  createOrResumeSession: true,
+  sendStageMessage: true,
+  subscribeEvents: true,
+  abort: true,
+  fetchMessages: false,
+  fetchStatus: false,
+  fetchDiff: false,
+};
+
+const cliOpenCodeBackend: OpenCodeBackend = {
+  capabilities: CLI_OPENCODE_BACKEND_CAPABILITIES,
+  run: async (request) => {
+    switch (request.kind) {
+      case "agent": {
+        const merged: RunSessionInternalOptions = { agent: request.agent, ...(request.options ?? {}) };
+        if (request.testOverrides) merged.__testOverrides = request.testOverrides;
+        return runSession(request.repoPath, request.message, merged);
+      }
+      case "continue":
+        return runSession(request.repoPath, request.message, {
+          continueSession: request.sessionId,
+          agent: request.options?.agent,
+          ...(request.testOverrides ? { __testOverrides: request.testOverrides } : {}),
+          ...(request.options ?? {}),
+        });
+      case "command": {
+        const normalized = normalizeCommand(request.command)!;
+        const message = ["/" + normalized, ...(request.args ?? [])].join(" ");
+        const merged: RunSessionInternalOptions = { command: normalized, ...(request.options ?? {}) };
+        if (request.testOverrides) merged.__testOverrides = request.testOverrides;
+        return runSession(request.repoPath, message, merged);
+      }
+      case "continue-command": {
+        const normalized = normalizeCommand(request.command)!;
+        const message = ["/" + normalized, ...(request.args ?? [])].join(" ");
+        return runSession(request.repoPath, message, {
+          command: normalized,
+          continueSession: request.sessionId,
+          ...(request.testOverrides ? { __testOverrides: request.testOverrides } : {}),
+          ...(request.options ?? {}),
+        });
+      }
+    }
+  },
+  ensureOrAttachServer: (repoPath) => spawnServer(repoPath),
+  abortSession: async (_repoPath, _sessionId) => ({ ok: false, reason: "not-supported-by-cli-backend" }),
+  fetchMessages: async () => [],
+  fetchStatus: async () => null,
+  fetchDiff: async () => null,
+};
+
+export function getDefaultOpenCodeBackend(): OpenCodeBackend {
+  return cliOpenCodeBackend;
+}
+
 type RunSessionInternalOptions = RunSessionOptionsBase & {
   command?: string;
   continueSession?: string;
@@ -2136,13 +2256,14 @@ export async function runCommand(
   options?: RunSessionOptionsBase,
   testOverrides?: RunSessionTestOverrides
 ): Promise<SessionResult> {
-  const normalized = normalizeCommand(command)!;
-  const message = ["/" + normalized, ...args].join(" ");
-
-  const merged: RunSessionInternalOptions = { command: normalized, ...(options ?? {}) };
-  if (testOverrides) merged.__testOverrides = testOverrides;
-
-  return runSession(repoPath, message, merged);
+  return getDefaultOpenCodeBackend().run({
+    kind: "command",
+    repoPath,
+    command,
+    args,
+    options,
+    testOverrides,
+  });
 }
 
 /**
@@ -2154,8 +2275,13 @@ export async function continueSession(
   message: string,
   options?: RunSessionOptionsBase & { agent?: string }
 ): Promise<SessionResult> {
-  const { agent, ...rest } = options ?? {};
-  return runSession(repoPath, message, { continueSession: sessionId, agent, ...rest });
+  return getDefaultOpenCodeBackend().run({
+    kind: "continue",
+    repoPath,
+    sessionId,
+    message,
+    options,
+  });
 }
 
 /**
@@ -2168,9 +2294,14 @@ export async function runAgent(
   options?: RunSessionOptionsBase,
   testOverrides?: RunSessionTestOverrides
 ): Promise<SessionResult> {
-  const merged: RunSessionInternalOptions = { agent, ...(options ?? {}) };
-  if (testOverrides) merged.__testOverrides = testOverrides;
-  return runSession(repoPath, message, merged);
+  return getDefaultOpenCodeBackend().run({
+    kind: "agent",
+    repoPath,
+    agent,
+    message,
+    options,
+    testOverrides,
+  });
 }
 
 /**
@@ -2183,9 +2314,14 @@ export async function continueCommand(
   args: string[] = [],
   options?: RunSessionOptionsBase
 ): Promise<SessionResult> {
-  const normalized = normalizeCommand(command)!;
-  const message = ["/" + normalized, ...args].join(" ");
-  return runSession(repoPath, message, { command: normalized, continueSession: sessionId, ...options });
+  return getDefaultOpenCodeBackend().run({
+    kind: "continue-command",
+    repoPath,
+    sessionId,
+    command,
+    args,
+    options,
+  });
 }
 
 /**
@@ -2261,7 +2397,7 @@ async function* streamSession(
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
-        yield JSON.parse(trimmed);
+        yield normalizeOpenCodeEvent(JSON.parse(trimmed));
       } catch {
         // ignore
       }
@@ -2270,7 +2406,7 @@ async function* streamSession(
 
   if (buffer.trim()) {
     try {
-      yield JSON.parse(buffer.trim());
+      yield normalizeOpenCodeEvent(JSON.parse(buffer.trim()));
     } catch {
       // ignore
     }
