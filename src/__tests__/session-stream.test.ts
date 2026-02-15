@@ -40,4 +40,22 @@ describe("OpenCode JSON stream handling", () => {
 
     expect(events).toEqual([{ a: 1 }, { b: 2 }]);
   });
+
+  test("normalizes legacy sessionID to sessionId", async () => {
+    const spawn = (() => {
+      const stdout = (async function* () {
+        yield Buffer.from('{"type":"text","sessionID":"ses_legacy"}\n');
+      })();
+
+      return { stdout } as any;
+    }) as any;
+
+    const events: any[] = [];
+    for await (const event of __streamSessionForTests("/tmp", "hello", { __testOverrides: { spawn } } as any)) {
+      events.push(event);
+    }
+
+    expect(events).toHaveLength(1);
+    expect(events[0].sessionId).toBe("ses_legacy");
+  });
 });
