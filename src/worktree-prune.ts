@@ -1,9 +1,10 @@
 import { $ } from "bun";
 import { existsSync } from "fs";
 import { rm } from "fs/promises";
-import { relative, resolve } from "path";
+import { resolve } from "path";
 
 import { isLegacyWorktreePath, isPathUnderDir } from "./git-worktree";
+import { classifyManagedWorktreePath, isManagedWorktreeRootClassification } from "./worktree-layout";
 import { buildWorktreePath } from "./worktree-paths";
 
 export type WorktreePruneSafety = {
@@ -19,14 +20,6 @@ export type WorktreePruneResult = {
   gitRemoved: boolean;
   error?: string;
 };
-
-function isValidManagedLayout(path: string, managedRoot: string): boolean {
-  const rel = relative(resolve(managedRoot), resolve(path));
-  if (!rel || rel.startsWith("..")) return false;
-  const segments = rel.split(/[\\/]+/).filter(Boolean);
-  if (segments.length < 4) return false;
-  return /^slot-\d+$/.test(segments[1] ?? "");
-}
 
 export function evaluateWorktreePruneSafety(params: {
   worktreePath?: string | null;
@@ -52,7 +45,8 @@ export function evaluateWorktreePruneSafety(params: {
   if (isLegacyWorktreePath(normalizedPath, { devDir: params.devDir, managedRoot })) {
     return { safe: false, reason: "legacy-worktree", normalizedPath };
   }
-  if (!isValidManagedLayout(normalizedPath, managedRoot)) {
+  const classification = classifyManagedWorktreePath(normalizedPath, managedRoot);
+  if (!isManagedWorktreeRootClassification(classification)) {
     return { safe: false, reason: "invalid-layout", normalizedPath };
   }
 
