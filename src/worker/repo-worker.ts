@@ -5012,6 +5012,8 @@ export class RepoWorker {
       waitForRequiredChecks: async (url, checks, opts) => await this.waitForRequiredChecks(url, checks, opts),
       runCiFailureTriage: async (input) => await this.runCiFailureTriage(input as any),
       recordMergeFailureArtifact: (url, diag) => this.recordMergeFailureArtifact(url, diag),
+      pauseIfGitHubRateLimited: async (task, stage, error, sessionId) =>
+        await this.pauseIfGitHubRateLimited(task, stage, error, { sessionId }),
       pauseIfHardThrottled: async (task, stage, sid) => await this.pauseIfHardThrottled(task, stage, sid),
       shouldAttemptProactiveUpdate: (pr) => this.shouldAttemptProactiveUpdate(pr as any),
       shouldRateLimitAutoUpdate: (pr, min) => this.shouldRateLimitAutoUpdate(pr as any, min),
