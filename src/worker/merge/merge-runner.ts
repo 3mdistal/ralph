@@ -100,9 +100,10 @@ export async function mergePrWithRequiredChecks(params: {
       extraFields?: Record<string, string>;
     }
   ) => Promise<unknown>;
+  pauseIfGitHubRateLimited: (task: AgentTask, stage: string, error: unknown, sessionId?: string) => Promise<AgentRun | null>;
 
   getPullRequestChecks: (prUrl: string) => Promise<PullRequestChecks>;
-  recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary) => void;
+  recordCiGateSummary: (prUrl: string, summary: RequiredChecksSummary, opts?: { timedOut?: boolean }) => void;
   buildIssueContextForAgent: (params: { repo: string; issueNumber: string }) => Promise<string>;
   runReviewAgent: (params: {
     agent: "product" | "devex" | "product-review" | "devex-review" | "general" | "ralph-plan";
@@ -219,6 +220,14 @@ export async function mergePrWithRequiredChecks(params: {
   try {
     baseBranch = await params.getPullRequestBaseBranch(prUrl);
   } catch (error: any) {
+    const paused = await params.pauseIfGitHubRateLimited(
+      params.task,
+      `${params.watchdogStagePrefix}-base-branch`,
+      error,
+      sessionId
+    );
+    if (paused) return { ok: false, run: paused };
+
     if (params.isAuthError(error)) return await blockOnAuthFailure(error, "reading PR base branch");
 
     const completed = new Date();
@@ -488,7 +497,7 @@ export async function mergePrWithRequiredChecks(params: {
     try {
       const status = await params.getPullRequestChecks(prUrl);
       const summary = summarizeRequiredChecks(status.checks, REQUIRED_CHECKS);
-      params.recordCiGateSummary(prUrl, summary);
+      params.recordCiGateSummary(prUrl, summary, { timedOut: false });
 
       if (status.mergeStateStatus === "DIRTY") {
         const recovery = await params.runMergeConflictRecovery({
@@ -594,6 +603,14 @@ export async function mergePrWithRequiredChecks(params: {
       await params.recordCheckpoint(params.task, "merge_step_complete", sessionId);
       return { ok: true, prUrl, sessionId };
     } catch (error: any) {
+      const paused = await params.pauseIfGitHubRateLimited(
+        params.task,
+        `${params.watchdogStagePrefix}-merge`,
+        error,
+        sessionId
+      );
+      if (paused) return { ok: false, run: paused };
+
       const shouldUpdateBeforeRetry =
         !didUpdateBranch &&
         (params.isOutOfDateMergeError(error) ||
@@ -680,7 +697,7 @@ export async function mergePrWithRequiredChecks(params: {
       try {
         const status = await params.getPullRequestChecks(prUrl);
         const summary = summarizeRequiredChecks(status.checks, REQUIRED_CHECKS);
-        params.recordCiGateSummary(prUrl, summary);
+        params.recordCiGateSummary(prUrl, summary, { timedOut: false });
 
         if (status.mergeStateStatus === "DIRTY") {
           source = "merge-conflict";
@@ -766,6 +783,14 @@ export async function mergePrWithRequiredChecks(params: {
         didUpdateBranch = true;
       }
     } catch (updateError: any) {
+      const paused = await params.pauseIfGitHubRateLimited(
+        params.task,
+        `${params.watchdogStagePrefix}-auto-update`,
+        updateError,
+        sessionId
+      );
+      if (paused) return { ok: false, run: paused };
+
       const reason = `Failed while auto-updating PR branch: ${params.formatGhError(updateError)}`;
       warn(`[ralph:worker:${params.repo}] ${reason}`);
       try {
