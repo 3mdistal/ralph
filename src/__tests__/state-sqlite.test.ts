@@ -183,7 +183,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
   test("classifyDurableStateInitError maps known failure classes", () => {
     const forward = classifyDurableStateInitError(
-      new Error("Unsupported state.sqlite schema_version=21; supported range=1..21 writable range=1..20.")
+      new Error("Unsupported state.sqlite schema_version=22; supported range=1..22 writable range=1..21.")
     );
     expect(forward.code).toBe("forward_incompatible");
     expect(forward.supportedRange).toBe(`1..${getDurableStateSchemaWindow().maxReadableSchema}`);
@@ -765,7 +765,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '21')");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '22')");
       db.exec(`
         CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
           run_id TEXT NOT NULL,
@@ -782,6 +782,18 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           PRIMARY KEY(run_id, gate)
+        );
+        CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          gate TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          content TEXT NOT NULL,
+          truncated INTEGER NOT NULL DEFAULT 0,
+          original_chars INTEGER,
+          original_lines INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
         );
       `);
     } finally {
@@ -813,6 +825,11 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_results'")
         .get() as { sql?: string } | undefined;
       expect(gateResultsSql?.sql).toContain("plan_review");
+
+      const gateArtifactColumns = migrated.query("PRAGMA table_info(ralph_run_gate_artifacts)").all() as Array<{ name: string }>;
+      const gateArtifactColumnNames = gateArtifactColumns.map((column) => column.name);
+      expect(gateArtifactColumnNames).toContain("artifact_policy_version");
+      expect(gateArtifactColumnNames).toContain("truncation_mode");
     } finally {
       migrated.close();
     }
@@ -1412,6 +1429,89 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     }
   });
 
+  test("migrates v21 gate artifacts to include artifact policy metadata columns", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '21')");
+      db.exec(`
+        CREATE TABLE repos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO repos(name, created_at, updated_at)
+        VALUES ('3mdistal/ralph', '2026-01-20T12:00:00.000Z', '2026-01-20T12:00:00.000Z');
+
+        CREATE TABLE ralph_runs (
+          run_id TEXT PRIMARY KEY,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT,
+          attempt_kind TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          outcome TEXT,
+          details_json TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+        INSERT INTO ralph_runs(
+          run_id, repo_id, issue_number, task_path, attempt_kind, started_at, created_at, updated_at
+        ) VALUES (
+          'run_v21', 1, 1, 'github:3mdistal/ralph#1', 'process',
+          '2026-01-20T12:00:01.000Z', '2026-01-20T12:00:01.000Z', '2026-01-20T12:00:01.000Z'
+        );
+
+        CREATE TABLE ralph_run_gate_artifacts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          gate TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          content TEXT NOT NULL,
+          truncated INTEGER NOT NULL DEFAULT 0,
+          original_chars INTEGER,
+          original_lines INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+        );
+
+        INSERT INTO ralph_run_gate_artifacts(
+          run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+        ) VALUES (
+          'run_v21', 'ci', 'failure_excerpt', 'legacy-artifact', 0, 15, 1, '2026-01-20T12:00:02.000Z', '2026-01-20T12:00:02.000Z'
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const migrated = new Database(dbPath);
+    try {
+      const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
+      expect(meta.value).toBe("22");
+
+      const row = migrated
+        .query(
+          "SELECT content, artifact_policy_version, truncation_mode FROM ralph_run_gate_artifacts WHERE run_id = 'run_v21' LIMIT 1"
+        )
+        .get() as { content?: string; artifact_policy_version?: number; truncation_mode?: string } | undefined;
+      expect(row?.content).toBe("legacy-artifact");
+      expect(row?.artifact_policy_version).toBe(0);
+      expect(row?.truncation_mode).toBe("tail");
+    } finally {
+      migrated.close();
+    }
+  });
+
   test("gate artifacts enforce retention cap", () => {
     initStateDb();
 
@@ -1443,6 +1543,75 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(artifacts.some((artifact) => artifact.content === "artifact-0")).toBe(false);
     expect(artifacts.some((artifact) => artifact.content === "artifact-1")).toBe(false);
     expect(artifacts.some((artifact) => artifact.content.includes("artifact-11"))).toBe(true);
+  });
+
+  test("gate artifact policy persists truncation mode and policy version", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#234",
+      taskPath: "github:3mdistal/ralph#234",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:20:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:20:01.000Z" });
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "note",
+      content: `head-${"x".repeat(900)}`,
+      at: "2026-01-20T12:20:02.000Z",
+    });
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "failure_excerpt",
+      content: `prefix-${"y".repeat(9000)}-suffix`,
+      at: "2026-01-20T12:20:03.000Z",
+    });
+
+    const state = getRalphRunGateState(runId);
+    const note = state.artifacts.find((artifact) => artifact.kind === "note");
+    const excerpt = state.artifacts.find((artifact) => artifact.kind === "failure_excerpt");
+
+    expect(note?.artifactPolicyVersion).toBe(1);
+    expect(note?.truncationMode).toBe("head");
+    expect(note?.truncated).toBe(true);
+    expect(note?.content.startsWith("head-")).toBe(true);
+
+    expect(excerpt?.artifactPolicyVersion).toBe(1);
+    expect(excerpt?.truncationMode).toBe("tail");
+    expect(excerpt?.truncated).toBe(true);
+    expect(excerpt?.content.endsWith("-suffix")).toBe(true);
+  });
+
+  test("gate result fields are redacted and bounded", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#234",
+      taskPath: "github:3mdistal/ralph#234",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:20:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:20:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "fail",
+      reason: `Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz1234567890 ${"z".repeat(500)}`,
+      at: "2026-01-20T12:20:04.000Z",
+    });
+
+    const state = getRalphRunGateState(runId);
+    const ci = state.results.find((result) => result.gate === "ci");
+    expect(ci?.reason).not.toContain("ghp_");
+    expect(ci?.reason).toContain("[REDACTED]");
+    expect((ci?.reason ?? "").length).toBeLessThanOrEqual(400);
   });
 
   test("latest gate selection is deterministic with ties", () => {
