@@ -110,6 +110,7 @@ function clampNonNegativeInt(value: number, fallback: number): number {
 type GitHubQueueDeps = {
   now?: () => Date;
   io?: GitHubQueueIO;
+  blockedCommentWriter?: (params: { repo: string; issueNumber: number; state: Parameters<typeof upsertBlockedComment>[0]["state"] }) => Promise<void>;
   relationshipsProviderFactory?: (repo: string) => IssueRelationshipProvider;
   pruneWorktree?: (params: {
     repo: string;
@@ -146,6 +147,19 @@ type IssueFetchResult = {
   labels: string[];
 };
 
+function needsDepsBlockedProjectionRepair(params: {
+  labels: string[];
+  depsBlocked: boolean;
+}): boolean {
+  const hasQueued = params.labels.includes(RALPH_LABEL_STATUS_QUEUED);
+  const hasInProgress = params.labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS);
+  const hasMetaBlocked = params.labels.includes(RALPH_LABEL_META_BLOCKED);
+  if (params.depsBlocked) {
+    return !hasQueued || hasInProgress || !hasMetaBlocked;
+  }
+  return hasMetaBlocked;
+}
+
 function getNowIso(deps?: GitHubQueueDeps): string {
   return (deps?.now ? deps.now() : new Date()).toISOString();
 }
@@ -160,6 +174,20 @@ async function createGitHubClient(repo: string): Promise<GitHubClient> {
     throw new Error("GitHub auth is not configured");
   }
   return new GitHubClient(repo, { getToken: resolveGitHubToken });
+}
+
+async function writeBlockedComment(params: {
+  repo: string;
+  issueNumber: number;
+  state: Parameters<typeof upsertBlockedComment>[0]["state"];
+}): Promise<void> {
+  const github = await createGitHubClient(params.repo);
+  await upsertBlockedComment({
+    github,
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    state: params.state,
+  });
 }
 
 function createGitHubQueueIo(): GitHubQueueIO {
@@ -439,6 +467,7 @@ function resolveIssueSnapshot(repo: string, issueNumber: number): IssueSnapshot 
 
 export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
   const io = deps?.io ?? createGitHubQueueIo();
+  const blockedCommentWriter = deps?.blockedCommentWriter ?? writeBlockedComment;
   const relationshipsProviderFactory =
     deps?.relationshipsProviderFactory ?? ((repo: string) => new GitHubRelationshipProvider(repo));
   let lastSweepAt = 0;
@@ -1358,9 +1387,16 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         windowMs: debounceWindowMs,
       });
       const statusCount = issue ? countStatusLabels(issue.labels) : 1;
-      const shouldApplyUpdate = !transitionGuard.suppress || statusCount !== 1;
+      const forceDepsRepair = issue ? needsDepsBlockedProjectionRepair({ labels: issue.labels, depsBlocked }) : false;
+      const shouldApplyUpdate = !transitionGuard.suppress || statusCount !== 1 || forceDepsRepair;
       if (transitionGuard.suppress && updateDelta.add.length + updateDelta.remove.length > 0) {
-        if (statusCount !== 1) {
+        if (forceDepsRepair) {
+          if (shouldLog(`queue:update-status:override-debounce:deps:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+            console.warn(
+              `[ralph:queue:github] Ignoring status transition debounce for ${issueRef.repo}#${issueRef.number}; enforcing deps-blocked projection`
+            );
+          }
+        } else if (statusCount !== 1) {
           if (shouldLog(`queue:update-status:override-debounce:${issueRef.repo}#${issueRef.number}`, 60_000)) {
             console.warn(
               `[ralph:queue:github] Ignoring status transition debounce for ${issueRef.repo}#${issueRef.number}; status labels drifted (count=${statusCount})`
@@ -1449,8 +1485,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
           const reason = normalizeTaskField(normalizedExtra["blocked-reason"]) ?? opState?.blockedReason?.trim() ?? null;
           const blockedAt = normalizeTaskField(normalizedExtra["blocked-at"]) ?? opState?.blockedAt?.trim() ?? null;
           const depsRefs = extractDependencyRefs(reason ?? "", issueRef.repo);
-          await upsertBlockedComment({
-            github: await createGitHubClient(issueRef.repo),
+          await blockedCommentWriter({
             repo: issueRef.repo,
             issueNumber: issueRef.number,
             state: {

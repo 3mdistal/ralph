@@ -161,7 +161,7 @@ describe("run context helpers", () => {
       publishDashboardEvent: (event) => events.push(event),
     });
 
-    options?.onEvent?.({ type: "text", sessionID: "ses_1", part: { text: 123 } });
+    options?.onEvent?.({ type: "text", sessionId: "ses_1", part: { text: 123 } });
     options?.onEvent?.({ type: "text", sessionId: "ses_2", part: { text: "hello" } });
     options?.onEvent?.({ type: "text", part: { text: "fallback" } });
 

@@ -70,9 +70,20 @@ type LabelEventSummary = {
   activeLabeledEventId: string | null;
 };
 
+type LabelEventScanTermination = "exhausted" | "cap-hit" | "error";
+
+type LabelEventSummariesResult = {
+  summaries: Map<string, LabelEventSummary>;
+  pagesScanned: number;
+  hardCap: number;
+  termination: LabelEventScanTermination;
+  errorMessage?: string;
+};
+
 type QueueOnEscalatedDecision = { outcome: "apply" | "refuse" | "unknown"; reason?: string };
 
 const CMD_LIVE_LABELS_TELEMETRY_SOURCE = "cmd-live-labels";
+const LABEL_EVENT_SCAN_HARD_CAP = 200;
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -99,6 +110,14 @@ function buildQueueLabelDelta(currentLabels: string[]): { add: string[]; remove:
   // This prevents a cmd:queue from being "processed" while leaving the issue without any status label.
   const labelsForDelta = withForcedRemovals.filter((label) => label !== RALPH_LABEL_STATUS_QUEUED);
   return statusToRalphLabelDelta("queued", labelsForDelta);
+}
+
+function isIssueEffectivelyQueued(labels: string[]): boolean {
+  if (!labels.includes(RALPH_LABEL_STATUS_QUEUED)) return false;
+  if (labels.includes(RALPH_LABEL_STATUS_PAUSED)) return false;
+  if (labels.includes(RALPH_LABEL_STATUS_ESCALATED)) return false;
+  if (labels.includes(RALPH_LABEL_STATUS_STOPPED)) return false;
+  return true;
 }
 
 async function fetchLiveIssueLabelsBestEffort(params: {
@@ -236,28 +255,39 @@ async function fetchIssueLabelEventSummaries(params: {
   repo: string;
   issueNumber: number;
   labels: string[];
-}): Promise<Map<string, LabelEventSummary>> {
+}): Promise<LabelEventSummariesResult> {
   const { owner, name } = splitRepoFullName(params.repo);
   const out = new Map<string, LabelEventSummary>();
   const targets = new Set(params.labels.map((label) => label.toLowerCase()));
   const perPage = 100;
-  const maxPages = 10;
+  let pagesScanned = 0;
+  let termination: LabelEventScanTermination = "exhausted";
+  let errorMessage: string | undefined;
   try {
     const events: IssueTimelineLabelEvent[] = [];
     let page = 1;
-    while (page <= maxPages) {
+    while (page <= LABEL_EVENT_SCAN_HARD_CAP) {
       const response = await params.github.request<IssueTimelineLabelEvent[]>(
         `/repos/${owner}/${name}/issues/${params.issueNumber}/events?per_page=${perPage}&page=${page}`
       );
       const rows = Array.isArray(response.data) ? response.data : [];
+      pagesScanned += 1;
       events.push(...rows);
-      if (rows.length < perPage) break;
+      if (rows.length < perPage) {
+        termination = "exhausted";
+        break;
+      }
       page += 1;
+    }
+    if (pagesScanned >= LABEL_EVENT_SCAN_HARD_CAP) {
+      termination = "cap-hit";
     }
     for (const label of targets) {
       out.set(label, summarizeLabelEvents(events, label));
     }
-  } catch {
+  } catch (error: any) {
+    termination = "error";
+    errorMessage = error?.message ?? String(error);
     for (const label of targets) {
       out.set(label, {
         latestLabeledEventId: null,
@@ -266,7 +296,30 @@ async function fetchIssueLabelEventSummaries(params: {
       });
     }
   }
-  return out;
+  return {
+    summaries: out,
+    pagesScanned,
+    hardCap: LABEL_EVENT_SCAN_HARD_CAP,
+    termination,
+    ...(errorMessage ? { errorMessage } : {}),
+  };
+}
+
+function buildCmdIdentitySource(summary: LabelEventSummary | undefined): "active-labeled" | "latest-labeled" | "unresolved" {
+  if (summary?.activeLabeledEventId) return "active-labeled";
+  if (summary?.latestLabeledEventId) return "latest-labeled";
+  return "unresolved";
+}
+
+function buildCmdIdentityDiagnostic(params: {
+  cmdLabel: string;
+  pagesScanned: number;
+  hardCap: number;
+  termination: LabelEventScanTermination;
+  errorMessage?: string;
+}): string {
+  const tail = params.errorMessage ? ` error=${params.errorMessage}` : "";
+  return `Command event identity unresolved for \`${params.cmdLabel}\` (termination=${params.termination} pagesScanned=${params.pagesScanned} hardCap=${params.hardCap}${tail}).`;
 }
 
 function parseCmdRecord(payload: string | null): CmdRecord | null {
@@ -318,21 +371,38 @@ export async function processOneCommand(
   const at = nowIso();
   const issueRef = `${params.repo}#${params.issueNumber}`;
 
-  const eventSummaries = await fetchIssueLabelEventSummaries({
+  const eventSummaryResult = await fetchIssueLabelEventSummaries({
     github,
     repo: params.repo,
     issueNumber: params.issueNumber,
     labels: [params.cmdLabel, RALPH_LABEL_STATUS_ESCALATED],
   });
-  const cmdSummary = eventSummaries.get(params.cmdLabel.toLowerCase());
-  const escalationSummary = eventSummaries.get(RALPH_LABEL_STATUS_ESCALATED.toLowerCase());
+  const cmdSummary = eventSummaryResult.summaries.get(params.cmdLabel.toLowerCase());
+  const escalationSummary = eventSummaryResult.summaries.get(RALPH_LABEL_STATUS_ESCALATED.toLowerCase());
   const eventId = cmdSummary?.activeLabeledEventId ?? cmdSummary?.latestLabeledEventId ?? null;
   const escalatedEventId = escalationSummary?.activeLabeledEventId ?? null;
+  const cmdEventSource = buildCmdIdentitySource(cmdSummary);
+  if (shouldLog(`ralph:cmd:identity:${issueRef}:${params.cmdLabel}`, 15_000)) {
+    console.warn(
+      `${TELEMETRY_PREFIX} ${issueRef} cmd-identity cmdLabel=${params.cmdLabel} cmdEventId=${eventId ?? "none"} escalatedEventId=${escalatedEventId ?? "none"} source=${cmdEventSource} pagesScanned=${eventSummaryResult.pagesScanned} hardCap=${eventSummaryResult.hardCap} termination=${eventSummaryResult.termination}${eventSummaryResult.errorMessage ? ` error=${eventSummaryResult.errorMessage}` : ""}`
+    );
+  }
   const key = buildCmdEventKey({ repo: params.repo, issueNumber: params.issueNumber, cmdLabel: params.cmdLabel, eventId });
+  const identityDiagnostic =
+    eventId === null
+      ? buildCmdIdentityDiagnostic({
+          cmdLabel: params.cmdLabel,
+          pagesScanned: eventSummaryResult.pagesScanned,
+          hardCap: eventSummaryResult.hardCap,
+          termination: eventSummaryResult.termination,
+          ...(eventSummaryResult.errorMessage ? { errorMessage: eventSummaryResult.errorMessage } : {}),
+        })
+      : null;
 
   const existingPayload = getIdempotencyPayload(key);
   const existing = parseCmdRecord(existingPayload);
   const completed = existing?.phase === "completed";
+  const completedRecordIsAuthoritative = completed && eventId !== null;
 
   const markerStateBase = {
     version: 1 as const,
@@ -352,24 +422,57 @@ export async function processOneCommand(
 
   const removeOnlyOps = planIssueLabelOps({ add: [], remove: [params.cmdLabel] });
 
-  if (completed) {
-    const removeResult = await executeIssueLabelOps({
-      github,
-      repo: params.repo,
-      issueNumber: params.issueNumber,
-      ops: removeOnlyOps,
-      ensureLabels: async () => await labelEnsurer.ensure(params.repo),
-      retryMissingLabelOnce: true,
-      ensureBefore: false,
-      log: (message) => console.warn(`${TELEMETRY_PREFIX} ${issueRef} ${message}`),
-      logLabel: issueRef,
-    });
+  if (completedRecordIsAuthoritative) {
+    if (params.cmdLabel === RALPH_LABEL_CMD_QUEUE) {
+      const liveLabels = await fetchLiveIssueLabelsBestEffort({
+        github,
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        fallback: params.currentLabels,
+      });
+      const commandStillPresent = liveLabels.includes(params.cmdLabel);
+      if (!isIssueEffectivelyQueued(liveLabels) && commandStillPresent) {
+        console.warn(
+          `${TELEMETRY_PREFIX} ${issueRef} queue-completed-key-recovery key=${key} labels=${liveLabels.join(",") || "none"}`
+        );
+      } else {
+        const removeResult = await executeIssueLabelOps({
+          github,
+          repo: params.repo,
+          issueNumber: params.issueNumber,
+          ops: removeOnlyOps,
+          ensureLabels: async () => await labelEnsurer.ensure(params.repo),
+          retryMissingLabelOnce: true,
+          ensureBefore: false,
+          log: (message) => console.warn(`${TELEMETRY_PREFIX} ${issueRef} ${message}`),
+          logLabel: issueRef,
+        });
 
-    const removed = removeResult.ok ? removeResult.remove.includes(params.cmdLabel) : false;
-    if (removeResult.ok && removed) {
-      applyLabelDeltaSnapshot({ repo: params.repo, issueNumber: params.issueNumber, add: [], remove: [params.cmdLabel], nowIso: at });
+        const removed = removeResult.ok ? removeResult.remove.includes(params.cmdLabel) : false;
+        if (removeResult.ok && removed) {
+          applyLabelDeltaSnapshot({ repo: params.repo, issueNumber: params.issueNumber, add: [], remove: [params.cmdLabel], nowIso: at });
+        }
+        return { processed: true, removedCmdLabel: removed };
+      }
+    } else {
+      const removeResult = await executeIssueLabelOps({
+        github,
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        ops: removeOnlyOps,
+        ensureLabels: async () => await labelEnsurer.ensure(params.repo),
+        retryMissingLabelOnce: true,
+        ensureBefore: false,
+        log: (message) => console.warn(`${TELEMETRY_PREFIX} ${issueRef} ${message}`),
+        logLabel: issueRef,
+      });
+
+      const removed = removeResult.ok ? removeResult.remove.includes(params.cmdLabel) : false;
+      if (removeResult.ok && removed) {
+        applyLabelDeltaSnapshot({ repo: params.repo, issueNumber: params.issueNumber, add: [], remove: [params.cmdLabel], nowIso: at });
+      }
+      return { processed: true, removedCmdLabel: removed };
     }
-    return { processed: true, removedCmdLabel: removed };
   }
 
   if (!existing) {
@@ -554,6 +657,10 @@ export async function processOneCommand(
   } catch (error: any) {
     decision = "failed";
     reason = error?.message ?? String(error);
+  }
+
+  if (identityDiagnostic && decision !== "failed") {
+    reason = reason ? `${reason} ${identityDiagnostic}` : identityDiagnostic;
   }
 
   const state: CmdCommentState = {

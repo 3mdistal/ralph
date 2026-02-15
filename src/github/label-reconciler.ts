@@ -22,7 +22,13 @@ import {
   type LabelOp,
 } from "../github-queue/core";
 import type { QueueTaskStatus } from "../queue/types";
-import { RALPH_LABEL_META_BLOCKED, RALPH_LABEL_STATUS_PAUSED, RALPH_LABEL_STATUS_STOPPED } from "../github-labels";
+import {
+  RALPH_LABEL_META_BLOCKED,
+  RALPH_LABEL_STATUS_IN_PROGRESS,
+  RALPH_LABEL_STATUS_PAUSED,
+  RALPH_LABEL_STATUS_QUEUED,
+  RALPH_LABEL_STATUS_STOPPED,
+} from "../github-labels";
 import { auditQueueParityForRepo } from "./queue-parity-audit";
 import { extractDependencyRefs, upsertBlockedComment } from "./blocked-comment";
 import { reconcileLocalStatusDriftForRepo } from "./local-status-drift";
@@ -35,6 +41,19 @@ const TELEMETRY_SOURCE = "label-reconciler";
 
 type ReconcileCooldownState = { desiredStatus: QueueTaskStatus; appliedAtMs: number };
 const lastAppliedByIssue = new Map<string, ReconcileCooldownState>();
+
+export function __testOnlyShouldBypassReconcilerCooldown(params: {
+  labels: string[];
+  depsBlocked: boolean;
+}): boolean {
+  const hasQueued = params.labels.includes(RALPH_LABEL_STATUS_QUEUED);
+  const hasInProgress = params.labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS);
+  const hasMetaBlocked = params.labels.includes(RALPH_LABEL_META_BLOCKED);
+  if (params.depsBlocked) {
+    return !hasQueued || hasInProgress || !hasMetaBlocked;
+  }
+  return hasMetaBlocked;
+}
 
 function applyLabelDeltaSnapshot(params: {
   repo: string;
@@ -124,6 +143,29 @@ async function reconcileRepo(
     warn: (message) => console.warn(message),
   });
 
+  const syncBlockedComment = async (params: {
+    issueNumber: number;
+    depsBlocked: boolean;
+    reason: string | null;
+    blockedAt: string | null;
+  }) => {
+    const deps = extractDependencyRefs(params.reason ?? "", repo);
+    await upsertBlockedComment({
+      github,
+      repo,
+      issueNumber: params.issueNumber,
+      state: {
+        version: 1,
+        kind: "deps",
+        blocked: params.depsBlocked,
+        reason: params.reason,
+        deps,
+        blockedAt: params.blockedAt,
+        updatedAt: nowIso,
+      },
+    });
+  };
+
   let processed = 0;
 
   for (const issue of issues) {
@@ -138,20 +180,43 @@ async function reconcileRepo(
     const desiredStatus = released ? "queued" : toDesiredStatus(opState.status ?? null);
     if (!desiredStatus) continue;
     const depsBlocked = isDependencyBlocked(opState);
+    const hasMetaBlocked = issue.labels.includes(RALPH_LABEL_META_BLOCKED);
+    const forceBypass = __testOnlyShouldBypassReconcilerCooldown({ labels: issue.labels, depsBlocked });
+    const blockedReason = opState.blockedReason?.trim() || null;
+    const blockedAt = opState.blockedAt?.trim() || null;
+    const shouldSyncBlockedComment = depsBlocked || hasMetaBlocked;
+
+    if (shouldSyncBlockedComment) {
+      try {
+        await syncBlockedComment({
+          issueNumber: issue.number,
+          depsBlocked,
+          reason: blockedReason,
+          blockedAt,
+        });
+      } catch (error: any) {
+        if (shouldLog(`ralph:labels:reconcile:blocked-comment:${repo}#${issue.number}`, 60_000)) {
+          console.warn(
+            `[ralph:labels:reconcile:${repo}] Failed blocked comment sync for ${repo}#${issue.number}: ${error?.message ?? String(error)}`
+          );
+        }
+      }
+    }
 
     const cooldownKey = `${repo}#${issue.number}`;
     const cooldown = lastAppliedByIssue.get(cooldownKey);
-    if (cooldown && cooldown.desiredStatus === desiredStatus && nowMs - cooldown.appliedAtMs < cooldownMs) {
+    if (cooldown && cooldown.desiredStatus === desiredStatus && nowMs - cooldown.appliedAtMs < cooldownMs && !forceBypass) {
       continue;
     }
 
     const delta = statusToRalphLabelDelta(desiredStatus, issue.labels, {
       opState: { status: opState.status ?? null, blockedSource: opState.blockedSource ?? null },
     });
-    const hasMetaBlocked = issue.labels.includes(RALPH_LABEL_META_BLOCKED);
     if (depsBlocked && !hasMetaBlocked) delta.add.push(RALPH_LABEL_META_BLOCKED);
     if (!depsBlocked && hasMetaBlocked) delta.remove.push(RALPH_LABEL_META_BLOCKED);
-    if (delta.add.length === 0 && delta.remove.length === 0) continue;
+    if (delta.add.length === 0 && delta.remove.length === 0) {
+      continue;
+    }
 
     const fromStatus = deriveRalphStatus(issue.labels, issue.state);
     const previous = getIssueStatusTransitionRecord(repo, issue.number);
@@ -170,7 +235,7 @@ async function reconcileRepo(
           }
         : null,
     });
-    if (suppress.suppress) {
+    if (suppress.suppress && !forceBypass) {
       const statusCount = countStatusLabels(issue.labels);
       if (statusCount === 1) {
         console.warn(
@@ -180,6 +245,10 @@ async function reconcileRepo(
       }
       console.warn(
         `[ralph:labels:reconcile:${repo}] Ignoring debounce for ${repo}#${issue.number}; status labels drifted (count=${statusCount})`
+      );
+    } else if (suppress.suppress && forceBypass && shouldLog(`ralph:labels:reconcile:override:${repo}#${issue.number}`, 60_000)) {
+      console.warn(
+        `[ralph:labels:reconcile:${repo}] Ignoring debounce for ${repo}#${issue.number}; enforcing deps-blocked projection repair`
       );
     }
 
@@ -238,33 +307,6 @@ async function reconcileRepo(
       });
       lastAppliedByIssue.set(cooldownKey, { desiredStatus, appliedAtMs: nowMs });
 
-      if (depsBlocked || hasMetaBlocked) {
-        try {
-          const reason = opState.blockedReason?.trim() || null;
-          const blockedAt = opState.blockedAt?.trim() || null;
-          const deps = extractDependencyRefs(reason ?? "", repo);
-          await upsertBlockedComment({
-            github,
-            repo,
-            issueNumber: issue.number,
-            state: {
-              version: 1,
-              kind: "deps",
-              blocked: depsBlocked,
-              reason,
-              deps,
-              blockedAt,
-              updatedAt: nowIso,
-            },
-          });
-        } catch (error: any) {
-          if (shouldLog(`ralph:labels:reconcile:blocked-comment:${repo}#${issue.number}`, 60_000)) {
-            console.warn(
-              `[ralph:labels:reconcile:${repo}] Failed blocked comment sync for ${repo}#${issue.number}: ${error?.message ?? String(error)}`
-            );
-          }
-        }
-      }
     }
 
     processed += 1;
