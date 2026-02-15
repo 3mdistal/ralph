@@ -36,6 +36,7 @@ describe("daemon record", () => {
     const base = mkdtempSync(join(tmpdir(), "ralph-daemon-"));
     tempDirs.push(base);
     process.env.XDG_STATE_HOME = base;
+    process.env.HOME = base;
 
     writeDaemonRecord({
       version: 1,

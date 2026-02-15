@@ -49,6 +49,7 @@ import { RollupMonitor } from "./rollup";
 import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 import { createPrioritySelectorState } from "./scheduler/priority-policy";
+import { classifyQueuedResumePath } from "./scheduler/queued-resume-path";
 import {
   issuePriorityWeight,
   normalizeTaskPriority,
@@ -831,11 +832,12 @@ async function startTask(opts: {
 
       const blockedSource = claimedTask["blocked-source"]?.trim() || "";
       const sessionId = claimedTask["session-id"]?.trim() || "";
-      const shouldResumeMergeConflict = sessionId && blockedSource === "merge-conflict";
-      const shouldResumeStall = sessionId && blockedSource === "stall";
-      const shouldResumeLoopTriage = sessionId && blockedSource === "loop-triage";
-      const shouldResumeQueuedSession =
-        sessionId && !shouldResumeMergeConflict && !shouldResumeStall && !shouldResumeLoopTriage;
+      const queuedResumePath = classifyQueuedResumePath({ blockedSource, sessionId });
+      const shouldResumeMergeConflict = queuedResumePath === "merge-conflict";
+      const shouldResumeStall = queuedResumePath === "stall";
+      const shouldResumeLoopTriage = queuedResumePath === "loop-triage";
+      const shouldResumeReview = queuedResumePath === "review";
+      const shouldResumeQueuedSession = queuedResumePath === "queued-session";
 
       if (shouldResumeMergeConflict) {
         console.log(
@@ -977,6 +979,59 @@ async function startTask(opts: {
         void getOrCreateWorkerForSlot(repo, slot)
           .resumeTask(claimedTask, {
             resumeMessage,
+            repoSlot: slot,
+          })
+          .then(async (run: AgentRun) => {
+            if (run.outcome === "success" && run.pr) {
+              try {
+                recordPrSnapshot({ repo, issue: claimedTask.issue, prUrl: run.pr, state: PR_STATE_MERGED });
+              } catch {
+                // best-effort
+              }
+
+              await rollupMonitor.recordMerge(repo, run.pr);
+            }
+          })
+          .catch((e) => {
+            console.error(`[ralph] Error resuming task ${claimedTask.name}:`, e);
+          })
+          .finally(() => {
+            inFlightTasks.delete(key);
+            forgetOwnedTask(claimedTask);
+            releaseSlot?.();
+            releaseGlobal();
+            releaseRepo();
+            if (!isShuttingDown) {
+              scheduleQueuedTasksSoon();
+              void checkIdleRollups();
+            }
+          });
+
+        return true;
+      }
+
+      if (shouldResumeReview) {
+        console.log(
+          `[ralph] Requeued review-blocked task ${claimedTask.name}; resuming existing session ${sessionId} for open-PR merge continuity`
+        );
+
+        await updateTaskStatus(claimedTask, "in-progress", {
+          "assigned-at": new Date().toISOString().split("T")[0],
+          "session-id": sessionId,
+          "throttled-at": "",
+          "resume-at": "",
+          "usage-snapshot": "",
+          "blocked-source": "",
+          "blocked-reason": "",
+          "blocked-details": "",
+          "blocked-at": "",
+          "blocked-checked-at": "",
+        });
+
+        void getOrCreateWorkerForSlot(repo, slot)
+          .resumeTask(claimedTask, {
+            resumeMessage:
+              "This task already has an open PR and was blocked at deterministic review. Resume this session and continue on the existing PR branch only. Do NOT create a new PR. Focus on fixing review gate blockers and failing required checks, then continue merge flow on the existing PR.",
             repoSlot: slot,
           })
           .then(async (run: AgentRun) => {

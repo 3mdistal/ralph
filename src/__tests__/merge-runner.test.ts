@@ -201,6 +201,29 @@ describe("mergePrWithRequiredChecks 405 handling", () => {
 });
 
 describe("mergePrWithRequiredChecks pre-merge CI remediation", () => {
+  test("does not merge when only non-required checks are green", async () => {
+    let recurseCalls = 0;
+
+    const { params, mergeCalls } = buildParams({
+      getPullRequestChecks: async () => ({
+        headSha: "sha-initial",
+        mergeStateStatus: "CLEAN",
+        baseRefName: "bot/integration",
+        checks: [{ name: "Other", state: "SUCCESS", rawState: "SUCCESS", detailsUrl: null }],
+      }),
+      recurse: async () => {
+        recurseCalls += 1;
+        return { ok: false as const, run: { taskName: "x", repo: "x", outcome: "failed" } };
+      },
+    });
+
+    const result = await mergePrWithRequiredChecks(params);
+
+    expect(result.ok).toBe(false);
+    expect(recurseCalls).toBe(1);
+    expect(mergeCalls).toHaveLength(0);
+  });
+
   test("enters CI triage when required checks fail at merge time", async () => {
     let statusCall = 0;
     let triageCalls = 0;

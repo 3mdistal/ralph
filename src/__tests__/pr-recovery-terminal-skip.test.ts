@@ -1,4 +1,7 @@
 import { describe, expect, mock, test, beforeEach } from "bun:test";
+import { mkdtempSync, mkdirSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 
 import { RepoWorker } from "../worker";
 
@@ -148,5 +151,46 @@ describe("PR recovery terminal skip", () => {
     expect(result.terminalRun?.outcome).toBe("success");
     expect(result.terminalRun?.completionKind).toBe("verified");
     expect(result.terminalRun?.noPrTerminalReason).toBe("ISSUE_CLOSED_UPSTREAM");
+  });
+
+  test("detached worktree attempts recovery branch materialization before NO_WORKTREE_BRANCH", async () => {
+    const worker = new RepoWorker("3mdistal/ralph", "/tmp", { queue: queueAdapter });
+    const wtRoot = mkdtempSync(join(tmpdir(), "ralph-pr-recovery-"));
+    const wtPath = join(wtRoot, "745", "github-3mdistal-ralph-745");
+    mkdirSync(wtPath, { recursive: true });
+
+    const materializeMock = mock(async () => ({
+      branch: "ralph/recovery-745-deadbeefcafe",
+      diagnostics: ["- Materialized recovery branch from detached HEAD: ralph/recovery-745-deadbeefcafe"],
+    }));
+
+    (worker as any).maybeSkipIssueForPrRecovery = async () => null;
+    (worker as any).getIssuePrResolution = async () => ({
+      selectedUrl: null,
+      duplicates: [],
+      source: "none",
+      diagnostics: [],
+    });
+    (worker as any).getGitWorktrees = async () => [
+      {
+        worktreePath: wtPath,
+        branch: undefined,
+        detached: true,
+      },
+    ];
+    (worker as any).materializeDetachedHeadRecoveryBranch = materializeMock;
+
+    const task = createMockTask({ issue: "3mdistal/ralph#745" });
+    const result = await (worker as any).tryEnsurePrFromWorktree({
+      task,
+      issueNumber: "745",
+      issueTitle: "Status reporting",
+      botBranch: "bot/integration",
+      started: new Date("2026-02-09T00:00:00.000Z"),
+    });
+
+    expect(materializeMock).toHaveBeenCalled();
+    expect(result.causeCode).not.toBe("NO_WORKTREE_BRANCH");
+    expect(result.diagnostics).toContain("Materialized recovery branch from detached HEAD");
   });
 });
