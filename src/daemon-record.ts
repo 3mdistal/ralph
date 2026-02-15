@@ -291,7 +291,7 @@ function normalizeIdentityCommand(command: string[]): string[] {
   return command.map((token) => token.trim()).filter(Boolean);
 }
 
-export function daemonIdentityMatches(
+function daemonIdentityMatches(
   record: Pick<DaemonRecord, "daemonId" | "pid" | "startedAt" | "command" | "cwd" | "controlRoot" | "controlFilePath">,
   expected: DaemonIdentitySnapshot
 ): boolean {
