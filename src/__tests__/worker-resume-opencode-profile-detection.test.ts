@@ -113,6 +113,45 @@ test("resume does not auto-switch profiles when session cannot be found", async 
   expect(resolved.error).toContain(sessionId);
 });
 
+test("resume detects session stored under session_diff", async () => {
+  const appleData = join(homeDir, ".opencode-profiles", "apple", "data");
+  const appleCfg = join(homeDir, ".opencode-profiles", "apple", "config");
+  const appleState = join(homeDir, ".opencode-profiles", "apple", "state");
+
+  await writeJson(getRalphConfigJsonPath(), {
+    opencode: {
+      enabled: true,
+      defaultProfile: "auto",
+      profiles: {
+        apple: { xdgDataHome: appleData, xdgConfigHome: appleCfg, xdgStateHome: appleState },
+      },
+    },
+  });
+
+  __resetConfigForTests();
+
+  const sessionId = "ses_test_profile_diff";
+  const shard = "feedbead";
+  const sessionFile = join(appleData, "opencode", "storage", "session_diff", shard, `${sessionId}.json`);
+  await mkdir(dirname(sessionFile), { recursive: true });
+  await writeFile(sessionFile, "{}", "utf8");
+
+  const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+  const task: any = {
+    repo: "3mdistal/ralph",
+    issue: "3mdistal/ralph#556",
+    name: "issue 556",
+    status: "in-progress",
+    _path: "orchestration/tasks/556.md",
+    "opencode-profile": "",
+    "session-id": sessionId,
+  };
+
+  const resolved = await (worker as any).resolveOpencodeXdgForTask(task, "resume", sessionId);
+  expect(resolved.profileName).toBe("apple");
+  expect(resolved.opencodeXdg?.dataHome).toBe(appleData);
+});
+
 test("writes config to the expected path", async () => {
   // Sanity check that our HOME override affects config resolution.
   const path = getRalphConfigJsonPath();
