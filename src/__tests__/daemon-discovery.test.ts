@@ -131,4 +131,90 @@ describe("daemon discovery", () => {
     expect(classified.state).toBe("missing");
     expect(classified.live).toBeNull();
   });
+
+  test("classifier ignores unsafe /tmp candidate when safe managed-legacy candidate is live", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-discovery-home-"));
+    const xdg = mkdtempSync(join(tmpdir(), "ralph-discovery-xdg-"));
+    tempDirs.push(home, xdg);
+
+    const canonicalPath = join(home, ".ralph", "control", "daemon-registry.json");
+    const classified = classifyDaemonCandidates({
+      canonicalPath,
+      homeDir: home,
+      xdgStateHome: xdg,
+      candidates: [
+        {
+          path: join("/tmp", "ralph", "1000", "daemon.json"),
+          isCanonical: false,
+          alive: true,
+          record: {
+            version: 1,
+            daemonId: "d_tmp",
+            pid: 222,
+            startedAt: "2026-02-09T00:00:00.000Z",
+            heartbeatAt: "2026-02-09T00:00:10.000Z",
+            controlRoot: join("/tmp", "ralph", "1000"),
+            ralphVersion: "test",
+            command: ["bun", "src/index.ts"],
+            cwd: process.cwd(),
+            controlFilePath: join("/tmp", "ralph", "1000", "control.json"),
+          },
+        },
+        {
+          path: join(xdg, "ralph", "daemon.json"),
+          isCanonical: false,
+          alive: true,
+          record: {
+            version: 1,
+            daemonId: "d_safe",
+            pid: 111,
+            startedAt: "2026-02-09T00:00:00.000Z",
+            heartbeatAt: "2026-02-09T00:00:09.000Z",
+            controlRoot: join(home, ".ralph", "control"),
+            ralphVersion: "test",
+            command: ["bun", "src/index.ts"],
+            cwd: process.cwd(),
+            controlFilePath: join(home, ".ralph", "control", "control.json"),
+          },
+        },
+      ],
+    });
+
+    expect(classified.state).toBe("live");
+    expect(classified.live?.record.daemonId).toBe("d_safe");
+  });
+
+  test("classifier fails closed when only unsafe /tmp candidates exist", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-discovery-home-"));
+    const xdg = mkdtempSync(join(tmpdir(), "ralph-discovery-xdg-"));
+    tempDirs.push(home, xdg);
+
+    const classified = classifyDaemonCandidates({
+      canonicalPath: join(home, ".ralph", "control", "daemon-registry.json"),
+      homeDir: home,
+      xdgStateHome: xdg,
+      candidates: [
+        {
+          path: join("/tmp", "ralph", "1000", "daemon.json"),
+          isCanonical: false,
+          alive: true,
+          record: {
+            version: 1,
+            daemonId: "d_tmp_only",
+            pid: 333,
+            startedAt: "2026-02-09T00:00:00.000Z",
+            heartbeatAt: "2026-02-09T00:00:10.000Z",
+            controlRoot: join("/tmp", "ralph", "1000"),
+            ralphVersion: "test",
+            command: ["bun", "src/index.ts"],
+            cwd: process.cwd(),
+            controlFilePath: join("/tmp", "ralph", "1000", "control.json"),
+          },
+        },
+      ],
+    });
+
+    expect(classified.state).toBe("missing");
+    expect(classified.live).toBeNull();
+  });
 });
