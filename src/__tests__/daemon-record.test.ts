@@ -5,9 +5,11 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 
 import {
   acquireDaemonSingletonLock,
+  readDaemonRecordAtPath,
   readDaemonRecord,
   resolveDaemonRecordPath,
   resolveDaemonRecordPathCandidates,
+  touchDaemonRecordHeartbeat,
   writeDaemonRecord,
 } from "../daemon-record";
 
@@ -169,5 +171,47 @@ describe("daemon record", () => {
 
     lock.release();
     expect(existsSync(lockPath)).toBeFalse();
+  });
+
+  test("touchDaemonRecordHeartbeat refuses refresh when identity mismatches", () => {
+    const home = mkdtempSync(join(tmpdir(), "ralph-daemon-home-"));
+    tempDirs.push(home);
+    process.env.HOME = home;
+
+    const startedAt = "2026-02-08T00:00:00.000Z";
+    const heartbeatAt = "2026-02-08T00:00:01.000Z";
+    const recordPath = resolveDaemonRecordPath({ homeDir: home });
+    writeDaemonRecord(
+      {
+        version: 1,
+        daemonId: "d_record",
+        pid: process.pid,
+        startedAt,
+        heartbeatAt,
+        controlRoot: join(home, ".ralph", "control"),
+        ralphVersion: "0.1.0",
+        command: ["bun", "src/index.ts"],
+        cwd: process.cwd(),
+        controlFilePath: join(home, ".ralph", "control", "control.json"),
+      },
+      { homeDir: home, writeLegacy: false }
+    );
+
+    const updated = touchDaemonRecordHeartbeat({
+      homeDir: home,
+      expectedIdentity: {
+        daemonId: "d_other",
+        pid: process.pid,
+        startedAt,
+        command: ["bun", "src/index.ts"],
+        cwd: process.cwd(),
+        controlRoot: join(home, ".ralph", "control"),
+        controlFilePath: join(home, ".ralph", "control", "control.json"),
+      },
+    });
+
+    expect(updated).toBeFalse();
+    const after = readDaemonRecordAtPath(recordPath, { homeDir: home });
+    expect(after?.heartbeatAt).toBe(heartbeatAt);
   });
 });

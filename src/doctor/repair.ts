@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, renameSync } from "fs";
-import { basename } from "path";
+import { basename, dirname } from "path";
 import {
   readDaemonRecordAtPath,
   resolveDaemonRecordPath,
@@ -7,6 +7,7 @@ import {
   writeDaemonRecord,
 } from "../daemon-record";
 import { analyzeLiveDaemonCandidates, buildDaemonIdentityKey } from "../daemon-identity-core";
+import { buildAuthorityPolicyContext, classifyAuthorityRoot, recordMatchesCanonicalControl } from "../daemon-authority-policy";
 import type { DoctorAppliedRepair, DoctorRepairRecommendation, DoctorSnapshot } from "./types";
 
 function isPidAlive(pid: number): boolean {
@@ -118,6 +119,10 @@ function collectCurrentLiveIdentityCounts(): Map<string, number> {
   return counts;
 }
 
+function countDistinctCurrentLiveIdentities(): number {
+  return collectCurrentLiveIdentityCounts().size;
+}
+
 function hasLiveDaemonReferencingControl(path: string): boolean {
   for (const daemonPath of resolveDaemonRecordPathCandidates()) {
     const record = readDaemonRecordAtPath(daemonPath);
@@ -135,6 +140,7 @@ export function applyDoctorRepairs(input: {
 }): DoctorAppliedRepair[] {
   const byId = new Map(input.recommendations.map((item) => [item.id, item]));
   const applied: DoctorAppliedRepair[] = [];
+  const authority = buildAuthorityPolicyContext();
 
   const liveAnalysis = analyzeLiveDaemonCandidates(
     input.snapshot.daemonCandidates
@@ -347,6 +353,51 @@ export function applyDoctorRepairs(input: {
     }
   }
 
+  const unsafeCanonicalRepair = byId.get("quarantine-unsafe-canonical-daemon-record");
+  if (unsafeCanonicalRepair) {
+    for (const path of unsafeCanonicalRepair.paths) {
+      if (input.dryRun) {
+        applied.push({
+          id: unsafeCanonicalRepair.id,
+          code: unsafeCanonicalRepair.code,
+          status: "skipped",
+          details: `Dry run: would rename ${path}.`,
+          paths: [path],
+        });
+        continue;
+      }
+
+      try {
+        if (!existsSync(path)) {
+          applied.push({
+            id: unsafeCanonicalRepair.id,
+            code: unsafeCanonicalRepair.code,
+            status: "skipped",
+            details: `Skipped ${path}: file no longer exists.`,
+            paths: [path],
+          });
+          continue;
+        }
+        const renamed = renameWithSuffix(path, buildSuffix("corrupt", input.nowIso));
+        applied.push({
+          id: unsafeCanonicalRepair.id,
+          code: unsafeCanonicalRepair.code,
+          status: "applied",
+          details: `Renamed ${basename(path)} -> ${basename(renamed)}.`,
+          paths: [path, renamed],
+        });
+      } catch (error: any) {
+        applied.push({
+          id: unsafeCanonicalRepair.id,
+          code: unsafeCanonicalRepair.code,
+          status: "failed",
+          details: `Failed to quarantine unsafe canonical daemon record ${path}: ${error?.message ?? String(error)}`,
+          paths: [path],
+        });
+      }
+    }
+  }
+
   const cleanupLegacyControlRepair = byId.get("cleanup-legacy-control-files");
   if (cleanupLegacyControlRepair) {
     const canonicalControlPath =
@@ -441,7 +492,23 @@ export function applyDoctorRepairs(input: {
         details: "Skipped promotion: no live legacy daemon record candidate available.",
         paths: promoteRepair.paths,
       });
-    } else if (liveAnalysis.distinctLiveIdentities > 1) {
+    } else if (classifyAuthorityRoot(dirname(candidate.path), authority) !== "managed-legacy") {
+      applied.push({
+        id: promoteRepair.id,
+        code: promoteRepair.code,
+        status: "skipped",
+        details: `Skipped promotion: ${candidate.path} is not in a managed legacy root.`,
+        paths: promoteRepair.paths,
+      });
+    } else if (!recordMatchesCanonicalControl(candidate.record, authority)) {
+      applied.push({
+        id: promoteRepair.id,
+        code: promoteRepair.code,
+        status: "skipped",
+        details: "Skipped promotion: live legacy daemon record does not reference canonical control root/path.",
+        paths: promoteRepair.paths,
+      });
+    } else if (countDistinctCurrentLiveIdentities() > 1) {
       applied.push({
         id: promoteRepair.id,
         code: promoteRepair.code,
