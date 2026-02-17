@@ -19,6 +19,7 @@ import {
   getConfig,
   getProfile,
 } from "../config";
+import { createConfiguredSessionAdapter } from "../opencode/session-adapter-factory";
 import { normalizeGitRef } from "../midpoint-labels";
 import { applyMidpointLabelsBestEffort as applyMidpointLabelsBestEffortCore } from "../midpoint-labeler";
 import { getAllowedOwners, getConfiguredGitHubAppSlug, isRepoAllowed } from "../github-app-auth";
@@ -400,6 +401,8 @@ const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
   getRalphXdgCacheHome,
 };
 
+const DEFAULT_TRANSPORT_SESSION_ADAPTER: SessionAdapter = createConfiguredSessionAdapter(DEFAULT_SESSION_ADAPTER);
+
 type QueueAdapter = {
   updateTaskStatus: typeof updateTaskStatus;
 };
@@ -513,7 +516,7 @@ export class RepoWorker {
       relationships?: IssueRelationshipProvider;
     }
   ) {
-    this.baseSession = opts?.session ?? DEFAULT_SESSION_ADAPTER;
+    this.baseSession = opts?.session ?? DEFAULT_TRANSPORT_SESSION_ADAPTER;
     this.contextRecovery = createContextRecoveryManager({
       repo: this.repo,
       baseSession: this.baseSession,

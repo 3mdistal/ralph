@@ -1,10 +1,11 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname } from "path";
-import { readDaemonRecord } from "./daemon-record";
+import { discoverDaemon } from "./daemon-discovery";
 import {
   resolveCanonicalControlFilePath,
   resolveLegacyControlFilePathCandidates,
 } from "./control-root";
+import { buildAuthorityPolicyContext, isTrustedControlFilePath } from "./daemon-authority-policy";
 
 export type DaemonMode = "running" | "draining" | "paused";
 
@@ -34,21 +35,15 @@ function getControlDefaults(opts?: { defaults?: Partial<ControlDefaults> }): Con
   };
 }
 
-function isPidAlive(pid: number): boolean {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function resolveEffectiveControlFilePath(opts?: { homeDir?: string; xdgStateHome?: string; log?: (message: string) => void }): string {
-  const record = readDaemonRecord({ homeDir: opts?.homeDir, xdgStateHome: opts?.xdgStateHome, log: opts?.log });
+  const discovery = discoverDaemon({ healStale: false, homeDir: opts?.homeDir, xdgStateHome: opts?.xdgStateHome });
+  const authority = buildAuthorityPolicyContext({ homeDir: opts?.homeDir, xdgStateHome: opts?.xdgStateHome });
   const daemonControlPath =
-    record && isPidAlive(record.pid) && record.controlFilePath.trim() ? record.controlFilePath.trim() : null;
-  return daemonControlPath ?? resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
+    discovery.state === "live" && discovery.live?.record.controlFilePath.trim()
+      ? discovery.live.record.controlFilePath.trim()
+      : null;
+  const trustedDaemonControlPath = daemonControlPath && isTrustedControlFilePath(daemonControlPath, authority) ? daemonControlPath : null;
+  return trustedDaemonControlPath ?? resolveControlFilePath(opts?.homeDir, opts?.xdgStateHome);
 }
 
 export function resolveControlFilePath(

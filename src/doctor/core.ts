@@ -1,6 +1,13 @@
 import { resolveCanonicalControlFilePath, resolveCanonicalControlRoot, resolveLegacyControlFilePathCandidates } from "../control-root";
 import { resolveDaemonRecordPath } from "../daemon-record";
 import { analyzeLiveDaemonCandidates } from "../daemon-identity-core";
+import { dirname } from "path";
+import {
+  buildAuthorityPolicyContext,
+  classifyAuthorityRoot,
+  isTrustedAuthorityRootClass,
+  recordMatchesCanonicalControl,
+} from "../daemon-authority-policy";
 import type {
   DoctorAppliedRepair,
   DoctorControlCandidate,
@@ -149,8 +156,14 @@ export function buildDoctorReport(input: {
   const canonicalDaemon = daemonCandidates.find((candidate) => candidate.is_canonical) ?? null;
   const canonicalControl = controlCandidates.find((candidate) => candidate.is_canonical) ?? null;
   const readableControls = controlCandidates.filter((candidate) => candidate.state === "readable" && candidate.control);
+  const authority = buildAuthorityPolicyContext();
+  const trustedLiveDaemons = liveDaemons.filter((candidate) => {
+    if (!candidate.record) return false;
+    const rootClass = classifyAuthorityRoot(dirname(candidate.path), authority);
+    return isTrustedAuthorityRootClass(rootClass);
+  });
   const liveAnalysis = analyzeLiveDaemonCandidates(
-    liveDaemons.map((candidate) => ({
+    trustedLiveDaemons.map((candidate) => ({
       path: candidate.path,
       isCanonical: candidate.is_canonical,
       alive: true,
@@ -158,17 +171,32 @@ export function buildDoctorReport(input: {
         daemonId: candidate.record!.daemonId,
         pid: candidate.record!.pid,
         startedAt: candidate.record!.startedAt,
+        controlRoot: candidate.record!.controlRoot,
+        controlFilePath: candidate.record!.controlFilePath,
       },
       candidate,
     }))
   );
+
+  for (const candidate of liveDaemons) {
+    if (!candidate.record) continue;
+    const rootClass = classifyAuthorityRoot(dirname(candidate.path), authority);
+    if (rootClass === "unsafe-tmp" || rootClass === "unknown") {
+      addFinding(findings, {
+        code: "UNSAFE_DAEMON_ROOT",
+        severity: "warn",
+        message: `Live daemon record at ${candidate.path} uses non-authoritative root class ${rootClass}.`,
+        paths: [candidate.path],
+      });
+    }
+  }
 
   if (liveAnalysis.hasConflict) {
     addFinding(findings, {
       code: "MULTIPLE_LIVE_DAEMON_RECORDS",
       severity: "error",
       message: "Multiple live daemon records were detected across known roots.",
-      paths: compactPaths(liveDaemons.map((candidate) => candidate.path)),
+      paths: compactPaths(trustedLiveDaemons.map((candidate) => candidate.path)),
     });
   }
 
@@ -218,7 +246,7 @@ export function buildDoctorReport(input: {
     });
   }
 
-  const liveLegacy = liveDaemons.find((candidate) => !candidate.is_canonical) ?? null;
+  const liveLegacy = trustedLiveDaemons.find((candidate) => !candidate.is_canonical) ?? null;
   if (liveLegacy) {
     addFinding(findings, {
       code: "LIVE_DAEMON_RECORD_IN_LEGACY_ROOT",
@@ -326,10 +354,22 @@ export function buildDoctorReport(input: {
     })
   );
 
-  const canonicalLive = liveDaemons.some((candidate) => candidate.is_canonical);
+  const canonicalLive = liveDaemons.some(
+    (candidate) => candidate.is_canonical && !!candidate.record && recordMatchesCanonicalControl(candidate.record, authority)
+  );
   const promotableLiveLegacyPath =
     !liveAnalysis.hasConflict && !canonicalLive && liveAnalysis.primaryLiveCandidate && !liveAnalysis.primaryLiveCandidate.isCanonical
+      && classifyAuthorityRoot(dirname(liveAnalysis.primaryLiveCandidate.path), authority) === "managed-legacy"
+      && recordMatchesCanonicalControl(liveAnalysis.primaryLiveCandidate.record, authority)
       ? liveAnalysis.primaryLiveCandidate.path
+      : null;
+
+  const unsafeCanonicalPath =
+    canonicalDaemon &&
+    canonicalDaemon.state === "live" &&
+    canonicalDaemon.record &&
+    !recordMatchesCanonicalControl(canonicalDaemon.record, authority)
+      ? canonicalDaemon.path
       : null;
 
   const expectedRoot = resolveCanonicalControlRoot();
@@ -354,6 +394,18 @@ export function buildDoctorReport(input: {
     cleanupLegacyControlPaths,
     hasLiveConflict: liveAnalysis.hasConflict,
   });
+
+  if (unsafeCanonicalPath) {
+    recommendations.push({
+      id: "quarantine-unsafe-canonical-daemon-record",
+      code: "QUARANTINE_UNSAFE_CANONICAL_DAEMON_RECORD",
+      title: "Quarantine unsafe canonical daemon record",
+      description: "Rename canonical daemon record when it points to unsafe/non-canonical control metadata.",
+      risk: "safe",
+      applies_by_default: false,
+      paths: [unsafeCanonicalPath],
+    });
+  }
 
   const hasError = findings.some((finding) => finding.severity === "error");
   const hasWarn = findings.some((finding) => finding.severity === "warn");

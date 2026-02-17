@@ -2,6 +2,7 @@ export type DaemonIdentityRecord = {
   daemonId: string;
   pid: number;
   startedAt: string;
+  [key: string]: unknown;
 };
 
 export type DaemonIdentityCandidate = {
