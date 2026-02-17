@@ -31,3 +31,7 @@ declare module "*?dashboard-control-plane" {
     replayLastMax: number;
   };
 }
+
+declare module "@opencode-ai/sdk" {
+  export function createOpencodeClient(options: { baseUrl: string }): unknown;
+}

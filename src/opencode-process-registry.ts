@@ -1,6 +1,7 @@
 import type { ChildProcess } from "child_process";
 
 export type OpencodeRun = {
+  kind?: "run" | "server";
   pid: number;
   pgid: number;
   useProcessGroup: boolean;
@@ -20,6 +21,7 @@ export function registerOpencodeRun(
 ): OpencodeRun | null {
   if (!proc.pid) return null;
   const record: OpencodeRun = {
+    kind: meta.kind ?? "run",
     pid: proc.pid,
     pgid: proc.pid,
     startedAt: meta.startedAt ?? Date.now(),

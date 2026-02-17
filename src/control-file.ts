@@ -1,7 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname } from "path";
 import { resolveControlFilePath, type DaemonMode } from "./drain";
-import { readDaemonRecord } from "./daemon-record";
+import { discoverDaemon } from "./daemon-discovery";
+import { buildAuthorityPolicyContext, isTrustedControlFilePath } from "./daemon-authority-policy";
 
 type ControlFileShape = Record<string, unknown>;
 
@@ -55,20 +56,12 @@ function applyPatch(current: ControlFileShape, patch: ControlFilePatch): Control
   return next;
 }
 
-function isPidAlive(pid: number): boolean {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export function updateControlFile(opts: { patch: ControlFilePatch; path?: string }): { path: string; state: ControlFileShape } {
-  const daemonRecord = readDaemonRecord();
+  const daemonDiscovery = discoverDaemon({ healStale: false });
+  const authority = buildAuthorityPolicyContext();
+  const daemonRecord = daemonDiscovery.state === "live" ? daemonDiscovery.live?.record ?? null : null;
   const daemonControlPath =
-    daemonRecord && isPidAlive(daemonRecord.pid) && daemonRecord.controlFilePath.trim()
+    daemonRecord && daemonRecord.controlFilePath.trim() && isTrustedControlFilePath(daemonRecord.controlFilePath.trim(), authority)
       ? daemonRecord.controlFilePath.trim()
       : null;
   const path = opts.path ?? daemonControlPath ?? resolveControlFilePath();
