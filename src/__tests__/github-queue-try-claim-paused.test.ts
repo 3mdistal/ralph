@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "fs/promises";
 import { join } from "path";
 import { tmpdir } from "os";
 
+import { getRalphConfigTomlPath } from "../paths";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 let homeDir: string;
@@ -22,9 +23,15 @@ describe("GitHub queue tryClaimTask pause switch", () => {
     const stateMod = await import("../state");
     stateMod.closeStateDbForTests();
     stateMod.initStateDb();
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
   });
 
   afterEach(async () => {
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+
     const stateMod = await import("../state");
     stateMod.closeStateDbForTests();
 
@@ -35,6 +42,17 @@ describe("GitHub queue tryClaimTask pause switch", () => {
     releaseLock?.();
     releaseLock = null;
   });
+
+  async function writeAutoQueueConfig(repo: string): Promise<void> {
+    await mkdir(join(homeDir, ".ralph"), { recursive: true });
+    await writeFile(
+      getRalphConfigTomlPath(),
+      [`repos = [{ name = "${repo}", autoQueue = { enabled = true } }]`, ""].join("\n"),
+      "utf8"
+    );
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+  }
 
   test("refuses to claim non-queued tasks when paused label is present", async () => {
     const now = new Date("2026-02-04T00:00:00.000Z");
@@ -146,5 +164,77 @@ describe("GitHub queue tryClaimTask pause switch", () => {
 
     expect(res.claimed).toBe(false);
     expect(res.reason).toBe("Issue is paused");
+  });
+
+  test("refuses to claim in-progress tasks when sub-issues are open", async () => {
+    const now = new Date("2026-02-04T00:00:00.000Z");
+    const queueMod = await import("../github-queue/io");
+    const stateMod = await import("../state");
+
+    const repo = "3mdistal/ralph";
+    const issueNumber = 313;
+    await writeAutoQueueConfig(repo);
+
+    stateMod.recordIssueSnapshot({
+      repo,
+      issue: `${repo}#${issueNumber}`,
+      title: "Parent resume gating",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/313",
+      at: now.toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo,
+      issue: `${repo}#${issueNumber}`,
+      labels: ["ralph:status:in-progress"],
+      at: now.toISOString(),
+    });
+
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => now,
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => ["ralph:status:in-progress"],
+        fetchIssue: async () => null,
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: false }),
+        mutateIssueLabels: async () => true,
+      },
+      relationshipsProviderFactory: () => ({
+        getSnapshot: async () => ({
+          issue: { repo, number: issueNumber },
+          coverage: { githubDeps: "complete", githubSubIssues: "complete", bodyDeps: false },
+          signals: [
+            {
+              source: "github",
+              kind: "sub_issue",
+              state: "open",
+              ref: { repo, number: 729 },
+            },
+          ],
+        }),
+      }),
+    });
+
+    const res = await driver.tryClaimTask({
+      task: {
+        _path: `github:${repo}#${issueNumber}`,
+        _name: `Issue ${issueNumber}`,
+        type: "agent-task",
+        "creation-date": now.toISOString(),
+        scope: "builder",
+        issue: `${repo}#${issueNumber}`,
+        repo,
+        status: "in-progress",
+        name: "Parent resume gating",
+      },
+      daemonId: "daemon-1",
+      nowMs: now.valueOf(),
+    });
+
+    expect(res.claimed).toBe(false);
+    expect(res.reason).toBe(`Issue blocked by dependencies (open sub-issue ${repo}#729)`);
   });
 });
