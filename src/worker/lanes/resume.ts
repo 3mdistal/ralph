@@ -4,7 +4,7 @@ import { getRepoBotBranch } from "../../config";
 import { isRepoAllowed } from "../../github-app-auth";
 import { classifyOpencodeFailure } from "../../opencode-error-classifier";
 import { selectPrUrl } from "../../routing";
-import { deleteIdempotencyKey } from "../../state";
+import { deleteIdempotencyKey, upsertIdempotencyKey } from "../../state";
 import { writeDxSurveyToGitHubIssues } from "../../github/dx-survey-writeback";
 import type { AgentTask } from "../../queue-backend";
 import { applyTaskPatch } from "../task-patch";
@@ -13,6 +13,7 @@ import type { AgentRun } from "../repo-worker";
 import { derivePrCreateEscalationReason } from "../pr-create-escalation-reason";
 import { classifyPrCreateFailurePolicy, computePrCreateRetryBackoffMs } from "../pr-create-policy";
 import type { PrEvidenceCauseCode } from "../../gates/pr-evidence-gate";
+import { buildStageSendLedgerKey, buildStageSendMessageId, buildStageSendPayload } from "../stage-sends";
 
 type ResumeTaskOptions = { resumeMessage?: string; repoSlot?: number | null };
 
@@ -168,6 +169,44 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
       const pausedBefore = await this.pauseIfHardThrottled(task, "resume", existingSessionId);
       if (pausedBefore) return pausedBefore;
 
+      const recordStageSend = (params: {
+        stage: string;
+        sessionId: string;
+        mode: "message" | "command";
+        content: string;
+        command?: string;
+        args?: string[];
+      }): string => {
+        const at = new Date().toISOString();
+        const messageId = buildStageSendMessageId({
+          sessionId: params.sessionId,
+          stage: params.stage,
+          content: params.content,
+        });
+        const key = buildStageSendLedgerKey({ repo: this.repo, taskPath: task._path, stage: params.stage });
+        try {
+          upsertIdempotencyKey({
+            key,
+            scope: "stage-send",
+            payloadJson: buildStageSendPayload({
+              repo: this.repo,
+              taskPath: task._path,
+              stage: params.stage,
+              sessionId: params.sessionId,
+              messageId,
+              mode: params.mode,
+              command: params.command,
+              args: params.args,
+              at,
+            }),
+            createdAt: at,
+          });
+        } catch {
+          // best-effort stage-send persistence
+        }
+        return messageId;
+      };
+
       return await this.withRunContext(task, "resume", async () => {
         this.publishDashboardEvent(
           {
@@ -188,6 +227,16 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
         this.logWorker(`Resuming task: ${task.name}`, { sessionId: existingSessionId, workerId: eventWorkerId });
 
         const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
+        const resumeStageMessageId = recordStageSend({
+          stage: "resume",
+          sessionId: existingSessionId,
+          mode: "message",
+          content: finalResumeMessage,
+        });
+        await this.queue.updateTaskStatus(task, "in-progress", {
+          "last-stage-message-id": resumeStageMessageId,
+          "last-stage-name": "resume",
+        });
 
         let buildResult = await this.session.continueSession(taskRepoPath, existingSessionId, finalResumeMessage, {
           repo: this.repo,
@@ -359,11 +408,22 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             if (pausedLoopBreak) return pausedLoopBreak;
 
             const loopBreakRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume loop-break", "in-progress");
+            const loopBreakMessage = "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.";
+            const loopBreakMessageId = recordStageSend({
+              stage: "resume-loop-break",
+              sessionId: buildResult.sessionId,
+              mode: "message",
+              content: loopBreakMessage,
+            });
+            await this.queue.updateTaskStatus(task, "in-progress", {
+              "last-stage-message-id": loopBreakMessageId,
+              "last-stage-name": "resume-loop-break",
+            });
 
             buildResult = await this.session.continueSession(
               taskRepoPath,
               buildResult.sessionId,
-              "You appear to be stuck. Stop repeating previous output and proceed with the next concrete step.",
+              loopBreakMessage,
               {
                 repo: this.repo,
                 cacheKey,
@@ -551,6 +611,16 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
             latestOutput: buildResult.output,
           });
           const resumeContinueRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "continue", "in-progress");
+          const continueMessageId = recordStageSend({
+            stage: "resume-continue",
+            sessionId: buildResult.sessionId,
+            mode: "message",
+            content: nudge,
+          });
+          await this.queue.updateTaskStatus(task, "in-progress", {
+            "last-stage-message-id": continueMessageId,
+            "last-stage-name": "resume-continue",
+          });
 
           buildResult = await this.session.continueSession(taskRepoPath, buildResult.sessionId, nudge, {
             repo: this.repo,
@@ -762,6 +832,18 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
 
         const surveyRepoPath = existsSync(taskRepoPath) ? taskRepoPath : this.repoPath;
         const resumeSurveyRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "survey", "in-progress");
+        const surveyMessageId = recordStageSend({
+          stage: "resume-survey",
+          sessionId: buildResult.sessionId,
+          mode: "command",
+          content: "/survey",
+          command: "survey",
+          args: [],
+        });
+        await this.queue.updateTaskStatus(task, "in-progress", {
+          "last-stage-message-id": surveyMessageId,
+          "last-stage-name": "resume-survey",
+        });
 
         const surveyResult = await this.session.continueCommand(surveyRepoPath, buildResult.sessionId, "survey", [], {
           repo: this.repo,

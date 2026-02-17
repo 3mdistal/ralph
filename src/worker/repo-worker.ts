@@ -585,7 +585,13 @@ export class RepoWorker {
   private requiredChecksLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private legacyWorktreesLogLimiter = new LogLimiter({ maxKeys: 2000 });
   private prResolver: ReturnType<typeof createIssuePrResolver>;
-  private checkpointEvents = new CheckpointEventDeduper();
+  private checkpointEvents = new CheckpointEventDeduper({
+    claimKey: (key: string) =>
+      recordIdempotencyKey({
+        key: `ralph:checkpoint-event:v1:${key}`,
+        scope: "checkpoint-event",
+      }),
+  });
   private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
   private ciDiagnosticsSignatureByPr = new Map<string, string>();
