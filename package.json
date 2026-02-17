@@ -24,6 +24,7 @@
     "knip": "knip"
   },
   "dependencies": {
+    "@opencode-ai/sdk": "^1.2.6",
     "blessed": "^0.1.81"
   },
   "devDependencies": {
