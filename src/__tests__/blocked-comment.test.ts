@@ -44,6 +44,20 @@ describe("blocked comment", () => {
     await rm(homeDir, { recursive: true, force: true });
   });
 
+  function markerFor(repo: string, issueNumber: number): string {
+    const fnv = (input: string): string => {
+      let hash = 2166136261;
+      for (let i = 0; i < input.length; i += 1) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 16777619) >>> 0;
+      }
+      return hash.toString(16).padStart(8, "0");
+    };
+    const base = `${repo}|${issueNumber}|blocked`;
+    const id = `${fnv(base)}${fnv(base.split("").reverse().join(""))}`.slice(0, 12);
+    return `<!-- ralph-blocked:v1 id=${id} -->`;
+  }
+
   test("builds and parses v1 state payload", () => {
     const body = buildBlockedCommentBody({
       marker: "<!-- ralph-blocked:v1 id=abc123 -->",
@@ -148,7 +162,7 @@ describe("blocked comment", () => {
   });
 
   test("skips patch when semantic blocked state is unchanged", async () => {
-    const marker = "<!-- ralph-blocked:v1 id=0ff48f803d0e -->";
+    const marker = markerFor("3mdistal/ralph", 762);
     const existingBody = buildBlockedCommentBody({
       marker,
       issueNumber: 762,
