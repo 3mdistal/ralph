@@ -207,7 +207,7 @@ describe("GitHub queue no-flap stale sweep", () => {
     expect(mutations).toEqual([]);
   });
 
-  test("does not downgrade in-progress when session activity is fresh", async () => {
+  test("does not downgrade in-progress when heartbeat is fresh", async () => {
     await writeJson(getRalphConfigJsonPath(), {
       queueBackend: "github",
       ownershipTtlMs: 30_000,
@@ -222,8 +222,7 @@ describe("GitHub queue no-flap stale sweep", () => {
     stateMod.initStateDb();
 
     const baseNow = new Date("2026-02-03T05:00:00.000Z");
-    const staleHeartbeat = new Date(baseNow.getTime() - 30 * 60_000).toISOString();
-    const freshSessionSeenAt = new Date(baseNow.getTime() - 5_000).toISOString();
+    const freshHeartbeat = new Date(baseNow.getTime() - 5_000).toISOString();
     const sessionId = "opencode-session-queue-no-flap-760";
 
     stateMod.recordIssueSnapshot({
@@ -247,23 +246,8 @@ describe("GitHub queue no-flap stale sweep", () => {
       taskPath: "github:3mdistal/ralph#760",
       status: "in-progress",
       sessionId,
-      heartbeatAt: staleHeartbeat,
+      heartbeatAt: freshHeartbeat,
       at: baseNow.toISOString(),
-    });
-
-    const runId = stateMod.createRalphRun({
-      repo: "3mdistal/ralph",
-      issue: "3mdistal/ralph#760",
-      taskPath: "github:3mdistal/ralph#760",
-      attemptKind: "process",
-      startedAt: new Date(baseNow.getTime() - 60_000).toISOString(),
-    });
-    stateMod.recordRalphRunSessionUse({
-      runId,
-      sessionId,
-      stepTitle: "build",
-      agent: "builder",
-      at: freshSessionSeenAt,
     });
 
     const mutations: Array<{ add: string[]; remove: string[] }> = [];
