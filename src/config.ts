@@ -2131,12 +2131,13 @@ export type RepoPreflightCommands = {
   commands: string[];
   source: "preflightCommand" | "verification.preflight" | "none";
   configured: boolean;
+  invalid: boolean;
 };
 
 export function getRepoPreflightCommands(repoName: string): RepoPreflightCommands {
   const cfg = getConfig();
   const repo = cfg.repos.find((r) => r.name === repoName);
-  if (!repo) return { commands: [], source: "none", configured: false };
+  if (!repo) return { commands: [], source: "none", configured: false, invalid: false };
 
   const rawPreflight = (repo as any).preflightCommand;
   if (rawPreflight !== undefined) {
@@ -2147,25 +2148,27 @@ export function getRepoPreflightCommands(repoName: string): RepoPreflightCommand
         : null;
 
     if (parsed !== null) {
-      return { commands: parsed, source: "preflightCommand", configured: true };
+      return { commands: parsed, source: "preflightCommand", configured: true, invalid: false };
     }
     console.warn(
       `[ralph] Invalid config preflightCommand for repo ${repoName}: ${JSON.stringify(rawPreflight)}; expected string or string[].`
     );
+    return { commands: [], source: "preflightCommand", configured: true, invalid: true };
   }
 
   const legacy = (repo as any).verification?.preflight;
   if (legacy !== undefined) {
     const parsed = toStringArrayOrNull(legacy);
     if (parsed !== null) {
-      return { commands: parsed, source: "verification.preflight", configured: true };
+      return { commands: parsed, source: "verification.preflight", configured: true, invalid: false };
     }
     console.warn(
       `[ralph] Invalid config repos[${repoName}].verification.preflight=${JSON.stringify(legacy)}; expected string[].`
     );
+    return { commands: [], source: "verification.preflight", configured: true, invalid: true };
   }
 
-  return { commands: [], source: "none", configured: false };
+  return { commands: [], source: "none", configured: false, invalid: false };
 }
 
 export function getRepoLoopDetectionConfig(repoName: string): LoopDetectionConfig | null {

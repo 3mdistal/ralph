@@ -2,6 +2,9 @@ export type CiFailureClassification = "regression" | "flake-suspected" | "infra"
 
 export type CiNextAction = "resume" | "spawn" | "quarantine";
 
+export const CI_TRIAGE_DECISION_VERSION = 1;
+export const CI_TRIAGE_CLASSIFIER_VERSION = 1;
+
 export type CiTriageClassificationReason =
   | "infra_timeout"
   | "infra_non_actionable"
@@ -30,6 +33,8 @@ export type CiTriageInput = {
 };
 
 export type CiTriageDecision = {
+  version: typeof CI_TRIAGE_DECISION_VERSION;
+  classifierVersion: typeof CI_TRIAGE_CLASSIFIER_VERSION;
   classification: CiFailureClassification;
   classificationReason: CiTriageClassificationReason;
   action: CiNextAction;
@@ -142,6 +147,8 @@ export function buildCiTriageDecision(input: CiTriageInput): CiTriageDecision {
   const classification = classifyCiFailure(input);
   const action = decideCiNextAction(input, classification.classification);
   return {
+    version: CI_TRIAGE_DECISION_VERSION,
+    classifierVersion: CI_TRIAGE_CLASSIFIER_VERSION,
     classification: classification.classification,
     classificationReason: classification.reason,
     action: action.action,

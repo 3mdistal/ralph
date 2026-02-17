@@ -12,6 +12,7 @@ describe("planner prompt", () => {
     expect(prompt).toContain("Child completion dossier");
     expect(prompt).toContain("consult @product");
     expect(prompt).toContain("consult @devex");
+    expect(prompt).toContain("RALPH_PLAN_REVIEW");
     expect(prompt).toContain("\"decision\": \"proceed\" | \"escalate\"");
     expect(prompt).toContain("\"confidence\": \"high\" | \"medium\" | \"low\"");
   });

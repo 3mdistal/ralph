@@ -1445,6 +1445,70 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(artifacts.some((artifact) => artifact.content.includes("artifact-11"))).toBe(true);
   });
 
+  test("gate artifacts are redacted before persistence", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#234",
+      taskPath: "github:3mdistal/ralph#234",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:21:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:21:01.000Z" });
+
+    const secret = "ghp_1234567890abcdefghijklmnopqrstuvwxyz";
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "failure_excerpt",
+      content: `token=${secret}\nAuthorization: Bearer secret-token-value`,
+      at: "2026-01-20T12:21:02.000Z",
+    });
+
+    const state = getRalphRunGateState(runId);
+    const artifact = state.artifacts.find((entry) => entry.gate === "ci" && entry.kind === "failure_excerpt");
+    expect(artifact).toBeDefined();
+    expect(artifact?.content).not.toContain(secret);
+    expect(artifact?.content).toContain("ghp_[REDACTED]");
+    expect(artifact?.content).toContain("Authorization: Bearer [REDACTED]");
+  });
+
+  test("gate artifacts are bounded with truncation metadata", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#234",
+      taskPath: "github:3mdistal/ralph#234",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:22:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:22:01.000Z" });
+
+    const longLine = "x".repeat(120);
+    const hugePayload = Array.from({ length: 260 }, () => longLine).join("\n");
+
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "failure_excerpt",
+      content: hugePayload,
+      at: "2026-01-20T12:22:02.000Z",
+    });
+
+    const state = getRalphRunGateState(runId);
+    const artifact = state.artifacts.find((entry) => entry.gate === "ci" && entry.kind === "failure_excerpt");
+    expect(artifact).toBeDefined();
+    expect(artifact?.truncated).toBe(true);
+    expect(artifact?.originalLines).toBe(260);
+    expect(artifact?.originalChars).toBe(hugePayload.length);
+    expect(artifact?.content.length ?? 0).toBeLessThanOrEqual(20_000);
+    expect((artifact?.content.split("\n").length ?? 0)).toBeLessThanOrEqual(200);
+  });
+
   test("latest gate selection is deterministic with ties", () => {
     initStateDb();
 

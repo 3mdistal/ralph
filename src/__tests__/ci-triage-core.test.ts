@@ -15,6 +15,8 @@ describe("ci triage core", () => {
       priorSignature: null,
     });
 
+    expect(decision.version).toBe(1);
+    expect(decision.classifierVersion).toBe(1);
     expect(decision.classification).toBe("infra");
   });
 
@@ -46,6 +48,38 @@ describe("ci triage core", () => {
     });
 
     expect(decision.action).toBe("resume");
+  });
+
+  test("chooses spawn for regression without session", () => {
+    const decision = buildCiTriageDecision({
+      timedOut: false,
+      failures: [{ name: "typecheck", rawState: "FAILURE", excerpt: "TS2339" }],
+      commands: ["bun run typecheck"],
+      attempt: 1,
+      maxAttempts: 5,
+      hasSession: false,
+      signature: "sig-a",
+      priorSignature: null,
+    });
+
+    expect(decision.classification).toBe("regression");
+    expect(decision.action).toBe("spawn");
+  });
+
+  test("quarantines repeated non-regression signature", () => {
+    const decision = buildCiTriageDecision({
+      timedOut: true,
+      failures: [{ name: "CI", rawState: "TIMED_OUT", excerpt: null }],
+      commands: [],
+      attempt: 2,
+      maxAttempts: 5,
+      hasSession: true,
+      signature: "same-signature",
+      priorSignature: "same-signature",
+    });
+
+    expect(decision.classification).toBe("infra");
+    expect(decision.action).toBe("quarantine");
   });
 });
 

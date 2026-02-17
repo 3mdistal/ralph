@@ -49,6 +49,7 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import { evaluatePreflightPolicy } from "../gates/preflight-policy";
 import {
   type NoPrTerminalReason,
   type PrEvidenceCauseCode,
@@ -112,7 +113,14 @@ import {
   type CiDebugCommentState,
   type CiTriageCommentState,
 } from "../github/ci-debug-comment";
-import { buildCiTriageDecision, type CiFailureClassification, type CiNextAction, type CiTriageDecision } from "../ci-triage/core";
+import {
+  CI_TRIAGE_CLASSIFIER_VERSION,
+  CI_TRIAGE_DECISION_VERSION,
+  buildCiTriageDecision,
+  type CiFailureClassification,
+  type CiNextAction,
+  type CiTriageDecision,
+} from "../ci-triage/core";
 import { buildCiFailureSignatureV2, type CiFailureSignatureV2 } from "../ci-triage/signature";
 import {
   buildMergeConflictCommentBody,
@@ -378,7 +386,9 @@ type CiFailureTriageOutcome =
     };
 
 type CiTriageRecord = {
-  version: 1;
+  version: 2;
+  decisionVersion: number;
+  classifierVersion: number;
   signatureVersion: 2;
   signature: string;
   classification: CiFailureClassification;
@@ -2562,18 +2572,18 @@ export class RepoWorker {
     }
 
     const preflightConfig = getRepoPreflightCommands(this.repo);
-    const skipReason =
-      preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
-        ? "preflight disabled (preflightCommand=[])"
-        : preflightConfig.configured
-          ? "preflight configured but empty"
-          : "no preflight configured";
+    const preflightPolicy = evaluatePreflightPolicy(preflightConfig);
+    if (preflightPolicy.action === "block") {
+      diagnostics.push(...preflightPolicy.diagnostics);
+      diagnostics.push(formatPrEvidenceCauseCodeLine(preflightPolicy.causeCode));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: preflightPolicy.causeCode };
+    }
 
     const preflightResult = await runPreflightGate({
       runId,
       worktreePath: candidate.worktreePath,
-      commands: preflightConfig.commands,
-      skipReason,
+      commands: preflightPolicy.commands,
+      skipReason: preflightPolicy.skipReason,
     });
 
     if (preflightResult.status === "fail") {
@@ -3043,7 +3053,9 @@ export class RepoWorker {
     commands: string[];
   }): CiTriageRecord {
     return {
-      version: 1,
+      version: 2,
+      decisionVersion: params.decision.version ?? CI_TRIAGE_DECISION_VERSION,
+      classifierVersion: params.decision.classifierVersion ?? CI_TRIAGE_CLASSIFIER_VERSION,
       signatureVersion: params.signature.version,
       signature: params.signature.signature,
       classification: params.decision.classification,

@@ -47,8 +47,7 @@ export type ReviewGateResult = {
 };
 
 const REVIEW_MARKER_PREFIX = "RALPH_REVIEW:";
-const REVIEW_MARKER_REGEX = /^\s*RALPH_REVIEW\b\s*[:\-]?\s*/i;
-const MARKDOWN_FENCE_LINE_REGEX = /^```(?:[a-z0-9_-]+)?$/i;
+const REVIEW_MARKER_REGEX = /^\s*RALPH_REVIEW:\s*/i;
 
 function tryParseReviewPayload(jsonText: string):
   | { ok: true; status: "pass" | "fail"; reason: string }
@@ -80,43 +79,6 @@ function tryParseReviewPayload(jsonText: string):
   return { ok: true, status, reason };
 }
 
-function tryParseFallbackPayload(lines: string[], lastNonEmptyIndex: number):
-  | { ok: true; status: "pass" | "fail"; reason: string }
-  | { ok: false } {
-  const candidates: string[] = [];
-  const lastLine = lines[lastNonEmptyIndex].trim();
-
-  candidates.push(lastLine);
-
-  if (lastLine.startsWith("`") && lastLine.endsWith("`") && lastLine.length >= 2) {
-    candidates.push(lastLine.replace(/^`+|`+$/g, "").trim());
-  }
-
-  if (lastLine === "```") {
-    let i = lastNonEmptyIndex - 1;
-    while (i >= 0 && !lines[i].trim()) i -= 1;
-    if (i >= 0) {
-      candidates.push(lines[i].trim());
-    }
-  }
-
-  for (let start = lastNonEmptyIndex; start >= 0; start -= 1) {
-    if (lines[start].includes("{")) {
-      candidates.push(lines.slice(start, lastNonEmptyIndex + 1).join("\n").trim());
-      break;
-    }
-  }
-
-  for (const candidate of candidates) {
-    const parsed = tryParseReviewPayload(candidate);
-    if (parsed.ok) {
-      return parsed;
-    }
-  }
-
-  return { ok: false };
-}
-
 export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult {
   const text = String(output ?? "");
   const lines = text.split(/\r?\n/);
@@ -140,34 +102,9 @@ export function parseRalphReviewMarker(output: string): ReviewMarkerParseResult 
     };
   }
 
-  let lastNonEmptyIndex = rawLastNonEmptyIndex;
-  while (lastNonEmptyIndex >= 0) {
-    const line = lines[lastNonEmptyIndex].trim();
-    if (!line || MARKDOWN_FENCE_LINE_REGEX.test(line)) {
-      lastNonEmptyIndex -= 1;
-      continue;
-    }
-    break;
-  }
-
-  if (lastNonEmptyIndex < 0) {
-    return {
-      ok: false,
-      failure: "empty_output",
-      reason: "Review marker invalid: output was empty",
-    };
-  }
+  const lastNonEmptyIndex = rawLastNonEmptyIndex;
 
   if (markerIndices.length === 0) {
-    const fallbackPayload = tryParseFallbackPayload(lines, lastNonEmptyIndex);
-    if (fallbackPayload.ok) {
-      return {
-        ok: true,
-        status: fallbackPayload.status,
-        reason: fallbackPayload.reason,
-        markerLine: `${REVIEW_MARKER_PREFIX} ${lines[lastNonEmptyIndex].trim()}`,
-      };
-    }
     return {
       ok: false,
       failure: "missing_marker",

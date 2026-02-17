@@ -53,6 +53,7 @@ describe("repos[].preflightCommand config", () => {
       commands: ["bun test"],
       source: "preflightCommand",
       configured: true,
+      invalid: false,
     });
   });
 
@@ -70,6 +71,7 @@ describe("repos[].preflightCommand config", () => {
       commands: ["bun test", "bun run typecheck"],
       source: "preflightCommand",
       configured: true,
+      invalid: false,
     });
   });
 
@@ -93,6 +95,7 @@ describe("repos[].preflightCommand config", () => {
       commands: ["bun test"],
       source: "preflightCommand",
       configured: true,
+      invalid: false,
     });
   });
 
@@ -110,10 +113,11 @@ describe("repos[].preflightCommand config", () => {
       commands: ["bun test"],
       source: "verification.preflight",
       configured: true,
+      invalid: false,
     });
   });
 
-  test("warns and ignores invalid preflightCommand", async () => {
+  test("marks invalid preflightCommand as configured-invalid", async () => {
     const configJsonPath = getRalphConfigJsonPath();
     await writeJson(configJsonPath, {
       maxWorkers: 1,
@@ -130,8 +134,9 @@ describe("repos[].preflightCommand config", () => {
       cfgMod.__resetConfigForTests();
       expect(cfgMod.getRepoPreflightCommands("demo/repo")).toEqual({
         commands: [],
-        source: "none",
-        configured: false,
+        source: "preflightCommand",
+        configured: true,
+        invalid: true,
       });
       expect(warn).toHaveBeenCalled();
     } finally {

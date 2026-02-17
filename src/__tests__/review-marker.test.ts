@@ -26,20 +26,6 @@ describe("parseRalphReviewMarker", () => {
     }
   });
 
-  test("accepts raw JSON payload on final line when marker is missing", () => {
-    const output = [
-      "Review notes",
-      '{"status":"pass","reason":"Looks good"}',
-    ].join("\n");
-
-    const result = parseRalphReviewMarker(output);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.status).toBe("pass");
-      expect(result.reason).toBe("Looks good");
-    }
-  });
-
   test("accepts case-insensitive marker prefix", () => {
     const output = 'ralph_review: {"status":"fail","reason":"Needs changes"}';
 
@@ -51,18 +37,17 @@ describe("parseRalphReviewMarker", () => {
     }
   });
 
-  test("accepts marker prefix without colon", () => {
+  test("fails when marker prefix omits colon", () => {
     const output = 'RALPH_REVIEW {"status":"pass","reason":"Looks good"}';
 
     const result = parseRalphReviewMarker(output);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.status).toBe("pass");
-      expect(result.reason).toBe("Looks good");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.failure).toBe("missing_marker");
     }
   });
 
-  test("accepts marker line wrapped in markdown fence", () => {
+  test("fails when marker is wrapped in markdown fence", () => {
     const output = [
       "```",
       'RALPH_REVIEW: {"status":"pass","reason":"Looks good"}',
@@ -70,45 +55,9 @@ describe("parseRalphReviewMarker", () => {
     ].join("\n");
 
     const result = parseRalphReviewMarker(output);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.status).toBe("pass");
-      expect(result.reason).toBe("Looks good");
-    }
-  });
-
-  test("accepts multiline trailing JSON payload when marker is missing", () => {
-    const output = [
-      "Review notes",
-      "{",
-      '  "status": "fail",',
-      '  "reason": "Needs follow-up"',
-      "}",
-    ].join("\n");
-
-    const result = parseRalphReviewMarker(output);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.status).toBe("fail");
-      expect(result.reason).toBe("Needs follow-up");
-    }
-  });
-
-  test("accepts fenced multiline JSON payload when marker is missing", () => {
-    const output = [
-      "```json",
-      "{",
-      '  "status": "pass",',
-      '  "reason": "Fenced fallback"',
-      "}",
-      "```",
-    ].join("\n");
-
-    const result = parseRalphReviewMarker(output);
-    expect(result.ok).toBe(true);
-    if (result.ok) {
-      expect(result.status).toBe("pass");
-      expect(result.reason).toBe("Fenced fallback");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.failure).toBe("marker_not_final_line");
     }
   });
 

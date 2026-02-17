@@ -9,6 +9,7 @@ import { isExplicitBlockerReason, isImplementationTaskFromIssue, shouldConsultDe
 import { summarizeForNote } from "../run-notes";
 import { parseIssueRef } from "../../github/issue-ref";
 import { classifyOpencodeFailure } from "../../opencode-error-classifier";
+import { recordPlanReviewGateResult } from "../../gates/plan-review";
 import { derivePrCreateEscalationReason } from "../pr-create-escalation-reason";
 import { classifyPrCreateFailurePolicy, computePrCreateRetryBackoffMs } from "../pr-create-policy";
 import type { PrEvidenceCauseCode } from "../../gates/pr-evidence-gate";
@@ -268,6 +269,11 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
         const pausedAfterPlanRetry = await this.pauseIfHardThrottled(task, "plan (post retry)", planResult.sessionId);
         if (pausedAfterPlanRetry) return pausedAfterPlanRetry;
 
+        const runId = this.activeRunId;
+        const planReview = runId
+          ? recordPlanReviewGateResult({ runId, output: String(planResult.output ?? ""), success: planResult.success })
+          : null;
+
         if (!planResult.success) {
           if (planResult.watchdogTimeout) {
             return await this.handleWatchdogTimeout(task, cacheKey, "plan", planResult, opencodeXdg);
@@ -295,6 +301,52 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
             taskName: task.name,
             repo: this.repo,
             outcome: "failed",
+            sessionId: planResult.sessionId,
+            escalationReason: reason,
+          };
+        }
+
+        if (planReview && (!planReview.ok || planReview.status !== "pass")) {
+          const reason = planReview.reason;
+          const hasPlanGap = hasProductGap(planResult.output);
+
+          console.log(`[ralph:worker:${this.repo}] Escalating: ${reason}`);
+
+          const wasEscalated = task.status === "escalated";
+          const escalated = await this.queue.updateTaskStatus(task, "escalated");
+          if (escalated) {
+            applyTaskPatch(task, "escalated", {});
+          }
+
+          await this.writeEscalationWriteback(task, {
+            reason,
+            escalationType: hasPlanGap ? "product-gap" : "other",
+          });
+
+          await this.notify.notifyEscalation({
+            taskName: task.name,
+            taskFileName: task._name,
+            taskPath: task._path,
+            issue: task.issue,
+            repo: this.repo,
+            sessionId: planResult.sessionId,
+            reason,
+            escalationType: hasPlanGap ? "product-gap" : "other",
+            planOutput: planResult.output,
+          });
+
+          if (escalated && !wasEscalated) {
+            await this.recordEscalatedRunNote(task, {
+              reason,
+              sessionId: planResult.sessionId,
+              details: planResult.output,
+            });
+          }
+
+          return {
+            taskName: task.name,
+            repo: this.repo,
+            outcome: "escalated",
             sessionId: planResult.sessionId,
             escalationReason: reason,
           };
