@@ -72,6 +72,10 @@ export interface QueueTask {
   "blocked-checked-at"?: string;
   /** Last checkpoint reached by worker */
   checkpoint?: string;
+  /** Last recorded stage-send message identifier */
+  "last-stage-message-id"?: string;
+  /** Stage name associated with last-stage-message-id */
+  "last-stage-name"?: string;
   /** Monotonic checkpoint sequence for dedupe */
   "checkpoint-seq"?: string;
   /** Pause requested at next checkpoint */
