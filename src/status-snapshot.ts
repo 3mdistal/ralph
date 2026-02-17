@@ -161,6 +161,17 @@ export type StatusSnapshot = {
   blocked: StatusBlockedTask[];
   orphans?: StatusOrphanTask[];
   drain: StatusDrainSnapshot;
+  githubGovernor?: {
+    enabled: boolean;
+    dryRun: boolean;
+    cooldown: { active: boolean; untilTs: number | null };
+    lanes: {
+      critical: { allowed: number; deferred: number };
+      important: { allowed: number; deferred: number };
+      best_effort: { allowed: number; deferred: number };
+    };
+    starvation: { count: number; lastAtTs: number | null };
+  };
 };
 
 const normalizeOrphanTask = (task: StatusOrphanTask): StatusOrphanTask => ({
@@ -292,5 +303,39 @@ export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
     starting: input.starting.map(normalizeTaskBase),
     queued: input.queued.map(normalizeTaskBase),
     throttled: input.throttled.map(normalizeThrottledTask),
+    githubGovernor: input.githubGovernor
+      ? {
+          enabled: input.githubGovernor.enabled === true,
+          dryRun: input.githubGovernor.dryRun === true,
+          cooldown: {
+            active: input.githubGovernor.cooldown.active === true,
+            untilTs:
+              typeof input.githubGovernor.cooldown.untilTs === "number" && Number.isFinite(input.githubGovernor.cooldown.untilTs)
+                ? input.githubGovernor.cooldown.untilTs
+                : null,
+          },
+          lanes: {
+            critical: {
+              allowed: Math.max(0, Math.floor(input.githubGovernor.lanes.critical.allowed ?? 0)),
+              deferred: Math.max(0, Math.floor(input.githubGovernor.lanes.critical.deferred ?? 0)),
+            },
+            important: {
+              allowed: Math.max(0, Math.floor(input.githubGovernor.lanes.important.allowed ?? 0)),
+              deferred: Math.max(0, Math.floor(input.githubGovernor.lanes.important.deferred ?? 0)),
+            },
+            best_effort: {
+              allowed: Math.max(0, Math.floor(input.githubGovernor.lanes.best_effort.allowed ?? 0)),
+              deferred: Math.max(0, Math.floor(input.githubGovernor.lanes.best_effort.deferred ?? 0)),
+            },
+          },
+          starvation: {
+            count: Math.max(0, Math.floor(input.githubGovernor.starvation.count ?? 0)),
+            lastAtTs:
+              typeof input.githubGovernor.starvation.lastAtTs === "number" && Number.isFinite(input.githubGovernor.starvation.lastAtTs)
+                ? input.githubGovernor.starvation.lastAtTs
+                : null,
+          },
+        }
+      : undefined,
   };
 }

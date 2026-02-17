@@ -449,6 +449,7 @@ function buildLabelOpsIo(io: GitHubQueueIO, repo: string, issueNumber: number) {
     addLabel: async (label: string) => await io.addIssueLabel(repo, issueNumber, label),
     addLabels: async (labels: string[]) => await io.addIssueLabels(repo, issueNumber, labels),
     removeLabel: async (label: string) => await io.removeIssueLabel(repo, issueNumber, label),
+    listLabels: async () => await io.listIssueLabels(repo, issueNumber),
   };
 }
 
@@ -572,6 +573,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
                 issueNumber: issue.number,
                 ensureLabels: async () => await io.ensureWorkflowLabels(repo),
                 retryMissingLabelOnce: true,
+                writeClass: "best-effort",
               });
 
               if (labelOps.ok) {
@@ -627,6 +629,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               issueNumber: issue.number,
               ensureLabels: async () => await io.ensureWorkflowLabels(repo),
               retryMissingLabelOnce: true,
+              writeClass: "best-effort",
             });
 
             if (labelOps.ok) {
@@ -791,6 +794,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               issueNumber: issue.number,
               ensureLabels: async () => await io.ensureWorkflowLabels(repo),
               retryMissingLabelOnce: true,
+              writeClass: "best-effort",
             });
 
             if (labelOps.ok) {
@@ -1039,9 +1043,38 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         issueNumber: issueRef.number,
         taskPath: opts.task._path || `github:${issueRef.repo}#${issueRef.number}`,
       };
+      const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
+
+      const getDependencyBlockReason = async (): Promise<string | null> => {
+        if (!autoQueueEnabled) return null;
+        try {
+          const relationships = relationshipsProviderFactory(issueRef.repo);
+          const snapshot = await relationships.getSnapshot(issueRef);
+          const resolved = resolveRelationshipSignals(snapshot);
+          logRelationshipDiagnostics({ repo: issueRef.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
+          const decision = computeBlockedDecision(resolved.signals);
+
+          if (decision.confidence === "unknown") {
+            // Unknown dependency coverage is not a blocker for claiming.
+            // Treat it as best-effort signal gathering rather than a hard gate.
+            if (shouldLog(`deps:unknown:${issueRef.repo}#${issueRef.number}`, 60_000)) {
+              console.warn(
+                `[ralph:queue:github] Dependency coverage unknown for ${issueRef.repo}#${issueRef.number}; proceeding without blocked label gating`
+              );
+            }
+            return null;
+          }
+
+          if (!decision.blocked) return null;
+          return decision.reasons.length > 0
+            ? `Issue blocked by dependencies (${decision.reasons.join(", ")})`
+            : "Issue blocked by dependencies";
+        } catch (error: any) {
+          return error?.message ?? String(error);
+        }
+      };
 
       if (opts.task.status === "queued") {
-        const autoQueueEnabled = getRepoAutoQueueConfig(issueRef.repo)?.enabled ?? false;
         const snapshotLabels = issue.labels;
         let plan = planClaim(snapshotLabels);
         const shouldCheckDependencies = autoQueueEnabled;
@@ -1057,31 +1090,9 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
 
           const shouldCheckDependenciesLive = autoQueueEnabled;
           if (shouldCheckDependenciesLive) {
-            try {
-              const relationships = relationshipsProviderFactory(issueRef.repo);
-              const snapshot = await relationships.getSnapshot(issueRef);
-              const resolved = resolveRelationshipSignals(snapshot);
-              logRelationshipDiagnostics({ repo: issueRef.repo, issue: snapshot.issue, diagnostics: resolved.diagnostics, area: "queue" });
-              const decision = computeBlockedDecision(resolved.signals);
-
-              if (decision.confidence === "unknown") {
-                // Unknown dependency coverage is not a blocker for claiming.
-                // Treat it as best-effort signal gathering rather than a hard gate.
-                if (shouldLog(`deps:unknown:${issueRef.repo}#${issueRef.number}`, 60_000)) {
-                  console.warn(
-                    `[ralph:queue:github] Dependency coverage unknown for ${issueRef.repo}#${issueRef.number}; proceeding without blocked label gating`
-                  );
-                }
-              } else if (decision.blocked) {
-                const reason =
-                  decision.reasons.length > 0
-                    ? `Issue blocked by dependencies (${decision.reasons.join(", ")})`
-                  : "Issue blocked by dependencies";
-
-                return { claimed: false, task: opts.task, reason };
-              }
-            } catch (error: any) {
-              return { claimed: false, task: opts.task, reason: error?.message ?? String(error) };
+            const dependencyBlockReason = await getDependencyBlockReason();
+            if (dependencyBlockReason) {
+              return { claimed: false, task: opts.task, reason: dependencyBlockReason };
             }
           }
           plan = planClaim(labelsForPlan);
@@ -1155,6 +1166,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             issueNumber: issueRef.number,
             ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
             retryMissingLabelOnce: true,
+            writeClass: "best-effort",
           });
           if (!labelOps.ok && labelOps.kind !== "transient") {
             return { claimed: false, task: opts.task, reason: "Failed to update claim labels" };
@@ -1215,6 +1227,13 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
         });
 
         return { claimed: true, task: view };
+      }
+
+      if (autoQueueEnabled) {
+        const dependencyBlockReason = await getDependencyBlockReason();
+        if (dependencyBlockReason) {
+          return { claimed: false, task: opts.task, reason: dependencyBlockReason };
+        }
       }
 
       const waitingOnPr = (opState.status ?? "").trim() === "waiting-on-pr";
@@ -1462,6 +1481,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             issueNumber: issueRef.number,
             ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
             retryMissingLabelOnce: true,
+            writeClass: "best-effort",
           });
           if (labelOps.ok) {
             applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: labelOps.add, remove: labelOps.remove, nowIso });

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "crypto";
 import { Database } from "bun:sqlite";
 
 import { getRalphHomeDir, getRalphStateDbPath, getSessionEventsPath } from "./paths";
-import { redactSensitiveText } from "./redaction";
+import { applyGateArtifactPolicy, applyGateFieldPolicy, type ArtifactTruncationMode } from "./gates/artifact-policy";
 import { isSafeSessionId } from "./session-id";
 import type { AlertKind, AlertTargetType } from "./alerts/core";
 import {
@@ -17,7 +17,7 @@ import {
   type DurableStateSchemaWindow,
 } from "./durable-state-capability";
 
-const SCHEMA_VERSION = 22;
+const SCHEMA_VERSION = 23;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
@@ -178,8 +178,6 @@ const GATE_STATUSES: GateStatus[] = ["pending", "pass", "fail", "skipped"];
 const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_excerpt", "note"];
 const GATE_NAME_CHECK_CONSTRAINT_SQL = `CHECK (gate IN (${GATE_NAMES.map((gate) => quoteSqlLiteral(gate)).join(", ")}))`;
 
-const ARTIFACT_MAX_LINES = 200;
-const ARTIFACT_MAX_CHARS = 20_000;
 const ARTIFACT_MAX_PER_GATE_KIND = 10;
 
 let db: Database | null = null;
@@ -269,32 +267,6 @@ function sanitizeOptionalText(
   return trimmed.slice(0, maxLength).trimEnd();
 }
 
-function redactAndBoundArtifact(value: string): {
-  content: string;
-  truncated: boolean;
-  originalChars: number;
-  originalLines: number;
-} {
-  const raw = String(value ?? "");
-  const originalChars = raw.length;
-  const originalLines = raw ? raw.split("\n").length : 0;
-  let content = redactSensitiveText(raw);
-  let truncated = false;
-
-  if (content.length > ARTIFACT_MAX_CHARS) {
-    content = content.slice(content.length - ARTIFACT_MAX_CHARS);
-    truncated = true;
-  }
-
-  const lines = content.split("\n");
-  if (lines.length > ARTIFACT_MAX_LINES) {
-    content = lines.slice(lines.length - ARTIFACT_MAX_LINES).join("\n");
-    truncated = true;
-  }
-
-  return { content, truncated, originalChars, originalLines };
-}
-
 function requireDb(): Database {
   if (!db) {
     throw new Error("State DB not initialized. Call initStateDb() at startup.");
@@ -365,6 +337,8 @@ function requiresGateEnumRepair(database: Database): boolean {
 
 function rebuildGateTablesForCurrentGateSet(database: Database): void {
   const hasReason = columnExists(database, "ralph_run_gate_results", "reason");
+  const hasArtifactPolicyVersion = columnExists(database, "ralph_run_gate_artifacts", "artifact_policy_version");
+  const hasTruncationMode = columnExists(database, "ralph_run_gate_artifacts", "truncation_mode");
   const resultsInsert = hasReason
     ? `
       INSERT INTO ralph_run_gate_results_repaired(
@@ -381,6 +355,25 @@ function rebuildGateTablesForCurrentGateSet(database: Database): void {
       SELECT
         run_id, gate, status, command, skip_reason, NULL, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
       FROM ralph_run_gate_results;
+    `;
+
+  const artifactsInsert =
+    hasArtifactPolicyVersion && hasTruncationMode
+      ? `
+      INSERT INTO ralph_run_gate_artifacts_repaired(
+        id, run_id, gate, kind, content, truncated, original_chars, original_lines, artifact_policy_version, truncation_mode, created_at, updated_at
+      )
+      SELECT
+        id, run_id, gate, kind, content, truncated, original_chars, original_lines, artifact_policy_version, truncation_mode, created_at, updated_at
+      FROM ralph_run_gate_artifacts;
+    `
+      : `
+      INSERT INTO ralph_run_gate_artifacts_repaired(
+        id, run_id, gate, kind, content, truncated, original_chars, original_lines, artifact_policy_version, truncation_mode, created_at, updated_at
+      )
+      SELECT
+        id, run_id, gate, kind, content, truncated, original_chars, original_lines, 0, 'tail', created_at, updated_at
+      FROM ralph_run_gate_artifacts;
     `;
 
   database.exec(`
@@ -416,16 +409,13 @@ function rebuildGateTablesForCurrentGateSet(database: Database): void {
       truncated INTEGER NOT NULL DEFAULT 0,
       original_chars INTEGER,
       original_lines INTEGER,
+      artifact_policy_version INTEGER NOT NULL DEFAULT 0,
+      truncation_mode TEXT NOT NULL DEFAULT 'tail',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
     );
-    INSERT INTO ralph_run_gate_artifacts_repaired(
-      id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
-    )
-    SELECT
-      id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
-    FROM ralph_run_gate_artifacts;
+    ${artifactsInsert}
     DROP TABLE ralph_run_gate_artifacts;
     ALTER TABLE ralph_run_gate_artifacts_repaired RENAME TO ralph_run_gate_artifacts;
 
@@ -485,6 +475,18 @@ const SCHEMA_INVARIANTS: SchemaInvariant[] = [
     tableName: "ralph_run_gate_results",
     columnName: "reason",
     definition: "TEXT",
+  },
+  {
+    kind: "column",
+    tableName: "ralph_run_gate_artifacts",
+    columnName: "artifact_policy_version",
+    definition: "INTEGER NOT NULL DEFAULT 0",
+  },
+  {
+    kind: "column",
+    tableName: "ralph_run_gate_artifacts",
+    columnName: "truncation_mode",
+    definition: "TEXT NOT NULL DEFAULT 'tail'",
   },
   {
     kind: "index",
@@ -814,7 +816,7 @@ function createBackupBeforeSchemaMutation(database: Database, stateDbPath: strin
 }
 
 const MIGRATION_CHECKPOINT_INVARIANT_REPAIR = "invariant-repair";
-const MIGRATION_CHECKSUM_INVARIANT_REPAIR = sha256Hex("state:invariant-repair:v20");
+const MIGRATION_CHECKSUM_INVARIANT_REPAIR = sha256Hex("state:invariant-repair:v22");
 
 function ensureStateMigrationTables(database: Database): void {
   database.exec(`
@@ -1228,6 +1230,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             truncated INTEGER NOT NULL DEFAULT 0,
             original_chars INTEGER,
             original_lines INTEGER,
+            artifact_policy_version INTEGER NOT NULL DEFAULT 0,
+            truncation_mode TEXT NOT NULL DEFAULT 'tail',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
@@ -1448,15 +1452,17 @@ function ensureSchema(database: Database, stateDbPath: string): void {
                 truncated INTEGER NOT NULL DEFAULT 0,
                 original_chars INTEGER,
                 original_lines INTEGER,
+                artifact_policy_version INTEGER NOT NULL DEFAULT 0,
+                truncation_mode TEXT NOT NULL DEFAULT 'tail',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
               );
               INSERT INTO ralph_run_gate_artifacts_new(
-                id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+                id, run_id, gate, kind, content, truncated, original_chars, original_lines, artifact_policy_version, truncation_mode, created_at, updated_at
               )
               SELECT
-                id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+                id, run_id, gate, kind, content, truncated, original_chars, original_lines, 0, 'tail', created_at, updated_at
               FROM ralph_run_gate_artifacts;
               DROP TABLE ralph_run_gate_artifacts;
               ALTER TABLE ralph_run_gate_artifacts_new RENAME TO ralph_run_gate_artifacts;
@@ -1576,15 +1582,17 @@ function ensureSchema(database: Database, stateDbPath: string): void {
                 truncated INTEGER NOT NULL DEFAULT 0,
                 original_chars INTEGER,
                 original_lines INTEGER,
+                artifact_policy_version INTEGER NOT NULL DEFAULT 0,
+                truncation_mode TEXT NOT NULL DEFAULT 'tail',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
               );
               INSERT INTO ralph_run_gate_artifacts_repaired(
-                id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+                id, run_id, gate, kind, content, truncated, original_chars, original_lines, artifact_policy_version, truncation_mode, created_at, updated_at
               )
               SELECT
-                id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+                id, run_id, gate, kind, content, truncated, original_chars, original_lines, 0, 'tail', created_at, updated_at
               FROM ralph_run_gate_artifacts;
               DROP TABLE ralph_run_gate_artifacts;
               ALTER TABLE ralph_run_gate_artifacts_repaired RENAME TO ralph_run_gate_artifacts;
@@ -1676,6 +1684,19 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             toVersion: 22,
             checkpoint: "v22-tasks-blocked-columns",
             checksum: sha256Hex("state:migration:v22-tasks-blocked-columns"),
+            backupId,
+            appliedAt: nowIso(),
+          });
+        }
+
+        if (existingVersion < 23) {
+          addColumnIfMissing(database, "ralph_run_gate_artifacts", "artifact_policy_version", "INTEGER NOT NULL DEFAULT 0");
+          addColumnIfMissing(database, "ralph_run_gate_artifacts", "truncation_mode", "TEXT NOT NULL DEFAULT 'tail'");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 23,
+            checkpoint: "v23-artifact-policy-columns",
+            checksum: sha256Hex("state:migration:v23-artifact-policy-columns"),
             backupId,
             appliedAt: nowIso(),
           });
@@ -2036,6 +2057,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       truncated INTEGER NOT NULL DEFAULT 0,
       original_chars INTEGER,
       original_lines INTEGER,
+      artifact_policy_version INTEGER NOT NULL DEFAULT 0,
+      truncation_mode TEXT NOT NULL DEFAULT 'tail',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
@@ -2234,6 +2257,46 @@ export function closeStateDbForTests(): void {
   db.close();
   db = null;
   dbPath = null;
+}
+
+const RUNTIME_SNAPSHOT_KEY_PREFIX = "runtime_snapshot:";
+
+function normalizeRuntimeSnapshotKey(key: string): string {
+  const trimmed = String(key ?? "").trim();
+  if (!trimmed) throw new Error("Runtime snapshot key must be non-empty");
+  if (!/^[a-zA-Z0-9._:-]{1,120}$/.test(trimmed)) {
+    throw new Error(`Invalid runtime snapshot key: ${trimmed}`);
+  }
+  return `${RUNTIME_SNAPSHOT_KEY_PREFIX}${trimmed}`;
+}
+
+export function setRuntimeSnapshot(key: string, value: unknown | null): void {
+  const database = requireDb();
+  const metaKey = normalizeRuntimeSnapshotKey(key);
+  if (value === null) {
+    database.query("DELETE FROM meta WHERE key = $key").run({ $key: metaKey });
+    return;
+  }
+  database
+    .query(
+      `INSERT INTO meta(key, value) VALUES ($key, $value)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    )
+    .run({ $key: metaKey, $value: JSON.stringify(value) });
+}
+
+export function getRuntimeSnapshot<T = unknown>(key: string): T | null {
+  const database = requireDb();
+  const metaKey = normalizeRuntimeSnapshotKey(key);
+  const row = database.query("SELECT value FROM meta WHERE key = $key").get({
+    $key: metaKey,
+  }) as { value?: string | null } | undefined;
+  if (!row?.value) return null;
+  try {
+    return JSON.parse(row.value) as T;
+  } catch {
+    return null;
+  }
 }
 
 function parseIssueNumber(issueRef: string): number | null {
@@ -3777,6 +3840,8 @@ type GateArtifactRow = {
   kind: GateArtifactKind;
   content: string;
   truncated: boolean;
+  truncationMode: ArtifactTruncationMode;
+  artifactPolicyVersion: number;
   originalChars: number | null;
   originalLines: number | null;
   createdAt: string;
@@ -3844,7 +3909,7 @@ function getRalphRunGateStateFromDatabase(database: Database, runId: string): Ra
 
   const artifacts = database
     .query(
-      `SELECT id, run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+      `SELECT id, run_id, gate, kind, content, truncated, original_chars, original_lines, artifact_policy_version, truncation_mode, created_at, updated_at
        FROM ralph_run_gate_artifacts
        WHERE run_id = $run_id
        ORDER BY id ASC`
@@ -3858,6 +3923,8 @@ function getRalphRunGateStateFromDatabase(database: Database, runId: string): Ra
     truncated: number;
     original_chars?: number | null;
     original_lines?: number | null;
+    artifact_policy_version?: number | null;
+    truncation_mode?: string | null;
     created_at: string;
     updated_at: string;
   }>;
@@ -3886,6 +3953,8 @@ function getRalphRunGateStateFromDatabase(database: Database, runId: string): Ra
       kind: assertGateArtifactKind(row.kind),
       content: row.content,
       truncated: Boolean(row.truncated),
+      truncationMode: row.truncation_mode === "head" ? "head" : "tail",
+      artifactPolicyVersion: typeof row.artifact_policy_version === "number" ? row.artifact_policy_version : 0,
       originalChars: typeof row.original_chars === "number" ? row.original_chars : null,
       originalLines: typeof row.original_lines === "number" ? row.original_lines : null,
       createdAt: row.created_at,
@@ -3975,11 +4044,11 @@ export function upsertRalphRunGateResult(params: {
   const statusInsert = statusPatch ?? "pending";
   const statusPatchFlag = statusPatch ? 1 : 0;
 
-  const commandPatch = sanitizeOptionalText(params.command, 1000);
-  const skipReasonPatch = sanitizeOptionalText(params.skipReason, 400);
-  const reasonPatch = sanitizeOptionalText(params.reason, 400);
-  const urlPatch = sanitizeOptionalText(params.url, 500);
-  const prUrlPatch = sanitizeOptionalText(params.prUrl, 500);
+  const commandPatch = applyGateFieldPolicy(params.command, 1000);
+  const skipReasonPatch = applyGateFieldPolicy(params.skipReason, 400);
+  const reasonPatch = applyGateFieldPolicy(params.reason, 400);
+  const urlPatch = applyGateFieldPolicy(params.url, 500);
+  const prUrlPatch = applyGateFieldPolicy(params.prUrl, 500);
 
   const commandPatchFlag = commandPatch !== undefined ? 1 : 0;
   const skipReasonPatchFlag = skipReasonPatch !== undefined ? 1 : 0;
@@ -4053,15 +4122,15 @@ export function recordRalphRunGateArtifact(params: {
   const at = params.at ?? nowIso();
   const gate = assertGateName(params.gate);
   const kind = assertGateArtifactKind(params.kind);
-  const bounded = redactAndBoundArtifact(params.content);
+  const bounded = applyGateArtifactPolicy({ kind, content: params.content });
 
   database.transaction(() => {
     database
       .query(
         `INSERT INTO ralph_run_gate_artifacts(
-           run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+           run_id, gate, kind, content, truncated, original_chars, original_lines, artifact_policy_version, truncation_mode, created_at, updated_at
          ) VALUES (
-           $run_id, $gate, $kind, $content, $truncated, $original_chars, $original_lines, $created_at, $updated_at
+           $run_id, $gate, $kind, $content, $truncated, $original_chars, $original_lines, $artifact_policy_version, $truncation_mode, $created_at, $updated_at
          )`
       )
       .run({
@@ -4072,6 +4141,8 @@ export function recordRalphRunGateArtifact(params: {
         $truncated: bounded.truncated ? 1 : 0,
         $original_chars: bounded.originalChars,
         $original_lines: bounded.originalLines,
+        $artifact_policy_version: bounded.artifactPolicyVersion,
+        $truncation_mode: bounded.truncationMode,
         $created_at: at,
         $updated_at: at,
       });
