@@ -86,6 +86,12 @@ export interface RepoConfig {
   verification?: RepoVerificationConfig;
   /** Optional per-repo edit-churn loop detection configuration. */
   loopDetection?: LoopDetectionConfigInput;
+  /** Internal: preflightCommand was declared but invalid in raw config. */
+  __preflightCommandParseError?: boolean;
+  /** Internal: verification.preflight key existed in raw config. */
+  __legacyPreflightDeclared?: boolean;
+  /** Internal: verification.preflight was declared but invalid in raw config. */
+  __legacyPreflightParseError?: boolean;
 }
 
 export type LoopDetectionConfigInput = {
@@ -1058,6 +1064,13 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     }
 
     const rawVerification = (repo as any).verification;
+    if (rawVerification && typeof rawVerification === "object" && !Array.isArray(rawVerification) && "preflight" in rawVerification) {
+      updates.__legacyPreflightDeclared = true;
+      const parsedLegacy = toStringArrayOrNull((rawVerification as any).preflight);
+      if (parsedLegacy === null) {
+        updates.__legacyPreflightParseError = true;
+      }
+    }
     if (rawVerification !== undefined) {
       const parsed = toRepoVerificationConfigOrNull(rawVerification, `repos[${repo.name}].verification`);
       if (parsed) {
@@ -1075,6 +1088,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           `[ralph] Invalid config preflightCommand for repo ${repo.name}: ${JSON.stringify(rawPreflight)}; expected string or string[].`
         );
         updates.preflightCommand = undefined;
+        updates.__preflightCommandParseError = true;
       } else {
         updates.preflightCommand = parsed;
       }
@@ -2133,38 +2147,145 @@ export type RepoPreflightCommands = {
   configured: boolean;
 };
 
-export function getRepoPreflightCommands(repoName: string): RepoPreflightCommands {
+export type RepoPreflightPolicyResolution =
+  | {
+      kind: "run";
+      commands: string[];
+      source: "preflightCommand" | "verification.preflight";
+      configured: true;
+    }
+  | {
+      kind: "disabled";
+      commands: [];
+      source: "preflightCommand";
+      configured: true;
+    }
+  | {
+      kind: "missing";
+      commands: [];
+      source: "none";
+      configured: false;
+      reason: string;
+    }
+  | {
+      kind: "misconfigured";
+      commands: [];
+      source: "preflightCommand" | "verification.preflight";
+      configured: true;
+      reason: string;
+    };
+
+export function resolveRepoPreflightPolicy(repoName: string): RepoPreflightPolicyResolution {
   const cfg = getConfig();
   const repo = cfg.repos.find((r) => r.name === repoName);
-  if (!repo) return { commands: [], source: "none", configured: false };
-
-  const rawPreflight = (repo as any).preflightCommand;
-  if (rawPreflight !== undefined) {
-    const parsed = Array.isArray(rawPreflight)
-      ? toStringArrayOrNull(rawPreflight)
-      : typeof rawPreflight === "string"
-        ? toStringOrStringArrayOrNull(rawPreflight)
-        : null;
-
-    if (parsed !== null) {
-      return { commands: parsed, source: "preflightCommand", configured: true };
-    }
-    console.warn(
-      `[ralph] Invalid config preflightCommand for repo ${repoName}: ${JSON.stringify(rawPreflight)}; expected string or string[].`
-    );
+  if (!repo) {
+    return {
+      kind: "missing",
+      commands: [],
+      source: "none",
+      configured: false,
+      reason: `repo ${repoName} is not configured in Ralph config`,
+    };
   }
 
-  const legacy = (repo as any).verification?.preflight;
-  if (legacy !== undefined) {
+  if ((repo as any).preflightCommand !== undefined || (repo as any).__preflightCommandParseError === true) {
+    if ((repo as any).__preflightCommandParseError === true) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "preflightCommand",
+        configured: true,
+        reason: "invalid repos[].preflightCommand (expected string or string[] of non-empty commands)",
+      };
+    }
+
+    const parsed = toStringArrayOrNull((repo as any).preflightCommand);
+    if (parsed === null) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "preflightCommand",
+        configured: true,
+        reason: "invalid repos[].preflightCommand (expected string or string[] of non-empty commands)",
+      };
+    }
+
+    if (parsed.length === 0) {
+      return {
+        kind: "disabled",
+        commands: [],
+        source: "preflightCommand",
+        configured: true,
+      };
+    }
+
+    return {
+      kind: "run",
+      commands: parsed,
+      source: "preflightCommand",
+      configured: true,
+    };
+  }
+
+  if ((repo as any).__legacyPreflightDeclared === true) {
+    if ((repo as any).__legacyPreflightParseError === true) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "verification.preflight",
+        configured: true,
+        reason: "invalid repos[].verification.preflight (expected string[] of non-empty commands)",
+      };
+    }
+
+    const legacy = (repo as any).verification?.preflight;
     const parsed = toStringArrayOrNull(legacy);
-    if (parsed !== null) {
-      return { commands: parsed, source: "verification.preflight", configured: true };
+    if (parsed === null) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "verification.preflight",
+        configured: true,
+        reason: "invalid repos[].verification.preflight (expected string[] of non-empty commands)",
+      };
     }
-    console.warn(
-      `[ralph] Invalid config repos[${repoName}].verification.preflight=${JSON.stringify(legacy)}; expected string[].`
-    );
+
+    if (parsed.length === 0) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "verification.preflight",
+        configured: true,
+        reason: "repos[].verification.preflight is empty; configure repos[].preflightCommand or explicitly disable with repos[].preflightCommand=[]",
+      };
+    }
+
+    return {
+      kind: "run",
+      commands: parsed,
+      source: "verification.preflight",
+      configured: true,
+    };
   }
 
+  return {
+    kind: "missing",
+    commands: [],
+    source: "none",
+    configured: false,
+    reason: "no repo preflight command configured",
+  };
+}
+
+export function getRepoPreflightCommands(repoName: string): RepoPreflightCommands {
+  const resolved = resolveRepoPreflightPolicy(repoName);
+  if (resolved.kind === "run" || resolved.kind === "disabled") {
+    return {
+      commands: resolved.commands,
+      source: resolved.source,
+      configured: true,
+    };
+  }
   return { commands: [], source: "none", configured: false };
 }
 

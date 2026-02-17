@@ -133,9 +133,73 @@ describe("repos[].preflightCommand config", () => {
         source: "none",
         configured: false,
       });
+      expect(cfgMod.resolveRepoPreflightPolicy("demo/repo")).toEqual({
+        kind: "misconfigured",
+        commands: [],
+        source: "preflightCommand",
+        configured: true,
+        reason: "invalid repos[].preflightCommand (expected string or string[] of non-empty commands)",
+      });
       expect(warn).toHaveBeenCalled();
     } finally {
       console.warn = priorWarn;
     }
+  });
+
+  test("treats preflightCommand=[] as explicit disable", async () => {
+    const configJsonPath = getRalphConfigJsonPath();
+    await writeJson(configJsonPath, {
+      maxWorkers: 1,
+      ownershipTtlMs: 60000,
+      repos: [{ name: "demo/repo", preflightCommand: [] }],
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+    expect(cfgMod.resolveRepoPreflightPolicy("demo/repo")).toEqual({
+      kind: "disabled",
+      commands: [],
+      source: "preflightCommand",
+      configured: true,
+    });
+  });
+
+  test("treats verification.preflight=[] as misconfigured", async () => {
+    const configJsonPath = getRalphConfigJsonPath();
+    await writeJson(configJsonPath, {
+      maxWorkers: 1,
+      ownershipTtlMs: 60000,
+      repos: [{ name: "demo/repo", verification: { preflight: [] } }],
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+    expect(cfgMod.resolveRepoPreflightPolicy("demo/repo")).toEqual({
+      kind: "misconfigured",
+      commands: [],
+      source: "verification.preflight",
+      configured: true,
+      reason:
+        "repos[].verification.preflight is empty; configure repos[].preflightCommand or explicitly disable with repos[].preflightCommand=[]",
+    });
+  });
+
+  test("reports missing preflight config when neither key exists", async () => {
+    const configJsonPath = getRalphConfigJsonPath();
+    await writeJson(configJsonPath, {
+      maxWorkers: 1,
+      ownershipTtlMs: 60000,
+      repos: [{ name: "demo/repo" }],
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+    expect(cfgMod.resolveRepoPreflightPolicy("demo/repo")).toEqual({
+      kind: "missing",
+      commands: [],
+      source: "none",
+      configured: false,
+      reason: "no repo preflight command configured",
+    });
   });
 });
