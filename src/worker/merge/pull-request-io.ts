@@ -36,8 +36,8 @@ export function normalizeMergeStateStatus(value: unknown): PullRequestMergeState
   }
 }
 
-const ghRead = (repo: string) => createGhRunner({ repo, mode: "read" });
-const ghWrite = (repo: string) => createGhRunner({ repo, mode: "write" });
+const ghRead = (repo: string) => createGhRunner({ repo, mode: "read", lane: "critical", source: "merge:required-checks" });
+const ghWrite = (repo: string) => createGhRunner({ repo, mode: "write", lane: "critical", source: "merge:execute" });
 
 export async function getPullRequestChecks(params: {
   repo: string;

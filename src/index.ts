@@ -1579,7 +1579,17 @@ async function main(): Promise<void> {
   const daemonRegistryHeartbeatTimer = setInterval(() => {
     if (isShuttingDown) return;
     try {
-      touchDaemonRecordHeartbeat();
+      touchDaemonRecordHeartbeat({
+        expectedIdentity: {
+          daemonId,
+          pid: process.pid,
+          startedAt: daemonStartedAt,
+          command: daemonCommand,
+          cwd: process.cwd(),
+          controlRoot: dirname(resolveControlFilePath()),
+          controlFilePath: resolveControlFilePath(),
+        },
+      });
     } catch {
       // ignore
     }

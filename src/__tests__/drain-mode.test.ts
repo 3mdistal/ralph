@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utim
 import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { DrainMonitor, isDraining, resolveControlFilePath } from "../drain";
+import { writeDaemonRecord } from "../daemon-record";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -227,6 +228,39 @@ describe("Drain mode", () => {
     const path = resolveControlFilePath(homeDir, "");
     const uid = typeof process.getuid === "function" ? process.getuid() : "unknown";
     expect(path).toBe(`/tmp/ralph/${uid}/control/control.json`);
+  });
+
+  test("ignores unsafe daemon controlFilePath outside trusted roots", () => {
+    const homeDir = mkdtempSync(join(tmpdir(), "ralph-drain-"));
+    tmpDirs.push(homeDir);
+
+    const canonicalControlPath = resolveControlFilePath(homeDir);
+    mkdirSync(dirname(canonicalControlPath), { recursive: true });
+    writeFileSync(canonicalControlPath, JSON.stringify({ version: 1, mode: "running" }));
+
+    const unsafeRoot = join("/tmp", "ralph", `unsafe-${process.pid}`);
+    const unsafeControlPath = join(unsafeRoot, "control.json");
+    mkdirSync(unsafeRoot, { recursive: true });
+    tmpDirs.push(unsafeRoot);
+    writeFileSync(unsafeControlPath, JSON.stringify({ version: 1, mode: "draining" }));
+
+    writeDaemonRecord(
+      {
+        version: 1,
+        daemonId: "d_poisoned",
+        pid: process.pid,
+        startedAt: "2026-02-08T00:00:00.000Z",
+        heartbeatAt: "2026-02-08T00:00:01.000Z",
+        controlRoot: unsafeRoot,
+        ralphVersion: "test",
+        command: ["bun", "src/index.ts"],
+        cwd: process.cwd(),
+        controlFilePath: unsafeControlPath,
+      },
+      { homeDir, writeLegacy: false }
+    );
+
+    expect(isDraining(homeDir, { autoCreate: false, suppressMissingWarnings: true })).toBe(false);
   });
 
   test("refuses symlinked control dir", () => {

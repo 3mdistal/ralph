@@ -28,6 +28,7 @@ export type WatchdogWritebackContext = {
     argsPreview?: string;
     source?: string;
     context?: string;
+    abortReason?: string;
     recentEvents?: string[];
   } | null;
   output?: string | null;
@@ -229,6 +230,7 @@ function buildTimeoutDetails(timeout?: WatchdogWritebackContext["watchdogTimeout
   if (timeout.argsPreview) lines.push(`Args preview: ${timeout.argsPreview}`);
   if (timeout.context) lines.push(`Context: ${timeout.context}`);
   if (timeout.source) lines.push(`Source: ${timeout.source}`);
+  if (timeout.abortReason) lines.push(`Abort detail: ${timeout.abortReason}`);
   return lines.map((line) => truncateText(sanitizeEscalationReason(line), MAX_LINE_CHARS));
 }
 

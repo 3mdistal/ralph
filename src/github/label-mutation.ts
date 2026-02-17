@@ -3,11 +3,18 @@ import { canAttemptLabelWrite, recordLabelWriteFailure, recordLabelWriteSuccess 
 import { addIssueLabels, listIssueLabels, normalizeLabel, removeIssueLabel } from "./issue-label-io";
 import { withIssueLabelLock } from "./issue-label-lock";
 import { enforceSingleStatusLabelInvariant } from "./status-label-invariant";
-import { RALPH_STATUS_LABEL_PREFIX } from "../github-labels";
+import {
+  RALPH_LABEL_STATUS_DONE,
+  RALPH_LABEL_STATUS_IN_BOT,
+  RALPH_STATUS_LABEL_PREFIX,
+} from "../github-labels";
+import { coalesceIssueLabelWrite } from "./write-coalescer";
 
 type LabelIdCache = Map<string, string>;
 
-export type LabelMutationResult = { ok: true } | { ok: false; error: unknown };
+export type LabelMutationResult =
+  | { ok: true; applied: boolean; reason?: "noop" }
+  | { ok: false; error: unknown };
 
 type LabelMutationPlan = {
   add: string[];
@@ -24,17 +31,39 @@ export async function mutateIssueLabels(params: {
   /** Optional caller tag for github.request telemetry. */
   telemetrySource?: string;
 }): Promise<LabelMutationResult> {
-  return await withIssueLabelLock({
+  const add = params.plan.add.map(normalizeLabel).filter((label): label is string => Boolean(label));
+  const remove = params.plan.remove.map(normalizeLabel).filter((label): label is string => Boolean(label));
+  if (add.length === 0 && remove.length === 0) {
+    console.log(
+      `[ralph:telemetry:${params.repo}] github.write.dropped ${JSON.stringify({
+        kind: "labels",
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        reason: "noop",
+        source: params.telemetrySource ?? null,
+      })}`
+    );
+    return { ok: true, applied: false, reason: "noop" };
+  }
+
+  const critical = add.includes(RALPH_LABEL_STATUS_IN_BOT) || add.includes(RALPH_LABEL_STATUS_DONE);
+
+  return await coalesceIssueLabelWrite({
     repo: params.repo,
     issueNumber: params.issueNumber,
-    run: async () => {
+    add,
+    remove,
+    source: params.telemetrySource,
+    critical,
+    run: async () =>
+      await withIssueLabelLock({
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        run: async () => {
       if (!canAttemptLabelWrite(params.repo)) {
         return { ok: false, error: new Error("GitHub label writes temporarily blocked") };
       }
-      const add = params.plan.add.map(normalizeLabel).filter((label): label is string => Boolean(label));
-      const remove = params.plan.remove.map(normalizeLabel).filter((label): label is string => Boolean(label));
 
-      if (add.length === 0 && remove.length === 0) return { ok: true };
 
       const nodeId = params.issueNodeId?.trim();
       if (!nodeId) return { ok: false, error: new Error("Missing issue node id") };
@@ -96,12 +125,13 @@ export async function mutateIssueLabels(params: {
           });
         }
 
-        return { ok: true };
+        return { ok: true, applied: true };
       } catch (error) {
         recordLabelWriteFailure(params.repo, error);
         return { ok: false, error };
       }
     },
+      }),
   });
 }
 

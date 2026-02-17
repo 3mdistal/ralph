@@ -3,7 +3,14 @@ import type { EnsureOutcome } from "./ensure-ralph-workflow-labels";
 import { canAttemptLabelWrite, recordLabelWriteFailure, recordLabelWriteSuccess } from "./label-write-backoff";
 import { withIssueLabelLock } from "./issue-label-lock";
 import { enforceSingleStatusLabelInvariant } from "./status-label-invariant";
-import { RALPH_STATUS_LABEL_PREFIX } from "../github-labels";
+import {
+  RALPH_LABEL_STATUS_DONE,
+  RALPH_LABEL_STATUS_IN_BOT,
+  RALPH_STATUS_LABEL_PREFIX,
+} from "../github-labels";
+import { coalesceIssueLabelWrite } from "./write-coalescer";
+import { shouldLog } from "../logging";
+import { publishDashboardEvent } from "../dashboard/publisher";
 
 export type LabelOp = { action: "add" | "remove"; label: string };
 
@@ -28,7 +35,10 @@ type LabelOpsIo = {
   addLabel: (label: string) => Promise<void>;
   addLabels?: (labels: string[]) => Promise<void>;
   removeLabel: (label: string) => Promise<{ removed?: boolean } | void>;
+  listLabels?: () => Promise<string[]>;
 };
+
+type LabelWriteClass = "critical" | "important" | "best-effort";
 
 type ApplyIssueLabelOpsParams = {
   ops: LabelOp[];
@@ -42,7 +52,302 @@ type ApplyIssueLabelOpsParams = {
   ensureBefore?: boolean;
   issueNumber?: number;
   skipIssueLock?: boolean;
+  writeClass?: LabelWriteClass;
+  bypassCoalescing?: boolean;
+  coalesceWindowMs?: number;
 };
+
+const DEFAULT_LABEL_WRITE_COALESCE_MS = 500;
+const COALESCER_MAX_IDLE_MS = 60_000;
+const ISSUE_WRITE_COOLDOWN_BASE_MS = 5_000;
+const ISSUE_WRITE_COOLDOWN_MAX_MS = 5 * 60_000;
+
+type CooldownState = {
+  untilMs: number;
+  failures: number;
+};
+
+type PendingLabelWrite = {
+  params: ApplyIssueLabelOpsParams;
+  ops: LabelOp[];
+  timer: ReturnType<typeof setTimeout> | null;
+  waiters: Array<{
+    resolve: (result: ApplyIssueLabelOpsResult) => void;
+    reject: (error: unknown) => void;
+  }>;
+  lastTouchedMs: number;
+};
+
+const pendingLabelWritesByIssue = new Map<string, PendingLabelWrite>();
+const issueLabelCooldownByKey = new Map<string, CooldownState>();
+
+function readLabelCoalesceWindowMs(override?: number): number {
+  if (typeof override === "number" && Number.isFinite(override)) {
+    return Math.max(0, Math.floor(override));
+  }
+  const raw = process.env.RALPH_GITHUB_LABEL_WRITE_COALESCE_MS;
+  if (raw === undefined) return DEFAULT_LABEL_WRITE_COALESCE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_LABEL_WRITE_COALESCE_MS;
+  return Math.max(0, Math.floor(parsed));
+}
+
+function classifyWriteClass(value: LabelWriteClass | undefined): LabelWriteClass {
+  return value ?? "important";
+}
+
+function isCommandLabel(label: string): boolean {
+  return label.trim().toLowerCase().startsWith("ralph:cmd:");
+}
+
+function canCoalesceLabelOps(params: ApplyIssueLabelOpsParams): boolean {
+  if (params.bypassCoalescing) return false;
+  if (classifyWriteClass(params.writeClass) !== "best-effort") return false;
+  if (!params.repo || typeof params.issueNumber !== "number") return false;
+  if (params.ops.some((op) => isCommandLabel(op.label))) return false;
+  return readLabelCoalesceWindowMs(params.coalesceWindowMs) > 0;
+}
+
+function buildIssueWriteKey(repo: string, issueNumber: number): string {
+  return `${repo}#${issueNumber}`;
+}
+
+function isLikelyTimeoutError(error: unknown): boolean {
+  const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  return /timed out|timeout|abort/i.test(message);
+}
+
+function isTransientFailureResult(result: ApplyIssueLabelOpsResult): boolean {
+  if (result.ok) return false;
+  if (result.kind === "transient") return true;
+  return isLikelyTimeoutError(result.error);
+}
+
+function nextIssueCooldownMs(previousFailures: number): number {
+  const exp = Math.max(0, Math.min(12, previousFailures));
+  return Math.min(ISSUE_WRITE_COOLDOWN_MAX_MS, ISSUE_WRITE_COOLDOWN_BASE_MS * 2 ** exp);
+}
+
+function emitWriteSuppressionTelemetry(params: {
+  repo: string;
+  issueNumber: number;
+  reason: string;
+  source: "coalesced" | "dropped-noop" | "suppressed-cooldown";
+  detail?: string;
+}): void {
+  const issueKey = `${params.repo}#${params.issueNumber}`;
+  if (!shouldLog(`label-write:${params.source}:${issueKey}`, 10_000)) return;
+  const message = `[ralph:github:labels] ${issueKey} ${params.source} reason=${params.reason}${
+    params.detail ? ` detail=${params.detail}` : ""
+  }`;
+  console.warn(message);
+  publishDashboardEvent(
+    {
+      type: "log.ralph",
+      level: "debug",
+      data: { message },
+    },
+    { repo: params.repo }
+  );
+}
+
+function cleanupStalePendingLabelWrites(nowMs: number): void {
+  for (const [key, entry] of pendingLabelWritesByIssue.entries()) {
+    if (entry.timer) continue;
+    if (entry.waiters.length > 0) continue;
+    if (nowMs - entry.lastTouchedMs < COALESCER_MAX_IDLE_MS) continue;
+    pendingLabelWritesByIssue.delete(key);
+  }
+}
+
+function mergeLabelOps(existing: LabelOp[], incoming: LabelOp[]): LabelOp[] {
+  const actionByLabel = new Map<string, "add" | "remove">();
+  const order: string[] = [];
+  const push = (op: LabelOp) => {
+    const label = normalizeLabel(op.label);
+    if (!label) return;
+    if (!actionByLabel.has(label)) order.push(label);
+    actionByLabel.set(label, op.action);
+  };
+  for (const op of existing) push(op);
+  for (const op of incoming) push(op);
+
+  const add: string[] = [];
+  const remove: string[] = [];
+  for (const label of order) {
+    const action = actionByLabel.get(label);
+    if (action === "add") add.push(label);
+    if (action === "remove") remove.push(label);
+  }
+  return planIssueLabelOps({ add, remove, allowNonRalph: true });
+}
+
+async function trimNoopLabelOpsAgainstLiveLabels(params: {
+  ops: LabelOp[];
+  io: LabelOpsIo;
+}): Promise<LabelOp[]> {
+  if (!params.io.listLabels) return params.ops;
+  let labels: string[];
+  try {
+    labels = (await params.io.listLabels()).map((label) => normalizeLabel(label)).filter((label): label is string => Boolean(label));
+  } catch {
+    return params.ops;
+  }
+  const set = new Set(labels);
+  const filtered: LabelOp[] = [];
+  for (const op of params.ops) {
+    if (op.action === "add") {
+      if (set.has(op.label)) continue;
+      set.add(op.label);
+      filtered.push(op);
+    } else {
+      if (!set.has(op.label)) continue;
+      set.delete(op.label);
+      filtered.push(op);
+    }
+  }
+  return filtered;
+}
+
+function getIssueCooldownState(issueKey: string): CooldownState | null {
+  const state = issueLabelCooldownByKey.get(issueKey);
+  if (!state) return null;
+  if (state.untilMs <= Date.now()) {
+    issueLabelCooldownByKey.delete(issueKey);
+    return null;
+  }
+  return state;
+}
+
+function recordIssueWriteSuccess(issueKey: string): void {
+  issueLabelCooldownByKey.delete(issueKey);
+}
+
+function recordIssueWriteFailure(issueKey: string): number {
+  const existing = issueLabelCooldownByKey.get(issueKey) ?? { untilMs: 0, failures: 0 };
+  const failures = existing.failures + 1;
+  const cooldownMs = nextIssueCooldownMs(failures - 1);
+  const untilMs = Date.now() + cooldownMs;
+  issueLabelCooldownByKey.set(issueKey, { untilMs, failures });
+  return untilMs;
+}
+
+async function enqueueCoalescedLabelWrite(params: ApplyIssueLabelOpsParams): Promise<ApplyIssueLabelOpsResult> {
+  const repo = params.repo!;
+  const issueNumber = params.issueNumber!;
+  const issueKey = buildIssueWriteKey(repo, issueNumber);
+  const windowMs = readLabelCoalesceWindowMs(params.coalesceWindowMs);
+  const nowMs = Date.now();
+  cleanupStalePendingLabelWrites(nowMs);
+
+  const blocked = getIssueCooldownState(issueKey);
+  if (blocked) {
+    emitWriteSuppressionTelemetry({
+      repo,
+      issueNumber,
+      reason: "cooldown-active",
+      source: "suppressed-cooldown",
+      detail: `until=${new Date(blocked.untilMs).toISOString()}`,
+    });
+    return {
+      ok: false,
+      add: [],
+      remove: [],
+      didRetry: false,
+      kind: "transient",
+      error: new Error(`Best-effort label writes cooling down until ${new Date(blocked.untilMs).toISOString()}`),
+    };
+  }
+
+  let entry = pendingLabelWritesByIssue.get(issueKey);
+  if (!entry) {
+    entry = {
+      params: { ...params },
+      ops: [],
+      timer: null,
+      waiters: [],
+      lastTouchedMs: nowMs,
+    };
+    pendingLabelWritesByIssue.set(issueKey, entry);
+  }
+
+  entry.params = { ...params };
+  entry.ops = mergeLabelOps(entry.ops, params.ops);
+  entry.lastTouchedMs = nowMs;
+
+  if (entry.timer) {
+    clearTimeout(entry.timer);
+    entry.timer = null;
+    emitWriteSuppressionTelemetry({
+      repo,
+      issueNumber,
+      reason: "merged-into-pending-window",
+      source: "coalesced",
+      detail: `ops=${entry.ops.length}`,
+    });
+  }
+
+  return await new Promise<ApplyIssueLabelOpsResult>((resolve, reject) => {
+    entry!.waiters.push({ resolve, reject });
+    entry!.timer = setTimeout(async () => {
+      const current = pendingLabelWritesByIssue.get(issueKey);
+      if (!current) return;
+      current.timer = null;
+      current.lastTouchedMs = Date.now();
+      const waiters = current.waiters.splice(0, current.waiters.length);
+      const ops = current.ops;
+      current.ops = [];
+
+      const flushParams: ApplyIssueLabelOpsParams = {
+        ...current.params,
+        ops,
+        bypassCoalescing: true,
+      };
+
+      try {
+        flushParams.ops = await trimNoopLabelOpsAgainstLiveLabels({ ops: flushParams.ops, io: flushParams.io });
+        if (flushParams.ops.length === 0) {
+          emitWriteSuppressionTelemetry({
+            repo,
+            issueNumber,
+            reason: "live-noop",
+            source: "dropped-noop",
+          });
+          const noop: ApplyIssueLabelOpsResult = { ok: true, add: [], remove: [], didRetry: false };
+          for (const waiter of waiters) waiter.resolve(noop);
+          return;
+        }
+
+        const result = await applyIssueLabelOpsNow(flushParams);
+        if (result.ok) {
+          recordIssueWriteSuccess(issueKey);
+        } else if (isTransientFailureResult(result)) {
+          const untilMs = recordIssueWriteFailure(issueKey);
+          emitWriteSuppressionTelemetry({
+            repo,
+            issueNumber,
+            reason: "transient-write-failure",
+            source: "suppressed-cooldown",
+            detail: `until=${new Date(untilMs).toISOString()}`,
+          });
+        }
+        for (const waiter of waiters) waiter.resolve(result);
+      } catch (error) {
+        const untilMs = recordIssueWriteFailure(issueKey);
+        emitWriteSuppressionTelemetry({
+          repo,
+          issueNumber,
+          reason: "flush-threw",
+          source: "suppressed-cooldown",
+          detail: `until=${new Date(untilMs).toISOString()}`,
+        });
+        for (const waiter of waiters) waiter.reject(error);
+      } finally {
+        current.lastTouchedMs = Date.now();
+      }
+    }, windowMs);
+  });
+}
 
 function isStatusLabel(label: string): boolean {
   return label.toLowerCase().startsWith(RALPH_STATUS_LABEL_PREFIX);
@@ -214,11 +519,32 @@ export async function executeIssueLabelOps(params: {
   ensureLabels?: () => Promise<EnsureOutcome>;
   retryMissingLabelOnce?: boolean;
   ensureBefore?: boolean;
+  writeClass?: LabelWriteClass;
+  coalesceWindowMs?: number;
 }): Promise<ApplyIssueLabelOpsResult> {
-  return await withIssueLabelLock({
-    repo: params.repo,
-    issueNumber: params.issueNumber,
-    run: async () => {
+  const add = params.ops.filter((op) => op.action === "add").map((op) => op.label);
+  const remove = params.ops.filter((op) => op.action === "remove").map((op) => op.label);
+  if (add.length === 0 && remove.length === 0) {
+    console.log(
+      `[ralph:telemetry:${params.repo}] github.write.dropped ${JSON.stringify({
+        kind: "labels",
+        repo: params.repo,
+        issueNumber: params.issueNumber,
+        reason: "noop",
+        source: params.logLabel ?? null,
+      })}`
+    );
+    return { ok: true, add: [], remove: [], didRetry: false };
+  }
+
+  const containsCmdLabel = params.ops.some((op) => op.label.toLowerCase().startsWith("ralph:cmd:"));
+  const critical = add.includes(RALPH_LABEL_STATUS_IN_BOT) || add.includes(RALPH_LABEL_STATUS_DONE);
+
+  const run = async () =>
+    await withIssueLabelLock({
+      repo: params.repo,
+      issueNumber: params.issueNumber,
+      run: async () => {
       const result = await applyIssueLabelOps({
         ops: params.ops,
         io: {
@@ -256,6 +582,8 @@ export async function executeIssueLabelOps(params: {
         ensureLabels: params.ensureLabels,
         retryMissingLabelOnce: params.retryMissingLabelOnce,
         ensureBefore: params.ensureBefore,
+        writeClass: params.writeClass,
+        coalesceWindowMs: params.coalesceWindowMs,
         skipIssueLock: true,
       });
 
@@ -294,15 +622,36 @@ export async function executeIssueLabelOps(params: {
 
       return result;
     },
+    });
+
+  if (containsCmdLabel) {
+    return await run();
+  }
+
+  return await coalesceIssueLabelWrite({
+    repo: params.repo,
+    issueNumber: params.issueNumber,
+    add,
+    remove,
+    source: params.logLabel,
+    critical,
+    run,
   });
 }
 
 export async function applyIssueLabelOps(params: ApplyIssueLabelOpsParams): Promise<ApplyIssueLabelOpsResult> {
+  if (canCoalesceLabelOps(params)) {
+    return await enqueueCoalescedLabelWrite(params);
+  }
+  return await applyIssueLabelOpsNow(params);
+}
+
+async function applyIssueLabelOpsNow(params: ApplyIssueLabelOpsParams): Promise<ApplyIssueLabelOpsResult> {
   if (!params.skipIssueLock && params.repo && typeof params.issueNumber === "number") {
     return await withIssueLabelLock({
       repo: params.repo,
       issueNumber: params.issueNumber,
-      run: async () => await applyIssueLabelOps({ ...params, skipIssueLock: true }),
+      run: async () => await applyIssueLabelOpsNow({ ...params, skipIssueLock: true }),
     });
   }
 
