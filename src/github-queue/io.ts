@@ -448,6 +448,7 @@ function buildLabelOpsIo(io: GitHubQueueIO, repo: string, issueNumber: number) {
     addLabel: async (label: string) => await io.addIssueLabel(repo, issueNumber, label),
     addLabels: async (labels: string[]) => await io.addIssueLabels(repo, issueNumber, labels),
     removeLabel: async (label: string) => await io.removeIssueLabel(repo, issueNumber, label),
+    listLabels: async () => await io.listIssueLabels(repo, issueNumber),
   };
 }
 
@@ -571,6 +572,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
                 issueNumber: issue.number,
                 ensureLabels: async () => await io.ensureWorkflowLabels(repo),
                 retryMissingLabelOnce: true,
+                writeClass: "best-effort",
               });
 
               if (labelOps.ok) {
@@ -626,6 +628,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               issueNumber: issue.number,
               ensureLabels: async () => await io.ensureWorkflowLabels(repo),
               retryMissingLabelOnce: true,
+              writeClass: "best-effort",
             });
 
             if (labelOps.ok) {
@@ -757,6 +760,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
               issueNumber: issue.number,
               ensureLabels: async () => await io.ensureWorkflowLabels(repo),
               retryMissingLabelOnce: true,
+              writeClass: "best-effort",
             });
 
             if (labelOps.ok) {
@@ -1121,6 +1125,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             issueNumber: issueRef.number,
             ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
             retryMissingLabelOnce: true,
+            writeClass: "best-effort",
           });
           if (!labelOps.ok && labelOps.kind !== "transient") {
             return { claimed: false, task: opts.task, reason: "Failed to update claim labels" };
@@ -1428,6 +1433,7 @@ export function createGitHubQueueDriver(deps?: GitHubQueueDeps) {
             issueNumber: issueRef.number,
             ensureLabels: async () => await io.ensureWorkflowLabels(issueRef.repo),
             retryMissingLabelOnce: true,
+            writeClass: "best-effort",
           });
           if (labelOps.ok) {
             applyLabelDelta({ repo: issueRef.repo, issueNumber: issueRef.number, add: labelOps.add, remove: labelOps.remove, nowIso });
