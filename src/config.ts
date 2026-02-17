@@ -10,6 +10,7 @@ import {
   getRalphSandboxManifestsDir,
 } from "./paths";
 import { resolveRequestedOpencodeProfile, type RequestedOpencodeProfile } from "./opencode-profile-utils";
+import type { OpencodeTransportMode } from "./opencode/transport-types";
 
 export type { WatchdogConfig, WatchdogThresholdMs, WatchdogThresholdsMs } from "./watchdog";
 import type { WatchdogConfig } from "./watchdog";
@@ -86,6 +87,12 @@ export interface RepoConfig {
   verification?: RepoVerificationConfig;
   /** Optional per-repo edit-churn loop detection configuration. */
   loopDetection?: LoopDetectionConfigInput;
+  /** Internal: preflightCommand was declared but invalid in raw config. */
+  __preflightCommandParseError?: boolean;
+  /** Internal: verification.preflight key existed in raw config. */
+  __legacyPreflightDeclared?: boolean;
+  /** Internal: verification.preflight was declared but invalid in raw config. */
+  __legacyPreflightParseError?: boolean;
 }
 
 export type LoopDetectionConfigInput = {
@@ -173,6 +180,8 @@ export interface OpencodeProfileConfig {
 export interface OpencodeConfig {
   /** Enable named OpenCode XDG profiles (default: true if section present). */
   enabled?: boolean;
+  /** Session transport mode (default: "cli"). */
+  transport?: OpencodeTransportMode;
   /** Default profile name for new tasks when control override missing. */
   defaultProfile?: string;
   /** Named profiles keyed by their identifier (e.g. "apple", "google"). */
@@ -1058,6 +1067,13 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     }
 
     const rawVerification = (repo as any).verification;
+    if (rawVerification && typeof rawVerification === "object" && !Array.isArray(rawVerification) && "preflight" in rawVerification) {
+      updates.__legacyPreflightDeclared = true;
+      const parsedLegacy = toStringArrayOrNull((rawVerification as any).preflight);
+      if (parsedLegacy === null) {
+        updates.__legacyPreflightParseError = true;
+      }
+    }
     if (rawVerification !== undefined) {
       const parsed = toRepoVerificationConfigOrNull(rawVerification, `repos[${repo.name}].verification`);
       if (parsed) {
@@ -1075,6 +1091,7 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
           `[ralph] Invalid config preflightCommand for repo ${repo.name}: ${JSON.stringify(rawPreflight)}; expected string or string[].`
         );
         updates.preflightCommand = undefined;
+        updates.__preflightCommandParseError = true;
       } else {
         updates.preflightCommand = parsed;
       }
@@ -1529,6 +1546,19 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
       }
     }
 
+    const rawTransport = (rawOpencode as any).transport;
+    let transport: OpencodeTransportMode | undefined;
+    if (rawTransport !== undefined) {
+      const trimmed = typeof rawTransport === "string" ? rawTransport.trim() : "";
+      if (trimmed === "cli" || trimmed === "sdk" || trimmed === "sdk-preferred") {
+        transport = trimmed;
+      } else {
+        console.warn(
+          `[ralph] Invalid config opencode.transport=${JSON.stringify(rawTransport)}; expected "cli" | "sdk" | "sdk-preferred". Ignoring.`
+        );
+      }
+    }
+
     const rawProfiles = (rawOpencode as any).profiles;
     const profiles: Record<string, OpencodeProfileConfig> = {};
 
@@ -1586,32 +1616,35 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
     const rawDefaultProfile = (rawOpencode as any).defaultProfile;
     const defaultProfile = typeof rawDefaultProfile === "string" ? rawDefaultProfile.trim() : "";
 
-    const attachManaged = (opencode: OpencodeConfig): OpencodeConfig =>
-      managedConfigDir ? { ...opencode, managedConfigDir } : opencode;
+    const attachConfigFields = (opencode: OpencodeConfig): OpencodeConfig => ({
+      ...opencode,
+      ...(transport ? { transport } : {}),
+      ...(managedConfigDir ? { managedConfigDir } : {}),
+    });
 
     if (enabled && profileNames.length === 0) {
       console.warn("[ralph] OpenCode profiles enabled but no valid profiles were configured; falling back to ambient XDG dirs");
-      loaded.opencode = attachManaged({ enabled: false });
+      loaded.opencode = attachConfigFields({ enabled: false });
     } else if (!enabled) {
-      loaded.opencode = attachManaged({ enabled: false });
+      loaded.opencode = attachConfigFields({ enabled: false });
     } else if (defaultProfile === "auto") {
-      loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
+      loaded.opencode = attachConfigFields({ enabled: true, defaultProfile, profiles });
     } else if (defaultProfile && profiles[defaultProfile]) {
-      loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
+      loaded.opencode = attachConfigFields({ enabled: true, defaultProfile, profiles });
     } else if (defaultProfile) {
       // Keep the invalid value so downstream profile resolution can fail closed.
       // (Avoid silently selecting a different profile when the user explicitly configured one.)
       console.warn(
         `[ralph] Invalid config opencode.defaultProfile=${JSON.stringify(defaultProfile)}; keeping value (will fail closed if unresolvable)`
       );
-      loaded.opencode = attachManaged({ enabled: true, defaultProfile, profiles });
+      loaded.opencode = attachConfigFields({ enabled: true, defaultProfile, profiles });
     } else {
       // No default specified; pick a stable fallback so callers have a deterministic default.
       const fallback = profileNames[0] ?? "";
       if (fallback) {
-        loaded.opencode = attachManaged({ enabled: true, defaultProfile: fallback, profiles });
+        loaded.opencode = attachConfigFields({ enabled: true, defaultProfile: fallback, profiles });
       } else {
-        loaded.opencode = attachManaged({ enabled: false });
+        loaded.opencode = attachConfigFields({ enabled: false });
       }
     }
   }
@@ -2133,38 +2166,145 @@ export type RepoPreflightCommands = {
   configured: boolean;
 };
 
-export function getRepoPreflightCommands(repoName: string): RepoPreflightCommands {
+export type RepoPreflightPolicyResolution =
+  | {
+      kind: "run";
+      commands: string[];
+      source: "preflightCommand" | "verification.preflight";
+      configured: true;
+    }
+  | {
+      kind: "disabled";
+      commands: [];
+      source: "preflightCommand";
+      configured: true;
+    }
+  | {
+      kind: "missing";
+      commands: [];
+      source: "none";
+      configured: false;
+      reason: string;
+    }
+  | {
+      kind: "misconfigured";
+      commands: [];
+      source: "preflightCommand" | "verification.preflight";
+      configured: true;
+      reason: string;
+    };
+
+export function resolveRepoPreflightPolicy(repoName: string): RepoPreflightPolicyResolution {
   const cfg = getConfig();
   const repo = cfg.repos.find((r) => r.name === repoName);
-  if (!repo) return { commands: [], source: "none", configured: false };
-
-  const rawPreflight = (repo as any).preflightCommand;
-  if (rawPreflight !== undefined) {
-    const parsed = Array.isArray(rawPreflight)
-      ? toStringArrayOrNull(rawPreflight)
-      : typeof rawPreflight === "string"
-        ? toStringOrStringArrayOrNull(rawPreflight)
-        : null;
-
-    if (parsed !== null) {
-      return { commands: parsed, source: "preflightCommand", configured: true };
-    }
-    console.warn(
-      `[ralph] Invalid config preflightCommand for repo ${repoName}: ${JSON.stringify(rawPreflight)}; expected string or string[].`
-    );
+  if (!repo) {
+    return {
+      kind: "missing",
+      commands: [],
+      source: "none",
+      configured: false,
+      reason: `repo ${repoName} is not configured in Ralph config`,
+    };
   }
 
-  const legacy = (repo as any).verification?.preflight;
-  if (legacy !== undefined) {
+  if ((repo as any).preflightCommand !== undefined || (repo as any).__preflightCommandParseError === true) {
+    if ((repo as any).__preflightCommandParseError === true) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "preflightCommand",
+        configured: true,
+        reason: "invalid repos[].preflightCommand (expected string or string[] of non-empty commands)",
+      };
+    }
+
+    const parsed = toStringArrayOrNull((repo as any).preflightCommand);
+    if (parsed === null) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "preflightCommand",
+        configured: true,
+        reason: "invalid repos[].preflightCommand (expected string or string[] of non-empty commands)",
+      };
+    }
+
+    if (parsed.length === 0) {
+      return {
+        kind: "disabled",
+        commands: [],
+        source: "preflightCommand",
+        configured: true,
+      };
+    }
+
+    return {
+      kind: "run",
+      commands: parsed,
+      source: "preflightCommand",
+      configured: true,
+    };
+  }
+
+  if ((repo as any).__legacyPreflightDeclared === true) {
+    if ((repo as any).__legacyPreflightParseError === true) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "verification.preflight",
+        configured: true,
+        reason: "invalid repos[].verification.preflight (expected string[] of non-empty commands)",
+      };
+    }
+
+    const legacy = (repo as any).verification?.preflight;
     const parsed = toStringArrayOrNull(legacy);
-    if (parsed !== null) {
-      return { commands: parsed, source: "verification.preflight", configured: true };
+    if (parsed === null) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "verification.preflight",
+        configured: true,
+        reason: "invalid repos[].verification.preflight (expected string[] of non-empty commands)",
+      };
     }
-    console.warn(
-      `[ralph] Invalid config repos[${repoName}].verification.preflight=${JSON.stringify(legacy)}; expected string[].`
-    );
+
+    if (parsed.length === 0) {
+      return {
+        kind: "misconfigured",
+        commands: [],
+        source: "verification.preflight",
+        configured: true,
+        reason: "repos[].verification.preflight is empty; configure repos[].preflightCommand or explicitly disable with repos[].preflightCommand=[]",
+      };
+    }
+
+    return {
+      kind: "run",
+      commands: parsed,
+      source: "verification.preflight",
+      configured: true,
+    };
   }
 
+  return {
+    kind: "missing",
+    commands: [],
+    source: "none",
+    configured: false,
+    reason: "no repo preflight command configured",
+  };
+}
+
+export function getRepoPreflightCommands(repoName: string): RepoPreflightCommands {
+  const resolved = resolveRepoPreflightPolicy(repoName);
+  if (resolved.kind === "run" || resolved.kind === "disabled") {
+    return {
+      commands: resolved.commands,
+      source: resolved.source,
+      configured: true,
+    };
+  }
   return { commands: [], source: "none", configured: false };
 }
 
@@ -2396,6 +2536,21 @@ export function getOpencodeDefaultProfileName(): string | null {
   const raw = cfg.opencode?.defaultProfile;
   const trimmed = typeof raw === "string" ? raw.trim() : "";
   return trimmed ? trimmed : null;
+}
+
+export function getOpencodeTransportMode(): OpencodeTransportMode {
+  const env = process.env.RALPH_OPENCODE_TRANSPORT?.trim();
+  if (env === "cli" || env === "sdk" || env === "sdk-preferred") {
+    return env;
+  }
+
+  const cfg = getConfig();
+  const mode = cfg.opencode?.transport;
+  if (mode === "cli" || mode === "sdk" || mode === "sdk-preferred") {
+    return mode;
+  }
+
+  return "cli";
 }
 
 export function getRequestedOpencodeProfileName(_controlProfileRaw?: string | null): RequestedOpencodeProfile {

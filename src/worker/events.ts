@@ -7,13 +7,27 @@ import { buildDashboardContext, resolveDashboardContext } from "./dashboard-cont
 
 export type WorkerDashboardEventInput = Omit<RalphEvent, "ts"> & { ts?: string };
 
+type CheckpointDeduperOptions = {
+  limit?: number;
+  claimKey?: (key: string) => boolean;
+};
+
 export class CheckpointEventDeduper {
   #seen = new Set<string>();
   #order: string[] = [];
   #limit: number;
+  #claimKey: ((key: string) => boolean) | null;
 
-  constructor(limit = 5000) {
-    this.#limit = Math.max(0, Math.floor(limit));
+  constructor(opts?: number | CheckpointDeduperOptions) {
+    const normalized: CheckpointDeduperOptions =
+      typeof opts === "number"
+        ? { limit: opts }
+        : {
+            limit: opts?.limit,
+            claimKey: opts?.claimKey,
+          };
+    this.#limit = Math.max(0, Math.floor(normalized.limit ?? 5000));
+    this.#claimKey = typeof normalized.claimKey === "function" ? normalized.claimKey : null;
   }
 
   hasEmitted(key: string): boolean {
@@ -22,7 +36,25 @@ export class CheckpointEventDeduper {
 
   emit(event: RalphEvent, key: string): void {
     if (this.#seen.has(key)) return;
+
+    if (this.#claimKey) {
+      let claimed = true;
+      try {
+        claimed = this.#claimKey(key);
+      } catch {
+        claimed = true;
+      }
+      if (!claimed) {
+        this.#remember(key);
+        return;
+      }
+    }
+
     ralphEventBus.publish(event);
+    this.#remember(key);
+  }
+
+  #remember(key: string): void {
     if (this.#limit === 0) return;
     this.#seen.add(key);
     this.#order.push(key);
