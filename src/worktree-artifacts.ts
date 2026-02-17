@@ -16,6 +16,10 @@ const DEFAULT_PLAN_TEMPLATE = [
   "",
 ].join("\n");
 
+export function isDefaultRalphPlanTemplate(text: string): boolean {
+  return String(text ?? "").trim() === DEFAULT_PLAN_TEMPLATE.trim();
+}
+
 function getRalphPlanPath(worktreePath: string): string {
   return join(worktreePath, RALPH_ARTIFACT_DIR, PLAN_FILENAME);
 }

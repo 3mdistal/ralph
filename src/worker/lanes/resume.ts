@@ -13,6 +13,7 @@ import type { AgentRun } from "../repo-worker";
 import { derivePrCreateEscalationReason } from "../pr-create-escalation-reason";
 import { classifyPrCreateFailurePolicy, computePrCreateRetryBackoffMs } from "../pr-create-policy";
 import type { PrEvidenceCauseCode } from "../../gates/pr-evidence-gate";
+import { resolvePlanReviewInput, runPlanReviewGate } from "../../gates/plan-review";
 
 type ResumeTaskOptions = { resumeMessage?: string; repoSlot?: number | null };
 
@@ -186,6 +187,150 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
         );
 
         this.logWorker(`Resuming task: ${task.name}`, { sessionId: existingSessionId, workerId: eventWorkerId });
+
+        const runId = this.activeRunId;
+        let planReview: Awaited<ReturnType<typeof runPlanReviewGate>> | null = null;
+        if (!runId) {
+          console.warn(`[ralph:worker:${this.repo}] Missing active run context; skipping plan-review gate on resume`);
+        } else {
+          let issueContext = "";
+          try {
+            issueContext = await this.buildIssueContextForAgent({ repo: this.repo, issueNumber: issueNumber || cacheKey });
+          } catch (error: any) {
+            issueContext = `Issue context unavailable: ${error?.message ?? String(error)}`;
+          }
+
+          const planInput = await resolvePlanReviewInput({
+            worktreePath: taskRepoPath,
+            plannerOutput: "",
+          });
+          let planReviewSessionId: string | undefined;
+          planReview = await runPlanReviewGate({
+            runId,
+            repo: this.repo,
+            issueRef: task.issue,
+            planInput,
+            issueContext,
+            runAgent: async (prompt: string) => {
+              const runLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume plan review", "in-progress");
+              const result = await this.session.runAgent(taskRepoPath, "product", prompt, {
+                repo: this.repo,
+                cacheKey: `${cacheKey}-resume-plan-review`,
+                runLogPath,
+                introspection: {
+                  repo: this.repo,
+                  issue: task.issue,
+                  taskName: task.name,
+                  step: 2,
+                  stepTitle: "resume plan review",
+                },
+                ...this.buildWatchdogOptions(task, "resume plan review"),
+                ...this.buildStallOptions(task, "resume plan review"),
+                ...this.buildLoopDetectionOptions(task, "resume plan review"),
+                ...opencodeSessionOptions,
+              });
+              planReviewSessionId = result.sessionId;
+              return result;
+            },
+            runRepairAgent: async (prompt: string) => {
+              const runLogPath = await this.recordRunLogPath(
+                task,
+                issueNumber || cacheKey,
+                "resume plan review repair",
+                "in-progress"
+              );
+              if (!planReviewSessionId) {
+                const result = await this.session.runAgent(taskRepoPath, "product", prompt, {
+                  repo: this.repo,
+                  cacheKey: `${cacheKey}-resume-plan-review-repair`,
+                  runLogPath,
+                  introspection: {
+                    repo: this.repo,
+                    issue: task.issue,
+                    taskName: task.name,
+                    step: 2,
+                    stepTitle: "resume plan review repair",
+                  },
+                  ...this.buildWatchdogOptions(task, "resume plan review repair"),
+                  ...this.buildStallOptions(task, "resume plan review repair"),
+                  ...this.buildLoopDetectionOptions(task, "resume plan review repair"),
+                  ...opencodeSessionOptions,
+                });
+                planReviewSessionId = result.sessionId;
+                return result;
+              }
+
+              const result = await this.session.continueSession(taskRepoPath, planReviewSessionId, prompt, {
+                agent: "product",
+                repo: this.repo,
+                cacheKey: `${cacheKey}-resume-plan-review-repair`,
+                runLogPath,
+                introspection: {
+                  repo: this.repo,
+                  issue: task.issue,
+                  taskName: task.name,
+                  step: 2,
+                  stepTitle: "resume plan review repair",
+                },
+                ...this.buildWatchdogOptions(task, "resume plan review repair"),
+                ...this.buildStallOptions(task, "resume plan review repair"),
+                ...this.buildLoopDetectionOptions(task, "resume plan review repair"),
+                ...opencodeSessionOptions,
+              });
+              planReviewSessionId = result.sessionId ?? planReviewSessionId;
+              return result;
+            },
+          });
+        }
+
+        if (planReview && planReview.status !== "pass") {
+          const reason = planReview.reason || "Plan-stage product review failed";
+          const escalationType = planReview.hasProductGap ? "product-gap" : "other";
+          console.log(`[ralph:worker:${this.repo}] Escalating on resume: ${reason}`);
+
+          const wasEscalated = task.status === "escalated";
+          const escalated = await this.queue.updateTaskStatus(task, "escalated");
+          if (escalated) {
+            applyTaskPatch(task, "escalated", {});
+          }
+          await this.writeEscalationWriteback(task, {
+            reason,
+            details: planReview.output,
+            escalationType,
+          });
+          await this.notify.notifyEscalation({
+            taskName: task.name,
+            taskFileName: task._name,
+            taskPath: task._path,
+            issue: task.issue,
+            repo: this.repo,
+            sessionId: planReview.sessionId || existingSessionId,
+            reason,
+            escalationType,
+            planOutput: planReview.output,
+            routing: {
+              decision: "escalate",
+              confidence: "high",
+              escalation_reason: reason,
+            },
+          });
+
+          if (escalated && !wasEscalated) {
+            await this.recordEscalatedRunNote(task, {
+              reason,
+              sessionId: planReview.sessionId || existingSessionId,
+              details: planReview.output,
+            });
+          }
+
+          return {
+            taskName: task.name,
+            repo: this.repo,
+            outcome: "escalated",
+            sessionId: planReview.sessionId || existingSessionId,
+            escalationReason: reason,
+          };
+        }
 
         const resumeRunLogPath = await this.recordRunLogPath(task, issueNumber || cacheKey, "resume", "in-progress");
 
