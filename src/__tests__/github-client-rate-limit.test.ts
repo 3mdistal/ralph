@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import { __resetGitHubClientForTests, GitHubApiError, GitHubClient } from "../github/client";
+import { __resetGitHubGovernorForTests, __setGitHubGovernorCooldownForTests } from "../github/budget-governor";
 
 async function withPatchedNow<T>(nowMs: number, fn: () => Promise<T> | T): Promise<T> {
   const original = Date.now;
@@ -18,10 +19,42 @@ describe("GitHubClient rate limit handling", () => {
   beforeEach(() => {
     priorFetch = globalThis.fetch;
     __resetGitHubClientForTests();
+    __resetGitHubGovernorForTests();
   });
 
   afterEach(() => {
     if (priorFetch) globalThis.fetch = priorFetch;
+    delete process.env.RALPH_GITHUB_BUDGET_GOVERNOR;
+    delete process.env.RALPH_GITHUB_BUDGET_GOVERNOR_DRY_RUN;
+  });
+
+  test("requestWithLane defers best-effort during cooldown without fetch", async () => {
+    process.env.RALPH_GITHUB_BUDGET_GOVERNOR = "1";
+    let fetchCalls = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (globalThis as any).fetch = async () => {
+      fetchCalls += 1;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    };
+
+    const nowMs = 5_000_000;
+    await withPatchedNow(nowMs, async () => {
+      __setGitHubGovernorCooldownForTests("3mdistal/ralph", nowMs + 45_000);
+      const client = new GitHubClient("3mdistal/ralph", {
+        getToken: async () => "token",
+      });
+
+      const result = await client.requestWithLane("/deferred", {
+        method: "GET",
+        lane: "best_effort",
+        source: "blocked-comment:find",
+      });
+      expect(result.ok).toBeFalse();
+      if (!result.ok) {
+        expect("deferred" in result).toBeTrue();
+      }
+      expect(fetchCalls).toBe(0);
+    });
   });
 
   test("classifies 403 API rate limit exceeded as rate_limit and backs off until reset", async () => {

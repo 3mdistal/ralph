@@ -91,7 +91,10 @@ export async function findCmdComment(params: {
 
   const response = await params.github.request<
     Array<{ id?: number | null; body?: string | null; updated_at?: string | null }>
-  >(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments?per_page=${limit}&sort=created&direction=desc`);
+  >(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments?per_page=${limit}&sort=created&direction=desc`, {
+    lane: "critical",
+    source: "cmd-comment:find",
+  });
   const comments = response.data ?? [];
 
   for (const comment of comments) {
@@ -123,6 +126,8 @@ export async function createCmdComment(params: {
   await params.github.request(`/repos/${owner}/${name}/issues/${params.issueNumber}/comments`, {
     method: "POST",
     body: { body: params.body },
+    lane: "critical",
+    source: "cmd-comment:create",
   });
 }
 
@@ -136,5 +141,7 @@ export async function updateCmdComment(params: {
   await params.github.request(`/repos/${owner}/${name}/issues/comments/${params.commentId}`, {
     method: "PATCH",
     body: { body: params.body },
+    lane: "critical",
+    source: "cmd-comment:update",
   });
 }

@@ -18,7 +18,7 @@ export async function updatePullRequestBranch(params: {
   formatGhError: (error: unknown) => string;
   updateViaWorktree: (prUrl: string) => Promise<void>;
 }): Promise<void> {
-  const ghWrite = createGhRunner({ repo: params.repo, mode: "write" });
+  const ghWrite = createGhRunner({ repo: params.repo, mode: "write", lane: "critical", source: "merge:update-branch" });
 
   try {
     await ghWrite`gh pr update-branch ${params.prUrl} --repo ${params.repo}`.cwd(params.cwd).quiet();

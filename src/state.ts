@@ -2236,6 +2236,46 @@ export function closeStateDbForTests(): void {
   dbPath = null;
 }
 
+const RUNTIME_SNAPSHOT_KEY_PREFIX = "runtime_snapshot:";
+
+function normalizeRuntimeSnapshotKey(key: string): string {
+  const trimmed = String(key ?? "").trim();
+  if (!trimmed) throw new Error("Runtime snapshot key must be non-empty");
+  if (!/^[a-zA-Z0-9._:-]{1,120}$/.test(trimmed)) {
+    throw new Error(`Invalid runtime snapshot key: ${trimmed}`);
+  }
+  return `${RUNTIME_SNAPSHOT_KEY_PREFIX}${trimmed}`;
+}
+
+export function setRuntimeSnapshot(key: string, value: unknown | null): void {
+  const database = requireDb();
+  const metaKey = normalizeRuntimeSnapshotKey(key);
+  if (value === null) {
+    database.query("DELETE FROM meta WHERE key = $key").run({ $key: metaKey });
+    return;
+  }
+  database
+    .query(
+      `INSERT INTO meta(key, value) VALUES ($key, $value)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`
+    )
+    .run({ $key: metaKey, $value: JSON.stringify(value) });
+}
+
+export function getRuntimeSnapshot<T = unknown>(key: string): T | null {
+  const database = requireDb();
+  const metaKey = normalizeRuntimeSnapshotKey(key);
+  const row = database.query("SELECT value FROM meta WHERE key = $key").get({
+    $key: metaKey,
+  }) as { value?: string | null } | undefined;
+  if (!row?.value) return null;
+  try {
+    return JSON.parse(row.value) as T;
+  } catch {
+    return null;
+  }
+}
+
 function parseIssueNumber(issueRef: string): number | null {
   const match = issueRef.match(/#(\d+)$/);
   if (!match) return null;

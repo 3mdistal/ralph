@@ -23,6 +23,7 @@ import {
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
 import { parseIssueRef } from "../github/issue-ref";
+import { getGitHubBudgetGovernorStatusForCli } from "../github/client";
 import { formatDuration } from "../logging";
 import { isHeartbeatStale, parseHeartbeatMs } from "../ownership";
 import { auditQueueParityForRepo } from "../github/queue-parity-audit";
@@ -361,6 +362,7 @@ export async function getStatusSnapshot(): Promise<StatusSnapshot> {
     escalations: {
       pending: base.pendingEscalationsCount,
     },
+    githubGovernor: getGitHubBudgetGovernorStatusForCli(),
     inProgress: inProgressWithStatus,
     starting: base.starting.map((t) => ({
       name: t.name,
@@ -505,6 +507,7 @@ function buildDegradedStatusSnapshot(reason: ReturnType<typeof probeDurableState
     activeProfile: null,
     throttle: {},
     escalations: { pending: 0 },
+    githubGovernor: getGitHubBudgetGovernorStatusForCli(),
     inProgress: [],
     starting: [],
     queued: [],
@@ -703,6 +706,7 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
       escalations: {
         pending: base.pendingEscalationsCount,
       },
+      githubGovernor: getGitHubBudgetGovernorStatusForCli(),
       inProgress: inProgressWithStatus,
       starting: base.starting.map((t) => ({
         name: t.name,

@@ -4,6 +4,15 @@ import { resolveGitHubToken } from "../github-auth";
 import { invalidateInstallationTokenCache } from "../github-app-auth";
 import { publishDashboardEvent } from "../dashboard/publisher";
 import { Semaphore, type ReleaseFn } from "../semaphore";
+import {
+  decideGitHubBudget,
+  getGitHubGovernorSummaryForStatus,
+  isGitHubBudgetGovernorEnabled,
+  isGitHubBudgetGovernorDryRun,
+  observeGitHubHeaders,
+  observeGitHubRateLimit,
+  type GitHubLane,
+} from "./budget-governor";
 import { SandboxTripwireError, assertSandboxWriteAllowed } from "./sandbox-tripwire";
 
 export type GitHubErrorCode = "rate_limit" | "not_found" | "conflict" | "auth" | "unknown";
@@ -33,6 +42,20 @@ export class GitHubApiError extends Error {
   }
 }
 
+export class GitHubDeferredError extends Error {
+  readonly lane: GitHubLane;
+  readonly untilTs: number;
+  readonly reason: "cooldown" | "lane_budget" | "pressure";
+
+  constructor(params: { lane: GitHubLane; untilTs: number; reason: "cooldown" | "lane_budget" | "pressure"; message: string }) {
+    super(params.message);
+    this.name = "GitHubDeferredError";
+    this.lane = params.lane;
+    this.untilTs = params.untilTs;
+    this.reason = params.reason;
+  }
+}
+
 export type GitHubResponse<T> = {
   data: T | null;
   etag: string | null;
@@ -50,7 +73,22 @@ type RequestOptions = {
   etag?: string;
   /** Optional caller tag for github.request telemetry (e.g. "label-reconciler"). */
   source?: string;
+  /** Internal budget lane hint. */
+  lane?: GitHubLane;
+  /** Allow typed deferral instead of immediate request execution. */
+  allowDeferral?: boolean;
 };
+
+export type GitHubDeferredResult = {
+  lane: GitHubLane;
+  untilTs: number;
+  reason: "cooldown" | "lane_budget" | "pressure";
+};
+
+export type GitHubRequestWithLaneResult<T> =
+  | { ok: true; response: GitHubResponse<T> }
+  | { ok: false; deferred: GitHubDeferredResult }
+  | { ok: false; error: GitHubApiError | Error };
 
 type ClientOptions = {
   /** Explicit token override; bypasses refresh (use for non-expiring tokens only). */
@@ -205,6 +243,18 @@ function sanitizeGitHubPath(path: string): string {
     const trimmed = raw.startsWith("/") ? raw : `/${raw}`;
     return trimmed.split("?")[0].split("#")[0] || "/";
   }
+}
+
+function defaultLaneForRequest(params: { lane?: GitHubLane; source?: string; method: string }): GitHubLane {
+  if (params.lane) return params.lane;
+  const source = (params.source ?? "").toLowerCase();
+  if (source.includes("blocked-comment") || source.includes("parity") || source.includes("audit") || source.includes("sweep")) {
+    return "best_effort";
+  }
+  if (source.includes("merge") || source.includes("required-check") || source.includes("cmd")) {
+    return "critical";
+  }
+  return params.method === "GET" || params.method === "HEAD" ? "important" : "important";
 }
 
 function isIssueLabelsCollectionPath(path: string): boolean {
@@ -403,6 +453,7 @@ export class GitHubClient {
   private async requestInternal<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T> & { headers: Headers }> {
     const url = `https://api.github.com${path.startsWith("/") ? "" : "/"}${path}`;
     const method = (opts.method ?? "GET").toUpperCase();
+    const lane = defaultLaneForRequest({ lane: opts.lane, source: opts.source, method });
     const sanitizedPath = sanitizeGitHubPath(path);
     const graphqlOperation = isGraphqlPath(path) ? getGraphqlOperation(opts.body) : null;
     const profile = getProfile();
@@ -439,12 +490,42 @@ export class GitHubClient {
       throw new Error(`Refusing to replace issue labels via PUT ${path}`);
     }
     const isWrite = method !== "GET" && method !== "HEAD";
+
+    if (opts.allowDeferral) {
+      const scopeKey = this.installationId ? `installation:${this.installationId}` : `repo:${this.repo}`;
+      const decision = decideGitHubBudget({ repo: this.repo, scopeKey, lane, isWrite, nowMs: Date.now() });
+      if (decision.kind === "defer") {
+        this.emitRequestTelemetry({
+          method,
+          path: sanitizedPath,
+          status: 0,
+          ok: false,
+          write: isWrite,
+          durationMs: 0,
+          attempt: 0,
+          source: typeof opts.source === "string" ? opts.source : undefined,
+          errorCode: "deferred",
+        });
+        if (!isGitHubBudgetGovernorDryRun()) {
+          throw new GitHubDeferredError({
+            lane,
+            untilTs: decision.untilTs,
+            reason: decision.reason,
+            message: `GitHub request deferred by budget governor (${decision.reason}) until ${new Date(decision.untilTs).toISOString()}`,
+          });
+        }
+      }
+    }
+
     const semaphores = GitHubClient.resolveSemaphores();
 
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const token = this.tokenOverride ?? (await this.getToken());
       const tokenKey = token ? fnv1a32(token) : null;
-      const backoffInfo = await this.waitForBackoffWithInfo(tokenKey);
+      const backoffInfo =
+        lane === "critical" && isGitHubBudgetGovernorEnabled()
+          ? { waitedMs: 0, resumeAtTs: null }
+          : await this.waitForBackoffWithInfo(tokenKey);
       const startedAt = Date.now();
 
       const init: RequestInit = {
@@ -519,6 +600,13 @@ export class GitHubClient {
       const durationMs = Math.max(0, Date.now() - startedAt);
 
       if (opts.allowNotFound && res.status === 404) {
+        observeGitHubHeaders({
+          repo: this.repo,
+          scopeKey: this.installationId ? `installation:${this.installationId}` : `repo:${this.repo}`,
+          nowMs: Date.now(),
+          remaining: parseHeaderInt(res.headers, "x-ratelimit-remaining"),
+          resetAtTs: parseRateLimitResetMs(res.headers),
+        });
         const ok = true;
         const rateLimited = false;
         const shouldEmit = this.shouldEmitRequestTelemetry({ ok, write: isWrite, rateLimited, backoffWaitMs: backoffInfo.waitedMs });
@@ -619,6 +707,23 @@ export class GitHubClient {
                   ? timestampMs
                   : now + 60_000;
           this.recordBackoff({ untilTs, installationId: extractInstallationId(text), tokenKey });
+          const observedInstallId = extractInstallationId(text) ?? this.installationId;
+          observeGitHubRateLimit({
+            repo: this.repo,
+            scopeKey: observedInstallId ? `installation:${observedInstallId}` : `repo:${this.repo}`,
+            nowMs: now,
+            resumeAtTs: untilTs,
+            remaining: parseHeaderInt(res.headers, "x-ratelimit-remaining"),
+            resetAtTs: resetMs,
+          });
+        } else {
+          observeGitHubHeaders({
+            repo: this.repo,
+            scopeKey: this.installationId ? `installation:${this.installationId}` : `repo:${this.repo}`,
+            nowMs: Date.now(),
+            remaining: parseHeaderInt(res.headers, "x-ratelimit-remaining"),
+            resetAtTs: resetMs,
+          });
         }
 
         const installId = extractInstallationId(text);
@@ -677,6 +782,13 @@ export class GitHubClient {
       }
 
       {
+        observeGitHubHeaders({
+          repo: this.repo,
+          scopeKey: this.installationId ? `installation:${this.installationId}` : `repo:${this.repo}`,
+          nowMs: Date.now(),
+          remaining: parseHeaderInt(res.headers, "x-ratelimit-remaining"),
+          resetAtTs: parseRateLimitResetMs(res.headers),
+        });
         const ok = true;
         const rateLimited = false;
         const shouldEmit = this.shouldEmitRequestTelemetry({ ok, write: isWrite, rateLimited, backoffWaitMs: backoffInfo.waitedMs });
@@ -726,6 +838,25 @@ export class GitHubClient {
   async request<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponse<T>> {
     const response = await this.requestInternal<T>(path, opts);
     return { data: response.data, etag: response.etag, status: response.status };
+  }
+
+  async requestWithLane<T>(path: string, opts: RequestOptions = {}): Promise<GitHubRequestWithLaneResult<T>> {
+    try {
+      const response = await this.requestInternal<T>(path, { ...opts, allowDeferral: true });
+      return { ok: true, response: { data: response.data, etag: response.etag, status: response.status } };
+    } catch (error) {
+      if (error instanceof GitHubDeferredError) {
+        return {
+          ok: false,
+          deferred: {
+            lane: error.lane,
+            untilTs: error.untilTs,
+            reason: error.reason,
+          },
+        };
+      }
+      return { ok: false, error: error as GitHubApiError | Error };
+    }
   }
 
   async requestWithMeta<T>(path: string, opts: RequestOptions = {}): Promise<GitHubResponseMeta<T>> {
@@ -837,4 +968,8 @@ export function splitRepoFullName(full: string): { owner: string; name: string }
 
 export function __resetGitHubClientForTests(overrides?: Partial<{ maxInflight: number; maxInflightWrites: number }>): void {
   GitHubClient.__resetForTests(overrides);
+}
+
+export function getGitHubBudgetGovernorStatusForCli(): ReturnType<typeof getGitHubGovernorSummaryForStatus> {
+  return getGitHubGovernorSummaryForStatus();
 }

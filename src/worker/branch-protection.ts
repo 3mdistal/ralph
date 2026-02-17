@@ -39,7 +39,7 @@ export function createBranchProtectionManager(params: {
     path: string,
     opts: { method?: string; body?: unknown; allowNotFound?: boolean } = {}
   ): Promise<T | null> => {
-    const response = await github.request<T>(path, opts);
+    const response = await github.request<T>(path, { ...opts, lane: "critical", source: "merge:branch-protection" });
     return response.data;
   };
 
