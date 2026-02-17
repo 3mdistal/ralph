@@ -4,10 +4,9 @@ export type ArtifactTruncationMode = "head" | "tail";
 export type GateArtifactPolicyKind = "command_output" | "failure_excerpt" | "note";
 
 export const ARTIFACT_POLICY_VERSION = 1;
-export const MAX_SUMMARY_CHARS = 512;
+const MAX_SUMMARY_CHARS = 512;
 export const MAX_TEXT_CHARS = 8192;
-export const MAX_TEXT_LINES = 200;
-export const MAX_LIST_ITEMS = 50;
+const MAX_TEXT_LINES = 200;
 
 export function applyTextPolicy(params: {
   value: string;
@@ -52,12 +51,6 @@ export function applyTextPolicy(params: {
     originalChars,
     originalLines,
   };
-}
-
-export function applyListPolicy<T>(items: T[] | null | undefined): T[] {
-  if (!Array.isArray(items)) return [];
-  if (items.length <= MAX_LIST_ITEMS) return items;
-  return items.slice(0, MAX_LIST_ITEMS);
 }
 
 export function applyGateArtifactPolicy(params: {
