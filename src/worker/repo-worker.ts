@@ -13,6 +13,7 @@ import {
   getRepoConcurrencySlots,
   getRepoLoopDetectionConfig,
   getRepoPreflightCommands,
+  resolveRepoPreflightPolicy,
   getRepoRequiredChecksOverride,
   getRepoSetupCommands,
   isAutoUpdateBehindEnabled,
@@ -50,6 +51,7 @@ import { LogLimiter, formatDuration } from "../logging";
 import { buildWorktreePath } from "../worktree-paths";
 
 import { runPreflightGate } from "../gates/preflight";
+import { decidePreflightForPrCreate, type PrCreatePreflightDecision } from "../gates/preflight-policy";
 import {
   type NoPrTerminalReason,
   type PrEvidenceCauseCode,
@@ -2466,6 +2468,83 @@ export class RepoWorker {
     }
   }
 
+  private resolveRepoPreflightPolicyForPrCreate() {
+    return resolveRepoPreflightPolicy(this.repo);
+  }
+
+  private decideRepoPreflightForPrCreate(decisionInput: ReturnType<typeof resolveRepoPreflightPolicy>) {
+    return decidePreflightForPrCreate({ repoName: this.repo, resolution: decisionInput });
+  }
+
+  private persistPreflightPolicyFailure(params: {
+    runId: string;
+    decision: Extract<PrCreatePreflightDecision, { action: "fail" }>;
+  }): void {
+    upsertRalphRunGateResult({
+      runId: params.runId,
+      gate: "preflight",
+      status: "fail",
+      reason: params.decision.reason,
+    });
+    recordRalphRunGateArtifact({
+      runId: params.runId,
+      gate: "preflight",
+      kind: "note",
+      content: [
+        "Preflight policy failure before PR creation.",
+        `Reason: ${params.decision.reason}`,
+        `Remediation: ${params.decision.remediation}`,
+      ].join("\n"),
+    });
+  }
+
+  private async executePreflightGate(params: {
+    runId: string;
+    worktreePath: string;
+    commands: string[];
+    skipReason?: string;
+  }) {
+    return await runPreflightGate(params);
+  }
+
+  private async runDeterministicPreflightForPrCreate(params: {
+    runId: string;
+    worktreePath: string;
+  }): Promise<{ ok: true; diagnostics: string[] } | { ok: false; diagnostics: string[]; causeCode: PrEvidenceCauseCode }> {
+    const diagnostics: string[] = [];
+    const resolved = this.resolveRepoPreflightPolicyForPrCreate();
+    const decision = this.decideRepoPreflightForPrCreate(resolved);
+
+    if (decision.action === "fail") {
+      this.persistPreflightPolicyFailure({ runId: params.runId, decision });
+      diagnostics.push("- Preflight policy failed; refusing to create PR");
+      diagnostics.push(`- ${decision.reason}`);
+      diagnostics.push(`- ${decision.remediation}`);
+      return { ok: false, diagnostics, causeCode: "POLICY_DENIED" };
+    }
+
+    const preflightResult = await this.executePreflightGate({
+      runId: params.runId,
+      worktreePath: params.worktreePath,
+      commands: decision.commands,
+      ...(decision.action === "skip" ? { skipReason: decision.skipReason } : {}),
+    });
+
+    if (preflightResult.status === "fail") {
+      diagnostics.push("- Preflight failed; refusing to create PR");
+      diagnostics.push(`- Gate: preflight=fail (runId=${params.runId})`);
+      return { ok: false, diagnostics, causeCode: "UNKNOWN" };
+    }
+
+    if (preflightResult.status === "skipped") {
+      diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
+    } else {
+      diagnostics.push("- Preflight passed");
+    }
+
+    return { ok: true, diagnostics };
+  }
+
   private async tryEnsurePrFromWorktree(params: {
     task: AgentTask;
     issueNumber: string;
@@ -2570,32 +2649,14 @@ export class RepoWorker {
       return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "LEASE_STALE" };
     }
 
-    const preflightConfig = getRepoPreflightCommands(this.repo);
-    const skipReason =
-      preflightConfig.source === "preflightCommand" && preflightConfig.configured && preflightConfig.commands.length === 0
-        ? "preflight disabled (preflightCommand=[])"
-        : preflightConfig.configured
-          ? "preflight configured but empty"
-          : "no preflight configured";
-
-    const preflightResult = await runPreflightGate({
+    const preflightGate = await this.runDeterministicPreflightForPrCreate({
       runId,
       worktreePath: candidate.worktreePath,
-      commands: preflightConfig.commands,
-      skipReason,
     });
-
-    if (preflightResult.status === "fail") {
-      diagnostics.push("- Preflight failed; refusing to create PR");
-      diagnostics.push(`- Gate: preflight=fail (runId=${runId})`);
-      diagnostics.push(formatPrEvidenceCauseCodeLine("UNKNOWN"));
-      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: "UNKNOWN" };
-    }
-
-    if (preflightResult.status === "skipped") {
-      diagnostics.push(`- Preflight skipped: ${preflightResult.skipReason ?? "(no reason)"}`);
-    } else {
-      diagnostics.push("- Preflight passed");
+    diagnostics.push(...preflightGate.diagnostics);
+    if (!preflightGate.ok) {
+      diagnostics.push(formatPrEvidenceCauseCodeLine(preflightGate.causeCode));
+      return { prUrl: null, diagnostics: diagnostics.join("\n"), causeCode: preflightGate.causeCode };
     }
 
     const readiness = await this.runPrReadinessChecks({
