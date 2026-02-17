@@ -8,6 +8,12 @@ Last updated: 2026-02-11
 
 It also stores deterministic gate state for each run (`ralph_run_gate_results`) and bounded, redacted artifacts (`ralph_run_gate_artifacts`).
 
+Gate artifact policy metadata is persisted per row to keep behavior auditable across upgrades:
+
+- `artifact_policy_version` (integer)
+- `truncation_mode` (`head` or `tail`)
+- existing truncation metadata (`truncated`, `original_chars`, `original_lines`)
+
 ## Migration policy
 
 - Forward-only, additive migrations on startup.

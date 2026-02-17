@@ -235,7 +235,7 @@ ralph sandbox tag --failed --apply
   - `maxPerTick` (number): cap issues reconciled per sync tick (default: 200)
   - `dryRun` (boolean): compute decisions without mutating labels (default: false)
 - `repos[].setup` (array): optional setup commands to run in the task worktree before any agent execution (operator-owned)
-- `repos[].preflightCommand` (string|string[]): optional deterministic preflight commands run in the task worktree before Ralph opens PRs (normalized to string[])
+- `repos[].preflightCommand` (string|string[]): deterministic preflight commands run in the task worktree before Ralph opens PRs (normalized to string[]). Preflight is required by default; set this explicitly for each repo, or set `repos[].preflightCommand=[]` to explicitly disable.
 - `repos[].verification` (object, optional): rollup PR verification guidance
   - `preflight` (array): legacy alias for `repos[].preflightCommand` (string[])
   - `e2e` (array): human E2E scenarios (`[{ title?: string, steps: string[] }]`)

@@ -3,11 +3,12 @@ import { buildDoctorReport, resolveDoctorExitCode } from "../doctor/core";
 import type { DoctorSnapshot } from "../doctor/types";
 
 function snapshotFixture(): DoctorSnapshot {
+  const home = process.env.HOME?.trim() || "/home/test";
   return {
     daemonCandidates: [
       {
-        path: "/home/test/.ralph/control/daemon-registry.json",
-        root: "/home/test/.ralph/control",
+        path: `${home}/.ralph/control/daemon-registry.json`,
+        root: `${home}/.ralph/control`,
         is_canonical: true,
         exists: false,
         state: "missing",
@@ -17,8 +18,8 @@ function snapshotFixture(): DoctorSnapshot {
         identity: null,
       },
       {
-        path: "/tmp/ralph/1000/daemon.json",
-        root: "/tmp/ralph/1000",
+        path: `${home}/.local/state/ralph/daemon.json`,
+        root: `${home}/.local/state/ralph`,
         is_canonical: false,
         exists: true,
         state: "live",
@@ -28,8 +29,8 @@ function snapshotFixture(): DoctorSnapshot {
           pid: process.pid,
           startedAt: new Date().toISOString(),
           heartbeatAt: new Date().toISOString(),
-          controlRoot: "/tmp/ralph/1000",
-          controlFilePath: "/tmp/ralph/1000/control.json",
+          controlRoot: `${home}/.ralph/control`,
+          controlFilePath: `${home}/.ralph/control/control.json`,
           cwd: process.cwd(),
           command: ["bun", "src/index.ts"],
           ralphVersion: "test",
@@ -40,8 +41,8 @@ function snapshotFixture(): DoctorSnapshot {
     ],
     controlCandidates: [
       {
-        path: "/home/test/.ralph/control/control.json",
-        root: "/home/test/.ralph/control",
+        path: `${home}/.ralph/control/control.json`,
+        root: `${home}/.ralph/control`,
         is_canonical: true,
         exists: true,
         state: "readable",
@@ -54,8 +55,8 @@ function snapshotFixture(): DoctorSnapshot {
         },
       },
       {
-        path: "/tmp/ralph/1000/control.json",
-        root: "/tmp/ralph/1000",
+        path: `${home}/.local/state/ralph/control.json`,
+        root: `${home}/.local/state/ralph`,
         is_canonical: false,
         exists: true,
         state: "readable",
@@ -70,17 +71,17 @@ function snapshotFixture(): DoctorSnapshot {
     ],
     roots: [
       {
-        root: "/home/test/.ralph/control",
-        daemon_record_paths: ["/home/test/.ralph/control/daemon-registry.json"],
+        root: `${home}/.ralph/control`,
+        daemon_record_paths: [`${home}/.ralph/control/daemon-registry.json`],
         daemon_records_present: 0,
-        control_file_paths: ["/home/test/.ralph/control/control.json"],
+        control_file_paths: [`${home}/.ralph/control/control.json`],
         control_files_present: 1,
       },
       {
-        root: "/tmp/ralph/1000",
-        daemon_record_paths: ["/tmp/ralph/1000/daemon.json"],
+        root: `${home}/.local/state/ralph`,
+        daemon_record_paths: [`${home}/.local/state/ralph/daemon.json`],
         daemon_records_present: 1,
-        control_file_paths: ["/tmp/ralph/1000/control.json"],
+        control_file_paths: [`${home}/.local/state/ralph/control.json`],
         control_files_present: 1,
       },
     ],
@@ -170,12 +171,13 @@ describe("doctor core", () => {
   });
 
   test("duplicate live records for same identity are warnings, not conflict errors", () => {
+    const home = process.env.HOME?.trim() || "/home/test";
     const report = buildDoctorReport({
       snapshot: {
         daemonCandidates: [
           {
-            path: "/home/test/.ralph/control/daemon-registry.json",
-            root: "/home/test/.ralph/control",
+            path: `${home}/.ralph/control/daemon-registry.json`,
+            root: `${home}/.ralph/control`,
             is_canonical: true,
             exists: true,
             state: "live",
@@ -185,8 +187,8 @@ describe("doctor core", () => {
               pid: process.pid,
               startedAt: "2026-02-08T00:00:00.000Z",
               heartbeatAt: "2026-02-08T00:00:01.000Z",
-              controlRoot: "/home/test/.ralph/control",
-              controlFilePath: "/home/test/.ralph/control/control.json",
+              controlRoot: `${home}/.ralph/control`,
+              controlFilePath: `${home}/.ralph/control/control.json`,
               cwd: process.cwd(),
               command: ["bun", "src/index.ts"],
               ralphVersion: "test",
@@ -195,8 +197,8 @@ describe("doctor core", () => {
             identity: { ok: true, reason: null },
           },
           {
-            path: "/tmp/ralph/1000/daemon.json",
-            root: "/tmp/ralph/1000",
+            path: `${home}/.local/state/ralph/daemon.json`,
+            root: `${home}/.local/state/ralph`,
             is_canonical: false,
             exists: true,
             state: "live",
@@ -206,8 +208,8 @@ describe("doctor core", () => {
               pid: process.pid,
               startedAt: "2026-02-08T00:00:00.000Z",
               heartbeatAt: "2026-02-08T00:00:01.000Z",
-              controlRoot: "/home/test/.ralph/control",
-              controlFilePath: "/tmp/ralph/1000/control.json",
+              controlRoot: `${home}/.ralph/control`,
+              controlFilePath: `${home}/.ralph/control/control.json`,
               cwd: process.cwd(),
               command: ["bun", "src/index.ts"],
               ralphVersion: "test",
@@ -218,8 +220,8 @@ describe("doctor core", () => {
         ],
         controlCandidates: [
           {
-            path: "/home/test/.ralph/control/control.json",
-            root: "/home/test/.ralph/control",
+            path: `${home}/.ralph/control/control.json`,
+            root: `${home}/.ralph/control`,
             is_canonical: true,
             exists: true,
             state: "readable",
@@ -232,8 +234,8 @@ describe("doctor core", () => {
             },
           },
           {
-            path: "/tmp/ralph/1000/control.json",
-            root: "/tmp/ralph/1000",
+            path: `${home}/.local/state/ralph/control.json`,
+            root: `${home}/.local/state/ralph`,
             is_canonical: false,
             exists: true,
             state: "readable",
@@ -257,5 +259,56 @@ describe("doctor core", () => {
     expect(report.findings.some((finding) => finding.code === "MULTIPLE_LIVE_DAEMON_RECORDS")).toBeFalse();
     expect(report.findings.some((finding) => finding.code === "DUPLICATE_LIVE_DAEMON_RECORDS")).toBeTrue();
     expect(report.recommended_repairs.some((repair) => repair.code === "QUARANTINE_DUPLICATE_DAEMON_RECORDS")).toBeTrue();
+  });
+
+  test("unsafe /tmp live candidate is inert for promotion", () => {
+    const home = process.env.HOME?.trim() || "/home/test";
+    const report = buildDoctorReport({
+      snapshot: {
+        daemonCandidates: [
+          {
+            path: `${home}/.ralph/control/daemon-registry.json`,
+            root: `${home}/.ralph/control`,
+            is_canonical: true,
+            exists: false,
+            state: "missing",
+            parse_error: null,
+            record: null,
+            pid_alive: null,
+            identity: null,
+          },
+          {
+            path: "/tmp/ralph/1000/daemon.json",
+            root: "/tmp/ralph/1000",
+            is_canonical: false,
+            exists: true,
+            state: "live",
+            parse_error: null,
+            record: {
+              daemonId: "d_tmp",
+              pid: process.pid,
+              startedAt: "2026-02-08T00:00:00.000Z",
+              heartbeatAt: "2026-02-08T00:00:01.000Z",
+              controlRoot: `${home}/.ralph/control`,
+              controlFilePath: `${home}/.ralph/control/control.json`,
+              cwd: process.cwd(),
+              command: ["bun", "src/index.ts"],
+              ralphVersion: "test",
+            },
+            pid_alive: true,
+            identity: { ok: true, reason: null },
+          },
+        ],
+        controlCandidates: [],
+        roots: [],
+      },
+      timestamp: "2026-02-08T00:00:00.000Z",
+      repairMode: false,
+      dryRun: false,
+      appliedRepairs: [],
+    });
+
+    expect(report.findings.some((finding) => finding.code === "UNSAFE_DAEMON_ROOT")).toBeTrue();
+    expect(report.recommended_repairs.some((repair) => repair.code === "PROMOTE_LIVE_DAEMON_RECORD_TO_CANONICAL")).toBeFalse();
   });
 });

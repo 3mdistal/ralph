@@ -37,6 +37,10 @@ type GateArtifactProjection = {
   createdAt: string;
   updatedAt: string;
   truncated: boolean;
+  truncationMode: "head" | "tail";
+  artifactPolicyVersion: number;
+  originalChars: number | null;
+  originalLines: number | null;
   content: string;
 };
 
@@ -129,6 +133,10 @@ export function buildGatesJsonOutput(params: {
       createdAt: artifact.createdAt,
       updatedAt: artifact.updatedAt,
       truncated: artifact.truncated,
+      truncationMode: artifact.truncationMode,
+      artifactPolicyVersion: artifact.artifactPolicyVersion,
+      originalChars: artifact.originalChars,
+      originalLines: artifact.originalLines,
       content: artifact.content,
     })),
     error: params.error ?? null,
