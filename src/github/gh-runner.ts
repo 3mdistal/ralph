@@ -5,6 +5,12 @@ import { mkdirSync } from "fs";
 import { getProfile, getSandboxProfileConfig } from "../config";
 import { resolveGhTokenEnv } from "../github-app-auth";
 import { getRalphGhConfigDir } from "../paths";
+import {
+  decideGitHubBudget,
+  isGitHubBudgetGovernorDryRun,
+  observeGitHubRateLimit,
+  type GitHubLane,
+} from "./budget-governor";
 import { SandboxTripwireError, assertSandboxWriteAllowed } from "./sandbox-tripwire";
 
 type GhCommandResult = { stdout: Uint8Array | string | { toString(): string } };
@@ -15,6 +21,22 @@ type GhProcess = {
 };
 
 type GhRunner = (strings: TemplateStringsArray, ...values: unknown[]) => GhProcess;
+
+export class GhDeferredError extends Error {
+  readonly lane: GitHubLane;
+  readonly untilTs: number;
+  readonly reason: "cooldown" | "lane_budget" | "pressure";
+
+  constructor(params: { lane: GitHubLane; untilTs: number; reason: "cooldown" | "lane_budget" | "pressure"; message: string }) {
+    super(params.message);
+    this.name = "GhDeferredError";
+    this.lane = params.lane;
+    this.untilTs = params.untilTs;
+    this.reason = params.reason;
+  }
+}
+
+const installationIdByRepo = new Map<string, string>();
 
 function getDefaultGhRunner(): GhRunner {
   return ((globalThis as any).$ ?? bunDollar) as unknown as GhRunner;
@@ -112,6 +134,84 @@ function parseGhApiMethod(command: string): string | null {
   return methodMatch[1]?.toUpperCase() ?? null;
 }
 
+function defaultLaneForGh(params: { lane?: GitHubLane; source?: string; mode: "read" | "write"; command: string }): GitHubLane {
+  if (params.lane) return params.lane;
+  const source = (params.source ?? "").toLowerCase();
+  const command = params.command.toLowerCase();
+
+  if (
+    source.includes("merge") ||
+    source.includes("required-check") ||
+    source.includes("cmd") ||
+    command.includes("pulls/") && command.includes("/merge") ||
+    command.includes("pr merge")
+  ) {
+    return "critical";
+  }
+  if (source.includes("blocked-comment") || source.includes("audit") || source.includes("parity") || source.includes("sweep")) {
+    return "best_effort";
+  }
+  return params.mode === "read" ? "important" : "important";
+}
+
+function parseHeaderIntFromText(text: string, name: string): number | null {
+  const pattern = new RegExp(`${name}\\s*[:=]\\s*([0-9]{1,12})`, "i");
+  const match = text.match(pattern);
+  if (!match?.[1]) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) ? Math.floor(value) : null;
+}
+
+function parseRetryAfterMsFromText(text: string): number | null {
+  const seconds = parseHeaderIntFromText(text, "retry-after");
+  if (!Number.isFinite(seconds) || (seconds ?? 0) <= 0) return null;
+  return Math.round((seconds as number) * 1000);
+}
+
+function parseRateLimitResetMsFromText(text: string): number | null {
+  const seconds = parseHeaderIntFromText(text, "x-ratelimit-reset");
+  if (!Number.isFinite(seconds) || (seconds ?? 0) <= 0) return null;
+  return Math.round((seconds as number) * 1000);
+}
+
+function extractInstallationId(text: string): string | null {
+  const match = text.match(/installation\s+id\s+(\d+)/i);
+  return match?.[1] ?? null;
+}
+
+function isRateLimitedText(text: string): boolean {
+  const value = text.toLowerCase();
+  return (
+    value.includes("api rate limit exceeded") ||
+    value.includes("rate limit exceeded") ||
+    value.includes("secondary rate limit") ||
+    value.includes("abuse detection") ||
+    value.includes("http 429") ||
+    value.includes("http 403") && value.includes("rate limit")
+  );
+}
+
+function observeRateLimitFromGhError(params: { repo: string; error: unknown }): void {
+  const anyErr = params.error as any;
+  const text = [anyErr?.stderr, anyErr?.stdout, anyErr?.message].map((v) => String(v ?? "")).join("\n");
+  if (!text.trim() || !isRateLimitedText(text)) return;
+
+  const nowMs = Date.now();
+  const retryAfterMs = parseRetryAfterMsFromText(text);
+  const resetAtMs = parseRateLimitResetMsFromText(text);
+  const untilTs = retryAfterMs != null ? nowMs + retryAfterMs : resetAtMs ?? nowMs + 60_000;
+  const installId = extractInstallationId(text) ?? installationIdByRepo.get(params.repo) ?? null;
+  if (installId) installationIdByRepo.set(params.repo, installId);
+  observeGitHubRateLimit({
+    repo: params.repo,
+    scopeKey: installId ? `installation:${installId}` : `repo:${params.repo}`,
+    nowMs,
+    resumeAtTs: untilTs,
+    remaining: parseHeaderIntFromText(text, "x-ratelimit-remaining"),
+    resetAtTs: resetAtMs,
+  });
+}
+
 function classifyGhCommand(command: string): "read" | "write" | "unknown" {
   const normalized = normalizeWhitespace(command);
   if (!normalized.startsWith("gh ")) return "unknown";
@@ -166,7 +266,7 @@ function assertGhCommandAllowed(params: { repo: string; mode: "read" | "write"; 
   }
 }
 
-export function createGhRunner(params: { repo: string; mode: "read" | "write" }): GhRunner {
+export function createGhRunner(params: { repo: string; mode: "read" | "write"; lane?: GitHubLane; source?: string }): GhRunner {
   return (strings: TemplateStringsArray, ...values: unknown[]): GhProcess => {
     const command = buildCommandString(strings, values);
     assertGhCommandAllowed({ repo: params.repo, mode: params.mode, command });
@@ -178,6 +278,23 @@ export function createGhRunner(params: { repo: string; mode: "read" | "write" })
         return wrapper;
       },
       quiet: async () => {
+        const lane = defaultLaneForGh({ lane: params.lane, source: params.source, mode: params.mode, command });
+        const scopeInstallId = installationIdByRepo.get(params.repo) ?? null;
+        const decision = decideGitHubBudget({
+          repo: params.repo,
+          scopeKey: scopeInstallId ? `installation:${scopeInstallId}` : `repo:${params.repo}`,
+          lane,
+          isWrite: params.mode === "write",
+          nowMs: Date.now(),
+        });
+        if (decision.kind === "defer" && !isGitHubBudgetGovernorDryRun()) {
+          throw new GhDeferredError({
+            lane,
+            untilTs: decision.untilTs,
+            reason: decision.reason,
+            message: `gh command deferred by budget governor (${decision.reason}) until ${new Date(decision.untilTs).toISOString()}`,
+          });
+        }
         const token = await resolveGhTokenEnv();
         const ghConfigDir = ensureGhConfigDirExists();
         return await withGhEnvLock(async () => {
@@ -188,12 +305,14 @@ export function createGhRunner(params: { repo: string; mode: "read" | "write" })
             try {
               return await configured.quiet();
             } catch (error: any) {
+              observeRateLimitFromGhError({ repo: params.repo, error });
               // Attach context for higher-signal diagnostics and classification.
               // Mutate in-place to preserve stack when possible.
               if (error && typeof error === "object") {
                 if ((error as any).ghCommand === undefined) (error as any).ghCommand = command;
                 if ((error as any).ghRepo === undefined) (error as any).ghRepo = params.repo;
                 if ((error as any).ghMode === undefined) (error as any).ghMode = params.mode;
+                if ((error as any).ghLane === undefined) (error as any).ghLane = lane;
               }
               throw error;
             }

@@ -81,6 +81,8 @@ describe("ralphctl status degraded mode", () => {
       expect(parsed.durableState?.minReadableSchema).toBeNumber();
       expect(parsed.durableState?.maxReadableSchema).toBeNumber();
       expect(parsed.durableState?.maxWritableSchema).toBeNumber();
+      expect(parsed.githubGovernor).toBeObject();
+      expect(typeof parsed.githubGovernor.enabled).toBe("boolean");
     } finally {
       await rm(homeDir, { recursive: true, force: true });
       await rm(xdgStateHome, { recursive: true, force: true });

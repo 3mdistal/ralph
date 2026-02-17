@@ -196,9 +196,16 @@ async function findBlockedComment(params: {
 }): Promise<BlockedCommentRecord | null> {
   const { owner, name } = splitRepoFullName(params.repo);
   const limit = Math.min(Math.max(1, params.limit ?? 50), 100);
-  const response = await params.github.request<Array<{ id?: number | null; body?: string | null; updated_at?: string | null; html_url?: string | null }>>(
-    `/repos/${owner}/${name}/issues/${params.issueNumber}/comments?per_page=${limit}&sort=created&direction=desc`
+  const responseResult = await requestBestEffort<Array<{ id?: number | null; body?: string | null; updated_at?: string | null; html_url?: string | null }>>(
+    params.github,
+    `/repos/${owner}/${name}/issues/${params.issueNumber}/comments?per_page=${limit}&sort=created&direction=desc`,
+    { source: "blocked-comment:find" }
   );
+  if (!responseResult.ok) {
+    if ("deferred" in responseResult) return null;
+    throw responseResult.error;
+  }
+  const response = responseResult.response;
   for (const comment of response.data ?? []) {
     const body = comment?.body ?? "";
     const match = body.match(MARKER_REGEX);
@@ -214,6 +221,38 @@ async function findBlockedComment(params: {
     };
   }
   return null;
+}
+
+async function requestBestEffort<T>(
+  github: GitHubClient,
+  path: string,
+  opts?: { method?: string; body?: unknown; source?: string }
+): Promise<{ ok: true; response: { data: T | null; status: number } } | { ok: false; deferred: true } | { ok: false; error: unknown }> {
+  const withLane = (github as any).requestWithLane;
+  if (typeof withLane === "function") {
+    const result = await withLane.call(github, path, {
+      method: opts?.method,
+      body: opts?.body,
+      lane: "best_effort",
+      source: opts?.source,
+    });
+    if (!result.ok) {
+      if ("deferred" in result) return { ok: false, deferred: true };
+      return { ok: false, error: result.error };
+    }
+    return { ok: true, response: result.response };
+  }
+
+  try {
+    const fallback = await github.request<T>(path, {
+      method: opts?.method,
+      body: opts?.body,
+      source: opts?.source,
+    });
+    return { ok: true, response: fallback };
+  } catch (error) {
+    return { ok: false, error };
+  }
 }
 
 async function upsertBlockedCommentNow(params: {
@@ -252,10 +291,16 @@ async function upsertBlockedCommentNow(params: {
       return { updated: false, url: existing.htmlUrl ?? null };
     }
     const { owner, name } = splitRepoFullName(params.repo);
-    const updated = await params.github.request<{ html_url?: string | null }>(
+    const updatedResult = await requestBestEffort<{ html_url?: string | null }>(
+      params.github,
       `/repos/${owner}/${name}/issues/comments/${existing.id}`,
-      { method: "PATCH", body: { body } }
+      { method: "PATCH", body: { body }, source: "blocked-comment:patch" }
     );
+    if (!updatedResult.ok) {
+      if ("deferred" in updatedResult) return { updated: false, url: existing.htmlUrl ?? null };
+      throw updatedResult.error;
+    }
+    const updated = updatedResult.response;
     upsertIdempotencyKey({ key: idempotencyKey, scope: "gh-blocked-comment", payloadJson: JSON.stringify({ semanticHash: expectedHash }) });
     return { updated: true, url: updated.data?.html_url ?? existing.htmlUrl ?? null };
   }
@@ -271,10 +316,16 @@ async function upsertBlockedCommentNow(params: {
 
   try {
     const { owner, name } = splitRepoFullName(params.repo);
-    const created = await params.github.request<{ html_url?: string | null }>(
+    const createdResult = await requestBestEffort<{ html_url?: string | null }>(
+      params.github,
       `/repos/${owner}/${name}/issues/${params.issueNumber}/comments`,
-      { method: "POST", body: { body } }
+      { method: "POST", body: { body }, source: "blocked-comment:create" }
     );
+    if (!createdResult.ok) {
+      if ("deferred" in createdResult) return { updated: false, url: null };
+      throw createdResult.error;
+    }
+    const created = createdResult.response;
     upsertIdempotencyKey({ key: idempotencyKey, scope: "gh-blocked-comment", payloadJson: JSON.stringify({ semanticHash: expectedHash }) });
     return { updated: true, url: created.data?.html_url ?? null };
   } catch (error) {

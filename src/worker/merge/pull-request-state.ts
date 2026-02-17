@@ -4,7 +4,7 @@ import { extractPullRequestNumber } from "../lanes/required-checks";
 
 import { normalizeMergeStateStatus } from "./pull-request-io";
 
-const ghRead = (repo: string) => createGhRunner({ repo, mode: "read" });
+const ghRead = (repo: string) => createGhRunner({ repo, mode: "read", lane: "critical", source: "merge:state" });
 
 export async function getPullRequestMergeState(params: {
   repo: string;
