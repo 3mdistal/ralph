@@ -163,6 +163,7 @@ async function reconcileRepo(
         blockedAt: params.blockedAt,
         updatedAt: nowIso,
       },
+      writeClass: "best-effort",
     });
   };
 

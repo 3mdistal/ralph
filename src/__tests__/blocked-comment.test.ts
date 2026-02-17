@@ -21,11 +21,11 @@ describe("blocked comment", () => {
   beforeEach(async () => {
     priorHome = process.env.HOME;
     priorStateDb = process.env.RALPH_STATE_DB_PATH;
-    priorWindow = process.env.RALPH_GITHUB_WRITE_COALESCE_WINDOW_MS;
+    priorWindow = process.env.RALPH_GITHUB_BLOCKED_COMMENT_COALESCE_MS;
     homeDir = await mkdtemp(join(tmpdir(), "ralph-blocked-comment-"));
     process.env.HOME = homeDir;
     process.env.RALPH_STATE_DB_PATH = join(homeDir, "state.sqlite");
-    process.env.RALPH_GITHUB_WRITE_COALESCE_WINDOW_MS = "0";
+    process.env.RALPH_GITHUB_BLOCKED_COMMENT_COALESCE_MS = "0";
     __resetBlockedCommentWriteStateForTests();
     const stateMod = await import("../state");
     stateMod.closeStateDbForTests();
@@ -39,8 +39,8 @@ describe("blocked comment", () => {
     else process.env.HOME = priorHome;
     if (priorStateDb === undefined) delete process.env.RALPH_STATE_DB_PATH;
     else process.env.RALPH_STATE_DB_PATH = priorStateDb;
-    if (priorWindow === undefined) delete process.env.RALPH_GITHUB_WRITE_COALESCE_WINDOW_MS;
-    else process.env.RALPH_GITHUB_WRITE_COALESCE_WINDOW_MS = priorWindow;
+    if (priorWindow === undefined) delete process.env.RALPH_GITHUB_BLOCKED_COMMENT_COALESCE_MS;
+    else process.env.RALPH_GITHUB_BLOCKED_COMMENT_COALESCE_MS = priorWindow;
     await rm(homeDir, { recursive: true, force: true });
   });
 
@@ -79,6 +79,7 @@ describe("blocked comment", () => {
   });
 
   test("coalesces concurrent upserts for identical blocked payload", async () => {
+    process.env.RALPH_GITHUB_BLOCKED_COMMENT_COALESCE_MS = "20";
     let createCalls = 0;
     const github = {
       request: async (path: string, opts: { method?: string } = {}) => {
@@ -103,8 +104,8 @@ describe("blocked comment", () => {
     };
 
     await Promise.all([
-      upsertBlockedComment({ github, repo: "3mdistal/ralph", issueNumber: 762, state }),
-      upsertBlockedComment({ github, repo: "3mdistal/ralph", issueNumber: 762, state }),
+      upsertBlockedComment({ github, repo: "3mdistal/ralph", issueNumber: 762, state, writeClass: "best-effort" }),
+      upsertBlockedComment({ github, repo: "3mdistal/ralph", issueNumber: 762, state, writeClass: "best-effort" }),
     ]);
 
     expect(createCalls).toBe(1);
@@ -144,5 +145,62 @@ describe("blocked comment", () => {
 
     expect(suppressed).toEqual({ updated: false, url: null });
     expect(createCalls).toBe(1);
+  });
+
+  test("skips patch when semantic blocked state is unchanged", async () => {
+    const marker = "<!-- ralph-blocked:v1 id=0ff48f803d0e -->";
+    const existingBody = buildBlockedCommentBody({
+      marker,
+      issueNumber: 762,
+      state: {
+        version: 1,
+        kind: "deps",
+        blocked: true,
+        reason: "blocked by #11",
+        deps: [{ repo: "3mdistal/ralph", issueNumber: 11 }],
+        blockedAt: "2026-02-15T00:00:00.000Z",
+        updatedAt: "2026-02-15T00:00:01.000Z",
+      },
+    });
+    let patchCalls = 0;
+
+    const github = {
+      request: async (path: string, opts?: { method?: string }) => {
+        if (String(path).includes("/comments?")) {
+          return {
+            data: [
+              {
+                id: 99,
+                body: existingBody,
+                html_url: "https://github.com/3mdistal/ralph/issues/762#issuecomment-99",
+              },
+            ],
+          };
+        }
+        if (opts?.method === "PATCH") {
+          patchCalls += 1;
+          return { data: { html_url: "https://github.com/3mdistal/ralph/issues/762#issuecomment-99" } };
+        }
+        throw new Error(`unexpected call: ${opts?.method ?? "GET"} ${path}`);
+      },
+    } as any;
+
+    const result = await upsertBlockedComment({
+      github,
+      repo: "3mdistal/ralph",
+      issueNumber: 762,
+      state: {
+        version: 1,
+        kind: "deps",
+        blocked: true,
+        reason: "blocked by #11",
+        deps: [{ repo: "3mdistal/ralph", issueNumber: 11 }],
+        blockedAt: "2026-02-15T00:00:00.000Z",
+        updatedAt: "2026-02-15T01:00:00.000Z",
+      },
+    });
+
+    expect(result.updated).toBe(false);
+    expect(patchCalls).toBe(0);
   });
 });
