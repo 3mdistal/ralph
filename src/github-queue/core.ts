@@ -193,6 +193,7 @@ export function computeStaleInProgressRecovery(params: {
   nowMs: number;
   ttlMs: number;
   graceMs?: number;
+  authoritativeActivityAtMs?: number | null;
 }): { shouldRecover: boolean; reason?: StaleInProgressRecoveryReason } {
   if (!params.labels.includes(RALPH_LABEL_STATUS_IN_PROGRESS)) return { shouldRecover: false };
   if ((params.opState?.status ?? "").trim() === "blocked") {
@@ -208,12 +209,20 @@ export function computeStaleInProgressRecovery(params: {
     return { shouldRecover: false, reason: "missing-op-state" };
   }
 
+  const authoritativeActivityAtMs =
+    typeof params.authoritativeActivityAtMs === "number" && Number.isFinite(params.authoritativeActivityAtMs)
+      ? params.authoritativeActivityAtMs
+      : null;
+
   const graceMs = Number.isFinite(params.graceMs) ? Math.max(0, Math.floor(params.graceMs as number)) : 0;
 
   const sessionId = params.opState.sessionId?.trim() ?? "";
   if (!sessionId) {
     const heartbeat = params.opState.heartbeatAt?.trim() ?? "";
     const heartbeatMs = heartbeat ? Date.parse(heartbeat) : NaN;
+    if (authoritativeActivityAtMs !== null && params.nowMs - authoritativeActivityAtMs <= params.ttlMs) {
+      return { shouldRecover: false };
+    }
 
     // Grace period: newly claimed tasks may briefly lack a sessionId.
     // If we have a recent heartbeat, defer recovery until grace elapses.
@@ -229,11 +238,22 @@ export function computeStaleInProgressRecovery(params: {
   }
 
   const heartbeat = params.opState.heartbeatAt?.trim() ?? "";
+  const heartbeatMs = heartbeat ? Date.parse(heartbeat) : NaN;
+  const freshestActivityMs =
+    authoritativeActivityAtMs !== null && Number.isFinite(heartbeatMs)
+      ? Math.max(authoritativeActivityAtMs, heartbeatMs)
+      : authoritativeActivityAtMs !== null
+        ? authoritativeActivityAtMs
+        : heartbeatMs;
+
+  if (Number.isFinite(freshestActivityMs) && params.nowMs - freshestActivityMs <= params.ttlMs) {
+    return { shouldRecover: false };
+  }
+
   if (!heartbeat) {
     return { shouldRecover: true, reason: "missing-heartbeat" };
   }
 
-  const heartbeatMs = Date.parse(heartbeat);
   if (!Number.isFinite(heartbeatMs)) {
     return { shouldRecover: true, reason: "invalid-heartbeat" };
   }

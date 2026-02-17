@@ -206,4 +206,73 @@ describe("GitHub queue no-flap stale sweep", () => {
     expect(blocked.map((task) => [task.issue, task.status])).toEqual([["3mdistal/ralph#711", "blocked"]]);
     expect(mutations).toEqual([]);
   });
+
+  test("does not downgrade in-progress when heartbeat is fresh", async () => {
+    await writeJson(getRalphConfigJsonPath(), {
+      queueBackend: "github",
+      ownershipTtlMs: 30_000,
+      repos: [{ name: "3mdistal/ralph", path: "/tmp/ralph", botBranch: "bot/integration" }],
+    });
+
+    const cfgMod = await import("../config");
+    cfgMod.__resetConfigForTests();
+
+    const stateMod = await import("../state");
+    stateMod.closeStateDbForTests();
+    stateMod.initStateDb();
+
+    const baseNow = new Date("2026-02-03T05:00:00.000Z");
+    const freshHeartbeat = new Date(baseNow.getTime() - 5_000).toISOString();
+    const sessionId = "opencode-session-queue-no-flap-760";
+
+    stateMod.recordIssueSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#760",
+      title: "Flapping labels",
+      state: "OPEN",
+      url: "https://github.com/3mdistal/ralph/issues/760",
+      githubUpdatedAt: baseNow.toISOString(),
+      at: baseNow.toISOString(),
+    });
+    stateMod.recordIssueLabelsSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#760",
+      labels: ["ralph:status:in-progress"],
+      at: baseNow.toISOString(),
+    });
+    stateMod.recordTaskSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#760",
+      taskPath: "github:3mdistal/ralph#760",
+      status: "in-progress",
+      sessionId,
+      heartbeatAt: freshHeartbeat,
+      at: baseNow.toISOString(),
+    });
+
+    const mutations: Array<{ add: string[]; remove: string[] }> = [];
+
+    const queueMod = await import("../github-queue/io");
+    const driver = queueMod.createGitHubQueueDriver({
+      now: () => new Date(baseNow),
+      io: {
+        ensureWorkflowLabels: async () => ({ ok: true, created: [], updated: [] }),
+        listIssueLabels: async () => ["ralph:status:in-progress"],
+        fetchIssue: async () => null,
+        reopenIssue: async () => {},
+        addIssueLabel: async () => {},
+        addIssueLabels: async () => {},
+        removeIssueLabel: async () => ({ removed: true }),
+        mutateIssueLabels: async ({ add, remove }) => {
+          mutations.push({ add, remove });
+          return true;
+        },
+      },
+    });
+
+    const queued = await driver.getTasksByStatus("queued");
+
+    expect(queued).toEqual([]);
+    expect(mutations).toEqual([]);
+  });
 });
