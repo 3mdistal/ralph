@@ -317,7 +317,7 @@ function detectOpencodeErrorCode(params: {
   return undefined;
 }
 
-function resolveOpencodeBin(): string {
+export function resolveOpencodeBin(): string {
   const override = process.env.OPENCODE_BIN?.trim();
   if (override) return override;
 
@@ -362,7 +362,10 @@ type OpencodeSpawnOptions = {
   };
 };
 
-function buildOpencodeSpawnEnvironment(opts?: OpencodeSpawnOptions): { env: Record<string, string | undefined>; xdgCacheHome: string } {
+export function buildOpencodeSpawnEnvironment(opts?: OpencodeSpawnOptions): {
+  env: Record<string, string | undefined>;
+  xdgCacheHome: string;
+} {
   const opencodeXdg = opts?.opencodeXdg;
   const xdgCacheHome = getIsolatedXdgCacheHome({
     repo: opts?.repo,

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
 import { tmpdir } from "os";
 import { mkdtempSync } from "fs";
 import { applyDoctorRepairs } from "../doctor/repair";
@@ -501,7 +501,7 @@ describe("doctor repair", () => {
       nowIso: "2026-02-08T20:00:00.000Z",
     });
 
-    expect(applied.some((item) => item.status === "skipped" && item.details.includes("refusing to overwrite"))).toBeTrue();
+    expect(applied.some((item) => item.id === "promote-live-daemon-record-to-canonical" && item.status === "skipped")).toBeTrue();
   });
 
   test("quarantines duplicate live daemon record while keeping canonical", () => {
@@ -596,6 +596,217 @@ describe("doctor repair", () => {
     expect(existsSync(legacyPath)).toBeFalse();
     const files = readdirSync(join(xdgDir, "ralph"));
     expect(files.some((file) => file.startsWith("daemon.json.duplicate-"))).toBeTrue();
+  });
+
+  test("skips promotion when source daemon record is from unsafe /tmp root", () => {
+    const legacyPath = join("/tmp", "ralph", `unsafe-${process.pid}`, "daemon.json");
+    mkdirSync(dirname(legacyPath), { recursive: true });
+    writeFileSync(
+      legacyPath,
+      `${JSON.stringify(
+        {
+          version: 1,
+          daemonId: "tmp-live",
+          pid: process.pid,
+          startedAt: "2026-02-08T20:00:00.000Z",
+          heartbeatAt: "2026-02-08T20:10:00.000Z",
+          controlRoot: join(homeDir, ".ralph", "control"),
+          controlFilePath: join(homeDir, ".ralph", "control", "control.json"),
+          ralphVersion: "test",
+          command: ["bun", "src/index.ts"],
+          cwd: process.cwd(),
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const snapshot: DoctorSnapshot = {
+      daemonCandidates: [
+        {
+          path: join(homeDir, ".ralph", "control", "daemon-registry.json"),
+          root: join(homeDir, ".ralph", "control"),
+          is_canonical: true,
+          exists: false,
+          state: "missing",
+          parse_error: null,
+          record: null,
+          pid_alive: null,
+          identity: null,
+        },
+        {
+          path: legacyPath,
+          root: dirname(legacyPath),
+          is_canonical: false,
+          exists: true,
+          state: "live",
+          parse_error: null,
+          record: {
+            daemonId: "tmp-live",
+            pid: process.pid,
+            startedAt: "2026-02-08T20:00:00.000Z",
+            heartbeatAt: "2026-02-08T20:10:00.000Z",
+            controlRoot: join(homeDir, ".ralph", "control"),
+            controlFilePath: join(homeDir, ".ralph", "control", "control.json"),
+            cwd: process.cwd(),
+            command: ["bun", "src/index.ts"],
+            ralphVersion: "test",
+          },
+          pid_alive: true,
+          identity: { ok: true, reason: null },
+        },
+      ],
+      controlCandidates: [],
+      roots: [],
+    };
+
+    const applied = applyDoctorRepairs({
+      snapshot,
+      recommendations: [
+        {
+          id: "promote-live-daemon-record-to-canonical",
+          code: "PROMOTE_LIVE_DAEMON_RECORD_TO_CANONICAL",
+          title: "Promote live daemon record to canonical path",
+          description: "",
+          risk: "safe",
+          applies_by_default: false,
+          paths: [legacyPath],
+        },
+      ],
+      dryRun: false,
+      nowIso: "2026-02-08T20:00:00.000Z",
+    });
+
+    expect(applied.some((item) => item.status === "skipped" && item.details.includes("managed legacy root"))).toBeTrue();
+    const canonicalPath = join(homeDir, ".ralph", "control", "daemon-registry.json");
+    expect(existsSync(canonicalPath)).toBeFalse();
+    rmSync(dirname(legacyPath), { recursive: true, force: true });
+  });
+
+  test("quarantines unsafe canonical daemon record and promotes safe legacy in same pass", () => {
+    const canonicalPath = join(homeDir, ".ralph", "control", "daemon-registry.json");
+    const legacyPath = join(xdgDir, "ralph", "daemon.json");
+    mkdirSync(join(homeDir, ".ralph", "control"), { recursive: true });
+    mkdirSync(join(xdgDir, "ralph"), { recursive: true });
+
+    writeFileSync(
+      canonicalPath,
+      `${JSON.stringify(
+        {
+          version: 1,
+          daemonId: "poisoned-canonical",
+          pid: process.pid,
+          startedAt: "2026-02-08T19:00:00.000Z",
+          heartbeatAt: "2026-02-08T19:10:00.000Z",
+          controlRoot: join("/tmp", "ralph", "poisoned"),
+          controlFilePath: join("/tmp", "ralph", "poisoned", "control.json"),
+          ralphVersion: "test",
+          command: ["bun", "src/index.ts"],
+          cwd: process.cwd(),
+        },
+        null,
+        2
+      )}\n`
+    );
+    writeFileSync(
+      legacyPath,
+      `${JSON.stringify(
+        {
+          version: 1,
+          daemonId: "legacy-live",
+          pid: process.pid,
+          startedAt: "2026-02-08T20:00:00.000Z",
+          heartbeatAt: "2026-02-08T20:10:00.000Z",
+          controlRoot: join(homeDir, ".ralph", "control"),
+          controlFilePath: join(homeDir, ".ralph", "control", "control.json"),
+          ralphVersion: "test",
+          command: ["bun", "src/index.ts"],
+          cwd: process.cwd(),
+        },
+        null,
+        2
+      )}\n`
+    );
+
+    const snapshot: DoctorSnapshot = {
+      daemonCandidates: [
+        {
+          path: canonicalPath,
+          root: join(homeDir, ".ralph", "control"),
+          is_canonical: true,
+          exists: true,
+          state: "live",
+          parse_error: null,
+          record: {
+            daemonId: "poisoned-canonical",
+            pid: process.pid,
+            startedAt: "2026-02-08T19:00:00.000Z",
+            heartbeatAt: "2026-02-08T19:10:00.000Z",
+            controlRoot: join("/tmp", "ralph", "poisoned"),
+            controlFilePath: join("/tmp", "ralph", "poisoned", "control.json"),
+            cwd: process.cwd(),
+            command: ["bun", "src/index.ts"],
+            ralphVersion: "test",
+          },
+          pid_alive: true,
+          identity: { ok: true, reason: null },
+        },
+        {
+          path: legacyPath,
+          root: join(xdgDir, "ralph"),
+          is_canonical: false,
+          exists: true,
+          state: "live",
+          parse_error: null,
+          record: {
+            daemonId: "legacy-live",
+            pid: process.pid,
+            startedAt: "2026-02-08T20:00:00.000Z",
+            heartbeatAt: "2026-02-08T20:10:00.000Z",
+            controlRoot: join(homeDir, ".ralph", "control"),
+            controlFilePath: join(homeDir, ".ralph", "control", "control.json"),
+            cwd: process.cwd(),
+            command: ["bun", "src/index.ts"],
+            ralphVersion: "test",
+          },
+          pid_alive: true,
+          identity: { ok: true, reason: null },
+        },
+      ],
+      controlCandidates: [],
+      roots: [],
+    };
+
+    const applied = applyDoctorRepairs({
+      snapshot,
+      recommendations: [
+        {
+          id: "quarantine-unsafe-canonical-daemon-record",
+          code: "QUARANTINE_UNSAFE_CANONICAL_DAEMON_RECORD",
+          title: "Quarantine unsafe canonical daemon record",
+          description: "",
+          risk: "safe",
+          applies_by_default: false,
+          paths: [canonicalPath],
+        },
+        {
+          id: "promote-live-daemon-record-to-canonical",
+          code: "PROMOTE_LIVE_DAEMON_RECORD_TO_CANONICAL",
+          title: "Promote live daemon record to canonical path",
+          description: "",
+          risk: "safe",
+          applies_by_default: false,
+          paths: [legacyPath, canonicalPath],
+        },
+      ],
+      dryRun: false,
+      nowIso: "2026-02-08T20:00:00.000Z",
+    });
+
+    expect(applied.some((item) => item.id === "quarantine-unsafe-canonical-daemon-record" && item.status === "applied")).toBeTrue();
+    expect(applied.some((item) => item.id === "promote-live-daemon-record-to-canonical" && item.status === "applied")).toBeTrue();
+    const canonicalRaw = readFileSync(canonicalPath, "utf8");
+    expect(canonicalRaw).toContain("legacy-live");
   });
 
   test("quarantines safe legacy control file duplicates", () => {
