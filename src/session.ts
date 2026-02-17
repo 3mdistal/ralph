@@ -67,6 +67,8 @@ export interface WatchdogTimeoutInfo {
   lastProgressMsAgo: number;
   argsPreview?: string;
   context?: string;
+  source?: string;
+  abortReason?: string;
   recentEvents?: string[];
 }
 
@@ -212,6 +214,58 @@ async function spawnServer(repoPath: string): Promise<ServerHandle> {
       }
     }, 30000);
   });
+}
+
+async function abortSessionViaServerApi(repoPath: string, sessionId: string): Promise<{ ok: boolean; reason?: string }> {
+  if (!isSafeSessionId(sessionId)) {
+    return { ok: false, reason: "unsafe-session-id" };
+  }
+
+  let handle: ServerHandle | null = null;
+  try {
+    handle = await spawnServer(repoPath);
+  } catch (e: any) {
+    return { ok: false, reason: `server-start-failed:${sanitizeOpencodeLog(e?.message ?? String(e))}` };
+  }
+
+  const baseUrl = handle.url.replace(/\/+$/, "");
+  const encodedId = encodeURIComponent(sessionId);
+  const endpoints: Array<{ path: string; body?: unknown }> = [
+    { path: `/session/${encodedId}/abort` },
+    { path: `/sessions/${encodedId}/abort` },
+    { path: `/v1/session/${encodedId}/abort` },
+    { path: `/v1/sessions/${encodedId}/abort` },
+    { path: "/session.abort", body: { path: { id: sessionId } } },
+    { path: "/v1/session.abort", body: { path: { id: sessionId } } },
+  ];
+
+  const failures: string[] = [];
+  try {
+    for (const endpoint of endpoints) {
+      try {
+        const response = await fetch(`${baseUrl}${endpoint.path}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(endpoint.body ?? { path: { id: sessionId } }),
+        });
+
+        if (response.ok) {
+          return { ok: true, reason: endpoint.path };
+        }
+
+        failures.push(`${endpoint.path}:${response.status}`);
+      } catch (e: any) {
+        failures.push(`${endpoint.path}:error:${sanitizeOpencodeLog(e?.message ?? String(e))}`);
+      }
+    }
+  } finally {
+    killServer(handle);
+  }
+
+  return {
+    ok: false,
+    reason: failures.length > 0 ? `no-abort-endpoint:${failures.slice(0, 3).join(",")}` : "no-abort-endpoint",
+  };
 }
 
 function killServer(handle: ServerHandle): void {
@@ -1018,6 +1072,9 @@ async function runSession(
       });
   const spawn = options?.__testOverrides?.spawn ?? spawnFn;
   const processKill = options?.__testOverrides?.processKill ?? process.kill;
+  const abortSession = options?.__testOverrides?.spawn
+    ? options?.__testOverrides?.abortSession
+    : options?.__testOverrides?.abortSession ?? options?.abortSession;
   const useProcessGroup = process.platform !== "win32";
 
   const proc = spawn(resolveOpencodeBin(), args, {
@@ -1295,6 +1352,61 @@ async function runSession(
         // ignore
       }
     }, 5000);
+  };
+
+  let processClosed = false;
+  if (typeof (proc as any)?.on === "function") {
+    proc.on("close", () => {
+      processClosed = true;
+    });
+  }
+
+  let killRequested = false;
+  const requestKillOnce = () => {
+    if (killRequested) return;
+    killRequested = true;
+    requestKill();
+  };
+
+  let watchdogTerminationRequested = false;
+  const requestWatchdogTermination = async () => {
+    if (watchdogTerminationRequested) return;
+    watchdogTerminationRequested = true;
+
+    if (abortSession && sessionId) {
+      try {
+        const aborted = await abortSession(repoPath, sessionId);
+        if (aborted.ok) {
+          if (watchdogTimeout) {
+            watchdogTimeout.source = "session.abort";
+            if (aborted.reason) watchdogTimeout.abortReason = aborted.reason;
+          }
+          console.warn(
+            `[ralph:watchdog] session.abort succeeded for ${sessionId}; waiting 5s before hard-kill fallback if process is still alive`
+          );
+          scheduler.setTimeout(() => {
+            if (processClosed) return;
+            if (watchdogTimeout) watchdogTimeout.source = "session.abort->kill-fallback";
+            requestKillOnce();
+          }, 5000);
+          return;
+        }
+
+        if (watchdogTimeout) {
+          watchdogTimeout.source = "session.abort-failed->kill-fallback";
+          if (aborted.reason) watchdogTimeout.abortReason = aborted.reason;
+        }
+      } catch (e: any) {
+        if (watchdogTimeout) {
+          watchdogTimeout.source = "session.abort-error->kill-fallback";
+          watchdogTimeout.abortReason = sanitizeOpencodeLog(e?.message ?? String(e));
+        }
+      }
+    } else if (watchdogTimeout) {
+      watchdogTimeout.source = sessionId ? "session.abort-unavailable->kill-fallback" : "no-session-id->kill-fallback";
+    }
+
+    requestKillOnce();
   };
 
   const watchdogEnabled = options?.watchdog?.enabled ?? true;
@@ -1614,7 +1726,7 @@ async function runSession(
                     trip.elapsedMsWithoutGate / 1000
                   )}s; killing opencode process`
                 );
-                requestKill();
+                requestKillOnce();
               }
             }
           }
@@ -1669,7 +1781,7 @@ async function runSession(
             `[ralph:stall] Session bootstrap timeout${ctx}: no session id after ${Math.round(elapsedMs / 1000)}s; killing opencode process`
           );
 
-          requestKill();
+          requestKillOnce();
           return;
         }
       }
@@ -1692,7 +1804,7 @@ async function runSession(
         `[ralph:stall] Hard timeout${ctx}: no stdout/stderr activity for ${Math.round(idleFor / 1000)}s; killing opencode process`
       );
 
-      requestKill();
+      requestKillOnce();
     }, 1000);
   }
 
@@ -1733,7 +1845,7 @@ async function runSession(
           `[ralph:watchdog] Hard timeout${ctx}: ${inFlight.toolName} ${inFlight.callId} after ${Math.round(elapsedMs / 1000)}s; killing opencode process`
         );
 
-        requestKill();
+        void requestWatchdogTermination();
       }
     }, 1000);
   }
@@ -1782,7 +1894,7 @@ async function runSession(
             guardrailsWallHardMs / 1000
           )}s; killing opencode process`
         );
-        requestKill();
+        requestKillOnce();
         return;
       }
 
@@ -1801,7 +1913,7 @@ async function runSession(
         console.warn(
           `[ralph:guardrail] Hard timeout${ctx}: tool calls ${toolStartCount} exceeded ${guardrailsToolCallsHard}; killing opencode process`
         );
-        requestKill();
+        requestKillOnce();
         return;
       }
 
@@ -1826,7 +1938,7 @@ async function runSession(
     let timeout: ReturnType<typeof setTimeout> | undefined;
 
     timeout = scheduler.setTimeout(() => {
-      requestKill();
+      requestKillOnce();
       resolve(124);
     }, fallbackTimeoutMs);
 
@@ -2180,6 +2292,7 @@ export type RunSessionTestOverrides = {
   scheduler?: Scheduler;
   sessionsDir?: string;
   processKill?: typeof process.kill;
+  abortSession?: (repoPath: string, sessionId: string) => Promise<{ ok: boolean; reason?: string }>;
   /** Overrides GitHub token resolution to avoid network in tests. */
   resolveGhTokenEnv?: () => Promise<string | null>;
 };
@@ -2200,7 +2313,11 @@ const cliOpenCodeBackend: OpenCodeBackend = {
   run: async (request) => {
     switch (request.kind) {
       case "agent": {
-        const merged: RunSessionInternalOptions = { agent: request.agent, ...(request.options ?? {}) };
+        const merged: RunSessionInternalOptions = {
+          agent: request.agent,
+          abortSession: cliOpenCodeBackend.abortSession,
+          ...(request.options ?? {}),
+        };
         if (request.testOverrides) merged.__testOverrides = request.testOverrides;
         return runSession(request.repoPath, request.message, merged);
       }
@@ -2208,13 +2325,18 @@ const cliOpenCodeBackend: OpenCodeBackend = {
         return runSession(request.repoPath, request.message, {
           continueSession: request.sessionId,
           agent: request.options?.agent,
+          abortSession: cliOpenCodeBackend.abortSession,
           ...(request.testOverrides ? { __testOverrides: request.testOverrides } : {}),
           ...(request.options ?? {}),
         });
       case "command": {
         const normalized = normalizeCommand(request.command)!;
         const message = ["/" + normalized, ...(request.args ?? [])].join(" ");
-        const merged: RunSessionInternalOptions = { command: normalized, ...(request.options ?? {}) };
+        const merged: RunSessionInternalOptions = {
+          command: normalized,
+          abortSession: cliOpenCodeBackend.abortSession,
+          ...(request.options ?? {}),
+        };
         if (request.testOverrides) merged.__testOverrides = request.testOverrides;
         return runSession(request.repoPath, message, merged);
       }
@@ -2224,6 +2346,7 @@ const cliOpenCodeBackend: OpenCodeBackend = {
         return runSession(request.repoPath, message, {
           command: normalized,
           continueSession: request.sessionId,
+          abortSession: cliOpenCodeBackend.abortSession,
           ...(request.testOverrides ? { __testOverrides: request.testOverrides } : {}),
           ...(request.options ?? {}),
         });
@@ -2231,7 +2354,7 @@ const cliOpenCodeBackend: OpenCodeBackend = {
     }
   },
   ensureOrAttachServer: (repoPath) => spawnServer(repoPath),
-  abortSession: async (_repoPath, _sessionId) => ({ ok: false, reason: "not-supported-by-cli-backend" }),
+  abortSession: async (repoPath, sessionId) => abortSessionViaServerApi(repoPath, sessionId),
   fetchMessages: async () => [],
   fetchStatus: async () => null,
   fetchDiff: async () => null,
@@ -2245,6 +2368,7 @@ type RunSessionInternalOptions = RunSessionOptionsBase & {
   command?: string;
   continueSession?: string;
   agent?: string;
+  abortSession?: (repoPath: string, sessionId: string) => Promise<{ ok: boolean; reason?: string }>;
   __testOverrides?: RunSessionTestOverrides;
 };
 
