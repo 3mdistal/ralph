@@ -183,7 +183,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
   test("classifyDurableStateInitError maps known failure classes", () => {
     const forward = classifyDurableStateInitError(
-      new Error("Unsupported state.sqlite schema_version=21; supported range=1..21 writable range=1..20.")
+      new Error("Unsupported state.sqlite schema_version=22; supported range=1..22 writable range=1..21.")
     );
     expect(forward.code).toBe("forward_incompatible");
     expect(forward.supportedRange).toBe(`1..${getDurableStateSchemaWindow().maxReadableSchema}`);
@@ -332,7 +332,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         integrity_check_result?: string;
       };
       expect(backupRow.from_schema_version).toBe(7);
-      expect(backupRow.to_schema_version).toBe(22);
+      expect(backupRow.to_schema_version).toBe(23);
       expect(backupRow.integrity_check_result).toBe("ok");
       expect(backupRow.backup_size_bytes).toBeGreaterThan(0);
       expect(backupRow.backup_sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -341,13 +341,13 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         "SELECT from_schema_version, to_schema_version, completed_at FROM state_migration_attempts ORDER BY id DESC LIMIT 1"
       ).get() as { from_schema_version?: number; to_schema_version?: number; completed_at?: string | null };
       expect(attemptRow.from_schema_version).toBe(7);
-      expect(attemptRow.to_schema_version).toBe(22);
+      expect(attemptRow.to_schema_version).toBe(23);
       expect(attemptRow.completed_at).toBeString();
 
       const completionCheckpoint = verify.query(
-        "SELECT checkpoint FROM state_migration_ledger WHERE checkpoint = 'schema-v22-complete' LIMIT 1"
+        "SELECT checkpoint FROM state_migration_ledger WHERE checkpoint = 'schema-v23-complete' LIMIT 1"
       ).get() as { checkpoint?: string } | undefined;
-      expect(completionCheckpoint?.checkpoint).toBe("schema-v22-complete");
+      expect(completionCheckpoint?.checkpoint).toBe("schema-v23-complete");
     } finally {
       verify.close();
     }
@@ -531,7 +531,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("22");
+      expect(meta.value).toBe("23");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -651,7 +651,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("22");
+      expect(meta.value).toBe("23");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -765,7 +765,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '21')");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '22')");
       db.exec(`
         CREATE TABLE IF NOT EXISTS ralph_run_gate_results (
           run_id TEXT NOT NULL,
@@ -782,6 +782,18 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
           PRIMARY KEY(run_id, gate)
+        );
+        CREATE TABLE IF NOT EXISTS ralph_run_gate_artifacts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          gate TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          content TEXT NOT NULL,
+          truncated INTEGER NOT NULL DEFAULT 0,
+          original_chars INTEGER,
+          original_lines INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
         );
       `);
     } finally {
@@ -813,6 +825,11 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'ralph_run_gate_results'")
         .get() as { sql?: string } | undefined;
       expect(gateResultsSql?.sql).toContain("plan_review");
+
+      const gateArtifactColumns = migrated.query("PRAGMA table_info(ralph_run_gate_artifacts)").all() as Array<{ name: string }>;
+      const gateArtifactColumnNames = gateArtifactColumns.map((column) => column.name);
+      expect(gateArtifactColumnNames).toContain("artifact_policy_version");
+      expect(gateArtifactColumnNames).toContain("truncation_mode");
     } finally {
       migrated.close();
     }
@@ -1139,7 +1156,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("22");
+      expect(meta.value).toBe("23");
 
       migrated
         .query(
@@ -1254,7 +1271,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("22");
+      expect(meta.value).toBe("23");
 
       const row = migrated
         .query("SELECT reason FROM ralph_run_gate_results WHERE run_id = 'run_v18' AND gate = 'ci'")
@@ -1376,7 +1393,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("22");
+      expect(meta.value).toBe("23");
 
       const backfilled = migrated
         .query("SELECT status FROM ralph_run_gate_results WHERE run_id = 'run_v20' AND gate = 'plan_review'")
@@ -1407,6 +1424,89 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         .query("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_ralph_run_gate_results_repo_issue_updated'")
         .get() as { name?: string } | undefined;
       expect(issueIndex?.name).toBe("idx_ralph_run_gate_results_repo_issue_updated");
+    } finally {
+      migrated.close();
+    }
+  });
+
+  test("migrates v21 gate artifacts to include artifact policy metadata columns", () => {
+    const dbPath = getRalphStateDbPath();
+    const db = new Database(dbPath);
+
+    try {
+      db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      db.exec("INSERT INTO meta(key, value) VALUES ('schema_version', '21')");
+      db.exec(`
+        CREATE TABLE repos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        INSERT INTO repos(name, created_at, updated_at)
+        VALUES ('3mdistal/ralph', '2026-01-20T12:00:00.000Z', '2026-01-20T12:00:00.000Z');
+
+        CREATE TABLE ralph_runs (
+          run_id TEXT PRIMARY KEY,
+          repo_id INTEGER NOT NULL,
+          issue_number INTEGER,
+          task_path TEXT,
+          attempt_kind TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          outcome TEXT,
+          details_json TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+        );
+        INSERT INTO ralph_runs(
+          run_id, repo_id, issue_number, task_path, attempt_kind, started_at, created_at, updated_at
+        ) VALUES (
+          'run_v21', 1, 1, 'github:3mdistal/ralph#1', 'process',
+          '2026-01-20T12:00:01.000Z', '2026-01-20T12:00:01.000Z', '2026-01-20T12:00:01.000Z'
+        );
+
+        CREATE TABLE ralph_run_gate_artifacts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL,
+          gate TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          content TEXT NOT NULL,
+          truncated INTEGER NOT NULL DEFAULT 0,
+          original_chars INTEGER,
+          original_lines INTEGER,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          FOREIGN KEY(run_id) REFERENCES ralph_runs(run_id) ON DELETE CASCADE
+        );
+
+        INSERT INTO ralph_run_gate_artifacts(
+          run_id, gate, kind, content, truncated, original_chars, original_lines, created_at, updated_at
+        ) VALUES (
+          'run_v21', 'ci', 'failure_excerpt', 'legacy-artifact', 0, 15, 1, '2026-01-20T12:00:02.000Z', '2026-01-20T12:00:02.000Z'
+        );
+      `);
+    } finally {
+      db.close();
+    }
+
+    closeStateDbForTests();
+    initStateDb();
+
+    const migrated = new Database(dbPath);
+    try {
+      const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
+      expect(meta.value).toBe("23");
+
+      const row = migrated
+        .query(
+          "SELECT content, artifact_policy_version, truncation_mode FROM ralph_run_gate_artifacts WHERE run_id = 'run_v21' LIMIT 1"
+        )
+        .get() as { content?: string; artifact_policy_version?: number; truncation_mode?: string } | undefined;
+      expect(row?.content).toBe("legacy-artifact");
+      expect(row?.artifact_policy_version).toBe(0);
+      expect(row?.truncation_mode).toBe("tail");
     } finally {
       migrated.close();
     }
@@ -1443,6 +1543,75 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(artifacts.some((artifact) => artifact.content === "artifact-0")).toBe(false);
     expect(artifacts.some((artifact) => artifact.content === "artifact-1")).toBe(false);
     expect(artifacts.some((artifact) => artifact.content.includes("artifact-11"))).toBe(true);
+  });
+
+  test("gate artifact policy persists truncation mode and policy version", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#234",
+      taskPath: "github:3mdistal/ralph#234",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:20:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:20:01.000Z" });
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "note",
+      content: `head-${"x".repeat(900)}`,
+      at: "2026-01-20T12:20:02.000Z",
+    });
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "failure_excerpt",
+      content: `prefix-${"y".repeat(9000)}-suffix`,
+      at: "2026-01-20T12:20:03.000Z",
+    });
+
+    const state = getRalphRunGateState(runId);
+    const note = state.artifacts.find((artifact) => artifact.kind === "note");
+    const excerpt = state.artifacts.find((artifact) => artifact.kind === "failure_excerpt");
+
+    expect(note?.artifactPolicyVersion).toBe(1);
+    expect(note?.truncationMode).toBe("head");
+    expect(note?.truncated).toBe(true);
+    expect(note?.content.startsWith("head-")).toBe(true);
+
+    expect(excerpt?.artifactPolicyVersion).toBe(1);
+    expect(excerpt?.truncationMode).toBe("tail");
+    expect(excerpt?.truncated).toBe(true);
+    expect(excerpt?.content.endsWith("-suffix")).toBe(true);
+  });
+
+  test("gate result fields are redacted and bounded", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#234",
+      taskPath: "github:3mdistal/ralph#234",
+      attemptKind: "process",
+      startedAt: "2026-01-20T12:20:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T12:20:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "fail",
+      reason: `Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz1234567890 ${"z".repeat(500)}`,
+      at: "2026-01-20T12:20:04.000Z",
+    });
+
+    const state = getRalphRunGateState(runId);
+    const ci = state.results.find((result) => result.gate === "ci");
+    expect(ci?.reason).not.toContain("ghp_");
+    expect(ci?.reason).toContain("[REDACTED]");
+    expect((ci?.reason ?? "").length).toBeLessThanOrEqual(400);
   });
 
   test("latest gate selection is deterministic with ties", () => {
@@ -1654,7 +1823,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("22");
+      expect(meta.value).toBe("23");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);

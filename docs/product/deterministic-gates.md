@@ -110,7 +110,8 @@ JSON contract (`--json`):
 - `gates[]` contains latest per-gate state in workflow order (`preflight`, `plan_review`, `product_review`, `devex_review`, `ci`, `pr_evidence`) with:
   - `name`, `status`, `createdAt`, `updatedAt`, `command`, `skipReason`, `reason`, `url`, `prNumber`, `prUrl`.
 - `artifacts[]` contains bounded artifact records with:
-  - `id`, `gate`, `kind`, `createdAt`, `updatedAt`, `truncated`, `content`.
+  - `id`, `gate`, `kind`, `createdAt`, `updatedAt`, `truncated`, `truncationMode`, `artifactPolicyVersion`, `originalChars`, `originalLines`, `content`.
+- Artifact policy defaults (v1): short text fields use head truncation (512 chars), log-like fields use tail truncation (8192 chars, 200 lines), and list payloads keep first 50 items before per-item truncation.
 - `error` is `null` on success. On durable-state failure, `error` is populated with `code`, `message`, and (when available) schema compatibility fields.
 - Compatibility rule: JSON evolution is additive-only (new optional fields may be added; existing fields and meanings are stable).
 
