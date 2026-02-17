@@ -42,7 +42,7 @@ export class GitHubApiError extends Error {
   }
 }
 
-export class GitHubDeferredError extends Error {
+class GitHubDeferredError extends Error {
   readonly lane: GitHubLane;
   readonly untilTs: number;
   readonly reason: "cooldown" | "lane_budget" | "pressure";

@@ -296,10 +296,6 @@ export function observeGitHubHeaders(params: {
   persistSummaryBestEffort(params.nowMs);
 }
 
-export function getGitHubGovernorSummary(nowMs: number = Date.now()): GitHubGovernorSummary {
-  return buildSummary(nowMs);
-}
-
 export function getGitHubGovernorSummaryForStatus(nowMs: number = Date.now()): GitHubGovernorSummary {
   const inMemory = buildSummary(nowMs);
   try {
