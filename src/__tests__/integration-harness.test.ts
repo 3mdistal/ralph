@@ -207,6 +207,7 @@ describe("integration-ish harness: full task lifecycle", () => {
     notifyErrorMock.mockClear();
     notifyTaskCompleteMock.mockClear();
     runAgentMock.mockClear();
+    runAgentMock.mockImplementation(defaultRunAgentImpl);
     continueSessionMock.mockClear();
     continueSessionMock.mockImplementation(defaultContinueSessionImpl);
     continueCommandMock.mockClear();
@@ -601,7 +602,7 @@ describe("integration-ish harness: full task lifecycle", () => {
         };
       }
       events.push("plan");
-      return defaultRunAgentImpl();
+      return defaultRunAgentImpl(...args);
     });
 
     const task = createMockTask();
