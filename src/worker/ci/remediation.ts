@@ -5,8 +5,8 @@ import { parseIssueRef } from "../../github/issue-ref";
 import { redactSensitiveText } from "../../redaction";
 
 import { findCiDebugComment, type CiDebugCommentState, type CiTriageCommentState } from "../../github/ci-debug-comment";
-import { buildCiTriageDecision } from "../../ci-triage/core";
-import { buildCiFailureSignatureV2 } from "../../ci-triage/signature";
+import { buildCiTriageExecutionPlan } from "../../ci-triage/core";
+import { buildCiFailureSignatureV3 } from "../../ci-triage/signature";
 import { summarizeRequiredChecks } from "../lanes/required-checks";
 
 // Keep these values aligned with src/worker/repo-worker.ts
@@ -69,7 +69,7 @@ export async function runCiFailureTriage(
   const failureEntries = remediation.logs.length > 0
     ? remediation.logs
     : remediation.failedChecks.map((check: any) => ({ ...check, logExcerpt: null }));
-  const signature = buildCiFailureSignatureV2({
+  const signature = buildCiFailureSignatureV3({
     timedOut: params.timedOut,
     failures: failureEntries.map((entry: any) => ({
       name: entry.name,
@@ -89,7 +89,7 @@ export async function runCiFailureTriage(
   const attemptNumber = Math.max(0, existingTriage.attemptCount ?? 0) + 1;
   const priorSignature = existingTriage.lastSignature ?? null;
 
-  const decision = buildCiTriageDecision({
+  const plan = buildCiTriageExecutionPlan({
     timedOut: params.timedOut,
     failures: failureEntries.map((entry: any) => ({
       name: entry.name,
@@ -102,7 +102,9 @@ export async function runCiFailureTriage(
     hasSession,
     signature: signature.signature,
     priorSignature,
+    signatureVersion: signature.version,
   });
+  const decision = plan.decision;
 
   const triageRecord = worker.buildCiTriageRecord({
     signature,
@@ -114,7 +116,20 @@ export async function runCiFailureTriage(
     failedChecks: remediation.failedChecks,
     commands: remediation.commands,
   });
-  worker.recordCiTriageArtifact(triageRecord);
+  if (!worker.recordCiTriageArtifact(triageRecord)) {
+    const reason = `Failed to persist CI triage artifact for ${params.prUrl}; refusing to run remediation side effects`;
+    console.warn(`[ralph:worker:${worker.repo}] ${reason}`);
+    return {
+      status: "failed",
+      run: {
+        taskName: params.task.name,
+        repo: worker.repo,
+        outcome: "failed",
+        sessionId: sessionId || undefined,
+        escalationReason: reason,
+      },
+    };
+  }
 
   console.log(
     `[ralph:worker:${worker.repo}] CI triage decision action=${decision.action} classification=${decision.classification} ` +
@@ -130,7 +145,7 @@ export async function runCiFailureTriage(
     lastUpdatedAt: new Date().toISOString(),
   };
 
-  if (attemptNumber > maxAttempts) {
+  if (!plan.attemptAllowed) {
     const reason = `Required checks not passing after ${maxAttempts} triage attempt(s); refusing to merge ${params.prUrl}`;
     return worker.escalateCiDebugRecovery({
       task: params.task,
@@ -189,6 +204,32 @@ export async function runCiFailureTriage(
   };
 
   if (decision.action === "quarantine") {
+    let followupIssue: { number: number; url: string } | null = null;
+    try {
+      followupIssue = await worker.upsertCiQuarantineFollowupIssue({
+        sourceIssue: issueRef,
+        signature: signature.signature,
+        occurrence: {
+          key: `${signature.signature}:${attemptNumber}:${headSha}`,
+          at: new Date().toISOString(),
+          sourceIssueNumber: issueRef.number,
+          prUrl: params.prUrl,
+          classification: decision.classification,
+          attempt: attemptNumber,
+          maxAttempts,
+          failingChecks: triageRecord.failingChecks,
+        },
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${worker.repo}] Failed to upsert CI quarantine follow-up issue: ${error?.message ?? String(error)}`
+      );
+    }
+    if (followupIssue) {
+      triageRecord.followupIssue = followupIssue;
+      worker.recordCiTriageArtifact(triageRecord);
+    }
+
     const backoffMs = worker.computeCiRemediationBackoffMs(attemptNumber);
     const resumeAt = new Date(Date.now() + backoffMs).toISOString();
     const lines = worker.buildCiTriageCommentLines({

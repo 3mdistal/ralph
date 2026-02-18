@@ -115,8 +115,19 @@ import {
   type CiDebugCommentState,
   type CiTriageCommentState,
 } from "../github/ci-debug-comment";
-import { buildCiTriageDecision, type CiFailureClassification, type CiNextAction, type CiTriageDecision } from "../ci-triage/core";
-import { buildCiFailureSignatureV2, type CiFailureSignatureV2 } from "../ci-triage/signature";
+import {
+  appendCiQuarantineOccurrence,
+  buildCiQuarantineFollowupBody,
+  buildCiQuarantineFollowupMarker,
+  createCiQuarantineIssue,
+  findOpenCiQuarantineIssueByMarker,
+  getCiQuarantineIssue,
+  parseCiQuarantineFollowupState,
+  updateCiQuarantineIssue,
+  type CiQuarantineFollowupOccurrence,
+} from "../github/ci-quarantine-followup";
+import { type CiFailureClassification, type CiNextAction, type CiTriageDecision } from "../ci-triage/core";
+import { type CiFailureSignatureV3 } from "../ci-triage/signature";
 import {
   buildMergeConflictCommentBody,
   createMergeConflictComment,
@@ -179,6 +190,7 @@ import {
   getIdempotencyRecord,
   getIdempotencyPayload,
   getLatestRunIdForSession,
+  getCiQuarantineFollowupMapping,
   getLoopTriageAttempt,
   getParentVerificationState,
   getRalphRunTokenTotals,
@@ -196,6 +208,7 @@ import {
   type RalphRunAttemptKind,
   type RalphRunDetails,
   tryClaimParentVerification,
+  upsertCiQuarantineFollowupMapping,
   upsertIdempotencyKey,
   upsertRalphRunGateResult,
 } from "../state";
@@ -381,8 +394,8 @@ type CiFailureTriageOutcome =
     };
 
 type CiTriageRecord = {
-  version: 1;
-  signatureVersion: 2;
+  version: 2;
+  signatureVersion: number;
   signature: string;
   classification: CiFailureClassification;
   classificationReason: string;
@@ -394,6 +407,7 @@ type CiTriageRecord = {
   priorSignature: string | null;
   failingChecks: Array<{ name: string; rawState: string; detailsUrl?: string | null }>;
   commands: string[];
+  followupIssue?: { number: number; url: string };
 };
 
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
@@ -3028,9 +3042,9 @@ export class RepoWorker {
     }
   }
 
-  private recordCiTriageArtifact(record: CiTriageRecord): void {
+  private recordCiTriageArtifact(record: CiTriageRecord): boolean {
     const runId = this.activeRunId;
-    if (!runId) return;
+    if (!runId) return false;
 
     try {
       recordRalphRunGateArtifact({
@@ -3039,10 +3053,12 @@ export class RepoWorker {
         kind: "note",
         content: JSON.stringify(record),
       });
+      return true;
     } catch (error: any) {
       console.warn(
         `[ralph:worker:${this.repo}] Failed to persist CI triage artifact: ${error?.message ?? String(error)}`
       );
+      return false;
     }
   }
 
@@ -3103,7 +3119,7 @@ export class RepoWorker {
   }
 
   private buildCiTriageRecord(params: {
-    signature: CiFailureSignatureV2;
+    signature: CiFailureSignatureV3;
     decision: CiTriageDecision;
     timedOut: boolean;
     attempt: number;
@@ -3113,7 +3129,7 @@ export class RepoWorker {
     commands: string[];
   }): CiTriageRecord {
     return {
-      version: 1,
+      version: 2,
       signatureVersion: params.signature.version,
       signature: params.signature.signature,
       classification: params.decision.classification,
@@ -3558,6 +3574,78 @@ export class RepoWorker {
     }
 
     await createCiDebugComment({ github: this.github, repo: this.repo, issueNumber: params.issueNumber, body });
+  }
+
+  private async upsertCiQuarantineFollowupIssue(params: {
+    sourceIssue: IssueRef;
+    signature: string;
+    occurrence: CiQuarantineFollowupOccurrence;
+  }): Promise<{ number: number; url: string } | null> {
+    const signature = params.signature.trim();
+    if (!signature) return null;
+
+    const { marker } = buildCiQuarantineFollowupMarker({ repo: this.repo, signature });
+    const sourceIssueRef = `${params.sourceIssue.repo}#${params.sourceIssue.number}`;
+    const title = `CI quarantine follow-up: ${signature.slice(0, 12)}`;
+
+    let candidate = null as Awaited<ReturnType<typeof getCiQuarantineIssue>>;
+    const mapped = getCiQuarantineFollowupMapping({ repo: this.repo, signature });
+    if (mapped?.issueNumber) {
+      const mappedIssue = await getCiQuarantineIssue({ github: this.github, repo: this.repo, issueNumber: mapped.issueNumber });
+      if (mappedIssue?.body?.includes(marker)) {
+        candidate = mappedIssue;
+      }
+    }
+
+    if (!candidate) {
+      candidate = await findOpenCiQuarantineIssueByMarker({ github: this.github, repo: this.repo, marker });
+    }
+
+    const previous = candidate ? parseCiQuarantineFollowupState(candidate.body) : null;
+    const next = appendCiQuarantineOccurrence({
+      previous,
+      signature,
+      sourceIssueNumber: params.sourceIssue.number,
+      occurrence: params.occurrence,
+    });
+    const body = buildCiQuarantineFollowupBody({
+      marker,
+      state: next.state,
+      sourceIssueRef,
+    });
+
+    let finalIssue: Awaited<ReturnType<typeof getCiQuarantineIssue>> = null;
+    if (candidate) {
+      if (!next.changed && candidate.state === "open" && candidate.body.trim() === body.trim()) {
+        finalIssue = candidate;
+      } else {
+        finalIssue = await updateCiQuarantineIssue({
+          github: this.github,
+          repo: this.repo,
+          issueNumber: candidate.number,
+          title,
+          body,
+          reopen: candidate.state !== "open",
+        });
+      }
+    } else {
+      finalIssue = await createCiQuarantineIssue({
+        github: this.github,
+        repo: this.repo,
+        title,
+        body,
+      });
+    }
+
+    if (!finalIssue) return null;
+    upsertCiQuarantineFollowupMapping({
+      repo: this.repo,
+      signature,
+      followupIssueNumber: finalIssue.number,
+      followupIssueUrl: finalIssue.url,
+      sourceIssueNumber: params.sourceIssue.number,
+    });
+    return { number: finalIssue.number, url: finalIssue.url };
   }
 
   private async applyCiDebugLabels(issue: IssueRef): Promise<void> {

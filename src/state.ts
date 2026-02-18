@@ -17,7 +17,7 @@ import {
   type DurableStateSchemaWindow,
 } from "./durable-state-capability";
 
-const SCHEMA_VERSION = 23;
+const SCHEMA_VERSION = 24;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
@@ -171,6 +171,15 @@ export type LoopTriageAttemptState = {
   lastDecision: string | null;
   lastRationale: string | null;
   lastUpdatedAtMs: number;
+};
+
+export type CiQuarantineFollowupMapping = {
+  repo: string;
+  signature: string;
+  issueNumber: number;
+  issueUrl: string;
+  sourceIssueNumber: number;
+  updatedAt: string;
 };
 
 const GATE_NAMES: GateName[] = ["preflight", "plan_review", "product_review", "devex_review", "ci", "pr_evidence"];
@@ -1701,6 +1710,34 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             appliedAt: nowIso(),
           });
         }
+        if (existingVersion < 24) {
+          database.exec(
+            "CREATE TABLE IF NOT EXISTS ci_quarantine_followups (" +
+              "repo_id INTEGER NOT NULL, " +
+              "signature TEXT NOT NULL, " +
+              "followup_issue_number INTEGER NOT NULL, " +
+              "followup_issue_url TEXT NOT NULL, " +
+              "source_issue_number INTEGER NOT NULL, " +
+              "created_at TEXT NOT NULL, " +
+              "updated_at TEXT NOT NULL, " +
+              "PRIMARY KEY(repo_id, signature), " +
+              "UNIQUE(repo_id, followup_issue_number), " +
+              "FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE" +
+              ")"
+          );
+          database.exec(
+            "CREATE INDEX IF NOT EXISTS idx_ci_quarantine_followups_repo_source_updated " +
+              "ON ci_quarantine_followups(repo_id, source_issue_number, updated_at)"
+          );
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 24,
+            checkpoint: "v24-ci-quarantine-followup-mapping",
+            checksum: sha256Hex("state:migration:v24-ci-quarantine-followup-mapping"),
+            backupId,
+            appliedAt: nowIso(),
+          });
+        }
         recordStateMigrationCheckpoint(database, {
           fromVersion: existingVersion,
           toVersion: SCHEMA_VERSION,
@@ -2125,6 +2162,19 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS ci_quarantine_followups (
+      repo_id INTEGER NOT NULL,
+      signature TEXT NOT NULL,
+      followup_issue_number INTEGER NOT NULL,
+      followup_issue_url TEXT NOT NULL,
+      source_issue_number INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(repo_id, signature),
+      UNIQUE(repo_id, followup_issue_number),
+      FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS state_migration_backups (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       from_schema_version INTEGER,
@@ -2191,6 +2241,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       ON issue_status_transition_guard(repo_id, updated_at_ms);
     CREATE INDEX IF NOT EXISTS idx_loop_triage_attempts_repo_issue_updated
       ON loop_triage_attempts(repo_id, issue_number, last_updated_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_ci_quarantine_followups_repo_source_updated
+      ON ci_quarantine_followups(repo_id, source_issue_number, updated_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_state_migration_backups_path ON state_migration_backups(backup_path);
   `);
 
@@ -5224,6 +5276,119 @@ export function bumpLoopTriageAttempt(params: {
       lastUpdatedAtMs: Math.max(0, Math.floor(nowMs)),
     }
   );
+}
+
+export function getCiQuarantineFollowupMapping(params: {
+  repo: string;
+  signature: string;
+}): CiQuarantineFollowupMapping | null {
+  if (!db) return null;
+  const signature = params.signature.trim();
+  if (!signature) return null;
+
+  const database = requireDb();
+  const row = database
+    .query(
+      `SELECT c.signature as signature,
+              c.followup_issue_number as followup_issue_number,
+              c.followup_issue_url as followup_issue_url,
+              c.source_issue_number as source_issue_number,
+              c.updated_at as updated_at
+       FROM ci_quarantine_followups c
+       JOIN repos r ON r.id = c.repo_id
+       WHERE r.name = $repo AND c.signature = $signature`
+    )
+    .get({
+      $repo: params.repo,
+      $signature: signature,
+    }) as
+    | {
+        signature?: string | null;
+        followup_issue_number?: number | null;
+        followup_issue_url?: string | null;
+        source_issue_number?: number | null;
+        updated_at?: string | null;
+      }
+    | undefined;
+
+  const issueNumber = Number(row?.followup_issue_number ?? 0);
+  const issueUrl = String(row?.followup_issue_url ?? "").trim();
+  if (!issueNumber || !issueUrl) return null;
+  return {
+    repo: params.repo,
+    signature: String(row?.signature ?? signature),
+    issueNumber,
+    issueUrl,
+    sourceIssueNumber: Number(row?.source_issue_number ?? 0) || 0,
+    updatedAt: String(row?.updated_at ?? "").trim() || nowIso(),
+  };
+}
+
+export function upsertCiQuarantineFollowupMapping(params: {
+  repo: string;
+  signature: string;
+  followupIssueNumber: number;
+  followupIssueUrl: string;
+  sourceIssueNumber: number;
+  at?: string;
+}): CiQuarantineFollowupMapping {
+  const database = requireDb();
+  const signature = params.signature.trim();
+  if (!signature) {
+    throw new Error("CI quarantine follow-up signature is required");
+  }
+  const issueNumber = Math.max(1, Math.floor(params.followupIssueNumber));
+  const sourceIssueNumber = Math.max(1, Math.floor(params.sourceIssueNumber));
+  const issueUrl = sanitizeOptionalText(params.followupIssueUrl, 500);
+  if (!issueUrl) {
+    throw new Error("CI quarantine follow-up issue URL is required");
+  }
+  const at = params.at?.trim() || nowIso();
+  const repoId = upsertRepo({ repo: params.repo, at });
+
+  database
+    .query(
+      `INSERT INTO ci_quarantine_followups(
+         repo_id,
+         signature,
+         followup_issue_number,
+         followup_issue_url,
+         source_issue_number,
+         created_at,
+         updated_at
+       ) VALUES (
+         $repo_id,
+         $signature,
+         $followup_issue_number,
+         $followup_issue_url,
+         $source_issue_number,
+         $created_at,
+         $updated_at
+       )
+       ON CONFLICT(repo_id, signature) DO UPDATE SET
+         followup_issue_number = excluded.followup_issue_number,
+         followup_issue_url = excluded.followup_issue_url,
+         source_issue_number = excluded.source_issue_number,
+         updated_at = excluded.updated_at`
+    )
+    .run({
+      $repo_id: repoId,
+      $signature: signature,
+      $followup_issue_number: issueNumber,
+      $followup_issue_url: issueUrl,
+      $source_issue_number: sourceIssueNumber,
+      $created_at: at,
+      $updated_at: at,
+    });
+
+  return {
+    repo: params.repo,
+    signature,
+    issueNumber,
+    issueUrl,
+    sourceIssueNumber,
+    updatedAt: at,
+  };
 }
 
 export function setParentVerificationPending(params: {
