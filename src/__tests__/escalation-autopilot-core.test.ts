@@ -67,6 +67,17 @@ describe("escalation autopilot core", () => {
     expect(contract).toEqual({ eligible: false, reason: "contract-surface" });
   });
 
+  test("NO PRODUCT GAP marker suppresses product-gap detection", () => {
+    const mixedMarkers = evaluateAutopilotEligibility({
+      escalationType: "watchdog",
+      reason: "tool timeout",
+      noteContent: ["PRODUCT GAP: stale note", "NO PRODUCT GAP: clarified in docs"].join("\n"),
+      decision: buildDecision(),
+    });
+
+    expect(mixedMarkers).toEqual({ eligible: true });
+  });
+
   test("blocked eligibility requires dependency reference", () => {
     const blockedNoRef = evaluateAutopilotEligibility({
       escalationType: "blocked",

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasProductGap, selectPrUrl } from "../routing";
+import { hasProductGap, resolveProductGapAcrossOutputs, selectPrUrl } from "../routing";
 
 describe("hasProductGap", () => {
   test("true only for explicit PRODUCT GAP: markers", () => {
@@ -21,6 +21,26 @@ describe("hasProductGap", () => {
     expect(hasProductGap("this is not documented anywhere")).toBe(false);
     expect(hasProductGap("PRODUCT GAP")).toBe(false);
     expect(hasProductGap("Here is the marker: PRODUCT GAP: missing policy")).toBe(false);
+  });
+
+  test("NO PRODUCT GAP overrides PRODUCT GAP when both appear", () => {
+    const productThenNo = ["PRODUCT GAP: missing policy", "NO PRODUCT GAP: policy actually exists"].join("\n");
+    const noThenProduct = ["NO PRODUCT GAP: fully specified", "PRODUCT GAP: stale assertion"].join("\n");
+
+    expect(hasProductGap(productThenNo)).toBe(false);
+    expect(hasProductGap(noThenProduct)).toBe(false);
+  });
+
+  test("resolves precedence across multiple outputs", () => {
+    expect(resolveProductGapAcrossOutputs(["PRODUCT GAP: missing behavior", "extra notes"]))
+      .toBe("product-gap");
+
+    expect(
+      resolveProductGapAcrossOutputs([
+        "PRODUCT GAP: missing behavior",
+        "NO PRODUCT GAP: clarified in canonical docs",
+      ])
+    ).toBe("no-product-gap");
   });
 });
 

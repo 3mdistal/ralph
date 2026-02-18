@@ -141,4 +141,17 @@ describe("escalation consultant core", () => {
 
     expect(prompt).not.toContain("Product-gap escalation");
   });
+
+  test("NO PRODUCT GAP overrides PRODUCT GAP in prompt specialization", () => {
+    const prompt = buildConsultantPrompt({
+      issue: "3mdistal/ralph#1",
+      repo: "3mdistal/ralph",
+      taskName: "Test task",
+      escalationType: "other",
+      reason: "Needs guidance",
+      noteContent: ["PRODUCT GAP: stale note", "NO PRODUCT GAP: clarified in docs"].join("\n"),
+    });
+
+    expect(prompt).not.toContain("Product-gap escalation");
+  });
 });

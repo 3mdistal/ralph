@@ -18,6 +18,15 @@ describe("parseRalphPlanReviewMarker", () => {
     }
   });
 
+  test("parses marker with leading whitespace", () => {
+    const output = ["notes", '   RALPH_PLAN_REVIEW: {"status":"pass","reason":"ok"}'].join("\n");
+    const result = parseRalphPlanReviewMarker(output);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.status).toBe("pass");
+    }
+  });
+
   test("fails when marker is missing", () => {
     const result = parseRalphPlanReviewMarker("No marker present");
     expect(result.ok).toBe(false);
@@ -31,6 +40,15 @@ describe("parseRalphPlanReviewMarker", () => {
       'RALPH_PLAN_REVIEW: {"status":"pass","reason":"ok"}',
       "extra",
     ].join("\n");
+    const result = parseRalphPlanReviewMarker(output);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.failure).toBe("marker_not_final_line");
+    }
+  });
+
+  test("fails when a trailing code fence appears after marker", () => {
+    const output = ['RALPH_PLAN_REVIEW: {"status":"pass","reason":"ok"}', "```"].join("\n");
     const result = parseRalphPlanReviewMarker(output);
     expect(result.ok).toBe(false);
     if (!result.ok) {

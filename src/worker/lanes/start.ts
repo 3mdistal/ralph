@@ -4,7 +4,7 @@ import { getRepoBotBranch } from "../../config";
 import { isRepoAllowed } from "../../github-app-auth";
 import { appendChildDossierToIssueContext } from "../../child-dossier/core";
 import { buildPlannerPrompt } from "../../planner-prompt";
-import { hasProductGap, parseRoutingDecision, selectPrUrl } from "../../routing";
+import { parseRoutingDecision, resolveProductGapAcrossOutputs, selectPrUrl } from "../../routing";
 import { isExplicitBlockerReason, isImplementationTaskFromIssue, shouldConsultDevex } from "../../escalation";
 import { summarizeForNote } from "../run-notes";
 import { parseIssueRef } from "../../github/issue-ref";
@@ -446,7 +446,8 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
         }
 
         let routing = parseRoutingDecision(planResult.output);
-        let hasGap = hasProductGap(planResult.output) || Boolean(planReview?.hasProductGap);
+        const gapOutputs = [planResult.output, planReview?.output ?? ""];
+        let hasGap = resolveProductGapAcrossOutputs(gapOutputs) === "product-gap";
 
         await this.recordCheckpoint(task, "routed", planResult.sessionId);
 
@@ -574,7 +575,8 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               const updatedRouting = parseRoutingDecision(rerouteResult.output);
               if (updatedRouting) routing = updatedRouting;
 
-              hasGap = hasGap || hasProductGap(rerouteResult.output);
+              gapOutputs.push(rerouteResult.output);
+              hasGap = resolveProductGapAcrossOutputs(gapOutputs) === "product-gap";
             }
           }
         }
