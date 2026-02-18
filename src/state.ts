@@ -17,7 +17,7 @@ import {
   type DurableStateSchemaWindow,
 } from "./durable-state-capability";
 
-const SCHEMA_VERSION = 23;
+const SCHEMA_VERSION = 24;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
@@ -179,6 +179,7 @@ const GATE_ARTIFACT_KINDS: GateArtifactKind[] = ["command_output", "failure_exce
 const GATE_NAME_CHECK_CONSTRAINT_SQL = `CHECK (gate IN (${GATE_NAMES.map((gate) => quoteSqlLiteral(gate)).join(", ")}))`;
 
 const ARTIFACT_MAX_PER_GATE_KIND = 10;
+const CI_CLASSIFIER_PAYLOAD_MAX_CHARS = 8192;
 
 let db: Database | null = null;
 let dbPath: string | null = null;
@@ -337,23 +338,55 @@ function requiresGateEnumRepair(database: Database): boolean {
 
 function rebuildGateTablesForCurrentGateSet(database: Database): void {
   const hasReason = columnExists(database, "ralph_run_gate_results", "reason");
+  const hasCiClassifierVersion = columnExists(database, "ralph_run_gate_results", "ci_classifier_version");
+  const hasCiClassifierPayloadJson = columnExists(database, "ralph_run_gate_results", "ci_classifier_payload_json");
   const hasArtifactPolicyVersion = columnExists(database, "ralph_run_gate_artifacts", "artifact_policy_version");
   const hasTruncationMode = columnExists(database, "ralph_run_gate_artifacts", "truncation_mode");
   const resultsInsert = hasReason
     ? `
       INSERT INTO ralph_run_gate_results_repaired(
-        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, ci_classifier_version, ci_classifier_payload_json, repo_id, issue_number, task_path, created_at, updated_at
       )
       SELECT
-        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+        run_id,
+        gate,
+        status,
+        command,
+        skip_reason,
+        reason,
+        url,
+        pr_number,
+        pr_url,
+        ${hasCiClassifierVersion ? "ci_classifier_version" : "NULL"},
+        ${hasCiClassifierPayloadJson ? "ci_classifier_payload_json" : "NULL"},
+        repo_id,
+        issue_number,
+        task_path,
+        created_at,
+        updated_at
       FROM ralph_run_gate_results;
     `
     : `
       INSERT INTO ralph_run_gate_results_repaired(
-        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+        run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, ci_classifier_version, ci_classifier_payload_json, repo_id, issue_number, task_path, created_at, updated_at
       )
       SELECT
-        run_id, gate, status, command, skip_reason, NULL, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+        run_id,
+        gate,
+        status,
+        command,
+        skip_reason,
+        NULL,
+        url,
+        pr_number,
+        pr_url,
+        ${hasCiClassifierVersion ? "ci_classifier_version" : "NULL"},
+        ${hasCiClassifierPayloadJson ? "ci_classifier_payload_json" : "NULL"},
+        repo_id,
+        issue_number,
+        task_path,
+        created_at,
+        updated_at
       FROM ralph_run_gate_results;
     `;
 
@@ -387,6 +420,8 @@ function rebuildGateTablesForCurrentGateSet(database: Database): void {
       url TEXT,
       pr_number INTEGER,
       pr_url TEXT,
+      ci_classifier_version INTEGER,
+      ci_classifier_payload_json TEXT,
       repo_id INTEGER NOT NULL,
       issue_number INTEGER,
       task_path TEXT,
@@ -474,6 +509,18 @@ const SCHEMA_INVARIANTS: SchemaInvariant[] = [
     kind: "column",
     tableName: "ralph_run_gate_results",
     columnName: "reason",
+    definition: "TEXT",
+  },
+  {
+    kind: "column",
+    tableName: "ralph_run_gate_results",
+    columnName: "ci_classifier_version",
+    definition: "INTEGER",
+  },
+  {
+    kind: "column",
+    tableName: "ralph_run_gate_results",
+    columnName: "ci_classifier_payload_json",
     definition: "TEXT",
   },
   {
@@ -1212,6 +1259,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             url TEXT,
             pr_number INTEGER,
             pr_url TEXT,
+            ci_classifier_version INTEGER,
+            ci_classifier_payload_json TEXT,
             repo_id INTEGER NOT NULL,
             issue_number INTEGER,
             task_path TEXT,
@@ -1425,6 +1474,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
                 url TEXT,
                 pr_number INTEGER,
                 pr_url TEXT,
+                ci_classifier_version INTEGER,
+                ci_classifier_payload_json TEXT,
                 repo_id INTEGER NOT NULL,
                 issue_number INTEGER,
                 task_path TEXT,
@@ -1435,10 +1486,38 @@ function ensureSchema(database: Database, stateDbPath: string): void {
                 FOREIGN KEY(repo_id) REFERENCES repos(id) ON DELETE CASCADE
               );
               INSERT INTO ralph_run_gate_results_new(
-                run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                run_id,
+                gate,
+                status,
+                command,
+                skip_reason,
+                url,
+                pr_number,
+                pr_url,
+                ci_classifier_version,
+                ci_classifier_payload_json,
+                repo_id,
+                issue_number,
+                task_path,
+                created_at,
+                updated_at
               )
               SELECT
-                run_id, gate, status, command, skip_reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                run_id,
+                gate,
+                status,
+                command,
+                skip_reason,
+                url,
+                pr_number,
+                pr_url,
+                NULL,
+                NULL,
+                repo_id,
+                issue_number,
+                task_path,
+                created_at,
+                updated_at
               FROM ralph_run_gate_results;
               DROP TABLE ralph_run_gate_results;
               ALTER TABLE ralph_run_gate_results_new RENAME TO ralph_run_gate_results;
@@ -1531,21 +1610,53 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             tableExists(database, "repos")
           ) {
             const hasReason = columnExists(database, "ralph_run_gate_results", "reason");
+            const hasCiClassifierVersion = columnExists(database, "ralph_run_gate_results", "ci_classifier_version");
+            const hasCiClassifierPayloadJson = columnExists(database, "ralph_run_gate_results", "ci_classifier_payload_json");
             const resultsInsert = hasReason
               ? `
                 INSERT INTO ralph_run_gate_results_repaired(
-                  run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                  run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, ci_classifier_version, ci_classifier_payload_json, repo_id, issue_number, task_path, created_at, updated_at
                 )
                 SELECT
-                  run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                  run_id,
+                  gate,
+                  status,
+                  command,
+                  skip_reason,
+                  reason,
+                  url,
+                  pr_number,
+                  pr_url,
+                  ${hasCiClassifierVersion ? "ci_classifier_version" : "NULL"},
+                  ${hasCiClassifierPayloadJson ? "ci_classifier_payload_json" : "NULL"},
+                  repo_id,
+                  issue_number,
+                  task_path,
+                  created_at,
+                  updated_at
                 FROM ralph_run_gate_results;
               `
               : `
                 INSERT INTO ralph_run_gate_results_repaired(
-                  run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                  run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, ci_classifier_version, ci_classifier_payload_json, repo_id, issue_number, task_path, created_at, updated_at
                 )
                 SELECT
-                  run_id, gate, status, command, skip_reason, NULL, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+                  run_id,
+                  gate,
+                  status,
+                  command,
+                  skip_reason,
+                  NULL,
+                  url,
+                  pr_number,
+                  pr_url,
+                  ${hasCiClassifierVersion ? "ci_classifier_version" : "NULL"},
+                  ${hasCiClassifierPayloadJson ? "ci_classifier_payload_json" : "NULL"},
+                  repo_id,
+                  issue_number,
+                  task_path,
+                  created_at,
+                  updated_at
                 FROM ralph_run_gate_results;
               `;
 
@@ -1560,6 +1671,8 @@ function ensureSchema(database: Database, stateDbPath: string): void {
                 url TEXT,
                 pr_number INTEGER,
                 pr_url TEXT,
+                ci_classifier_version INTEGER,
+                ci_classifier_payload_json TEXT,
                 repo_id INTEGER NOT NULL,
                 issue_number INTEGER,
                 task_path TEXT,
@@ -1697,6 +1810,18 @@ function ensureSchema(database: Database, stateDbPath: string): void {
             toVersion: 23,
             checkpoint: "v23-artifact-policy-columns",
             checksum: sha256Hex("state:migration:v23-artifact-policy-columns"),
+            backupId,
+            appliedAt: nowIso(),
+          });
+        }
+        if (existingVersion < 24) {
+          addColumnIfMissing(database, "ralph_run_gate_results", "ci_classifier_version", "INTEGER");
+          addColumnIfMissing(database, "ralph_run_gate_results", "ci_classifier_payload_json", "TEXT");
+          recordStateMigrationCheckpoint(database, {
+            fromVersion: existingVersion,
+            toVersion: 24,
+            checkpoint: "v24-ci-triage-classifier-columns",
+            checksum: sha256Hex("state:migration:v24-ci-triage-classifier-columns"),
             backupId,
             appliedAt: nowIso(),
           });
@@ -2034,11 +2159,13 @@ function ensureSchema(database: Database, stateDbPath: string): void {
       status TEXT NOT NULL CHECK (status IN ('pending', 'pass', 'fail', 'skipped')),
       command TEXT,
       skip_reason TEXT,
-      reason TEXT,
-      url TEXT,
-      pr_number INTEGER,
-      pr_url TEXT,
-      repo_id INTEGER NOT NULL,
+                reason TEXT,
+                url TEXT,
+                pr_number INTEGER,
+                pr_url TEXT,
+                ci_classifier_version INTEGER,
+                ci_classifier_payload_json TEXT,
+                repo_id INTEGER NOT NULL,
       issue_number INTEGER,
       task_path TEXT,
       created_at TEXT NOT NULL,
@@ -3807,6 +3934,8 @@ type GateResultRow = {
   url: string | null;
   prNumber: number | null;
   prUrl: string | null;
+  ciClassifierVersion: number | null;
+  ciClassifierPayloadJson: string | null;
   repoId: number;
   issueNumber: number | null;
   taskPath: string | null;
@@ -3866,7 +3995,7 @@ function getRepoIdByNameFromDatabase(database: Database, repo: string): number |
 function getRalphRunGateStateFromDatabase(database: Database, runId: string): RalphRunGateState {
   const results = database
     .query(
-       `SELECT run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+       `SELECT run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, ci_classifier_version, ci_classifier_payload_json, repo_id, issue_number, task_path, created_at, updated_at
        FROM ralph_run_gate_results
        WHERE run_id = $run_id
        ORDER BY gate ASC`
@@ -3881,6 +4010,8 @@ function getRalphRunGateStateFromDatabase(database: Database, runId: string): Ra
     url?: string | null;
     pr_number?: number | null;
     pr_url?: string | null;
+    ci_classifier_version?: number | null;
+    ci_classifier_payload_json?: string | null;
     repo_id: number;
     issue_number?: number | null;
     task_path?: string | null;
@@ -3921,6 +4052,8 @@ function getRalphRunGateStateFromDatabase(database: Database, runId: string): Ra
       url: row.url ?? null,
       prNumber: typeof row.pr_number === "number" ? row.pr_number : null,
       prUrl: row.pr_url ?? null,
+      ciClassifierVersion: typeof row.ci_classifier_version === "number" ? row.ci_classifier_version : null,
+      ciClassifierPayloadJson: row.ci_classifier_payload_json ?? null,
       repoId: row.repo_id,
       issueNumber: typeof row.issue_number === "number" ? row.issue_number : null,
       taskPath: row.task_path ?? null,
@@ -3997,6 +4130,8 @@ export function upsertRalphRunGateResult(params: {
   url?: string | null;
   prNumber?: number | null;
   prUrl?: string | null;
+  ciClassifierVersion?: number | null;
+  ciClassifierPayloadJson?: string | null;
   at?: string;
 }): void {
   const database = requireDb();
@@ -4030,12 +4165,14 @@ export function upsertRalphRunGateResult(params: {
   const reasonPatch = applyGateFieldPolicy(params.reason, 400);
   const urlPatch = applyGateFieldPolicy(params.url, 500);
   const prUrlPatch = applyGateFieldPolicy(params.prUrl, 500);
+  const ciClassifierPayloadJsonPatch = applyGateFieldPolicy(params.ciClassifierPayloadJson, CI_CLASSIFIER_PAYLOAD_MAX_CHARS);
 
   const commandPatchFlag = commandPatch !== undefined ? 1 : 0;
   const skipReasonPatchFlag = skipReasonPatch !== undefined ? 1 : 0;
   const reasonPatchFlag = reasonPatch !== undefined ? 1 : 0;
   const urlPatchFlag = urlPatch !== undefined ? 1 : 0;
   const prUrlPatchFlag = prUrlPatch !== undefined ? 1 : 0;
+  const ciClassifierPayloadJsonPatchFlag = ciClassifierPayloadJsonPatch !== undefined ? 1 : 0;
 
   let prNumberPatchFlag = 0;
   let prNumberValue: number | null = null;
@@ -4049,12 +4186,26 @@ export function upsertRalphRunGateResult(params: {
           : null;
   }
 
+  let ciClassifierVersionPatchFlag = 0;
+  let ciClassifierVersionValue: number | null = null;
+  if (params.ciClassifierVersion !== undefined) {
+    ciClassifierVersionPatchFlag = 1;
+    if (params.ciClassifierVersion === null) {
+      ciClassifierVersionValue = null;
+    } else if (Number.isFinite(params.ciClassifierVersion)) {
+      const normalized = Math.floor(params.ciClassifierVersion);
+      ciClassifierVersionValue = normalized > 0 ? normalized : null;
+    } else {
+      ciClassifierVersionValue = null;
+    }
+  }
+
   database
     .query(
       `INSERT INTO ralph_run_gate_results(
-         run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, repo_id, issue_number, task_path, created_at, updated_at
+         run_id, gate, status, command, skip_reason, reason, url, pr_number, pr_url, ci_classifier_version, ci_classifier_payload_json, repo_id, issue_number, task_path, created_at, updated_at
        ) VALUES (
-         $run_id, $gate, $status_insert, $command, $skip_reason, $reason, $url, $pr_number, $pr_url, $repo_id, $issue_number, $task_path, $created_at, $updated_at
+         $run_id, $gate, $status_insert, $command, $skip_reason, $reason, $url, $pr_number, $pr_url, $ci_classifier_version, $ci_classifier_payload_json, $repo_id, $issue_number, $task_path, $created_at, $updated_at
        )
        ON CONFLICT(run_id, gate) DO UPDATE SET
          status = CASE WHEN $status_patch = 1 THEN $status_update ELSE ralph_run_gate_results.status END,
@@ -4064,6 +4215,8 @@ export function upsertRalphRunGateResult(params: {
          url = CASE WHEN $url_patch = 1 THEN excluded.url ELSE ralph_run_gate_results.url END,
          pr_number = CASE WHEN $pr_number_patch = 1 THEN excluded.pr_number ELSE ralph_run_gate_results.pr_number END,
          pr_url = CASE WHEN $pr_url_patch = 1 THEN excluded.pr_url ELSE ralph_run_gate_results.pr_url END,
+         ci_classifier_version = CASE WHEN $ci_classifier_version_patch = 1 THEN excluded.ci_classifier_version ELSE ralph_run_gate_results.ci_classifier_version END,
+         ci_classifier_payload_json = CASE WHEN $ci_classifier_payload_json_patch = 1 THEN excluded.ci_classifier_payload_json ELSE ralph_run_gate_results.ci_classifier_payload_json END,
          updated_at = $updated_at`
     )
     .run({
@@ -4084,6 +4237,10 @@ export function upsertRalphRunGateResult(params: {
       $pr_number_patch: prNumberPatchFlag,
       $pr_url: prUrlPatch ?? null,
       $pr_url_patch: prUrlPatchFlag,
+      $ci_classifier_version: ciClassifierVersionValue,
+      $ci_classifier_version_patch: ciClassifierVersionPatchFlag,
+      $ci_classifier_payload_json: ciClassifierPayloadJsonPatch ?? null,
+      $ci_classifier_payload_json_patch: ciClassifierPayloadJsonPatchFlag,
       $repo_id: meta.repoId,
       $issue_number: meta.issueNumber,
       $task_path: meta.taskPath,

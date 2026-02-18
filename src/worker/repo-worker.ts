@@ -115,8 +115,13 @@ import {
   type CiDebugCommentState,
   type CiTriageCommentState,
 } from "../github/ci-debug-comment";
-import { buildCiTriageDecision, type CiFailureClassification, type CiNextAction, type CiTriageDecision } from "../ci-triage/core";
+import { buildCiTriageDecision, type CiNextAction, type CiTriageDecision } from "../ci-triage/core";
 import { buildCiFailureSignatureV2, type CiFailureSignatureV2 } from "../ci-triage/signature";
+import {
+  CI_TRIAGE_CLASSIFIER_VERSION,
+  buildCiTriageClassifierPayloadV1,
+  type CiTriageClassifierPayload,
+} from "../ci-triage/payload";
 import {
   buildMergeConflictCommentBody,
   createMergeConflictComment,
@@ -379,22 +384,6 @@ type CiFailureTriageOutcome =
       status: "failed" | "escalated" | "throttled";
       run: AgentRun;
     };
-
-type CiTriageRecord = {
-  version: 1;
-  signatureVersion: 2;
-  signature: string;
-  classification: CiFailureClassification;
-  classificationReason: string;
-  action: CiNextAction;
-  actionReason: string;
-  timedOut: boolean;
-  attempt: number;
-  maxAttempts: number;
-  priorSignature: string | null;
-  failingChecks: Array<{ name: string; rawState: string; detailsUrl?: string | null }>;
-  commands: string[];
-};
 
 const DEFAULT_SESSION_ADAPTER: SessionAdapter = {
   runAgent,
@@ -3028,9 +3017,22 @@ export class RepoWorker {
     }
   }
 
-  private recordCiTriageArtifact(record: CiTriageRecord): void {
+  private recordCiTriageArtifact(record: CiTriageClassifierPayload): void {
     const runId = this.activeRunId;
     if (!runId) return;
+
+    try {
+      upsertRalphRunGateResult({
+        runId,
+        gate: "ci",
+        ciClassifierVersion: CI_TRIAGE_CLASSIFIER_VERSION,
+        ciClassifierPayloadJson: JSON.stringify(record),
+      });
+    } catch (error: any) {
+      console.warn(
+        `[ralph:worker:${this.repo}] Failed to persist CI triage classifier payload: ${error?.message ?? String(error)}`
+      );
+    }
 
     try {
       recordRalphRunGateArtifact({
@@ -3111,9 +3113,8 @@ export class RepoWorker {
     priorSignature: string | null;
     failedChecks: FailedCheck[];
     commands: string[];
-  }): CiTriageRecord {
-    return {
-      version: 1,
+  }): CiTriageClassifierPayload {
+    return buildCiTriageClassifierPayloadV1({
       signatureVersion: params.signature.version,
       signature: params.signature.signature,
       classification: params.decision.classification,
@@ -3130,7 +3131,7 @@ export class RepoWorker {
         detailsUrl: check.detailsUrl ?? null,
       })),
       commands: params.commands,
-    };
+    });
   }
 
   private async getCheckLog(runId: string): Promise<CheckLogResult> {
