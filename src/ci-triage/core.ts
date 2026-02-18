@@ -29,6 +29,27 @@ export type CiTriageInput = {
   priorSignature?: string | null;
 };
 
+export type CiTriageRecordPayload = {
+  version: 2;
+  signatureVersion: number;
+  signature: string;
+  classification: CiFailureClassification;
+  classificationReason: CiTriageClassificationReason;
+  action: CiNextAction;
+  actionReason: CiTriageActionReason;
+  timedOut: boolean;
+  attempt: number;
+  maxAttempts: number;
+  priorSignature: string | null;
+};
+
+export type CiTriageExecutionPlan = {
+  decision: CiTriageDecision;
+  attemptAllowed: boolean;
+  exhaustedBudget: boolean;
+  record: CiTriageRecordPayload;
+};
+
 export type CiTriageDecision = {
   classification: CiFailureClassification;
   classificationReason: CiTriageClassificationReason;
@@ -146,5 +167,27 @@ export function buildCiTriageDecision(input: CiTriageInput): CiTriageDecision {
     classificationReason: classification.reason,
     action: action.action,
     actionReason: action.reason,
+  };
+}
+
+export function buildCiTriageExecutionPlan(input: CiTriageInput & { signatureVersion: number }): CiTriageExecutionPlan {
+  const decision = buildCiTriageDecision(input);
+  return {
+    decision,
+    attemptAllowed: input.attempt <= input.maxAttempts,
+    exhaustedBudget: input.attempt >= input.maxAttempts,
+    record: {
+      version: 2,
+      signatureVersion: input.signatureVersion,
+      signature: input.signature,
+      classification: decision.classification,
+      classificationReason: decision.classificationReason,
+      action: decision.action,
+      actionReason: decision.actionReason,
+      timedOut: input.timedOut,
+      attempt: input.attempt,
+      maxAttempts: input.maxAttempts,
+      priorSignature: input.priorSignature ?? null,
+    },
   };
 }

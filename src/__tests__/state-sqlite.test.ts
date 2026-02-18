@@ -16,6 +16,7 @@ import {
   ensureRalphRunGateRows,
   getIdempotencyPayload,
   getLoopTriageAttempt,
+  getCiQuarantineFollowupMapping,
   getDurableStateSchemaWindow,
   getLatestRunGateStateForIssue,
   getLatestRunGateStateForPr,
@@ -50,6 +51,7 @@ import {
   recordRollupMerge,
   upsertRalphRunGateResult,
   shouldAllowLoopTriageAttempt,
+  upsertCiQuarantineFollowupMapping,
   upsertIdempotencyKey,
 } from "../state";
 import { getRalphStateDbPath } from "../paths";
@@ -332,7 +334,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         integrity_check_result?: string;
       };
       expect(backupRow.from_schema_version).toBe(7);
-      expect(backupRow.to_schema_version).toBe(23);
+      expect(backupRow.to_schema_version).toBe(24);
       expect(backupRow.integrity_check_result).toBe("ok");
       expect(backupRow.backup_size_bytes).toBeGreaterThan(0);
       expect(backupRow.backup_sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -341,13 +343,13 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         "SELECT from_schema_version, to_schema_version, completed_at FROM state_migration_attempts ORDER BY id DESC LIMIT 1"
       ).get() as { from_schema_version?: number; to_schema_version?: number; completed_at?: string | null };
       expect(attemptRow.from_schema_version).toBe(7);
-      expect(attemptRow.to_schema_version).toBe(23);
+      expect(attemptRow.to_schema_version).toBe(24);
       expect(attemptRow.completed_at).toBeString();
 
       const completionCheckpoint = verify.query(
-        "SELECT checkpoint FROM state_migration_ledger WHERE checkpoint = 'schema-v23-complete' LIMIT 1"
+        "SELECT checkpoint FROM state_migration_ledger WHERE checkpoint = 'schema-v24-complete' LIMIT 1"
       ).get() as { checkpoint?: string } | undefined;
-      expect(completionCheckpoint?.checkpoint).toBe("schema-v23-complete");
+      expect(completionCheckpoint?.checkpoint).toBe("schema-v24-complete");
     } finally {
       verify.close();
     }
@@ -531,7 +533,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("23");
+      expect(meta.value).toBe("24");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -651,7 +653,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("23");
+      expect(meta.value).toBe("24");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -1156,7 +1158,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("23");
+      expect(meta.value).toBe("24");
 
       migrated
         .query(
@@ -1271,7 +1273,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("23");
+      expect(meta.value).toBe("24");
 
       const row = migrated
         .query("SELECT reason FROM ralph_run_gate_results WHERE run_id = 'run_v18' AND gate = 'ci'")
@@ -1393,7 +1395,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("23");
+      expect(meta.value).toBe("24");
 
       const backfilled = migrated
         .query("SELECT status FROM ralph_run_gate_results WHERE run_id = 'run_v20' AND gate = 'plan_review'")
@@ -1497,7 +1499,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("23");
+      expect(meta.value).toBe("24");
 
       const row = migrated
         .query(
@@ -1823,7 +1825,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("23");
+      expect(meta.value).toBe("24");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
@@ -1990,6 +1992,38 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     expect(shouldAllowLoopTriageAttempt(1, 2)).toBe(true);
     expect(shouldAllowLoopTriageAttempt(2, 2)).toBe(false);
     expect(shouldAllowLoopTriageAttempt(3, 2)).toBe(false);
+  });
+
+  test("upserts and reads CI quarantine follow-up mapping by signature", () => {
+    initStateDb();
+
+    expect(getCiQuarantineFollowupMapping({ repo: "3mdistal/ralph", signature: "sig-1" })).toBeNull();
+
+    const first = upsertCiQuarantineFollowupMapping({
+      repo: "3mdistal/ralph",
+      signature: "sig-1",
+      followupIssueNumber: 9001,
+      followupIssueUrl: "https://github.com/3mdistal/ralph/issues/9001",
+      sourceIssueNumber: 732,
+      at: "2026-02-18T00:00:00.000Z",
+    });
+    expect(first.issueNumber).toBe(9001);
+
+    const second = upsertCiQuarantineFollowupMapping({
+      repo: "3mdistal/ralph",
+      signature: "sig-1",
+      followupIssueNumber: 9002,
+      followupIssueUrl: "https://github.com/3mdistal/ralph/issues/9002",
+      sourceIssueNumber: 732,
+      at: "2026-02-18T00:00:10.000Z",
+    });
+    expect(second.issueNumber).toBe(9002);
+
+    const mapped = getCiQuarantineFollowupMapping({ repo: "3mdistal/ralph", signature: "sig-1" });
+    expect(mapped).not.toBeNull();
+    expect(mapped?.issueNumber).toBe(9002);
+    expect(mapped?.issueUrl).toBe("https://github.com/3mdistal/ralph/issues/9002");
+    expect(mapped?.sourceIssueNumber).toBe(732);
   });
 
   test("lists open PR candidates for an issue", () => {

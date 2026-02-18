@@ -1,7 +1,17 @@
 import { redactSensitiveText } from "../redaction";
+import { createHash } from "crypto";
 
 export type CiFailureSignatureV2 = {
   version: 2;
+  signature: string;
+  components: {
+    timedOut: boolean;
+    failures: Array<{ name: string; rawState: string; excerptFingerprint: string | null }>;
+  };
+};
+
+export type CiFailureSignatureV3 = {
+  version: 3;
   signature: string;
   components: {
     timedOut: boolean;
@@ -26,6 +36,10 @@ function hashFNV1a(input: string): string {
     hash = Math.imul(hash, FNV_PRIME) >>> 0;
   }
   return hash.toString(16).padStart(8, "0");
+}
+
+function hashSha256(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
 }
 
 function normalizeExcerptFingerprint(excerpt: string | null | undefined): string | null {
@@ -56,6 +70,33 @@ export function buildCiFailureSignatureV2(params: {
   return {
     version: 2,
     signature: hashFNV1a(payload),
+    components: {
+      timedOut: params.timedOut,
+      failures,
+    },
+  };
+}
+
+export function buildCiFailureSignatureV3(params: {
+  timedOut: boolean;
+  failures: CiFailureSignatureEntry[];
+}): CiFailureSignatureV3 {
+  const failures = params.failures
+    .map((failure) => ({
+      name: failure.name.trim(),
+      rawState: failure.rawState.trim(),
+      excerptFingerprint: normalizeExcerptFingerprint(failure.excerpt ?? null),
+    }))
+    .sort((a, b) => {
+      if (a.name !== b.name) return a.name.localeCompare(b.name);
+      if (a.rawState !== b.rawState) return a.rawState.localeCompare(b.rawState);
+      return (a.excerptFingerprint ?? "").localeCompare(b.excerptFingerprint ?? "");
+    });
+
+  const payload = JSON.stringify({ timedOut: params.timedOut, failures });
+  return {
+    version: 3,
+    signature: hashSha256(payload),
     components: {
       timedOut: params.timedOut,
       failures,
