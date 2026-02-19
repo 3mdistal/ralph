@@ -10,7 +10,14 @@ import {
   RALPH_LABEL_STATUS_ESCALATED,
   RALPH_LABEL_STATUS_PAUSED,
 } from "../github-labels";
-import { closeStateDbForTests, getIdempotencyPayload, initStateDb, upsertIdempotencyKey } from "../state";
+import {
+  closeStateDbForTests,
+  getIdempotencyPayload,
+  getTaskOpStateByPath,
+  initStateDb,
+  recordTaskSnapshot,
+  upsertIdempotencyKey,
+} from "../state";
 import { acquireGlobalTestLock } from "./helpers/test-lock";
 
 describe("github cmd-processor", () => {
@@ -219,6 +226,74 @@ describe("github cmd-processor", () => {
       (req) => req.method === "DELETE" && req.path.endsWith(`/issues/43/labels/${encodeURIComponent(RALPH_LABEL_STATUS_PAUSED)}`)
     );
     expect(pausedDeletes.length).toBeGreaterThan(0);
+  });
+
+  test("queue command clears stale local session linkage before enqueue", async () => {
+    const requests: Array<{ path: string; method: string; body?: any }> = [];
+    originalRequest = GitHubClient.prototype.request;
+    const requestStub: GitHubClient["request"] = async (path: string, opts: { method?: string; body?: any } = {}) => {
+      const method = (opts.method ?? "GET").toUpperCase();
+      requests.push({ path, method, body: opts.body });
+
+      if (path.includes("/issues/46/events")) {
+        return {
+          data: [
+            {
+              id: 901,
+              event: "labeled",
+              label: { name: RALPH_LABEL_CMD_QUEUE },
+            },
+          ],
+          status: 200,
+          etag: null,
+        } as any;
+      }
+
+      if (path.includes("/issues/46/comments") && method === "GET") {
+        return { data: [], status: 200, etag: null } as any;
+      }
+
+      if (path.includes("/issues/46/comments") && method === "POST") {
+        return { data: { id: 1006 }, status: 201, etag: null } as any;
+      }
+
+      if (path.includes("/labels?")) {
+        return { data: [], status: 200, etag: null } as any;
+      }
+
+      return { data: {}, status: 200, etag: null } as any;
+    };
+    GitHubClient.prototype.request = requestStub;
+
+    recordTaskSnapshot({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#46",
+      taskPath: "github:3mdistal/ralph#46",
+      taskName: "resume me",
+      status: "in-progress",
+      sessionId: "ses_stale",
+      daemonId: "d_stale",
+      heartbeatAt: "2026-02-18T00:00:00.000Z",
+      blockedSource: "profile-unresolvable",
+      blockedReason: "missing session",
+    });
+
+    const result = await __processOneCommandForTests({
+      repo: "3mdistal/ralph",
+      issueNumber: 46,
+      cmdLabel: RALPH_LABEL_CMD_QUEUE as any,
+      currentLabels: [RALPH_LABEL_CMD_QUEUE, "ralph:status:in-progress"],
+      issueState: "OPEN",
+    });
+
+    expect(result.processed).toBe(true);
+    expect(result.removedCmdLabel).toBe(true);
+
+    const opState = getTaskOpStateByPath("3mdistal/ralph", "github:3mdistal/ralph#46");
+    expect(opState?.status).toBe("queued");
+    expect(opState?.sessionId).toBeNull();
+    expect(opState?.daemonId).toBeNull();
+    expect(opState?.heartbeatAt).toBeNull();
   });
 
   test("refuses stale queue command when escalation is newer", async () => {
