@@ -11,6 +11,7 @@ export function classifyQueuedResumePath(params: {
   if (blockedSource === "merge-conflict") return "merge-conflict";
   if (blockedSource === "stall") return "stall";
   if (blockedSource === "loop-triage") return "loop-triage";
+  if (blockedSource === "profile-unresolvable") return "fresh";
   if (blockedSource === "review") return "review";
   return "queued-session";
 }

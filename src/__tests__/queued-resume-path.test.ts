@@ -17,6 +17,10 @@ describe("queued resume path classification", () => {
     expect(classifyQueuedResumePath({ blockedSource: "loop-triage", sessionId: "ses_123" })).toBe("loop-triage");
   });
 
+  test("forces fresh start when previous resume failed with profile-unresolvable", () => {
+    expect(classifyQueuedResumePath({ blockedSource: "profile-unresolvable", sessionId: "ses_123" })).toBe("fresh");
+  });
+
   test("falls back to queued-session for other blocked sources with session", () => {
     expect(classifyQueuedResumePath({ blockedSource: "runtime-error", sessionId: "ses_123" })).toBe("queued-session");
   });
