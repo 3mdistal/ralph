@@ -1,6 +1,7 @@
 import { getConfig } from "../config";
 import { shouldLog } from "../logging";
 import {
+  clearTaskExecutionStateForIssue,
   getIdempotencyPayload,
   getIssueLabels,
   hasIdempotencyKey,
@@ -612,6 +613,15 @@ export async function processOneCommand(
       }
 
       if (decision !== "refused") {
+        if (desiredStatus === "queued") {
+          clearTaskExecutionStateForIssue({
+            repo: params.repo,
+            issueNumber: params.issueNumber,
+            status: "queued",
+            reason: `cmd:${params.cmdLabel}`,
+          });
+        }
+
         releaseTaskSlot({
           repo: params.repo,
           issueNumber: params.issueNumber,
