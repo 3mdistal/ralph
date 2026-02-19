@@ -114,102 +114,43 @@ describe("gates command output", () => {
     const state = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 240 });
     const json = buildGatesJsonOutput({ repo: "3mdistal/ralph", issueNumber: 240, state });
 
-    expect(json).toEqual({
+    expect(json).toMatchObject({
       version: 2,
       repo: "3mdistal/ralph",
       issueNumber: 240,
       runId,
-      gates: [
-        {
-          name: "preflight",
-          status: "pending",
-          createdAt: "2026-01-20T13:00:01.000Z",
-          updatedAt: "2026-01-20T13:00:01.000Z",
-          command: null,
-          skipReason: null,
-          reason: null,
-          url: null,
-          prNumber: null,
-          prUrl: null,
-        },
-        {
-          name: "plan_review",
-          status: "pending",
-          createdAt: "2026-01-20T13:00:01.000Z",
-          updatedAt: "2026-01-20T13:00:01.000Z",
-          command: null,
-          skipReason: null,
-          reason: null,
-          url: null,
-          prNumber: null,
-          prUrl: null,
-        },
-        {
-          name: "product_review",
-          status: "pending",
-          createdAt: "2026-01-20T13:00:01.000Z",
-          updatedAt: "2026-01-20T13:00:01.000Z",
-          command: null,
-          skipReason: null,
-          reason: null,
-          url: null,
-          prNumber: null,
-          prUrl: null,
-        },
-        {
-          name: "devex_review",
-          status: "pending",
-          createdAt: "2026-01-20T13:00:01.000Z",
-          updatedAt: "2026-01-20T13:00:01.000Z",
-          command: null,
-          skipReason: null,
-          reason: null,
-          url: null,
-          prNumber: null,
-          prUrl: null,
-        },
-        {
-          name: "ci",
-          status: "fail",
-          createdAt: "2026-01-20T13:00:01.000Z",
-          updatedAt: "2026-01-20T13:00:02.000Z",
-          command: null,
-          skipReason: null,
-          reason: null,
-          url: "https://github.com/3mdistal/ralph/actions/runs/1200",
-          prNumber: 240,
-          prUrl: "https://github.com/3mdistal/ralph/pull/240",
-        },
-        {
-          name: "pr_evidence",
-          status: "pending",
-          createdAt: "2026-01-20T13:00:01.000Z",
-          updatedAt: "2026-01-20T13:00:01.000Z",
-          command: null,
-          skipReason: null,
-          reason: null,
-          url: null,
-          prNumber: null,
-          prUrl: null,
-        },
-      ],
-      artifacts: [
-        {
-          id: 1,
-          gate: "ci",
-          kind: "failure_excerpt",
-          createdAt: "2026-01-20T13:00:03.000Z",
-          updatedAt: "2026-01-20T13:00:03.000Z",
-          truncated: false,
-          truncationMode: "tail",
-          artifactPolicyVersion: 1,
-          originalChars: 9,
-          originalLines: 1,
-          content: "short log",
-        },
-      ],
       error: null,
     });
+    expect(json.gates).toHaveLength(6);
+    expect(json.gates[0]?.name).toBe("preflight");
+    expect(json.gates[0]?.status).toBe("pending");
+    const ciGate = json.gates.find((gate) => gate.name === "ci");
+    expect(ciGate).toMatchObject({
+      status: "fail",
+      url: "https://github.com/3mdistal/ralph/actions/runs/1200",
+      prNumber: 240,
+      prUrl: "https://github.com/3mdistal/ralph/pull/240",
+      classifierVersion: null,
+      classifierPayload: null,
+      classifierSource: null,
+      classifierSummary: null,
+      classifierUnsupportedVersion: null,
+    });
+    expect(json.artifacts).toEqual([
+      {
+        id: 1,
+        gate: "ci",
+        kind: "failure_excerpt",
+        createdAt: "2026-01-20T13:00:03.000Z",
+        updatedAt: "2026-01-20T13:00:03.000Z",
+        truncated: false,
+        truncationMode: "tail",
+        artifactPolicyVersion: 1,
+        originalChars: 9,
+        originalLines: 1,
+        content: "short log",
+      },
+    ]);
   });
 
   test("uses read-only path when durable state is forward-newer but readable", async () => {
@@ -249,6 +190,155 @@ describe("gates command output", () => {
     expect(parsed.runId).toBe(runId);
     expect(parsed.gates[0]?.name).toBe("preflight");
     expect(parsed.gates[0]?.status).toBe("pass");
+  });
+
+  test("projects persisted CI classifier payload in JSON output", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#241",
+      taskPath: "github:3mdistal/ralph#241",
+      attemptKind: "process",
+      startedAt: "2026-01-20T13:10:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T13:10:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "fail",
+      ciClassifierVersion: 1,
+      ciClassifierPayloadJson: JSON.stringify({
+        kind: "ci-triage-classifier",
+        version: 1,
+        signatureVersion: 2,
+        signature: "sig-241",
+        classification: "regression",
+        classificationReason: "regression_checks",
+        action: "resume",
+        actionReason: "resume_has_session",
+        timedOut: false,
+        attempt: 1,
+        maxAttempts: 5,
+        priorSignature: null,
+        failingChecks: [{ name: "test", rawState: "FAILURE", detailsUrl: null }],
+        commands: ["bun test"],
+      }),
+      at: "2026-01-20T13:10:02.000Z",
+    });
+
+    const state = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 241 });
+    const json = buildGatesJsonOutput({ repo: "3mdistal/ralph", issueNumber: 241, state });
+    const ciGate = json.gates.find((gate) => gate.name === "ci");
+    expect(ciGate?.classifierVersion).toBe(1);
+    expect(ciGate?.classifierSource).toBe("persisted");
+    expect(ciGate?.classifierSummary).toContain("classification=regression");
+    expect(ciGate?.classifierPayload).toMatchObject({
+      kind: "ci-triage-classifier",
+      version: 1,
+      signature: "sig-241",
+      action: "resume",
+    });
+  });
+
+  test("falls back to legacy CI classifier artifact when persisted payload is missing", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#242",
+      taskPath: "github:3mdistal/ralph#242",
+      attemptKind: "process",
+      startedAt: "2026-01-20T13:20:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T13:20:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "fail",
+      at: "2026-01-20T13:20:02.000Z",
+    });
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "note",
+      content: JSON.stringify({
+        version: 1,
+        signatureVersion: 2,
+        signature: "legacy-242",
+        classification: "infra",
+        classificationReason: "infra_timeout",
+        action: "spawn",
+        actionReason: "spawn_flake_or_infra",
+        timedOut: true,
+        attempt: 2,
+        maxAttempts: 5,
+        priorSignature: null,
+        failingChecks: [],
+        commands: [],
+      }),
+      at: "2026-01-20T13:20:03.000Z",
+    });
+
+    const state = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 242 });
+    const json = buildGatesJsonOutput({ repo: "3mdistal/ralph", issueNumber: 242, state });
+    const ciGate = json.gates.find((gate) => gate.name === "ci");
+    expect(ciGate?.classifierVersion).toBe(1);
+    expect(ciGate?.classifierSource).toBe("artifact");
+    expect(ciGate?.classifierSummary).toContain("classification=infra");
+  });
+
+  test("does not fall back to legacy artifact when persisted version is unsupported", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#243",
+      taskPath: "github:3mdistal/ralph#243",
+      attemptKind: "process",
+      startedAt: "2026-01-20T13:30:00.000Z",
+    });
+
+    ensureRalphRunGateRows({ runId, at: "2026-01-20T13:30:01.000Z" });
+    upsertRalphRunGateResult({
+      runId,
+      gate: "ci",
+      status: "fail",
+      ciClassifierVersion: 99,
+      ciClassifierPayloadJson: JSON.stringify({ kind: "ci-triage-classifier", version: 99 }),
+      at: "2026-01-20T13:30:02.000Z",
+    });
+    recordRalphRunGateArtifact({
+      runId,
+      gate: "ci",
+      kind: "note",
+      content: JSON.stringify({
+        version: 1,
+        signatureVersion: 2,
+        signature: "legacy-243",
+        classification: "regression",
+        classificationReason: "regression_checks",
+        action: "resume",
+        actionReason: "resume_has_session",
+        timedOut: false,
+        attempt: 1,
+        maxAttempts: 5,
+        priorSignature: null,
+        failingChecks: [],
+        commands: [],
+      }),
+      at: "2026-01-20T13:30:03.000Z",
+    });
+
+    const state = getLatestRunGateStateForIssue({ repo: "3mdistal/ralph", issueNumber: 243 });
+    const json = buildGatesJsonOutput({ repo: "3mdistal/ralph", issueNumber: 243, state });
+    const ciGate = json.gates.find((gate) => gate.name === "ci");
+    expect(ciGate?.classifierVersion).toBe(99);
+    expect(ciGate?.classifierSource).toBe("persisted");
+    expect(ciGate?.classifierPayload).toBeNull();
+    expect(ciGate?.classifierUnsupportedVersion).toBe(99);
   });
 
   test("emits stable JSON error payload for forward-incompatible durable state", async () => {

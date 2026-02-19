@@ -10,6 +10,11 @@ import {
   type GateStatus,
   type RalphRunGateState,
 } from "../state";
+import {
+  formatCiTriageClassifierSummary,
+  parseCiTriageClassifierLegacyArtifact,
+  parseCiTriageClassifierPayload,
+} from "../ci-triage/payload";
 
 function parseIssueNumber(raw: string | undefined): number | null {
   if (!raw) return null;
@@ -28,6 +33,11 @@ type GateResultProjection = {
   url: string | null;
   prNumber: number | null;
   prUrl: string | null;
+  classifierVersion: number | null;
+  classifierPayload: Record<string, unknown> | null;
+  classifierSource: "persisted" | "artifact" | null;
+  classifierSummary: string | null;
+  classifierUnsupportedVersion: number | null;
 };
 
 type GateArtifactProjection = {
@@ -95,6 +105,72 @@ function buildErrorOutput(error: ReturnType<typeof classifyDurableStateInitError
   };
 }
 
+function buildCiClassifierProjection(params: {
+  result: RalphRunGateState["results"][number];
+  artifacts: RalphRunGateState["artifacts"];
+}): Pick<
+  GateResultProjection,
+  "classifierVersion" | "classifierPayload" | "classifierSource" | "classifierSummary" | "classifierUnsupportedVersion"
+> {
+  const empty = {
+    classifierVersion: null,
+    classifierPayload: null,
+    classifierSource: null,
+    classifierSummary: null,
+    classifierUnsupportedVersion: null,
+  } as const;
+  if (params.result.gate !== "ci") return empty;
+
+  if (typeof params.result.ciClassifierVersion === "number") {
+    const parsed = parseCiTriageClassifierPayload({
+      version: params.result.ciClassifierVersion,
+      payloadJson: params.result.ciClassifierPayloadJson,
+    });
+    if (parsed.status === "ok") {
+      return {
+        classifierVersion: parsed.version,
+        classifierPayload: parsed.payload as unknown as Record<string, unknown>,
+        classifierSource: "persisted",
+        classifierSummary: formatCiTriageClassifierSummary(parsed.payload),
+        classifierUnsupportedVersion: null,
+      };
+    }
+    if (parsed.status === "unsupported_version") {
+      return {
+        classifierVersion: parsed.version,
+        classifierPayload: null,
+        classifierSource: "persisted",
+        classifierSummary: `unsupported classifier payload version ${parsed.version}`,
+        classifierUnsupportedVersion: parsed.version,
+      };
+    }
+    return {
+      classifierVersion: params.result.ciClassifierVersion,
+      classifierPayload: null,
+      classifierSource: "persisted",
+      classifierSummary: "invalid persisted classifier payload",
+      classifierUnsupportedVersion: null,
+    };
+  }
+
+  const artifacts = [...params.artifacts]
+    .filter((artifact) => artifact.gate === "ci" && artifact.kind === "note")
+    .sort((left, right) => right.id - left.id);
+  for (const artifact of artifacts) {
+    const parsed = parseCiTriageClassifierLegacyArtifact(artifact.content);
+    if (parsed.status !== "ok") continue;
+    return {
+      classifierVersion: parsed.version,
+      classifierPayload: parsed.payload as unknown as Record<string, unknown>,
+      classifierSource: "artifact",
+      classifierSummary: formatCiTriageClassifierSummary(parsed.payload),
+      classifierUnsupportedVersion: null,
+    };
+  }
+
+  return empty;
+}
+
 export function buildGatesJsonOutput(params: {
   repo: string;
   issueNumber: number;
@@ -114,18 +190,26 @@ export function buildGatesJsonOutput(params: {
     repo: params.repo,
     issueNumber: params.issueNumber,
     runId,
-    gates: results.map((result) => ({
-      name: result.gate,
-      status: result.status,
-      createdAt: result.createdAt,
-      updatedAt: result.updatedAt,
-      command: result.command,
-      skipReason: result.skipReason,
-      reason: result.reason,
-      url: result.url,
-      prNumber: result.prNumber,
-      prUrl: result.prUrl,
-    })),
+    gates: results.map((result) => {
+      const ciClassifier = buildCiClassifierProjection({ result, artifacts });
+      return {
+        name: result.gate,
+        status: result.status,
+        createdAt: result.createdAt,
+        updatedAt: result.updatedAt,
+        command: result.command,
+        skipReason: result.skipReason,
+        reason: result.reason,
+        url: result.url,
+        prNumber: result.prNumber,
+        prUrl: result.prUrl,
+        classifierVersion: ciClassifier.classifierVersion,
+        classifierPayload: ciClassifier.classifierPayload,
+        classifierSource: ciClassifier.classifierSource,
+        classifierSummary: ciClassifier.classifierSummary,
+        classifierUnsupportedVersion: ciClassifier.classifierUnsupportedVersion,
+      };
+    }),
     artifacts: artifacts.map((artifact) => ({
       id: artifact.id,
       gate: artifact.gate,
@@ -226,6 +310,10 @@ export async function runGatesCommand(opts: { args: string[] }): Promise<void> {
     if (result.url) console.log(`  url: ${result.url}`);
     if (result.prNumber) console.log(`  pr: #${result.prNumber}`);
     if (result.prUrl) console.log(`  pr url: ${result.prUrl}`);
+    const ciClassifier = buildCiClassifierProjection({ result, artifacts: state.artifacts });
+    if (ciClassifier.classifierSummary) {
+      console.log(`  classifier: ${ciClassifier.classifierSummary}`);
+    }
   }
 
   if (state.artifacts.length > 0) {
