@@ -20,9 +20,9 @@ function createTask() {
 }
 
 describe("repo worker issue failure circuit integration", () => {
-  const updateTaskStatusMock = mock(async (task: any, status: string, fields: Record<string, string>) => {
+  const updateTaskStatusMock = mock(async (task: any, status: string, fields?: Record<string, string | number>) => {
     task.status = status;
-    Object.assign(task, fields);
+    Object.assign(task, fields ?? {});
     return true;
   });
 
