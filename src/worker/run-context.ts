@@ -87,6 +87,12 @@ function extractPrNumber(prUrl: string | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function summarizeError(error: unknown): string | null {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  const trimmed = message.trim();
+  return trimmed ? trimmed : null;
+}
+
 function buildMissingPrEvidenceNote(params: {
   task: AgentTask;
   repo: string;
@@ -289,6 +295,7 @@ export async function withRunContext<TResult extends { outcome?: string }>(param
   const recordingSession = params.ports.createContextRecoveryAdapter(recordingBase);
 
   let result: TResult | null = null;
+  let runErrorSummary: string | null = null;
   const context = params.ports.buildDashboardContext(params.task, runId);
 
   try {
@@ -301,6 +308,9 @@ export async function withRunContext<TResult extends { outcome?: string }>(param
       return await params.ports.withSessionAdapters({ baseSession: recordingBase, session: recordingSession }, params.run);
     });
     return result;
+  } catch (error: unknown) {
+    runErrorSummary = summarizeError(error);
+    throw error;
   } finally {
     params.ports.publishDashboardEvent({
       type: "worker.became_idle",
@@ -329,6 +339,15 @@ export async function withRunContext<TResult extends { outcome?: string }>(param
 
     if (completionDecision.causeCode && !finalDetails.prEvidenceCauseCode) {
       finalDetails.prEvidenceCauseCode = completionDecision.causeCode;
+    }
+
+    if (attemptedOutcome === "failed") {
+      if (!finalDetails.stage) {
+        finalDetails.stage = "run";
+      }
+      if (runErrorSummary && !finalDetails.errorSummary) {
+        finalDetails.errorSummary = runErrorSummary;
+      }
     }
 
     if (attemptedOutcome === "success" && issueLinked) {
