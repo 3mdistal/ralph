@@ -101,7 +101,14 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
       const opencodeXdg = resolvedOpencode.opencodeXdg;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
-      if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
+      const pinnedProfile = task["opencode-profile"]?.trim() || "";
+      if (opencodeProfileName && pinnedProfile !== opencodeProfileName) {
+        if (pinnedProfile) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Resume profile affinity moved ${JSON.stringify(pinnedProfile)} -> ${JSON.stringify(opencodeProfileName)} ` +
+              `for session ${JSON.stringify(existingSessionId)}`
+          );
+        }
         await this.queue.updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
       }
 

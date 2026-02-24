@@ -152,6 +152,93 @@ test("resume detects session stored under session_diff", async () => {
   expect(resolved.opencodeXdg?.dataHome).toBe(appleData);
 });
 
+test("resume falls back when pinned profile session moved to another configured profile", async () => {
+  const appleData = join(homeDir, ".opencode-profiles", "apple", "data");
+  const appleCfg = join(homeDir, ".opencode-profiles", "apple", "config");
+  const appleState = join(homeDir, ".opencode-profiles", "apple", "state");
+
+  const googleData = join(homeDir, ".opencode-profiles", "google", "data");
+  const googleCfg = join(homeDir, ".opencode-profiles", "google", "config");
+  const googleState = join(homeDir, ".opencode-profiles", "google", "state");
+
+  await writeJson(getRalphConfigJsonPath(), {
+    opencode: {
+      enabled: true,
+      defaultProfile: "auto",
+      profiles: {
+        apple: { xdgDataHome: appleData, xdgConfigHome: appleCfg, xdgStateHome: appleState },
+        google: { xdgDataHome: googleData, xdgConfigHome: googleCfg, xdgStateHome: googleState },
+      },
+    },
+  });
+
+  __resetConfigForTests();
+
+  const sessionId = "ses_moved_profile_detect";
+  const shard = "fadedcab";
+  const sessionFile = join(googleData, "opencode", "storage", "session", shard, `${sessionId}.json`);
+  await mkdir(dirname(sessionFile), { recursive: true });
+  await writeFile(sessionFile, "{}", "utf8");
+
+  const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+  const task: any = {
+    repo: "3mdistal/ralph",
+    issue: "3mdistal/ralph#557",
+    name: "issue 557",
+    status: "in-progress",
+    _path: "orchestration/tasks/557.md",
+    "opencode-profile": "apple",
+    "session-id": sessionId,
+  };
+
+  const resolved = await (worker as any).resolveOpencodeXdgForTask(task, "resume", sessionId);
+  expect(resolved.profileName).toBe("google");
+  expect(resolved.opencodeXdg?.dataHome).toBe(googleData);
+  expect(resolved.error).toBeUndefined();
+});
+
+test("resume emits terminal profile-unresolvable reason when session is missing everywhere", async () => {
+  const appleData = join(homeDir, ".opencode-profiles", "apple", "data");
+  const appleCfg = join(homeDir, ".opencode-profiles", "apple", "config");
+  const appleState = join(homeDir, ".opencode-profiles", "apple", "state");
+
+  const googleData = join(homeDir, ".opencode-profiles", "google", "data");
+  const googleCfg = join(homeDir, ".opencode-profiles", "google", "config");
+  const googleState = join(homeDir, ".opencode-profiles", "google", "state");
+
+  await writeJson(getRalphConfigJsonPath(), {
+    opencode: {
+      enabled: true,
+      defaultProfile: "auto",
+      profiles: {
+        apple: { xdgDataHome: appleData, xdgConfigHome: appleCfg, xdgStateHome: appleState },
+        google: { xdgDataHome: googleData, xdgConfigHome: googleCfg, xdgStateHome: googleState },
+      },
+    },
+  });
+
+  __resetConfigForTests();
+
+  const sessionId = "ses_missing_everywhere";
+  const worker = new RepoWorker("3mdistal/ralph", "/tmp");
+  const task: any = {
+    repo: "3mdistal/ralph",
+    issue: "3mdistal/ralph#558",
+    name: "issue 558",
+    status: "in-progress",
+    _path: "orchestration/tasks/558.md",
+    "opencode-profile": "apple",
+    "session-id": sessionId,
+  };
+
+  const resolved = await (worker as any).resolveOpencodeXdgForTask(task, "resume", sessionId);
+  expect(resolved.profileName).toBe(null);
+  expect(resolved.opencodeXdg).toBeUndefined();
+  expect(resolved.error).toContain("blocked:profile-unresolvable");
+  expect(resolved.error).toContain("terminal");
+  expect(resolved.error).toContain("pinnedProfile=apple");
+});
+
 test("writes config to the expected path", async () => {
   // Sanity check that our HOME override affects config resolution.
   const path = getRalphConfigJsonPath();
