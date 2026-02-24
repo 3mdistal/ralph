@@ -20,8 +20,11 @@ export type OpencodeXdg = {
 };
 
 export type ResolveOpencodeXdgResult = {
+  kind: "ok" | "restart-fresh" | "blocked";
   profileName: string | null;
   opencodeXdg?: OpencodeXdg;
+  reason?: string;
+  clearPinnedProfile?: boolean;
   error?: string;
 };
 
@@ -98,14 +101,6 @@ async function profileContainsSession(params: {
   return false;
 }
 
-function profileToXdg(profile: ResolvedProfile): OpencodeXdg {
-  return {
-    dataHome: profile.xdgDataHome,
-    stateHome: profile.xdgStateHome,
-    cacheHome: profile.xdgCacheHome,
-  };
-}
-
 export function getPinnedOpencodeProfileName(task: AgentTask): string | null {
   const raw = task["opencode-profile"];
   const trimmed = typeof raw === "string" ? raw.trim() : "";
@@ -115,7 +110,7 @@ export function getPinnedOpencodeProfileName(task: AgentTask): string | null {
 export async function resolveOpencodeXdgForTask(
   opts: ResolveOpencodeXdgForTaskOptions
 ): Promise<ResolveOpencodeXdgResult> {
-  if (!isOpencodeProfilesEnabled()) return { profileName: null };
+  if (!isOpencodeProfilesEnabled()) return { kind: "ok", profileName: null };
 
   const nowMs = opts.nowMs ?? Date.now();
   const readdir = opts.readdir ?? readdirFs;
@@ -124,43 +119,19 @@ export async function resolveOpencodeXdgForTask(
   const warn = opts.warn ?? ((message: string) => console.warn(message));
 
   const pinned = getPinnedOpencodeProfileName(opts.task);
-
-  if (pinned && opts.phase !== "resume") {
-    const resolved = resolveOpencodeProfile(pinned);
-    if (!resolved) {
-      return {
-        profileName: pinned,
-        error: buildProfileUnresolvableError({
-          phase: opts.phase,
-          taskIssue: opts.task.issue,
-          reason: `Task is pinned to unknown OpenCode profile ${JSON.stringify(pinned)}`,
-          configuredProfiles: listOpencodeProfileNames(),
-          pinnedProfile: pinned,
-          sessionId: undefined,
-        }),
-      };
-    }
-
-    return {
-      profileName: resolved.name,
-      opencodeXdg: {
-        dataHome: resolved.xdgDataHome,
-        stateHome: resolved.xdgStateHome,
-        cacheHome: resolved.xdgCacheHome,
-      },
-    };
-  }
-
   if (opts.phase === "resume") {
     if (!opts.sessionId) {
+      const error = buildProfileUnresolvableError({
+        phase: "resume",
+        taskIssue: opts.task.issue,
+        reason: "Resume requires a session ID to resolve the OpenCode profile",
+        configuredProfiles: listOpencodeProfileNames(),
+      });
       return {
+        kind: "blocked",
         profileName: null,
-        error: buildProfileUnresolvableError({
-          phase: "resume",
-          taskIssue: opts.task.issue,
-          reason: "Resume requires a session ID to resolve the OpenCode profile",
-          configuredProfiles: listOpencodeProfileNames(),
-        }),
+        reason: "Resume requires a session ID to resolve the OpenCode profile",
+        error,
       };
     }
 
@@ -170,19 +141,15 @@ export async function resolveOpencodeXdgForTask(
       .filter((profile): profile is ResolvedProfile => Boolean(profile));
 
     const preferred = pinned ? resolveOpencodeProfile(pinned) : null;
+    const clearPinnedProfile = Boolean(pinned && !preferred);
     if (pinned && !preferred) {
-      return {
-        profileName: pinned,
-        error: buildProfileUnresolvableError({
-          phase: "resume",
-          taskIssue: opts.task.issue,
-          reason: `Task is pinned to unknown OpenCode profile ${JSON.stringify(pinned)}`,
-          configuredProfiles: configuredProfileNames,
-          pinnedProfile: pinned,
-          sessionId: opts.sessionId,
-        }),
-      };
+      warn(
+        `[ralph:worker:${opts.repo}] Ignoring stale task OpenCode profile affinity=${JSON.stringify(
+          pinned
+        )}; profile is no longer configured`
+      );
     }
+
     const orderedCandidates: ResolvedProfile[] = preferred
       ? [preferred, ...configuredResolved.filter((profile) => profile.name !== preferred.name)]
       : configuredResolved;
@@ -208,8 +175,9 @@ export async function resolveOpencodeXdgForTask(
       }
 
       return {
+        kind: "ok",
         profileName: candidate.name,
-        opencodeXdg: profileToXdg(candidate),
+        opencodeXdg: toOpencodeXdg(candidate),
       };
     }
 
@@ -222,16 +190,28 @@ export async function resolveOpencodeXdgForTask(
         : "; terminal: no profile contains the session");
 
     return {
+      kind: "restart-fresh",
       profileName: null,
-      error: buildProfileUnresolvableError({
-        phase: "resume",
-        taskIssue: opts.task.issue,
-        reason,
-        configuredProfiles: configuredProfileNames,
-        pinnedProfile: preferred?.name ?? pinned ?? null,
-        sessionId: opts.sessionId,
-      }),
+      reason,
+      clearPinnedProfile,
     };
+  }
+
+  if (pinned) {
+    const resolved = resolveOpencodeProfile(pinned);
+    if (resolved) {
+      return {
+        kind: "ok",
+        profileName: resolved.name,
+        opencodeXdg: toOpencodeXdg(resolved),
+      };
+    }
+
+    warn(
+      `[ralph:worker:${opts.repo}] Ignoring stale task OpenCode profile affinity=${JSON.stringify(
+        pinned
+      )}; profile is no longer configured`
+    );
   }
 
   // Source of truth is config (opencode.defaultProfile). The control file no longer controls profile.
@@ -276,24 +256,32 @@ export async function resolveOpencodeXdgForTask(
     warn(
       `[ralph:worker:${opts.repo}] ${PROFILE_UNRESOLVABLE_PREFIX}: ${reason}; refusing ambient fallback while profiles are enabled`
     );
+    const error = buildProfileUnresolvableError({
+      phase: "start",
+      taskIssue: opts.task.issue,
+      reason,
+      configuredProfiles: listOpencodeProfileNames(),
+      requestedProfile,
+    });
     return {
+      kind: "blocked",
       profileName: null,
-      error: buildProfileUnresolvableError({
-        phase: "start",
-        taskIssue: opts.task.issue,
-        reason,
-        configuredProfiles: listOpencodeProfileNames(),
-        requestedProfile,
-      }),
+      reason,
+      error,
     };
   }
 
   return {
+    kind: "ok",
     profileName: resolved.name,
-    opencodeXdg: {
-      dataHome: resolved.xdgDataHome,
-      stateHome: resolved.xdgStateHome,
-      cacheHome: resolved.xdgCacheHome,
-    },
+    opencodeXdg: toOpencodeXdg(resolved),
+  };
+}
+
+function toOpencodeXdg(profile: NonNullable<ReturnType<typeof resolveOpencodeProfile>>): OpencodeXdg {
+  return {
+    dataHome: profile.xdgDataHome,
+    stateHome: profile.xdgStateHome,
+    cacheHome: profile.xdgCacheHome,
   };
 }

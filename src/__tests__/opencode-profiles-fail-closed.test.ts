@@ -123,3 +123,34 @@ test("profiles disabled preserves legacy non-fail-closed behavior", async () => 
   expect(resolved.error).toBeUndefined();
   expect(resolved.profileName).toBe(null);
 });
+
+test("start ignores stale task profile affinity and resolves from config", async () => {
+  const appleData = join(homeDir, ".opencode-profiles", "apple", "data");
+  const appleCfg = join(homeDir, ".opencode-profiles", "apple", "config");
+  const appleState = join(homeDir, ".opencode-profiles", "apple", "state");
+  await writeJson(getRalphConfigJsonPath(), {
+    opencode: {
+      enabled: true,
+      defaultProfile: "apple",
+      profiles: {
+        apple: {
+          xdgDataHome: appleData,
+          xdgConfigHome: appleCfg,
+          xdgStateHome: appleState,
+        },
+      },
+    },
+  });
+  __resetConfigForTests();
+
+  const resolved = await resolveOpencodeXdgForTask({
+    task: { issue: "3mdistal/ralph#610", "opencode-profile": "stale-profile" } as any,
+    phase: "start",
+    repo: "3mdistal/ralph",
+    getThrottleDecision: mockThrottleDecision as any,
+  });
+
+  expect(resolved.kind).toBe("ok");
+  expect(resolved.profileName).toBe("apple");
+  expect(resolved.error).toBeUndefined();
+});
