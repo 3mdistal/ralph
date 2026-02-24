@@ -498,10 +498,16 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 
   if (result.outcome === "escalated") {
     details.reasonCode = "escalated";
+    details.stage = "worker";
   }
 
   if (result.outcome === "failed") {
     details.reasonCode = "failed";
+    details.stage = "worker";
+  }
+
+  if (result.escalationReason) {
+    details.errorSummary = result.escalationReason;
   }
 
   return Object.keys(details).length ? details : undefined;
