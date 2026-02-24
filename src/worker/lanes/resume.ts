@@ -375,12 +375,19 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
 
+        const skipContinueRetries = prRecoveryCauseCode === "POLICY_DENIED";
+        if (skipContinueRetries) {
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, "PR recovery failed with POLICY_DENIED; skipping continue retries."]
+            .filter(Boolean)
+            .join("\n\n");
+        }
+
         let continueAttempts = 0;
         let anomalyAborts = 0;
         let lastAnomalyCount = 0;
         let prCreateLeaseKey: string | null = null;
 
-        while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
+        while (!prUrl && !skipContinueRetries && continueAttempts < MAX_CONTINUE_RETRIES) {
           await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
 
           const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);
