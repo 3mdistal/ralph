@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { hasProductGap, selectPrUrl } from "../routing";
+import { hasProductGap, selectPrUrl, shouldEscalateProductGap } from "../routing";
 
 describe("hasProductGap", () => {
   test("true only for explicit PRODUCT GAP: markers", () => {
@@ -21,6 +21,35 @@ describe("hasProductGap", () => {
     expect(hasProductGap("this is not documented anywhere")).toBe(false);
     expect(hasProductGap("PRODUCT GAP")).toBe(false);
     expect(hasProductGap("Here is the marker: PRODUCT GAP: missing policy")).toBe(false);
+  });
+});
+
+describe("shouldEscalateProductGap", () => {
+  test("downgrades deterministic artifact PRODUCT GAP when repo is not opted in", () => {
+    const output = "PRODUCT GAP: missing claims/canonical.jsonl and docs/product/deterministic-gates.md";
+    expect(
+      shouldEscalateProductGap(output, {
+        deterministicArtifactContractRequired: false,
+      })
+    ).toBe(false);
+  });
+
+  test("preserves hard-block behavior when repo is opted in", () => {
+    const output = "PRODUCT GAP: missing canonical claims contract artifacts";
+    expect(
+      shouldEscalateProductGap(output, {
+        deterministicArtifactContractRequired: true,
+      })
+    ).toBe(true);
+  });
+
+  test("keeps non-contract product gaps as escalations", () => {
+    const output = "PRODUCT GAP: behavior for paused queue ownership is unspecified";
+    expect(
+      shouldEscalateProductGap(output, {
+        deterministicArtifactContractRequired: false,
+      })
+    ).toBe(true);
   });
 });
 

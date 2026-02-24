@@ -2,7 +2,7 @@
  * Routing decision parser for planning output
  */
 
-import { hasProductGap } from "./product-gap";
+import { hasProductGap, shouldEscalateProductGap } from "./product-gap";
 
 export interface RoutingDecision {
   decision: "proceed" | "escalate";
@@ -97,7 +97,7 @@ function normalizeDecision(obj: Record<string, any>): RoutingDecision | null {
   };
 }
 
-export { hasProductGap };
+export { hasProductGap, shouldEscalateProductGap };
 
 /**
  * Extract PR URL from session output
