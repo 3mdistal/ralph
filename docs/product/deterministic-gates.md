@@ -217,11 +217,23 @@ When CI fails, Ralph creates a triage step that:
 - decides the next action:
   - resume the same worker (best when failure clearly relates to their diff)
   - start a new focused worker (best when it needs deep debugging or different expertise)
-  - quarantine/label flaky tests (best when evidence suggests non-determinism)
+  - quarantine retry lane (best when repeated non-regression signatures suggest flake/infra)
 
 Guidelines:
 - avoid pasting full CI logs into LLM context; summarize and attach a short excerpt
 - store the CI URL and any extracted snippets as artifacts on the run record
+
+Normative policy (approved 2026-02-18):
+- Trigger quarantine only after a repeated failure signature for non-regression classes (`infra` or `flake-suspected`).
+- For `regression`, prefer resume/spawn before quarantine.
+- Retry budget remains bounded by `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` (default: `5`).
+- Quarantine backoff is exponential `30s -> 60s -> 120s` (cap `120s`) with jitter.
+- Escalate when budget is exhausted, or repeated-signature no-progress persists through bounded retries.
+
+Deterministic persistence contract:
+- Persist a versioned triage payload before remediation side effects (`resume|spawn|quarantine`).
+- The triage payload includes classifier version/signature, classification + reason, action + reason, attempt metadata, and prior signature.
+- Persisted artifacts are bounded/redacted and auditable through `ralph gates ... --json`.
 
 Escalation policy:
 - CI failures should default to an internal rework loop (resume/spawn) and only escalate to a human when they meet an escalation condition in `docs/escalation-policy.md` (e.g. product doc gap, hard external blocker).
@@ -234,7 +246,8 @@ Behavior:
 - Detect: if required checks are failing or timed out, do not escalate until bounded remediation attempts complete.
 - Comment: post a single canonical GitHub **issue** comment listing failing required check names + links, base/head refs, and the action statement: “Ralph is spawning a dedicated CI-debug run to make required checks green.” Edit this comment as CI state changes (no duplicates).
 - Run: spawn a dedicated CI-debug run immediately with a fresh worktree and fresh OpenCode session (no planning phase). Seed the prompt with failing check names/URLs/refs and a brief failure summary.
-- Retries: bounded attempts; configurable via `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` (default: 5). If the same failure signature repeats across attempts, stop early and escalate.
+- Retries: bounded attempts; configurable via `RALPH_CI_REMEDIATION_MAX_ATTEMPTS` (default: 5). Repeated non-regression signatures route to quarantine with bounded backoff before escalation.
+- Follow-up issues: dedupe by failing-check signature (one open follow-up per signature). Append occurrences to the same follow-up instead of creating duplicates.
 
 - GitHub status: keep `ralph:status:in-progress` while remediation attempts continue. Set `ralph:status:escalated` only after bounded CI-debug attempts fail.
 - Escalation: post a final comment summarizing what failed, what was tried (links to attempts), and the exact next human action.
