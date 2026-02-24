@@ -16,6 +16,7 @@ import {
   resolveRepoPreflightPolicy,
   getRepoRequiredChecksOverride,
   getRepoSetupCommands,
+  isRepoProductGapDeterministicContractRequired,
   isAutoUpdateBehindEnabled,
   getConfig,
   getProfile,
@@ -181,6 +182,7 @@ import { PAUSED_AT_CHECKPOINT_FIELD, parseCheckpointValue } from "./checkpoint-f
 import { applyTaskPatch } from "./task-patch";
 import { runStartLane } from "./lanes/start";
 import { runResumeLane } from "./lanes/resume";
+import { createIssueFailureCircuitBreaker, type IssueFailureCircuitDecision } from "./issue-failure-circuit-breaker";
 import {
   bumpLoopTriageAttempt,
   completeParentVerification,
@@ -498,10 +500,16 @@ function buildRunDetails(result: AgentRun | null): RalphRunDetails | undefined {
 
   if (result.outcome === "escalated") {
     details.reasonCode = "escalated";
+    details.stage = "worker";
   }
 
   if (result.outcome === "failed") {
     details.reasonCode = "failed";
+    details.stage = "worker";
+  }
+
+  if (result.escalationReason) {
+    details.errorSummary = result.escalationReason;
   }
 
   return Object.keys(details).length ? details : undefined;
@@ -611,6 +619,7 @@ export class RepoWorker {
   private activeRunId: string | null = null;
   private activeDashboardContext: DashboardEventContext | null = null;
   private ciDiagnosticsSignatureByPr = new Map<string, string>();
+  private issueFailureCircuit = createIssueFailureCircuitBreaker();
 
   // Keep thin wrapper methods on RepoWorker for test hooks.
   // Tests frequently monkeypatch these via `(worker as any)`.
@@ -764,6 +773,157 @@ export class RepoWorker {
         data: { message },
       },
       overrides
+    );
+  }
+
+  private clearIssueFailureCircuit(task: AgentTask): void {
+    const issueRef = parseIssueRef(task.issue, task.repo);
+    if (!issueRef) return;
+    this.issueFailureCircuit.clearIssue({ repo: issueRef.repo, issueNumber: issueRef.number });
+  }
+
+  private async applyIssueFailureCircuitBreaker(task: AgentTask, run: AgentRun, lane: "process" | "resume"): Promise<void> {
+    if (run.outcome !== "failed") {
+      if (run.outcome === "success" || run.outcome === "escalated") {
+        this.clearIssueFailureCircuit(task);
+      }
+      return;
+    }
+
+    if (task.status === "blocked" || task.status === "throttled" || task.status === "escalated") {
+      return;
+    }
+
+    const issueRef = parseIssueRef(task.issue, task.repo);
+    if (!issueRef) return;
+
+    const decision = this.issueFailureCircuit.recordFailure({
+      repo: issueRef.repo,
+      issueNumber: issueRef.number,
+      reason: run.escalationReason || "failed",
+      nowMs: Date.now(),
+    });
+
+    if (decision.action === "none") return;
+    if (decision.action === "open") {
+      await this.openIssueFailureCircuit(task, run, lane, decision);
+      return;
+    }
+
+    await this.backoffIssueFailure(task, lane, decision);
+  }
+
+  private async backoffIssueFailure(
+    task: AgentTask,
+    lane: "process" | "resume",
+    decision: Extract<IssueFailureCircuitDecision, { action: "backoff" }>
+  ): Promise<void> {
+    const now = new Date();
+    const resumeAt = new Date(now.getTime() + decision.backoffMs).toISOString();
+    const extraFields: Record<string, string> = {
+      "throttled-at": now.toISOString(),
+      "resume-at": resumeAt,
+      "usage-snapshot": JSON.stringify({
+        reason: "issue-failure-circuit-breaker",
+        lane,
+        fingerprint: decision.fingerprint,
+        normalizedReason: decision.normalizedReason,
+        recentCount: decision.recentCount,
+        opened: decision.opened,
+      }),
+      "daemon-id": "",
+      "heartbeat-at": "",
+      "worker-id": "",
+      "repo-slot": "",
+    };
+    if (decision.opened) {
+      extraFields["blocked-source"] = "runtime-error";
+      extraFields["blocked-reason"] = `Failure circuit open for fingerprint ${decision.fingerprint}; waiting for cooldown`;
+      extraFields["blocked-details"] = `recentCount=${decision.recentCount} lane=${lane}`;
+      extraFields["blocked-at"] = now.toISOString();
+      extraFields["blocked-checked-at"] = now.toISOString();
+    }
+
+    const updated = await this.queue.updateTaskStatus(task, "throttled", extraFields);
+    if (updated) {
+      applyTaskPatch(task, "throttled", extraFields);
+    }
+
+    console.warn(
+      `[ralph:worker:${this.repo}] Failure circuit backoff for ${task.issue}: fingerprint=${decision.fingerprint} ` +
+        `count=${decision.recentCount} lane=${lane} backoff=${Math.round(decision.backoffMs / 1000)}s`
+    );
+  }
+
+  private async openIssueFailureCircuit(
+    task: AgentTask,
+    run: AgentRun,
+    lane: "process" | "resume",
+    decision: Extract<IssueFailureCircuitDecision, { action: "open" }>
+  ): Promise<void> {
+    const reason =
+      `Failure circuit breaker opened for repeated ${lane} failures ` +
+      `(fingerprint=${decision.fingerprint}, count=${decision.recentCount})`;
+    const details = [
+      `Task: ${task.name}`,
+      `Issue: ${task.issue}`,
+      `Lane: ${lane}`,
+      `Fingerprint: ${decision.fingerprint}`,
+      `Count in window: ${decision.recentCount}`,
+      `Normalized reason: ${decision.normalizedReason}`,
+      run.escalationReason ? `Latest error: ${run.escalationReason}` : null,
+      task["run-log-path"]?.trim() ? `Run log: ${task["run-log-path"]?.trim()}` : null,
+      task["session-id"]?.trim() ? `Session: ${task["session-id"]?.trim()}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const wasEscalated = task.status === "escalated";
+    const extraFields: Record<string, string> = {
+      "daemon-id": "",
+      "heartbeat-at": "",
+      "worker-id": "",
+      "repo-slot": "",
+      "blocked-source": "runtime-error",
+      "blocked-reason": reason,
+      "blocked-details": `fingerprint=${decision.fingerprint}; count=${decision.recentCount}; lane=${lane}`,
+      "blocked-at": new Date().toISOString(),
+      "blocked-checked-at": new Date().toISOString(),
+    };
+    const escalated = await this.queue.updateTaskStatus(task, "escalated", extraFields);
+    if (escalated) {
+      applyTaskPatch(task, "escalated", extraFields);
+    }
+
+    await this.writeEscalationWriteback(task, {
+      reason,
+      details,
+      escalationType: "other",
+    });
+    await this.notify.notifyEscalation({
+      taskName: task.name,
+      taskFileName: task._name,
+      taskPath: task._path,
+      issue: task.issue,
+      repo: this.repo,
+      scope: task.scope,
+      priority: task.priority,
+      sessionId: task["session-id"]?.trim() || run.sessionId || undefined,
+      reason,
+      escalationType: "other",
+      planOutput: details,
+    });
+
+    if (escalated && !wasEscalated) {
+      await this.recordEscalatedRunNote(task, {
+        reason,
+        sessionId: task["session-id"]?.trim() || run.sessionId || undefined,
+        details,
+      });
+    }
+
+    console.warn(
+      `[ralph:worker:${this.repo}] Failure circuit opened for ${task.issue}: fingerprint=${decision.fingerprint} count=${decision.recentCount}`
     );
   }
 
@@ -2086,6 +2246,10 @@ export class RepoWorker {
       ...preflightLines,
       "```",
     ].join("\n");
+  }
+
+  private isRepoProductGapDeterministicContractRequired(): boolean {
+    return isRepoProductGapDeterministicContractRequired(this.repo);
   }
 
   private async getGitWorktrees(): Promise<GitWorktreeEntry[]> {
@@ -5423,8 +5587,11 @@ export class RepoWorker {
     phase: "start" | "resume",
     sessionId?: string
   ): Promise<{
+    kind: "ok" | "restart-fresh" | "blocked";
     profileName: string | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    reason?: string;
+    clearPinnedProfile?: boolean;
     error?: string;
   }> {
     return resolveOpencodeXdgForTaskCore({
@@ -6049,12 +6216,16 @@ export class RepoWorker {
   }
 
   async resumeTask(task: AgentTask, opts?: { resumeMessage?: string; repoSlot?: number | null }): Promise<AgentRun> {
-    return await runResumeLane(this, task, opts);
+    const run = await runResumeLane(this, task, opts);
+    await this.applyIssueFailureCircuitBreaker(task, run, "resume");
+    return run;
   }
 
 
   async processTask(task: AgentTask, opts?: { repoSlot?: number | null }): Promise<AgentRun> {
-    return await runStartLane(this, task, opts);
+    const run = await runStartLane(this, task, opts);
+    await this.applyIssueFailureCircuitBreaker(task, run, "process");
+    return run;
   }
 
   private async createAgentRun(

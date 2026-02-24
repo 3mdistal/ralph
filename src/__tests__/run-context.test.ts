@@ -75,6 +75,8 @@ describe("run context helpers", () => {
     const events: string[] = [];
     let activeRunId: string | null = "run-prev";
     let withSessionAdaptersCalled = false;
+    let completedOutcome: any = null;
+    let completedDetails: any = null;
     let currentBase: SessionAdapter | null = makeSessionAdapter();
     let currentSession: SessionAdapter | null = makeSessionAdapter();
 
@@ -120,7 +122,10 @@ describe("run context helpers", () => {
           publishDashboardEvent: (event) => events.push(event.type),
           createRunRecord: () => "run-2",
           ensureRunGateRows: () => {},
-          completeRun: () => {},
+          completeRun: (params) => {
+            completedOutcome = params.outcome;
+            completedDetails = params.details ?? null;
+          },
           upsertRunGateResult: () => {},
           recordRunGateArtifact: () => {},
           buildRunDetails: () => undefined,
@@ -141,6 +146,9 @@ describe("run context helpers", () => {
     expect(currentBase).not.toBeNull();
     expect(currentSession).not.toBeNull();
     expect(events).toEqual(["worker.became_busy", "worker.became_idle"]);
+    expect(completedOutcome).toBe("failed");
+    expect(completedDetails?.stage).toBe("run");
+    expect(completedDetails?.errorSummary).toBe("boom");
   });
 
   test("withDashboardSessionOptions forwards session events", () => {

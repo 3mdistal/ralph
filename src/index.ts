@@ -50,6 +50,7 @@ import { Semaphore } from "./semaphore";
 import { createSchedulerController, startQueuedTasks } from "./scheduler";
 import { createPrioritySelectorState } from "./scheduler/priority-policy";
 import { classifyQueuedResumePath } from "./scheduler/queued-resume-path";
+import { buildFreshStartSessionResetPatch, shouldResetSessionForFreshStart } from "./scheduler/fresh-start-session-reset";
 import {
   issuePriorityWeight,
   normalizeTaskPriority,
@@ -838,6 +839,12 @@ async function startTask(opts: {
       const shouldResumeLoopTriage = queuedResumePath === "loop-triage";
       const shouldResumeReview = queuedResumePath === "review";
       const shouldResumeQueuedSession = queuedResumePath === "queued-session";
+
+      if (shouldResetSessionForFreshStart({ blockedSource, sessionId, queuedResumePath })) {
+        const resetPatch = buildFreshStartSessionResetPatch();
+        await updateTaskStatus(claimedTask, "queued", resetPatch);
+        Object.assign(claimedTask, resetPatch);
+      }
 
       if (shouldResumeMergeConflict) {
         console.log(

@@ -93,6 +93,8 @@ export type RalphRunTracePointer = {
 };
 export type RalphRunDetails = {
   reasonCode?: string;
+  stage?: string;
+  errorSummary?: string;
   errorCode?: string;
   escalationType?: string;
   prUrl?: string;
@@ -220,6 +222,8 @@ function sanitizeRalphRunDetails(details?: RalphRunDetails | null): RalphRunDeta
 
   const sanitized: RalphRunDetails = {};
   const reasonCode = sanitizeRunDetailString(details.reasonCode, 120);
+  const stage = sanitizeRunDetailString(details.stage, 120);
+  const errorSummary = sanitizeRunDetailString(details.errorSummary, 400);
   const errorCode = sanitizeRunDetailString(details.errorCode, 120);
   const escalationType = sanitizeRunDetailString(details.escalationType, 120);
   const prUrl = sanitizeRunDetailString(details.prUrl, 500);
@@ -228,6 +232,8 @@ function sanitizeRalphRunDetails(details?: RalphRunDetails | null): RalphRunDeta
   const prEvidenceCauseCode = sanitizeRunDetailString(details.prEvidenceCauseCode, 64);
 
   if (reasonCode) sanitized.reasonCode = reasonCode;
+  if (stage) sanitized.stage = stage;
+  if (errorSummary) sanitized.errorSummary = errorSummary;
   if (errorCode) sanitized.errorCode = errorCode;
   if (escalationType) sanitized.escalationType = escalationType;
   if (prUrl) sanitized.prUrl = prUrl;
@@ -237,6 +243,17 @@ function sanitizeRalphRunDetails(details?: RalphRunDetails | null): RalphRunDeta
   if (details.watchdogTimeout) sanitized.watchdogTimeout = true;
 
   return Object.keys(sanitized).length ? sanitized : null;
+}
+
+function normalizeCompletedRunDetails(params: {
+  outcome: RalphRunOutcome;
+  details: RalphRunDetails | null;
+}): RalphRunDetails | null {
+  const normalized = { ...(params.details ?? {}) };
+  if (params.outcome === "failed" && !normalized.reasonCode) {
+    normalized.reasonCode = "failed";
+  }
+  return Object.keys(normalized).length ? normalized : null;
 }
 
 function parseJsonArray(value?: string | null): string[] {
@@ -3848,7 +3865,11 @@ export function completeRalphRun(params: {
   const database = requireDb();
   const at = params.completedAt ?? nowIso();
   const sanitizedDetails = sanitizeRalphRunDetails(params.details ?? null);
-  const detailsJson = sanitizedDetails ? JSON.stringify(sanitizedDetails) : null;
+  const normalizedDetails = normalizeCompletedRunDetails({
+    outcome: params.outcome,
+    details: sanitizedDetails,
+  });
+  const detailsJson = normalizedDetails ? JSON.stringify(normalizedDetails) : null;
 
   database
     .query(

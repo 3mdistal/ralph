@@ -94,15 +94,50 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
       const eventWorkerId = task["worker-id"]?.trim();
 
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume", existingSessionId);
+      const opencodeResolutionKind = resolvedOpencode.kind ?? (resolvedOpencode.error ? "blocked" : "ok");
 
-      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
+      if (opencodeResolutionKind === "blocked") {
+        throw new Error(resolvedOpencode.error || resolvedOpencode.reason || "OpenCode profile resolution failed");
+      }
+
+      if (opencodeResolutionKind === "restart-fresh") {
+        const resetPatch: Record<string, string> = {
+          "session-id": "",
+          "blocked-source": "",
+          "blocked-reason": "",
+          "blocked-details": "",
+          "blocked-at": "",
+          "blocked-checked-at": "",
+        };
+        if (resolvedOpencode.clearPinnedProfile) {
+          resetPatch["opencode-profile"] = "";
+        }
+        await this.queue.updateTaskStatus(task, "queued", resetPatch);
+        applyTaskPatch(task, "queued", resetPatch);
+
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: existingSessionId,
+          escalationReason: resolvedOpencode.reason || "Resume session could not be located under configured profiles",
+        };
+      }
 
       const opencodeProfileName = resolvedOpencode.profileName;
       const opencodeXdg = resolvedOpencode.opencodeXdg;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
-      if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
+      const pinnedProfile = task["opencode-profile"]?.trim() || "";
+      if (opencodeProfileName && pinnedProfile !== opencodeProfileName) {
+        if (pinnedProfile) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Resume profile affinity moved ${JSON.stringify(pinnedProfile)} -> ${JSON.stringify(opencodeProfileName)} ` +
+              `for session ${JSON.stringify(existingSessionId)}`
+          );
+        }
         await this.queue.updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
+        task["opencode-profile"] = opencodeProfileName;
       }
 
       const pausedSetup = await this.pauseIfHardThrottled(task, "setup (resume)", existingSessionId);
@@ -340,12 +375,19 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
           prUrl = this.updateOpenPrSnapshot(task, prUrl, recovered.prUrl ?? null);
         }
 
+        const skipContinueRetries = prRecoveryCauseCode === "POLICY_DENIED";
+        if (skipContinueRetries) {
+          prRecoveryDiagnostics = [prRecoveryDiagnostics, "PR recovery failed with POLICY_DENIED; skipping continue retries."]
+            .filter(Boolean)
+            .join("\n\n");
+        }
+
         let continueAttempts = 0;
         let anomalyAborts = 0;
         let lastAnomalyCount = 0;
         let prCreateLeaseKey: string | null = null;
 
-        while (!prUrl && continueAttempts < MAX_CONTINUE_RETRIES) {
+        while (!prUrl && !skipContinueRetries && continueAttempts < MAX_CONTINUE_RETRIES) {
           await this.drainNudges(task, taskRepoPath, buildResult.sessionId || existingSessionId, cacheKey, "resume", opencodeXdg);
 
           const anomalyStatus = await readLiveAnomalyCount(buildResult.sessionId);

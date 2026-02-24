@@ -4,7 +4,7 @@ import { getRepoBotBranch } from "../../config";
 import { isRepoAllowed } from "../../github-app-auth";
 import { appendChildDossierToIssueContext } from "../../child-dossier/core";
 import { buildPlannerPrompt } from "../../planner-prompt";
-import { hasProductGap, parseRoutingDecision, selectPrUrl } from "../../routing";
+import { hasProductGap, parseRoutingDecision, selectPrUrl, shouldEscalateProductGap } from "../../routing";
 import { isExplicitBlockerReason, isImplementationTaskFromIssue, shouldConsultDevex } from "../../escalation";
 import { summarizeForNote } from "../run-notes";
 import { parseIssueRef } from "../../github/issue-ref";
@@ -58,7 +58,10 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
       if (pausedPreStart) return pausedPreStart;
 
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "start");
-      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
+      const opencodeResolutionKind = resolvedOpencode.kind ?? (resolvedOpencode.error ? "blocked" : "ok");
+      if (opencodeResolutionKind !== "ok") {
+        throw new Error(resolvedOpencode.error || resolvedOpencode.reason || "OpenCode profile resolution failed");
+      }
 
       const opencodeProfileName = resolvedOpencode.profileName;
       const opencodeXdg = resolvedOpencode.opencodeXdg;
@@ -82,9 +85,10 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
       const shouldClearBlocked = Boolean(
         task["blocked-source"]?.trim() || task["blocked-reason"]?.trim() || task["blocked-details"]?.trim()
       );
+      const shouldUpdateProfileAffinity = Boolean(opencodeProfileName && task["opencode-profile"]?.trim() !== opencodeProfileName);
       const markedStarting = await this.queue.updateTaskStatus(task, "starting", {
         "assigned-at": startTime.toISOString().split("T")[0],
-        ...(!task["opencode-profile"]?.trim() && opencodeProfileName ? { "opencode-profile": opencodeProfileName } : {}),
+        ...(shouldUpdateProfileAffinity ? { "opencode-profile": opencodeProfileName } : {}),
         ...(workerId ? { "worker-id": workerId } : {}),
         ...(typeof allocatedSlot === "number" ? { "repo-slot": String(allocatedSlot) } : {}),
         ...(shouldClearBlocked
@@ -99,6 +103,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
       });
       if (workerId) task["worker-id"] = workerId;
       if (typeof allocatedSlot === "number") task["repo-slot"] = String(allocatedSlot);
+      if (shouldUpdateProfileAffinity && opencodeProfileName) task["opencode-profile"] = opencodeProfileName;
       if (!markedStarting) {
         throw new Error("Failed to mark task starting (queue update failed)");
       }
@@ -312,8 +317,22 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
         await this.recordCheckpoint(task, "planned", planResult.sessionId);
         this.publishCheckpoint("planned", { sessionId: planResult.sessionId || undefined });
 
+        const strictDeterministicProductGap = this.isRepoProductGapDeterministicContractRequired();
+        const evaluateProductGap = (output: string, stage: string): boolean => {
+          const hasGapSignal = hasProductGap(output);
+          const shouldEscalate = shouldEscalateProductGap(output, {
+            deterministicArtifactContractRequired: strictDeterministicProductGap,
+          });
+          if (!strictDeterministicProductGap && hasGapSignal && !shouldEscalate) {
+            console.warn(
+              `[ralph:worker:${this.repo}] ${stage}: downgraded PRODUCT GAP caused only by missing deterministic artifact contract files`
+            );
+          }
+          return shouldEscalate;
+        };
+
         let routing = parseRoutingDecision(planResult.output);
-        let hasGap = hasProductGap(planResult.output);
+        let hasGap = evaluateProductGap(planResult.output, "planner routing");
 
         await this.recordCheckpoint(task, "routed", planResult.sessionId);
 
@@ -441,7 +460,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               const updatedRouting = parseRoutingDecision(rerouteResult.output);
               if (updatedRouting) routing = updatedRouting;
 
-              hasGap = hasGap || hasProductGap(rerouteResult.output);
+              hasGap = hasGap || evaluateProductGap(rerouteResult.output, "reroute routing");
             }
           }
         }

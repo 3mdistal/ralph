@@ -943,6 +943,37 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     }
   });
 
+  test("persists normalized non-empty details for failed runs", () => {
+    initStateDb();
+
+    const runId = createRalphRun({
+      repo: "3mdistal/ralph",
+      issue: "3mdistal/ralph#795",
+      taskPath: "github:3mdistal/ralph#795",
+      attemptKind: "process",
+      startedAt: "2026-02-24T10:00:00.000Z",
+    });
+
+    completeRalphRun({
+      runId,
+      outcome: "failed",
+      completedAt: "2026-02-24T10:05:00.000Z",
+    });
+
+    const db = new Database(getRalphStateDbPath());
+    try {
+      const runRow = db
+        .query("SELECT details_json FROM ralph_runs WHERE run_id = $run_id")
+        .get({ $run_id: runId }) as { details_json?: string | null };
+
+      expect(runRow.details_json).toBeTruthy();
+      const details = JSON.parse(String(runRow.details_json));
+      expect(details.reasonCode).toBe("failed");
+    } finally {
+      db.close();
+    }
+  });
+
   test("persists gate state across restarts", () => {
     initStateDb();
 
