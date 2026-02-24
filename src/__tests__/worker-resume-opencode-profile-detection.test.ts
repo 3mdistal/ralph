@@ -242,7 +242,7 @@ test("resume falls back when pinned profile session moved to another configured 
   expect(resolved.error).toBeUndefined();
 });
 
-test("resume emits terminal profile-unresolvable reason when session is missing everywhere", async () => {
+test("resume requests fresh restart when session is missing everywhere", async () => {
   const appleData = join(homeDir, ".opencode-profiles", "apple", "data");
   const appleCfg = join(homeDir, ".opencode-profiles", "apple", "config");
   const appleState = join(homeDir, ".opencode-profiles", "apple", "state");
@@ -277,11 +277,11 @@ test("resume emits terminal profile-unresolvable reason when session is missing 
   };
 
   const resolved = await (worker as any).resolveOpencodeXdgForTask(task, "resume", sessionId);
+  expect(resolved.kind).toBe("restart-fresh");
   expect(resolved.profileName).toBe(null);
   expect(resolved.opencodeXdg).toBeUndefined();
-  expect(resolved.error).toContain("blocked:profile-unresolvable");
-  expect(resolved.error).toContain("terminal");
-  expect(resolved.error).toContain("pinnedProfile=apple");
+  expect(resolved.reason).toContain("terminal");
+  expect(resolved.reason).toContain(sessionId);
 });
 
 test("writes config to the expected path", async () => {
