@@ -94,15 +94,50 @@ export async function runResumeLane(deps: ResumeLaneDeps, task: AgentTask, opts?
       const eventWorkerId = task["worker-id"]?.trim();
 
       const resolvedOpencode = await this.resolveOpencodeXdgForTask(task, "resume", existingSessionId);
+      const opencodeResolutionKind = resolvedOpencode.kind ?? (resolvedOpencode.error ? "blocked" : "ok");
 
-      if (resolvedOpencode.error) throw new Error(resolvedOpencode.error);
+      if (opencodeResolutionKind === "blocked") {
+        throw new Error(resolvedOpencode.error || resolvedOpencode.reason || "OpenCode profile resolution failed");
+      }
+
+      if (opencodeResolutionKind === "restart-fresh") {
+        const resetPatch: Record<string, string> = {
+          "session-id": "",
+          "blocked-source": "",
+          "blocked-reason": "",
+          "blocked-details": "",
+          "blocked-at": "",
+          "blocked-checked-at": "",
+        };
+        if (resolvedOpencode.clearPinnedProfile) {
+          resetPatch["opencode-profile"] = "";
+        }
+        await this.queue.updateTaskStatus(task, "queued", resetPatch);
+        applyTaskPatch(task, "queued", resetPatch);
+
+        return {
+          taskName: task.name,
+          repo: this.repo,
+          outcome: "failed",
+          sessionId: existingSessionId,
+          escalationReason: resolvedOpencode.reason || "Resume session could not be located under configured profiles",
+        };
+      }
 
       const opencodeProfileName = resolvedOpencode.profileName;
       const opencodeXdg = resolvedOpencode.opencodeXdg;
       const opencodeSessionOptions = opencodeXdg ? { opencodeXdg } : {};
 
-      if (!task["opencode-profile"]?.trim() && opencodeProfileName) {
+      const pinnedProfile = task["opencode-profile"]?.trim() || "";
+      if (opencodeProfileName && pinnedProfile !== opencodeProfileName) {
+        if (pinnedProfile) {
+          console.warn(
+            `[ralph:worker:${this.repo}] Resume profile affinity moved ${JSON.stringify(pinnedProfile)} -> ${JSON.stringify(opencodeProfileName)} ` +
+              `for session ${JSON.stringify(existingSessionId)}`
+          );
+        }
         await this.queue.updateTaskStatus(task, "in-progress", { "opencode-profile": opencodeProfileName });
+        task["opencode-profile"] = opencodeProfileName;
       }
 
       const pausedSetup = await this.pauseIfHardThrottled(task, "setup (resume)", existingSessionId);

@@ -5434,8 +5434,11 @@ export class RepoWorker {
     phase: "start" | "resume",
     sessionId?: string
   ): Promise<{
+    kind: "ok" | "restart-fresh" | "blocked";
     profileName: string | null;
     opencodeXdg?: { dataHome?: string; configHome?: string; stateHome?: string; cacheHome?: string };
+    reason?: string;
+    clearPinnedProfile?: boolean;
     error?: string;
   }> {
     return resolveOpencodeXdgForTaskCore({
