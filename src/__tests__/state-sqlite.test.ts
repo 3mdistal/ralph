@@ -334,7 +334,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         integrity_check_result?: string;
       };
       expect(backupRow.from_schema_version).toBe(7);
-      expect(backupRow.to_schema_version).toBe(24);
+      expect(backupRow.to_schema_version).toBe(25);
       expect(backupRow.integrity_check_result).toBe("ok");
       expect(backupRow.backup_size_bytes).toBeGreaterThan(0);
       expect(backupRow.backup_sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -343,13 +343,13 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
         "SELECT from_schema_version, to_schema_version, completed_at FROM state_migration_attempts ORDER BY id DESC LIMIT 1"
       ).get() as { from_schema_version?: number; to_schema_version?: number; completed_at?: string | null };
       expect(attemptRow.from_schema_version).toBe(7);
-      expect(attemptRow.to_schema_version).toBe(24);
+      expect(attemptRow.to_schema_version).toBe(25);
       expect(attemptRow.completed_at).toBeString();
 
       const completionCheckpoint = verify.query(
-        "SELECT checkpoint FROM state_migration_ledger WHERE checkpoint = 'schema-v24-complete' LIMIT 1"
+        "SELECT checkpoint FROM state_migration_ledger WHERE checkpoint = 'schema-v25-complete' LIMIT 1"
       ).get() as { checkpoint?: string } | undefined;
-      expect(completionCheckpoint?.checkpoint).toBe("schema-v24-complete");
+      expect(completionCheckpoint?.checkpoint).toBe("schema-v25-complete");
     } finally {
       verify.close();
     }
@@ -533,7 +533,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("24");
+      expect(meta.value).toBe("25");
 
       const issueColumns = migrated.query("PRAGMA table_info(issues)").all() as Array<{ name: string }>;
       const issueColumnNames = issueColumns.map((column) => column.name);
@@ -653,7 +653,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
       const meta = migrated
         .query("SELECT value FROM meta WHERE key = 'schema_version'")
         .get() as { value?: string };
-      expect(meta.value).toBe("24");
+      expect(meta.value).toBe("25");
 
       const columns = migrated.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>;
       const columnNames = columns.map((column) => column.name);
@@ -1189,7 +1189,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("24");
+      expect(meta.value).toBe("25");
 
       migrated
         .query(
@@ -1304,7 +1304,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("24");
+      expect(meta.value).toBe("25");
 
       const row = migrated
         .query("SELECT reason FROM ralph_run_gate_results WHERE run_id = 'run_v18' AND gate = 'ci'")
@@ -1426,7 +1426,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("24");
+      expect(meta.value).toBe("25");
 
       const backfilled = migrated
         .query("SELECT status FROM ralph_run_gate_results WHERE run_id = 'run_v20' AND gate = 'plan_review'")
@@ -1530,7 +1530,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
     const migrated = new Database(dbPath);
     try {
       const meta = migrated.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("24");
+      expect(meta.value).toBe("25");
 
       const row = migrated
         .query(
@@ -1856,7 +1856,7 @@ describe("State SQLite (~/.ralph/state.sqlite)", () => {
 
     try {
       const meta = db.query("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value?: string };
-      expect(meta.value).toBe("24");
+      expect(meta.value).toBe("25");
 
       const repoCount = db.query("SELECT COUNT(*) as n FROM repos").get() as { n: number };
       expect(repoCount.n).toBe(1);
