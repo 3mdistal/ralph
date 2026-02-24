@@ -32,7 +32,7 @@ function extractProductGapReasons(output: string): string[] {
   return reasons;
 }
 
-export function hasMissingDeterministicArtifactGap(output: string): boolean {
+function hasMissingDeterministicArtifactGap(output: string): boolean {
   const reasons = extractProductGapReasons(output);
   for (const reason of reasons) {
     const normalized = reason.toLowerCase();
