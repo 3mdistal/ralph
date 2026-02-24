@@ -17,7 +17,7 @@ import {
   type DurableStateSchemaWindow,
 } from "./durable-state-capability";
 
-const SCHEMA_VERSION = 24;
+const SCHEMA_VERSION = 25;
 const MIN_SUPPORTED_SCHEMA_VERSION = 1;
 const MAX_READABLE_SCHEMA_VERSION = SCHEMA_VERSION + 1;
 const DEFAULT_MIGRATION_BUSY_TIMEOUT_MS = 3_000;
