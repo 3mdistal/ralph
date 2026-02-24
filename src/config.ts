@@ -43,6 +43,8 @@ export type RepoVerificationConfig = {
   staging?: RepoVerificationStaging[];
 };
 
+export type RepoProductGapDeterministicContract = "required" | "best-effort";
+
 export interface RepoConfig {
   name: string;      // "owner/repo"
   path: string;      // "/Users/alice/Developer/repo"
@@ -85,6 +87,8 @@ export interface RepoConfig {
   autoQueue?: Partial<AutoQueueConfig>;
   /** Optional per-repo verification guidance for rollup PRs. */
   verification?: RepoVerificationConfig;
+  /** Whether missing deterministic product artifacts should hard-block PRODUCT GAP escalations. */
+  productGapDeterministicContract?: RepoProductGapDeterministicContract;
   /** Optional per-repo edit-churn loop detection configuration. */
   loopDetection?: LoopDetectionConfigInput;
   /** Internal: preflightCommand was declared but invalid in raw config. */
@@ -1080,6 +1084,19 @@ function validateConfig(loaded: RalphConfig): RalphConfig {
         updates.verification = parsed;
       } else {
         updates.verification = undefined;
+      }
+    }
+
+    const rawProductGapContract = (repo as any).productGapDeterministicContract;
+    if (rawProductGapContract !== undefined) {
+      if (rawProductGapContract === "required" || rawProductGapContract === "best-effort") {
+        updates.productGapDeterministicContract = rawProductGapContract;
+      } else {
+        console.warn(
+          `[ralph] Invalid config productGapDeterministicContract for repo ${repo.name}: ` +
+            `${JSON.stringify(rawProductGapContract)}; defaulting to best-effort`
+        );
+        updates.productGapDeterministicContract = "best-effort";
       }
     }
 
@@ -2158,6 +2175,12 @@ export function getRepoVerificationConfig(repoName: string): RepoVerificationCon
   const cfg = getConfig();
   const repo = cfg.repos.find((r) => r.name === repoName);
   return repo?.verification ?? null;
+}
+
+export function isRepoProductGapDeterministicContractRequired(repoName: string): boolean {
+  const cfg = getConfig();
+  const repo = cfg.repos.find((r) => r.name === repoName);
+  return repo?.productGapDeterministicContract === "required";
 }
 
 export type RepoPreflightCommands = {

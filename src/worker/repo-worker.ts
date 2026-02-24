@@ -16,6 +16,7 @@ import {
   resolveRepoPreflightPolicy,
   getRepoRequiredChecksOverride,
   getRepoSetupCommands,
+  isRepoProductGapDeterministicContractRequired,
   isAutoUpdateBehindEnabled,
   getConfig,
   getProfile,
@@ -2092,6 +2093,10 @@ export class RepoWorker {
       ...preflightLines,
       "```",
     ].join("\n");
+  }
+
+  private isRepoProductGapDeterministicContractRequired(): boolean {
+    return isRepoProductGapDeterministicContractRequired(this.repo);
   }
 
   private async getGitWorktrees(): Promise<GitWorktreeEntry[]> {

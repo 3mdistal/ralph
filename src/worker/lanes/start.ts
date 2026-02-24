@@ -4,7 +4,7 @@ import { getRepoBotBranch } from "../../config";
 import { isRepoAllowed } from "../../github-app-auth";
 import { appendChildDossierToIssueContext } from "../../child-dossier/core";
 import { buildPlannerPrompt } from "../../planner-prompt";
-import { hasProductGap, parseRoutingDecision, selectPrUrl } from "../../routing";
+import { hasProductGap, parseRoutingDecision, selectPrUrl, shouldEscalateProductGap } from "../../routing";
 import { isExplicitBlockerReason, isImplementationTaskFromIssue, shouldConsultDevex } from "../../escalation";
 import { summarizeForNote } from "../run-notes";
 import { parseIssueRef } from "../../github/issue-ref";
@@ -312,8 +312,22 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
         await this.recordCheckpoint(task, "planned", planResult.sessionId);
         this.publishCheckpoint("planned", { sessionId: planResult.sessionId || undefined });
 
+        const strictDeterministicProductGap = this.isRepoProductGapDeterministicContractRequired();
+        const evaluateProductGap = (output: string, stage: string): boolean => {
+          const hasGapSignal = hasProductGap(output);
+          const shouldEscalate = shouldEscalateProductGap(output, {
+            deterministicArtifactContractRequired: strictDeterministicProductGap,
+          });
+          if (!strictDeterministicProductGap && hasGapSignal && !shouldEscalate) {
+            console.warn(
+              `[ralph:worker:${this.repo}] ${stage}: downgraded PRODUCT GAP caused only by missing deterministic artifact contract files`
+            );
+          }
+          return shouldEscalate;
+        };
+
         let routing = parseRoutingDecision(planResult.output);
-        let hasGap = hasProductGap(planResult.output);
+        let hasGap = evaluateProductGap(planResult.output, "planner routing");
 
         await this.recordCheckpoint(task, "routed", planResult.sessionId);
 
@@ -441,7 +455,7 @@ export async function runStartLane(deps: StartLaneDeps, task: AgentTask, opts?: 
               const updatedRouting = parseRoutingDecision(rerouteResult.output);
               if (updatedRouting) routing = updatedRouting;
 
-              hasGap = hasGap || hasProductGap(rerouteResult.output);
+              hasGap = hasGap || evaluateProductGap(rerouteResult.output, "reroute routing");
             }
           }
         }
