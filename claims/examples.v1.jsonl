@@ -1,0 +1,1 @@
+{"schemaVersion":1,"domain":"claims","id":"claims.example.minimal","surface":"filesystem","path":"claims/canonical.jsonl","claim":"Claims ledger canonical entries are represented as JSON objects in JSONL format.","status":"planned","source":"claims/README.md"}

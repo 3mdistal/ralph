@@ -18,13 +18,17 @@
     "sandbox:init": "bun run src/index.ts sandbox:init",
     "sandbox:seed": "bun run src/index.ts sandbox:seed",
     "check:no-legacy-vault-tokens": "bun run scripts/check-no-legacy-vault-tokens.ts",
+    "claims:check": "bun run scripts/claims-canonicalize.ts --check",
+    "claims:fmt": "bun run scripts/claims-canonicalize.ts",
     "test": "bun run check:no-legacy-vault-tokens && bun test",
     "typecheck": "tsc --noEmit",
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json --noEmit",
     "build": "tsc -p tsconfig.json && bun run scripts/copy-managed-templates.ts",
     "knip": "knip"
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.2.6",
+    "ajv": "^8.17.1",
     "blessed": "^0.1.81"
   },
   "devDependencies": {

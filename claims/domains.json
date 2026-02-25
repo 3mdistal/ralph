@@ -1,5 +1,6 @@
 {
   "domains": [
+    { "id": "claims", "description": "Claims ledger format and validation" },
     { "id": "orchestration", "description": "Queue, labels, operator UX" },
     { "id": "dashboard", "description": "Control plane API, events, operator UI" },
     { "id": "worktree", "description": "Isolation + worktree lifecycle" },
