@@ -1,25 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { buildClaimsSchemaValidator, validateAndCanonicalizeClaimsJsonl } from "../src/claims";
-
-interface DomainsFile {
-  domains?: Array<{ id?: unknown }>;
-}
-
-function loadDomains(filePath: string): ReadonlySet<string> {
-  const raw = readFileSync(filePath, "utf8");
-  const parsed = JSON.parse(raw) as DomainsFile;
-  if (!parsed || !Array.isArray(parsed.domains)) {
-    throw new Error(`Invalid domains file: ${filePath}`);
-  }
-
-  const ids = parsed.domains
-    .map((domain) => domain.id)
-    .filter((id): id is string => typeof id === "string" && id.length > 0);
-
-  return new Set(ids);
-}
+import { buildClaimsSchemaValidator, parseAllowedDomains, validateAndCanonicalizeClaimsJsonl } from "../src/claims";
 
 function normalizeNewlines(input: string): string {
   return input.replace(/\r\n?/g, "\n");
@@ -56,7 +38,7 @@ function main(): number {
 
   const rawClaims = readFileSync(canonicalPath, "utf8");
   const schema = JSON.parse(readFileSync(schemaPath, "utf8")) as unknown;
-  const allowedDomains = loadDomains(domainsPath);
+  const allowedDomains = parseAllowedDomains(JSON.parse(readFileSync(domainsPath, "utf8")) as unknown);
   const validateSchema = buildClaimsSchemaValidator(schema);
 
   const result = validateAndCanonicalizeClaimsJsonl(rawClaims, {

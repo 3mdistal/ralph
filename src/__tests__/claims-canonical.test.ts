@@ -1,21 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { buildClaimsSchemaValidator, validateAndCanonicalizeClaimsJsonl } from "../claims";
+import { buildClaimsSchemaValidator, parseAllowedDomains, validateAndCanonicalizeClaimsJsonl } from "../claims";
 
 function readText(path: string): string {
   return readFileSync(resolve(process.cwd(), path), "utf8");
 }
 
 function readAllowedDomains(): ReadonlySet<string> {
-  const raw = JSON.parse(readText("claims/domains.json")) as {
-    domains?: Array<{ id?: unknown }>;
-  };
-  return new Set(
-    (raw.domains ?? [])
-      .map((entry) => entry.id)
-      .filter((id): id is string => typeof id === "string" && id.length > 0)
-  );
+  return parseAllowedDomains(JSON.parse(readText("claims/domains.json")) as unknown);
 }
 
 function normalizeNewlines(input: string): string {
