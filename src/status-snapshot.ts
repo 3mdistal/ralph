@@ -123,6 +123,30 @@ export type StatusDependencySatisfactionOverride = {
   via: string | null;
 };
 
+export type StatusOnboardingCheckStatus = "pass" | "warn" | "fail" | "unavailable";
+
+export type StatusOnboardingOverallStatus = "pass" | "warn" | "fail";
+
+export type StatusOnboardingCheck = {
+  checkId: string;
+  title: string;
+  critical: boolean;
+  status: StatusOnboardingCheckStatus;
+  reason: string;
+  remediation: string[];
+};
+
+export type StatusOnboardingRepo = {
+  repo: string;
+  status: StatusOnboardingOverallStatus;
+  checks: StatusOnboardingCheck[];
+};
+
+export type StatusOnboardingSnapshot = {
+  version: 1;
+  repos: StatusOnboardingRepo[];
+};
+
 import type { StatusUsageSnapshot } from "./status-usage";
 
 export type StatusSnapshot = {
@@ -172,6 +196,7 @@ export type StatusSnapshot = {
     };
     starvation: { count: number; lastAtTs: number | null };
   };
+  onboarding?: StatusOnboardingSnapshot;
 };
 
 const normalizeOrphanTask = (task: StatusOrphanTask): StatusOrphanTask => ({
@@ -238,6 +263,42 @@ const normalizeInProgressTask = (task: StatusInProgressTask): StatusInProgressTa
   sessionId: normalizeOptionalString(task.sessionId),
   line: normalizeOptionalString(task.line),
 });
+
+const normalizeOnboarding = (onboarding?: StatusOnboardingSnapshot): StatusOnboardingSnapshot | undefined => {
+  if (!onboarding || onboarding.version !== 1 || !Array.isArray(onboarding.repos)) return undefined;
+  const repos = onboarding.repos
+    .map((repo) => {
+      const repoName = normalizeOptionalString(repo.repo);
+      if (!repoName) return null;
+      const status = repo.status === "pass" || repo.status === "warn" || repo.status === "fail" ? repo.status : "warn";
+      const checks = Array.isArray(repo.checks)
+        ? repo.checks
+            .map((check) => {
+              const checkId = normalizeOptionalString(check.checkId);
+              const title = normalizeOptionalString(check.title);
+              if (!checkId || !title) return null;
+              const checkStatus =
+                check.status === "pass" || check.status === "warn" || check.status === "fail" || check.status === "unavailable"
+                  ? check.status
+                  : "unavailable";
+              return {
+                checkId,
+                title,
+                critical: check.critical === true,
+                status: checkStatus,
+                reason: normalizeOptionalString(check.reason) ?? "No details",
+                remediation: Array.isArray(check.remediation)
+                  ? check.remediation.map((item) => String(item ?? "").trim()).filter(Boolean)
+                  : [],
+              };
+            })
+            .filter((check): check is StatusOnboardingCheck => Boolean(check))
+        : [];
+      return { repo: repoName, status, checks };
+    })
+    .filter((repo): repo is StatusOnboardingRepo => Boolean(repo));
+  return { version: 1, repos };
+};
 
 export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
   const desiredMode = normalizeOptionalString(input.desiredMode);
@@ -337,5 +398,6 @@ export function buildStatusSnapshot(input: StatusSnapshot): StatusSnapshot {
           },
         }
       : undefined,
+    onboarding: normalizeOnboarding(input.onboarding),
   };
 }

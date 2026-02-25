@@ -344,7 +344,7 @@ bun dev
 bun run status
 ```
 
-Status output includes blocked tasks with reasons/idle age and recent alert summaries (when available).
+Status output includes an onboarding checklist per managed repo (pass/warn/fail with remediation hints), blocked tasks with reasons/idle age, and recent alert summaries (when available).
 
 Machine-readable output:
 
@@ -352,7 +352,7 @@ Machine-readable output:
 bun run status --json
 ```
 
-JSON output includes a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, a short `blockedDetailsSnippet`, and per-task `alerts` summaries when present.
+JSON output includes an optional versioned `onboarding` object (`version`, `repos[]`, per-check status/reason/remediation), plus a `blocked` array with `blockedAt`, `blockedSource`, `blockedReason`, a short `blockedDetailsSnippet`, and per-task `alerts` summaries when present.
 
 Live updates (prints when status changes):
 

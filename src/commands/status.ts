@@ -20,6 +20,7 @@ import {
   probeDurableState,
   listOrphanedTasksWithOpState,
 } from "../state";
+import type { StatusOnboardingSnapshot } from "../status-snapshot";
 import { getThrottleDecision } from "../throttle";
 import { computeDaemonGate } from "../daemon-gate";
 import { parseIssueRef } from "../github/issue-ref";
@@ -36,12 +37,17 @@ import {
   getTaskOpencodeProfileName,
   summarizeBlockedDetailsSnippet,
 } from "../status-utils";
+import { collectOnboardingEvaluations, collectUnavailableOnboardingEvaluations } from "../status-onboarding/probes";
+import { formatOnboardingSection } from "../status-onboarding/render";
 
 const STATUS_USAGE_TIMEOUT_MS = 10_000;
 const STATUS_USAGE_CONCURRENCY = 2;
 const STATUS_TOKEN_TIMEOUT_MS = 5_000;
 const STATUS_TOKEN_CONCURRENCY = 3;
 const STATUS_TOKEN_BUDGET_MS = 4_000;
+const STATUS_ONBOARDING_CONCURRENCY = 2;
+const STATUS_ONBOARDING_PER_REPO_TIMEOUT_MS = 4_000;
+const STATUS_ONBOARDING_TOTAL_BUDGET_MS = 12_000;
 
 const DISABLE_GITHUB_QUEUE_SWEEPS_ENV = "RALPH_GITHUB_QUEUE_DISABLE_SWEEPS";
 
@@ -286,6 +292,173 @@ async function collectBaseStatusData(opts?: { disableGitHubQueueSweeps?: boolean
   };
 }
 
+async function buildInProgressStatusRows(params: {
+  inProgress: Awaited<ReturnType<typeof getTasksByStatus>>;
+  getAlertSummary: StatusBaseData["getAlertSummary"];
+  includeTokens: boolean;
+}): Promise<StatusSnapshot["inProgress"]> {
+  return Promise.all(
+    params.inProgress.map(async (task) => {
+      const sessionId = task["session-id"]?.trim() || null;
+      const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
+      const opencodeProfile = getTaskOpencodeProfileName(task);
+      const tokens = params.includeTokens
+        ? await readRunTokenTotals({
+            repo: task.repo,
+            issue: task.issue,
+            opencodeProfile,
+            timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
+            concurrency: STATUS_TOKEN_CONCURRENCY,
+            budgetMs: STATUS_TOKEN_BUDGET_MS,
+          })
+        : { tokensTotal: null, tokensComplete: false };
+      return {
+        name: task.name,
+        repo: task.repo,
+        issue: task.issue,
+        priority: task.priority ?? "p2-medium",
+        opencodeProfile,
+        sessionId,
+        nowDoing,
+        line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
+        tokensTotal: params.includeTokens ? tokens.tokensTotal : undefined,
+        tokensComplete: params.includeTokens ? tokens.tokensComplete : undefined,
+        alerts: params.getAlertSummary(task),
+      };
+    })
+  );
+}
+
+async function collectOnboardingSnapshot(base: StatusBaseData): Promise<StatusOnboardingSnapshot> {
+  const repos = await collectOnboardingEvaluations({
+    repos: base.config.repos,
+    queueState: base.queueState,
+    concurrency: STATUS_ONBOARDING_CONCURRENCY,
+    perRepoTimeoutMs: STATUS_ONBOARDING_PER_REPO_TIMEOUT_MS,
+    totalBudgetMs: STATUS_ONBOARDING_TOTAL_BUDGET_MS,
+  });
+  return { version: 1, repos };
+}
+
+function buildUnavailableOnboardingSnapshot(config: ReturnType<typeof getConfig>, reason: string): StatusOnboardingSnapshot {
+  return {
+    version: 1,
+    repos: collectUnavailableOnboardingEvaluations(config.repos, reason),
+  };
+}
+
+async function composeStatusSnapshotFromBase(params: {
+  base: StatusBaseData;
+  drain: StatusDrainState;
+  usageRows?: Awaited<ReturnType<typeof collectStatusUsageRows>>;
+  includeTokens: boolean;
+}): Promise<StatusSnapshot> {
+  const inProgressWithStatus = await buildInProgressStatusRows({
+    inProgress: params.base.inProgress,
+    getAlertSummary: params.base.getAlertSummary,
+    includeTokens: params.includeTokens,
+  });
+  const onboarding = await collectOnboardingSnapshot(params.base);
+
+  return buildStatusSnapshot({
+    mode: params.base.mode,
+    desiredMode: params.base.desiredMode,
+    durableState: buildWritableDurableStateSnapshot(),
+    queue: {
+      backend: params.base.queueState.backend,
+      health: params.base.queueState.health,
+      fallback: params.base.queueState.fallback,
+      diagnostics: params.base.queueState.diagnostics ?? null,
+    },
+    parity: params.base.parity,
+    daemon: params.base.daemon,
+    daemonLiveness: params.base.daemonLiveness,
+    controlProfile: params.base.controlProfile || null,
+    activeProfile: params.base.resolvedProfile ?? null,
+    throttle: params.base.throttle.snapshot,
+    usage: params.usageRows ? { profiles: params.usageRows } : undefined,
+    dependencySatisfactionOverrides: params.base.depSatisfaction,
+    triageRuns: params.base.triageRuns.map((r) => ({
+      runId: r.runId,
+      repo: r.repo,
+      issueNumber: r.issueNumber,
+      outcome: r.outcome,
+      score: r.score,
+      reasons: r.reasons,
+      tokensTotal: r.tokensTotal,
+      toolCallCount: r.toolCallCount,
+      wallTimeMs: r.wallTimeMs,
+      computedAt: r.computedAt,
+    })),
+    escalations: {
+      pending: params.base.pendingEscalationsCount,
+    },
+    githubGovernor: getGitHubBudgetGovernorStatusForCli(),
+    onboarding,
+    inProgress: inProgressWithStatus,
+    starting: params.base.starting.map((t) => ({
+      name: t.name,
+      repo: t.repo,
+      issue: t.issue,
+      priority: t.priority ?? "p2-medium",
+      opencodeProfile: getTaskOpencodeProfileName(t),
+      alerts: params.base.getAlertSummary(t),
+    })),
+    drain: {
+      requestedAt: params.drain.requestedAt ? new Date(params.drain.requestedAt).toISOString() : null,
+      timeoutMs: params.drain.timeoutMs ?? null,
+      pauseRequested: params.drain.pauseRequested,
+      pauseAtCheckpoint: params.drain.pauseAtCheckpoint,
+    },
+    queued: params.base.queued.map((t) => ({
+      name: t.name,
+      repo: t.repo,
+      issue: t.issue,
+      priority: t.priority ?? "p2-medium",
+      opencodeProfile: getTaskOpencodeProfileName(t),
+      alerts: params.base.getAlertSummary(t),
+    })),
+    throttled: params.base.throttled.map((t) => ({
+      name: t.name,
+      repo: t.repo,
+      issue: t.issue,
+      priority: t.priority ?? "p2-medium",
+      opencodeProfile: getTaskOpencodeProfileName(t),
+      sessionId: t["session-id"]?.trim() || null,
+      resumeAt: t["resume-at"]?.trim() || null,
+      alerts: params.base.getAlertSummary(t),
+    })),
+    blocked: params.base.blockedSorted.map((t) => {
+      const details = t["blocked-details"]?.trim() ?? "";
+      return {
+        name: t.name,
+        repo: t.repo,
+        issue: t.issue,
+        priority: t.priority ?? "p2-medium",
+        opencodeProfile: getTaskOpencodeProfileName(t),
+        sessionId: t["session-id"]?.trim() || null,
+        blockedAt: t["blocked-at"]?.trim() || null,
+        blockedSource: t["blocked-source"]?.trim() || null,
+        blockedReason: t["blocked-reason"]?.trim() || null,
+        blockedDetailsSnippet: details ? summarizeBlockedDetailsSnippet(details) : null,
+        alerts: params.base.getAlertSummary(t),
+      };
+    }),
+    orphans: params.base.orphans.map((orphan) => ({
+      repo: orphan.repo,
+      issue: orphan.issue,
+      taskPath: orphan.taskPath,
+      reason: orphan.reason,
+      issueState: orphan.issueState,
+      labels: orphan.labels,
+      heartbeatAt: orphan.heartbeatAt,
+      daemonId: orphan.daemonId,
+      repoSlot: orphan.repoSlot,
+      worktreePath: orphan.worktreePath,
+    })),
+  });
+}
+
 export type StatusDrainState = {
   requestedAt: number | null;
   timeoutMs: number | null;
@@ -311,119 +484,15 @@ export async function collectStatusSnapshot(opts: { drain: StatusDrainState; ini
 export async function getStatusSnapshot(): Promise<StatusSnapshot> {
   initStateDb();
   const base = await collectBaseStatusData({ disableGitHubQueueSweeps: true });
-
-  const inProgressWithStatus = await Promise.all(
-    base.inProgress.map(async (task) => {
-      const sessionId = task["session-id"]?.trim() || null;
-      const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
-      return {
-        name: task.name,
-        repo: task.repo,
-        issue: task.issue,
-        priority: task.priority ?? "p2-medium",
-        opencodeProfile: getTaskOpencodeProfileName(task),
-        sessionId,
-        nowDoing,
-        line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
-        alerts: base.getAlertSummary(task),
-      };
-    })
-  );
-
-  return buildStatusSnapshot({
-    mode: base.mode,
-    desiredMode: base.desiredMode,
-    durableState: buildWritableDurableStateSnapshot(),
-    queue: {
-      backend: base.queueState.backend,
-      health: base.queueState.health,
-      fallback: base.queueState.fallback,
-      diagnostics: base.queueState.diagnostics ?? null,
-    },
-    parity: base.parity,
-    daemon: base.daemon,
-    daemonLiveness: base.daemonLiveness,
-    controlProfile: base.controlProfile || null,
-    activeProfile: base.resolvedProfile ?? null,
-    throttle: base.throttle.snapshot,
-    dependencySatisfactionOverrides: base.depSatisfaction,
-    triageRuns: base.triageRuns.map((r) => ({
-      runId: r.runId,
-      repo: r.repo,
-      issueNumber: r.issueNumber,
-      outcome: r.outcome,
-      score: r.score,
-      reasons: r.reasons,
-      tokensTotal: r.tokensTotal,
-      toolCallCount: r.toolCallCount,
-      wallTimeMs: r.wallTimeMs,
-      computedAt: r.computedAt,
-    })),
-    escalations: {
-      pending: base.pendingEscalationsCount,
-    },
-    githubGovernor: getGitHubBudgetGovernorStatusForCli(),
-    inProgress: inProgressWithStatus,
-    starting: base.starting.map((t) => ({
-      name: t.name,
-      repo: t.repo,
-      issue: t.issue,
-      priority: t.priority ?? "p2-medium",
-      opencodeProfile: getTaskOpencodeProfileName(t),
-      alerts: base.getAlertSummary(t),
-    })),
+  return composeStatusSnapshotFromBase({
+    base,
+    includeTokens: false,
     drain: {
       requestedAt: null,
       timeoutMs: base.control.drainTimeoutMs ?? null,
       pauseRequested: base.control.pauseRequested === true,
       pauseAtCheckpoint: base.control.pauseAtCheckpoint ?? null,
     },
-    queued: base.queued.map((t) => ({
-      name: t.name,
-      repo: t.repo,
-      issue: t.issue,
-      priority: t.priority ?? "p2-medium",
-      opencodeProfile: getTaskOpencodeProfileName(t),
-      alerts: base.getAlertSummary(t),
-    })),
-    throttled: base.throttled.map((t) => ({
-      name: t.name,
-      repo: t.repo,
-      issue: t.issue,
-      priority: t.priority ?? "p2-medium",
-      opencodeProfile: getTaskOpencodeProfileName(t),
-      sessionId: t["session-id"]?.trim() || null,
-      resumeAt: t["resume-at"]?.trim() || null,
-      alerts: base.getAlertSummary(t),
-    })),
-    blocked: base.blockedSorted.map((t) => {
-      const details = t["blocked-details"]?.trim() ?? "";
-      return {
-        name: t.name,
-        repo: t.repo,
-        issue: t.issue,
-        priority: t.priority ?? "p2-medium",
-        opencodeProfile: getTaskOpencodeProfileName(t),
-        sessionId: t["session-id"]?.trim() || null,
-        blockedAt: t["blocked-at"]?.trim() || null,
-        blockedSource: t["blocked-source"]?.trim() || null,
-        blockedReason: t["blocked-reason"]?.trim() || null,
-        blockedDetailsSnippet: details ? summarizeBlockedDetailsSnippet(details) : null,
-        alerts: base.getAlertSummary(t),
-      };
-    }),
-    orphans: base.orphans.map((orphan) => ({
-      repo: orphan.repo,
-      issue: orphan.issue,
-      taskPath: orphan.taskPath,
-      reason: orphan.reason,
-      issueState: orphan.issueState,
-      labels: orphan.labels,
-      heartbeatAt: orphan.heartbeatAt,
-      daemonId: orphan.daemonId,
-      repoSlot: orphan.repoSlot,
-      worktreePath: orphan.worktreePath,
-    })),
   });
 }
 
@@ -508,6 +577,7 @@ function buildDegradedStatusSnapshot(reason: ReturnType<typeof probeDurableState
     throttle: {},
     escalations: { pending: 0 },
     githubGovernor: getGitHubBudgetGovernorStatusForCli(),
+    onboarding: buildUnavailableOnboardingSnapshot(config, "Durable state degraded"),
     inProgress: [],
     starting: [],
     queued: [],
@@ -563,6 +633,10 @@ function printDegradedStatusText(snapshot: StatusSnapshot): void {
   if (snapshot.durableState?.ok === false) {
     const reason = snapshot.durableState.code ?? "unknown";
     console.warn(`Durable state degraded (${reason}): ${snapshot.durableState.message ?? "no details"}`);
+  }
+  if (snapshot.onboarding) {
+    const onboardingLines = formatOnboardingSection(snapshot.onboarding.repos);
+    for (const line of onboardingLines) console.log(line);
   }
   console.log("Queue parity: unavailable (durable state degraded)");
   console.log("Escalations: unavailable (durable state degraded)");
@@ -644,130 +718,11 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
   });
 
   if (json) {
-    const inProgressWithStatus = await Promise.all(
-      base.inProgress.map(async (task) => {
-        const sessionId = task["session-id"]?.trim() || null;
-        const nowDoing = sessionId ? await getSessionNowDoing(sessionId) : null;
-        const opencodeProfile = getTaskOpencodeProfileName(task);
-        const tokens = await readRunTokenTotals({
-          repo: task.repo,
-          issue: task.issue,
-          opencodeProfile,
-          timeoutMs: STATUS_TOKEN_TIMEOUT_MS,
-          concurrency: STATUS_TOKEN_CONCURRENCY,
-          budgetMs: STATUS_TOKEN_BUDGET_MS,
-        });
-        return {
-          name: task.name,
-          repo: task.repo,
-          issue: task.issue,
-          priority: task.priority ?? "p2-medium",
-          opencodeProfile,
-          sessionId,
-          nowDoing,
-          line: sessionId && nowDoing ? formatNowDoingLine(nowDoing, formatTaskLabel(task)) : null,
-          tokensTotal: tokens.tokensTotal,
-          tokensComplete: tokens.tokensComplete,
-          alerts: base.getAlertSummary(task),
-        };
-      })
-    );
-
-    const snapshot = buildStatusSnapshot({
-      mode: base.mode,
-      desiredMode: base.desiredMode,
-      durableState: buildWritableDurableStateSnapshot(),
-      queue: {
-        backend: base.queueState.backend,
-        health: base.queueState.health,
-        fallback: base.queueState.fallback,
-        diagnostics: base.queueState.diagnostics ?? null,
-      },
-      parity: base.parity,
-      daemon: base.daemon,
-      daemonLiveness: base.daemonLiveness,
-      controlProfile: base.controlProfile || null,
-      activeProfile: base.resolvedProfile ?? null,
-      throttle: base.throttle.snapshot,
-      usage: { profiles: usageRows },
-      dependencySatisfactionOverrides: base.depSatisfaction,
-      triageRuns: base.triageRuns.map((r) => ({
-        runId: r.runId,
-        repo: r.repo,
-        issueNumber: r.issueNumber,
-        outcome: r.outcome,
-        score: r.score,
-        reasons: r.reasons,
-        tokensTotal: r.tokensTotal,
-        toolCallCount: r.toolCallCount,
-        wallTimeMs: r.wallTimeMs,
-        computedAt: r.computedAt,
-      })),
-      escalations: {
-        pending: base.pendingEscalationsCount,
-      },
-      githubGovernor: getGitHubBudgetGovernorStatusForCli(),
-      inProgress: inProgressWithStatus,
-      starting: base.starting.map((t) => ({
-        name: t.name,
-        repo: t.repo,
-        issue: t.issue,
-        priority: t.priority ?? "p2-medium",
-        opencodeProfile: getTaskOpencodeProfileName(t),
-        alerts: base.getAlertSummary(t),
-      })),
-      drain: {
-        requestedAt: opts.drain.requestedAt ? new Date(opts.drain.requestedAt).toISOString() : null,
-        timeoutMs: opts.drain.timeoutMs ?? null,
-        pauseRequested: opts.drain.pauseRequested,
-        pauseAtCheckpoint: opts.drain.pauseAtCheckpoint,
-      },
-      queued: base.queued.map((t) => ({
-        name: t.name,
-        repo: t.repo,
-        issue: t.issue,
-        priority: t.priority ?? "p2-medium",
-        opencodeProfile: getTaskOpencodeProfileName(t),
-        alerts: base.getAlertSummary(t),
-      })),
-      throttled: base.throttled.map((t) => ({
-        name: t.name,
-        repo: t.repo,
-        issue: t.issue,
-        priority: t.priority ?? "p2-medium",
-        opencodeProfile: getTaskOpencodeProfileName(t),
-        sessionId: t["session-id"]?.trim() || null,
-        resumeAt: t["resume-at"]?.trim() || null,
-        alerts: base.getAlertSummary(t),
-      })),
-      blocked: base.blockedSorted.map((t) => {
-        const details = t["blocked-details"]?.trim() ?? "";
-        return {
-          name: t.name,
-          repo: t.repo,
-          issue: t.issue,
-          priority: t.priority ?? "p2-medium",
-          opencodeProfile: getTaskOpencodeProfileName(t),
-          sessionId: t["session-id"]?.trim() || null,
-          blockedAt: t["blocked-at"]?.trim() || null,
-          blockedSource: t["blocked-source"]?.trim() || null,
-          blockedReason: t["blocked-reason"]?.trim() || null,
-          blockedDetailsSnippet: details ? summarizeBlockedDetailsSnippet(details) : null,
-          alerts: base.getAlertSummary(t),
-        };
-      }),
-      orphans: base.orphans.map((orphan) => ({
-        repo: orphan.repo,
-        issue: orphan.issue,
-        taskPath: orphan.taskPath,
-        reason: orphan.reason,
-        issueState: orphan.issueState,
-        labels: orphan.labels,
-        heartbeatAt: orphan.heartbeatAt,
-        daemonId: orphan.daemonId,
-        repoSlot: orphan.repoSlot,
-        worktreePath: orphan.worktreePath,
-      })),
+    const snapshot = await composeStatusSnapshotFromBase({
+      base,
+      drain: opts.drain,
+      usageRows,
+      includeTokens: true,
     });
 
     console.log(JSON.stringify(snapshot, null, 2));
@@ -818,6 +773,10 @@ export async function runStatusCommand(opts: { args: string[]; drain: StatusDrai
 
   const usageLines = formatStatusUsageSection(usageRows);
   for (const line of usageLines) console.log(line);
+
+  const onboardingSnapshot = await collectOnboardingSnapshot(base);
+  const onboardingLines = formatOnboardingSection(onboardingSnapshot.repos);
+  for (const line of onboardingLines) console.log(line);
 
   console.log(`Escalations: ${base.pendingEscalationsCount} pending`);
 
